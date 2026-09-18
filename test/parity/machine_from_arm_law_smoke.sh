@@ -29,4 +29,11 @@ grep -q "^P 0$" <<< "$out" && fail "return escape in arm body NOT refused: $out"
 out=$(printf 'const enum St of u8:\n    Step\n    Stop\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            while n > 0:\n                n <- n - 1\n            next St.Stop\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
 grep -q "^P 0$" <<< "$out" && fail "hidden while in arm body NOT refused: $out"
 
-echo "machine-from arm-law smoke OK: straight-line legal; hidden if/while + return escape refused by stage1"
+# 5. LEGAL: an error union in an arm. `catch` is an EXPRESSION — stage0 reads a statement
+# `catch` as an ExprStmt and accepts it here (verified: it emits an object). Stage1 models
+# the same source as a `Stmt.Match` tagged `__catch_match`, so refusing every Match made
+# stage1 OVER-strict and rejected a program stage0 compiles.
+out=$(printf 'error LoadError:\n    Failed\n\ndef load(fail: bool) -> i64 error[LoadError]:\n    raise LoadError.Failed if fail\n    7\n\nconst enum St of u8:\n    Step\n    Stop\n\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            catch load(false):\n                loaded:\n                    n <- n - loaded\n                    true\n                error failure:\n                    n <- 0\n                    true\n            next St.Stop\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
+grep -q "^P 0$" <<< "$out" || fail "catch in arm body flagged: $out"
+
+echo "machine-from arm-law smoke OK: straight-line + catch legal; hidden if/while + return escape refused by stage1"

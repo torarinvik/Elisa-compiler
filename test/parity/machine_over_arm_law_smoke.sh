@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
-# docs/123 §5 (the machine arm law), stage1-OWNED (docs/125 step 13): a `machine over` arm
-# body may branch locally before a shared transition. `continue` remains invalid because
-# it can bypass that transition. `return` and `break` remain arm exits.
+# docs/123 §5 (the machine arm law): a `machine over` arm body is STRAIGHT-LINE. ALL
+# discrimination lives in the arm HEADER (`State, input if guard:`), so a body
+# `if`/`match`/`while`/`for` — and a postfix guard, which desugars to an `if` — is REFUSED.
+# `return` and `break` are legal arm exits; `continue` would bypass the arm's decision.
+#
+# ERROR HANDLING IS NOT BRANCHING and stays legal: `catch`/`try`/`get` are EXPRESSIONS.
+# Stage1 models a STATEMENT `catch` as a `Stmt.Match` tagged `__catch_match`, so the law
+# asks that annotation rather than the node kind — see machine_over_arm_stmt_illegal.
+#
+# This gate is a PARITY gate, not a stage1 assertion: every branch-law case is checked
+# against stage0 as well, so stage1 can neither under- nor over-refuse relative to the
+# oracle. Cases marked stage1-only pin stage1's own AST shapes (Expr.IndexN, Scope roots)
+# whose snippets do not type-check under stage0.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
@@ -9,44 +19,216 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "machine-over arm-law smoke FAIL: $1" >&2; exit 1; }
 
-# 1. LEGAL: straight-line body mutating the driven resource + `-> State` transition.
-#    An unrelated outer binding is deliberately not used here: the foreign-mutation law
-#    rejects it, and the stage0 oracle now enforces that rule as well.
-out=$(printf 'def scan(cursor: mutable i64) -> i64:\n    machine over cursor while cursor < 1:\n        state Run\n        start Run\n        Run, _:\n            cursor <- cursor + 1\n            -> Run\n    return cursor\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" || fail "legal straight-line arm flagged: $out"
+# Keep the scratch file inside the repo: stage0 emits a zero-byte object for a source
+# spelled /private/tmp/... and TMPDIR resolves there on macOS.
+TMPD="$REPO_ROOT/build/machine_arm_law_smoke.$$"
+mkdir -p "$TMPD"
+trap 'rm -rf "$TMPD"' EXIT
+CASE="$TMPD/case.elisa"
 
-# 1b. LEGAL: compound assignment is also a straight-line mutation and must use the same
-# driven-resource validation as `<-`, rather than being silently skipped by stage1.
-out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            lexer += 1\n            -> Run\n    return 0\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" || fail "legal compound assignment arm flagged: $out"
+# run_case LABEL legal|illegal|stage1-legal  < source
+#   legal        both compilers must accept the arm body
+#   illegal      both compilers must refuse it (stage0 via a docs/123 §5 sentence)
+#   stage1-legal stage1 must accept; stage0 is not consulted
+run_case() {
+    local label="$1" expect="$2"
+    cat > "$CASE"
+    local report stage1_clean stage0_law
+    report=$("$RPT" < "$CASE")
+    stage1_clean=no
+    grep -q "^P 0$" <<< "$report" && stage1_clean=yes
+    stage0_law=$("$ELISACORE_BIN" -emit ast "$CASE" 2>&1 >/dev/null | grep -c "docs/123")
+    case "$expect" in
+        legal)
+            [[ "$stage1_clean" == yes ]] || fail "$label: stage1 flagged a LEGAL arm body: $report"
+            [[ "$stage0_law" -eq 0 ]] || fail "$label: stage0 refuses it, so it is not legal ($stage0_law docs/123 errors)"
+            ;;
+        illegal)
+            [[ "$stage1_clean" == no ]] || fail "$label: stage1 did NOT refuse an ILLEGAL arm body: $report"
+            [[ "$stage0_law" -ge 1 ]] || fail "$label: stage0 does not refuse it, so stage1 is now OVER-strict"
+            ;;
+        stage1-legal)
+            [[ "$stage1_clean" == yes ]] || fail "$label: stage1 flagged a legal arm body: $report"
+            ;;
+        *) fail "bad expectation $expect" ;;
+    esac
+}
 
-# 1c. LEGAL: a multi-subscript assignment target is still rooted in the driven value. Stage1
-# stores this as `Expr.IndexN`; its machine lvalue-root helper must not reject it while stage0
-# represents the same source as an IndexExpr with Index2.
-out=$(printf 'def scan(table: mutable Table&) -> i64:\n    machine over table[0, 0]:\n        state Run\n        start Run\n        Run, _:\n            table[0, 0] <- 1\n            -> Run\n    return 0\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" || fail "legal multi-index assignment arm flagged: $out"
+# ---------------------------------------------------------------- legal, both compilers
 
-# 1d. LEGAL: a qualified value expression still contributes its base binding to the driven
-# resource set. `Scope` is a distinct AST node from `Field`; the stage1 root walker must recurse
-# through it so a mutation of `resource` is not misclassified as foreign state.
-out=$(printf 'def scan(resource: mutable Resource&) -> i64:\n    machine over resource::current():\n        state Run\n        start Run\n        Run, _:\n            resource[0] <- 1\n            -> Run\n    return 0\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" || fail "qualified driven-resource root was not retained: $out"
+run_case "straight-line body + transition" legal <<'EOF'
+def scan(cursor: mutable i64) -> i64:
+    machine over cursor while cursor < 1:
+        state Run
+        start Run
+        Run, _:
+            cursor <- cursor + 1
+            -> Run
+    return cursor
+EOF
 
-# 2. LEGAL: a branch can update the driven resource before the outer transition.
-out=$(printf 'def scan(total: mutable i64) -> i64:\n    machine over total while total < 2:\n        state Run\n        start Run\n        Run, _:\n            if total == 0:\n                total <- total + 1\n            else:\n                total <- total + 2\n            -> Run\n    return total\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" || fail "branch in arm body flagged: $out"
+# `return` and `break` are arm EXITS, not escapes (unlike `machine from`, which resolves
+# with `done`).
+run_case "return and break as arm exits" legal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, 0:
+            total <- 1
+            -> Run
+        Run, 1:
+            total <- 2
+            break
+        Run, _:
+            return total
+    return total
+EOF
 
-# 2b. LEGAL: a catch expression and its local arms are permitted before the
-# machine arm's shared transition.
-out=$("$RPT" < "$REPO_ROOT/test/fixtures/machine_transition/branching_catch.elisa")
-grep -q "^P 0$" <<< "$out" || fail "catch in arm body flagged: $out"
+# An error union in an arm is fine: `try` propagates without branching.
+run_case "try propagates from an arm" legal <<'EOF'
+error LoadError:
+    Failed
 
-# 2c. LEGAL: nested iteration completes before the arm transition.
-out=$(printf 'def scan(total: mutable i64) -> i64:\n    machine over total while total < 1:\n        state Run\n        start Run\n        Run, _:\n            for item in [1] |total|:\n                total <- total + item\n            -> Run\n    return total\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" || fail "for loop in arm body flagged: $out"
+def load(fail: bool) -> i64 error[LoadError]:
+    raise LoadError.Failed if fail
+    7
 
-# 3. ILLEGAL: `continue` (every arm ends in `-> State`, `return`, or `break`).
-out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    total: i64 = 0\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            continue\n    return total\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" && fail "continue in arm body NOT refused: $out"
+def scan(total: mutable i64) -> i64 error[LoadError]:
+    machine over total while total < 7:
+        state Run
+        start Run
+        Run, _:
+            value: i64 = try load(false)
+            total <- total + value
+            -> Run
+    return total
+EOF
 
-echo "machine-over arm-law smoke OK: branches and transitions legal; continue refused"
+# Both `catch` spellings — the expression form and the statement form stage1 models as a
+# tagged `Stmt.Match`. Kept as a fixture because it is also a RUNNABLE parity program.
+run_case "catch in an arm (expression and statement form)" legal \
+    < "$REPO_ROOT/test/fixtures/machine_transition/catch_in_arm.elisa"
+
+# -------------------------------------------------------------- illegal, both compilers
+
+run_case "block if/else" illegal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, _:
+            if total == 0:
+                total <- total + 1
+            else:
+                total <- total + 2
+            -> Run
+    return total
+EOF
+
+# A postfix guard desugars to an `if`, so it is the same refusal — this is the form that
+# reads as straight-line but is not.
+run_case "postfix guard" illegal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, _:
+            total <- total + 1 if total == 0
+            total <- total + 2 if total == 1
+            -> Run
+    return total
+EOF
+
+run_case "match in arm body" illegal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, _:
+            match total:
+                0:
+                    total <- total + 1
+                _:
+                    total <- total + 2
+            -> Run
+    return total
+EOF
+
+run_case "while loop in arm body" illegal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, _:
+            while total < 2:
+                total <- total + 1
+            -> Run
+    return total
+EOF
+
+run_case "for loop in arm body" illegal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 1:
+        state Run
+        start Run
+        Run, _:
+            for item in [1] |total|:
+                total <- total + item
+            -> Run
+    return total
+EOF
+
+run_case "continue" illegal <<'EOF'
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, _:
+            continue
+    return total
+EOF
+
+# ------------------------------------------------ stage1-only AST shapes (see header)
+
+# Compound assignment is a straight-line mutation and must go through the same
+# driven-resource validation as `<-`, rather than being silently skipped.
+run_case "compound assignment target" stage1-legal <<'EOF'
+def scan(lexer: mutable Lexer&) -> i64:
+    machine over lexer.current_char() while not lexer.is_end():
+        state Run
+        start Run
+        Run, .Digit:
+            lexer += 1
+            -> Run
+    return 0
+EOF
+
+# A multi-subscript target is still rooted in the driven value. Stage1 stores this as
+# `Expr.IndexN`; stage0 represents the same source as an IndexExpr with Index2.
+run_case "multi-index assignment target" stage1-legal <<'EOF'
+def scan(table: mutable Table&) -> i64:
+    machine over table[0, 0]:
+        state Run
+        start Run
+        Run, _:
+            table[0, 0] <- 1
+            -> Run
+    return 0
+EOF
+
+# A qualified value expression still contributes its base binding to the driven-resource
+# set. `Scope` is a distinct AST node from `Field`; the root walker must recurse through it
+# so mutating `resource` is not misclassified as foreign state.
+run_case "qualified driven-resource root" stage1-legal <<'EOF'
+def scan(resource: mutable Resource&) -> i64:
+    machine over resource::current():
+        state Run
+        start Run
+        Run, _:
+            resource[0] <- 1
+            -> Run
+    return 0
+EOF
+
+echo "machine-over arm-law smoke OK: straight-line + catch/try legal; if/guard/match/while/for/continue refused, in BOTH compilers"
