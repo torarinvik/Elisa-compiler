@@ -6,6 +6,33 @@
 extend Parser:
     public:
 
+        # The SOURCE spelling of the input literal that `unary_expression` just consumed,
+        # from its head token through the last token it took. stage0 rebuilds the same text
+        # from its coverage key (`char:m` -> `'m'`, `tag:TokenKind.A` -> `TokenKind.A`), and
+        # the source always spells it that way. A quoted token's own span EXCLUDES its
+        # delimiters (Ast::pos_of_quoted_token), so widen by one on each side.
+        def machine_input_literal_text(parser: Parser&, start_index: usize) -> sview:
+            empty_text: sview = sview("", 0, 0)
+            empty_text return if start_index >= parser.position or parser.position > parser.tokens.count
+            first_index: mutable usize = start_index
+            last_index: mutable usize = parser.position - 1
+            # stage0 renders the literal from its coverage KEY, which is built from the
+            # EXPRESSION -- so `Go, (1.0):` and `Go, 1.0:` print the same `1.0`. A raw source
+            # span keeps the parentheses, so peel the redundant ones back off.
+            while first_index < last_index and parser.tokens[first_index].kind == TokenKind.LParen and parser.tokens[last_index].kind == TokenKind.RParen |first_index, last_index|:
+                first_index <- first_index + 1
+                last_index <- last_index - 1
+            head: Token = parser.tokens[first_index]
+            last: Token = parser.tokens[last_index]
+            head_quoted: bool = head.kind == TokenKind.CharLit or head.kind == TokenKind.StringLit
+            last_quoted: bool = last.kind == TokenKind.CharLit or last.kind == TokenKind.StringLit
+            start: usize = (head.start.usize() - 1) if head_quoted else head.start.usize()
+            end: usize = (last.start.usize() + last.length.usize() + 1) if last_quoted else (last.start.usize() + last.length.usize())
+            empty_text return if end <= start
+            return parser.span_view(start, end)
+
+
+
         def parse_machine_arm(parser: lmut Parser) -> MachineArmAst:
             rebind state_token: Token, parser = parser.expect(TokenKind.Ident)
             state_text: sview = Lexer::text_or_empty(state_token, parser.source)
@@ -33,6 +60,7 @@ extend Parser:
             parser, _ <- parser.expect(TokenKind.Comma)
 
             input_literals: mutable darray[Ast::Expr] = []
+            input_literal_texts: mutable darray[sview] = []
             input_ranges: mutable darray[MachineRange] = []
             input_wild: mutable bool = false
             input_bind: mutable sview = ""
@@ -48,22 +76,25 @@ extend Parser:
             else:
                 machine over parser.position while true:
                     state Alternative
-                    state Range(lo: Ast::Expr)
+                    state Range(lo: Ast::Expr, lo_text: sview)
                     state Separator
                     start Alternative
 
                     Alternative, _:
+                        literal_head_index: usize = parser.position
                         rebind literal_opt: Ast::Expr?, parser = parser.unary_expression()
-                        -> Range(get literal_opt else (Ast::Expr.Invalid))
+                        literal_text: sview = parser.machine_input_literal_text(literal_head_index)
+                        -> Range(get literal_opt else (Ast::Expr.Invalid), literal_text)
 
-                    Range(lo), _ if parser.peek() == TokenKind.RangeLt or parser.peek() == TokenKind.RangeLe:
+                    Range(lo, lo_text), _ if parser.peek() == TokenKind.RangeLt or parser.peek() == TokenKind.RangeLe:
                         rebind range_token: Token, parser = parser.advance()
                         rebind hi_opt: Ast::Expr?, parser = parser.unary_expression()
                         input_ranges.push(MachineRange{lo: lo, hi: get hi_opt else (Ast::Expr.Invalid), inclusive: range_token.kind == TokenKind.RangeLe})
                         -> Separator
 
-                    Range(lo), _:
+                    Range(lo, lo_text), _:
                         input_literals.push(lo)
+                        input_literal_texts.push(lo_text)
                         -> Separator
 
                     Separator, _ if parser.peek() == TokenKind.Pipe:
@@ -103,12 +134,11 @@ extend Parser:
                     -> Scan
             parser, _ <- parser.expect(TokenKind.Dedent)
 
-            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, state_token) if not saw_decision
-
             return MachineArmAst{
                 state_name: state_text,
                 payloads: payloads,
                 input_literals: input_literals,
+                input_literal_texts: input_literal_texts,
                 input_ranges: input_ranges,
                 input_wild: input_wild,
                 input_bind: input_bind,
@@ -120,6 +150,7 @@ extend Parser:
                 target_offset: target_offset,
                 transition_args: transition_args,
                 transition_temp_names: [],
+                has_decision: saw_decision,
                 line: state_token.line
             }
 
@@ -133,7 +164,7 @@ extend Parser:
             parser <- parser.skip_newlines()
             return if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
             decision_token: Token = parser.cursor()
-            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, decision_token) if saw_decision == true
+            parser <- parser.error_named(Ast::ParseErrorKind.MachineLaw, decision_token, "machine arm continues after its `->`/return/break decision — the decision must be the arm's final statement", "") if saw_decision == true
             match parser.peek():
                 TokenKind.Arrow:
                     rebind arrow_token: Token, parser = parser.advance()
@@ -151,17 +182,23 @@ extend Parser:
                         parser, _ <- parser.expect(TokenKind.RParen)
                     parser, _ <- parser.accept(TokenKind.Newline)
                 _:
-                    body_head_token: Token = parser.cursor()
                     rebind stmt_opt: Ast::Stmt?, parser = parser.statement()
                     if stmt_opt is body_statement:
                         # Read the predicate into a local first: it borrows the parser's
                         # annotation table, and the refusal assigns back through `parser`.
                         arm_stmt_illegal: bool = machine_over_arm_stmt_illegal(parser.enum_annotations, body_statement)
-                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, body_head_token) if arm_stmt_illegal
+                        refusal: sview = machine_over_arm_refusal_sentence(body_statement)
                         parser <- parser.push_statement_with_pending(body, body_statement)
                         saw_decision <- true if machine_statement_exits(body_statement)
                         parser <- parser.skip_trailing_can(true)
                         parser, _ <- parser.accept(TokenKind.Newline)
+                        # stage0 validates each arm statement with the cursor ALREADY past it
+                        # (p.cur() after parseStatement, which also consumed the terminating
+                        # newline), so the refusal lands on the FOLLOWING line -- the `-> Text`
+                        # after the branch, not the `if` that opened it. The line is half the
+                        # parity: parse_error_message_diff compares `LINE|message` sets.
+                        refusal_token: Token = parser.cursor()
+                        parser <- parser.error_named(Ast::ParseErrorKind.MachineLaw, refusal_token, refusal, "") if arm_stmt_illegal
                     else:
                         parser, _ <- parser.advance()
 
