@@ -5,14 +5,122 @@
 
 extend Semantic:
     private:
+        # Recorded mutability of `name` -- INNERMOST (last-pushed) wins, mirroring
+        # `local_type_of` over the parallel channels this walker keeps in lockstep.
+        def local_mutable_of(names: darray[sview]&, mutables: darray[bool]&, name: sview) -> bool:
+            can Abort.Panic:
+                while name_index > 0 |name_index: usize = names.count|:
+                    name_index <- name_index - 1
+                    mutables[name_index] return if names[name_index] == name and name_index < mutables.count
+                return false
+
+
+        # Recorded interned TypeId of `name`'s annotation (0 = unmodeled). The table's own
+        # `local_type_ids` channel is rebuilt per pass and is EMPTY while this check runs,
+        # so the walker interns its own as it descends.
+        def local_type_id_channel_of(names: darray[sview]&, ids: darray[u32]&, name: sview) -> u32:
+            can Abort.Panic:
+                while name_index > 0 |name_index: usize = names.count|:
+                    name_index <- name_index - 1
+                    ids[name_index] return if names[name_index] == name and name_index < ids.count
+                return 0
+
+
+        # `(expr)` is transparent to every place predicate below; stage0 strips it in
+        # `stripMutationTargetExpr` before classifying.
+        def ref_place_stripped(place: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match place:
+                    Expr.Paren(inner, paren_line):
+                        return ref_place_stripped(inner)
+                    _:
+                        return place
+
+
+        # The interned type of the place `&x` would point at. The walker's own channel
+        # answers for a binding and for an element of one; anything else falls back to the
+        # shared structural resolver.
+        def ref_source_type_id(place: Ast::Expr, names: darray[sview]&, types: darray[sview]&, ids: darray[u32]&, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                stripped: Ast::Expr = ref_place_stripped(place)
+                match stripped:
+                    Expr.Ident(place_name, place_line):
+                        channel_id: u32 = local_type_id_channel_of(names, ids, place_name)
+                        channel_id return if channel_id != 0
+                        return structural_type_id_of(stripped, names, types, table)
+                    Expr.Index(indexed_object, index_expression, index_line):
+                        element_id: u32 = indexed_element_type_id(ref_source_type_id(indexed_object, names, types, ids, table), table)
+                        element_id return if element_id != 0
+                        return structural_type_id_of(stripped, names, types, table)
+                    _:
+                        return structural_type_id_of(stripped, names, types, table)
+
+
+        # stage0's `mutationPathWritable`: the PATH leading to a place, whose default is
+        # WRITABLE -- an element of an immutable array is still an addressable slot. Only a
+        # path rooted in an immutable REFERENCE is closed to mutation.
+        def ref_path_is_writable(path: Ast::Expr, names: darray[sview]&, types: darray[sview]&, mutables: darray[bool]&, ids: darray[u32]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match ref_place_stripped(path):
+                    Expr.Field(field_object, field_name, field_line):
+                        return ref_path_is_writable(field_object, names, types, mutables, ids, table)
+                    Expr.Index(indexed_object, index_expression, index_line):
+                        return ref_path_is_writable(indexed_object, names, types, mutables, ids, table)
+                    Expr.Slice(sliced_object, slice_low, slice_high, slice_line):
+                        return ref_path_is_writable(sliced_object, names, types, mutables, ids, table)
+                    Expr.Ident(root_name, root_line):
+                        local_mutable_of(names, mutables, root_name) return if interned_kind(local_type_id_channel_of(names, ids, root_name), table) == SemTypeKind.Ref
+                        return true
+                    _:
+                        return true
+
+
+        # stage0's `exprCanYieldWritableRef`: whether `&place` is a MUTABLE reference.
+        # A place that is not one of these three shapes has no address to take.
+        def ref_place_is_writable(place: Ast::Expr, names: darray[sview]&, types: darray[sview]&, mutables: darray[bool]&, ids: darray[u32]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match ref_place_stripped(place):
+                    Expr.Ident(place_name, place_line):
+                        return local_mutable_of(names, mutables, place_name)
+                    Expr.Field(field_object, field_name, field_line):
+                        owner_id: mutable u32 = ref_source_type_id(field_object, names, types, ids, table)
+                        while interned_kind(owner_id, table) == SemTypeKind.Ref |owner_id|:
+                            owner_id <- interned_elem(owner_id, 0, table)
+                        false return if not field_is_mutable(table, interned_name(owner_id, table), field_name)
+                        return ref_path_is_writable(field_object, names, types, mutables, ids, table)
+                    Expr.Index(indexed_object, index_expression, index_line):
+                        return ref_path_is_writable(indexed_object, names, types, mutables, ids, table)
+                    _:
+                        return false
+
+
+        # Which replacement stage0 names for the removed `x.ref[T]` shorthand. BORROW
+        # (`&x`) iff the target is a reference to the SAME pointee -- the reference's own
+        # mutability is not part of that comparison -- that pointee is not the universal
+        # `void&` erasure, and `&x`'s real mutability suffices: a `mutable T&` target on a
+        # non-writable place is a mutability-FORCING reinterpret, not a borrow. Anything
+        # else is `(&x).cast[T]`. A receiver this walker cannot type interns as 0 and lands
+        # on the reinterpret wording, which is the conservative reading.
+        def ref_shorthand_is_borrow(receiver: Ast::Expr, target: Ast::Expr, names: darray[sview]&, types: darray[sview]&, mutables: darray[bool]&, ids: darray[u32]&, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                target_id: u32 = annotation_type_id(target, table)
+                false return if interned_kind(target_id, table) != SemTypeKind.Ref
+                pointee_id: u32 = interned_elem(target_id, 0, table)
+                false return if pointee_id == 0 or interned_name(pointee_id, table) == "void"
+                source_id: u32 = ref_source_type_id(receiver, names, types, ids, table)
+                false return if source_id == 0 or source_id != pointee_id
+                true return if not type_is_mutable(target)
+                return ref_place_is_writable(receiver, names, types, mutables, ids, table)
+
+
         # Walk through expressions, checking for redundant casts.
-        def walk_expression_for_redundant_cast(expression: Ast::Expr, table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&) -> void:
+        def walk_expression_for_redundant_cast(expression: Ast::Expr, table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&, var_mutables: mutable darray[bool]&, var_type_ids: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Binary(left, operator, right, line):
                         # Recursively walk both sides
-                        table <- walk_expression_for_redundant_cast(left, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(right, table, var_types, type_names) if operator != TokenKind.Is and operator != TokenKind.As
+                        table <- walk_expression_for_redundant_cast(left, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(right, table, var_types, type_names, var_mutables, var_type_ids) if operator != TokenKind.Is and operator != TokenKind.As
                     Expr.Call(callee, arguments, argument_names, line):
                         if arguments.count == 0:
                             match callee:
@@ -24,17 +132,21 @@ extend Semantic:
                                             pass
                                 _:
                                     pass
-                        table <- walk_expression_for_redundant_cast(callee, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(callee, table, var_types, type_names, var_mutables, var_type_ids)
                         for argument in arguments |table|:
-                            table <- walk_expression_for_redundant_cast(argument, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(argument, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Field(object, field, line):
-                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Scope(base, name, line):
-                        table <- walk_expression_for_redundant_cast(base, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(base, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Index(object, index, line):
                         match object:
                             Expr.Field(receiver_for_ref, ref_field, ref_line):
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RemovedRefShorthand, name: "ref", line: line.line, expected: "", actual: ""}) if ref_field == "ref"
+                                if ref_field == "ref":
+                                    # `expected` carries the replacement stage0 would name, so the
+                                    # renderer does not need the types back.
+                                    ref_replacement: sview = "borrow" if ref_shorthand_is_borrow(receiver_for_ref, index, var_types, type_names, var_mutables, var_type_ids, table) else "cast"
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RemovedRefShorthand, name: "ref", line: line.line, expected: ref_replacement, actual: ""})
                             _:
                                 pass
                         # Detect redundant `.cast[T]`: object is `recv.cast`, index is the target
@@ -51,98 +163,100 @@ extend Semantic:
                                             pass
                             _:
                                 pass
-                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(index, table, var_types, type_names) if not index_receiver_is_type_application(object)
+                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(index, table, var_types, type_names, var_mutables, var_type_ids) if not index_receiver_is_type_application(object)
                     Expr.Unary(operator, operand, line):
-                        table <- walk_expression_for_redundant_cast(operand, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(operand, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Paren(inner, line):
-                        table <- walk_expression_for_redundant_cast(inner, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(inner, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Array(elements, line):
                         for element in elements |table|:
-                            table <- walk_expression_for_redundant_cast(element, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(element, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Tuple(elements, line):
                         for element in elements |table|:
-                            table <- walk_expression_for_redundant_cast(element, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(element, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Slice(object, low, high, line):
-                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(low, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(high, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(low, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(high, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.IndexN(object, arguments, line):
-                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(object, table, var_types, type_names, var_mutables, var_type_ids)
                         for argument in arguments |table|:
-                            table <- walk_expression_for_redundant_cast(argument, table, var_types, type_names) if not index_receiver_is_type_application(object)
+                            table <- walk_expression_for_redundant_cast(argument, table, var_types, type_names, var_mutables, var_type_ids) if not index_receiver_is_type_application(object)
                     Expr.SetLit(elements, line):
                         for element in elements |table|:
-                            table <- walk_expression_for_redundant_cast(element, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(element, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.DictLit(entries, line):
                         for entry in entries |table|:
-                            table <- walk_expression_for_redundant_cast(entry.key, table, var_types, type_names)
-                            table <- walk_expression_for_redundant_cast(entry.value, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(entry.key, table, var_types, type_names, var_mutables, var_type_ids)
+                            table <- walk_expression_for_redundant_cast(entry.value, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Construct(type_expression, fields, line):
-                        table <- walk_expression_for_redundant_cast(type_expression, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(type_expression, table, var_types, type_names, var_mutables, var_type_ids)
                         for field in fields |table|:
-                            table <- walk_expression_for_redundant_cast(field.value, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(field.value, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.RecordUpdate(base, fields, line):
-                        table <- walk_expression_for_redundant_cast(base, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(base, table, var_types, type_names, var_mutables, var_type_ids)
                         for field in fields |table|:
-                            table <- walk_expression_for_redundant_cast(field.value, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(field.value, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.If(condition, then_expr, else_expr, line):
-                        table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(then_expr, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(else_expr, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(then_expr, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(else_expr, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Comprehension(loop_variable, iterable, condition, body, line):
-                        table <- walk_expression_for_redundant_cast(iterable, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(body, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(iterable, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(body, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Lambda(parameters, body, line):
-                        table <- walk_statements_for_redundant_cast(body, table, var_types, type_names)
+                        table <- walk_statements_for_redundant_cast(body, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Block(statements, value, captures, line):
-                        table <- walk_statements_for_redundant_cast(statements, table, var_types, type_names)
-                        table <- walk_expression_for_redundant_cast(value, table, var_types, type_names)
+                        table <- walk_statements_for_redundant_cast(statements, table, var_types, type_names, var_mutables, var_type_ids)
+                        table <- walk_expression_for_redundant_cast(value, table, var_types, type_names, var_mutables, var_type_ids)
                     Expr.Match(scrutinee, arms, line):
-                        table <- walk_expression_for_redundant_cast(scrutinee, table, var_types, type_names)
+                        table <- walk_expression_for_redundant_cast(scrutinee, table, var_types, type_names, var_mutables, var_type_ids)
                         for arm in arms |table|:
-                            table <- walk_statements_for_redundant_cast(arm.body, table, var_types, type_names)
+                            table <- walk_statements_for_redundant_cast(arm.body, table, var_types, type_names, var_mutables, var_type_ids)
                     # Literals and other expressions don't contain relevant sub-expressions
                     _:
                         pass
 
         # Walk through statements, tracking variable types and checking for impossible comparisons.
-        def walk_statements_for_redundant_cast(statements: darray[Ast::Stmt], table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&) -> void:
+        def walk_statements_for_redundant_cast(statements: darray[Ast::Stmt], table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&, var_mutables: mutable darray[bool]&, var_type_ids: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- walk_expression_for_redundant_cast(expression, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(expression, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.VarDecl(name, type_expression, value, line):
                             # Record the type for this variable
                             type_name: sview = bare_type_name(type_expression)
                             note_local_type(var_types, type_names, name, type_name)
-                            table <- walk_expression_for_redundant_cast(value, table, var_types, type_names)
+                            var_mutables.push(local_binding_is_mutable(name, line.line, line.offset, type_expression, table))
+                            var_type_ids.push(annotation_type_id(type_expression, table))
+                            table <- walk_expression_for_redundant_cast(value, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.Assign(target, operator, value, line):
-                            table <- walk_expression_for_redundant_cast(target, table, var_types, type_names)
-                            table <- walk_expression_for_redundant_cast(value, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(target, table, var_types, type_names, var_mutables, var_type_ids)
+                            table <- walk_expression_for_redundant_cast(value, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names)
-                            table <- walk_statements_for_redundant_cast(then_body, table, var_types, type_names)
-                            table <- walk_statements_for_redundant_cast(else_body, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names, var_mutables, var_type_ids)
+                            table <- walk_statements_for_redundant_cast(then_body, table, var_types, type_names, var_mutables, var_type_ids)
+                            table <- walk_statements_for_redundant_cast(else_body, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.While(condition, body, line):
-                            table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names)
-                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(condition, table, var_types, type_names, var_mutables, var_type_ids)
+                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- walk_expression_for_redundant_cast(iterable, table, var_types, type_names)
-                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(iterable, table, var_types, type_names, var_mutables, var_type_ids)
+                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names)
+                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- walk_expression_for_redundant_cast(scrutinee, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(scrutinee, table, var_types, type_names, var_mutables, var_type_ids)
                             for arm in arms |table|:
-                                table <- walk_expression_for_redundant_cast(arm.guard, table, var_types, type_names)
-                                table <- walk_statements_for_redundant_cast(arm.body, table, var_types, type_names)
+                                table <- walk_expression_for_redundant_cast(arm.guard, table, var_types, type_names, var_mutables, var_type_ids)
+                                table <- walk_statements_for_redundant_cast(arm.body, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.Return(value, line):
-                            table <- walk_expression_for_redundant_cast(return_value, table, var_types, type_names) if value is return_value
+                            table <- walk_expression_for_redundant_cast(return_value, table, var_types, type_names, var_mutables, var_type_ids) if value is return_value
                         Stmt.Contract(kind, expression, line):
-                            table <- walk_expression_for_redundant_cast(expression, table, var_types, type_names)
+                            table <- walk_expression_for_redundant_cast(expression, table, var_types, type_names, var_mutables, var_type_ids)
                         Stmt.Invalid:
                             pass
                         Stmt.Break(label, line):
@@ -159,12 +273,16 @@ extend Semantic:
                             # Create fresh type tracking for this function
                             var_types: mutable darray[sview] = []
                             type_names: mutable darray[sview] = []
+                            var_mutables: mutable darray[bool] = []
+                            var_type_ids: mutable darray[u32] = []
                             # Record parameter types
                             for param in params |table|:
                                 param_type: sview = bare_type_name(param.type_expression)
                                 note_local_type(var_types, type_names, param.name, param_type)
+                                var_mutables.push(param.is_mutable or type_is_mutable(param.type_expression))
+                                var_type_ids.push(annotation_type_id(param.type_expression, table))
                             # Walk the function body
-                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names)
+                            table <- walk_statements_for_redundant_cast(body, table, var_types, type_names, var_mutables, var_type_ids)
                         Decl.Module(module_name, body, line):
                             table <- check_redundant_cast_declarations(body, table)
                         Decl.Scoped(body, line):
