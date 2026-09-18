@@ -48,6 +48,10 @@ check_case undefined_callee $'def use() -> i64:\n    return baz()\n'
 check_case ufcs_nonconforming $'struct Bare:\n    y: i64\n\nprotocol Eq:\n    def eq(self: Self, other: Self) -> bool\n\ndef same(a: Bare, b: Bare) -> bool:\n    return a.eq(b)\n'
 check_case generic_bound $'struct Bare:\n    y: i64\n\nprotocol Comparable:\n    type Item\n    def lt(a: Item, b: Item) -> bool\n\ndef max_of[T: Comparable](a: T, b: T) -> T:\n    if a.lt(b):\n        return b\n    return a\n\ndef use() -> Bare:\n    p: Bare = Bare{y: 1}\n    q: Bare = Bare{y: 2}\n    return max_of[Bare](p, q)\n'
 check_case field_on_param $'protocol Eq:\n    def lt(a: Self, b: Self) -> bool\n\ndef m[T](a: T) -> bool:\n    return a.lt(a)\n'
+# A generic application with MORE THAN ONE type argument is a different AST node than
+# the single-argument one; it carried no cascade until IndexN was handled too.
+check_case generic_multi_type_arg $'def f(x: i64) -> void:\n    _ = nosuch_generic[i64, i64](x, 16)\n'
+check_case generic_one_type_arg $'def f(x: i64) -> void:\n    y: i64 = nosuch_generic[i64](x)\n'
 
 # SILENT: the poisoned name is an ARGUMENT, not the callee.
 check_case poisoned_argument $'struct Header:\n    a: i64\n\ndef use() -> usize:\n    return offset_of(Header, missing)\n'
