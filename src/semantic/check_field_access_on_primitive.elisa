@@ -46,6 +46,67 @@ extend Semantic:
                     _:
                         pass
 
+        # A string LITERAL, or a binding whose declared type is a reference to a byte.
+        def field_arm_is_string_like(expression: Ast::Expr, var_types: darray[sview]&, type_names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.StringLit(arm_text, arm_string_line):
+                        return true
+                    Expr.Ident(arm_name, arm_ident_line):
+                        return local_type_of(var_types, type_names, arm_name) == "u8"
+                    Expr.Paren(arm_inner, arm_paren_line):
+                        return field_arm_is_string_like(arm_inner, var_types, type_names)
+                    _:
+                        return false
+
+
+        # Whether stage0's const evaluator can read this operand: a literal, or a name that
+        # is NOT shadowed by a local or parameter -- it then names a global const. The
+        # evaluator reads only the global table, so a shadowing binding makes the operand a
+        # runtime value even when a const of that name exists.
+        def field_operand_folds(expression: Ast::Expr, var_types: darray[sview]&, type_names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.StringLit(fold_text, fold_string_line):
+                        return true
+                    Expr.BoolLit(fold_bool, fold_bool_line):
+                        return true
+                    Expr.IntLit(fold_int, fold_int_line):
+                        return true
+                    Expr.CharLit(fold_char, fold_char_line):
+                        return true
+                    Expr.Ident(fold_name, fold_ident_line):
+                        return local_type_of(var_types, type_names, fold_name) == ""
+                    Expr.Paren(fold_inner, fold_paren_line):
+                        return field_operand_folds(fold_inner, var_types, type_names)
+                    _:
+                        return false
+
+
+        # `.len` is a COMPILE-TIME string's byte length, not a property of the runtime type
+        # `u8&`. A ternary receiver therefore folds only when the WHOLE expression folds: a
+        # condition or an arm that is a runtime binding leaves an ordinary `u8&`, and stage0
+        # answers "field access requires struct type, got u8". Measured against stage0's
+        # TestU8RefLenRequiresCompileTimeString, whose three ternary rows differ only in
+        # WHICH operand is the runtime one -- the arm, the other arm, or the condition.
+        #
+        # Restricted to the `u8&` family on purpose: a ternary over views or containers
+        # keeps its real `.len`/`.count`, so one arm must be a string literal or a binding
+        # declared as a reference to a byte before this can fire.
+        def field_receiver_is_unfoldable_string_ternary(expression: Ast::Expr, var_types: darray[sview]&, type_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(ternary_inner, ternary_paren_line):
+                        return field_receiver_is_unfoldable_string_ternary(ternary_inner, var_types, type_names)
+                    Expr.If(ternary_condition, ternary_then, ternary_else, ternary_line):
+                        string_like: bool = field_arm_is_string_like(ternary_then, var_types, type_names) or field_arm_is_string_like(ternary_else, var_types, type_names)
+                        return false if not string_like
+                        every_operand_folds: bool = field_operand_folds(ternary_condition, var_types, type_names) and field_operand_folds(ternary_then, var_types, type_names) and field_operand_folds(ternary_else, var_types, type_names)
+                        return not every_operand_folds
+                    _:
+                        return false
+
+
         # Walk through expressions, checking for field access on primitives.
         def walk_expression_for_field_access_on_primitive(expression: Ast::Expr, table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -68,6 +129,11 @@ extend Semantic:
                         object_type: InferType = infer_expression_type(object, var_types, type_names, table)
                         actual: sview = stage0_value_spelling(object_type)
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FieldAccessOnPrimitive, name: "", pos: line, line: line.line, expected: "", actual: actual}) if object_type.kind == SemTypeKind.Int or object_type.kind == SemTypeKind.Float or object_type.kind == SemTypeKind.Bool or object_type.kind == SemTypeKind.Char
+                        # A ternary receiver never reaches the scalar test above -- it infers
+                        # as String or Unknown -- so the unfoldable case is asked separately,
+                        # and only when that test did not already fire.
+                        receiver_is_scalar: bool = object_type.kind == SemTypeKind.Int or object_type.kind == SemTypeKind.Float or object_type.kind == SemTypeKind.Bool or object_type.kind == SemTypeKind.Char
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FieldAccessOnPrimitive, name: "", pos: line, line: line.line, expected: "", actual: "u8"}) if not receiver_is_scalar and field_receiver_is_unfoldable_string_ternary(object, var_types, type_names)
                     Expr.Scope(base, name, line):
                         table <- walk_expression_for_field_access_on_primitive(base, table, var_types, type_names)
                     Expr.Index(object, index, line):
@@ -166,8 +232,16 @@ extend Semantic:
                         Stmt.Expr(expression, line):
                             table <- walk_expression_for_field_access_on_primitive(expression, table, var_types, type_names)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            # Record the type for this variable
-                            type_name: sview = bare_type_name(type_expression)
+                            # Record the type for this variable. A LOCAL whose declared type
+                            # is a reference to a primitive needs the same referent
+                            # substitution the parameter path does above -- `bare_type_name`
+                            # strips `mutable` but not `&`, so `s: u8& = "abc"` recorded ""
+                            # and `s.len` stayed silent. stage0 rejects it: the initializer
+                            # being a string LITERAL does not make the binding a
+                            # compile-time string, only a `const` folds.
+                            declared_name: sview = bare_type_name(type_expression)
+                            declared_referent: sview = bare_type_name_through_ref(type_expression)
+                            type_name: sview = declared_referent if declared_name == "" and scalar_name_is_numeric(declared_referent) else declared_name
                             note_local_type(var_types, type_names, name, type_name)
                             note_local_type_id(name, type_expression, table)
                             table <- walk_expression_for_field_access_on_primitive(value, table, var_types, type_names)
