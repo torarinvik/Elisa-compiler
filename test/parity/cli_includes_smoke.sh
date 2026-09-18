@@ -199,6 +199,52 @@ else
     fail "include_path_nul: the compiler did not reject the path cleanly or wrote an object"
 fi
 
+# stage0's include preprocessor also takes the BRACE form (parseIncludeDirective):
+# `{$I 'p'}`, `{$I "p"}`, `{$I p}` and the `{$include ...}` long form, keyword case
+# insensitive. The driver took only `include "p"` / `#include "p"`, so
+# elisa-proof/examples/include_macro.elisa -- which stage0 compiles with no diagnostics --
+# came out as four `unexpected token { at top level` per directive. A bare argument holding
+# whitespace is NOT a path, which is stage0's rule and the last case below.
+mkdir -p "$WORK/brace"
+printf 'def brace_identity(x: i64) -> i64:\n    ensure result == x\n    return x\n' > "$WORK/brace/included.elisa"
+brace_case() {
+    directive="$1"
+    label="$2"
+    mkdir -p "$WORK/brace/$label"
+    cp "$WORK/brace/included.elisa" "$WORK/brace/$label/included.elisa"
+    {
+        printf '%s\n' "$directive"
+        printf 'def use_brace_import(x: i64) -> i64:\n    ensure result == x\n    return brace_identity(x)\n'
+    } > "$WORK/brace/$label/entry.elisa"
+    total=$((total + 1))
+    if RUN "$BIN" -o "$WORK/brace/$label/entry.o" "$WORK/brace/$label/entry.elisa" >"$WORK/brace/$label/stderr" 2>&1 \
+       && [ -s "$WORK/brace/$label/entry.o" ]; then
+        ok
+    else
+        fail "include_brace_$label: the driver did not expand $directive"
+    fi
+}
+brace_case "{\$I './included.elisa'}" single_quoted
+brace_case "{\$I \"./included.elisa\"}" double_quoted
+brace_case "{\$I ./included.elisa}" bare
+brace_case "{\$include \"./included.elisa\"}" long_keyword
+brace_case "{\$INCLUDE \"./included.elisa\"}" upper_keyword
+
+# A bare argument with whitespace is refused rather than guessed at, so the directive stays
+# an ordinary line and the source fails to parse.
+mkdir -p "$WORK/brace/spaced"
+printf 'def brace_identity(x: i64) -> i64:\n    ensure result == x\n    return x\n' > "$WORK/brace/spaced/included.elisa"
+{
+    printf '{$I ./included.elisa extra}\n'
+    printf 'def use_brace_import(x: i64) -> i64:\n    ensure result == x\n    return brace_identity(x)\n'
+} > "$WORK/brace/spaced/entry.elisa"
+total=$((total + 1))
+if RUN "$BIN" -o "$WORK/brace/spaced/entry.o" "$WORK/brace/spaced/entry.elisa" >"$WORK/brace/spaced/stderr" 2>&1; then
+    fail "include_brace_spaced: a bare argument with whitespace was treated as a path"
+else
+    ok
+fi
+
 if [ "$pass" -ne "$total" ]; then
     echo "cli_includes_smoke FAILED: passed=$pass total=$total"
     exit 1
