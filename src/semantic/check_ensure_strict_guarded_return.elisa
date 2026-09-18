@@ -1,0 +1,221 @@
+# Stage1 semantic — the guarded-return `ensure` rule (`extend Semantic: private:`).
+#
+# stage0 proves an `ensure` PER RETURN PATH, with the path condition as a known fact:
+# `ensure result == n + 3` over `if n == 0: return 2` is reported at the `return 2` line
+# quoting `known facts: - n == 0` and `(it can fail when n=0)`. stage1's main prover only
+# judges a single straight-line return (check_ensure_strict_walk.elisa), so every branchy
+# body went unreported. This file covers the DECIDABLE slice of that gap: a guard that
+# PINS an integer parameter to a literal closes the goal into a sentence of constants, so
+# a FALSE verdict is a fact and not a guess -- no flow fact stage0 tracks can rescue a
+# goal that is already arithmetic. Everything that does not fold stays unreported.
+
+extend Semantic:
+    private:
+        # `expression` folded to an integer constant with `name` bound to `value` and
+        # `result` bound to `return_expression`. Overflow means NOT a constant, the rule
+        # linear_arith_safe documents: Elisa's signed arithmetic traps, so an unguarded
+        # fold would abort the compiler on its own input rather than answer wrongly.
+        def es_guard_fold(expression: Ast::Expr, name: sview, value: i64, return_expression: Ast::Expr, has_return: bool, found: mutable bool&, depth: u32) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                if depth > 32:
+                    found <- false
+                    return 0
+                resolved: Ast::Expr = resolve_result(expression, return_expression, has_return)
+                match resolved:
+                    Expr.IntLit(literal_value, literal_line):
+                        found <- true
+                        return literal_value
+                    Expr.Ident(ident_name, ident_line):
+                        if ident_name == name and name != "":
+                            found <- true
+                            return value
+                        found <- false
+                        return 0
+                    Expr.Paren(inner, paren_line):
+                        return es_guard_fold(inner, name, value, return_expression, has_return, found, depth + 1)
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Minus:
+                            inner_value: i64 = es_guard_fold(operand, name, value, return_expression, has_return, found, depth + 1)
+                            negated: (known: bool, value: i64) = linear_neg_safe(inner_value)
+                            if not negated.known:
+                                found <- false
+                                return 0
+                            return negated.value
+                        found <- false
+                        return 0
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_found: mutable bool = false
+                        right_found: mutable bool = false
+                        left_value: i64 = es_guard_fold(left, name, value, return_expression, has_return, left_found, depth + 1)
+                        right_value: i64 = es_guard_fold(right, name, value, return_expression, has_return, right_found, depth + 1)
+                        if not (left_found and right_found):
+                            found <- false
+                            return 0
+                        folded: (known: bool, value: i64) = linear_arith_safe(left_value, operator, right_value)
+                        if not folded.known:
+                            found <- false
+                            return 0
+                        found <- true
+                        return folded.value
+                    _:
+                        found <- false
+                        return 0
+
+        # A bare integer literal (with an optional leading `-`), for the right-hand side of
+        # a guard. Deliberately NOT a general fold: a guard is only usable when the pinned
+        # value is written out, and a wider fold here would accept `n == m` shapes that pin
+        # nothing.
+        def es_guard_literal(expression: Ast::Expr) -> (known: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(literal_value, literal_line):
+                        return (true, literal_value)
+                    Expr.Paren(inner, paren_line):
+                        return es_guard_literal(inner)
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Minus:
+                            inner: (known: bool, value: i64) = es_guard_literal(operand)
+                            return (false, 0) if not inner.known
+                            return linear_neg_safe(inner.value)
+                        return (false, 0)
+                    _:
+                        return (false, 0)
+
+        # Does any statement in `body` (at any depth) assign to `name`?
+        def es_name_is_reassigned(name: sview, body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                reassigned: mutable bool = false
+                for statement in body |reassigned, name|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, assign_line):
+                            reassigned <- true if ident_name_of(target) == name
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            reassigned <- true if es_name_is_reassigned(name, then_body) or es_name_is_reassigned(name, else_body)
+                        Stmt.While(while_condition, while_body, while_line):
+                            reassigned <- true if es_name_is_reassigned(name, while_body)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            reassigned <- true if es_name_is_reassigned(name, for_body)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            reassigned <- true if es_name_is_reassigned(name, block_body)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |reassigned, name|:
+                                reassigned <- true if es_name_is_reassigned(name, arm.body)
+                        _:
+                            pass
+                return reassigned
+
+        # `PARAM == LITERAL` (either order) where PARAM is a parameter of this function that
+        # the body never reassigns. A reassigned name is not pinned by the guard, so it is
+        # refused rather than substituted.
+        def es_guard_pinned_param(condition: Ast::Expr, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]) -> (known: bool, name: sview, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.EqEq:
+                            left_name: sview = ident_name_of(left)
+                            right_name: sview = ident_name_of(right)
+                            left_literal: (known: bool, value: i64) = es_guard_literal(left)
+                            right_literal: (known: bool, value: i64) = es_guard_literal(right)
+                            if left_name != "" and right_literal.known and (any parameter in parameters where parameter.name == left_name) and not es_name_is_reassigned(left_name, body):
+                                return (true, left_name, right_literal.value)
+                            if right_name != "" and left_literal.known and (any parameter in parameters where parameter.name == right_name) and not es_name_is_reassigned(right_name, body):
+                                return (true, right_name, left_literal.value)
+                    _:
+                        pass
+                return (false, sview("", 0, 0), 0)
+
+        # Is `predicate` DEFINITELY false with PARAM pinned to `value`? `and`/`or` are walked
+        # so a compound `requires a >= 0 and a <= 10` still decides. Anything that does not
+        # fold answers "not false" -- this is a reachability veto, so only certainty counts.
+        def es_guard_predicate_false(predicate: Ast::Expr, name: sview, value: i64) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return es_guard_predicate_false(inner, name, value)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            return es_guard_predicate_false(left, name, value) or es_guard_predicate_false(right, name, value)
+                        if operator == TokenKind.Or:
+                            return es_guard_predicate_false(left, name, value) and es_guard_predicate_false(right, name, value)
+                        left_found: mutable bool = false
+                        right_found: mutable bool = false
+                        left_value: i64 = es_guard_fold(left, name, value, left, false, left_found, 0)
+                        right_value: i64 = es_guard_fold(right, name, value, right, false, right_found, 0)
+                        false return if not (left_found and right_found)
+                        return not (left_value == right_value) if operator == TokenKind.EqEq
+                        return not (left_value != right_value) if operator == TokenKind.BangEq
+                        return not (left_value < right_value) if operator == TokenKind.Lt
+                        return not (left_value > right_value) if operator == TokenKind.Gt
+                        return not (left_value <= right_value) if operator == TokenKind.LtEq
+                        return not (left_value >= right_value) if operator == TokenKind.GtEq
+                        return false
+                    _:
+                        return false
+
+        # Is the pinned path REACHABLE at all? A guard that contradicts a `requires` clause,
+        # a parameter `where` refinement, or the parameter's own unsigned domain is DEAD
+        # code: stage0 discharges the obligation vacuously and says nothing, so firing there
+        # would be a pure over-report. Measured, both ways -- `requires n > 0` over
+        # `if n == 0: return 2` is CLEAN in stage0, while `requires n >= 0` reports.
+        def es_guard_path_feasible(name: sview, value: i64, requires_predicates: darray[Ast::Expr]&, parameters: darray[Ast::ParamDecl]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                feasible: mutable bool = true
+                for predicate in requires_predicates |feasible, name, value|:
+                    feasible <- false if es_guard_predicate_false(predicate, name, value)
+                for parameter in parameters |feasible, name, value|:
+                    base_type: mutable Ast::Expr = parameter.type_expression
+                    match parameter.type_expression:
+                        Expr.Refinement(refined_base, refined_predicate, refinement_line):
+                            base_type <- refined_base
+                            feasible <- false if es_guard_predicate_false(refined_predicate, name, value)
+                        _:
+                            pass
+                    feasible <- false if parameter.name == name and value < 0 and ensure_unsigned_type_name(bare_type_name(base_type))
+                return feasible
+
+        # `L op R` evaluates to FALSE with PARAM pinned to `value` and `result` bound to
+        # `returned`. A goal that does not fold on both sides is NOT refuted.
+        def es_goal_refuted_under(goal: Ast::Expr, name: sview, value: i64, returned: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_found: mutable bool = false
+                        right_found: mutable bool = false
+                        left_value: i64 = es_guard_fold(left, name, value, returned, true, left_found, 0)
+                        right_value: i64 = es_guard_fold(right, name, value, returned, true, right_found, 0)
+                        false return if not (left_found and right_found)
+                        return not (left_value == right_value) if operator == TokenKind.EqEq
+                        return not (left_value != right_value) if operator == TokenKind.BangEq
+                        return not (left_value < right_value) if operator == TokenKind.Lt
+                        return not (left_value > right_value) if operator == TokenKind.Gt
+                        return not (left_value <= right_value) if operator == TokenKind.LtEq
+                        return not (left_value >= right_value) if operator == TokenKind.GtEq
+                        return false
+                    _:
+                        return false
+
+        # Every top-level `if PARAM == K:` whose single `return E` REFUTES `goal`, by the
+        # line of that RETURN -- where stage0 anchors a per-path verdict, not at the
+        # `ensure` clause. ONE PER GUARD, which is stage0's own arity: two refuting guards
+        # in one function draw two diagnostics there, measured. An `else:` arm is fine --
+        # the then-path is taken exactly when the guard holds, whatever the other arm does,
+        # so it is judged on its own.
+        def es_guarded_return_lines(kind: sview, goal: Ast::Expr, body: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl]&, requires_predicates: darray[Ast::Expr]&) -> darray[u32]:
+            can Memory.Allocate, Abort.Panic:
+                lines: mutable darray[u32] = []
+                return lines if kind != "ensure"
+                for statement in body |lines, goal, parameters, body, requires_predicates|:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            if then_body.count == 1:
+                                pin: (known: bool, name: sview, value: i64) = es_guard_pinned_param(condition, parameters, body)
+                                if pin.known and es_guard_path_feasible(pin.name, pin.value, requires_predicates, parameters):
+                                    match then_body[0]:
+                                        Stmt.Return(return_value, return_line):
+                                            if return_value is returned:
+                                                lines.push(return_line.line) if es_goal_refuted_under(goal, pin.name, pin.value, returned)
+                                        _:
+                                            pass
+                        _:
+                            pass
+                return lines
