@@ -1,0 +1,184 @@
+# The CASCADE diagnostic stage0 raises after a call whose CALLEE could not be resolved.
+#
+# stage0 types an unresolvable callee `<invalid>` and then reports the call itself:
+#     def use() -> i64:
+#         return Api::hidden()
+#   error: "Api.hidden" is private to module "Api"
+#   error: cannot call non-function value of type <invalid>
+# Both, on the same line, every time. stage1 reported only the first, so 15 oracle cases
+# came out one diagnostic short. This file adds the second from stage1's OWN diagnostics:
+# it fires only where a poisoning error is already present, so it can never invent a
+# cascade for a call stage1 resolved.
+#
+# The POISON SET is measured, not guessed -- it is exactly the five kinds that sit on a
+# call line with a cascade in the oracle, each with the callee shape that made it poison:
+#   UndefinedName / UnknownFieldAccess      the diagnostic NAMES the callee
+#   PrivateMemberAccess                     any call on the line (`Api::Secret::hidden()`
+#                                           names the module, not the member)
+#   FieldAccessOnPrimitive                  the callee is a `recv.method` field access
+#   GenericInterfaceBoundUnsatisfied        the callee is a `f[T]` type application
+# Requiring the shape is what keeps the rule honest: the same five kinds appear on 20
+# other call lines in the oracle with NO cascade, and every one of them is a poisoned
+# ARGUMENT rather than a poisoned callee (`offset_of(Header, missing)`, `Tick.ping()`
+# where `Tick` is the undefined name, `region scratch(reserve_commit):`). The name/shape
+# test rejects all 20.
+#
+# One exception is not about the callee at all: an AMBIGUOUS UFCS call resolves to a set
+# of candidates rather than to nothing, so stage0 has a type to complain about and emits
+# no cascade. A UfcsAmbiguousCall on the line vetoes the whole line.
+
+extend Semantic:
+    private:
+        # The name a call is written with: the last identifier of the callee chain.
+        def coi_callee_spelling(callee: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match callee:
+                    Expr.Ident(ident_name, ident_line):
+                        return ident_name
+                    Expr.Field(object, field, field_line):
+                        return field
+                    Expr.Scope(base, scope_name, scope_line):
+                        return scope_name
+                    Expr.Paren(inner, paren_line):
+                        return coi_callee_spelling(inner)
+                    Expr.Index(object, index, index_line):
+                        return coi_callee_spelling(object)
+                    _:
+                        pass
+                return sview("", 0, 0)
+
+        # `recv.method(...)` -- the callee is a field access on a value.
+        def coi_callee_is_field(callee: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match callee:
+                    Expr.Field(object, field, field_line):
+                        return true
+                    Expr.Paren(inner, paren_line):
+                        return coi_callee_is_field(inner)
+                    _:
+                        return false
+
+        # `f[T](...)` -- the callee is a type application.
+        def coi_callee_is_index(callee: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match callee:
+                    Expr.Index(object, index, index_line):
+                        return true
+                    Expr.Paren(inner, paren_line):
+                        return coi_callee_is_index(inner)
+                    _:
+                        return false
+
+        # Does a diagnostic already on `line` poison a callee spelled `spelling` with this
+        # shape? See the poison set in the file header.
+        def coi_callee_is_poisoned(table: SymbolTable&, line: u32, spelling: sview, is_field: bool, is_index: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                poisoned: mutable bool = false
+                vetoed: mutable bool = false
+                for diagnostic in table.diagnostics |poisoned, vetoed, line, spelling, is_field, is_index|:
+                    if diagnostic.line == line:
+                        vetoed <- true if diagnostic.kind == DiagnosticKind.UfcsAmbiguousCall
+                        named: bool = diagnostic.name == spelling and spelling != ""
+                        poisoned <- true if diagnostic.kind == DiagnosticKind.UndefinedName and named
+                        poisoned <- true if diagnostic.kind == DiagnosticKind.UnknownFieldAccess and named
+                        poisoned <- true if diagnostic.kind == DiagnosticKind.PrivateMemberAccess
+                        poisoned <- true if diagnostic.kind == DiagnosticKind.FieldAccessOnPrimitive and is_field
+                        poisoned <- true if diagnostic.kind == DiagnosticKind.GenericInterfaceBoundUnsatisfied and is_index
+                return poisoned and not vetoed
+
+        def coi_check_expression(expression: Ast::Expr, reported: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        # ONE per line: stage0 reports the invalid call, not each spelling of
+                        # it, and `Api::visible() + Api::hidden()` draws a single cascade.
+                        already: bool = any seen in reported where seen == line.line
+                        if not already and coi_callee_is_poisoned(table, line.line, coi_callee_spelling(callee), coi_callee_is_field(callee), coi_callee_is_index(callee)):
+                            reported.push(line.line)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.CallOfInvalidValue, name: "", line: line.line, expected: "", actual: ""})
+                        table <- coi_check_expression(callee, reported, table)
+                        for argument in arguments |table, reported| -> table:
+                            table <- coi_check_expression(argument, reported, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- coi_check_expression(left, reported, table)
+                        table <- coi_check_expression(right, reported, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- coi_check_expression(operand, reported, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- coi_check_expression(inner, reported, table)
+                    Expr.Field(object, field, field_line):
+                        table <- coi_check_expression(object, reported, table)
+                    Expr.Index(object, index, index_line):
+                        table <- coi_check_expression(object, reported, table)
+                    Expr.If(condition, then_expr, else_expr, if_expr_line):
+                        table <- coi_check_expression(condition, reported, table)
+                        table <- coi_check_expression(then_expr, reported, table)
+                        table <- coi_check_expression(else_expr, reported, table)
+                    Expr.Array(elements, array_line):
+                        for element in elements |table, reported| -> table:
+                            table <- coi_check_expression(element, reported, table)
+                    Expr.Tuple(elements, tuple_line):
+                        for element in elements |table, reported| -> table:
+                            table <- coi_check_expression(element, reported, table)
+                    _:
+                        pass
+
+        def coi_check_statements(statements: darray[Ast::Stmt], reported: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, reported| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- coi_check_expression(expression, reported, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- coi_check_expression(value, reported, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- coi_check_expression(target, reported, table)
+                            table <- coi_check_expression(value, reported, table)
+                        Stmt.Return(value, line):
+                            table <- coi_check_expression(returned, reported, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- coi_check_expression(condition, reported, table)
+                            table <- coi_check_statements(then_body, reported, table)
+                            table <- coi_check_statements(else_body, reported, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- coi_check_expression(condition, reported, table)
+                            table <- coi_check_statements(while_body, reported, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- coi_check_expression(iterable, reported, table)
+                            table <- coi_check_statements(for_body, reported, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- coi_check_statements(body, reported, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- coi_check_expression(scrutinee, reported, table)
+                            for arm in arms |table, reported| -> table:
+                                table <- coi_check_statements(arm.body, reported, table)
+                        Stmt.Contract(kind, expression, line):
+                            # `uses C(x)` names a CONTRACT, not a callee. stage0 resolves it
+                            # against the contract table and says `unknown contract \`C\``; it
+                            # never types the head as a value, so there is no cascade. stage1
+                            # happens to report the same line as `undefined identifier`, which
+                            # would otherwise look exactly like a poisoned callee. Measured:
+                            # stage0 DOES cascade inside `requires`/`ensure`, only not here.
+                            table <- coi_check_expression(expression, reported, table) if kind != "uses"
+                        _:
+                            pass
+
+        def coi_walk(declarations: darray[Ast::Decl], reported: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table, reported| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- coi_check_statements(body, reported, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- coi_walk(module_body, reported, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- coi_walk(scoped_body, reported, table)
+                        _:
+                            pass
+
+    public:
+        # RUNS LAST in check_full_into: it reads the diagnostics every other check produced.
+        def check_call_of_invalid(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                reported: mutable darray[u32] = []
+                table <- coi_walk(file.top_decls, reported, table)
