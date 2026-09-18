@@ -48,6 +48,10 @@ build_fixture \
     "$ROOT/test/fixtures/wasm/component_arena_reuse.wit" \
     "$ROOT/test/fixtures/wasm/component_arena_reuse.elisa" \
     arena-reuse
+build_fixture \
+    "$ROOT/test/fixtures/wasm/component_enum_export.wit" \
+    "$ROOT/test/fixtures/wasm/component_enum_export.elisa" \
+    enum-export
 
 # Keep stage0's component ABI path covered as well.  This is optional so the
 # normal stage1 smoke remains runnable from a checkout that has not built a

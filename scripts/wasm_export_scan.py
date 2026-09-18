@@ -149,7 +149,7 @@ def parse_parameter(text: str, function: str) -> dict[str, Any]:
     }
 
 
-def abi_for_type(type_text: str, function: str, position: str) -> tuple[str, str]:
+def abi_for_type(type_text: str, function: str, position: str, *, component: bool = False) -> tuple[str, str]:
     normalized = normalize_type(type_text)
     if normalized.endswith("?"):
         raise WasmBuildError(
@@ -162,13 +162,17 @@ def abi_for_type(type_text: str, function: str, position: str) -> tuple[str, str
         return "pointer", "i32"
     if normalized in SCALAR_TYPES:
         return "scalar", SCALAR_TYPES[normalized]
+    if component:
+        # Named scalar enums are represented by i32 in the core module; the
+        # supplied component WIT assigns the semantic enum shape at link time.
+        return "scalar", "i32"
     raise WasmBuildError(
         f"{function}: {position} type {type_text!r} is not directly representable in the generated "
         "WASM bindings; export a scalar or pointer adapter"
     )
 
 
-def parse_exports(source: str) -> list[dict[str, Any]]:
+def parse_exports(source: str, *, component: bool = False) -> list[dict[str, Any]]:
     exports: list[dict[str, Any]] = []
     seen: set[str] = set()
     pending_link_name: str | None = None
@@ -185,10 +189,10 @@ def parse_exports(source: str) -> list[dict[str, Any]]:
             return_type = normalize_type(raw_return or "void")
             parameters = [parse_parameter(item, public_name) for item in split_top_level(raw_parameters)]
             for parameter in parameters:
-                binding, wasm_type = abi_for_type(parameter["type"], public_name, f"parameter {parameter['name']}")
+                binding, wasm_type = abi_for_type(parameter["type"], public_name, f"parameter {parameter['name']}", component=component)
                 parameter["binding"] = binding
                 parameter["wasm_type"] = wasm_type
-            binding, wasm_type = abi_for_type(return_type, public_name, "return")
+            binding, wasm_type = abi_for_type(return_type, public_name, "return", component=component)
             exports.append(
                 {
                     "name": public_name,
@@ -214,10 +218,10 @@ def parse_exports(source: str) -> list[dict[str, Any]]:
                 return_type = normalize_type(raw_return or "void")
                 parameters = [parse_parameter(item, "main") for item in split_top_level(raw_parameters)]
                 for parameter in parameters:
-                    binding, wasm_type = abi_for_type(parameter["type"], "main", f"parameter {parameter['name']}")
+                    binding, wasm_type = abi_for_type(parameter["type"], "main", f"parameter {parameter['name']}", component=component)
                     parameter["binding"] = binding
                     parameter["wasm_type"] = wasm_type
-                binding, wasm_type = abi_for_type(return_type, "main", "return")
+                binding, wasm_type = abi_for_type(return_type, "main", "return", component=component)
                 exports.append(
                     {
                         "name": "main",
@@ -234,5 +238,4 @@ def parse_exports(source: str) -> list[dict[str, Any]]:
     if not exports:
         raise WasmBuildError("WASM source has no exported function; add `export fn name(...) -> T = target`")
     return exports
-
 

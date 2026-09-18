@@ -67,10 +67,10 @@ def _python_export_scanner() -> Any:
         raise WasmBuildError("Python WASM export scanner is unavailable") from error
 
 
-def parse_exports(source: str) -> list[dict[str, Any]]:
+def parse_exports(source: str, *, component: bool = False) -> list[dict[str, Any]]:
     scanner = _python_export_scanner()
     try:
-        return scanner.parse_exports(source)
+        return scanner.parse_exports(source, component=component)
     except scanner.WasmBuildError as error:
         raise WasmBuildError(str(error)) from error
 
@@ -234,7 +234,7 @@ def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[
         )
     if launcher is None and scanner_script is None:
         flat_source = read_flat_source(source)
-        return flat_source, parse_exports(flat_source)
+        return flat_source, parse_exports(flat_source, component=bool(getattr(args, "component_types", [])))
     if launcher is None or scanner_script is None:
         raise WasmBuildError(
             "--export-scan-launcher and --export-scan-script must be supplied together"
