@@ -17,8 +17,11 @@ BASELINE="$REPO_ROOT/test/fixtures/parse_error_messages.baseline"
 [[ -x "$STAGE1" ]] || { echo "parse_error_message_diff FAILED: no stage1 at $STAGE1" >&2; exit 1; }
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 (cd "$ELISA_CORE/compiler" && ELISA_PARSER_PARITY_OUT="$WORK/oracle.tsv" go test ./src/parser -count=1 >/dev/null)
-# `path:LINE:COL-COL: msg` or `path:LINE: msg` -> `LINE|msg`; warnings and notes are not errors.
-readings() { { grep -E '^[^:]*:[0-9]+(:[0-9-]+)?: ' "$1" || true; } | { grep -vE ': (warning|note): ' || true; } | sed -E 's#^[^:]*:([0-9]+)(:[0-9-]+)?: #\1|#' | sort -u; }
+# `path:LINE:COL-COL: msg`, `path:LINE:COL-ENDLINE:ENDCOL: msg` (a span that crosses lines)
+# or `path:LINE: msg` -> `LINE|msg`; warnings and notes are not errors. The cross-line span
+# has to be spelled out: a pattern that only allowed `COL-COL` silently DROPPED 7 of stage0's
+# sentences, so those cases were scored against an empty stage0 reading.
+readings() { { grep -E '^[^:]*:[0-9]+(:[0-9]+(-[0-9]+(:[0-9]+)?)?)?: ' "$1" || true; } | { grep -vE ': (warning|note): ' || true; } | sed -E 's#^[^:]*:([0-9]+)(:[0-9]+(-[0-9]+(:[0-9]+)?)?)?: #\1|#' | sort -u; }
 agree=0; total=0
 while IFS=$'\t' read -r name expected_errors notices encoded; do
     [[ "$expected_errors" -gt 0 ]] || continue
