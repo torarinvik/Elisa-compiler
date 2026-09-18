@@ -3,6 +3,12 @@
 # Expects REPO_ROOT to be set by the caller. ELISA_STAGE1_BIN and ELISA_RUNTIME_OBJ may
 # pin the local product and runtime; the caller's stage0 selector is intentionally ignored.
 
+# FAIL LOUDLY ON AN UNSET REPO_ROOT. This file is sourced by 74 gate checks, which all set
+# REPO_ROOT first; run directly it used to expand `bash "$REPO_ROOT/scripts/..."` to the
+# absolute path `/scripts/...`, and the resulting rc=127 read as "the freshness check is
+# broken" rather than "you sourced this wrong". Name the contract in the error instead.
+: "${REPO_ROOT:?build_parse_report.sh: REPO_ROOT must be set by the caller; this script is meant to be sourced from a gate, e.g. REPO_ROOT=\"$PWD\" source test/parity/build_parse_report.sh}"
+
 command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; return 2 2>/dev/null || exit 2; }
 
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"

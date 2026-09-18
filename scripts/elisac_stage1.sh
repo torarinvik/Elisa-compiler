@@ -22,6 +22,14 @@
 #   elisac_stage1.sh --emit-driver   # only build the product binary (needs seed elisac)
 set -euo pipefail
 
+# macOS upgrades can leave the selected Xcode SDK/linker in a state that
+# requires an interactive license agreement. Prefer the installed Command Line
+# Tools for headless compiler gates unless the caller explicitly selected a
+# developer directory.
+if [[ -z "${DEVELOPER_DIR:-}" && -d /Library/Developer/CommandLineTools ]]; then
+  export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+fi
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
@@ -33,6 +41,15 @@ LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
+fi
+# Prefer LLVM's archive tool on macOS. `/usr/bin/ar` is an Xcode shim and
+# refuses to run until the machine-wide Xcode license has been accepted.
+if [[ -z "${ELISA_AR:-}" ]]; then
+  if [[ -x "$LLVM_BIN_DIR/llvm-ar" ]]; then
+    export ELISA_AR="$LLVM_BIN_DIR/llvm-ar"
+  else
+    export ELISA_AR="$(command -v ar || true)"
+  fi
 fi
 # Prefer the canonical Elisa-core checkout in both a top-level compiler checkout
 # and a nested profiler worktree. The old `../stage0/.../elisac-local` default

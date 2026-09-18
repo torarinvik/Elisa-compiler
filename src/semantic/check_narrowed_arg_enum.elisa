@@ -41,22 +41,24 @@ extend Semantic:
                 return nae_is_assignable(annotations, parent, super_enum, depth + 1)
 
         # The declared bare type name of parameter `position` (0-based) of function `fn_name`,
-        # searching all top-level (and module/scoped) Decl.Func declarations, or "".
-        def nae_param_type(declarations: darray[Ast::Decl], fn_name: sview, position: usize) -> sview:
+        # or "" when the name is not a single unambiguous function.
+        #
+        # Reads the symbol table's hash-chained parameter index rather than re-walking the
+        # declaration tree: the un-narrowed check below fires on EVERY enum-typed parameter
+        # and local, so a per-call-site walk of every declaration in the file would be
+        # quadratic on a self-hosting build, where includes flatten the whole compiler into
+        # one file.
+        #
+        # OVERLOADS are refused outright. The lookup resolves by BARE NAME, and a name
+        # declared more than once concatenates its overloads' parameters into one run — so
+        # "position 1" could name a parameter of the wrong signature and report a type error
+        # that is not there. Staying silent there keeps this check from rejecting a program
+        # stage0 accepts; same-named helpers in different modules are ordinary in a
+        # flattened build.
+        def nae_param_type(table: SymbolTable&, fn_name: sview, position: usize) -> sview:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations:
-                    match declaration:
-                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            bare_type_name(parameters[position].type_expression) return if function_name == fn_name and position < parameters.count
-                        Decl.Module(module_name, module_body, module_line):
-                            nested: sview = nae_param_type(module_body, fn_name, position)
-                            nested return if nested != ""
-                        Decl.Scoped(scoped_body, scoped_line):
-                            nested_s: sview = nae_param_type(scoped_body, fn_name, position)
-                            nested_s return if nested_s != ""
-                        _:
-                            pass
-                return sview("", 0, 0)
+                "" return if direct_function_count(table, fn_name) != 1
+                return function_parameter_type_at_firm(table, fn_name, position)
 
         # In an arm narrowed to `narrowed_enum`, flag a call `f(…, scrutinee, …)` whose parameter at
         # the scrutinee's position expects an enum `T` that `narrowed_enum` is not assignable to.
@@ -64,15 +66,21 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
+                        # A NAMED argument (`f(value: e)`) breaks the positional mapping this
+                        # check depends on, so a call that uses any is left alone rather than
+                        # matched against the wrong parameter.
+                        uses_named: bool = any argument_name in argument_names where argument_name != ""
                         match callee:
                             Expr.Ident(fn_name, fn_line):
                                 for argument in arguments |table, position = 0| -> table:
                                     match argument:
                                         Expr.Ident(argument_name, argument_line):
-                                            if argument_name == scrutinee:
-                                                param_type: sview = nae_param_type(declarations, fn_name, position)
+                                            if argument_name == scrutinee and not uses_named:
+                                                param_type: sview = nae_param_type(table, fn_name, position)
                                                 if param_type != "" and is_enum_name(table, param_type) and not nae_is_assignable(annotations, narrowed_enum, param_type, 0):
-                                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NarrowedArgEnumMismatch, name: fn_name, pos: call_line, line: call_line.line, expected: param_type, actual: narrowed_enum})
+                                                    # stage0 spans the ARGUMENT, not the call: `13:34-39` for the argument
+                                                    # ident, where stage1 used to report the call head (`13:33-34`).
+                                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NarrowedArgEnumMismatch, name: fn_name, pos: argument_line, line: argument_line.line, expected: param_type, actual: narrowed_enum})
                                         _:
                                             pass
                                     position <- position + 1
@@ -113,6 +121,98 @@ extend Semantic:
                         _:
                             pass
 
+        # --- the UN-NARROWED base case -------------------------------------------------
+        # Everything above fires only inside a `match` arm that narrows the scrutinee. The
+        # same error exists with no match in sight: an identifier whose DECLARED type is an
+        # enum, handed to a parameter expecting an enum it is not assignable to.
+        #
+        #     def require_right(v: Right) -> i64: ...
+        #     def use(value: Root) -> i64: return require_right(value)   # expects Right, got Root
+        #
+        # Measured against stage0, the DECLARED type is the operative one and almost nothing
+        # narrows it: not an `if v is Right:` guard, not an assignment of a `Right` value --
+        # both still report "got Root". Only a `match` arm headed by a variant path narrows,
+        # and that arm is already reported by the walk above, so descending into it here
+        # would report the same call twice. Widening stays legal in the other direction: a
+        # `Right` argument satisfies a `Root` parameter, and a grandchild its grandparent.
+        def nae_declared_statement(statement: Ast::Stmt, name: sview, declared_enum: sview, declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, line):
+                        table <- nae_check_expression(expression, name, declared_enum, declarations, annotations, table)
+                    Stmt.Assign(target, operator, value, line):
+                        table <- nae_check_expression(value, name, declared_enum, declarations, annotations, table)
+                    Stmt.VarDecl(var_name, type_expression, value, line):
+                        table <- nae_check_expression(value, name, declared_enum, declarations, annotations, table)
+                    Stmt.Return(value, line):
+                        if value is returned:
+                            table <- nae_check_expression(returned, name, declared_enum, declarations, annotations, table)
+                    Stmt.If(condition, then_body, else_body, if_line):
+                        table <- nae_check_expression(condition, name, declared_enum, declarations, annotations, table)
+                        table <- nae_declared_from(then_body, 0, name, declared_enum, declarations, annotations, table)
+                        table <- nae_declared_from(else_body, 0, name, declared_enum, declarations, annotations, table)
+                    Stmt.While(condition, while_body, while_line):
+                        table <- nae_check_expression(condition, name, declared_enum, declarations, annotations, table)
+                        table <- nae_declared_from(while_body, 0, name, declared_enum, declarations, annotations, table)
+                    Stmt.For(bind, variables, iterable, for_body, for_line):
+                        table <- nae_declared_from(for_body, 0, name, declared_enum, declarations, annotations, table)
+                    Stmt.Block(kind, clause, binding, body, block_line):
+                        table <- nae_declared_from(body, 0, name, declared_enum, declarations, annotations, table)
+                    Stmt.Match(scrutinee_expr, arms, match_line):
+                        table <- nae_check_expression(scrutinee_expr, name, declared_enum, declarations, annotations, table)
+                        scrutinee_is_name: bool = match scrutinee_expr:
+                            Expr.Ident(scrutinee_name, scrutinee_line): scrutinee_name == name
+                            _:                                         false
+                        for arm in arms |table| -> table:
+                            arm_narrows: bool = match arm.pattern:
+                                Pattern.Variant(path, fields): scrutinee_is_name
+                                _:                             false
+                            table <- nae_declared_from(arm.body, 0, name, declared_enum, declarations, annotations, table) if not arm_narrows
+                    _:
+                        pass
+
+        # Walk `statements` from `start`, stopping at a declaration that SHADOWS `name`:
+        # past that point the identifier is a different variable with a declared type of its
+        # own, which its own seeding pass below covers.
+        def nae_declared_from(statements: darray[Ast::Stmt], start: usize, name: sview, declared_enum: sview, declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in start..<statements.count |table, shadowed = false| -> table:
+                    continue if shadowed
+                    statement: Ast::Stmt = statements[index]
+                    table <- nae_declared_statement(statement, name, declared_enum, declarations, annotations, table)
+                    match statement:
+                        Stmt.VarDecl(var_name, type_expression, value, var_line):
+                            shadowed <- true if var_name == name
+                        _:
+                            pass
+                return
+
+        # Seed the declared-type check from every enum-typed LOCAL: its scope is the rest of
+        # the block it was declared in. Parameters are seeded by the caller over the whole
+        # body.
+        def nae_declared_locals(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in 0..<statements.count |table| -> table:
+                    statement: Ast::Stmt = statements[index]
+                    match statement:
+                        Stmt.VarDecl(var_name, type_expression, value, var_line):
+                            declared: sview = bare_type_name(type_expression)
+                            table <- nae_declared_from(statements, index + 1, var_name, declared, declarations, annotations, table) if declared != "" and is_enum_name(table, declared)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- nae_declared_locals(then_body, declarations, annotations, table)
+                            table <- nae_declared_locals(else_body, declarations, annotations, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- nae_declared_locals(while_body, declarations, annotations, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- nae_declared_locals(for_body, declarations, annotations, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- nae_declared_locals(body, declarations, annotations, table)
+                        Stmt.Match(scrutinee_expr, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- nae_declared_locals(arm.body, declarations, annotations, table)
+                        _:
+                            pass
+
         def nae_walk_body(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
@@ -149,6 +249,13 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            # Three seedings, deliberately disjoint: each enum-typed
+                            # PARAMETER over the whole body, each enum-typed LOCAL over the
+                            # rest of its block, and the narrowing walk over `match` arms.
+                            for parameter in parameters |table| -> table:
+                                declared_param: sview = bare_type_name(parameter.type_expression)
+                                table <- nae_declared_from(body, 0, parameter.name, declared_param, top_declarations, annotations, table) if declared_param != "" and is_enum_name(table, declared_param)
+                            table <- nae_declared_locals(body, top_declarations, annotations, table)
                             table <- nae_walk_body(body, top_declarations, annotations, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- nae_walk_declarations(module_body, top_declarations, annotations, table)

@@ -104,37 +104,6 @@ extend Parser:
             return parser.span_view(pattern_start, pattern_end)
 
 
-        # Parse one match-arm pattern. Three layers: a top-level comma list is a tuple
-        # pattern; each element may be an or-pattern (`A | B`); each alternative is a
-        # primary (wildcard, literal, bare binding, variant, struct, or category binder).
-        # Anything exotic is captured losslessly as `Other`, and parsing always halts at
-        # the arm's block colon so the parser never regresses.
-        def parse_pattern(parser: lmut Parser) -> Ast::Pattern:
-            rebind first: Ast::Pattern, parser = parser.parse_pattern_or()
-            first return if parser.peek() != TokenKind.Comma
-                
-            elements: mutable darray[Ast::Pattern] = [first]
-            machine over parser.position while true:
-                state More
-                state Element
-                start More
-
-                More, _ if parser.peek() != TokenKind.Comma:
-                    break
-
-                More, _:
-                    parser.position <- parser.position + 1
-                    -> Element
-
-                Element, _ if parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline:
-                    break
-
-                Element, _:
-                    elements.push(parser.parse_pattern_or())
-                    -> More
-            return (Ast::Pattern.Tuple(elements))
-
-
         # An or-pattern `A | B | …` / `A or B or …` (or just a single primary). The lexer
         # already distinguishes boolean `or`; inside a pattern it is an alternative token.
         # Previously the parser stopped after A and silently ignored the remaining alternatives,
@@ -153,6 +122,161 @@ extend Parser:
                     options.push(parser.parse_pattern_primary())
                     -> More
             return (Ast::Pattern.Or(options))
+
+
+        # stage0 parity (parseMatchPatternNoPipe + parseTopLevelMatchArmAlternatives): at the
+        # TOP level of an arm header the two spellings are NOT synonyms.
+        #
+        #   A(x) | B(y):      `|` separates SIBLING ARMS. The parser fans the header out into
+        #                     one arm per alternative, each with its own copy of the shared
+        #                     body, so the alternatives never have to agree on binder names.
+        #   A(x) or B(y):     `or` builds ONE Pattern.Or arm. stage0 then REFUSES it whenever
+        #                     an alternative binds a name, because it cannot merge alias and
+        #                     borrow facts across the alternatives
+        #                     (check_or_pattern_bindings: TopLevelOrPatternBindsNames).
+        #
+        # Nested payload patterns still read BOTH spellings as one or-group — that is what
+        # stage0's parseNestedOrMatchPattern does — so parse_pattern_or above is unchanged and
+        # keeps serving every nested site.
+        #
+        # Reading `|` as an arm-level Pattern.Or (what stage1 did before) conflated the two in
+        # both directions: a stage0-legal `A(x) | B(y):` arm looked like the unsupported `or`
+        # form, and an `A(x) or B(y):` arm that stage0 refuses was silently accepted.
+        def parse_pattern_no_pipe(parser: lmut Parser) -> Ast::Pattern:
+            rebind first: Ast::Pattern, parser = parser.parse_pattern_or_word()
+            first return if parser.peek() != TokenKind.Comma
+
+            elements: mutable darray[Ast::Pattern] = [first]
+            machine over parser.position while true:
+                state More
+                state Element
+                start More
+
+                More, _ if parser.peek() != TokenKind.Comma:
+                    break
+
+                More, _:
+                    parser.position <- parser.position + 1
+                    -> Element
+
+                Element, _ if parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline:
+                    break
+
+                Element, _:
+                    elements.push(parser.parse_pattern_or_word())
+                    -> More
+            return (Ast::Pattern.Tuple(elements))
+
+
+        # One arm-level alternative: a primary, optionally joined to further primaries by the
+        # WORD `or`. A `|` is left for parse_top_level_patterns to fan out.
+        def parse_pattern_or_word(parser: lmut Parser) -> Ast::Pattern:
+            rebind first: Ast::Pattern, parser = parser.parse_pattern_primary()
+            first return if parser.peek() != TokenKind.Or
+
+            options: mutable darray[Ast::Pattern] = [first]
+            machine over parser.position while parser.peek() == TokenKind.Or:
+                state More
+                start More
+
+                More, _:
+                    parser.position <- parser.position + 1
+                    options.push(parser.parse_pattern_primary())
+                    -> More
+            return (Ast::Pattern.Or(options))
+
+
+        # `PATTERN (| PATTERN)*` — every top-level alternative of one arm header, appended to
+        # a caller-owned buffer. A separating `|` may sit on a continuation line, so a layout
+        # Newline in front of it is skipped (the rule parse_with_arm already follows).
+        def parse_top_level_patterns(parser: lmut Parser, out: mutable darray[Ast::Pattern]&) -> void:
+            rebind first: Ast::Pattern, parser = parser.parse_pattern_no_pipe()
+            out.push(first)
+            machine over parser.position while parser.next_nonnewline_is_pipe():
+                state More
+                start More
+
+                More, _:
+                    parser <- parser.skip_newlines()
+                    parser.position <- parser.position + 1                       # `|`
+                    rebind alternative: Ast::Pattern, parser = parser.parse_pattern_no_pipe()
+                    out.push(alternative)
+                    -> More
+            return
+
+
+        # Push one fanned-out sibling arm. Every alternative gets its OWN copy of the shared
+        # body: arms are rewritten independently downstream, so they must not alias one buffer.
+        def append_arm_alternative(alternative: Ast::Pattern, body: darray[Ast::Stmt], guard: Ast::Expr, arm_head: Token, arms_buffer: mutable darray[Ast::MatchArm]&) -> void:
+            copied: mutable darray[Ast::Stmt] = []
+            copied.extend(body)
+            arms_buffer.push(Ast::MatchArm{pattern: alternative, body: copied, guard: guard, pos: Ast::pos_of_token(arm_head)})
+
+
+        # Whether `pattern` introduces ANY binding name. A deliberate structural mirror of
+        # the semantic layer's collect_pattern_binding_names: the arm-level or-pattern rule
+        # is purely syntactic, so deciding it here — where the arm head token is still in
+        # hand — cannot disagree with the analyzer on a real program.
+        def pattern_binds_any_name(pattern: Ast::Pattern) -> bool:
+            can Abort.Panic:
+                match pattern:
+                    Ast::Pattern.Binding(binding_name):
+                        return binding_name != "" and binding_name != "_"
+                    Ast::Pattern.TypeBind(bound_type_name, binder_name):
+                        return binder_name != "" and binder_name != "_"
+                    Ast::Pattern.As(as_name, as_inner):
+                        true return if as_name != "" and as_name != "_"
+                        for as_inner_pattern in as_inner:
+                            true return if pattern_binds_any_name(as_inner_pattern)
+                        return false
+                    Ast::Pattern.Variant(variant_path, variant_fields):
+                        for variant_field in variant_fields:
+                            true return if pattern_binds_any_name(variant_field)
+                        return false
+                    Ast::Pattern.Struct(struct_path, struct_fields):
+                        for struct_field in struct_fields:
+                            true return if pattern_binds_any_name(struct_field)
+                        return false
+                    Ast::Pattern.Field(field_selector, field_inner):
+                        for field_inner_pattern in field_inner:
+                            true return if pattern_binds_any_name(field_inner_pattern)
+                        return false
+                    Ast::Pattern.Tuple(tuple_elements):
+                        for tuple_element in tuple_elements:
+                            true return if pattern_binds_any_name(tuple_element)
+                        return false
+                    Ast::Pattern.Or(nested_options):
+                        for nested_option in nested_options:
+                            true return if pattern_binds_any_name(nested_option)
+                        return false
+                    _:
+                        return false
+                return false
+
+
+        # Record the arm HEAD span when this arm's top-level pattern is an `or` that binds a
+        # name — the span stage0 reports for "top-level or-pattern alternatives that bind
+        # names are not supported". Only the WORD `or` builds a `Pattern.Or` at arm level
+        # (`|` fans out into sibling arms in parse_top_level_patterns), so a legal
+        # `A(x) | B(y):` arm is never recorded.
+        #
+        # The span lives in scalar File columns rather than in `MatchArm.pos` because that
+        # field does not survive into the semantic layer for a match STATEMENT, only for a
+        # match EXPRESSION; reporting from here is position-exact for both.
+        def note_or_arm_binding(parser: lmut Parser, alternative: Ast::Pattern, arm_head: Token) -> void:
+            can Memory.Allocate, Abort.Panic:
+                binds: mutable bool = false
+                match alternative:
+                    Ast::Pattern.Or(recorded_options):
+                        for recorded_option in recorded_options |binds|:
+                            binds <- true if pattern_binds_any_name(recorded_option)
+                    _:
+                        pass
+                return if not binds
+                parser.or_arm_binding_lines <- parser.or_arm_binding_lines.push(arm_head.line)
+                parser.or_arm_binding_columns <- parser.or_arm_binding_columns.push(arm_head.column)
+                parser.or_arm_binding_end_columns <- parser.or_arm_binding_end_columns.push(arm_head.column + arm_head.length)
+                return
 
 
         # Capture a range's upper literal, preserving a unary minus as part of the
@@ -501,6 +625,34 @@ extend Parser:
             parser, _ <- parser.expect(TokenKind.Ident) if accepted_as_2
             rebind arms_buffer: darray[Ast::MatchArm], parser = parser.parse_catch_arm_block(catch_token)
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__catch_match", name: "__catch_match", line: catch_token.line})
+            # The two catch RULES (`non-exhaustive catch over F; missing F.V` and `catch arm
+            # "X" does not match F`) read the parser's side tables, and only the EXPRESSION
+            # form was recording them. A statement `catch` therefore went entirely unchecked:
+            # stage0 rejects `catch f(x): value: ... Problem.First: ...` when `Problem.Second`
+            # is unhandled, and stage1 compiled it silently -- an error case the author never
+            # wrote a branch for, accepted. Record the same rows here.
+            #
+            # Arm 0 is the SUCCESS arm and is skipped, exactly as the expression form does:
+            # it binds the call's value, not an error variant, so counting it would both
+            # satisfy exhaustiveness by accident and read its binder as a variant name.
+            catch_callee: sview = parser.catch_callee_name(scrutinee)
+            if catch_callee != "":
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: catch_callee, name: "__catch_expr", line: catch_token.line})
+                # Keep the match on the arm's packed pattern in place; passing a MatchArm
+                # through a helper copies its payload-bearing pattern handle.
+                while catch_arm_index < arms_buffer.count |catch_arm_index: usize = 1, parser, catch_callee, catch_token|:
+                    match arms_buffer[catch_arm_index].pattern:
+                        Ast::Pattern.Binding(binder_name):
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: catch_callee, name: binder_name, line: catch_token.line})
+                        Ast::Pattern.Variant(variant_path, variant_fields):
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: catch_callee, name: variant_path, line: catch_token.line})
+                        Ast::Pattern.Wildcard:
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: catch_callee, name: "__catch_all", line: catch_token.line})
+                        Ast::Pattern.TypeBind(bind_type_name, bind_binder):
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: catch_callee, name: "__catch_all", line: catch_token.line}) if bind_type_name == "error"
+                        _:
+                            pass
+                    catch_arm_index <- catch_arm_index + 1
             # stage0 reads a `catch` arm as a MATCH EXPRESSION arm, so each one must end with
             # an expression: an arm whose last statement ASSIGNS is rejected there ("match
             # expression arm must end with an expression") while stage1 accepted it. Recorded
@@ -531,13 +683,40 @@ extend Parser:
 
 
         # Parse the `: NEWLINE INDENT (PATTERN: <block>)* DEDENT` arm block shared by
-        # `match` and `catch`. Each arm's pattern is decomposed via parse_pattern (exotic
+        # `match` and `catch`. Each arm header is decomposed via parse_top_level_patterns (exotic
         # forms captured losslessly), and parsing always halts at the arm's block colon so
         # a malformed head never spins the loop.
         def parse_arm_block(parser: lmut Parser) -> darray[Ast::MatchArm]:
             arms_buffer: mutable darray[Ast::MatchArm] = []
             parser <- parser.parse_arm_block_into(arms_buffer)
+            parser <- parser.note_wildcard_arms(arms_buffer)
             return arms_buffer
+
+
+        # Record the span of every non-final `_` arm head. stage0 rejects a `_`-headed arm
+        # anywhere but LAST, guarded or not, and reports it at the ARM HEAD (`7:9-10`) for
+        # the statement and the expression form alike. Recorded HERE rather than in the
+        # semantic walk because a match STATEMENT's arms reach that walk with
+        # `MatchArm.pos` zeroed (a match EXPRESSION's do not) -- the same asymmetry the
+        # or-pattern columns above work around. `arms` is still the parser's own buffer at
+        # this point, so its arm positions are intact.
+        #
+        # Called from parse_arm_block, the `match` wrapper only: `catch` blocks reach
+        # parse_arm_block_into directly, and stage0 applies this rule to `match`, not to
+        # `catch`.
+        def note_wildcard_arms(parser: lmut Parser, arms: darray[Ast::MatchArm]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                wildcard_index: mutable usize = 0
+                for wildcard_arm in arms |parser, wildcard_index|:
+                    arm_is_wildcard: bool = match wildcard_arm.pattern:
+                        Ast::Pattern.Wildcard: true
+                        _: false
+                    if arm_is_wildcard and wildcard_index + 1 < arms.count:
+                        parser.wildcard_arm_lines <- parser.wildcard_arm_lines.push(wildcard_arm.pos.line)
+                        parser.wildcard_arm_columns <- parser.wildcard_arm_columns.push(wildcard_arm.pos.column)
+                        parser.wildcard_arm_end_columns <- parser.wildcard_arm_end_columns.push(wildcard_arm.pos.end_column)
+                    wildcard_index <- wildcard_index + 1
+                return
 
 
         # Populate a caller-owned arm buffer so packed patterns are never shallow-copied
@@ -564,16 +743,13 @@ extend Parser:
                     arms_buffer.extend([arm for arm in with_arms])
                     continue
 
-                rebind __d_220: Ast::Pattern, parser = parser.parse_pattern()
-                pattern: mutable Ast::Pattern = __d_220
-
-                # A comma-separated pattern list is a tuple arm (`A, B, C:` — one
-                # pattern per scrutinee of a multi-scrutinee match).
-                if parser.peek() == TokenKind.Comma:
-                    pattern_elements: mutable darray[Ast::Pattern] = [pattern]
-                    while parser.accept(TokenKind.Comma) |parser|:
-                        pattern_elements.push(parser.parse_pattern())
-                    pattern <- (Ast::Pattern.Tuple(pattern_elements))
+                # `A | B:` fans out into one sibling arm per alternative, the way stage0's
+                # parseTopLevelMatchArmAlternatives does; only the word `or` stays a single
+                # Pattern.Or arm. A comma-separated pattern list is still a tuple arm
+                # (`A, B, C:` — one pattern per scrutinee of a multi-scrutinee match), which
+                # parse_pattern_no_pipe folds in per alternative.
+                alternatives: mutable darray[Ast::Pattern] = []
+                parser <- parser.parse_top_level_patterns(alternatives)
 
                 # docs/122 §5.1 arm-header guard: `Pattern if cond:` — the guard
                 # expression ends at the arm's block colon; pattern bindings are in
@@ -592,8 +768,14 @@ extend Parser:
                     parser, _ <- parser.advance()                   # malformed arm; don't spin
                     continue
 
+                # Recorded only once the arm head is known well-formed (the malformed-arm
+                # guard above `continue`s before here), so a dropped arm is never reported.
+                for recorded_alternative in alternatives |parser|:
+                    parser <- parser.note_or_arm_binding(recorded_alternative, arm_head)
+
                 rebind body: darray[Ast::Stmt], parser = parser.parse_block()
-                arms_buffer.push(Ast::MatchArm{pattern: pattern, body: body, guard: guard, pos: Ast::pos_of_token(arm_head)})
+                for alternative in alternatives:
+                    append_arm_alternative(alternative, body, guard, arm_head, arms_buffer)
 
             parser, _ <- parser.expect(TokenKind.Dedent)
             return
