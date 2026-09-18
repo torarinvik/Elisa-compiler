@@ -62,6 +62,10 @@ REGRESSIONS = [
     # `not` chains instantly. Fixed by deleting the redundant second walk. 100 is comfortably
     # past the point that used to hang (n=30) while keeping this regression's own runtime short.
     ("deep_not_chain", "def main() -> i64:\n    b: bool = " + "not " * 100 + "true\n    return 0 if b else 1\n"),
+    # A mutator changed the valid `recover(count: mutable i64&)` parameter to
+    # `recover(count: mutable&)`. Stage0 rejects the missing pointee type; stage1 must
+    # reject the same cast-marker placeholder before backend type lowering can trap.
+    ("malformed_mutable_ref_annotation", open(os.path.join(ROOT, "test/repro/try_void_recovery_paths.elisa")).read().replace("def recover(count: mutable i64&)", "def recover(count: mutable&)")),
 ]
 
 OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")), "opt")
