@@ -34,11 +34,17 @@ out=$(printf 'def identity(value: i64) -> i64:\n    return value\ndef ok(values:
 grep -Fq 'reduce_sum callback must return a numeric accumulator' <<< "$out" && fail "numeric reduce_sum callback rejected: $out"
 
 # 6. 0 FP across frontend + stdlib.
+# Counted per line, not per sentence: the reporter analyses one file at a time, so every
+# cross-module name is undefined and poisons its operand -- stage0 emits the same follow-on
+# sentence on the same line. Only a sentence that is the ONLY diagnostic on its line lacks a
+# poisoning diagnostic to explain it, and that is what a real false positive looks like.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "must be bool|requires bool operands|requires numeric operands" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | awk '
+    /^  L[0-9]+ / { n[$1]++; if ($0 ~ /must be bool|requires bool operands|requires numeric operands/) hit[$1] = 1 }
+    END { c = 0; for (l in hit) if (n[l] == 1) c++; print c + 0 }')
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
-[ "$t" -eq 0 ] || fail "$t type-check false positives across frontend+stdlib"
+[ "$t" -eq 0 ] || fail "$t standalone type-check false positives across frontend+stdlib"
 
 echo "call-return smoke OK: direct call typed by return type, feeds condition/operand checks, overload-ambiguous silent, 0 FP across frontend+stdlib"
