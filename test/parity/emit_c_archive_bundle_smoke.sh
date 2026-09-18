@@ -37,9 +37,16 @@ check_bundle() {
         cmp -s "$WORK/s0/lib.$ext" "$WORK/s1/lib.$ext" || {
             bad=1; echo "DIFF $label lib.$ext:"; diff "$WORK/s0/lib.$ext" "$WORK/s1/lib.$ext" | head -6; }
     done
+    # `__.SYMDEF` is the archive INDEX, not a member the consumer links, and its NAME is
+    # chosen by whichever archiver ran: /usr/bin/ar writes `__.SYMDEF SORTED`, llvm-ar writes
+    # `__.SYMDEF` in every --format it accepts. scripts/elisac_stage1.sh deliberately selects
+    # llvm-ar (the /usr/bin/ar shim refuses until the machine-wide Xcode license is accepted),
+    # so the two sides can never agree on that entry and no compiler change could make them.
+    # Drop it and keep comparing the object members strictly -- that is the property this
+    # check was added for, after `<base>.elisacore_module.o` silently renamed one.
     local m0 m1
-    m0="$(ar t "$WORK/s0/lib.a" | tr '\n' ' ')"
-    m1="$(ar t "$WORK/s1/lib.a" | tr '\n' ' ')"
+    m0="$(ar t "$WORK/s0/lib.a" | grep -v '^__\.SYMDEF' | tr '\n' ' ')"
+    m1="$(ar t "$WORK/s1/lib.a" | grep -v '^__\.SYMDEF' | tr '\n' ' ')"
     [[ "$m0" == "$m1" ]] || { bad=1; echo "DIFF $label members: [$m0] vs [$m1]"; }
     if [[ "$bad" == 0 ]]; then same=$((same + 1)); else differ=$((differ + 1)); fi
 }

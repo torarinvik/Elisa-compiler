@@ -310,7 +310,9 @@ class ExportScannerSelectionTests(unittest.TestCase):
         ):
             self.assertEqual(load_export_scan(source_path, SimpleNamespace()), (flattened, exports))
         read_source.assert_called_once_with(source_path)
-        parse_source.assert_called_once_with(flattened)
+        # `component=` arrived with enum exports in component mode (ee50240f); the default
+        # path passes it explicitly, so the bare-argument expectation no longer matches.
+        parse_source.assert_called_once_with(flattened, component=False)
 
     def test_opt_in_uses_elisascript_without_loading_python_scanner(self) -> None:
         source_path = Path("/tmp/input.elisa")
