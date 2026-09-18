@@ -101,7 +101,12 @@ extend Backend:
         # The type of an UNANNOTATED `const NAME = VALUE`, taken from the initializer the way
         # stage0 does. Only literal initializers infer; anything else stays Unmodeled and
         # declines rather than being guessed at.
-        def infer_const_type(const_value: Expr) -> ValueType can[Abort.Panic]:
+        def infer_const_type(const_value: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            # `const N = "abcd".len` / `const N = GREETING.len`: a compile-time string's length is
+            # an `i64` in stage0 (constStringLenField), so the const is one too.
+            if const_value is Expr.Field(inferred_len_receiver, inferred_len_member, inferred_len_line):
+                if inferred_len_member == "len" and const_eval_string_len(inferred_len_receiver, structs) >= 0:
+                    return ValueType{kind: TypeKind.Signed, bits: 64}
             if const_value is Expr.IntLit(inferred_int_literal, _):
                 # stage0's default integer type is `int` -- signed 64-bit.
                 return ValueType{kind: TypeKind.Signed, bits: 64}
@@ -114,8 +119,101 @@ extend Backend:
                 # literal type, matching the ordinary `const NAME = "..."` source spelling.
                 return ValueType{kind: TypeKind.CStr, bits: 0}
             if const_value is Expr.Paren(inferred_inner, inferred_paren_line):
-                return infer_const_type(inferred_inner)
+                return infer_const_type(inferred_inner, structs)
             return ValueType{kind: TypeKind.Unmodeled, bits: 0}
+
+
+
+        # The expression under any parentheses.
+        def paren_stripped_expression(expression: Expr) -> Expr can[Abort.Panic]:
+            if expression is Expr.Paren(stripped_inner, stripped_line):
+                return paren_stripped_expression(stripped_inner)
+            return expression
+
+
+
+        # `.len` of a COMPILE-TIME `u8&` string, folded to its decoded byte length; -1 when the
+        # receiver is not one. stage0 accepts `.len` on a `u8&` only when the receiver
+        # const-evaluates to a string (constStringLenField) -- a literal, a const stage0 types as
+        # `u8&` (unannotated, or annotated `u8&`), or a constant choice between them -- and folds it
+        # over every byte, an embedded NUL included. An annotated `const NAME: cstr` is a C string:
+        # its `.len` in a function is a runtime ctx_strlen and is never folded here. A local
+        # shadowing the const is the caller's to rule out, since only it has the scope.
+        def const_string_len(receiver: Expr, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                stripped: Expr = paren_stripped_expression(receiver)
+                if stripped is Expr.StringLit(len_literal_text, _):
+                    return decoded_literal_length(len_literal_text)
+                if stripped is Expr.Ident(len_const_name, len_const_line):
+                    len_const_index: i64 = const_index_of(structs, len_const_name)
+                    -1 return if len_const_index < 0
+                    -1 return if len_const_index.usize() >= structs.const_literal_typed.count
+                    -1 return if not structs.const_literal_typed[len_const_index.usize()]
+                    return decoded_literal_length(structs.const_cstr_text[len_const_index.usize()])
+                if stripped is Expr.If(len_condition, len_then, len_else, len_if_line):
+                    len_condition_ok: mutable bool = true
+                    len_condition_value: i64 = fold_const_expr(len_condition, structs, len_condition_ok)
+                    -1 return if not len_condition_ok
+                    return const_string_len(len_then if len_condition_value != 0 else len_else, structs)
+                return -1
+
+
+
+        # Whether a constant fold over `expression` would read a name that is a LOCAL binding here
+        # (parameter, local, loop or pattern variable). The const table knows nothing of function
+        # scopes, so folding such an expression reads the GLOBAL const the local shadows:
+        # `def f(A: u8&): return (A if true else "zz").len` folded the global A's length, whatever A
+        # held. A form the folds never read counts as naming one -- refusing only costs a fold.
+        def expression_reads_local_binding(expression: Expr, local_scope: mutable Scope&) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                if expression is Expr.Ident(local_read_name, local_read_line):
+                    return lookup_index(local_scope, local_read_name) >= 0
+                if expression is Expr.Paren(local_read_inner, local_read_paren_line):
+                    return expression_reads_local_binding(local_read_inner, local_scope)
+                if expression is Expr.If(local_read_condition, local_read_then, local_read_else, local_read_if_line):
+                    return expression_reads_local_binding(local_read_condition, local_scope) or expression_reads_local_binding(local_read_then, local_scope) or expression_reads_local_binding(local_read_else, local_scope)
+                if expression is Expr.Binary(local_read_left, local_read_operator, local_read_right, local_read_binary_line):
+                    return expression_reads_local_binding(local_read_left, local_scope) or expression_reads_local_binding(local_read_right, local_scope)
+                if expression is Expr.Unary(local_read_unary_operator, local_read_operand, local_read_unary_line):
+                    return expression_reads_local_binding(local_read_operand, local_scope)
+                if expression is Expr.Field(local_read_object, local_read_field, local_read_field_line):
+                    return expression_reads_local_binding(local_read_object, local_scope)
+                false return if expression is Expr.StringLit(local_read_string, _)
+                false return if expression is Expr.IntLit(local_read_int, _)
+                false return if expression is Expr.BoolLit(local_read_bool, _)
+                false return if expression is Expr.Scope(local_read_scope_base, local_read_scope_name, local_read_scope_line)
+                return true
+
+
+
+        # `.len` of a compile-time string as the CONSTANT EVALUATOR reads it -- in a const
+        # initializer, an array extent or a `static if` -- which follows the receiver's type the
+        # way the running program does: a cstr's `.len` is strlen and stops at the first NUL, a
+        # `u8&` string or an sview counts every byte. stage0 folded a cstr const as its byte count
+        # too, until that contradicted the ctx_strlen of the same const at runtime
+        # (`const G: cstr = "ab\0cd"`: 2 at runtime, 5 folded). -1 when the receiver is not one.
+        def const_eval_string_len(receiver: Expr, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                stripped: Expr = paren_stripped_expression(receiver)
+                if stripped is Expr.StringLit(eval_len_literal_text, _):
+                    return decoded_literal_length(eval_len_literal_text)
+                if stripped is Expr.Ident(eval_len_const_name, eval_len_const_line):
+                    eval_len_const_index: i64 = const_index_of(structs, eval_len_const_name)
+                    -1 return if eval_len_const_index < 0
+                    -1 return if eval_len_const_index.usize() >= structs.const_text_is_literal.count
+                    -1 return if not structs.const_text_is_literal[eval_len_const_index.usize()]
+                    eval_len_text: sview = structs.const_cstr_text[eval_len_const_index.usize()]
+                    return decoded_literal_length(eval_len_text) if structs.const_literal_typed[eval_len_const_index.usize()]
+                    eval_len_kind: TypeKind = structs.const_types[eval_len_const_index.usize()].kind
+                    return decoded_literal_length(eval_len_text) if eval_len_kind == TypeKind.SView
+                    return decoded_literal_strlen(eval_len_text) if eval_len_kind == TypeKind.CStr
+                    return -1
+                if stripped is Expr.If(eval_len_condition, eval_len_then, eval_len_else, eval_len_if_line):
+                    eval_len_condition_ok: mutable bool = true
+                    eval_len_condition_value: i64 = fold_const_expr(eval_len_condition, structs, eval_len_condition_ok)
+                    -1 return if not eval_len_condition_ok
+                    return const_eval_string_len(eval_len_then if eval_len_condition_value != 0 else eval_len_else, structs)
+                return -1
 
 
 
@@ -140,7 +238,17 @@ extend Backend:
                     # type the backend does not model, and guessing i64 there would be wrong.
                     const_declared: mutable ValueType = const_annotated
                     if const_type_expression is Expr.Absent:
-                        const_declared <- infer_const_type(const_value)
+                        const_declared <- infer_const_type(const_value, structs)
+                    # `const NAME: u8& = "..."` is the same compile-time `u8&` string an unannotated
+                    # string const is in stage0 -- a pointer to the literal whose `.len` folds -- so
+                    # it takes the same row. As a bare Ref it had no text carrier, stayed
+                    # unresolved, and every function reading it DECLINED.
+                    const_reg_byte_ref_literal: mutable bool = false
+                    if const_declared.kind == TypeKind.Ref and not const_is_mutable:
+                        const_reg_ref_target: ValueType = ref_target_of(const_declared, structs)
+                        if const_reg_ref_target.kind == TypeKind.Unsigned and const_reg_ref_target.bits == 8 and paren_stripped_expression(const_value) is Expr.StringLit(const_reg_ref_literal, _):
+                            const_declared <- ValueType{kind: TypeKind.CStr, bits: 0}
+                            const_reg_byte_ref_literal <- true
                     if const_is_mutable:
                         # `global` declarations use the same AST variant as consts, but
                         # must remain addressable storage rather than entering the fold table.
@@ -173,10 +281,15 @@ extend Backend:
                     # A `const cstr = "..."` resolves here too: its text is all the use site
                     # needs, and leaving it unresolved declined every function that read it.
                     const_reg_cstr_text: mutable sview = ""
+                    const_reg_text_is_literal: mutable bool = false
                     const_reg_is_byte_darray: bool = const_declared.kind == TypeKind.DArray and darray_element_of(const_declared, structs).kind == TypeKind.Unsigned and darray_element_of(const_declared, structs).bits == 8
                     if const_declared.kind == TypeKind.CStr or const_declared.kind == TypeKind.SView or const_reg_is_byte_darray:
-                        if const_value is Expr.StringLit(const_reg_cstr_lit, _):
+                        if paren_stripped_expression(const_value) is Expr.StringLit(const_reg_cstr_lit, _):
                             const_reg_cstr_text <- const_reg_cstr_lit
+                            const_reg_text_is_literal <- true
+                    const_reg_literal_typed: mutable bool = false
+                    if const_type_expression is Expr.Absent or const_reg_byte_ref_literal:
+                        const_reg_literal_typed <- const_reg_text_is_literal
                     existing_const: i64 = const_index_of_in(structs, owner, const_name)
                     if existing_const >= 0:
                         structs.const_types[existing_const.usize()] <- const_declared
@@ -188,17 +301,21 @@ extend Backend:
                         if const_reg_float_text != "":
                             structs.const_float_text[existing_const.usize()] <- const_reg_float_text
                             structs.const_resolved[existing_const.usize()] <- true
-                        if const_reg_cstr_text != "":
+                        if const_reg_text_is_literal:
                             structs.const_cstr_text[existing_const.usize()] <- const_reg_cstr_text
+                            structs.const_text_is_literal[existing_const.usize()] <- true
+                            structs.const_literal_typed[existing_const.usize()] <- const_reg_literal_typed
                             structs.const_resolved[existing_const.usize()] <- true
                         return
                     structs.const_names <- structs.const_names.push(const_name)
                     structs.const_owners <- structs.const_owners.push(owner)
                     structs.const_types <- structs.const_types.push(const_declared)
                     structs.const_values <- structs.const_values.push(0)
-                    structs.const_resolved <- structs.const_resolved.push(const_reg_float_text != "" or const_reg_cstr_text != "")
+                    structs.const_resolved <- structs.const_resolved.push(const_reg_float_text != "" or const_reg_text_is_literal)
                     structs.const_float_text <- structs.const_float_text.push(const_reg_float_text)
                     structs.const_cstr_text <- structs.const_cstr_text.push(const_reg_cstr_text)
+                    structs.const_text_is_literal <- structs.const_text_is_literal.push(const_reg_text_is_literal)
+                    structs.const_literal_typed <- structs.const_literal_typed.push(const_reg_literal_typed)
                     structs.const_float_values <- structs.const_float_values.push(0.0)
                     structs.const_float_ok <- structs.const_float_ok.push(false)
                     structs.const_globals <- structs.const_globals.push(zeroed)
@@ -219,6 +336,16 @@ extend Backend:
                 if expression is Expr.BoolLit(bool_literal_value, _):
                     handled <- true
                     return 1 if bool_literal_value else 0
+                # `const N = "abcd".len`: a compile-time string's length is an integer constant
+                # (stage0's evalConstAggregateFieldExpr). Tried before the enum-ordinal reading of
+                # a Field, which never names a string -- and only taken when it folds, so an enum
+                # member that happens to be called `len` still reads as its ordinal.
+                if expression is Expr.Field(len_fold_receiver, len_fold_member, len_fold_line):
+                    if len_fold_member == "len":
+                        len_folded: i64 = const_eval_string_len(len_fold_receiver, structs)
+                        if len_folded >= 0:
+                            handled <- true
+                            return len_folded
                 if expression is Expr.Field(enum_head_expression, enum_member_name, enum_field_line):
                     handled <- true
                     enum_fold_ordinal: i64 = ordinal_of_dotted_path_expr(expression, structs)

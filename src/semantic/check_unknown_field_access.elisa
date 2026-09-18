@@ -4,6 +4,23 @@
 # does not match any known function/property name (properties and UFCS
 # methods look identical to field access syntactically, so any function
 # name match bails out — soundness over recall).
+#
+# The local types this check reads are only as good as its scope model: a name bound in
+# one body and read, from another, as a same-spelled local of a different struct type is
+# exactly the false positive it used to report on valid programs. The rules below were
+# MEASURED against stage0 on 2026-09-17 (one-feature probes, each clean in stage0):
+#   * Every indented body is a scope: `if`/`else`/`while`/`for` bodies, match arms (guard
+#     included), lambdas, comprehensions, block expressions, and every prefixed block
+#     (`can`, `region`, `with`, ...) EXCEPT the `let`/`move`/`expect` desugarings, whose
+#     VarDecls bind into the ENCLOSING scope.
+#   * An initializer is resolved before its own name is in scope: `x: B = B{b: x.a}`
+#     reads the OUTER `x`.
+#   * `x = value` declares `x` exactly like `x: T = value`; only `<-` mutates.
+#   * `is` binders are visible in the body their test guards (an `if` then-body, a
+#     `while` body, the right operand of `and`, an if-expression's then-arm), through
+#     parentheses, `and` and `or`, but never through `not` and never after the statement.
+# A binder's type is not inferred. It is recorded as `__firm_scope_binder__`, which shadows
+# a same-named typed local without giving the binder a type of its own.
 
 extend Semantic:
     private:
@@ -15,6 +32,85 @@ extend Semantic:
                 false return if not (field == "count" or field == "rows")
                 return any soa_owner in table.soa_layout_owners where soa_owner == struct_name
 
+        # stage0 resolves a field access on a builtin container through the RUNTIME struct
+        # behind it (runtimeBackedStructType, analyzer_builtins.go): `view[T]` is
+        # `DynArrayView{data, len}`, `darray[T]` and `dstr` are `DynArray{items, count,
+        # capacity}`, `sview` is `StringView{data, len}`, and a dict/set keyed by an integer,
+        # bool or cstr is `DynDict`/`DynSet{items, count, used, capacity, arena}`. Any other
+        # field is `struct "DynArrayView" has no field "count"` there -- including `.count` on
+        # a view and `.len` on a darray. "" for every other head (a dict/set with another key
+        # type gets a different stage0 sentence and stays silent here).
+        def runtime_struct_for_container(head: sview, key_id: u32, table: SymbolTable&) -> sview:
+            can Abort.Panic:
+                "DynArrayView" return if head == "view"
+                "DynArray" return if head == "darray"
+                "" return if head != "dict" and head != "set"
+                key_kind: SemTypeKind = interned_kind(key_id, table)
+                runtime_key: bool = key_kind == SemTypeKind.Int or key_kind == SemTypeKind.Bool or (key_kind == SemTypeKind.String and interned_name(key_id, table) == "cstr")
+                "" return if not runtime_key
+                "DynDict" return if head == "dict"
+                return "DynSet"
+
+        # The runtime struct behind a STRING-kind type, by spelling.
+        def runtime_struct_for_string(spelling: sview) -> sview:
+            can Abort.Panic:
+                "DynArray" return if spelling == "dstr"
+                "StringView" return if spelling == "sview"
+                return ""
+
+        # The runtime struct of an interned row, peeling one non-null reference the way
+        # stage0's lookupField strips a `T&` receiver first.
+        def runtime_struct_of_type_id(type_id: u32, table: SymbolTable&) -> sview:
+            can Abort.Panic:
+                row_id: mutable u32 = type_id
+                row_id <- interned_elem(row_id, 0, table) if interned_kind(row_id, table) == SemTypeKind.Ref
+                row_kind: SemTypeKind = interned_kind(row_id, table)
+                runtime_struct_for_string(interned_name(row_id, table)) return if row_kind == SemTypeKind.String
+                "" return if row_kind != SemTypeKind.Container
+                return runtime_struct_for_container(interned_name(row_id, table), interned_elem(row_id, 0, table), table)
+
+        def runtime_struct_has_field(struct_name: sview, field: sview) -> bool:
+            can Abort.Panic:
+                if struct_name == "DynArrayView" or struct_name == "StringView":
+                    return field == "data" or field == "len"
+                if struct_name == "DynArray":
+                    return field == "items" or field == "count" or field == "capacity"
+                return field == "items" or field == "count" or field == "used" or field == "capacity" or field == "arena"
+
+        # Record NAME as a new binding of unknown type in BOTH local-type channels (the flat
+        # name channel and the structural one), so it shadows any same-named outer local.
+        def note_unknown_field_binder(name: sview, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                note_local_type(var_types, type_names, name, "__firm_scope_binder__")
+                note_local_type_id_direct(name, 0, table)
+
+        # Every name a match-arm (or `let`) pattern binds.
+        def note_unknown_field_pattern_binders(pattern: Ast::Pattern, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                binders: mutable darray[sview] = []
+                gather_pattern_names(pattern, binders)
+                for binder in binders |var_types, type_names, table|:
+                    table <- note_unknown_field_binder(binder, var_types, type_names, table)
+
+        # The names the `is` tests of CONDITION bind for the body it guards. Only parentheses,
+        # `and` and `or` carry them; `not` does not (stage0 resolves `x` in the body of
+        # `if not (m is x):` to the outer `x`).
+        def note_unknown_field_is_binders(condition: Ast::Expr, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.Is:
+                            binders: mutable darray[sview] = []
+                            flow_collect_is_binds(right, binders)
+                            for binder in binders |var_types, type_names, table|:
+                                table <- note_unknown_field_binder(binder, var_types, type_names, table)
+                        elif operator == TokenKind.And or operator == TokenKind.Or:
+                            table <- note_unknown_field_is_binders(left, var_types, type_names, table)
+                            table <- note_unknown_field_is_binders(right, var_types, type_names, table)
+                    Expr.Paren(inner, line):
+                        table <- note_unknown_field_is_binders(inner, var_types, type_names, table)
+                    _:
+                        pass
 
         # Walk through expressions, checking for unknown field access.
         def walk_expression_for_unknown_field_access(expression: Ast::Expr, table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&) -> void:
@@ -22,7 +118,15 @@ extend Semantic:
                 match expression:
                     Expr.Binary(left, operator, right, line):
                         table <- walk_expression_for_unknown_field_access(left, table, var_types, type_names)
-                        table <- walk_expression_for_unknown_field_access(right, table, var_types, type_names) if operator != TokenKind.Is and operator != TokenKind.As
+                        if operator == TokenKind.And:
+                            # `m is x and x.b > 0`: the left operand's binders are in scope
+                            # for the right operand, and only there.
+                            and_mark: usize = var_types.count
+                            table <- note_unknown_field_is_binders(left, var_types, type_names, table)
+                            table <- walk_expression_for_unknown_field_access(right, table, var_types, type_names)
+                            table <- close_type_scope(and_mark, var_types, type_names, table)
+                        elif operator != TokenKind.Is and operator != TokenKind.As:
+                            table <- walk_expression_for_unknown_field_access(right, table, var_types, type_names)
                     Expr.Call(callee, arguments, argument_names, line):
                         # The callee, if a Field, is a method call — walk its receiver
                         # only, never apply the unknown-field check to the callee Field.
@@ -38,11 +142,38 @@ extend Semantic:
                         object_type: InferType = infer_expression_type(object, var_types, type_names, table)
                         struct_name: sview = object_type.name
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownFieldAccess, name: field, pos: line, line: line.line, expected: struct_name, actual: ""}) if object_type.kind == SemTypeKind.Named and struct_is_registered(table, struct_name) and not struct_has_field(table, struct_name, field) and direct_function_count(table, field) == 0 and not soa_row_api_name(table, struct_name, field)
+                        # A builtin container receiver is checked against its runtime struct.
+                        runtime_struct: mutable sview = ""
+                        runtime_struct <- runtime_struct_for_string(object_type.name) if object_type.kind == SemTypeKind.String
+                        # An extern parameter row keeps the container HEAD as its flat type name
+                        # (`@bounds(buf, count)` rewrites the pointer row to `view`).
+                        runtime_struct <- runtime_struct_for_container(object_type.name, 0, table) if object_type.kind == SemTypeKind.Named and (object_type.name == "view" or object_type.name == "darray") and not struct_is_registered(table, object_type.name)
+                        match object:
+                            Expr.Ident(receiver_name, receiver_pos):
+                                # The innermost LOCAL row only (no global fallback), and never for
+                                # a scope binder, whose id 0 carries no type of its own.
+                                runtime_struct <- runtime_struct_of_type_id(local_type_id_of(receiver_name, table), table) if runtime_struct == "" and local_type_of(var_types, type_names, receiver_name) != "__firm_scope_binder__"
+                            _:
+                                # Any other receiver by its inferred HEAD alone: a slice of a darray
+                                # is a view, which its structural row would not say.
+                                runtime_struct <- runtime_struct_for_container(object_type.name, 0, table) if runtime_struct == "" and object_type.kind == SemTypeKind.Container and (object_type.name == "view" or object_type.name == "darray")
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownFieldAccess, name: field, pos: line, line: line.line, expected: runtime_struct, actual: ""}) if runtime_struct != "" and not runtime_struct_has_field(runtime_struct, field) and direct_function_count(table, field) == 0
                     Expr.Scope(base, name, line):
                         table <- walk_expression_for_unknown_field_access(base, table, var_types, type_names)
                     Expr.Index(object, index, line):
-                        table <- walk_expression_for_unknown_field_access(object, table, var_types, type_names)
-                        table <- walk_expression_for_unknown_field_access(index, table, var_types, type_names) if not index_receiver_is_type_application(object)
+                        if index_receiver_is_type_application(object):
+                            # `p.cast[T]`, `p.ref[T]`, `p.call_as[F]`: a reinterpret spelling, not a
+                            # field read -- stage0 parses it straight to a cast. Only the receiver is
+                            # an expression; walking the Field reported `DynArray has no field "cast"`
+                            # on std's `indices.cast[darray[T]&]`.
+                            match object:
+                                Expr.Field(reinterpreted, _, _):
+                                    table <- walk_expression_for_unknown_field_access(reinterpreted, table, var_types, type_names)
+                                _:
+                                    pass
+                        else:
+                            table <- walk_expression_for_unknown_field_access(object, table, var_types, type_names)
+                            table <- walk_expression_for_unknown_field_access(index, table, var_types, type_names)
                     Expr.Unary(operator, operand, line):
                         table <- walk_expression_for_unknown_field_access(operand, table, var_types, type_names)
                     Expr.Paren(inner, line):
@@ -58,9 +189,17 @@ extend Semantic:
                         table <- walk_expression_for_unknown_field_access(low, table, var_types, type_names)
                         table <- walk_expression_for_unknown_field_access(high, table, var_types, type_names)
                     Expr.IndexN(object, arguments, line):
-                        table <- walk_expression_for_unknown_field_access(object, table, var_types, type_names)
-                        for argument in arguments |table|:
-                            table <- walk_expression_for_unknown_field_access(argument, table, var_types, type_names) if not index_receiver_is_type_application(object)
+                        if index_receiver_is_type_application(object):
+                            # A reinterpret spelling (see Expr.Index): the bracket holds types.
+                            match object:
+                                Expr.Field(reinterpreted, _, _):
+                                    table <- walk_expression_for_unknown_field_access(reinterpreted, table, var_types, type_names)
+                                _:
+                                    pass
+                        else:
+                            table <- walk_expression_for_unknown_field_access(object, table, var_types, type_names)
+                            for argument in arguments |table|:
+                                table <- walk_expression_for_unknown_field_access(argument, table, var_types, type_names)
                     Expr.SetLit(elements, line):
                         for element in elements |table|:
                             table <- walk_expression_for_unknown_field_access(element, table, var_types, type_names)
@@ -80,21 +219,38 @@ extend Semantic:
                             table <- walk_expression_for_unknown_field_access(field.value, table, var_types, type_names)
                     Expr.If(condition, then_expr, else_expr, line):
                         table <- walk_expression_for_unknown_field_access(condition, table, var_types, type_names)
+                        then_mark: usize = var_types.count
+                        table <- note_unknown_field_is_binders(condition, var_types, type_names, table)
                         table <- walk_expression_for_unknown_field_access(then_expr, table, var_types, type_names)
+                        table <- close_type_scope(then_mark, var_types, type_names, table)
                         table <- walk_expression_for_unknown_field_access(else_expr, table, var_types, type_names)
                     Expr.Comprehension(loop_variable, iterable, condition, body, line):
                         table <- walk_expression_for_unknown_field_access(iterable, table, var_types, type_names)
+                        comprehension_mark: usize = var_types.count
+                        table <- note_unknown_field_binder(loop_variable, var_types, type_names, table) if loop_variable != ""
                         table <- walk_expression_for_unknown_field_access(condition, table, var_types, type_names)
+                        table <- note_unknown_field_is_binders(condition, var_types, type_names, table)
                         table <- walk_expression_for_unknown_field_access(body, table, var_types, type_names)
+                        table <- close_type_scope(comprehension_mark, var_types, type_names, table)
                     Expr.Lambda(parameters, body, line):
+                        lambda_mark: usize = var_types.count
+                        for parameter in parameters |var_types, type_names, table|:
+                            table <- note_unknown_field_binder(parameter, var_types, type_names, table)
                         table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                        table <- close_type_scope(lambda_mark, var_types, type_names, table)
                     Expr.Block(statements, value, captures, line):
+                        block_mark: usize = var_types.count
                         table <- walk_statements_for_unknown_field_access(statements, table, var_types, type_names)
                         table <- walk_expression_for_unknown_field_access(value, table, var_types, type_names)
+                        table <- close_type_scope(block_mark, var_types, type_names, table)
                     Expr.Match(scrutinee, arms, line):
                         table <- walk_expression_for_unknown_field_access(scrutinee, table, var_types, type_names)
-                        for arm in arms |table|:
+                        for arm in arms |table, var_types, type_names|:
+                            arm_mark: usize = var_types.count
+                            table <- note_unknown_field_pattern_binders(arm.pattern, var_types, type_names, table)
+                            table <- walk_expression_for_unknown_field_access(arm.guard, table, var_types, type_names)
                             table <- walk_statements_for_unknown_field_access(arm.body, table, var_types, type_names)
+                            table <- close_type_scope(arm_mark, var_types, type_names, table)
                     # Literals and other expressions don't contain relevant sub-expressions
                     _:
                         pass
@@ -126,35 +282,60 @@ extend Semantic:
         # Walk through statements, tracking variable types and checking for unknown field access.
         def walk_statements_for_unknown_field_access(statements: darray[Ast::Stmt], table: lmut SymbolTable, var_types: mutable darray[sview]&, type_names: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table|:
+                for statement in statements |table, var_types, type_names|:
                     match statement:
                         Stmt.Expr(expression, line):
                             table <- walk_expression_for_unknown_field_access(expression, table, var_types, type_names)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            type_name: sview = bare_type_name(type_expression)
-                            note_local_type(var_types, type_names, name, type_name)
+                            # The initializer first: it reads the OUTER binding of `name`.
                             table <- walk_expression_for_unknown_field_access(value, table, var_types, type_names)
+                            note_local_type(var_types, type_names, name, bare_type_name(type_expression))
+                            note_local_type_id(name, type_expression, table)
                         Stmt.Assign(target, operator, value, line):
                             table <- walk_expression_for_unknown_field_access(target, table, var_types, type_names)
                             table <- walk_expression_for_unknown_field_access(value, table, var_types, type_names)
+                            # `x = value` DECLARES `x` (mutation is `<-`); its type is not inferred.
+                            if operator == TokenKind.Assign and target is Expr.Ident(declared_name, declared_pos):
+                                table <- note_unknown_field_binder(declared_name, var_types, type_names, table)
                         Stmt.If(condition, then_body, else_body, line):
                             table <- walk_expression_for_unknown_field_access(condition, table, var_types, type_names)
+                            then_mark: usize = var_types.count
+                            table <- note_unknown_field_is_binders(condition, var_types, type_names, table)
                             table <- walk_statements_for_unknown_field_access(then_body, table, var_types, type_names)
+                            table <- close_type_scope(then_mark, var_types, type_names, table)
                             table <- walk_statements_for_unknown_field_access(else_body, table, var_types, type_names)
+                            table <- close_type_scope(then_mark, var_types, type_names, table)
                         Stmt.While(condition, body, line):
                             table <- walk_expression_for_unknown_field_access(condition, table, var_types, type_names)
+                            while_mark: usize = var_types.count
+                            table <- note_unknown_field_is_binders(condition, var_types, type_names, table)
                             table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                            table <- close_type_scope(while_mark, var_types, type_names, table)
                         Stmt.For(bind, variables, iterable, body, line):
                             table <- walk_expression_for_unknown_field_access(iterable, table, var_types, type_names)
+                            for_mark: usize = var_types.count
+                            for variable in variables |var_types, type_names, table|:
+                                table <- note_unknown_field_binder(variable, var_types, type_names, table)
                             table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                            table <- close_type_scope(for_mark, var_types, type_names, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_let_destructure_block(body, line.line, table, var_types, type_names) if kind == "let"
-                            table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                            if kind == "let" or kind == "move" or kind == "expect":
+                                # Desugared destructuring: the bindings belong to the enclosing scope.
+                                table <- check_let_destructure_block(body, line.line, table, var_types, type_names) if kind == "let"
+                                table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                            else:
+                                block_mark: usize = var_types.count
+                                table <- note_unknown_field_binder(binding, var_types, type_names, table) if binding != ""
+                                table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                                table <- close_type_scope(block_mark, var_types, type_names, table)
                         Stmt.Match(scrutinee, arms, line):
                             table <- walk_expression_for_unknown_field_access(scrutinee, table, var_types, type_names)
-                            for arm in arms |table|:
+                            for arm in arms |table, var_types, type_names|:
+                                arm_mark: usize = var_types.count
+                                table <- note_unknown_field_pattern_binders(arm.pattern, var_types, type_names, table)
                                 table <- walk_expression_for_unknown_field_access(arm.guard, table, var_types, type_names)
                                 table <- walk_statements_for_unknown_field_access(arm.body, table, var_types, type_names)
+                                table <- close_type_scope(arm_mark, var_types, type_names, table)
                         Stmt.Return(value, line):
                             table <- walk_expression_for_unknown_field_access(return_value, table, var_types, type_names) if value is return_value
                         Stmt.Contract(kind, expression, line):
@@ -167,26 +348,47 @@ extend Semantic:
                             pass
 
         # Walk through function declarations.
-        def check_unknown_field_access_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def check_unknown_field_access_declarations(declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, contract_lines: darray[u32]&, contract_kinds: darray[sview]&, contract_exprs: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            # Fresh STRUCTURAL channel too, in lockstep with the flat one (one
+                            # entry per parameter in each), so close_type_scope's single mark
+                            # truncates both -- see seed_local_type_ids.
+                            seed_local_type_ids(params, table)
                             var_types: mutable darray[sview] = []
                             type_names: mutable darray[sview] = []
-                            for param in params |table|:
+                            for param in params |var_types, type_names|:
                                 param_type: sview = bare_type_name(param.type_expression)
                                 note_local_type(var_types, type_names, param.name, param_type)
                             table <- walk_statements_for_unknown_field_access(body, table, var_types, type_names)
+                        Decl.Extern(extern_name, param_start, arity, variadic, callable, extern_return, extern_decorators, line):
+                            # A `requires` clause is an expression over the extern's parameters,
+                            # which live in the signature side tables rather than in a body. A
+                            # `@bounds(buf, count)` pointer row already reads `view` there, so
+                            # `requires buf.count > 0` is an unknown DynArrayView field exactly as
+                            # it is in stage0. Both local-type channels restart in lockstep.
+                            clear_local_type_ids(table)
+                            extern_var_types: mutable darray[sview] = []
+                            extern_type_names: mutable darray[sview] = []
+                            for extern_index in param_start.usize()..<(param_start.usize() + arity.usize()) |extern_var_types, extern_type_names, table|:
+                                continue if extern_index >= extern_params.count
+                                note_local_type(extern_var_types, extern_type_names, extern_params[extern_index].name, extern_params[extern_index].type_name)
+                                note_local_type_id_direct(extern_params[extern_index].name, 0, table)
+                            for contract_index in 0..<contract_exprs.count |table, extern_var_types, extern_type_names| -> table:
+                                continue if contract_index >= contract_lines.count or contract_index >= contract_kinds.count
+                                continue if contract_lines[contract_index] != line.line or contract_kinds[contract_index] != "requires"
+                                table <- walk_expression_for_unknown_field_access(contract_exprs[contract_index], table, extern_var_types, extern_type_names)
                         Decl.Module(module_name, body, line):
-                            table <- check_unknown_field_access_declarations(body, table)
+                            table <- check_unknown_field_access_declarations(body, extern_params, contract_lines, contract_kinds, contract_exprs, table)
                         Decl.Scoped(body, line):
-                            table <- check_unknown_field_access_declarations(body, table)
+                            table <- check_unknown_field_access_declarations(body, extern_params, contract_lines, contract_kinds, contract_exprs, table)
                         _:
                             pass
 
     public:
         # Public entry point for the check.
-        def check_unknown_field_access(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def check_unknown_field_access(declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, contract_lines: darray[u32]&, contract_kinds: darray[sview]&, contract_exprs: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- check_unknown_field_access_declarations(declarations, table)
+                table <- check_unknown_field_access_declarations(declarations, extern_params, contract_lines, contract_kinds, contract_exprs, table)

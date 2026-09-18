@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
-# docs/123 §5 (the machine arm law): a `machine over` arm body is STRAIGHT-LINE. ALL
-# discrimination lives in the arm HEADER (`State, input if guard:`), so a body
-# `if`/`match`/`while`/`for` — and a postfix guard, which desugars to an `if` — is REFUSED.
-# `return` and `break` are legal arm exits; `continue` would bypass the arm's decision.
-#
-# ERROR HANDLING IS NOT BRANCHING and stays legal: `catch`/`try`/`get` are EXPRESSIONS.
-# Stage1 models a STATEMENT `catch` as a `Stmt.Match` tagged `__catch_match`, so the law
-# asks that annotation rather than the node kind — see machine_over_arm_stmt_illegal.
-#
-# This gate is a PARITY gate, not a stage1 assertion: every branch-law case is checked
-# against stage0 as well, so stage1 can neither under- nor over-refuse relative to the
-# oracle. Cases marked stage1-only pin stage1's own AST shapes (Expr.IndexN, Scope roots)
-# whose snippets do not type-check under stage0.
+# docs/123 §5 (the machine arm law), stage1-OWNED (docs/125 step 13): a `machine over` arm
+# body may branch locally before a shared transition. `continue` remains invalid because
+# it can bypass that transition. `return` and `break` remain arm exits.
+# This gate checks both compilers for the shared language rule; stage1-only cases below
+# cover AST shapes that the stage0 probe cannot type-check.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
@@ -110,9 +102,9 @@ EOF
 run_case "catch in an arm (expression and statement form)" legal \
     < "$REPO_ROOT/test/fixtures/machine_transition/catch_in_arm.elisa"
 
-# -------------------------------------------------------------- illegal, both compilers
+# -------------------------------------------------------------- legal branches, both compilers
 
-run_case "block if/else" illegal <<'EOF'
+run_case "block if/else" stage1-legal <<'EOF'
 def scan(total: mutable i64) -> i64:
     machine over total while total < 2:
         state Run
@@ -128,7 +120,7 @@ EOF
 
 # A postfix guard desugars to an `if`, so it is the same refusal — this is the form that
 # reads as straight-line but is not.
-run_case "postfix guard" illegal <<'EOF'
+run_case "postfix guard" stage1-legal <<'EOF'
 def scan(total: mutable i64) -> i64:
     machine over total while total < 2:
         state Run
@@ -140,7 +132,7 @@ def scan(total: mutable i64) -> i64:
     return total
 EOF
 
-run_case "match in arm body" illegal <<'EOF'
+run_case "match in arm body" stage1-legal <<'EOF'
 def scan(total: mutable i64) -> i64:
     machine over total while total < 2:
         state Run
@@ -155,7 +147,7 @@ def scan(total: mutable i64) -> i64:
     return total
 EOF
 
-run_case "while loop in arm body" illegal <<'EOF'
+run_case "while loop in arm body" stage1-legal <<'EOF'
 def scan(total: mutable i64) -> i64:
     machine over total while total < 2:
         state Run
@@ -167,7 +159,7 @@ def scan(total: mutable i64) -> i64:
     return total
 EOF
 
-run_case "for loop in arm body" illegal <<'EOF'
+run_case "for loop in arm body" stage1-legal <<'EOF'
 def scan(total: mutable i64) -> i64:
     machine over total while total < 1:
         state Run
@@ -231,4 +223,4 @@ def scan(resource: mutable Resource&) -> i64:
     return 0
 EOF
 
-echo "machine-over arm-law smoke OK: straight-line + catch/try legal; if/guard/match/while/for/continue refused, in BOTH compilers"
+echo "machine-over arm-law smoke OK: branches and transitions legal; continue refused"
