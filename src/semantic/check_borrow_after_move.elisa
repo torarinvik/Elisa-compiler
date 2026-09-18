@@ -364,6 +364,10 @@ extend Semantic:
                         return bam_place_root(rooted_object)
                     Expr.Paren(rooted_inner, rooted_paren_pos):
                         return bam_place_root(rooted_inner)
+                    # `xs[i]` is interior storage of `xs`, so a borrow of it is a borrow of
+                    # the container -- stage0 reports `return &xs[0]` on a local array.
+                    Expr.Index(rooted_indexed, rooted_index, rooted_index_pos):
+                        return bam_place_root(rooted_indexed)
                     _:
                         return ""
 
@@ -395,6 +399,13 @@ extend Semantic:
                         return if return_operator != TokenKind.Ampersand
                         escaping: sview = bam_place_root(return_operand)
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReturnRefToLocal, name: escaping, pos: return_pos, line: return_pos.line, expected: "", actual: ""}) if escaping != "" and (any known_local in locals where known_local == escaping)
+                    # `x.ref[T]` -- the REMOVED reference shorthand. stage0 reports its removal
+                    # and then keeps analysing it as `&x`, so the dangle lands too; stage1 used
+                    # to stop at the removal message and let the use-after-free through.
+                    Expr.Index(Expr.Field(ref_receiver, ref_selector, ref_field_pos), ref_target, ref_index_pos):
+                        return if ref_selector != "ref"
+                        ref_escaping: sview = bam_place_root(ref_receiver)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReturnRefToLocal, name: ref_escaping, pos: ref_index_pos, line: ref_index_pos.line, expected: "", actual: ""}) if ref_escaping != "" and (any known_local in locals where known_local == ref_escaping)
                     _:
                         pass
 
@@ -420,6 +431,62 @@ extend Semantic:
                         Stmt.Match(match_scrutinee, match_arms, match_pos):
                             for match_arm in match_arms |table| -> table:
                                 table <- bam_escape_statements(match_arm.body, locals, table)
+                        _:
+                            pass
+
+        # The root of a BORROW expression: `&place` and the removed `place.ref[T]` shorthand
+        # both hand out a reference into `place`'s storage.
+        def bam_borrow_root(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Unary(borrow_operator, borrow_operand, borrow_pos):
+                        "" return if borrow_operator != TokenKind.Ampersand
+                        return bam_place_root(borrow_operand)
+                    Expr.Index(Expr.Field(borrow_receiver, borrow_selector, borrow_field_pos), borrow_target, borrow_index_pos):
+                        "" return if borrow_selector != "ref"
+                        return bam_place_root(borrow_receiver)
+                    _:
+                        return ""
+
+        # An INTERIOR place (`out.p`, `out[i]`) -- writing one publishes through the target's
+        # own storage. A bare `p <- ...` writes the POINTEE of a reference parameter, which is
+        # the caller's value and not a place that can hold a borrow.
+        def bam_place_is_interior(place: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Field(interior_object, interior_field, interior_field_pos):
+                        return true
+                    Expr.Index(interior_indexed, interior_index, interior_index_pos):
+                        return true
+                    Expr.Paren(interior_inner, interior_paren_pos):
+                        return bam_place_is_interior(interior_inner)
+                    _:
+                        return false
+
+        # `out.p <- &local` where `out` is a REFERENCE parameter: the frame dies at the return
+        # but the pointee it just published lives on in the caller's storage. stage0 reports
+        # this from the same escape analysis as the return form, with its own sentence.
+        def bam_store_statements(statements: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Assign(store_target, store_operator, store_value, store_pos):
+                            stored: sview = bam_borrow_root(store_value)
+                            target_root: sview = bam_place_root(store_target)
+                            escapes: bool = stored != "" and target_root != "" and bam_place_is_interior(store_target) and (any known_local in locals where known_local == stored) and (any outer in ref_params where outer == target_root)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StoreRefToLocal, name: stored, pos: store_pos, line: store_pos.line, expected: "", actual: ""}) if escapes
+                        Stmt.If(branch_condition, branch_then, branch_else, branch_pos):
+                            table <- bam_store_statements(branch_then, locals, ref_params, table)
+                            table <- bam_store_statements(branch_else, locals, ref_params, table)
+                        Stmt.While(loop_condition, loop_body, loop_pos):
+                            table <- bam_store_statements(loop_body, locals, ref_params, table)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
+                            table <- bam_store_statements(for_body, locals, ref_params, table)
+                        Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
+                            table <- bam_store_statements(block_body, locals, ref_params, table)
+                        Stmt.Match(match_scrutinee, match_arms, match_pos):
+                            for match_arm in match_arms |table| -> table:
+                                table <- bam_store_statements(match_arm.body, locals, ref_params, table)
                         _:
                             pass
 
@@ -469,6 +536,8 @@ extend Semantic:
                                     owners.push(parameter.name) if bam_owner_type_name(parameter.type_expression, table) != "" and borrow_bound_once(binders, parameter.name)
                                 bam_collect_owners(function_body, binders, table, owners)
                                 bam_collect_locals(function_body, binders, locals)
+                                for value_parameter in function_parameters |locals|:
+                                    locals.push(value_parameter.name) if not affine_annotation_is_ref(value_parameter.type_expression) and borrow_bound_once(binders, value_parameter.name)
                             kinds: mutable darray[u32] = []
                             details: mutable darray[sview] = []
                             for owner in owners |kinds, details|:
@@ -483,6 +552,10 @@ extend Semantic:
                             if function_return is declared_return:
                                 returns_reference <- affine_annotation_is_ref(declared_return)
                             table <- bam_escape_statements(function_body, locals, table) if returns_reference and locals.count > 0
+                            ref_params: mutable darray[sview] = []
+                            for ref_parameter in function_parameters |ref_params|:
+                                ref_params.push(ref_parameter.name) if affine_annotation_is_ref(ref_parameter.type_expression) and borrow_bound_once(binders, ref_parameter.name)
+                            table <- bam_store_statements(function_body, locals, ref_params, table) if ref_params.count > 0 and locals.count > 0
                         Decl.Module(module_name, module_body, module_pos):
                             table <- bam_declarations(module_body, lend_names, lend_positions, table)
                         Decl.Scoped(scoped_body, scoped_pos):
