@@ -70,6 +70,20 @@ def main() -> i64:
     wrapper: Wrapper = zeroed
     wrapper.handle.tag
 '''),
+    'zeroed_generic_wrapper': (True, '''type Payload = Vault::Handle
+struct Wrapper[T]:
+    payload: T
+def main() -> i64:
+    wrapper: Wrapper[Payload] = zeroed
+    wrapper.payload.tag
+'''),
+    'zeroed_owner': (False, '''module Vault::Child:
+    def empty() -> i64:
+        h: Vault::Handle = zeroed
+        h.tag
+def main() -> i32:
+    0 if Vault::Child::empty() == 0 else 1
+'''),
     'record_update': (True, '''def main() -> i64:
     h = Vault::Handle()
     changed = h{value = 0}
