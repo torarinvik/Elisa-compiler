@@ -35,3 +35,31 @@ and the self-hosted compiler agree on these tails. Separately built frontend
 consumers still need a rebuild from their parser sources. The stage0 regression is
 committed in the compiler repository as `26a06695`, with the void/unannotated
 correction in `3a5520d`.
+
+## Tuple tails
+
+A bare comma-separated tuple can be the final expression of a function or of
+its terminal branches, just as it can be the result of a value block:
+
+```elisa
+def adjacent(n: i64) -> (first: i64, second: i64):
+    n, n + 1
+
+def totals(n: i64) -> (sum: i64, count: i64):
+    for index in 0..<n |sum: i64 = 0, count: i64 = 0| -> sum, count:
+        sum <- sum + index
+        count <- count + 1
+```
+
+The tuple uses the existing multi-value return representation; it introduces no
+heap wrapper. Non-tail bare tuple lines outside value blocks remain rejected.
+`test/differential/cases/tuple_function_tail.elisa` covers direct, branch, match,
+block and loop results, empty loops, and deferred cleanup. The block-expression
+parity gate runs it through both compilers at O0/O2 and compares optimized LLVM
+for implicit and explicit tuple returns.
+
+Tuple-valued calls and locals can also be destructured directly or as a block's
+result. The backend evaluates the aggregate once, extracts its fields, and binds
+or updates the destination variables. This is distinct from `lmut` thread claims;
+ordinary struct results retain the existing claim behavior. Tests cover discarded
+fields and reassignment, including a counter that detects repeated evaluation.

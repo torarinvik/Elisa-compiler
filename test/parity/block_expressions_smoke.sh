@@ -14,7 +14,7 @@ from pathlib import Path
 import re, subprocess, sys
 root, stage0, stage1, work = sys.argv[1:]
 work = Path(work)
-for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
+for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'tuple_function_tail', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
     outputs = []
     for stage, compiler in enumerate((stage0, stage1)):
         for level in ('-O0', '-O2'):
@@ -28,6 +28,24 @@ for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_e
             outputs.append((result.stdout, result.stderr))
     assert all(output == outputs[0] for output in outputs), (fixture, outputs)
     print(f'{fixture}: stage0/stage1 O0/O2 runtime and byte parity PASS', flush=True)
+    if fixture == 'tuple_function_tail':
+        for stage, compiler in enumerate((stage0, stage1)):
+            bodies = []
+            for spelling in ('n, n + 1', 'return n, n + 1'):
+                probe = work / 'tuple_codegen.elisa'
+                probe.write_text('def pair(n: i64) -> (first: i64, second: i64):\n    ' + spelling + '\n\ndef total(n: i64) -> i64:\n    a, b = pair(n)\n    a + b\n\nexport fn total(n: i64) -> i64 = total\n')
+                ir = work / f'tuple-codegen-{stage}.ll'
+                subprocess.run([compiler, '-emit', 'llvm', '-O2', '-o', str(ir), str(probe)], check=True, timeout=60)
+                bodies.append(ir.read_text())
+            assert bodies[0] == bodies[1], (compiler, 'tuple tail changes generated LLVM compared with explicit return')
+            probe.write_text('def pair(n: i64) -> (first: i64, second: i64):\n    n, n + 1\n\ndef total(n: i64) -> i64:\n    a, b = pair(n)\n    a + b\n\nexport fn total(n: i64) -> i64 = total\n')
+            subprocess.run([compiler, '-emit', 'llvm', '-O2', '-o', str(ir), str(probe)], check=True, timeout=60)
+            total = re.search(r'define[^\n]*@total\([^\n]*\)[^{]*\{(.*?)\n\}', ir.read_text(), re.S)
+            assert total, (compiler, 'missing total() in LLVM')
+            assert 'alloca ' not in total.group(1), (compiler, total.group(1))
+            calls = re.findall(r'\bcall\b[^\n]*@([^ (]+)', total.group(1))
+            assert all(name in ('pair', 'llvm.sadd.with.overflow.i64', 'llvm.trap') for name in calls), (compiler, calls)
+        print('tuple_function_tail: implicit/explicit optimized LLVM identical PASS', flush=True)
     if fixture in ('block_reference_threading', 'block_state_threading', 'with_collection_append'):
         function = 'forward' if fixture == 'block_reference_threading' else 'update'
         for compiler in (stage0, stage1):
@@ -45,6 +63,8 @@ for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_e
 # Keep lexical boundaries and capture checking enforced while widening valid forms.
 state_prefix = 'struct State:\n    value: mutable i64\n\nstruct Handle:\n    kind: i64\n\n'
 for name, body in {
+    'tuple_tail_wrong_arity': '    1, 2\n',
+    'tuple_tail_scope_escape': '    a, b =\n        hidden: i64 = 42\n        hidden, hidden + 1\n    return hidden\n',
     'append_region_escape': '    region outer(8192):\n        rows: mutable darray[darray[i64]] @outer = []\n        region short(4096):\n            row: darray[i64] @short = [1]\n            rows += row\n    return 0\n',
     'append_bulk': '    xs: mutable darray[i64] = []\n    xs += [1, 2]\n    return 0\n',
     'append_wrong_element': '    xs: mutable darray[i64] = []\n    xs += true\n    return 0\n',
