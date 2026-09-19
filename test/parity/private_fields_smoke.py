@@ -53,6 +53,23 @@ def main() -> i64:
     h = identity[Vault::Handle](Vault::Handle())
     h.value
 '''),
+    'generic_pattern': (True, '''def identity[T](value: T) -> T:
+    value
+def main() -> i64:
+    h = identity[Vault::Handle](Vault::Handle())
+    match h:
+        Vault::Handle{value: v}: v
+'''),
+    'zeroed': (True, '''def main() -> i64:
+    h: Vault::Handle = zeroed
+    h.tag
+'''),
+    'zeroed_nested': (True, '''struct Wrapper:
+    handle: Vault::Handle
+def main() -> i64:
+    wrapper: Wrapper = zeroed
+    wrapper.handle.tag
+'''),
     'record_update': (True, '''def main() -> i64:
     h = Vault::Handle()
     changed = h{value = 0}
