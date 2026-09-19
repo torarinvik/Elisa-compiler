@@ -93,10 +93,12 @@ def source(body: list[str], clobbers: list[str], requires: list[str]) -> str:
 
 def ensure_driver(elisac: str, llvm_config: str) -> pathlib.Path:
     src = ROOT / "test" / "breadth" / "easm_verify_stdin.elisa"
+    profiler_script = ROOT / "scripts" / "write_profiler_hook_fallbacks.sh"
     obj = ROOT / "build" / "easm_verify_stdin.o"
     log = ROOT / "build" / "easm_verify_stdin.log"
     ROOT.joinpath("build").mkdir(parents=True, exist_ok=True)
-    if not DRIVER.exists() or src.stat().st_mtime > DRIVER.stat().st_mtime:
+    if (not DRIVER.exists() or src.stat().st_mtime > DRIVER.stat().st_mtime
+            or profiler_script.stat().st_mtime > DRIVER.stat().st_mtime):
         with open(log, "w", encoding="utf-8") as fh:
             proc = subprocess.run(
                 [elisac, "-emit", "obj", "-O2", "-o", str(obj), str(src)],
@@ -107,11 +109,17 @@ def ensure_driver(elisac: str, llvm_config: str) -> pathlib.Path:
         if proc.returncode != 0 or not obj.exists():
             raise RuntimeError(f"failed to compile easm_verify_stdin (see {log})")
         libdir = subprocess.check_output([llvm_config, "--libdir"], text=True).strip()
-        subprocess.check_call(
-            ["clang", "-o", str(DRIVER), str(obj), f"-L{libdir}", "-lLLVM", f"-Wl,-rpath,{libdir}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        fallback = ROOT / "build" / f"easm_profile_hooks.{os.getpid()}.c"
+        try:
+            with fallback.open("w", encoding="utf-8") as fh:
+                subprocess.run(["bash", str(profiler_script)], stdout=fh, check=True)
+            subprocess.check_call(
+                ["clang", "-o", str(DRIVER), str(obj), str(fallback), f"-L{libdir}", "-lLLVM", f"-Wl,-rpath,{libdir}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            fallback.unlink(missing_ok=True)
     return DRIVER
 
 
