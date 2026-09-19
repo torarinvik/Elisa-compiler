@@ -1,5 +1,67 @@
 extend Semantic:
     private:
+        const CALLABLE_ERROR_ROW_NONE: u32 = 4294967295
+
+        # A source-order hash-chain projection of only the annotation owners that occur in
+        # `try` rows. The generic annotation table is shared by every semantic check; looking
+        # up a callee through this projection avoids rescanning unrelated rows for every try.
+        struct CallableErrorAnnotationIndex:
+            heads: mutable dict[u64, u32]
+            tails: mutable dict[u64, u32]
+            next: mutable darray[u32]
+            source_rows: mutable darray[usize]
+
+        def callable_error_index_head(index: CallableErrorAnnotationIndex&, owner: sview) -> u32:
+            can Abort.Panic:
+                return head if index.heads.get(name_hash(owner)) is head else CALLABLE_ERROR_ROW_NONE
+
+        def callable_error_index_tail(index: CallableErrorAnnotationIndex&, owner: sview) -> u32:
+            can Abort.Panic:
+                return tail_row if index.tails.get(name_hash(owner)) is tail_row else CALLABLE_ERROR_ROW_NONE
+
+        def callable_error_index_build(annotations: darray[Ast::EnumAnnotation]&, targets: darray[sview]&, index: mutable CallableErrorAnnotationIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for source_row in 0..<annotations.count |source_row, annotations, targets, index|:
+                    owner: sview = annotations[source_row].owner
+                    continue if owner == "" or not any target in targets where target == owner
+                    previous: u32 = callable_error_index_tail(index, owner)
+                    row: u32 = index.next.count.u32()
+                    index.next <- index.next.push(CALLABLE_ERROR_ROW_NONE)
+                    index.source_rows <- index.source_rows.push(source_row)
+                    if previous != CALLABLE_ERROR_ROW_NONE:
+                        index.next[previous.usize()] <- row
+                    else:
+                        index.heads <- index.heads.put(name_hash(owner), row)
+                    index.tails <- index.tails.put(name_hash(owner), row)
+
+        def callable_error_indexed_returns_error(index: CallableErrorAnnotationIndex&, annotations: darray[Ast::EnumAnnotation]&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview) -> bool:
+            can Abort.Panic:
+                row: mutable u32 = callable_error_index_head(index, name)
+                while row != CALLABLE_ERROR_ROW_NONE |row, annotations, module_annotations, name, enclosing_module, callee_qualifier|:
+                    annotation: Ast::EnumAnnotation = annotations[index.source_rows[row.usize()]]
+                    true return if annotation.owner == name and annotation.name == "__error_return" and callable_row_in_scope(module_annotations, annotation.offset, annotation.line, enclosing_module, callee_qualifier)
+                    row <- index.next[row.usize()]
+                row <- callable_error_index_head(index, name)
+                while row != CALLABLE_ERROR_ROW_NONE |row, annotations, name|:
+                    true return if annotations[index.source_rows[row.usize()]].owner == name and annotations[index.source_rows[row.usize()]].name == "__error_return"
+                    row <- index.next[row.usize()]
+                return false
+
+        def callable_error_indexed_family(index: CallableErrorAnnotationIndex&, annotations: darray[Ast::EnumAnnotation]&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview) -> sview:
+            can Abort.Panic:
+                fallback: mutable sview = ""
+                fallback_found: mutable bool = false
+                row: mutable u32 = callable_error_index_head(index, name)
+                while row != CALLABLE_ERROR_ROW_NONE |row, annotations, module_annotations, name, enclosing_module, callee_qualifier, fallback, fallback_found|:
+                    annotation: Ast::EnumAnnotation = annotations[index.source_rows[row.usize()]]
+                    if annotation.owner == name and annotation.name != "__error_return" and annotation.name != "__export_array" and annotation.name != "__lsp_func_name":
+                        if not fallback_found:
+                            fallback <- annotation.name
+                            fallback_found <- true
+                        annotation.name return if callable_row_in_scope(module_annotations, annotation.offset, annotation.line, enclosing_module, callee_qualifier)
+                    row <- index.next[row.usize()]
+                return fallback
+
         # The module a fallible function was declared in, keyed by the declaration's byte
         # offset (the same key the destination side already uses).
         # Matched by OFFSET when both sides carry one and by LINE otherwise — the same rule
@@ -87,12 +149,12 @@ extend Semantic:
                         false return if not enum_has_variant(table, destination, table.enum_variant_name[variant_index])
                 return saw_source_tag
 
-        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, annotations: darray[Ast::EnumAnnotation]&, module_annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, annotations: darray[Ast::EnumAnnotation]&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 enclosing: (line: u32, offset: u32) = enclosing_try_function(table, annotation.line, annotation.offset)
                 enclosing_module: sview = fallible_fn_module(annotations, enclosing.offset, enclosing.line)
                 callee_qualifier: sview = try_callee_qualifier(annotations, annotation.offset)
-                source: sview = callable_error_family(annotations, module_annotations, annotation.owner, enclosing_module, callee_qualifier)
+                source: sview = callable_error_indexed_family(error_index, annotations, module_annotations, annotation.owner, enclosing_module, callee_qualifier)
                 return if source == ""
                 function_line: u32 = enclosing.line
                 destinations: mutable darray[sview] = []
@@ -114,8 +176,14 @@ extend Semantic:
         def check_try_fallible_rows(annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 module_annotations: mutable darray[Ast::EnumAnnotation] = []
+                callable_targets: mutable darray[sview] = []
+                error_index: mutable CallableErrorAnnotationIndex = CallableErrorAnnotationIndex{heads: {}, tails: {}, next: [], source_rows: []}
                 for module_annotation in annotations |module_annotations|:
                     module_annotations.push(module_annotation) if module_annotation.owner == "__fn_module"
+                for try_annotation in annotations |callable_targets|:
+                    if try_annotation.name == "__try_without_else" and try_annotation.owner != "__unknown_call" and not any target in callable_targets where target == try_annotation.owner:
+                        callable_targets.push(try_annotation.owner)
+                callable_error_index_build(annotations, callable_targets, error_index)
                 for annotation in annotations |table, annotations|:
                     # Only these rows can produce either diagnostic below.
                     # Resolving scope for unrelated annotation rows turned the
@@ -129,11 +197,11 @@ extend Semantic:
                     # A callee that is not a declared function (a fn-typed parameter or
                     # local, e.g. `try f(x)` with `f: fn(...) -> T error[R]`) may be
                     # fallible through its TYPE — unknowable here, so stay silent.
-                    if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and (annotation.owner == "__noncall" or direct_function_count(table, annotation.owner) > 0) and not callable_returns_error(annotations, module_annotations, annotation.owner, row_module, row_qualifier):
+                    if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and (annotation.owner == "__noncall" or direct_function_count(table, annotation.owner) > 0) and not callable_error_indexed_returns_error(error_index, annotations, module_annotations, annotation.owner, row_module, row_qualifier):
                         return_type_id: u32 = function_return_type_id(table, annotation.owner)
                         reason: sview = "optional" if interned_kind(return_type_id, table) == SemTypeKind.Optional else "nonfallible"
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryRequiresFallible, name: annotation.owner, line: annotation.line, expected: reason, actual: ""})
-                    table <- check_try_propagation_row(annotation, annotations, module_annotations, table) if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and callable_returns_error(annotations, module_annotations, annotation.owner, row_module, row_qualifier)
+                    table <- check_try_propagation_row(annotation, annotations, module_annotations, error_index, table) if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and callable_error_indexed_returns_error(error_index, annotations, module_annotations, annotation.owner, row_module, row_qualifier)
 
         # The bare callee name of `try f(...) else …`, "" for anything else. Deliberately
         # bare-ident only: a qualified callee would need the module-resolution dance above,
