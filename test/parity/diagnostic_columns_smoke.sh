@@ -43,22 +43,29 @@ agree=0; pending=0; diverged=0; fixtures=0
 for fixture in "$FIXTURES"/*.elisa; do
     [ -f "$fixture" ] || continue
     fixtures=$((fixtures + 1))
-    paste -d'#' <(positions "$EC" "$fixture") <(positions "$BIN" "$fixture") > "$WORK/pairs" 2>/dev/null
-    while IFS='#' read -r a b; do
-        [ -n "$a" ] && [ -n "$b" ] || continue
-        a_line="${a%%|*}"; a_rest="${a#*|}"; a_span="${a_rest%%|*}"; a_msg="${a_rest#*|}"
-        b_line="${b%%|*}"; b_rest="${b#*|}"; b_span="${b_rest%%|*}"; b_msg="${b_rest#*|}"
-        # Only compare diagnostics the two agree are the same one.
-        [ "$a_line" = "$b_line" ] && [ "$a_msg" = "$b_msg" ] || continue
-        if [ -z "$b_span" ]; then
-            pending=$((pending + 1))
-        elif [ "$a_span" = "$b_span" ]; then
-            agree=$((agree + 1))
-        else
-            diverged=$((diverged + 1))
-            [ "$diverged" -le 10 ] && echo "  DIVERGED ${fixture##*/} line $a_line: stage0 $a_span, stage1 $b_span" >&2
-        fi
-    done < "$WORK/pairs"
+    positions "$EC" "$fixture" > "$WORK/a" 2>/dev/null
+    positions "$BIN" "$fixture" > "$WORK/b" 2>/dev/null
+    counts=$(awk -F'|' -v fx="${fixture##*/}" -v shown="$diverged" '
+        NR == FNR { key = $1 "|" $3; seen[key]++; span[key, seen[key]] = $2; next }
+        {
+            key = $1 "|" $3
+            used[key]++
+            if (used[key] > seen[key]) next          # stage1 row stage0 never printed
+            a = span[key, used[key]]; b = $2
+            if (b == "") { pending++ }
+            else if (a == b) { agree++ }
+            else {
+                diverged++
+                if (shown + diverged <= 10)
+                    printf "  DIVERGED %s line %s: stage0 %s, stage1 %s\n", fx, $1, a, b > "/dev/stderr"
+            }
+        }
+        END { printf "%d %d %d", agree + 0, pending + 0, diverged + 0 }
+    ' "$WORK/a" "$WORK/b")
+    agree=$((agree + ${counts%% *}))
+    rest="${counts#* }"
+    pending=$((pending + ${rest%% *}))
+    diverged=$((diverged + ${rest##* }))
 done
 
 echo "diagnostic_columns_smoke: $fixtures fixtures — $agree agreeing, $pending pending (line only), $diverged diverged"
