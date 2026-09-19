@@ -3,7 +3,7 @@
 # direct self-recursion (parity with stage0 ports). A field whose type is an unresolved
 # bare name flags UnknownFieldType; a struct field typing itself directly (infinite size)
 # flags RecursiveStruct. Refs/optionals/generics are never flagged (sound subset).
-# 0 FP across the frontend + stdlib.
+# Check the complete compiler/include closure for false positives.
 #
 # Usage: test/parity/struct_layout_smoke.sh
 set -euo pipefail
@@ -15,9 +15,11 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 fail() { echo "struct-layout smoke FAIL: $1" >&2; exit 1; }
 
-# 1. An unknown field type MUST be flagged (only lowercase names, to avoid cross-module false positives).
+# 1. An unknown field type MUST be flagged regardless of capitalization.
 out=$(printf 'struct Point:\n    x: unknown\n    y: i64\n' | "$RPT")
 grep -q "L2 .*unknown type \"unknown\"" <<< "$out" || fail "unknown field type not flagged on field line: $out"
+out=$(printf 'struct Point:\n    x: Missing\n    y: i64\n' | "$RPT")
+grep -q 'L2 .*unknown type "Missing"' <<< "$out" || fail "capitalized unknown field type not flagged: $out"
 
 # 2. A directly self-recursive struct MUST be flagged.
 out=$(printf 'struct Node:\n    val: i64\n    next: Node\n' | "$RPT")
@@ -49,12 +51,16 @@ grep -q "unknown type \"M::Missing\"" <<< "$out" || fail "qualified unknown fiel
 out=$(printf 'module M::N:\n    struct Good:\n        x: i64\n\nstruct Uses:\n    x: M::N::Good\n' | "$RPT")
 grep -q "unknown type" <<< "$out" && fail "false positive on nested qualified type: $out"
 
-# 9. 0 FP across frontend + stdlib.
-n=0
-while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "unknown type|directly self-recursive" || true)
-  n=$((n + c))
-done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
-[ "$n" -eq 0 ] || fail "$n struct-layout false positives across frontend+stdlib"
+# 9. Check a COMPLETE compilation unit. Feeding each included file separately to the
+# reporter omits its imported types and mistakes real missing declarations for false
+# positives. The native driver's interface mode expands includes and runs semantic
+# validation over the actual compiler and stdlib without generating native code.
+layout_log="$REPO_ROOT/build/struct_layout_self.log"
+if ! bash "$REPO_ROOT/scripts/elisac_stage1.sh" -permissive -emit iface \
+    -o "$REPO_ROOT/build/struct_layout_self.elisai" "$REPO_ROOT/src/driver/elisac.elisa" \
+    >"$layout_log" 2>&1; then
+  tail -20 "$layout_log" >&2
+  fail "whole compiler/include closure rejected (see $layout_log)"
+fi
 
-echo "struct-layout smoke OK: flags unknown field types + direct self-recursion, silent on refs/optionals/mutuals, 0 false positives across frontend+stdlib"
+echo "struct-layout smoke OK: unknown types and recursion checked; whole compiler/include closure accepted"

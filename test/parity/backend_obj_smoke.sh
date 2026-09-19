@@ -339,7 +339,7 @@ debug_ir_case() {
     local dir="$BUILD/obj_dbgir"; mkdir -p "$dir"
     if [ ! -f "$BUILD/emit_obj_debug_ir" ]; then
         if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj_debug_ir.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" 2>/dev/null \
-           || ! clang -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
+           || ! clang -Wl,-dead_strip -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
             echo "  FAIL obj_dbgir_$name: could not build emit_obj_debug_ir"; return
         fi
     fi
