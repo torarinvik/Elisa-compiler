@@ -217,6 +217,7 @@ NAMES=(
     static_string_binding_argument
     static_string_binding_declaration
     static_string_binding_ternary
+    container_literal_block_tail
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -400,6 +401,7 @@ EXPECTS=(
     "argument 1 to \"take\" expects sview, got static u8&"
     "variable \"t\" expects sview, got static u8&"
     "ternary branches are incompatible: static u8& and sview"
+    "darray literal has no region to allocate in"
 )
 
 total=0
