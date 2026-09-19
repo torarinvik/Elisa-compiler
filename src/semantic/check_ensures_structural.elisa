@@ -124,15 +124,97 @@ extend Semantic:
 
         # A refstate consume `ensures X => !` on a non-ref param X (parser marks it
         # `__ensures_nonref` at 3900000076, owner=function, name=param).
-        def ens_check_ref_target(annotations: darray[Ast::EnumAnnotation], table: lmut SymbolTable) -> void:
+        #
+        # The annotation's `line` is that SENTINEL, not a source position, and this check
+        # used to hand it straight to the Diagnostic: every one of these printed
+        # `file.elisa:3900000075:` where stage0 prints `4:39-42`. The real line now travels
+        # in `detail_line`. stage0 also names the offending type (`, got Job`), which the
+        # renderer appends whenever the parameter's type resolves to a bare name here.
+        def ens_check_ref_target(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for annotation in annotations |table| -> table:
+                for annotation in file.enum_annotations |table| -> table:
                     if annotation.line == 3900000076:
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsuresRefTarget, name: annotation.name, line: 3900000076, expected: annotation.owner, actual: ""})
+                        consumed_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+                        resolved_consumed: bool = ens_param_type_at(file.top_decls, annotation.detail_line, annotation.name, consumed_type)
+                        consumed_name: sview = else_void_type_name(consumed_type) if resolved_consumed else sview("", 0, 0)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsuresRefTarget, name: annotation.name, line: annotation.detail_line, expected: annotation.owner, actual: consumed_name})
+
+        # Every struct this file declares, and whether it carries named states. A `typestate
+        # X:` declaration lowers to a Decl.Struct with has_named_states set, so both
+        # spellings land here.
+        def ens_struct_state_flags(declarations: darray[Ast::Decl], names: mutable darray[sview]&, stateful: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, stateful|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            names.push(struct_name)
+                            stateful.push(has_named_states)
+                        Decl.Module(module_name, module_body, module_line):
+                            ens_struct_state_flags(module_body, names, stateful)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            ens_struct_state_flags(scoped_body, names, stateful)
+                        _:
+                            pass
+
+        # The declared type of `parameter_name` on the function declared at `func_line`,
+        # into `out_type`. False when this file declares no such function or parameter.
+        def ens_param_type_at(declarations: darray[Ast::Decl], func_line: u32, parameter_name: sview, out_type: mutable Ast::Expr&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                resolved: mutable bool = false
+                for declaration in declarations |resolved, out_type|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            if line.line == func_line and not resolved:
+                                for parameter in parameters |resolved, out_type|:
+                                    if parameter.name == parameter_name and not resolved:
+                                        out_type <- parameter.type_expression
+                                        resolved <- true
+                        Decl.Module(module_name, module_body, module_line):
+                            resolved <- ens_param_type_at(module_body, func_line, parameter_name, out_type) if not resolved
+                        Decl.Scoped(scoped_body, scoped_line):
+                            resolved <- ens_param_type_at(scoped_body, func_line, parameter_name, out_type) if not resolved
+                        _:
+                            pass
+                return resolved
+
+        # stage0 (analyzer_func_types.go) requires an `ensures <param> => <State>`
+        # postcondition to resolve to a NAMED-STATE-BEARING target. stage1 recorded the
+        # postcondition -- the typestate flow checks already read it -- but never checked the
+        # target's type, so `def finish(job: mutable ParseJob&) -> bool ensures job => Ready`
+        # was accepted silently for a plain struct.
+        #
+        # SOUND SUBSET: fire only when the target parameter's type reduces to a bare name that
+        # IS a struct declared in this file, and that struct carries no named states. A type
+        # declared in another file is invisible to a single-file check (treating an unknown
+        # capitalized name as an error measured 5556 false positives the one time it was
+        # tried), and an alias, a generic parameter or a bracketed `T[State]` never reduces to
+        # a plain declared struct name -- all of those stay silent rather than guess.
+        def ens_check_state_target(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                struct_names: mutable darray[sview] = []
+                struct_stateful: mutable darray[bool] = []
+                ens_struct_state_flags(file.top_decls, struct_names, struct_stateful)
+                return if struct_names.count == 0
+                for postcondition in file.typestate_postconditions |table| -> table:
+                    target_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+                    resolved: bool = ens_param_type_at(file.top_decls, postcondition.line, postcondition.parameter_name, target_type)
+                    base: sview = else_void_type_name(target_type) if resolved else sview("", 0, 0)
+                    declared: mutable bool = false
+                    bears_states: mutable bool = false
+                    for index in 0..<struct_names.count |declared, bears_states|:
+                        if struct_names[index] == base and not declared and base != "":
+                            declared <- true
+                            bears_states <- struct_stateful[index]
+                    if declared and not bears_states:
+                        function_name: sview = ens_func_name_at(file.top_decls, postcondition.line)
+                        mutable_marker: u32 = 1 if type_marker_present_here(target_type, TokenKind.Mutable) else 0
+                        ref_marker: u32 = 1 if type_marker_present_here(target_type, TokenKind.Ampersand) else 0
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsuresStateTarget, name: postcondition.parameter_name, line: postcondition.line, expected: function_name, actual: base, expected_count: mutable_marker, actual_count: ref_marker})
 
         def check_ensures_structural(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- ens_check_ref_target(file.enum_annotations, table)
+                table <- ens_check_state_target(file, table)
+                table <- ens_check_ref_target(file, table)
                 return_bool_annotations: mutable darray[Ast::EnumAnnotation] = []
                 for annotation in file.enum_annotations |return_bool_annotations|:
                     return_bool_annotations.push(annotation) if ens_return_bool_annotation(annotation)
