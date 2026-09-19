@@ -42,6 +42,13 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
+# `ELISA_RUNTIME_OBJ=none` is an explicit product-link mode: emit only the
+# module object so a dependency graph can provide one shared Elisa runtime
+# archive. An unset value retains the normal standalone archive behavior.
+ELISA_OMIT_RUNTIME=0
+if [[ "${ELISA_RUNTIME_OBJ:-}" == "none" ]]; then
+  ELISA_OMIT_RUNTIME=1
+fi
 # Prefer LLVM's archive tool on macOS. `/usr/bin/ar` is an Xcode shim and
 # refuses to run until the machine-wide Xcode license has been accepted.
 if [[ -z "${ELISA_AR:-}" ]]; then
@@ -212,7 +219,11 @@ export ELISA_STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT}"
 export ELISA_STAGE1_SELF="${ELISA_STAGE1_SELF:-$BIN}"
 export ELISA_LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$LLVM_BIN_DIR}"
 [[ -x "$ELISA_CLANG_TOOL" ]] && export ELISA_CLANG="${ELISA_CLANG:-$ELISA_CLANG_TOOL}" || true
-export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+if (( ELISA_OMIT_RUNTIME )); then
+  export ELISA_RUNTIME_OBJ=""
+elif [[ -z "${ELISA_RUNTIME_OBJ:-}" ]]; then
+  export ELISA_RUNTIME_OBJ="$ROOT/build/runtime/elisacore_runtime.o"
+fi
 resolve_python_tools
 [[ -n "${PYTHON_HOST:-}" ]] && export PYTHON_BIN="${PYTHON_BIN:-$PYTHON_HOST}" || true
 # PYTHON_CONFIG is exported ONLY when the caller named one. An implicit `python3-config`
