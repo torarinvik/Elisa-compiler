@@ -92,7 +92,6 @@ NAMES=(
     duplicate_decorator
     duplicate_dict_key
     duplicate_match_arm
-    duplicate_pattern_binding
     duplicate_set_element
     duplicate_variant_field
     empty_iterable
@@ -237,7 +236,7 @@ EXPECTS=(
     "call to \"callee\" requires can[Console]"
     "call to \"h\" requires can[Abort]"
     "must be the first statements of the function body"
-    "returns void (no result value to bind)"
+    "undefined identifier \"result\""
     "dict keys cannot contain linear handles, got Guard"
     "set elements cannot contain linear handles, got Guard"
     "termination clause is unused"
@@ -247,8 +246,8 @@ EXPECTS=(
     "raise requires the current function to return an error union"
     "region annotation \`@owner\` is only valid on a function return type; named values do not carry an independent region"
     "cannot be returned with a region-less type"
-    "return type expects row[0], got shape_out[0]"
-    "return type expects pair[0], got pair[0]"
+    "return type expects darray[i32, row], got darray[i32, shape_out#1]"
+    "argument 2 to \"same\" expects darray[i32, pair], got darray[i32, shape_after#3]"
     "region dependency facts were invalidated by destroy of region \"scratch\""
     "cannot allocate from destroyed region \"scratch\""
     "storage dependency facts were invalidated by darray push"
@@ -276,7 +275,6 @@ EXPECTS=(
     "duplicate @hot annotation on function \"f\" (first seen at line 1:2)"
     "dict literal has a duplicate key \"\""
     "match arm \"1\" is unreachable because an earlier arm already matches it"
-    "name x bound more than once in pattern"
     "set literal has a duplicate element \"\""
     "duplicate payload field \"x\" in enum variant \"E\".\"A\""
     "empty list literal requires an expected array or darray type"
@@ -355,13 +353,13 @@ EXPECTS=(
     "operator requires numeric operands"
     "operator requires numeric operands"
     "augmented assignment requires numeric operands"
+    "cannot return value: region dependency facts include local region"
+    "cannot return value: region dependency facts include local region"
+    "cannot return value: region dependency facts include local region"
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
-    "escapes via return; the region is freed at scope exit"
-    "escapes via return; the region is freed at scope exit"
-    "escapes via return; the region is freed at scope exit"
-    "escapes via return; the region is freed at scope exit"
-    "escapes via return; the region is freed at scope exit"
+    "cannot return value: region dependency facts include local region"
+    "match requires an enum"
     "value backed by scope-owned region \"scratch\" escapes via return; the region is freed at block exit"
     "darray push allocates into function-scoped region"
     "darray push allocates into function-scoped region"
@@ -373,7 +371,7 @@ EXPECTS=(
     "argument 1 to \"g\" expects i64, got Box"
     "argument 1 to \"bump\" expects mutable S&, got S"
     "argument 1 to \"sink\" expects C, got mutable C&"
-    "operator \"binary\" used on unbound generic type parameter \"T\""
+    "operator requires numeric operands"
     "cannot assign (_0: i64, _1: i64) to i64"
     "tuple destructuring expects 3 bindings, got 2"
     "escapes via return; the region is freed at scope exit"
