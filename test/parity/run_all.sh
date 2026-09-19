@@ -435,14 +435,17 @@ oracle_lane=(
   "$REPO_ROOT/test/parity/semantic_acceptance_diff.sh"
   "$REPO_ROOT/test/parity/diagnostics_diff.sh"
   "$REPO_ROOT/test/parity/semantic_internal_diff.sh"
+  "$REPO_ROOT/test/parity/parse_error_message_diff.sh"
 )
 oracle_names=(
   "parser acceptance parity (stage1 == stage0)"
   "semantic acceptance parity (stage1 == stage0)"
   "diagnostics message parity (stage1 covers stage0)"
   "internal-suite differential (ratchet)"
+  "parse-error message parity (ratchet)"
 )
 push "diagnostic breadth baseline" "$REPO_ROOT/test/breadth/run.sh" --baseline "$REPO_ROOT/test/fixtures/diagnostics.baseline.tsv" "$REPO_ROOT/test/fixtures/diagnostics"
+push "diagnostic line parity (ratchet)" "$REPO_ROOT/test/parity/diagnostic_line_parity.sh"
 
 serial_lane=()
 for smoke in "$REPO_ROOT"/test/parity/*_smoke.sh; do
@@ -494,7 +497,7 @@ fi
 
 # Count CHECKS, not pool jobs: the two serial lanes are one job each but many checks.
 total_checks=$(( ${#JOB_NAMES[@]} + ${#serial_lane[@]} + ${#oracle_lane[@]} ))
-TOTAL_AVAILABLE=$(( $(ls "$REPO_ROOT"/test/parity/*_smoke.sh | wc -l) + 9 ))
+TOTAL_AVAILABLE=$(( $(ls "$REPO_ROOT"/test/parity/*_smoke.sh | wc -l) + 11 ))
 if [[ "$GATE_PROFILE" == full ]]; then
   echo "stage1 parity gate — ${total_checks} checks, ${GATE_JOBS} at a time (2 serial lanes):"
 else
