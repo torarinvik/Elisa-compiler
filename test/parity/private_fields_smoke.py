@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise privacy through real compiler front doors, including runtime success."""
+"""Exercise privacy through real compiler front doors, including identical LLVM for public/private layouts."""
 import os
 from pathlib import Path
 import subprocess
@@ -74,6 +74,13 @@ def main() -> i32:
     h = Vault::Handle()
     0 if Vault::Child::get(&h) == 41 else 1
 '''),
+    'visibility_named_fields': (False, '''struct Flags:
+    private: i64
+    public: i64
+def main() -> i32:
+    flags = Flags{private: 1, public: 2}
+    0 if flags.private + flags.public == 3 else 1
+'''),
     'same_name_global': (False, '''struct Handle:
     value: i64
 def main() -> i32:
@@ -91,6 +98,41 @@ def main() -> i32:
 def main() -> i32:
     item: Vault::Nested::Item = Vault::Nested::Item()
     0 if Vault::Nested::read(&item) == 3 else 1
+'''),
+    'relative_catch': (False, '''module Left:
+    module Ops:
+        error Failure:
+            Failed
+        def make() -> Vault::Handle error[Failure]:
+            Vault::Handle()
+    def get() -> Vault::Handle:
+        catch Ops::make():
+            value: value
+            error failure: Vault::Handle()
+module Right::Ops:
+    error Failure:
+        Failed
+    def make() -> i64 error[Failure]:
+        7
+def main() -> i32:
+    h = Left::get()
+    0 if Vault::read(&h) == 41 else 1
+'''),
+    'qualified_catch': (False, '''module Left::Ops:
+    error Failure:
+        Failed
+    def make() -> Vault::Handle error[Failure]:
+        Vault::Handle()
+module Right::Ops:
+    error Failure:
+        Failed
+    def make() -> i64 error[Failure]:
+        7
+def main() -> i32:
+    h: Vault::Handle = catch Left::Ops::make():
+        value: value
+        error failure: Vault::Handle()
+    0 if Vault::read(&h) == 41 else 1
 '''),
     'same_name_public': (False, '''module Other:
     struct Handle:
@@ -116,6 +158,12 @@ def main():
                     assert result.returncode != 0 and 'is private to module' in output, (compiler, name, result.returncode, output[-6000:])
                 else:
                     assert result.returncode == 0, (compiler, name, output[-6000:])
+                if name == 'constructor':
+                    private_ir = (work / 'case.ll').read_text()
+                    source.write_text((BASE + body).replace('private:', 'public :'))
+                    public = subprocess.run([str(compiler), '-emit', 'llvm', '-o', str(work / 'case.ll'), str(source)], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    assert public.returncode == 0, public.stderr
+                    assert (work / 'case.ll').read_text() == private_ir, 'field privacy changed generated LLVM'
                 print(f'{compiler.name}: {name} PASS', flush=True)
 if __name__ == '__main__':
     main()
