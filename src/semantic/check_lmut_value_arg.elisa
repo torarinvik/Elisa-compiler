@@ -7,11 +7,19 @@
 # Such bindings are immutable values, never mutable places.
 extend Semantic:
     private:
+        # Parameter rows are keyed only by bare function name. A full-program build can
+        # legitimately contain the same member name in several modules, so positional
+        # facts are sound only when that bare name resolves to one Func declaration.
+        def lvarg_signature_is_unique(table: SymbolTable&, callee: sview) -> bool:
+            can Abort.Panic:
+                return direct_function_count(table, callee) == 1
+
         # Whether callee's positional parameter at `position` is a `mutable T&` borrow (from the
         # function_param registry). Like an lmut parameter, it needs a mutable PLACE — a value or
         # a temporary is rejected the same way.
         def mutable_ref_position_of(table: SymbolTable&, callee: sview, position: u32) -> bool:
             can Abort.Panic:
+                false return if not lvarg_signature_is_unique(table, callee)
                 # Was an O(function_param_owner.count) scan of every parameter in the whole
                 # program, per call argument — see the matching comment on
                 # function_parameter_count in resolve_expr.elisa.
@@ -27,11 +35,13 @@ extend Semantic:
 
         def place_required_position(table: SymbolTable&, callee: sview, position: u32) -> bool:
             can Abort.Panic:
+                false return if not lvarg_signature_is_unique(table, callee)
                 return lmut_threads_position(table, callee, position) or mutable_ref_position_of(table, callee, position)
 
         # The declared bare type of callee's positional parameter at `position`, else "".
         def value_param_type_at(table: SymbolTable&, callee: sview, position: u32) -> sview:
             can Abort.Panic:
+                sview("", 0, 0) return if not lvarg_signature_is_unique(table, callee)
                 # Was an O(function_param_owner.count) scan of every parameter in the whole
                 # program, per call argument — see the matching comment on
                 # function_parameter_count in resolve_expr.elisa.
@@ -84,14 +94,35 @@ extend Semantic:
                     _:
                         return false
 
-        # How a binding borrows: 0 a value, 1 a plain `T&`, 2 a writable borrow (`mutable T&`
-        # or `lmut T`). The receiver map carries this instead of a bare bool so a diagnostic
-        # can spell the reference the way stage0 does rather than always saying `mutable`.
+        # How a binding is passed: 0 a plain value, 1 a plain `T&`, 2 an explicit
+        # writable borrow (`mutable T&` or `lmut T`), and 3 a mutable aggregate local
+        # whose initializer aliases an existing reference. Stage0 permits ordinary
+        # mutable aggregate values to be copied by value; only the aliasing form is
+        # represented as `mutable T&` at a by-value call boundary. The receiver map
+        # carries this distinction instead of a bare bool.
         def lvarg_ref_kind(type_expression: Ast::Expr) -> u8:
             can Abort.Panic:
-                0 return if not lvarg_type_is_ref(type_expression)
-                2 return if lvarg_type_is_lmut(type_expression) or lvarg_type_has_mutable(type_expression)
-                return 1
+                2 return if lvarg_type_is_lmut(type_expression) or (lvarg_type_is_ref(type_expression) and lvarg_type_has_mutable(type_expression))
+                1 return if lvarg_type_is_ref(type_expression)
+                return 0
+
+        # A mutable aggregate is address-backed for value-parameter assignability, but
+        # `&value` is still its first valid borrow and must not be diagnosed as a
+        # reference-to-reference. Only explicit reference annotations qualify here.
+        def ref_arg_is_explicit(argument: Ast::Expr, receiver_names: darray[sview]&, receiver_is_ref: darray[u8]&) -> bool:
+            can Abort.Panic:
+                name: sview = match argument:
+                    Expr.Ident(ident_name, ident_line): ident_name
+                    Expr.Move(operand, move_line): ident_name_of(operand)
+                    Expr.Paren(inner, paren_line): ident_name_of(inner)
+                    _: sview("", 0, 0)
+                false return if name == ""
+                index: mutable usize = 0
+                found: mutable bool = false
+                while index < receiver_names.count |found, index|:
+                    found <- true if not found and receiver_names[index] == name and (receiver_is_ref[index] == 1 or receiver_is_ref[index] == 2)
+                    index <- index + 1
+                return found
 
         # The base struct type of a REFERENCE argument — an ident (or `move ident`) naming a
         # binding whose type is a reference (`&`/`lmut`, per `receiver_is_ref`) — else "". Such
@@ -131,14 +162,13 @@ extend Semantic:
                     index <- index + 1
                 return kind
 
-        # Whether a by-value parameter type is one a borrow cannot inhabit. stage0's rule
-        # (AssignableTo in types_assignability.go) lets a `T&` satisfy a `T` parameter only
-        # when T is numeric or bool, so the builtin string and view structs belong here beside
-        # the registered ones — `lvarg_needs_place_tracking` already treats those three as
-        # structs for exactly this reason.
+        # Whether a by-value parameter type is one a mutable aggregate borrow cannot inhabit.
+        # For this inverse mismatch, Stage0 permits the builtin string/view representations
+        # (`cstr`, `sview`, `dstr`) through their special assignability rules; the parity gap is
+        # specifically registered user-defined aggregate types such as `Grade`.
         def lvarg_value_param_is_place(name: sview, table: SymbolTable&) -> bool:
             can Abort.Panic:
-                true return if name == "cstr" or name == "sview" or name == "dstr"
+                false return if name == "cstr" or name == "sview" or name == "dstr"
                 return is_registered_type(name, table)
 
         # Whether an argument explicitly takes the address of its operand. A reference binding
@@ -162,7 +192,7 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match argument:
                     Expr.Unary(operator, operand, unary_line):
-                        return ref_arg_base_type(operand, receiver_names, receiver_types, receiver_is_ref) if operator == TokenKind.Ampersand
+                        return ref_arg_base_type(operand, receiver_names, receiver_types, receiver_is_ref) if operator == TokenKind.Ampersand and ref_arg_is_explicit(operand, receiver_names, receiver_is_ref)
                         return sview("", 0, 0)
                     Expr.Paren(inner, paren_line):
                         return nested_ref_arg_base_type(inner, receiver_names, receiver_types, receiver_is_ref)
@@ -249,7 +279,7 @@ extend Semantic:
                                 # stage0 spells a writable borrow `mutable T&` and a plain one `T&`.
                                 # A Diagnostic may only carry source sviews, so the spelling lives in
                                 # the kind rather than being concatenated into `actual`.
-                                writable_borrow: bool = ref_arg_ref_kind(argument, receiver_names, receiver_types, receiver_is_ref) == 2
+                                writable_borrow: bool = ref_arg_ref_kind(argument, receiver_names, receiver_types, receiver_is_ref) >= 2
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefArgValueParam, name: callee_name, pos: Ast::expr_pos(argument), line: line.line, expected: value_param, actual: ref_base, expected_count: position + 1}) if ref_to_value and writable_borrow
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PlainRefArgValueParam, name: callee_name, pos: Ast::expr_pos(argument), line: line.line, expected: value_param, actual: ref_base, expected_count: position + 1}) if ref_to_value and not writable_borrow
                                 position <- position + 1
@@ -457,7 +487,14 @@ extend Semantic:
                             if base_type != "":
                                 receiver_names.push(name)
                                 receiver_types.push(base_type)
-                                receiver_is_ref.push(lvarg_ref_kind(type_expression))
+                                kind: mutable u8 = lvarg_ref_kind(type_expression)
+                                # A mutable value initialized directly from a reference
+                                # binding remains an alias, even though its annotation
+                                # has no `&`. This is the Stage0-invalid case; a fresh
+                                # mutable value such as `Vec3 = zeroed` is an ordinary
+                                # by-value aggregate and must remain accepted.
+                                kind <- 3 if kind == 0 and lvarg_type_has_mutable(type_expression) and ref_arg_is_explicit(value, receiver_names, receiver_is_ref)
+                                receiver_is_ref.push(kind)
                         Stmt.If(condition, then_body, else_body, line):
                             lvarg_collect_receivers(then_body, receiver_names, receiver_types, receiver_is_ref)
                             lvarg_collect_receivers(else_body, receiver_names, receiver_types, receiver_is_ref)
