@@ -55,7 +55,7 @@ sort -t$'\t' -k4,4 -k5,5 "$ORACLE" | awk -F'\t' '
         if ($2 + $3 > bestn) { best = $0; bestn = $2 + $3 }
     }
     END { flush() }
-' > "$WORK/deduped.tsv"
+' | awk -F'\t' 'BEGIN { OFS = "\t" } { for (i = 1; i <= 7; i++) if ($i == "") $i = "."; NF = 7; print }' > "$WORK/deduped.tsv"
 fi
 
 total=0
@@ -123,6 +123,11 @@ replay_chunk() {
     local total=0 mismatches=0
     : > "$1.mismatches.tsv"
 while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 overlay_b64; do
+    # `.` is the placeholder the dedupe writes for an empty column (see above); it is not
+    # valid base64, so this can never shadow a real value.
+    for v in fname_b64 opts_b64 src_b64 msgs_b64 overlay_b64; do
+        [[ "${!v}" == "." ]] && printf -v "$v" '%s' ""
+    done
     total=$((total + 1))
     opts="$(printf '%s' "$opts_b64" | openssl base64 -d -A)"
     hdr=""
@@ -213,7 +218,7 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
     [[ $((parse_errors + diagnostics)) -gt 0 ]] && actual_class=1
     if [[ "$expected_class" != "$actual_class" ]]; then
         mismatches=$((mismatches + 1))
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$fname_b64" "$errors" "$warnings" "$opts_b64" "$src_b64" "$msgs_b64" >> "$1.mismatches.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fname_b64" "$errors" "$warnings" "$opts_b64" "$src_b64" "${msgs_b64:-.}" "${overlay_b64:-.}" >> "$1.mismatches.tsv"
     fi
 done < "$1"
     printf '%s\t%s\n' "$total" "$mismatches" > "$1.count"
@@ -248,8 +253,9 @@ fi
 if [[ "$mismatches" -gt "$baseline" ]]; then
     echo "semantic internal diff FAILED: $mismatches/$total mismatches exceeds baseline $baseline" >&2
     echo "first 20 mismatching sources:" >&2
-    head -20 "$WORK/mismatches.tsv" | while IFS=$'\t' read -r f e w o s m; do
+    head -20 "$WORK/mismatches.tsv" | while IFS=$'\t' read -r f e w o s m ov; do
         echo "--- expected errors=$e warnings=$w opts=$(printf '%s' "$o" | openssl base64 -d -A)" >&2
+        [[ "${ov:-.}" == "." ]] || echo "    guest layout: $(printf '%s' "$ov" | openssl base64 -d -A)" >&2
         printf '%s' "$s" | openssl base64 -d -A | head -12 >&2
         echo >&2
     done
