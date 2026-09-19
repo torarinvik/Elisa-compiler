@@ -1,11 +1,10 @@
 # Unknown type-name checking: a type annotation (parameter, return, local `VarDecl`, or
 # `const`) that names a type which does not exist. Reuses the conservative, proven
 # `is_unresolved_type` predicate (from resolve_struct_layout) that the struct-field
-# `UnknownFieldType` check uses: it flags ONLY lowercase, multi-character names that are
-# neither a primitive nor a registered struct/enum. Empty names, single-letter generics
-# (`T`), capitalized/cross-module names, and non-bare type exprs (`darray[T]`, `T&`, `T?`,
-# qualified `A::B`) are never flagged — `bare_type_name` returns "" or a name the predicate
-# then clears, so false positives on real code are avoided. Parity: stage0's `unknown type`.
+# `UnknownFieldType` check uses: it flags every bare name that is neither a declared generic,
+# primitive, region, nor registered struct/enum. Empty names and single-letter generics (`T`)
+# remain exempt; structured expressions (`darray[T]`, `T&`, `T?`, qualified `A::B`) are handled
+# by the element walk or their qualified-name checks. Parity: stage0's `unknown type`.
 
 extend Semantic:
     private:
@@ -19,10 +18,13 @@ extend Semantic:
             return false if any owner in table.struct_field_owner where owner == name
             return interface_is_declared(table.protocol_declarations, name)
 
-        # Flag one type-annotation expression if its bare name is unresolved.
-        def check_type_annotation(type_expression: Ast::Expr, table: lmut SymbolTable) -> void:
+        # `Self` is a compiler-defined receiver type, but only inside an impl scope. Keeping
+        # the context explicit matters: a free `def f(x: Self)` and a struct field `x: Self`
+        # are still unknown types, while `impl P for T: def f(self: Self)` is well-formed.
+        def check_type_annotation(type_expression: Ast::Expr, allow_self: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 type_name: sview = bare_type_name(type_expression)
+                return if allow_self and type_name == "Self"
                 if is_protocol_constraint_name(type_name, table):
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProtocolRequiresConcreteType, name: type_name, pos: Ast::expr_pos(type_expression), line: expr_line(type_expression), expected: "", actual: ""})
                     return
@@ -72,19 +74,19 @@ extend Semantic:
         # check_type_annotation above — no double report). Covers statement AND
         # parameter positions (param payload lists read correctly since stage0
         # da3fb1c6 fixed brace-grower region inference).
-        def check_annotation_element_types(type_expression: Ast::Expr, line: u32, table: lmut SymbolTable) -> void:
+        def check_annotation_element_types(type_expression: Ast::Expr, line: u32, allow_self: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 no_siblings: darray[sview] = []
-                table <- check_annotation_element_types_with(type_expression, line, no_siblings, table)
+                table <- check_annotation_element_types_with(type_expression, line, no_siblings, allow_self, table)
 
 
         # Parameter positions pass the SIBLING parameter names: `i: IndexOf[xs]` uses
         # `xs` (a sibling param) as a VALUE argument to a dependent refinement, and
         # `SlotIndex[cap128]` uses a declared const — neither is a type name.
-        def check_annotation_element_types_with(type_expression: Ast::Expr, line: u32, sibling_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_annotation_element_types_with(type_expression: Ast::Expr, line: u32, sibling_params: darray[sview]&, allow_self: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 type_id: u32 = annotation_type_id(type_expression, table)
-                table <- check_interned_elements(type_id, type_expression, line, 0, sibling_params, table)
+                table <- check_interned_elements(type_id, type_expression, line, 0, sibling_params, allow_self, table)
 
 
         # Whether NAME is a VALUE in scope (a declared const, or a sibling parameter) —
@@ -96,6 +98,17 @@ extend Semantic:
                 if symbol_lookup is symbol:
                     return symbol.kind == SymbolKind.Const
                 return false
+
+        # The runtime's protocol carriers use a small, compiler-defined state slot that is
+        # not a nominal Elisa type: `Thread[..., Joinable|Pending]`, `Task[..., Pending]`,
+        # and `MutexGuard[Held]`. Preserve those state tags while still rejecting an unknown
+        # type in every ordinary generic argument (`darray[Thing]`, `Box[Thing]`, ...).
+        def is_protocol_state_argument(type_id: u32, element_position: u32, name: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                head: sview = interned_name(type_id, table)
+                true return if (head == "Thread" or head == "Task") and element_position == 1 and name in {"Joinable", "Pending"}
+                true return if head == "MutexGuard" and element_position == 0 and name == "Held"
+                return element_position == 0 and any typestate_name in table.typestate_struct_names where typestate_name == head
 
         # Recursively flag unresolved Named ELEMENT rows of an interned type. Depth-
         # bounded defensively (interned rows are acyclic by construction).
@@ -122,16 +135,16 @@ extend Semantic:
                         return Ast::pos_at_line(line)
 
 
-        def check_interned_elements(type_id: u32, annotation: Ast::Expr, line: u32, depth: u32, sibling_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_interned_elements(type_id: u32, annotation: Ast::Expr, line: u32, depth: u32, sibling_params: darray[sview]&, allow_self: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if type_id == 0 or depth > 16
                 element_count: u32 = interned_elem_count(type_id, table)
                 while element_position < element_count |element_position: u32 = 0, table|:
                     element_id: u32 = interned_elem(type_id, element_position, table)
                     element_name: sview = interned_name(element_id, table) if interned_kind(element_id, table) == SemTypeKind.Named else ""
-                    flagged: bool = element_name != "" and is_unresolved_type(element_name, table) and not type_arg_is_value_name(element_name, sibling_params, table)
+                    flagged: bool = element_name != "" and is_unresolved_type(element_name, table) and not (allow_self and element_name == "Self") and not type_arg_is_value_name(element_name, sibling_params, table) and not is_protocol_state_argument(type_id, element_position, element_name, table)
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: element_name, pos: type_ident_pos_in(annotation, element_name, line), line: line, expected: "", actual: ""}) if flagged
-                    table <- check_interned_elements(element_id, annotation, line, depth + 1, sibling_params, table)
+                    table <- check_interned_elements(element_id, annotation, line, depth + 1, sibling_params, allow_self, table)
                     element_position <- element_position + 1
 
         # Local `VarDecl` annotations, recursing into nested statement bodies. The
@@ -139,7 +152,7 @@ extend Semantic:
         # value-form type argument that names a param (`head: Expr[owner]`, where `owner`
         # is a value binding filling a region/dependent parameter of `Expr`) is recognized
         # as a VALUE, not flagged as an unknown type — mirrors the parameter-position path.
-        def check_unknown_types_in_body(statements: darray[Ast::Stmt], sibling_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_unknown_types_in_body(statements: darray[Ast::Stmt], sibling_params: darray[sview]&, allow_self: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 # LOCALS join the value-name set as the walk passes their declarations: a
                 # region-parameterized application `Expr[arena]` names the LOCAL `arena:
@@ -152,31 +165,28 @@ extend Semantic:
                 for statement in statements |table, scoped_names| -> table, scoped_names:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- check_type_annotation(type_expression, table)
+                            table <- check_type_annotation(type_expression, allow_self, table)
                             table <- check_ordinary_enum_variant_type(type_expression, table)
-                            table <- check_annotation_element_types_with(type_expression, line.line, scoped_names, table)
+                            table <- check_annotation_element_types_with(type_expression, line.line, scoped_names, allow_self, table)
                             scoped_names.push(name)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_unknown_types_in_body(then_body, scoped_names, table)
-                            table <- check_unknown_types_in_body(else_body, scoped_names, table)
+                            table <- check_unknown_types_in_body(then_body, scoped_names, allow_self, table)
+                            table <- check_unknown_types_in_body(else_body, scoped_names, allow_self, table)
                         Stmt.While(condition, body, line):
-                            table <- check_unknown_types_in_body(body, scoped_names, table)
+                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_unknown_types_in_body(body, scoped_names, table)
+                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, table)
                         Stmt.Block(kind, clause, binding, body, line):
                             scoped_names.push(binding) if binding != ""
-                            table <- check_unknown_types_in_body(body, scoped_names, table)
+                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table, scoped_names| -> table:
-                                table <- check_unknown_types_in_body(arm.body, scoped_names, table)
+                                table <- check_unknown_types_in_body(arm.body, scoped_names, allow_self, table)
                         _:
                             pass
 
-        # A type-alias RHS `type NameId = TARGET` must name a KNOWN type. Unlike a param/return
-        # annotation (where a bare capitalized unknown is an implicit generic, so is_unresolved_type
-        # skips capitals), an alias RHS resolves in a context with no implicit generics — a
-        # capitalized-unknown bare target IS an error. The ONLY legitimate capitalized bare names
-        # here are the alias's own type-params (`type Foo[Elem] = Elem`), so exclude the global
+        # A type-alias RHS `type NameId = TARGET` must name a KNOWN type. The only legitimate
+        # capitalized bare names here are the alias's own type-params (`type Foo[Elem] = Elem`), so exclude the global
         # `__alias_param` set (over-excluding — a param of another alias is skipped too — only ever
         # MISSES, never false-positives). Bare targets only (non-bare `darray[T]` return "").
         def alias_target_unresolved(name: sview, alias_params: darray[sview]&, table: SymbolTable&) -> bool:
@@ -211,9 +221,15 @@ extend Semantic:
                     alias_params.push(annotation.name) if annotation.owner == "__alias_param"
                 table <- check_alias_target_declarations(file.top_decls, alias_params, table)
 
+    private:
+        # Source offsets identify the actual scope even when #line resets line numbers in
+        # another included file. Both protocol and inherent implementations bind Self.
+        def is_impl_scope(pos: Ast::Pos, table: SymbolTable&) -> bool:
+            return any annotation in table.protocol_annotations where (annotation.owner == "__impl_scope" or annotation.owner == "__ext_concrete") and annotation.offset == pos.offset and annotation.line == pos.line
+
         # Entry point: check parameter, return, local, and const type annotations across all
         # declarations (recursing into modules and scoped blocks).
-        def check_unknown_type_name(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def check_unknown_type_name_in(declarations: darray[Ast::Decl], allow_self: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -222,25 +238,32 @@ extend Semantic:
                             for parameter in params |sibling_params|:
                                 sibling_params.push(parameter.name)
                             for parameter in params |table| -> table:
-                                table <- check_type_annotation(parameter.type_expression, table)
+                                table <- check_type_annotation(parameter.type_expression, allow_self, table)
                                 table <- check_ordinary_enum_variant_type(parameter.type_expression, table)
-                                table <- check_annotation_element_types_with(parameter.type_expression, line.line, sibling_params, table)
+                                table <- check_annotation_element_types_with(parameter.type_expression, line.line, sibling_params, allow_self, table)
                             if return_type is return_type_expr:
-                                table <- check_type_annotation(return_type_expr, table)
+                                table <- check_type_annotation(return_type_expr, allow_self, table)
                                 table <- check_ordinary_enum_variant_type(return_type_expr, table)
-                            table <- check_unknown_types_in_body(body, sibling_params, table)
+                            table <- check_unknown_types_in_body(body, sibling_params, allow_self, table)
                         Decl.Const(const_name, type_expression, value, is_mutable, const_line):
-                            table <- check_type_annotation(type_expression, table)
+                            table <- check_type_annotation(type_expression, allow_self, table)
                         Decl.Enum(enum_name, enum_variants, enum_is_const, enum_storage, enum_line):
                             # A variant PAYLOAD names a type like any annotation does; nothing
                             # checked these, so `A(Thing)` was accepted silently while stage0
                             # reported it.
                             for enum_variant in enum_variants |table| -> table:
                                 for payload_type in enum_variant.fields |table| -> table:
-                                    table <- check_type_annotation(payload_type, table)
+                                    table <- check_type_annotation(payload_type, allow_self, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_unknown_type_name(module_body, table)
+                            table <- check_unknown_type_name_in(module_body, allow_self, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_unknown_type_name(scoped_body, table)
+                            nested_allow_self: bool = allow_self or is_impl_scope(scoped_line, table)
+                            table <- check_unknown_type_name_in(scoped_body, nested_allow_self, table)
                         _:
                             pass
+
+    public:
+        # Free functions and ordinary scopes have no implicit receiver type.
+        def check_unknown_type_name(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_unknown_type_name_in(declarations, false, table)
