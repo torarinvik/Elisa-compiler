@@ -76,6 +76,25 @@ extend Semantic:
 
         const READONLY_FUNCTION_ROW: u32 = 4294967295
 
+        # The readonly-reference pass keeps a compact parallel declaration table because the
+        # parser AST does not carry module ownership on each function call. Build a hash-chain
+        # projection over that table once: resolver and parameter-contract queries otherwise
+        # rescan every declaration for every call in the imported proof system.
+        struct ReadonlyFunctionIndex:
+            heads: mutable dict[u64, u32]
+            next: mutable darray[u32]
+
+        def readonly_function_index_head(index: ReadonlyFunctionIndex&, name: sview) -> u32:
+            can Abort.Panic:
+                return head if index.heads.get(name_hash(name)) is head else READONLY_FUNCTION_ROW
+
+        def build_readonly_function_index(names: darray[sview]&, index: mutable ReadonlyFunctionIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for row in 0..<names.count |row, names, index|:
+                    previous: u32 = readonly_function_index_head(index, names[row])
+                    index.next <- index.next.push(previous)
+                    index.heads <- index.heads.put(name_hash(names[row]), row.u32())
+
         def record_readonly_function(table: lmut SymbolTable, name: sview, owner: sview) -> void:
             can Memory.Allocate, Abort.Panic:
                 table.readonly_function_names <- table.readonly_function_names.push(name)
@@ -101,7 +120,7 @@ extend Semantic:
         # Resolve a direct call before consulting its reference-parameter rows.
         # Module-local declarations shadow top-level functions; a top-level declaration
         # is next; among module members only imports visible to this source are candidates.
-        def readonly_resolve_callee_owner(callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, callee: sview, caller_owner: sview, qualified_owner: sview, is_qualified: bool, resolved_owner: mutable sview&, table: SymbolTable&) -> bool:
+        def readonly_resolve_callee_owner(callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, callee: sview, caller_owner: sview, qualified_owner: sview, is_qualified: bool, resolved_owner: mutable sview&, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 if is_qualified:
                     false return if not readonly_function_declared(table, callee, qualified_owner)
@@ -115,31 +134,33 @@ extend Semantic:
                     return true
                 distinct_owners: mutable usize = 0
                 selected_owner: mutable sview = ""
-                while index < callee_names.count |index: usize = 0, distinct_owners, selected_owner|:
-                    if positions[index] == READONLY_FUNCTION_ROW and callee_names[index] == callee and readonly_unqualified_owner_visible(table, caller_owner, callee, callee_owners[index]):
+                row: mutable u32 = readonly_function_index_head(lookup, callee)
+                while row != READONLY_FUNCTION_ROW |row, distinct_owners, selected_owner|:
+                    if positions[row.usize()] == READONLY_FUNCTION_ROW and callee_names[row.usize()] == callee and readonly_unqualified_owner_visible(table, caller_owner, callee, callee_owners[row.usize()]):
                         first_for_owner: mutable bool = true
-                        while earlier < index |earlier: usize = 0, first_for_owner, callee_names, callee_owners, positions|:
-                            first_for_owner <- false if positions[earlier] == READONLY_FUNCTION_ROW and callee_names[earlier] == callee and callee_owners[earlier] == callee_owners[index]
-                            earlier <- earlier + 1
+                        earlier: mutable u32 = readonly_function_index_head(lookup, callee)
+                        while earlier != row |earlier, first_for_owner, callee_names, callee_owners, positions|:
+                            first_for_owner <- false if positions[earlier.usize()] == READONLY_FUNCTION_ROW and callee_names[earlier.usize()] == callee and callee_owners[earlier.usize()] == callee_owners[row.usize()]
+                            earlier <- lookup.next[earlier.usize()]
                         if first_for_owner:
                             distinct_owners <- distinct_owners + 1
-                            selected_owner <- callee_owners[index]
-                    index <- index + 1
+                            selected_owner <- callee_owners[row.usize()]
+                    row <- lookup.next[row.usize()]
                 false return if distinct_owners != 1
                 resolved_owner <- selected_owner
                 return true
 
 
-        def readonly_callee_target(expression: Ast::Expr, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, caller_owner: sview, callee_name: mutable sview&, callee_owner: mutable sview&, table: SymbolTable&) -> bool:
+        def readonly_callee_target(expression: Ast::Expr, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, caller_owner: sview, callee_name: mutable sview&, callee_owner: mutable sview&, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 match expression:
                     Expr.Ident(name, line):
                         callee_name <- name
-                        return readonly_resolve_callee_owner(callee_names, callee_owners, positions, name, caller_owner, "", false, callee_owner, table)
+                        return readonly_resolve_callee_owner(callee_names, callee_owners, positions, lookup, name, caller_owner, "", false, callee_owner, table)
                     Expr.Scope(base, name, line):
                         if base is Expr.Ident(module_name, module_line):
                             callee_name <- name
-                            return readonly_resolve_callee_owner(callee_names, callee_owners, positions, name, caller_owner, module_name, true, callee_owner, table)
+                            return readonly_resolve_callee_owner(callee_names, callee_owners, positions, lookup, name, caller_owner, module_name, true, callee_owner, table)
                     _:
                         pass
                 return false
@@ -147,29 +168,30 @@ extend Semantic:
 
         # Cache includes both namespace owner and function name: the same spelling in
         # two modules can have different reference contracts at the same argument slot.
-        def mutable_ref_param_type(callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, callee: sview, owner: sview, position: usize) -> sview:
+        def mutable_ref_param_type(callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, callee: sview, owner: sview, position: usize) -> sview:
             can Abort.Panic:
                 for cache_index in 0..<cache_callees.count |cache_callees, cache_owners, cache_positions, cache_types|:
                     return cache_types[cache_index] if cache_callees[cache_index] == callee and cache_owners[cache_index] == owner and cache_positions[cache_index] == position.u32()
                 result: mutable sview = ""
                 found: mutable bool = false
                 ambiguous: mutable bool = false
-                while index < callee_names.count |index: usize = 0|:
-                    if callee_names[index] == callee and callee_owners[index] == owner and positions[index] == position.u32():
+                row: mutable u32 = readonly_function_index_head(lookup, callee)
+                while row != READONLY_FUNCTION_ROW |row|:
+                    if callee_names[row.usize()] == callee and callee_owners[row.usize()] == owner and positions[row.usize()] == position.u32():
                         # This pre-check has no module/overload-resolution context. Only report
                         # readonly-to-mutable when EVERY same-named declaration seen at this
                         # position requires the SAME mutable referent. A value/readonly-ref
                         # candidate makes the mismatch inconclusive; a differently typed
                         # mutable candidate may belong to a sibling module with the same member
                         # name. The ordinary resolver owns the exact call target.
-                        if type_names[index] == "":
+                        if type_names[row.usize()] == "":
                             ambiguous <- true
                         elif not found:
-                            result <- type_names[index]
+                            result <- type_names[row.usize()]
                             found <- true
-                        elif result != type_names[index]:
+                        elif result != type_names[row.usize()]:
                             ambiguous <- true
-                    index <- index + 1
+                    row <- lookup.next[row.usize()]
                 resolved: sview = "" if ambiguous or not found else result
                 cache_callees.push(callee)
                 cache_owners.push(owner)
@@ -206,37 +228,37 @@ extend Semantic:
                             pass
 
 
-        def check_readonly_call(expression: Ast::Expr, readonly_names: darray[sview]&, readonly_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_readonly_call(expression: Ast::Expr, readonly_names: darray[sview]&, readonly_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
                         target_name: mutable sview = ""
                         target_owner: mutable sview = ""
-                        if readonly_callee_target(callee, callee_names, callee_owners, positions, table.current_module, &target_name, &target_owner, table):
+                        if readonly_callee_target(callee, callee_names, callee_owners, positions, lookup, table.current_module, &target_name, &target_owner, table):
                             while argument_index < arguments.count |table, cache_callees, cache_owners, cache_positions, cache_types, argument_index: usize = 0| -> table:
                                 argument_root: sview = readonly_root_name(arguments[argument_index])
                                 readonly_index: i64 = readonly_name_index(readonly_names, argument_root)
                                 # Only positional readonly arguments can produce this diagnostic.
                                 # Avoid scanning all parameter metadata for unrelated arguments.
                                 if readonly_index >= 0 and argument_names[argument_index] == "":
-                                    expected_type: sview = mutable_ref_param_type(callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, target_name, target_owner, argument_index)
+                                    expected_type: sview = mutable_ref_param_type(callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, target_name, target_owner, argument_index)
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgument, name: target_name, pos: Ast::expr_pos(arguments[argument_index]), line: line.line, expected: expected_type, actual: readonly_types[readonly_index.usize()], expected_count: argument_index.u32() + 1}) if expected_type != ""
                                 argument_index <- argument_index + 1
-                        table <- check_readonly_call(callee, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(callee, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         for argument in arguments |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
-                            table <- check_readonly_call(argument, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(argument, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Field(object, field, line):
-                        table <- check_readonly_call(object, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(object, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Index(object, index, line):
-                        table <- check_readonly_call(object, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                        table <- check_readonly_call(index, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(object, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(index, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- check_readonly_call(left, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                        table <- check_readonly_call(right, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(left, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(right, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Unary(operator, operand, line):
-                        table <- check_readonly_call(operand, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(operand, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Paren(inner, line):
-                        table <- check_readonly_call(inner, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(inner, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     _:
                         pass
 
@@ -255,7 +277,7 @@ extend Semantic:
         # has to be removed: a block's locals do not outlive it (using one after
         # its block is "undefined identifier") and a local may not shadow a
         # parameter ("duplicate local ... already defined as param").
-        def check_readonly_statements(statements: darray[Ast::Stmt], readonly_names: darray[sview]&, readonly_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_readonly_statements(statements: darray[Ast::Stmt], readonly_names: darray[sview]&, readonly_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 scope_names: mutable darray[sview] = [entry for entry in readonly_names]
                 scope_types: mutable darray[sview] = [entry for entry in readonly_types]
@@ -274,13 +296,13 @@ extend Semantic:
                             readonly_target_pos: Ast::Pos = readonly_ident_pos if target is Ast::Expr.Ident(_, readonly_ident_pos) else line
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutation, name: root, pos: readonly_target_pos, line: line.line, expected: scope_types[readonly_index.usize()], actual: ""}) if readonly_index >= 0 and mutating
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutationNote, name: root, pos: readonly_target_pos, line: line.line, expected: scope_types[readonly_index.usize()], actual: ""}) if readonly_index >= 0 and mutating
-                            table <- check_readonly_call(value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Expr(expression, line):
-                            table <- check_readonly_call(expression, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(expression, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Return(value, line):
-                            table <- check_readonly_call(return_value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table) if value is return_value
+                            table <- check_readonly_call(return_value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if value is return_value
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- check_readonly_call(value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                             # Recorded AFTER its own initializer is checked: the
                             # declaration is not in scope for the value it binds.
                             # A leading `mutable name:` is a binding qualifier,
@@ -297,26 +319,26 @@ extend Semantic:
                                 scope_names.push(name)
                                 scope_types.push(bare_type_name_through_ref(type_expression))
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_readonly_call(condition, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(then_body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(else_body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(condition, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_statements(then_body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_statements(else_body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.While(condition, body, line):
-                            table <- check_readonly_call(condition, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(condition, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_readonly_call(iterable, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(iterable, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- check_readonly_call(scrutinee, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(scrutinee, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                             for arm in arms |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
-                                table <- check_readonly_statements(arm.body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                                table <- check_readonly_statements(arm.body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         _:
                             pass
 
 
-        def check_readonly_ref_declarations(declarations: darray[Ast::Decl], callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_readonly_ref_declarations(declarations: darray[Ast::Decl], callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
                     match declaration:
@@ -334,14 +356,14 @@ extend Semantic:
                                 if type_is_readonly_ref(param.type_expression) and not param.is_mutable:
                                     readonly_names.push(param.name)
                                     readonly_types.push(bare_type_name_through_ref(param.type_expression))
-                            table <- check_readonly_statements(body, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_statements(body, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Decl.Module(name, body, line):
                             outer_module: sview = table.current_module
                             table.current_module <- name
-                            table <- check_readonly_ref_declarations(body, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_ref_declarations(body, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                             table.current_module <- outer_module
                         Decl.Scoped(body, line):
-                            table <- check_readonly_ref_declarations(body, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_ref_declarations(body, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         _:
                             pass
 
@@ -399,57 +421,57 @@ extend Semantic:
                 return result
 
         # Flag `f(&recv.field)` where the field is non-mutable and the parameter is `mutable T&`.
-        def readonly_amp_check_expr(expression: Ast::Expr, receiver_names: darray[sview]&, receiver_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def readonly_amp_check_expr(expression: Ast::Expr, receiver_names: darray[sview]&, receiver_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
                         target_name: mutable sview = ""
                         target_owner: mutable sview = ""
-                        if readonly_callee_target(callee, callee_names, callee_owners, positions, table.current_module, &target_name, &target_owner, table):
+                        if readonly_callee_target(callee, callee_names, callee_owners, positions, lookup, table.current_module, &target_name, &target_owner, table):
                             while argument_index < arguments.count |table, cache_callees, cache_owners, cache_positions, cache_types, argument_index: usize = 0| -> table:
                                 field_type: sview = readonly_amp_field_type(arguments[argument_index], receiver_names, receiver_types, table)
-                                expected_type: sview = mutable_ref_param_type(callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, target_name, target_owner, argument_index)
+                                expected_type: sview = mutable_ref_param_type(callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, target_name, target_owner, argument_index)
                                 mismatch: bool = field_type != "" and expected_type != "" and argument_names[argument_index] == ""
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgument, name: target_name, pos: Ast::expr_pos(arguments[argument_index]), line: line.line, expected: expected_type, actual: field_type, expected_count: argument_index.u32() + 1}) if mismatch
                                 argument_index <- argument_index + 1
                         for argument in arguments |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
-                            table <- readonly_amp_check_expr(argument, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_expr(argument, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Paren(inner, paren_line):
-                        table <- readonly_amp_check_expr(inner, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- readonly_amp_check_expr(inner, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Binary(left, operator, right, binary_line):
-                        table <- readonly_amp_check_expr(left, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                        table <- readonly_amp_check_expr(right, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- readonly_amp_check_expr(left, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- readonly_amp_check_expr(right, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     _:
                         pass
 
-        def readonly_amp_check_stmts(statements: darray[Ast::Stmt], receiver_names: darray[sview]&, receiver_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def readonly_amp_check_stmts(statements: darray[Ast::Stmt], receiver_names: darray[sview]&, receiver_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- readonly_amp_check_expr(expression, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_expr(expression, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- readonly_amp_check_expr(value, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_expr(value, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- readonly_amp_check_expr(value, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_expr(value, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Return(value, line):
-                            table <- readonly_amp_check_expr(return_value, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table) if value is return_value
+                            table <- readonly_amp_check_expr(return_value, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if value is return_value
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- readonly_amp_check_stmts(then_body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- readonly_amp_check_stmts(else_body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_stmts(then_body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_stmts(else_body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.While(condition, body, line):
-                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
-                                table <- readonly_amp_check_stmts(arm.body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                                table <- readonly_amp_check_stmts(arm.body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         _:
                             pass
 
-        def readonly_amp_check_declarations(declarations: darray[Ast::Decl], callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def readonly_amp_check_declarations(declarations: darray[Ast::Decl], callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
                     match declaration:
@@ -461,14 +483,14 @@ extend Semantic:
                                 if base_type != "":
                                     receiver_names.push(param.name)
                                     receiver_types.push(base_type)
-                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_stmts(body, receiver_names, receiver_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Decl.Module(name, body, line):
                             outer_module: sview = table.current_module
                             table.current_module <- name
-                            table <- readonly_amp_check_declarations(body, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_declarations(body, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                             table.current_module <- outer_module
                         Decl.Scoped(body, line):
-                            table <- readonly_amp_check_declarations(body, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- readonly_amp_check_declarations(body, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         _:
                             pass
 
@@ -483,6 +505,8 @@ extend Semantic:
                 cache_owners: mutable darray[sview] = []
                 cache_positions: mutable darray[u32] = []
                 cache_types: mutable darray[sview] = []
+                lookup: mutable ReadonlyFunctionIndex = ReadonlyFunctionIndex{heads: {}, next: []}
                 table <- table.collect_mutable_ref_params(declarations, "", callee_names, callee_owners, positions, type_names)
-                table <- check_readonly_ref_declarations(declarations, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
-                table <- readonly_amp_check_declarations(declarations, callee_names, callee_owners, positions, type_names, cache_callees, cache_owners, cache_positions, cache_types, table)
+                build_readonly_function_index(callee_names, &lookup)
+                table <- check_readonly_ref_declarations(declarations, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                table <- readonly_amp_check_declarations(declarations, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
