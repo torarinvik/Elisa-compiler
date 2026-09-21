@@ -1,6 +1,6 @@
 # Scope smoke — BINDINGS and BLOCKS: an or-chain whose alternatives bind the same name at
 # different payload slots, a declaration that must not outlive its block, a value block's
-# trailing expression, and match ALTERNATION arms. These are the gaps gen2 found by trying to
+# trailing expression, match ALTERNATION arms, and a `while` loop expression's yield. These are the gaps gen2 found by trying to
 # compile the compiler; none of them is visible by inspection, because every program here
 # compiles clean and then returns the wrong answer.
 
@@ -153,3 +153,70 @@ def main() -> i64:
     return width("f64")
 EOF
 )" 8
+
+# 8. A `while` loop expression yields its header accumulator exactly as a `for` does: in tail
+#    position, bound to a name, as a value block's tail, past an early `return`, with captured
+#    outer mutables beside the declared counter (repo-health rh_pylock's shape), and when it
+#    yields a second accumulator rather than the counter. 77 = every check agreed; anything
+#    else is the bitmask of the checks that failed.
+differential while_loop_expression_yields "$(cat <<'EOF'
+def count_to(n: usize) -> usize:
+    while i < n |i: usize = 0| -> i:
+        i <- i + 1
+
+
+def count_bound(n: usize) -> usize:
+    x: usize = while i < n |i: usize = 0| -> i:
+        i <- i + 1
+    x
+
+
+def in_block(n: usize) -> usize:
+    y: usize =
+        base: usize = 10
+        while i < n |i: usize = base| -> i:
+            i <- i + 1
+    y
+
+
+def first_negative(values: i64[3]) -> usize:
+    while i < 3 |i: usize = 0| -> i:
+        return i if values[i] < 0
+        i <- i + 1
+
+
+def scan_end(data: i64[4], start: usize, end: usize) -> usize:
+    limit: mutable usize = end
+    quote: mutable i64 = 0
+    while i < limit |i: usize = start, limit, quote| -> i:
+        return i if data[i] == 35 and quote == 0
+        quote <- data[i] if data[i] == 34 and quote == 0
+        i <- i + 1
+
+
+def sum_while(values: i64[3]) -> i64:
+    while i < 3 |i: usize = 0, sum: i64 = 0| -> sum:
+        sum <- sum + values[i]
+        i <- i + 1
+
+
+def for_count(n: usize) -> usize:
+    for k in 0..<n |c: usize = 0| -> c:
+        c <- c + 1
+
+
+def main() -> i64:
+    fails: mutable i64 = 0
+    fails <- fails + 1 if count_to(5) != 5 or count_to(5) != for_count(5)
+    fails <- fails + 2 if count_bound(7) != 7
+    fails <- fails + 4 if in_block(13) != 13
+    negative: i64[3] = [1, -1, 3]
+    positive: i64[3] = [1, 2, 3]
+    fails <- fails + 8 if first_negative(negative) != 1 or first_negative(positive) != 3
+    hash: i64[4] = [1, 35, 2, 3]
+    plain: i64[4] = [1, 2, 3, 4]
+    fails <- fails + 16 if scan_end(hash, 0, 4) != 1 or scan_end(plain, 0, 4) != 4 or scan_end(plain, 3, 2) != 3
+    fails <- fails + 32 if sum_while(positive) != 6
+    return 77 if fails == 0 else fails
+EOF
+)" 77
