@@ -217,6 +217,7 @@ NAMES=(
     static_string_binding_declaration
     static_string_binding_ternary
     container_literal_block_tail
+    discarded_loop_value
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -400,6 +401,7 @@ EXPECTS=(
     "variable \"t\" expects sview, got static u8&"
     "ternary branches are incompatible: static u8& and sview"
     "darray literal has no region to allocate in"
+    "accumulator loop result \`valid\` is discarded; make the loop the final expression of its block"
 )
 
 total=0
