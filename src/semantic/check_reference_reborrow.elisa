@@ -1,0 +1,676 @@
+# `&name` where `name` is ALREADY a reference (`name: T&`, `name: mutable T&`, `name: lmut T`,
+# a `T&?` narrowed by `is`, or an unannotated local copied from one) builds a reference to that
+# reference, `T&&`. stage0 types it exactly so and rejects it wherever the destination is not
+# itself `T&&`. stage1 used to accept it everywhere the older nested-reference test in
+# check_lmut_value_arg did not look (inside `catch` and `raise ... if`, behind a module-qualified
+# callee, into an immutable `T&` parameter, a return, a struct field, a typed `with`) and then
+# lowered it to the address of the PARAMETER'S OWN SLOT, so the callee read and wrote the wrong
+# memory (elisa-engine: a SIGTRAP in world_spawn, a wrong audio-recovery target, an input
+# struct that never advanced).
+#
+# stage0's rule, measured one probe per row:
+#   rejected: `&ref` as an argument to `T&`, `mutable T&`, `lmut T`, by-value `T`, `void&`,
+#     `T&?` or `darray[T]&`; as an annotated `T&` local's value, a typed `with`, a `return`
+#     of `T&`, a `T&` struct-literal field, a UFCS receiver, a field-access base; and an
+#     unannotated `r = &ref` later used where a `T&` is wanted (reported at that use).
+#   accepted: a `T&&` destination; a generic one (`T`, or `T&` with T a type parameter);
+#     `(&ref).cast[...]`; `&ref.field` (the address of a FIELD); an unannotated `r = &ref`
+#     that is only forwarded to `T&&`; and any binding that merely SHADOWS the reference
+#     (a for-loop element, a pattern binder, a lambda parameter).
+#
+# SOUND subset: a call is judged only when EVERY declaration its bare name reaches rejects the
+# argument, so an overload or a generic never produces a false report.
+#
+# Binding kinds, innermost binding wins: 0 not a reference (recorded only to SHADOW one),
+# 1 reference, 2 reference to a reference (`r = &ref`), 3 optional reference (`T&?`).
+extend Semantic:
+    private:
+        # Reference layers a declared type carries: `T&` / `lmut T` -> 1, `T&&` -> 2, a plain
+        # type -> 0. Storage and mutability qualifiers are transparent. 255 for a shape this
+        # check does not model (an optional, a function type, an untyped slot).
+        def rr_type_ref_depth(type_expression: Ast::Expr) -> u8:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        inner: u8 = rr_type_ref_depth(operand)
+                        255 return if inner == 255
+                        inner + 1 return if operator == TokenKind.Ampersand or operator == TokenKind.Lmut
+                        inner return if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail
+                        return 255
+                    Expr.Paren(inner_type, paren_pos):
+                        return rr_type_ref_depth(inner_type)
+                    Expr.Ident(type_name, ident_pos):
+                        return 0
+                    Expr.Scope(scope_base, scope_name, scope_pos):
+                        return 0
+                    Expr.Index(indexed_type, index_type, index_pos):
+                        return 0
+                    Expr.IndexN(indexed_head, index_arguments, index_n_pos):
+                        return 0
+                    _:
+                        return 255
+
+        # A type with its outer storage/mutability qualifiers and parentheses removed, so
+        # `mutable T&?` exposes its `?`.
+        def rr_peel_qualifiers(type_expression: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        rr_peel_qualifiers(operand) return if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail
+                    Expr.Paren(inner_type, paren_pos):
+                        return rr_peel_qualifiers(inner_type)
+                    _:
+                        pass
+                return type_expression
+
+        # The payload of an optional type `X?`, else Invalid.
+        def rr_optional_payload(type_expression: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                peeled: Ast::Expr = rr_peel_qualifiers(type_expression)
+                match peeled:
+                    Expr.Unary(operator, operand, unary_pos):
+                        operand return if operator == TokenKind.Question
+                    _:
+                        pass
+                return (Ast::Expr.Invalid)
+
+        # The binding kind a declared type gives its name.
+        def rr_binding_kind_of_type(type_expression: Ast::Expr) -> u8:
+            can Abort.Panic:
+                1 return if rr_type_ref_depth(type_expression) == 1
+                3 return if rr_type_ref_depth(rr_optional_payload(type_expression)) == 1
+                return 0
+
+        # Whether `name` is a struct or enum the program declares. Narrower than
+        # is_registered_type on purpose: an alias or an extern type may stand for anything.
+        def rr_is_nominal_type(name: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for symbol in table.symbols:
+                    true return if symbol.name == name and (symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum)
+                return false
+
+        def rr_is_container_type(name: sview) -> bool:
+            can Abort.Panic:
+                return name in {"darray", "view", "dview", "dict", "set", "slice"}
+
+        # Whether a type names something concrete — a primitive, a declared struct or enum, or
+        # a container of one — rather than a generic parameter or a name this check cannot see.
+        def rr_type_is_concrete(type_expression: Ast::Expr, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return rr_type_is_concrete(operand, table)
+                    Expr.Paren(inner_type, paren_pos):
+                        return rr_type_is_concrete(inner_type, table)
+                    Expr.Ident(type_name, ident_pos):
+                        return is_primitive_type(type_name) or rr_is_container_type(type_name) or rr_is_nominal_type(type_name, table)
+                    Expr.Scope(scope_base, scope_name, scope_pos):
+                        return rr_is_nominal_type(scope_name, table)
+                    Expr.Index(indexed_type, index_type, index_pos):
+                        return rr_type_is_concrete(indexed_type, table)
+                    Expr.IndexN(indexed_head, index_arguments, index_n_pos):
+                        return rr_type_is_concrete(indexed_head, table)
+                    _:
+                        return false
+
+        # Whether a `&ref` (a `T&&`) may NOT flow into a slot declared `type_expression`. Only a
+        # `T&&` slot, a generic one, or one this check cannot model accepts it.
+        def rr_destination_rejects(type_expression: Ast::Expr, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                payload: Ast::Expr = rr_optional_payload(type_expression)
+                rr_destination_rejects(payload, table) return if rr_type_ref_depth(payload) != 255
+                false return if rr_type_ref_depth(type_expression) > 1
+                return rr_type_is_concrete(type_expression, table)
+
+        # Whether a declared type is written at all (a `name = value` local has none).
+        def rr_is_annotated(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Invalid:
+                        return false
+                    Expr.Absent:
+                        return false
+                    _:
+                        return true
+
+        def rr_kind_of(name: sview, names: darray[sview]&, kinds: darray[u8]&) -> u8:
+            can Abort.Panic:
+                index: mutable usize = names.count
+                while index > 0 |index|:
+                    index <- index - 1
+                    kinds[index] return if names[index] == name
+                return 0
+
+        def rr_origin_of(name: sview, names: darray[sview]&, origins: darray[sview]&) -> sview:
+            can Abort.Panic:
+                index: mutable usize = names.count
+                while index > 0 |index|:
+                    index <- index - 1
+                    origins[index] return if names[index] == name
+                return sview("", 0, 0)
+
+        # Record a binding. A non-reference is recorded only when it SHADOWS a reference; the
+        # scope otherwise stays as small as the function's reference bindings.
+        def rr_bind(name: sview, kind: u8, origin: sview, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == "" or name == "_"
+                return if kind == 0 and rr_kind_of(name, names, kinds) == 0
+                names.push(name)
+                kinds.push(kind)
+                origins.push(origin)
+
+        # Drop every binding recorded after `mark` — the end of a nested body.
+        def rr_restore(mark: usize, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if names.count <= mark
+                names.truncate(mark)
+                kinds.truncate(mark)
+                origins.truncate(mark)
+
+        # Every name a pattern binds shadows an outer binding of that name.
+        def rr_bind_pattern(pattern: Ast::Pattern, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Ast::Pattern.Binding(binding_name):
+                        rr_bind(binding_name, 0, sview("", 0, 0), names, kinds, origins)
+                    Ast::Pattern.Rest(rest_name):
+                        rr_bind(rest_name, 0, sview("", 0, 0), names, kinds, origins)
+                    Ast::Pattern.TypeBind(bound_type, binder):
+                        rr_bind(binder, 0, sview("", 0, 0), names, kinds, origins)
+                    Ast::Pattern.As(as_name, as_inner):
+                        rr_bind(as_name, 0, sview("", 0, 0), names, kinds, origins)
+                        for inner_pattern in as_inner |names, kinds, origins|:
+                            rr_bind_pattern(inner_pattern, names, kinds, origins)
+                    Ast::Pattern.Tuple(elements):
+                        for element in elements |names, kinds, origins|:
+                            rr_bind_pattern(element, names, kinds, origins)
+                    Ast::Pattern.Variant(variant_path, variant_fields):
+                        for variant_field in variant_fields |names, kinds, origins|:
+                            rr_bind_pattern(variant_field, names, kinds, origins)
+                    Ast::Pattern.Struct(struct_path, struct_fields):
+                        for struct_field in struct_fields |names, kinds, origins|:
+                            rr_bind_pattern(struct_field, names, kinds, origins)
+                    Ast::Pattern.Field(selector, field_inner):
+                        for field_pattern in field_inner |names, kinds, origins|:
+                            rr_bind_pattern(field_pattern, names, kinds, origins)
+                    Ast::Pattern.Or(options):
+                        for option in options |names, kinds, origins|:
+                            rr_bind_pattern(option, names, kinds, origins)
+                    _:
+                        pass
+
+        # The name an expression denotes when it is a bare identifier (through parentheses).
+        def rr_ident_name(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(ident_name, ident_pos):
+                        return ident_name
+                    Expr.Paren(paren_inner, paren_pos):
+                        return rr_ident_name(paren_inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # The `is` binders of an `if`/`while` condition (through `and` and parentheses). The
+        # binder of an optional reference IS a reference (stage0 rejects `&c` after
+        # `if opt is c`); every other binder only shadows.
+        def rr_bind_condition(condition: Ast::Expr, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, binary_pos):
+                        if operator == TokenKind.Is:
+                            subject_kind: u8 = rr_kind_of(rr_ident_name(left), names, kinds)
+                            binder: sview = rr_ident_name(right)
+                            if binder != "":
+                                binder_kind: mutable u8 = 0
+                                binder_kind <- 1 if subject_kind == 3
+                                rr_bind(binder, binder_kind, sview("", 0, 0), names, kinds, origins)
+                            match right:
+                                Expr.Call(pattern_callee, pattern_arguments, pattern_names, pattern_pos):
+                                    for pattern_argument in pattern_arguments |names, kinds, origins|:
+                                        rr_bind(rr_ident_name(pattern_argument), 0, sview("", 0, 0), names, kinds, origins)
+                                _:
+                                    pass
+                        if operator == TokenKind.And:
+                            rr_bind_condition(left, names, kinds, origins)
+                            rr_bind_condition(right, names, kinds, origins)
+                    Expr.Paren(condition_inner, paren_pos):
+                        rr_bind_condition(condition_inner, names, kinds, origins)
+                    _:
+                        pass
+
+        # The kind an unannotated `name = value` local takes: `&ref` makes a reference to a
+        # reference, any other `&place` a reference, and a bare binding copies its kind (a copy
+        # of a reference is the reference — stage0 rejects `x = ref` then `&x` as `T&&`).
+        def rr_inferred_kind(value: Ast::Expr, names: darray[sview]&, kinds: darray[u8]&) -> u8:
+            can Abort.Panic:
+                match value:
+                    Expr.Unary(operator, operand, unary_pos):
+                        0 return if operator != TokenKind.Ampersand
+                        operand_kind: u8 = rr_kind_of(rr_ident_name(operand), names, kinds)
+                        2 return if operand_kind == 1 or operand_kind == 2
+                        return 1
+                    Expr.Ident(ident_name, ident_pos):
+                        return rr_kind_of(ident_name, names, kinds)
+                    Expr.Paren(paren_inner, paren_pos):
+                        return rr_inferred_kind(paren_inner, names, kinds)
+                    _:
+                        return 0
+
+        # The reference binding `value` borrows again: `&name` (through parentheses) with
+        # `name` a reference. "" otherwise — `&name.field` is the address of a FIELD.
+        def rr_reborrowed_name(value: Ast::Expr, names: darray[sview]&, kinds: darray[u8]&) -> sview:
+            can Abort.Panic:
+                match value:
+                    Expr.Unary(operator, operand, unary_pos):
+                        if operator == TokenKind.Ampersand:
+                            borrowed: sview = rr_ident_name(operand)
+                            borrowed return if borrowed != "" and rr_kind_of(borrowed, names, kinds) == 1
+                        return sview("", 0, 0)
+                    Expr.Paren(paren_inner, paren_pos):
+                        return rr_reborrowed_name(paren_inner, names, kinds)
+                    _:
+                        return sview("", 0, 0)
+
+        # A bare reference-to-reference local (`r` after `r = &ref`), else "".
+        def rr_double_ref_name(value: Ast::Expr, names: darray[sview]&, kinds: darray[u8]&) -> sview:
+            can Abort.Panic:
+                forwarded: sview = rr_ident_name(value)
+                forwarded return if forwarded != "" and rr_kind_of(forwarded, names, kinds) == 2
+                return sview("", 0, 0)
+
+        # Report `value` if it is `&ref` or a reference-to-reference local. The caller has
+        # already established that its destination rejects a `T&&`. `state` picks the
+        # sentence: 0 an argument, 1 a return / variable / field, 2 a typed `with`.
+        def rr_report(value: Ast::Expr, state: u32, names: darray[sview]&, kinds: darray[u8]&, origins: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                value_pos: Ast::Pos = Ast::expr_pos(value)
+                reborrowed: sview = rr_reborrowed_name(value, names, kinds)
+                if reborrowed != "":
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReferenceReborrow, name: reborrowed, pos: value_pos, line: value_pos.line, expected: "", actual: "", state_code: state})
+                    return
+                forwarded: sview = rr_double_ref_name(value, names, kinds)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReferenceReborrow, name: forwarded, pos: value_pos, line: value_pos.line, expected: rr_origin_of(forwarded, names, origins), actual: "", state_code: 3}) if forwarded != ""
+
+        # Whether `value` needs its destination judged at all.
+        def rr_is_suspect(value: Ast::Expr, names: darray[sview]&, kinds: darray[u8]&) -> bool:
+            can Abort.Panic:
+                return rr_reborrowed_name(value, names, kinds) != "" or rr_double_ref_name(value, names, kinds) != ""
+
+        # Every declaration a call, a struct literal or a module-qualified receiver can name.
+        def rr_collect_declarations(declarations: darray[Ast::Decl], collected: mutable darray[Ast::Decl]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |collected|:
+                    match declaration:
+                        Decl.Func(function_name, function_params, function_return, function_body, function_effects, function_decorators, function_pos):
+                            collected.push(declaration)
+                        Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, extern_decorators, extern_pos):
+                            collected.push(declaration)
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                            collected.push(declaration)
+                        Decl.Module(module_name, module_body, module_pos):
+                            collected.push(declaration)
+                            rr_collect_declarations(module_body, collected)
+                        Decl.Scoped(scoped_body, scoped_pos):
+                            rr_collect_declarations(scoped_body, collected)
+                        _:
+                            pass
+
+        # How one Func or Extern declaration treats a `T&&` bound at `position`, or by name
+        # when `argument_name` is set: 0 no such parameter, 1 accepts, 2 rejects.
+        def rr_callee_verdict(declaration: Ast::Decl, position: usize, argument_name: sview, extern_params: darray[Ast::ExternParam]&, table: SymbolTable&) -> u8:
+            can Abort.Panic:
+                match declaration:
+                    Decl.Func(function_name, function_params, function_return, function_body, function_effects, function_decorators, function_pos):
+                        index: mutable usize = 0
+                        while index < function_params.count |index|:
+                            named_match: bool = argument_name != "" and function_params[index].name == argument_name
+                            positional_match: bool = argument_name == "" and index == position
+                            if named_match or positional_match:
+                                2 return if rr_destination_rejects(function_params[index].type_expression, table)
+                                return 1
+                            index <- index + 1
+                        return 0
+                    Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, extern_decorators, extern_pos):
+                        # An extern keeps only the head of each parameter type, plus whether it
+                        # is a reference; no extern parameter in either tree is spelt `T&&`.
+                        index: mutable usize = 0
+                        while index < arity.usize() |index|:
+                            slot: usize = param_start.usize() + index
+                            0 return if slot >= extern_params.count
+                            named_match: bool = argument_name != "" and extern_params[slot].name == argument_name
+                            positional_match: bool = argument_name == "" and index == position
+                            if named_match or positional_match:
+                                2 return if extern_params[slot].is_ref
+                                return 1
+                            index <- index + 1
+                        return 0
+                    _:
+                        return 0
+
+        # Whether every declaration `callee` names rejects a `T&&` at this argument — and at
+        # least one does. A `T&&` overload, a generic, or no declaration at all accepts.
+        def rr_call_rejects(callee: sview, position: usize, argument_name: sview, declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                false return if callee == ""
+                rejecting: mutable usize = 0
+                accepting: mutable usize = 0
+                for declaration in declarations |rejecting, accepting|:
+                    candidate: sview = match declaration:
+                        Decl.Func(function_name, function_params, function_return, function_body, function_effects, function_decorators, function_pos): function_name
+                        Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, extern_decorators, extern_pos): extern_name
+                        _: sview("", 0, 0)
+                    if candidate == callee:
+                        verdict: u8 = rr_callee_verdict(declaration, position, argument_name, extern_params, table)
+                        rejecting <- rejecting + 1 if verdict == 2
+                        accepting <- accepting + 1 if verdict == 1
+                return rejecting > 0 and accepting == 0
+
+        # Whether every struct named `type_name` declares a `field_name` member that rejects a
+        # `T&&` — and at least one does.
+        def rr_field_rejects(type_name: sview, field_name: sview, declarations: darray[Ast::Decl]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                false return if type_name == "" or field_name == ""
+                rejecting: mutable usize = 0
+                accepting: mutable usize = 0
+                for declaration in declarations |rejecting, accepting|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                            if struct_name == type_name:
+                                for member in members |rejecting, accepting|:
+                                    if member.name == field_name:
+                                        rejecting <- rejecting + 1 if rr_destination_rejects(member.type_expression, table)
+                                        accepting <- accepting + 1 if not rr_destination_rejects(member.type_expression, table)
+                        _:
+                            pass
+                return rejecting > 0 and accepting == 0
+
+        # Whether `field_name` is a member of some declared struct: `(&ref).field` is judged
+        # only for a real field, never for a builtin pseudo-member such as `.cast`.
+        def rr_is_struct_member(field_name: sview, declarations: darray[Ast::Decl]&) -> bool:
+            can Abort.Panic:
+                found: mutable bool = false
+                for declaration in declarations |found|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                            for member in members |found|:
+                                found <- true if member.name == field_name
+                        _:
+                            pass
+                return found
+
+        # Whether the object of `object.method(...)` names a type or a module (a qualified
+        # call) rather than a value (a UFCS call, whose receiver is argument 1).
+        def rr_is_static_receiver(object: Ast::Expr, declarations: darray[Ast::Decl]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                match object:
+                    Expr.Ident(object_name, object_pos):
+                        true return if rr_is_nominal_type(object_name, table)
+                        found: mutable bool = false
+                        for declaration in declarations |found|:
+                            match declaration:
+                                Decl.Module(module_name, module_body, module_pos):
+                                    found <- true if module_name == object_name
+                                _:
+                                    pass
+                        return found
+                    Expr.Scope(scope_base, scope_name, scope_pos):
+                        return true
+                    _:
+                        return false
+
+        # The type name a struct literal constructs (`Counter{…}`, `M::Counter{…}`, `Box[T]{…}`).
+        def rr_construct_type_name(type_expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(type_name, ident_pos):
+                        return type_name
+                    Expr.Scope(scope_base, scope_name, scope_pos):
+                        return scope_name
+                    Expr.Index(indexed_type, index_type, index_pos):
+                        return rr_construct_type_name(indexed_type)
+                    Expr.IndexN(indexed_head, index_arguments, index_n_pos):
+                        return rr_construct_type_name(indexed_head)
+                    _:
+                        return sview("", 0, 0)
+
+        # Judge every argument of one call against its callee's declarations.
+        def rr_check_call(callee: Ast::Expr, arguments: darray[Ast::Expr], argument_names: darray[sview], names: darray[sview]&, kinds: darray[u8]&, origins: darray[sview]&, declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callee_name: mutable sview = sview("", 0, 0)
+                shift: mutable usize = 0
+                match callee:
+                    Expr.Ident(called_name, called_pos):
+                        callee_name <- called_name
+                    Expr.Scope(qualifier, qualified_name, qualified_pos):
+                        callee_name <- qualified_name
+                    Expr.Field(receiver, method_name, method_pos):
+                        callee_name <- method_name
+                        if not rr_is_static_receiver(receiver, declarations, table):
+                            shift <- 1
+                            receiver_name: sview = rr_reborrowed_name(receiver, names, kinds)
+                            table <- rr_report(receiver, 1, names, kinds, origins, table) if receiver_name != "" and rr_call_rejects(method_name, 0, sview("", 0, 0), declarations, extern_params, table)
+                    _:
+                        pass
+                return if callee_name == ""
+                index: mutable usize = 0
+                while index < arguments.count |index, table| -> table:
+                    argument: Ast::Expr = arguments[index]
+                    if rr_is_suspect(argument, names, kinds):
+                        argument_name: mutable sview = sview("", 0, 0)
+                        argument_name <- argument_names[index] if index < argument_names.count
+                        table <- rr_report(argument, 0, names, kinds, origins, table) if rr_call_rejects(callee_name, index + shift, argument_name, declarations, extern_params, table)
+                    index <- index + 1
+
+        # Walk the expressions of one arm-like body: a pattern's binders, a guard, statements.
+        def rr_check_arms(arms: darray[Ast::MatchArm], return_type: Ast::Expr, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&, declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |table, names, kinds, origins| -> table:
+                    mark: usize = names.count
+                    rr_bind_pattern(arm.pattern, names, kinds, origins)
+                    table <- rr_check_expression(arm.guard, return_type, names, kinds, origins, declarations, extern_params, table)
+                    table <- rr_check_statements(arm.body, return_type, names, kinds, origins, declarations, extern_params, table)
+                    rr_restore(mark, names, kinds, origins)
+
+        def rr_check_expressions(expressions: darray[Ast::Expr], return_type: Ast::Expr, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&, declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for expression in expressions |table, names, kinds, origins| -> table:
+                    table <- rr_check_expression(expression, return_type, names, kinds, origins, declarations, extern_params, table)
+
+        # Every call argument, struct-literal field, UFCS receiver and field-access base is a
+        # destination; everything else is only descended into.
+        def rr_check_expression(expression: Ast::Expr, return_type: Ast::Expr, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&, declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        table <- rr_check_call(callee, arguments, argument_names, names, kinds, origins, declarations, extern_params, table)
+                        match callee:
+                            Expr.Field(method_receiver, method_name, method_pos):
+                                table <- rr_check_expression(method_receiver, return_type, names, kinds, origins, declarations, extern_params, table)
+                            _:
+                                table <- rr_check_expression(callee, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expressions(arguments, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, effect_arguments, effect_argument_names, effect_pos):
+                        table <- rr_check_expressions(effect_arguments, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Field(object, field, field_pos):
+                        base_name: sview = rr_reborrowed_name(object, names, kinds)
+                        table <- rr_report(object, 1, names, kinds, origins, table) if base_name != "" and rr_is_struct_member(field, declarations)
+                        table <- rr_check_expression(object, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Scope(scope_base, scope_name, scope_pos):
+                        table <- rr_check_expression(scope_base, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Index(indexed, index, index_pos):
+                        table <- rr_check_expression(indexed, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(index, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Slice(sliced, low, high, slice_pos):
+                        table <- rr_check_expression(sliced, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(low, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(high, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.IndexN(indexed_n, index_arguments, index_n_pos):
+                        table <- rr_check_expression(indexed_n, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expressions(index_arguments, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        table <- rr_check_expression(left, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(right, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Unary(operator, operand, unary_pos):
+                        table <- rr_check_expression(operand, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Move(moved, move_pos):
+                        table <- rr_check_expression(moved, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.RegionNew(allocated, region, region_pos):
+                        table <- rr_check_expression(allocated, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Paren(paren_inner, paren_pos):
+                        table <- rr_check_expression(paren_inner, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Array(array_elements, array_pos):
+                        table <- rr_check_expressions(array_elements, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Tuple(tuple_elements, tuple_pos):
+                        table <- rr_check_expressions(tuple_elements, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.SetLit(set_elements, set_pos):
+                        table <- rr_check_expressions(set_elements, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.DictLit(entries, dict_pos):
+                        for entry in entries |table, names, kinds, origins| -> table:
+                            table <- rr_check_expression(entry.key, return_type, names, kinds, origins, declarations, extern_params, table)
+                            table <- rr_check_expression(entry.value, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Construct(construct_type, construct_fields, construct_pos):
+                        constructed: sview = rr_construct_type_name(construct_type)
+                        for field_init in construct_fields |table, names, kinds, origins| -> table:
+                            table <- rr_report(field_init.value, 1, names, kinds, origins, table) if rr_is_suspect(field_init.value, names, kinds) and rr_field_rejects(constructed, field_init.name, declarations, table)
+                            table <- rr_check_expression(field_init.value, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.RecordUpdate(update_base, update_fields, update_pos):
+                        table <- rr_check_expression(update_base, return_type, names, kinds, origins, declarations, extern_params, table)
+                        for update_field in update_fields |table, names, kinds, origins| -> table:
+                            table <- rr_check_expression(update_field.value, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        table <- rr_check_expression(condition, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(then_expr, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(else_expr, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Match(scrutinee, match_arms, match_pos):
+                        table <- rr_check_expression(scrutinee, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_arms(match_arms, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Catch(guarded, catch_arms, catch_pos):
+                        table <- rr_check_expression(guarded, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_arms(catch_arms, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.Comprehension(loop_variable, iterable, comprehension_condition, comprehension_body, comprehension_pos):
+                        table <- rr_check_expression(iterable, return_type, names, kinds, origins, declarations, extern_params, table)
+                        comprehension_mark: usize = names.count
+                        rr_bind(loop_variable, 0, sview("", 0, 0), names, kinds, origins)
+                        table <- rr_check_expression(comprehension_condition, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(comprehension_body, return_type, names, kinds, origins, declarations, extern_params, table)
+                        rr_restore(comprehension_mark, names, kinds, origins)
+                    Expr.Refinement(refined, predicate, refinement_pos):
+                        table <- rr_check_expression(refined, return_type, names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(predicate, return_type, names, kinds, origins, declarations, extern_params, table)
+                    Expr.GetElse(get_guarded, recovery, get_pos):
+                        table <- rr_check_expression(get_guarded, return_type, names, kinds, origins, declarations, extern_params, table)
+                        recovery_mark: usize = names.count
+                        table <- rr_check_statements(recovery, return_type, names, kinds, origins, declarations, extern_params, table)
+                        rr_restore(recovery_mark, names, kinds, origins)
+                    Expr.Lambda(lambda_params, lambda_body, lambda_pos):
+                        # A lambda's `return` answers to the lambda, whose type is not declared.
+                        lambda_mark: usize = names.count
+                        for lambda_param in lambda_params |names, kinds, origins|:
+                            rr_bind(lambda_param, 0, sview("", 0, 0), names, kinds, origins)
+                        table <- rr_check_statements(lambda_body, (Ast::Expr.Invalid), names, kinds, origins, declarations, extern_params, table)
+                        rr_restore(lambda_mark, names, kinds, origins)
+                    Expr.Block(block_stmts, block_value, block_captures, block_pos):
+                        block_mark: usize = names.count
+                        table <- rr_check_statements(block_stmts, (Ast::Expr.Invalid), names, kinds, origins, declarations, extern_params, table)
+                        table <- rr_check_expression(block_value, (Ast::Expr.Invalid), names, kinds, origins, declarations, extern_params, table)
+                        rr_restore(block_mark, names, kinds, origins)
+                    _:
+                        pass
+
+        def rr_check_statements(statements: darray[Ast::Stmt], return_type: Ast::Expr, names: mutable darray[sview]&, kinds: mutable darray[u8]&, origins: mutable darray[sview]&, declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, names, kinds, origins| -> table:
+                    match statement:
+                        Stmt.Expr(expression, expression_pos):
+                            table <- rr_check_expression(expression, return_type, names, kinds, origins, declarations, extern_params, table)
+                        Stmt.VarDecl(declared_name, type_expression, value, declaration_pos):
+                            table <- rr_check_expression(value, return_type, names, kinds, origins, declarations, extern_params, table)
+                            annotated: bool = rr_is_annotated(type_expression)
+                            # The parser spells a typed `with` as this synthesized borrow.
+                            with_state: u32 = 2 if declared_name == "__with_place" else 1
+                            table <- rr_report(value, with_state, names, kinds, origins, table) if annotated and rr_is_suspect(value, names, kinds) and rr_destination_rejects(type_expression, table)
+                            # A written type decides the binding's kind; an inferred one follows the value.
+                            bound_kind: u8 = rr_binding_kind_of_type(type_expression) if annotated else rr_inferred_kind(value, names, kinds)
+                            bound_origin: sview = sview("", 0, 0) if annotated else rr_ident_name(rr_address_operand(value))
+                            rr_bind(declared_name, bound_kind, bound_origin, names, kinds, origins)
+                        Stmt.Assign(target, operator, assigned, assign_pos):
+                            table <- rr_check_expression(target, return_type, names, kinds, origins, declarations, extern_params, table)
+                            table <- rr_check_expression(assigned, return_type, names, kinds, origins, declarations, extern_params, table)
+                            # `name = value` DEFINES `name`; `<-` only stores into it.
+                            rr_bind(rr_ident_name(target), rr_inferred_kind(assigned, names, kinds), rr_ident_name(rr_address_operand(assigned)), names, kinds, origins) if operator == TokenKind.Assign
+                        Stmt.Return(returned_value, return_pos):
+                            if returned_value is returned:
+                                table <- rr_check_expression(returned, return_type, names, kinds, origins, declarations, extern_params, table)
+                                table <- rr_report(returned, 1, names, kinds, origins, table) if rr_is_suspect(returned, names, kinds) and rr_destination_rejects(return_type, table)
+                        Stmt.If(if_condition, then_body, else_body, if_pos):
+                            table <- rr_check_expression(if_condition, return_type, names, kinds, origins, declarations, extern_params, table)
+                            if_mark: usize = names.count
+                            rr_bind_condition(if_condition, names, kinds, origins)
+                            table <- rr_check_statements(then_body, return_type, names, kinds, origins, declarations, extern_params, table)
+                            rr_restore(if_mark, names, kinds, origins)
+                            table <- rr_check_statements(else_body, return_type, names, kinds, origins, declarations, extern_params, table)
+                            rr_restore(if_mark, names, kinds, origins)
+                        Stmt.While(while_condition, while_body, while_pos):
+                            table <- rr_check_expression(while_condition, return_type, names, kinds, origins, declarations, extern_params, table)
+                            while_mark: usize = names.count
+                            rr_bind_condition(while_condition, names, kinds, origins)
+                            table <- rr_check_statements(while_body, return_type, names, kinds, origins, declarations, extern_params, table)
+                            rr_restore(while_mark, names, kinds, origins)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            table <- rr_check_expression(iterable, return_type, names, kinds, origins, declarations, extern_params, table)
+                            for_mark: usize = names.count
+                            rr_bind(bind, 0, sview("", 0, 0), names, kinds, origins)
+                            for variable in variables |names, kinds, origins|:
+                                rr_bind(variable, 0, sview("", 0, 0), names, kinds, origins)
+                            table <- rr_check_statements(for_body, return_type, names, kinds, origins, declarations, extern_params, table)
+                            rr_restore(for_mark, names, kinds, origins)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_pos):
+                            block_mark: usize = names.count
+                            rr_bind(binding, 0, sview("", 0, 0), names, kinds, origins)
+                            table <- rr_check_statements(block_body, return_type, names, kinds, origins, declarations, extern_params, table)
+                            rr_restore(block_mark, names, kinds, origins)
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            table <- rr_check_expression(scrutinee, return_type, names, kinds, origins, declarations, extern_params, table)
+                            table <- rr_check_arms(arms, return_type, names, kinds, origins, declarations, extern_params, table)
+                        Stmt.Contract(contract_kind, contract_expression, contract_pos):
+                            table <- rr_check_expression(contract_expression, return_type, names, kinds, origins, declarations, extern_params, table)
+                        _:
+                            pass
+
+        # The operand of `&operand` (through parentheses), else Invalid: the name a
+        # reference-to-reference local was taken from, for the diagnostic.
+        def rr_address_operand(value: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match value:
+                    Expr.Unary(operator, operand, unary_pos):
+                        operand return if operator == TokenKind.Ampersand
+                    Expr.Paren(paren_inner, paren_pos):
+                        return rr_address_operand(paren_inner)
+                    _:
+                        pass
+                return (Ast::Expr.Invalid)
+
+        def rr_check_declarations(declarations: darray[Ast::Decl], all_declarations: darray[Ast::Decl]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, function_params, function_return, function_body, function_effects, function_decorators, function_pos):
+                            names: mutable darray[sview] = []
+                            kinds: mutable darray[u8] = []
+                            origins: mutable darray[sview] = []
+                            for parameter in function_params |names, kinds, origins|:
+                                rr_bind(parameter.name, rr_binding_kind_of_type(parameter.type_expression), sview("", 0, 0), &names, &kinds, &origins)
+                            declared_return: Ast::Expr = get function_return else (Ast::Expr.Invalid)
+                            table <- rr_check_statements(function_body, declared_return, &names, &kinds, &origins, all_declarations, extern_params, table)
+                        Decl.Module(module_name, module_body, module_pos):
+                            table <- rr_check_declarations(module_body, all_declarations, extern_params, table)
+                        Decl.Scoped(scoped_body, scoped_pos):
+                            table <- rr_check_declarations(scoped_body, all_declarations, extern_params, table)
+                        _:
+                            pass
+
+        def check_reference_reborrow(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                declarations: mutable darray[Ast::Decl] = []
+                rr_collect_declarations(file.top_decls, &declarations)
+                table <- rr_check_declarations(file.top_decls, &declarations, file.extern_params, table)
