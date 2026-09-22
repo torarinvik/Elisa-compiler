@@ -21,10 +21,10 @@ stage1_compile() {
 
 expect_reject_both() {
     local fixture="$1" stage0_status=0 stage1_status=0
-    "$ELISACORE_BIN" -emit obj -o "$WORK/stage0.o" "$fixture" >/dev/null 2>&1 || stage0_status=$?
-    stage1_compile -emit obj -o "$WORK/stage1.o" "$fixture" >/dev/null 2>&1 || stage1_status=$?
-    [[ "$stage0_status" -ne 0 ]] || { echo "field-access scope smoke FAIL: Stage0 accepted $fixture" >&2; exit 1; }
-    [[ "$stage1_status" -ne 0 ]] || { echo "field-access scope smoke FAIL: Stage1 accepted $fixture" >&2; exit 1; }
+    "$ELISACORE_BIN" -emit obj -o "$WORK/stage0.o" "$fixture" >"$WORK/stage0.log" 2>&1 || stage0_status=$?
+    stage1_compile -emit obj -o "$WORK/stage1.o" "$fixture" >"$WORK/stage1.log" 2>&1 || stage1_status=$?
+    [[ "$stage0_status" -eq 1 ]] || { echo "field-access scope smoke FAIL: expected Stage0 semantic rejection (exit 1), got $stage0_status for $fixture" >&2; cat "$WORK/stage0.log" >&2; exit 1; }
+    [[ "$stage1_status" -eq 1 ]] || { echo "field-access scope smoke FAIL: expected Stage1 semantic rejection (exit 1), got $stage1_status for $fixture" >&2; cat "$WORK/stage1.log" >&2; exit 1; }
 }
 
 expect_accept_both() {
@@ -38,10 +38,12 @@ expect_accept_both() {
 }
 
 expect_reject_both "$REPO_ROOT/test/repro/generic_field_access_scope_leak.elisa"
+expect_reject_both "$REPO_ROOT/test/repro/generic_field_access_ref_param.neg.elisa"
+expect_accept_both "$REPO_ROOT/test/repro/generic_field_access_ref_shadow.pos.elisa"
 expect_reject_both "$REPO_ROOT/test/repro/generic_field_access_match_scope_leak.neg.elisa"
 expect_reject_both "$REPO_ROOT/test/repro/generic_field_access_array_child.neg.elisa"
 expect_accept_both "$REPO_ROOT/test/repro/generic_field_access_scope_shadow.pos.elisa"
 expect_reject_both "$REPO_ROOT/test/repro/primitive_field_access_scope_leak.neg.elisa"
 expect_accept_both "$REPO_ROOT/test/repro/primitive_field_access_scope_shadow.pos.elisa"
 expect_reject_both "$REPO_ROOT/test/fixtures/diagnostics/field_access_through_primitive_ref.neg.elisa"
-echo "field-access parity smoke OK: generic and by-value branch scopes, valid local shadows, and primitive-reference rejection"
+echo "field-access parity smoke OK: generic value/ref parameters, branch-scope shadowing, and primitive-reference rejection"

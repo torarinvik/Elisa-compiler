@@ -358,6 +358,40 @@ def use(x: i64) -> i64:
 def main() -> i64:
     return use(84) + use(-1)
 """)
+    # A catch expression inside a value-match arm exercises nested result slots. Without
+    # independent slot storage, the error-specific branches could reach `catch.done` without
+    # storing their selected value, so the following outer match observed uninitialized data.
+    yield ("catch_value_inside_match_arm", """
+error OperationError:
+    Invalid
+    DeviceUnavailable
+
+def operate(mode: i64) -> i64 error[OperationError]:
+    raise OperationError.Invalid if mode == 0
+    raise OperationError.DeviceUnavailable if mode == 1
+    return mode
+
+def choose(mode: i64) -> i64:
+    return match mode:
+        0:
+            catch operate(mode):
+                ok: ok + 4
+                OperationError.Invalid: 11
+                OperationError.DeviceUnavailable: 12
+        1:
+            catch operate(mode):
+                ok: ok + 4
+                OperationError.Invalid: 21
+                OperationError.DeviceUnavailable: 22
+        _:
+            catch operate(mode):
+                ok: ok + 4
+                OperationError.Invalid: 31
+                OperationError.DeviceUnavailable: 32
+
+def main() -> i64:
+    return choose(0) * 1000 + choose(1) * 100 + choose(2)
+""")
     # stage0 reads a `catch` arm as a MATCH EXPRESSION arm: it must end with an expression,
     # and an arm ending in an ASSIGNMENT is rejected. stage1 used to accept this program —
     # a PERMISSIVE divergence, the direction no decline census can see. Kept as a generator
