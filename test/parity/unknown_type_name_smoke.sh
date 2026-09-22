@@ -18,6 +18,12 @@ import tempfile
 import textwrap
 
 compilers = sys.argv[1:]
+# Both compilers reject, but in different layers: stage0 resolves the builtin typestate
+# tags (`Held`, `Frozen`, ...) and refuses them only when lowering needs a representation
+# (`unsupported builtin type`, no span), while stage1 reports `unknown type` up front.
+# Acceptance must agree; the wording and spans legitimately do not.
+REJECTED = "<rejected by both>"
+guard = "struct Guard[S]:\n    handle: i64\n"
 impl = '''\
 protocol Identity:
     def identity(self: Self) -> Self
@@ -55,6 +61,15 @@ impl Identity for Item:
     ("nested_free_self", impl + "def bad(value: darray[Self]) -> void:\n    pass\n", 'unknown type "Self"'),
     ("field_self_after_impl", impl + "struct Bad:\n    value: Self\n", 'unknown type "Self"'),
     ("impl_unknown_parameter", impl.replace("copy: Self", "copy: Missing"), 'unknown type "Missing"'),
+    # A builtin typestate tag is a legal argument to a generic struct whose fields never
+    # lower it (scope_smoke_generics.sh case 35 runs one); an undeclared name is not.
+    ("phantom_builtin_tag", guard + "def hold(value: Guard[Held]) -> void:\n    pass\n", None),
+    ("phantom_builtin_tags", guard + "def hold(a: Guard[Local], b: Guard[Frozen], c: Guard[Joinable], d: Guard[Pending]) -> void:\n    pass\n", None),
+    ("phantom_builtin_tag_local", guard + "def hold() -> void:\n    value: Guard[Held] = zeroed\n", None),
+    ("phantom_unknown_argument", guard + "def bad(value: Guard[Missing]) -> void:\n    pass\n", 'unknown type "Missing"'),
+    ("bare_builtin_tag", "def bad(value: Held) -> void:\n    pass\n", REJECTED),
+    ("optional_builtin_tag", "def bad(value: Frozen?) -> void:\n    pass\n", REJECTED),
+    ("field_builtin_tag", "struct Bad:\n    value: Joinable\n", REJECTED),
 ]
 
 with tempfile.TemporaryDirectory(prefix="elisa-unknown-types-") as directory:
@@ -71,10 +86,12 @@ with tempfile.TemporaryDirectory(prefix="elisa-unknown-types-") as directory:
             output = result.stdout + result.stderr
             if diagnostic is None:
                 assert result.returncode == 0, (name, compiler, result.returncode, output)
+            elif diagnostic == REJECTED:
+                assert result.returncode == 1, (name, compiler, result.returncode, output)
             else:
                 assert result.returncode == 1 and diagnostic in output, (name, compiler, result.returncode, output)
             unknowns.append(re.findall(r':(\d+:\d+-\d+): (unknown type "[^"]+")', output))
-        assert unknowns[0] == unknowns[1], (name, unknowns)
+        assert diagnostic == REJECTED or unknowns[0] == unknowns[1], (name, unknowns)
 
 print(f"unknown-type smoke OK: {len(cases)} cases agree on acceptance and unknown-type spans")
 PY

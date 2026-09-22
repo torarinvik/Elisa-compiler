@@ -61,12 +61,15 @@ def main() -> i64:
 EOF
 )" 42
 
-# 35. A PHANTOM generic parameter: `Guard[Held]` where `Held` is declared NOWHERE and
-#     `struct Guard[S]` never mentions `S` in a field. stage0 instantiates it anyway
-#     (`%MutexGuard__Held`); stage1 rejected any unresolved type argument up front, which
-#     declined every guard-returning lock primitive. An argument the fields DO use still
-#     fails — substituting it leaves the field Unmodeled and the existing field check
-#     declines, one step later.
+# 35. A PHANTOM generic parameter: `Guard[Held]`, where `struct Guard[S]` never mentions
+#     `S` in a field. `Held` is not a user type but one of stage0's builtin typestate tags
+#     (`Local`/`Frozen`/`Joinable`/`Pending`/`Held`, analyzer_builtins.go): it resolves in
+#     every type position yet has no representation, so stage0 instantiates `%Guard__Held`
+#     and refuses only a FIELD that must lower it ("unsupported builtin type"). A name that
+#     is really unknown (`Guard[Missing]`) is `unknown type` in both compilers — see
+#     unknown_type_name_smoke.sh. From 9445dd86 stage1 reported `Held` as an unknown type
+#     unless the head was literally `MutexGuard`; the element walk now accepts any builtin
+#     tag passed to a generic struct.
 differential phantom_generic_parameter "$(cat <<'EOF'
 struct Guard[S]:
     handle: mutable void&?
