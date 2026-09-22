@@ -220,3 +220,37 @@ def main() -> i64:
     return 77 if fails == 0 else fails
 EOF
 )" 77
+
+# 36. An `is` binding in a VALUE-position `if` condition, read by a later `and` conjunct and
+#     by the true value. This is the shape of codegen_target_machine's
+#     `2 if getenv(…) is pic and pic.cast[cstr] == "1" else 0`. stage1's resolver walked a
+#     ternary condition as one plain expression, so the conjunct reported `undefined
+#     identifier "pic"`, and stage1 could not compile its own compiler. stage0 scopes it
+#     like an `if` statement (analyzeCondExpr). An `or` of two alternatives that each bind
+#     `inner` still binds it, and each call takes a different branch, so a wrong slot or
+#     a dropped conjunct changes the sum: 70 + 1 + 5 + 5 + 0 + 2 + 0 + 0.
+differential ternary_condition_and_binding "$(cat <<'EOF'
+enum Expr:
+    Leaf(value: i64)
+    Tag(label: i64, inner: i64)
+    Wrap(inner: i64)
+
+
+def score(node: Expr) -> i64:
+    return value * 10 if node is Expr.Leaf(value) and value > 3 else 1
+
+
+def either(node: Expr) -> i64:
+    return inner + 3 if (node is Expr.Tag(label, inner) or node is Expr.Wrap(inner)) and inner == 2 else 0
+
+
+def present(p: i64&?) -> i64:
+    return 2 if p is q and q > 3 else 0
+
+
+def main() -> i64:
+    x: i64 = 7
+    small: i64 = 1
+    return score(Expr.Leaf(7)) + score(Expr.Leaf(2)) + either(Expr.Wrap(2)) + either(Expr.Tag(9, 2)) + either(Expr.Wrap(3)) + present(&x) + present(&small) + present(null)
+EOF
+)" 83

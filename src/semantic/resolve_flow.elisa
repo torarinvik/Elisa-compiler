@@ -38,6 +38,74 @@ extend Semantic:
                     bound_mutability.push(carried)
 
 
+        # The condition of an `if`/`while` statement or a value-position `if`
+        # (`A if COND else B`) scopes like stage0's analyzeCondExpr: the RIGHT operand of an
+        # `and` sees the bindings its left operand's truth introduces
+        # (`2 if p is q and q.cast[i64] != 0 else 0`). `or` and `not` recurse into their
+        # operands but add nothing, because a false operand binds nothing; every other form is
+        # walked as a plain expression. So `if p is q or q…` leaves `q` undefined, as in stage0.
+        # Each connective this unwraps counts against the walk depth, as walk_expression would;
+        # past the limit walk_expression reports the overflow itself.
+        def walk_condition_expression(expression: Ast::Expr, table: lmut SymbolTable, bound: darray[sview]&, bound_mutability: darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                connective: bool = match expression:
+                    Expr.Paren(_, _): true
+                    Expr.Binary(_, binary_operator, _, _): binary_operator == TokenKind.And or binary_operator == TokenKind.Or
+                    Expr.Unary(unary_operator, _, _): unary_operator == TokenKind.Not
+                    _: false
+                table.walk_depth <- table.walk_depth + 1 if connective
+                if not connective or table.walk_depth > EXPRESSION_ANALYSIS_DEPTH_LIMIT:
+                    table <- walk_expression(expression, table, bound, bound_mutability)
+                else:
+                    match expression:
+                        Expr.Paren(inner, paren_line):
+                            table <- walk_condition_expression(inner, table, bound, bound_mutability)
+                        Expr.Unary(operator, operand, unary_line):
+                            table <- walk_condition_expression(operand, table, bound, bound_mutability)
+                        Expr.Binary(left, operator, right, binary_line):
+                            table <- walk_condition_expression(left, table, bound, bound_mutability)
+                            right_scope: mutable darray[sview] = [bound_name for bound_name in bound]
+                            right_mutability: mutable darray[bool] = [is_mutable for is_mutable in bound_mutability]
+                            gather_truthy_condition_bindings(left, table, right_scope) if operator == TokenKind.And
+                            pad_bound_mutability(right_scope, right_mutability)
+                            table <- walk_condition_expression(right, table, right_scope, right_mutability)
+                        _:
+                            pass
+                table.walk_depth <- table.walk_depth - 1 if connective
+
+
+        # The names a condition binds when it is TRUE. This mirrors stage0's
+        # bindConditionPatternLocals with truthy set:
+        #   - an `is`/`as` test binds its pattern, plus a recorded variant alias;
+        #   - `and` binds both sides;
+        #   - `or` binds only a name that EVERY alternative binds (`e is A(x) or e is B(x)`);
+        #   - `not` binds nothing, because stage0 binds nothing under a false polarity, even
+        #     under `not not`.
+        def gather_truthy_condition_bindings(expression: Ast::Expr, table: SymbolTable&, bound: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        gather_truthy_condition_bindings(inner, table, bound)
+                    Expr.Binary(left, operator, right, binary_line):
+                        match operator:
+                            TokenKind.And:
+                                gather_truthy_condition_bindings(left, table, bound)
+                                gather_truthy_condition_bindings(right, table, bound)
+                            TokenKind.Or:
+                                left_names: mutable darray[sview] = []
+                                right_names: mutable darray[sview] = []
+                                gather_truthy_condition_bindings(left, table, left_names)
+                                gather_truthy_condition_bindings(right, table, right_names)
+                                bound.extend([candidate for candidate in left_names if any other in right_names where other == candidate])
+                            TokenKind.Is | TokenKind.As:
+                                gather_is_target(right, bound)
+                                gather_is_variant_aliases(expression, table.is_variant_alias_lines, table.is_variant_alias_names, bound)
+                            _:
+                                pass
+                    _:
+                        pass
+
+
 
 
         # Resolve an `Expr.Ident` assignment target. `=` introduces a fresh binding; any other
@@ -143,18 +211,19 @@ extend Semantic:
                                 _:
                                     table <- walk_expression(target, table, bound, bound_mutability)
                         Stmt.If(condition, then_body, else_body, line):
-                            # Gather the condition's `is`-bindings into scope BEFORE walking
-                            # it, so a later conjunct of an `and`-chain can use a binding an
-                            # earlier conjunct introduced (`a is E.A(m) and m == n`) — and so
-                            # the same holds for a postfix guard `STMT if …is P(m)… and …m…`,
-                            # which desugars to this If. The bindings stay scoped to the
-                            # condition + then-body and are truncated before the else-body.
+                            # The condition scopes as a ternary's does: a later `and` conjunct
+                            # sees an earlier conjunct's `is`-bindings (`a is E.A(m) and m == n`);
+                            # an `or` alternative, a `not` operand and an earlier conjunct see
+                            # none. The then-body sees what the condition binds when TRUE, the
+                            # else-body nothing. A postfix guard `STMT if COND` desugars to this
+                            # If, so it follows the same rule. This used to gather every binding
+                            # in the condition up front, which silently accepted
+                            # `if p is q or q…` and read `q` when `p` was null.
                             mark: usize = bound.count
                             mutability_mark: usize = bound_mutability.count
-                            gather_expression_bindings(condition, bound)
-                            gather_is_variant_aliases(condition, table.is_variant_alias_lines, table.is_variant_alias_names, bound)
+                            table <- walk_condition_expression(condition, table, bound, bound_mutability)
+                            gather_truthy_condition_bindings(condition, table, bound)
                             pad_bound_mutability(bound, bound_mutability)
-                            table <- walk_expression(condition, table, bound, bound_mutability)
                             table <- resolve_body(then_body, table, bound, bound_mutability)
                             bound.truncate(mark)
                             bound_mutability.truncate(mutability_mark)
@@ -164,11 +233,10 @@ extend Semantic:
                         Stmt.While(condition, body, line):
                             while_mark: usize = bound.count
                             while_mutability_mark: usize = bound_mutability.count
-                            # As with `if`, bindings from an earlier `is` conjunct are
-                            # visible to later conjuncts as well as the loop body.
-                            gather_expression_bindings(condition, bound)
+                            # Scoped exactly as Stmt.If: the loop body is the TRUE branch.
+                            table <- walk_condition_expression(condition, table, bound, bound_mutability)
+                            gather_truthy_condition_bindings(condition, table, bound)
                             pad_bound_mutability(bound, bound_mutability)
-                            table <- walk_expression(condition, table, bound, bound_mutability)
                             table.current_loop_depth <- table.current_loop_depth + 1
                             table <- resolve_body(body, table, bound, bound_mutability)
                             table.current_loop_depth <- table.current_loop_depth - 1
@@ -292,75 +360,6 @@ extend Semantic:
                         Stmt.Continue(label, line):
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ContinueOutsideLoop, name: "continue", line: line.line, expected: "", actual: ""}) if table.current_loop_depth == 0
                             terminated <- true
-
-
-
-
-        # Resolve identifiers in the VALUE positions of each statement (type annotations are
-        # skipped). Recurses nested blocks and match arms. FLATTENED variant — used for
-        # lambda bodies and expression-position match arms (small, pre-gathered scopes);
-        # function bodies use the ordered `resolve_body` above.
-        def walk_statements(statements: darray[Ast::Stmt], table: lmut SymbolTable, bound: darray[sview]&, bound_mutability: darray[bool]&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                for statement in statements |table|:
-                    match statement:
-                        Stmt.Expr(expression, line):
-                            table <- walk_expression(expression, table, bound, bound_mutability)
-                        Stmt.VarDecl(name, type_expression, value, line):
-                            table <- walk_expression(value, table, bound, bound_mutability)
-                        Stmt.Assign(target, operator, value, line):
-                            # `<-` on a bare undeclared name is a distinct error from a
-                            # plain undefined reference: it requires an EXISTING target.
-                            # Report it specifically (and skip walking the target so the
-                            # generic UndefinedName isn't also raised for the same token).
-                            handled: mutable bool = false
-                            if operator == TokenKind.LArrow:
-                                match target:
-                                    Expr.Ident(target_name, target_line):
-                                        if target_name == "_" or not name_known(table, bound, target_name):
-                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignUndefinedTarget, name: target_name, pos: Ast::expr_pos(target), line: line.line, expected: "", actual: ""})
-                                            handled <- true
-                                    _:
-                                        pass
-                            table <- walk_expression(target, table, bound, bound_mutability) if not handled
-                            table <- walk_expression(value, table, bound, bound_mutability)
-                        Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_expression(condition, table, bound, bound_mutability)
-                            table <- walk_statements(then_body, table, bound, bound_mutability)
-                            table <- walk_statements(else_body, table, bound, bound_mutability)
-                        Stmt.While(condition, body, line):
-                            table <- walk_expression(condition, table, bound, bound_mutability)
-                            table <- walk_statements(body, table, bound, bound_mutability)
-                        Stmt.For(bind, variables, iterable, body, line):
-                            table <- walk_expression(iterable, table, bound, bound_mutability)
-                            table <- walk_statements(body, table, bound, bound_mutability)
-                        Stmt.Return(value, line):
-                            table <- walk_expression(return_value, table, bound, bound_mutability) if value is return_value
-                        Stmt.Block(kind, clause, binding, body, line):
-                            for consumed_name in clause |table| -> table:
-                                table <- walk_expression((Ast::Expr.Ident(consumed_name, line)), table, bound, bound_mutability) if kind == "destroy"
-                            # A block that introduces a handle binding (`with … as owner:`,
-                            # `lock m as guard:`, `pool workers(N):`) makes it visible in the body.
-                            block_scope: mutable darray[sview] = [scoped_name for scoped_name in bound]
-                            block_mutability: mutable darray[bool] = [scoped_mut for scoped_mut in bound_mutability]
-                            if binding != "":
-                                block_scope.push(binding)
-                                block_mutability.push(false)
-                            table <- walk_statements(body, table, block_scope, block_mutability)
-                        Stmt.Match(scrutinee, arms, line):
-                            table <- walk_expression(scrutinee, table, bound, bound_mutability)
-                            for arm in arms |table|:
-                                table <- walk_statements(arm.body, table, bound, bound_mutability)
-                        Stmt.Contract(kind, expression, line):
-                            table <- walk_expression(expression, table, bound, bound_mutability)
-                        # No value references to resolve. Explicit (no wildcard) so a new Stmt
-                        # variant forces a decision here.
-                        Stmt.Invalid:
-                            pass
-                        Stmt.Break(label, line):
-                            pass
-                        Stmt.Continue(label, line):
-                            pass
 
 include "./resolve_flow_termination.elisa"
 include "./resolve_flow_exhaustiveness.elisa"
