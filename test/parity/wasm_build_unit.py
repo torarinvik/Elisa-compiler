@@ -188,6 +188,29 @@ class WasmExportScanClientTests(unittest.TestCase):
         with self.assertRaisesRegex(WasmExportScanClientError, "inconsistent scanner payload ABI"):
             _decode_build_payload(payload)
 
+    def test_export_client_keeps_ordinary_build_payload_by_default(self) -> None:
+        payload = self.encode()
+        with (
+            patch(
+                "scripts.wasm_export_scan_client._scanner_command",
+                return_value=["launcher", "scanner", "--build-payload", "source"],
+            ) as command_builder,
+            patch(
+                "scripts.wasm_export_scan_client._capture_process_output",
+                return_value=(0, payload, b""),
+            ) as capture,
+        ):
+            self.assertEqual(
+                run_export_scan("launcher", "scanner", Path("/tmp/module.elisa")),
+                ("export fn answer() -> i32 = answer_impl\n", [self.row]),
+            )
+        command_builder.assert_called_once_with(
+            "launcher", "scanner", Path("/tmp/module.elisa"), "--build-payload"
+        )
+        capture.assert_called_once_with(
+            ["launcher", "scanner", "--build-payload", "source"]
+        )
+
     def test_rss_sampler_sums_process_group_and_descendant_tree(self) -> None:
         process = SimpleNamespace(pid=100)
         snapshot = "100 1 100 10\n101 100 100 20\n102 101 102 30\n200 1 200 99\n"
