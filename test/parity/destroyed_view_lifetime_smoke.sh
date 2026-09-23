@@ -13,6 +13,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 ulimit -c 0 || true
 
 BAD="$ROOT/test/repro/sview_region_use_after_destroy.elisa"
+GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
 for optimization in 0 2; do
@@ -28,6 +29,18 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$bad_output" ]] || { echo "destroyed view lifetime smoke: wrote executable for rejected stale view at O$optimization" >&2; exit 1; }
+
+    generic_output="$WORK/generic-wrapper-O$optimization"
+    generic_log="$generic_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$generic_output.ll" "$GENERIC_BAD" >"$generic_log" 2>&1; then
+        echo "destroyed view lifetime smoke: Stage1 accepted a generic region-carrying wrapper after its region was destroyed at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "scratch"' "$generic_log" || {
+        echo "destroyed view lifetime smoke: generic wrapper rejection lost its region dependency at O$optimization" >&2
+        cat "$generic_log" >&2
+        exit 1
+    }
 
     good_output="$WORK/good-O$optimization"
     good_log="$good_output.log"
