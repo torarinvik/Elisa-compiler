@@ -25,7 +25,7 @@ extend Semantic:
         # explicitly (resolve_flow's Stmt.VarDecl), so `total: mutable i64` then an inner
         # `total: i64` still leaves `false` as the last entry and E10 still fires — the
         # `capture shadow probe` in resolve_smoke.sh pins exactly that.
-        def pad_bound_mutability(bound: darray[sview]&, bound_mutability: mutable darray[bool]&) -> void:
+        def pad_bound_mutability(bound: darray[sview]&, bound_mutability: mutable darray[bool]&, bound_ids: mutable darray[BindingId]&, owner: DeclId, binding_serial: mutable u64&) -> void:
             can Memory.Allocate, Abort.Panic:
                 while bound_mutability.count < bound.count:
                     carried: mutable bool = false
@@ -36,6 +36,8 @@ extend Semantic:
                             carried <- true
                             scan <- 0
                     bound_mutability.push(carried)
+                while bound_ids.count < bound.count:
+                    bound_ids.push(fresh_binding_id(owner, binding_serial))
 
 
         # The condition of an `if`/`while` statement or a value-position `if`
@@ -46,7 +48,7 @@ extend Semantic:
         # walked as a plain expression. So `if p is q or q…` leaves `q` undefined, as in stage0.
         # Each connective this unwraps counts against the walk depth, as walk_expression would;
         # past the limit walk_expression reports the overflow itself.
-        def walk_condition_expression(expression: Ast::Expr, table: lmut SymbolTable, bound: darray[sview]&, bound_mutability: darray[bool]&) -> void:
+        def walk_condition_expression(expression: Ast::Expr, table: lmut SymbolTable, bound: darray[sview]&, bound_mutability: darray[bool]&, bound_ids: darray[BindingId]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 connective: bool = match expression:
                     Expr.Paren(_, _): true
@@ -55,20 +57,21 @@ extend Semantic:
                     _: false
                 table.walk_depth <- table.walk_depth + 1 if connective
                 if not connective or table.walk_depth > EXPRESSION_ANALYSIS_DEPTH_LIMIT:
-                    table <- walk_expression(expression, table, bound, bound_mutability)
+                    table <- walk_expression(expression, table, bound, bound_mutability, bound_ids)
                 else:
                     match expression:
                         Expr.Paren(inner, paren_line):
-                            table <- walk_condition_expression(inner, table, bound, bound_mutability)
+                            table <- walk_condition_expression(inner, table, bound, bound_mutability, bound_ids)
                         Expr.Unary(operator, operand, unary_line):
-                            table <- walk_condition_expression(operand, table, bound, bound_mutability)
+                            table <- walk_condition_expression(operand, table, bound, bound_mutability, bound_ids)
                         Expr.Binary(left, operator, right, binary_line):
-                            table <- walk_condition_expression(left, table, bound, bound_mutability)
+                            table <- walk_condition_expression(left, table, bound, bound_mutability, bound_ids)
                             right_scope: mutable darray[sview] = [bound_name for bound_name in bound]
                             right_mutability: mutable darray[bool] = [is_mutable for is_mutable in bound_mutability]
+                            right_ids: mutable darray[BindingId] = [id for id in bound_ids]
                             gather_truthy_condition_bindings(left, table, right_scope) if operator == TokenKind.And
-                            pad_bound_mutability(right_scope, right_mutability)
-                            table <- walk_condition_expression(right, table, right_scope, right_mutability)
+                            pad_bound_mutability(right_scope, right_mutability, right_ids, table.current_function_decl_id, table.next_binding_serial)
+                            table <- walk_condition_expression(right, table, right_scope, right_mutability, right_ids)
                         _:
                             pass
                 table.walk_depth <- table.walk_depth - 1 if connective
@@ -112,13 +115,15 @@ extend Semantic:
         # operator requires an EXISTING target, reported as a specific diagnostic. Modelled as a
         # split on the operator plus ordered guarded early-exits (name_known / const_is_immutable
         # are pure, so re-testing them in the return guards is behaviour-identical).
-        def resolve_ident_assign_target(operator: TokenKind, target: Ast::Expr, target_name: sview, target_line: u32, line: u32, bound: mutable darray[sview]&, bound_mutability: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+        def resolve_ident_assign_target(operator: TokenKind, target: Ast::Expr, target_name: sview, target_line: u32, line: u32, bound: mutable darray[sview]&, bound_mutability: mutable darray[bool]&, bound_ids: mutable darray[BindingId]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match operator:
                     TokenKind.Assign:
                         bound.push(target_name)
                         bound_mutability.push(false)
-                        table <- record_reference(table, target_line, target_name, false)
+                        binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                        bound_ids.push(binding_id)
+                        table <- record_reference(table, target_line, target_name, false, binding_id)
                     _:
                         # A NON-`=` assign (`<-` or a compound `+=`/…) requires an EXISTING
                         # target; a bare undeclared name is a distinct error from a plain
@@ -132,47 +137,49 @@ extend Semantic:
                         # local's immutability is handled by the mutation pass.
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignImmutable, name: target_name, line: line, expected: "", actual: ""}) if bound_last_index(bound, target_name) < 0 and const_is_immutable(table, target_name)
                         return if bound_last_index(bound, target_name) < 0 and const_is_immutable(table, target_name)
-                        table <- walk_expression(target, table, bound, bound_mutability)
+                        table <- walk_expression(target, table, bound, bound_mutability, bound_ids)
 
 
 
 
-        def resolve_body(statements: darray[Ast::Stmt], table: lmut SymbolTable, bound: mutable darray[sview]&, bound_mutability: mutable darray[bool]&) -> void:
+        def resolve_body(statements: darray[Ast::Stmt], table: lmut SymbolTable, bound: mutable darray[sview]&, bound_mutability: mutable darray[bool]&, bound_ids: mutable darray[BindingId]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 # Unreachable-code tracking: once a statement in THIS list unconditionally
                 # exits it (`return`/`break`/`continue`), every following statement is dead.
                 # Flag only the first such statement (a whole dead tail is one finding).
                 terminated: mutable bool = false
                 reported: mutable bool = false
-                for statement in statements |table, bound, bound_mutability, terminated, reported|:
+                for statement in statements |table, bound, bound_mutability, bound_ids, terminated, reported|:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnreachableCode, name: "", line: statement_line(statement), expected: "", actual: ""}) if terminated and not reported and not statement_is_invalid(statement)
                     reported <- true if terminated and not reported and not statement_is_invalid(statement)
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- walk_expression(expression, table, bound, bound_mutability)
+                            table <- walk_expression(expression, table, bound, bound_mutability, bound_ids)
                             # An `is` refinement in a bare expression statement (e.g.
                             # `assert x is n`) keeps its binding for later statements —
                             # over-permissive, never a false unresolved.
                             gather_expression_bindings(expression, bound)
-                            pad_bound_mutability(bound, bound_mutability)
+                            pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
                         Stmt.VarDecl(name, type_expression, value, line):
                             # The initializer resolves BEFORE the name binds (`x: T = x`
                             # is use-before-declaration, as in stage0).
-                            table <- walk_expression(value, table, bound, bound_mutability)
+                            table <- walk_expression(value, table, bound, bound_mutability, bound_ids)
                             gather_expression_bindings(value, bound)
-                            pad_bound_mutability(bound, bound_mutability)
+                            pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
                             bound.push(name)
                             bound_mutability.push(local_binding_is_mutable(name, line.line, line.offset, type_expression, table))
-                            table <- record_reference(table, line.line, name, false)
+                            binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                            bound_ids.push(binding_id)
+                            table <- record_reference(table, line.line, name, false, binding_id)
                         Stmt.Assign(target, operator, value, line):
-                            table <- walk_expression(value, table, bound, bound_mutability)
+                            table <- walk_expression(value, table, bound, bound_mutability, bound_ids)
                             gather_expression_bindings(value, bound)
-                            pad_bound_mutability(bound, bound_mutability)
+                            pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
                             match target:
                                 Expr.Array(elements, array_line):
                                     # Multi-target: `=` defines fresh idents; `<-`/compound
                                     # targets are references that must already resolve.
-                                    for element in elements |table, bound, bound_mutability|:
+                                    for element in elements |table, bound, bound_mutability, bound_ids|:
                                         match element:
                                             Expr.Ident(element_name, ident_line):
                                                 match operator:
@@ -193,23 +200,26 @@ extend Semantic:
                                                         # reading after pushing only one of the two pools
                                                         # is an out-of-range read.
                                                         rebound_mutability: bool = bound_name_is_mutable(element_name, bound, bound_mutability) if name_known(table, bound, element_name) else false
+                                                        prior_binding_index: int = bound_last_index(bound, element_name) if name_known(table, bound, element_name) else -1
+                                                        binding_id: BindingId = bound_ids[prior_binding_index.usize()] if prior_binding_index >= 0 else fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
                                                         bound.push(element_name)
                                                         bound_mutability.push(rebound_mutability)
-                                                        table <- record_reference(table, ident_line.line, element_name, false)
+                                                        bound_ids.push(binding_id)
+                                                        table <- record_reference(table, ident_line.line, element_name, false, binding_id)
                                                     _:
-                                                        table <- walk_expression(element, table, bound, bound_mutability)
+                                                        table <- walk_expression(element, table, bound, bound_mutability, bound_ids)
                                             _:
-                                                table <- walk_expression(element, table, bound, bound_mutability)
+                                                table <- walk_expression(element, table, bound, bound_mutability, bound_ids)
                                 Expr.Ident(target_name, target_line):
-                                    table <- resolve_ident_assign_target(operator, target, target_name, target_line.line, line.line, bound, bound_mutability, table)
+                                    table <- resolve_ident_assign_target(operator, target, target_name, target_line.line, line.line, bound, bound_mutability, bound_ids, table)
                                 Expr.Call(callee, call_arguments, call_argument_names, call_line):
                                     # Assigning to a call result is never valid (stage0:
                                     # `invalid assignment target`). Still walk the call so
                                     # its own references resolve.
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InvalidAssignTarget, name: "", line: line.line, expected: "", actual: ""})
-                                    table <- walk_expression(target, table, bound, bound_mutability)
+                                    table <- walk_expression(target, table, bound, bound_mutability, bound_ids)
                                 _:
-                                    table <- walk_expression(target, table, bound, bound_mutability)
+                                    table <- walk_expression(target, table, bound, bound_mutability, bound_ids)
                         Stmt.If(condition, then_body, else_body, line):
                             # The condition scopes as a ternary's does: a later `and` conjunct
                             # sees an earlier conjunct's `is`-bindings (`a is E.A(m) and m == n`);
@@ -221,27 +231,32 @@ extend Semantic:
                             # `if p is q or q…` and read `q` when `p` was null.
                             mark: usize = bound.count
                             mutability_mark: usize = bound_mutability.count
-                            table <- walk_condition_expression(condition, table, bound, bound_mutability)
+                            binding_id_mark: usize = bound_ids.count
+                            table <- walk_condition_expression(condition, table, bound, bound_mutability, bound_ids)
                             gather_truthy_condition_bindings(condition, table, bound)
-                            pad_bound_mutability(bound, bound_mutability)
-                            table <- resolve_body(then_body, table, bound, bound_mutability)
+                            pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
+                            table <- resolve_body(then_body, table, bound, bound_mutability, bound_ids)
                             bound.truncate(mark)
                             bound_mutability.truncate(mutability_mark)
-                            table <- resolve_body(else_body, table, bound, bound_mutability)
+                            bound_ids.truncate(binding_id_mark)
+                            table <- resolve_body(else_body, table, bound, bound_mutability, bound_ids)
                             bound.truncate(mark)
                             bound_mutability.truncate(mutability_mark)
+                            bound_ids.truncate(binding_id_mark)
                         Stmt.While(condition, body, line):
                             while_mark: usize = bound.count
                             while_mutability_mark: usize = bound_mutability.count
+                            while_binding_id_mark: usize = bound_ids.count
                             # Scoped exactly as Stmt.If: the loop body is the TRUE branch.
-                            table <- walk_condition_expression(condition, table, bound, bound_mutability)
+                            table <- walk_condition_expression(condition, table, bound, bound_mutability, bound_ids)
                             gather_truthy_condition_bindings(condition, table, bound)
-                            pad_bound_mutability(bound, bound_mutability)
+                            pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
                             table.current_loop_depth <- table.current_loop_depth + 1
-                            table <- resolve_body(body, table, bound, bound_mutability)
+                            table <- resolve_body(body, table, bound, bound_mutability, bound_ids)
                             table.current_loop_depth <- table.current_loop_depth - 1
                             bound.truncate(while_mark)
                             bound_mutability.truncate(while_mutability_mark)
+                            bound_ids.truncate(while_binding_id_mark)
                         Stmt.For(bind, variables, iterable, body, line):
                             # `where PATTERN: GUARD` layers TWO Refinements over the iterable:
                             # the PATTERN inside, the GUARD outside. Peel both, so the base
@@ -253,20 +268,23 @@ extend Semantic:
                                 Expr.Refinement(filter_base, filter_predicate, filter_line):
                                     match filter_base:
                                         Expr.Refinement(inner_base, inner_predicate, inner_line):
-                                            table <- walk_expression(inner_base, table, bound, bound_mutability)
+                                            table <- walk_expression(inner_base, table, bound, bound_mutability, bound_ids)
                                             filter_expression <- inner_predicate
                                             filter_guard <- filter_predicate
                                         _:
-                                            table <- walk_expression(filter_base, table, bound, bound_mutability)
+                                            table <- walk_expression(filter_base, table, bound, bound_mutability, bound_ids)
                                             filter_expression <- filter_predicate
                                 _:
-                                    table <- walk_expression(iterable, table, bound, bound_mutability)
+                                    table <- walk_expression(iterable, table, bound, bound_mutability, bound_ids)
                             for_mark: usize = bound.count
                             for_mutability_mark: usize = bound_mutability.count
-                            for variable in variables |table, bound, bound_mutability|:
+                            for_binding_id_mark: usize = bound_ids.count
+                            for variable in variables |table, bound, bound_mutability, bound_ids|:
                                 bound.push(variable)
                                 bound_mutability.push(bind == "mutable")
-                                table <- record_reference(table, line.line, variable, false)
+                                binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                                bound_ids.push(binding_id)
+                                table <- record_reference(table, line.line, variable, false, binding_id)
                             # A `where` filter may refine a loop variable with an `is`-pattern
                             # (`for item in xs where item is Expr.Int(value):`) — its payload
                             # bindings (`value`) are in scope for the loop body. Walk the filter,
@@ -286,19 +304,19 @@ extend Semantic:
                             if is_bare_pattern_filter(filter_value):
                                 gather_is_target(filter_value, bound)
                             else:
-                                table <- walk_expression(filter_value, table, bound, bound_mutability)
+                                table <- walk_expression(filter_value, table, bound, bound_mutability, bound_ids)
                                 gather_expression_bindings(filter_value, bound)
-                            while bound_mutability.count < bound.count |bound_mutability|:
-                                bound_mutability.push(false)
+                            pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
                             # The GUARD resolves in the PATTERN's scope -- `value > 2` after
                             # `item is Expr.Int(value)` -- so it is walked only now, with the
                             # pattern's bindings already in `bound`.
-                            table <- walk_expression(guard_value, table, bound, bound_mutability) if filter_guard is guard_value
+                            table <- walk_expression(guard_value, table, bound, bound_mutability, bound_ids) if filter_guard is guard_value
                             table.current_loop_depth <- table.current_loop_depth + 1
-                            table <- resolve_body(body, table, bound, bound_mutability)
+                            table <- resolve_body(body, table, bound, bound_mutability, bound_ids)
                             table.current_loop_depth <- table.current_loop_depth - 1
                             bound.truncate(for_mark)
                             bound_mutability.truncate(for_mutability_mark)
+                            bound_ids.truncate(for_binding_id_mark)
                         Stmt.Block(kind, clause, binding, body, line):
                             # Prefix blocks are NOT value scopes: a `static if/elif/else`
                             # branch is compile-time INCLUSION (exactly one branch's
@@ -308,25 +326,31 @@ extend Semantic:
                             # through un-truncated.
                             bound.push(binding) if binding != ""
                             bound_mutability.push(false) if binding != ""
-                            table <- record_reference(table, line.line, binding, false) if binding != ""
+                            # Allocating an unused serial for an unnamed block is harmless; a
+                            # binding identity is consumed only when the declaration is named.
+                            block_binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                            bound_ids.push(block_binding_id) if binding != ""
+                            table <- record_reference(table, line.line, binding, false, block_binding_id) if binding != ""
                             for consumed_name in clause |table| -> table:
-                                table <- walk_expression((Ast::Expr.Ident(consumed_name, line)), table, bound, bound_mutability) if kind == "destroy"
-                            table <- resolve_body(body, table, bound, bound_mutability)
+                                table <- walk_expression((Ast::Expr.Ident(consumed_name, line)), table, bound, bound_mutability, bound_ids) if kind == "destroy"
+                            table <- resolve_body(body, table, bound, bound_mutability, bound_ids)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- walk_expression(scrutinee, table, bound, bound_mutability)
+                            table <- walk_expression(scrutinee, table, bound, bound_mutability, bound_ids)
                             table <- check_unreachable_arms(arms, table, line.line)
-                            for arm in arms |table, bound, bound_mutability|:
+                            for arm in arms |table, bound, bound_mutability, bound_ids|:
                                 table <- check_pattern_variants(arm.pattern, table, line.line, arm_report_pos(arm, line.line))
                                 arm_mark: usize = bound.count
                                 arm_mutability_mark: usize = bound_mutability.count
+                                arm_binding_id_mark: usize = bound_ids.count
                                 gather_arm_pattern(arm.pattern, bound)
-                                pad_bound_mutability(bound, bound_mutability)
+                                pad_bound_mutability(bound, bound_mutability, bound_ids, table.current_function_decl_id, table.next_binding_serial)
                                 # docs/122 §5.1: the arm guard resolves in the arm's
                                 # pattern scope (walk_expression is a no-op on Invalid).
-                                table <- walk_expression(arm.guard, table, bound, bound_mutability)
-                                table <- resolve_body(arm.body, table, bound, bound_mutability)
+                                table <- walk_expression(arm.guard, table, bound, bound_mutability, bound_ids)
+                                table <- resolve_body(arm.body, table, bound, bound_mutability, bound_ids)
                                 bound.truncate(arm_mark)
                                 bound_mutability.truncate(arm_mutability_mark)
+                                bound_ids.truncate(arm_binding_id_mark)
                         Stmt.Return(value, line):
                             # `return get X else return Y`: the get-else recovery is itself a return,
                             # so stage0's flow analysis does NOT treat the outer return as an
@@ -334,7 +358,7 @@ extend Semantic:
                             # unreachable. Mirror that by suppressing termination for this shape.
                             getelse_recovery_returns: mutable bool = false
                             if value is return_value:
-                                table <- walk_expression(return_value, table, bound, bound_mutability)
+                                table <- walk_expression(return_value, table, bound, bound_mutability, bound_ids)
                                 match return_value:
                                     Expr.GetElse(guarded, recovery, getelse_line):
                                         getelse_recovery_returns <- flow_recovery_returns(recovery)
@@ -348,7 +372,8 @@ extend Semantic:
                             binds_result: bool = kind == "ensure" or kind == "ensures" or expression_mentions_ensures(expression)
                             bound.push("result") if binds_result
                             bound_mutability.push(false) if binds_result
-                            table <- walk_expression(expression, table, bound, bound_mutability)
+                            bound_ids.push(fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)) if binds_result
+                            table <- walk_expression(expression, table, bound, bound_mutability, bound_ids)
                         Stmt.Invalid:
                             pass
                         Stmt.Break(label, line):
