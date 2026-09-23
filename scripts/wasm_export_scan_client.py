@@ -516,9 +516,12 @@ def run_export_scan(
     launcher: str | os.PathLike[str],
     scanner_script: str | os.PathLike[str],
     source: Path,
+    *,
+    component: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run the configured scanner and validate its versioned build payload."""
-    command = _scanner_command(launcher, scanner_script, source, "--build-payload")
+    option = "--build-component-payload" if component else "--build-payload"
+    command = _scanner_command(launcher, scanner_script, source, option)
     returncode, stdout, stderr = _capture_process_output(command)
     if returncode != 0:
         raise _scanner_failure(returncode, stdout, stderr)

@@ -30,6 +30,7 @@ from scripts.wasm_export_scan_client import (
     _decode_flatten_payload,
     _process_tree_rss_bytes,
     _validate_exports,
+    run_export_scan,
     run_flatten_source,
 )
 from scripts.wasm_facade import js_input, js_output, ts_type
@@ -150,6 +151,29 @@ class WasmExportScanClientTests(unittest.TestCase):
         )
         capture.assert_called_once_with(
             ["launcher", "scanner", "--flatten-payload", "source"]
+        )
+
+    def test_export_client_selects_component_payload_when_requested(self) -> None:
+        payload = self.encode()
+        with (
+            patch(
+                "scripts.wasm_export_scan_client._scanner_command",
+                return_value=["launcher", "scanner", "--build-component-payload", "source"],
+            ) as command_builder,
+            patch(
+                "scripts.wasm_export_scan_client._capture_process_output",
+                return_value=(0, payload, b""),
+            ) as capture,
+        ):
+            self.assertEqual(
+                run_export_scan("launcher", "scanner", Path("/tmp/module.elisa"), component=True),
+                ("export fn answer() -> i32 = answer_impl\n", [self.row]),
+            )
+        command_builder.assert_called_once_with(
+            "launcher", "scanner", Path("/tmp/module.elisa"), "--build-component-payload"
+        )
+        capture.assert_called_once_with(
+            ["launcher", "scanner", "--build-component-payload", "source"]
         )
 
     def test_rss_sampler_sums_process_group_and_descendant_tree(self) -> None:
@@ -334,6 +358,27 @@ class ExportScannerSelectionTests(unittest.TestCase):
             "/usr/bin/elisac",
             "/tmp/wasm_export_scan.elisascript",
             source_path,
+            component=False,
+        )
+
+    def test_opt_in_passes_component_mode_to_elisascript_scanner(self) -> None:
+        source_path = Path("/tmp/input.elisa")
+        flattened = "export fn open() -> u32 = open_impl\n"
+        exports = [{"name": "open"}]
+        args = SimpleNamespace(
+            export_scan_launcher="/usr/bin/elisac",
+            export_scan_script="/tmp/wasm_export_scan.elisascript",
+            component_types=["Widget"],
+        )
+        with patch(
+            "scripts.wasm_build.run_export_scan", return_value=(flattened, exports)
+        ) as scan:
+            self.assertEqual(load_export_scan(source_path, args), (flattened, exports))
+        scan.assert_called_once_with(
+            "/usr/bin/elisac",
+            "/tmp/wasm_export_scan.elisascript",
+            source_path,
+            component=True,
         )
 
     def test_runtime_cache_uses_elisascript_flatten_payload_when_configured(self) -> None:

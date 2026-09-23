@@ -239,8 +239,9 @@ def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[
         raise WasmBuildError(
             "--export-scan-launcher and --export-scan-script must be supplied together"
         )
+    component = bool(getattr(args, "component_types", []))
     try:
-        return run_export_scan(launcher, scanner_script, source)
+        return run_export_scan(launcher, scanner_script, source, component=component)
     except WasmExportScanClientError as error:
         raise WasmBuildError(str(error)) from error
 
