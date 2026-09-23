@@ -28,6 +28,12 @@ grep -Fq 'global "current" cannot store linear handle values of type Handle' <<<
 plain=$(printf 'struct Value:\n    raw: mutable uintptr\ndef ok(value: Value) -> void:\n    borrow: Value& = &value\n    _ = borrow\n' | "$RPT")
 grep -Fq 'linear value' <<< "$plain" && fail "ordinary struct address rejected: $plain"
 
+generic_affine=$(printf 'affine struct GenericOwner[T]:\n    value: T\ndef bad(owner: GenericOwner[i64]) -> void:\n    duplicate: GenericOwner[i64] = owner\n' | "$RPT")
+grep -Fq 'linear value "owner" must be moved explicitly before move into local "duplicate"' <<< "$generic_affine" || fail "generic affine owner copy accepted: $generic_affine"
+
+generic_plain=$(printf 'struct PlainBox[T]:\n    value: T\ndef ok(box: PlainBox[i64]) -> void:\n    duplicate: PlainBox[i64] = box\n' | "$RPT")
+grep -Fq 'must be moved explicitly' <<< "$generic_plain" && fail "ordinary generic value was classified affine: $generic_plain"
+
 containing=$(printf 'struct Holder:\n    thread: mutable Thread[i64, Joinable]\ndef bad_param(holder: Holder&) -> void:\n    pass\ndef bad_local(holder: Holder) -> void:\n    alias: Holder& = &holder\n    _ = alias\n' | "$RPT")
 grep -Fq 'references to values containing linear handles are not supported; got Holder&' <<< "$containing" || fail "reference to affine-containing struct accepted: $containing"
 grep -Fq 'cannot take address of value containing linear handles' <<< "$containing" || fail "address of affine-containing struct accepted: $containing"
