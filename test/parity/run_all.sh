@@ -408,6 +408,7 @@ HEAVY_FIRST=(
   "$REPO_ROOT/test/parity/compile_time_smoke.sh"         # 224s
   "$REPO_ROOT/test/parity/adversarial_differential_smoke.sh"  # 206s
   "$REPO_ROOT/test/parity/backend_native_smoke.sh"       # 169s
+  "$REPO_ROOT/test/parity/packed_sparse_word_bounds_smoke.sh"
   "$REPO_ROOT/test/parity/loop_smoke.sh"                 # 121s
   "$REPO_ROOT/test/parity/extern_view_abi_smoke.sh"
   "$REPO_ROOT/test/parity/scope_binding_smoke.sh"
