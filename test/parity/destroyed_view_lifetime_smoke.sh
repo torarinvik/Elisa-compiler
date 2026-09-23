@@ -18,9 +18,11 @@ MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
 JSON_REGION_MISMATCH_BAD="$ROOT/test/repro/json_handle_region_mismatch.elisa"
 OPTIONAL_BAD="$ROOT/test/repro/sview_optional_region_use_after_destroy.elisa"
+SHADOW_BAD="$ROOT/test/repro/region_shadow_inner_use_after_destroy.elisa"
 JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
 ARENA_VIEW_BAD="$ROOT/test/repro/manual_arena_free_use_after_region.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
+SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
 for optimization in 0 2; do
     bad_output="$WORK/bad-O$optimization"
@@ -100,6 +102,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$optional_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected optional stale view at O$optimization" >&2; exit 1; }
+
+    shadow_bad_output="$WORK/shadow-inner-after-destroy-O$optimization"
+    shadow_bad_log="$shadow_bad_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$shadow_bad_output.ll" "$SHADOW_BAD" >"$shadow_bad_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted an inner shadowed-region view after destroy at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "r"' "$shadow_bad_log" || {
+        echo "destroyed view lifetime smoke: inner shadowed-region rejection lost its region identity at O$optimization" >&2
+        cat "$shadow_bad_log" >&2
+        exit 1
+    }
+    [[ ! -e "$shadow_bad_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected shadowed-region use at O$optimization" >&2; exit 1; }
 
     json_view_output="$WORK/json-view-after-arena-free-O$optimization"
     json_view_log="$json_view_output.log"
@@ -193,6 +208,23 @@ for optimization in 0 2; do
         cat "$optional_good_log.run" >&2
         exit 1
     }
+
+    shadow_good_output="$WORK/shadow-outer-live-O$optimization"
+    shadow_good_log="$shadow_good_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$shadow_good_output" "$SHADOW_GOOD" >"$shadow_good_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: rejected an outer value after an inner same-name region was destroyed at O$optimization" >&2
+        cat "$shadow_good_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$shadow_good_output" >"$shadow_good_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 0 ]] || {
+        echo "destroyed view lifetime smoke: outer shadowed-region control returned $run_status at O$optimization" >&2
+        cat "$shadow_good_log.run" >&2
+        exit 1
+    }
 done
 
-echo "destroyed view lifetime smoke OK: stale and cross-arena values are rejected; live and last-use controls pass at O0/O2"
+echo "destroyed view lifetime smoke OK: stale uses are rejected; live, last-use, and shadowed-region controls pass at O0/O2"
