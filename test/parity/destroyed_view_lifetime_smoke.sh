@@ -99,6 +99,22 @@ for optimization in 0 2; do
     }
     [[ ! -e "$arena_view_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected arena-bound view at O$optimization" >&2; exit 1; }
 
+    for invalidation in reset rewind; do
+        invalidation_source="$ROOT/test/repro/manual_arena_${invalidation}_use_after_region.elisa"
+        invalidation_output="$WORK/view-after-arena-${invalidation}-O$optimization"
+        invalidation_log="$invalidation_output.log"
+        if "$STAGE1" -emit llvm "-O$optimization" -o "$invalidation_output.ll" "$invalidation_source" >"$invalidation_log" 2>&1; then
+            echo "destroyed view lifetime smoke: Stage1 accepted an arena-bound view after arena_${invalidation} at O$optimization" >&2
+            exit 1
+        fi
+        rg -Fq 'region dependency facts were invalidated by destroy of region "arena"' "$invalidation_log" || {
+            echo "destroyed view lifetime smoke: arena_${invalidation} rejection lost the arena dependency at O$optimization" >&2
+            cat "$invalidation_log" >&2
+            exit 1
+        }
+        [[ ! -e "$invalidation_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejected arena_${invalidation} use at O$optimization" >&2; exit 1; }
+    done
+
     good_output="$WORK/good-O$optimization"
     good_log="$good_output.log"
     "$STAGE1" -emit exe "-O$optimization" -o "$good_output" "$GOOD" >"$good_log" 2>&1 || {
