@@ -412,6 +412,7 @@ HEAVY_FIRST=(
   "$REPO_ROOT/test/parity/packed_dense_word_bounds_smoke.sh"
   "$REPO_ROOT/test/parity/arena_alloc_size_overflow_smoke.sh"
   "$REPO_ROOT/test/parity/arena_runtime_lifecycle_smoke.sh"
+  "$REPO_ROOT/test/parity/arena_cache_concurrency_smoke.sh"
   "$REPO_ROOT/test/parity/fixed_buffer_safety_smoke.sh"
   "$REPO_ROOT/test/parity/runtime_string_allocation_smoke.sh"
   "$REPO_ROOT/test/parity/runtime_string_view_safety_smoke.sh"
