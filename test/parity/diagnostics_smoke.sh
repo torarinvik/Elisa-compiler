@@ -143,6 +143,7 @@ NAMES=(
     membership_rhs_container
     darray_push_type_mismatch
     dict_index_key_mismatch
+    dict_index_scalar_projection
     param_structural_type
     container_comparison
     invalid_ctor_cast
@@ -350,6 +351,7 @@ EXPECTS=(
     "membership operator requires a list literal or tokenset on the right-hand side, got darray[cstr]"
     "darray push expects i64, got static u8"
     "dict index expects key of type i64, got static u8"
+    "optional reference to dictionary value"
     "if condition must be bool, got darray"
     "cannot compare darray[i64] and int"
     "invalid cast from int to bool"
