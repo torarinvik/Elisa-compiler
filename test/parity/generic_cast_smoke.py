@@ -38,6 +38,10 @@ SAFE_CAST = """def readonly[T](value: mutable T&) -> T&:
     value.cast[T&]
 """
 
+SAFE_IDENTITY_CAST = """def identity[T](value: mutable T&) -> mutable T&:
+    value.cast[mutable T&]
+"""
+
 GRANTED_CASTS = {
     "generic cast": """def convert[T, U](value: T) -> U:
     can Unsafe.PointerCast:
@@ -85,6 +89,11 @@ def main() -> None:
     safe_output = safe.stdout + safe.stderr
     assert safe.returncode == 0 and "D 0" in safe_output, (safe.returncode, safe_output[-5000:])
     print("same-type mutability drop: accepted PASS", flush=True)
+
+    identity = analyze_case(reporter, "same_type_mutable_identity", SAFE_IDENTITY_CAST, strict=True)
+    identity_output = identity.stdout + identity.stderr
+    assert identity.returncode == 0 and "D 0" in identity_output, (identity.returncode, identity_output[-5000:])
+    print("same-type mutable reference: accepted PASS", flush=True)
 
     for name, source in GRANTED_CASTS.items():
         granted = analyze_case(reporter, f"granted_{name.replace(' ', '_')}", source, strict=True)
