@@ -38,6 +38,34 @@ def main() -> i64:
     return state.value
 EOF
 
+OPTIONAL_GLOBAL_FIXTURE="$WORK/valid_optional_global.elisa"
+cat > "$OPTIONAL_GLOBAL_FIXTURE" <<'EOF'
+global mutable active: mutable i64&? = null
+
+def main() -> i64:
+    if active is found:
+        return 0
+    return 42
+EOF
+
+ARRAY_GLOBAL_FIXTURE="$WORK/valid_array_global.elisa"
+cat > "$ARRAY_GLOBAL_FIXTURE" <<'EOF'
+global mutable values: i64[2] = [20, 22]
+
+def main() -> i64:
+    return values[0] + values[1]
+EOF
+
+CSTR_GLOBAL_FIXTURE="$WORK/valid_cstr_global.elisa"
+cat > "$CSTR_GLOBAL_FIXTURE" <<'EOF'
+extern strlen(text: cstr) -> usize
+
+global mutable greeting: cstr = "hello"
+
+def main() -> i64:
+    return 42 if strlen(greeting) == 5 else 0
+EOF
+
 run_reject_case() {
     local stage="$1" fixture="$2" global_name="$3" reason="$4"
     local object="$WORK/$stage-$global_name.o" log="$WORK/$stage-$global_name.log" status
@@ -119,6 +147,12 @@ run_accept_case() {
 
 run_accept_case stage0 "$POSITIVE_FIXTURE" scalar "a scalar constant global initializer"
 run_accept_case stage1 "$POSITIVE_FIXTURE" scalar "a scalar constant global initializer"
+run_accept_case stage0 "$OPTIONAL_GLOBAL_FIXTURE" optional-null "a null optional-reference global"
+run_accept_case stage1 "$OPTIONAL_GLOBAL_FIXTURE" optional-null "a null optional-reference global"
+run_accept_case stage0 "$ARRAY_GLOBAL_FIXTURE" array "a fixed-array global initializer"
+run_accept_case stage1 "$ARRAY_GLOBAL_FIXTURE" array "a fixed-array global initializer"
 run_accept_case stage0 "$OPTIONAL_AGGREGATE_FIXTURE" optional-aggregate "an aggregate global with an absent optional reference"
 run_accept_case stage1 "$OPTIONAL_AGGREGATE_FIXTURE" optional-aggregate "an aggregate global with an absent optional reference"
-echo "global initializer smoke OK: unsupported forms reject; supported scalar and aggregate values return 42"
+run_accept_case stage0 "$CSTR_GLOBAL_FIXTURE" cstr "a C-string global initializer"
+run_accept_case stage1 "$CSTR_GLOBAL_FIXTURE" cstr "a C-string global initializer"
+echo "global initializer smoke OK: unsupported forms reject; supported scalar, optional, array, aggregate, and string values return 42"
