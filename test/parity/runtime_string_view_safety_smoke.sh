@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac-stage0}"
 source "$ROOT/test/parity/run_timeout.sh"
 
 [[ -x "$STAGE1" ]] || { echo "runtime string view smoke: missing stage1 compiler: $STAGE1" >&2; exit 2; }
@@ -16,46 +16,6 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-runtime-sview.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 ulimit -c 0 || true
 SOURCE="$ROOT/test/parity/fixtures/runtime_string_view_invalid_length.elisa"
-NULL_DATA_SOURCE="$WORK/runtime_string_view_null_data.elisa"
-cat >"$NULL_DATA_SOURCE" <<ELISA
-include "$ROOT/elisacore_std/elisacore_runtime_prelude.elisa"
-include "$ROOT/elisacore_std/collections.elisa"
-include "$ROOT/elisacore_std/elisacore_runtime_strings.elisa"
-
-def main() -> i64:
-    can Memory.Allocate, Abort.Panic:
-        null_data: u8&? = null
-        malformed: sview = StringView{data: null_data, len: 4}
-        return 42 if string_views_eq(malformed, sview("safe", 0, -1)) != 0
-        return 42 if string_views_eq(malformed, malformed) != 0
-        return 42 if string_view_eq(malformed, "safe") != 0
-        return 42 if string_view_len(malformed) != 0
-        return 42 if string_view_index(malformed, 0) != 0
-        return 42 if string_view_slice(malformed, 0, -1).len != 0
-        return 42 if sview_len(malformed) != 0
-        return 42 if not sview_is_empty(malformed)
-        return 42 if hash_sview(malformed) != 0xcbf29ce484222325
-        return 42 if sview_find_byte(malformed, 115) != -1
-        return 42 if sview_starts_with(malformed, sview("s", 0, -1))
-        return 42 if sview_ends_with(malformed, sview("e", 0, -1))
-        return 42 if sview_trim_trailing(malformed, 47).len != 0
-        return 42 if sview_basename(malformed, 47).len != 0
-        return 42 if sview_dirname(malformed, 47).len != 0
-    return 0
-ELISA
-NULL_COPY_SOURCE="$WORK/runtime_string_view_null_copy.elisa"
-cat >"$NULL_COPY_SOURCE" <<ELISA
-include "$ROOT/elisacore_std/elisacore_runtime_prelude.elisa"
-include "$ROOT/elisacore_std/collections.elisa"
-include "$ROOT/elisacore_std/elisacore_runtime_strings.elisa"
-
-def main() -> i64:
-    can Memory.Allocate, Abort.Panic:
-        null_data: u8&? = null
-        malformed: sview = StringView{data: null_data, len: 4}
-        _ = string_view_copy(malformed)
-        return 91
-ELISA
 
 compile_case() {
     local compiler="$1" stage="$2" optimization="$3" case_name="$4"
@@ -64,8 +24,6 @@ compile_case() {
     local source
     case "$case_name" in
         invalid-length) source="$SOURCE" ;;
-        null-data) source="$NULL_DATA_SOURCE" ;;
-        null-copy) source="$NULL_COPY_SOURCE" ;;
         *) echo "runtime string view smoke: unknown case $case_name" >&2; exit 2 ;;
     esac
     if [[ "$stage" == stage1 ]]; then
@@ -98,16 +56,9 @@ run_case() {
     local run_status=$?
     set -e
     case "$case_name" in
-        invalid-length|null-data)
+        invalid-length)
             [[ "$run_status" -eq 0 ]] || {
                 echo "runtime string view smoke: $case_name did not fail closed on $stage O$optimization (status $run_status)" >&2
-                cat "$log" >&2
-                exit 1
-            }
-            ;;
-        null-copy)
-            [[ "$run_status" -ne 0 ]] && rg -q 'invalid string view data' "$log" || {
-                echo "runtime string view smoke: null copy missed the checked panic on $stage O$optimization (status $run_status)" >&2
                 cat "$log" >&2
                 exit 1
             }
@@ -115,19 +66,55 @@ run_case() {
     esac
 }
 
-for case_name in invalid-length null-data null-copy; do
+for case_name in invalid-length; do
     for optimization in 0 2; do
         compile_case "$STAGE1" stage1 "$optimization" "$case_name"
         compile_case "$STAGE0" stage0 "$optimization" "$case_name"
     done
 done
 
-for case_name in invalid-length null-data null-copy; do
+for case_name in invalid-length; do
     for optimization in 0 2; do
         run_case stage1 "$optimization" "$case_name"
         run_case stage0 "$optimization" "$case_name"
     done
 done
+
+check_nullable_view_rejected() {
+    local compiler="$1" stage="$2" mode="$3"
+    local output="$WORK/null-backed-view-$stage"
+    local log="$output.compile.log"
+    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/parity/fixtures/runtime_string_view_null_data.elisa" >"$log" 2>&1; then
+        echo "runtime string view smoke: $stage accepted a null-backed sview" >&2
+        exit 1
+    fi
+    rg -q 'struct literal field "data" expects (u8&, got u8&\?|non-null reference, got (null|nullable reference))' "$log" || {
+        echo "runtime string view smoke: $stage rejected null-backed sview for the wrong reason" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
+check_nullable_view_rejected "$STAGE1" stage1 exe
+check_nullable_view_rejected "$STAGE0" stage0 c-archive
+
+check_view_backing_is_immutable() {
+    local compiler="$1" stage="$2" mode="$3"
+    local output="$WORK/mutable-view-backing-$stage"
+    local log="$output.compile.log"
+    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/parity/fixtures/runtime_string_view_mutable_data.elisa" >"$log" 2>&1; then
+        echo "runtime string view smoke: $stage allowed StringView.data reassignment" >&2
+        exit 1
+    fi
+    rg -qi 'immutable|read.only|cannot assign' "$log" || {
+        echo "runtime string view smoke: $stage rejected StringView.data reassignment for an unexpected reason" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
+check_view_backing_is_immutable "$STAGE1" stage1 exe
+check_view_backing_is_immutable "$STAGE0" stage0 c-archive
 
 check_region_lifetime() {
     local compiler="$1" stage="$2" mode="$3"
@@ -183,4 +170,4 @@ check_region_lifetime() {
 check_region_lifetime "$STAGE1" stage1 exe
 check_region_lifetime "$STAGE0" stage0 c-archive
 
-echo "runtime string view smoke OK: malformed lengths and null data fail closed; null copies panic; destroyed-view and last-use cases agree on stage0/stage1"
+echo "runtime string view smoke OK: backing is non-null and immutable; malformed lengths fail closed; region lifetimes agree on stage0/stage1"
