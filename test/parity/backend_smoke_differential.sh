@@ -159,6 +159,8 @@ diff_case const_u8 'const B: u8 = 200\n\ndef main() -> i64:\n    return B.i64() 
 diff_case const_shadowed_by_local 'const V: i64 = 1\n\ndef main() -> i64:\n    V: i64 = 42\n    return V\n'
 diff_case const_in_arithmetic 'const A: i64 = 40\nconst B: i64 = 2\n\ndef main() -> i64:\n    return A + B\n'
 diff_object_case global_mutable_negative_float 'global mutable weight: f64 = -1.5\n\ndef main() -> i64:\n    return 42 if weight == -1.5 else 0\n'
+diff_object_case global_mutable_float_arithmetic 'global mutable weight: f64 = 1.5 + 2.5\n\ndef main() -> i64:\n    return 42 if weight == 4.0 else 0\n'
+diff_object_case global_mutable_f32_arithmetic 'global mutable weight: f32 = 0.1 + 0.2\n\ndef main() -> i64:\n    return 42 if weight > 0.29 and weight < 0.31 else 0\n'
 diff_case aggregate_global_refs 'struct Pair:\n    left: i32\n    right: i32\n\nstruct Holder:\n    pair: Pair\n\nglobal base: Pair = Pair{left: 1, right: 2}\nglobal table: Pair[2] = [base, Pair{left: 3, right: 4}]\nglobal picked: Pair = table[1]\nglobal wrapped: Holder = Holder{pair: table[0]}\nglobal first_left: i32 = table[0].left\n\ndef main() -> i64:\n    return picked.left.i64() + wrapped.pair.right.i64() + first_left.i64()\n'
 # `const A: mutable i64 = 42` is accepted by stage0, so `is_mutable` must not decline.
 diff_case const_mutable_global 'const A: mutable i64 = 42\n\ndef main() -> i64:\n    return A\n'
