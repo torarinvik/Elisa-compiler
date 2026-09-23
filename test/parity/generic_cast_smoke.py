@@ -26,6 +26,23 @@ BAD_CASTS = {
     local: T = value
     local.cast[i64&]
 """,
+    "generic_if_expression_to_pointer": """def hidden_if[T](value: T, flag: bool) -> i64&:
+    return value.cast[i64&] if flag else null
+""",
+    "generic_match_statement_to_pointer": """def hidden_match[T](value: T, tag: i64) -> void:
+    match tag:
+        1:
+            value.cast[i64&]
+        _:
+            pass
+""",
+    "generic_contract_to_pointer": """def hidden_contract[T](value: T) -> void:
+    requires value.cast[i64&] != null
+""",
+    "generic_while_condition_to_pointer": """def hidden_while[T](value: T) -> void:
+    while value.cast[bool]:
+        break
+""",
     "pointer_to_generic": """def reinterpret[T](value: i64&) -> T&:
     value.cast[T&]
 """,
@@ -51,6 +68,76 @@ GRANTED_CASTS = {
     can Unsafe.PointerCast:
         return address.T()
 """,
+}
+
+# NUL facts from a short-lived branch snapshot are not promoted to the enclosing flow state.
+# Pre-existing facts do survive joins when every path preserves them; a clear on one match arm
+# invalidates them. This deliberately tests both the conservative warning and the no-escape rule.
+NUL_FLOW_CASES = {
+    "one_branch_terminator_does_not_escape": ("""def scan(bytes: mutable darray[u8]&, flag: bool) -> void:
+    if flag:
+        bytes.push(0)
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", True),
+    "new_terminator_in_every_branch_is_not_promoted": ("""def scan(bytes: mutable darray[u8]&, flag: bool) -> void:
+    if flag:
+        bytes.push(0)
+    else:
+        bytes.push(0)
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", True),
+    "zero_iteration_loop_terminator_does_not_escape": ("""def scan(bytes: mutable darray[u8]&, flag: bool) -> void:
+    while flag:
+        bytes.push(0)
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", True),
+    "one_match_arm_terminator_does_not_escape": ("""def scan(bytes: mutable darray[u8]&, tag: i64) -> void:
+    match tag:
+        0:
+            bytes.push(0)
+        _:
+            pass
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", True),
+    "new_terminator_in_every_match_arm_is_not_promoted": ("""def scan(bytes: mutable darray[u8]&, tag: i64) -> void:
+    match tag:
+        0:
+            bytes.push(0)
+        _:
+            bytes.push(0)
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", True),
+    "preexisting_terminator_survives_branch_join": ("""def scan(bytes: mutable darray[u8]&, flag: bool) -> void:
+    bytes.push(0)
+    if flag:
+        pass
+    else:
+        pass
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", False),
+    "match_arm_invalidation_drops_preexisting_terminator": ("""def scan(bytes: mutable darray[u8]&, tag: i64) -> void:
+    bytes.push(0)
+    match tag:
+        0:
+            bytes.clear()
+        _:
+            pass
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", True),
+    "preexisting_terminator_survives_loop_join": ("""def scan(bytes: mutable darray[u8]&, flag: bool) -> void:
+    bytes.push(0)
+    while flag:
+        pass
+    can Unsafe.PointerCast, Unsafe.BufferReinterpret:
+        (&bytes[0]).cast[static u8&]
+""", False),
 }
 
 
@@ -102,6 +189,15 @@ def main() -> None:
             name, granted.returncode, output[-5000:]
         )
         print(f"{name}: explicit grant accepted PASS", flush=True)
+
+    for name, (source, should_warn) in NUL_FLOW_CASES.items():
+        result = analyze_case(reporter, name, source, strict=True)
+        output = result.stdout + result.stderr
+        has_erasure_warning = "erases its length" in output
+        assert result.returncode == 0 and has_erasure_warning == should_warn, (
+            name, result.returncode, output[-5000:]
+        )
+        print(f"{name}: conservative NUL-flow join PASS", flush=True)
 
     warning = analyze_case(reporter, "default_warning", BAD_CASTS["numeric_conversion_to_generic"], strict=False)
     output = warning.stdout + warning.stderr

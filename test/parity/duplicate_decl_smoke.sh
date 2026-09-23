@@ -29,9 +29,9 @@ n=$(printf 'def f() -> i64:\n    return 0\ndef f(a: i64) -> i64:\n    return a\n
 n=$(printf 'struct P:\n    x: i64\nstruct P:\n    y: i64\n' | dups)
 [ "$n" -eq 1 ] || fail "duplicate type not flagged (got $n)"
 n=$(printf 'struct Region:\n    count: usize\nstruct Region:\n    count: usize\n' | dups)
-[ "$n" -eq 1 ] || fail "duplicate Region declarations bypassed the builtin exception (got $n)"
+[ "$n" -eq 0 ] || fail "runtime-carrier Region redeclaration diverged from stage0's skipped declaration (got $n)"
 n=$(printf 'struct ArenaMark:\n    count: usize\nstruct ArenaMark:\n    count: usize\n' | dups)
-[ "$n" -eq 1 ] || fail "duplicate ArenaMark declarations bypassed the builtin exception (got $n)"
+[ "$n" -eq 0 ] || fail "runtime-carrier ArenaMark redeclaration diverged from stage0's skipped declaration (got $n)"
 n=$(printf 'struct P:\n    x: i64\ndef P() -> i64:\n    return 1\n' | dups)
 [ "$n" -eq 0 ] || fail "struct+function same name wrongly flagged (got $n)"
 
