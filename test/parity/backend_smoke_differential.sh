@@ -4,6 +4,38 @@
 #
 # Sourced by backend_native_smoke.sh.
 
+diff_object_case() {
+    # Standalone scalar programs can use -emit obj on both compilers. Keep this separate
+    # from diff_case: stage0's c-archive path rejects some otherwise valid global programs,
+    # and treating that as an ordinary differential skip would leave the regression
+    # untested. This path is only for fixtures that do not need Elisa runtime symbols.
+    local name="$1" src="$2"
+    total=$((total + 1))
+    local ll="$BUILD/diff_$name.ll"
+
+    if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL diff_$name: stage1 declined to emit"; return
+    fi
+    "$LLC" -filetype=obj "$ll" -o "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: llc rejected stage1 IR"; return; }
+    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
+    RUN "$BUILD/diff_${name}_s1"; local got1=$?
+
+    printf '%b' "$src" > "$BUILD/diff_$name.elisa"
+    if ! "$ELISACORE_BIN" -emit obj -o "$BUILD/diff_${name}_s0.o" "$BUILD/diff_$name.elisa" 2>/dev/null; then
+        echo "  FAIL diff_$name: stage0 rejected standalone object program"; return
+    fi
+    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.o" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
+    RUN "$BUILD/diff_${name}_s0"; local got0=$?
+
+    if [ "$got1" -eq 124 ] || [ "$got0" -eq 124 ]; then
+        echo "  FAIL diff_$name: TIMED OUT (stage1=$got1 stage0=$got0)"; return
+    fi
+    if [ "$got1" -ne "$got0" ]; then
+        echo "  FAIL diff_$name: stage1=$got1 stage0=$got0 (backends disagree)"; return
+    fi
+    pass=$((pass + 1))
+}
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -126,6 +158,7 @@ diff_case const_u8 'const B: u8 = 200\n\ndef main() -> i64:\n    return B.i64() 
 # A LOCAL shadows a global const of the same name.
 diff_case const_shadowed_by_local 'const V: i64 = 1\n\ndef main() -> i64:\n    V: i64 = 42\n    return V\n'
 diff_case const_in_arithmetic 'const A: i64 = 40\nconst B: i64 = 2\n\ndef main() -> i64:\n    return A + B\n'
+diff_object_case global_mutable_negative_float 'global mutable weight: f64 = -1.5\n\ndef main() -> i64:\n    return 42 if weight == -1.5 else 0\n'
 diff_case aggregate_global_refs 'struct Pair:\n    left: i32\n    right: i32\n\nstruct Holder:\n    pair: Pair\n\nglobal base: Pair = Pair{left: 1, right: 2}\nglobal table: Pair[2] = [base, Pair{left: 3, right: 4}]\nglobal picked: Pair = table[1]\nglobal wrapped: Holder = Holder{pair: table[0]}\nglobal first_left: i32 = table[0].left\n\ndef main() -> i64:\n    return picked.left.i64() + wrapped.pair.right.i64() + first_left.i64()\n'
 # `const A: mutable i64 = 42` is accepted by stage0, so `is_mutable` must not decline.
 diff_case const_mutable_global 'const A: mutable i64 = 42\n\ndef main() -> i64:\n    return A\n'
