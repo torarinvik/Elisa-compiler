@@ -176,7 +176,8 @@ def main() -> i32:
 
 def main():
     env = dict(os.environ, ELISA_ALLOW_STALE_STAGE1='1')
-    compilers = [ROOT / '../../Go projects/Elisa-core/compiler/bin/elisac', ROOT / 'scripts/elisac_stage1.sh']
+    stage0 = Path(os.environ.get('ELISACORE_BIN', ROOT / '../../Go projects/Elisa-core/compiler/bin/elisac'))
+    compilers = [stage0, ROOT / 'scripts/elisac_stage1.sh']
     with tempfile.TemporaryDirectory(prefix='elisa-private-fields-') as directory:
         work = Path(directory)
         for compiler in compilers:
