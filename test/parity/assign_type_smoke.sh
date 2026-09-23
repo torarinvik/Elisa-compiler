@@ -56,8 +56,8 @@ out=$(printf 'def f() -> bool:\n    return true\n' | "$RPT")
 grep -q "return type expects bool" <<< "$out" && fail "false positive on matching Return: $out"
 
 # 8. Field assignment type mismatch MUST flag.
-out=$(printf 'struct S:\n    x: bool\ndef f() -> void:\n    s: S = S{}\n    s.x <- 5\n' | "$RPT")
-grep -qE "expects bool, got (i64|int)" <<< "$out" || fail "Field assign mismatch not flagged: $out"
+out=$(printf 'struct S:\n    x: mutable bool\ndef f() -> void:\n    s: mutable S = S{}\n    s.x <- 5\n' | "$RPT")
+grep -qE "(cannot assign (i64|int) to bool|expects bool, got (i64|int))" <<< "$out" || fail "Field assign mismatch not flagged: $out"
 
 # 9. Structural generic-container mismatch MUST flag (darray <- dict).
 out=$(printf 'def f() -> void:\n    a: mutable darray[i64] = []\n    b: dict[cstr, i64] = {}\n    a <- b\n' | "$RPT")

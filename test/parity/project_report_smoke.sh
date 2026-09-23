@@ -32,7 +32,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-EC="${ELISAC:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+EC="${ELISAC:-${ELISA_S0_REAL:-${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}}}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$EC" || exit $?
 BUILD="$ROOT/build/project_report"
 rm -rf "$BUILD"

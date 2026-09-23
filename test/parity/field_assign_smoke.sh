@@ -11,12 +11,12 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "field-assign smoke FAIL: $1" >&2; exit 1; }
 
 # 1. a string assigned to an i64 field MUST be flagged.
-out=$(printf 'struct C:\n    count: i64\n\ndef f(c: mutable C) -> void:\n    c.count <- "s"\n' | "$RPT")
-grep -q "\"count\" expects i64, got static u8" <<< "$out" || fail "string-to-i64-field not flagged: $out"
+out=$(printf 'struct C:\n    count: mutable i64\n\ndef f(c: mutable C) -> void:\n    c.count <- "s"\n' | "$RPT")
+grep -qE '("count" expects i64, got static u8|cannot assign static u8&? to i64)' <<< "$out" || fail "string-to-i64-field not flagged: $out"
 
 # 2. a bool assigned to a string field MUST be flagged.
-out=$(printf 'struct C:\n    name: sview\n\ndef f(c: mutable C) -> void:\n    c.name <- true\n' | "$RPT")
-grep -q "\"name\" expects sview, got bool" <<< "$out" || fail "bool-to-string-field not flagged: $out"
+out=$(printf 'struct C:\n    name: mutable sview\n\ndef f(c: mutable C) -> void:\n    c.name <- true\n' | "$RPT")
+grep -qE '("name" expects sview, got bool|cannot assign bool to sview)' <<< "$out" || fail "bool-to-string-field not flagged: $out"
 
 # 3. a compatible int assigned to an i64 field must NOT be flagged.
 out=$(printf 'struct C:\n    count: i64\n\ndef f(c: mutable C) -> void:\n    c.count <- 5\n' | "$RPT")
