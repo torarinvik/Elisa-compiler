@@ -45,6 +45,7 @@ for stage in stage0 stage1; do
     fi
     grep -Eq 'fence seq_cst' "$ir" || fail "$stage omitted the sequentially consistent fence"
     grep -Eq 'cmpxchg ptr .* acq_rel acquire' "$ir" || fail "$stage omitted pointer compare_exchange"
+    grep -Eq 'atomicrmw xchg ptr .* acq_rel' "$ir" || fail "$stage omitted pointer exchange"
     grep -Eq 'load atomic i8, .* acquire' "$ir" || fail "$stage omitted bool atomic load"
     grep -Eq 'store atomic i8 .* release' "$ir" || fail "$stage omitted bool atomic store"
     grep -Eq 'load atomic double, .* acquire' "$ir" || fail "$stage omitted floating-point atomic load"
@@ -76,4 +77,4 @@ for optimization in 0 2; do
     done
 done
 
-echo "atomic-runtime smoke OK: integer/bool/pointer/float atomics, fence IR, and 4-thread CAS increments at O0/O2 on Stage0/Stage1"
+echo "atomic-runtime smoke OK: integer/bool/pointer/float atomics, fence IR, pointer exchange, and 4-thread CAS increments at O0/O2 on Stage0/Stage1"
