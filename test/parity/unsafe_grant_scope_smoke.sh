@@ -40,6 +40,31 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "alias grant does not escape into closure": (
+        "# strict\n"
+        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&) -> void:\n"
+        "    can Unsafe.Alias:\n"
+        "        callback: fn() -> void = fn():\n"
+        "            alias: mutable i64& = get_ref(x)\n"
+        "            pair(alias, x)\n"
+        "        callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "closure may grant its own alias operation": (
+        "# strict\n"
+        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&) -> void:\n"
+        "    callback: fn() -> void = fn():\n"
+        "        alias: mutable i64& = get_ref(x)\n"
+        "        can Unsafe.Alias:\n            pair(alias, x)\n"
+        "    callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "alias in match arm": (
         "# strict\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
