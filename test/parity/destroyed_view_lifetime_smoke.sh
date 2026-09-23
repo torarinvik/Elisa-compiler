@@ -17,6 +17,7 @@ GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
 JSON_REGION_MISMATCH_BAD="$ROOT/test/repro/json_handle_region_mismatch.elisa"
+SHADOW_REBIND_BAD="$ROOT/test/repro/shadowed_region_generic_rebind.elisa"
 OPTIONAL_BAD="$ROOT/test/repro/sview_optional_region_use_after_destroy.elisa"
 SHADOW_BAD="$ROOT/test/repro/region_shadow_inner_use_after_destroy.elisa"
 JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
@@ -89,6 +90,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$json_mismatch_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected cross-arena JSON handle at O$optimization" >&2; exit 1; }
+
+    shadow_rebind_output="$WORK/shadowed-region-generic-rebind-O$optimization"
+    shadow_rebind_log="$shadow_rebind_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$shadow_rebind_output.ll" "$SHADOW_REBIND_BAD" >"$shadow_rebind_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted rebinding an outer generic handle to an inner same-name region at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'Box' "$shadow_rebind_log" || {
+        echo "destroyed view lifetime smoke: same-name region rebind rejection did not report a structural type mismatch at O$optimization" >&2
+        cat "$shadow_rebind_log" >&2
+        exit 1
+    }
+    [[ ! -e "$shadow_rebind_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected cross-region rebind at O$optimization" >&2; exit 1; }
 
     optional_output="$WORK/optional-view-after-destroy-O$optimization"
     optional_log="$optional_output.log"
@@ -223,6 +237,23 @@ for optimization in 0 2; do
     [[ "$run_status" -eq 0 ]] || {
         echo "destroyed view lifetime smoke: outer shadowed-region control returned $run_status at O$optimization" >&2
         cat "$shadow_good_log.run" >&2
+        exit 1
+    }
+
+    shadow_rebind_good_output="$WORK/shadowed-region-generic-rebind-live-O$optimization"
+    shadow_rebind_good_log="$shadow_rebind_good_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$shadow_rebind_good_output" "$ROOT/test/parity/fixtures/shadowed_region_generic_rebind_live.elisa" >"$shadow_rebind_good_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: rejected a same-region generic handle rebind at O$optimization" >&2
+        cat "$shadow_rebind_good_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$shadow_rebind_good_output" >"$shadow_rebind_good_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 0 ]] || {
+        echo "destroyed view lifetime smoke: same-region generic rebind control returned $run_status at O$optimization, expected 0" >&2
+        cat "$shadow_rebind_good_log.run" >&2
         exit 1
     }
 done

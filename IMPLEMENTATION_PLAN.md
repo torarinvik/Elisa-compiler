@@ -661,7 +661,7 @@ bash test/parity/loop_region_reuse_smoke.sh
 bash test/parity/thread_real_smoke.sh
 
 # Full acceptance and independent bootstrap/runtime checks.
-ELISA_GATE_NO_CACHE=1 bash test/parity/run_all.sh --profile full
+ELISA_GATE_PROFILE=full ELISA_GATE_NO_CACHE=1 bash test/parity/run_all.sh
 bash test/parity/self_host_gen3_smoke.sh
 bash test/parity/self_host_runtime_smoke.sh
 ```
@@ -1201,8 +1201,10 @@ Every landed change goes through, in order:
    PERMISSIVE all ratcheted at zero);
 4. `bash scripts/self_host_gen2.sh` then `bash test/parity/self_host_gen3_smoke.sh`
    (stage A 5/5, stage B gen3 builds, stage C `gen3.o == gen4.o`, stage D 40 identical runs);
-5. `bash test/parity/run_all.sh --profile full` (~11 min, ~330 checks; the ONLY profile a
-   commit may rely on — a green partial profile means "I have not broken the obvious things").
+5. `ELISA_GATE_PROFILE=full bash test/parity/run_all.sh` (the ONLY profile a commit may rely
+   on — a green partial profile means "I have not broken the obvious things"). The runner
+   reported 455 checks on 2026-09-24; the count is tree- and configuration-dependent, so
+   record the exact count from each completed run rather than using the old ~330 estimate.
 
 stage0 is the oracle. When stage1 and a fixture disagree, stage0 arbitrates; when stage0 and
 a recorded expectation disagree, stage0 wins — unless stage0 is shown wrong by a second
@@ -1327,8 +1329,9 @@ One commit, message carrying the five silent wrong answers it closes and the del
 stage0 divergence. Evidence line: `effect_handler 48/35/39/14; gen3==gen4; stage D 40/40`.
 
 ### 2.1 Re-baseline the full gate
-Run `run_all.sh --profile full` once on the committed tree and record the exact count here
-(replace "~330"). Any red check is triaged with the stale-gate-rot discipline: of five red
+Run `ELISA_GATE_PROFILE=full bash test/parity/run_all.sh` once on the committed tree and
+record the exact count here. The current runner reported 455 checks on 2026-09-24; keep this
+as a measured point, not a permanent expected count. Any red check is triaged with the stale-gate-rot discipline: of five red
 gates that looked like rot, THREE were real bugs. Never relax an assertion without building
 the pre-change tree in a `git worktree` (never `git stash`) and proving the behaviour changed
 for a reason you can name.
@@ -2144,7 +2147,7 @@ PART 1  the task's probe matrix: every fixture through BOTH compilers; print
 PART 2  the focused smoke(s) named in the task
 PART 3  differential_corpus.sh + adversarial_differential.py (-O0 and -O2)
 PART 4  self_host_gen2.sh + self_host_gen3_smoke.sh (run ALONE, not in parallel with PART 2/3)
-PART 5  run_all.sh --profile full   (only before a commit)
+PART 5  ELISA_GATE_PROFILE=full bash test/parity/run_all.sh   (only before a commit)
 echo "ALL PARTS DONE"
 ```
 

@@ -25,4 +25,18 @@ for output in "$WORK/stage0.ll" "$WORK/stage1.ll"; do
     rg -q 'call i32 .*RenderHost.*checked' "$output"
 done
 
+# Region-generic fallible results are returned through the same hidden out/status ABI.
+# Keep these source regressions in the recurring differential gate, including the
+# module-qualified JSON wrapper path that must retain its region-indexed handle type.
+for fixture in try_generic_region_error_return try_json_handle_region_error_return; do
+    source="$ROOT/test/repro/$fixture.elisa"
+    for stage in stage0 stage1; do
+        compiler="$STAGE0"
+        if [[ "$stage" == stage1 ]]; then compiler="$STAGE1"; fi
+        output="$WORK/$stage-$fixture.ll"
+        "$compiler" -emit llvm -O0 -o "$output" "$source" >"$WORK/$stage-$fixture.log" 2>&1
+        ! rg -q '!elisa\.declined' "$output"
+    done
+done
+
 echo "cross-module fallible return parity OK"
