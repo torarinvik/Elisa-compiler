@@ -17,6 +17,7 @@ GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
 JSON_REGION_MISMATCH_BAD="$ROOT/test/repro/json_handle_region_mismatch.elisa"
+OPTIONAL_BAD="$ROOT/test/repro/sview_optional_region_use_after_destroy.elisa"
 JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
 ARENA_VIEW_BAD="$ROOT/test/repro/manual_arena_free_use_after_region.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
@@ -86,6 +87,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$json_mismatch_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected cross-arena JSON handle at O$optimization" >&2; exit 1; }
+
+    optional_output="$WORK/optional-view-after-destroy-O$optimization"
+    optional_log="$optional_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$optional_output.ll" "$OPTIONAL_BAD" >"$optional_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a present optional view after its region was destroyed at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "scratch"' "$optional_log" || {
+        echo "destroyed view lifetime smoke: optional view rejection lost its backing-region dependency at O$optimization" >&2
+        cat "$optional_log" >&2
+        exit 1
+    }
+    [[ ! -e "$optional_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected optional stale view at O$optimization" >&2; exit 1; }
 
     json_view_output="$WORK/json-view-after-arena-free-O$optimization"
     json_view_log="$json_view_output.log"
@@ -162,6 +176,23 @@ for optimization in 0 2; do
         cat "$last_use_log.run" >&2
         exit 1
     }
+
+    optional_good_output="$WORK/optional-view-live-O$optimization"
+    optional_good_log="$optional_good_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$optional_good_output" "$ROOT/test/parity/fixtures/sview_optional_region_live_use.elisa" >"$optional_good_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: rejected a present optional view used before destroy, or an absent optional afterward at O$optimization" >&2
+        cat "$optional_good_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$optional_good_output" >"$optional_good_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 0 ]] || {
+        echo "destroyed view lifetime smoke: optional live/absent control returned $run_status at O$optimization" >&2
+        cat "$optional_good_log.run" >&2
+        exit 1
+    }
 done
 
-echo "destroyed view lifetime smoke OK: stale uses and cross-arena generic handles are rejected; live and last-use-before-destroy controls pass at O0/O2"
+echo "destroyed view lifetime smoke OK: stale and cross-arena values are rejected; live and last-use controls pass at O0/O2"
