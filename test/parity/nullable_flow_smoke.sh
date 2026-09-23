@@ -21,8 +21,17 @@ check_rejected $'struct Box:\n    value: int\nextern maybe_box() -> Box&?\ndef b
 
 check_rejected $'struct Box:\n    value: mutable int\nextern maybe_box() -> Box&?\ndef bad() -> int:\n    box: mutable Box&? = maybe_box()\n    alias: Box&? = box\n    if alias == null:\n        return 0\n    box <- null\n    return alias.value\n' 'field access requires proven non-null reference'
 
+check_rejected $'def bad(value: i64&?) -> bool:\n    value == 5\n' 'nullable reference "value" must be proven non-null before scalar use'
+check_rejected $'def bad(value: i64&?) -> i64:\n    value + 1\n' 'nullable reference "value" must be proven non-null before scalar use'
+
 guarded=$(printf 'struct Box:\n    value: mutable int\nextern maybe_box() -> Box&?\ndef ok() -> int:\n    box: Box&? = maybe_box()\n    if box == null:\n        return 0\n    return box.value\n' | "$RPT")
 grep -q '^D 0$' <<< "$guarded"
+
+guarded_scalar=$(printf 'def ok(value: i64&?) -> i64:\n    if value == null:\n        return 0\n    return value + 1\n' | "$RPT")
+grep -q '^D 0$' <<< "$guarded_scalar"
+
+null_test=$(printf 'def ok(value: i64&?) -> bool:\n    value == null\n' | "$RPT")
+grep -q '^D 0$' <<< "$null_test"
 
 decorated_guard=$(printf 'struct Box:\n    value: int\n@guard_nonnull(box)\ndef has_box(box: Box&?) -> bool:\n    return box != null\ndef read(box: Box&?) -> int:\n    if not has_box(box):\n        return 0\n    return box.value\n' | "$RPT")
 grep -q '^D 0$' <<< "$decorated_guard"
