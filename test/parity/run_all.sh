@@ -416,6 +416,7 @@ HEAVY_FIRST=(
   "$REPO_ROOT/test/parity/runtime_string_allocation_smoke.sh"
   "$REPO_ROOT/test/parity/runtime_string_view_safety_smoke.sh"
   "$REPO_ROOT/test/parity/json_opaque_dom_smoke.sh"
+  "$REPO_ROOT/test/parity/no_partial_backend_output_smoke.sh"
   "$REPO_ROOT/test/parity/dict_index_optional_type_smoke.sh"
   "$REPO_ROOT/test/parity/loop_smoke.sh"                 # 121s
   "$REPO_ROOT/test/parity/extern_view_abi_smoke.sh"
