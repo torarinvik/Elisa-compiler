@@ -154,6 +154,16 @@ class WasmExportScanClientTests(unittest.TestCase):
         )
 
     def test_export_client_selects_component_payload_when_requested(self) -> None:
+        self.row["return"] = "WindowState"
+        self.row["parameters"] = [
+            {
+                "name": "state",
+                "type": "WindowState",
+                "default": None,
+                "binding": "scalar",
+                "wasm_type": "i32",
+            }
+        ]
         payload = self.encode()
         with (
             patch(
@@ -175,6 +185,8 @@ class WasmExportScanClientTests(unittest.TestCase):
         capture.assert_called_once_with(
             ["launcher", "scanner", "--build-component-payload", "source"]
         )
+        with self.assertRaisesRegex(WasmExportScanClientError, "inconsistent scanner payload ABI"):
+            _decode_build_payload(payload)
 
     def test_rss_sampler_sums_process_group_and_descendant_tree(self) -> None:
         process = SimpleNamespace(pid=100)

@@ -91,7 +91,7 @@ def _require_identifier(value: Any, label: str) -> str:
     return identifier
 
 
-def _abi_for_type(type_name: str) -> tuple[str, str] | None:
+def _abi_for_type(type_name: str, *, component: bool = False) -> tuple[str, str] | None:
     if type_name.endswith("?"):
         return None
     if type_name == "cstr":
@@ -100,17 +100,24 @@ def _abi_for_type(type_name: str) -> tuple[str, str] | None:
         return "pointer", "i32"
     wasm_type = _SCALAR_WASM_TYPES.get(type_name)
     if wasm_type is None:
-        return None
+        return ("scalar", "i32") if component else None
     return "scalar", wasm_type
 
 
-def _validate_abi(type_name: str, binding: Any, wasm_type: Any, label: str) -> None:
-    expected = _abi_for_type(type_name)
+def _validate_abi(
+    type_name: str,
+    binding: Any,
+    wasm_type: Any,
+    label: str,
+    *,
+    component: bool = False,
+) -> None:
+    expected = _abi_for_type(type_name, component=component)
     if expected is None or (binding, wasm_type) != expected:
         raise WasmExportScanClientError(f"inconsistent scanner payload ABI: {label}")
 
 
-def _validate_exports(value: Any) -> list[dict[str, Any]]:
+def _validate_exports(value: Any, *, component: bool = False) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value or len(value) > MAX_EXPORTS:
         raise WasmExportScanClientError("invalid scanner payload field: exports")
 
@@ -146,7 +153,13 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
             "i32", "i64", "f32", "f64", "void"
         }:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.wasm_type")
-        _validate_abi(return_type, row["binding"], row["wasm_type"], f"{label}.return")
+        _validate_abi(
+            return_type,
+            row["binding"],
+            row["wasm_type"],
+            f"{label}.return",
+            component=component,
+        )
         if type(row["line"]) is not int or row["line"] < 1:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.line")
 
@@ -201,13 +214,18 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
                 parameter["binding"],
                 parameter["wasm_type"],
                 parameter_label,
+                component=component,
             )
         exports.append(row)
 
     return exports
 
 
-def _decode_build_payload(stdout: bytes) -> tuple[str, list[dict[str, Any]]]:
+def _decode_build_payload(
+    stdout: bytes,
+    *,
+    component: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
     if not stdout or len(stdout) > MAX_PROCESS_OUTPUT_BYTES or not stdout.endswith(b"\n"):
         raise WasmExportScanClientError("Elisascript scanner returned an invalid payload frame")
     json_bytes = stdout[:-1]
@@ -237,7 +255,7 @@ def _decode_build_payload(stdout: bytes) -> tuple[str, list[dict[str, Any]]]:
         ) from error
     if source_bytes > MAX_FLATTENED_SOURCE_BYTES:
         raise WasmExportScanClientError("Elisascript scanner returned oversized flattened source")
-    return flattened_source, _validate_exports(payload["exports"])
+    return flattened_source, _validate_exports(payload["exports"], component=component)
 
 
 def _decode_flatten_payload(stdout: bytes) -> str:
@@ -527,7 +545,7 @@ def run_export_scan(
         raise _scanner_failure(returncode, stdout, stderr)
     if stderr:
         raise WasmExportScanClientError("Elisascript scanner wrote unexpected stderr on success")
-    return _decode_build_payload(stdout)
+    return _decode_build_payload(stdout, component=component)
 
 
 def run_flatten_source(
