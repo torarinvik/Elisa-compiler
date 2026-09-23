@@ -30,16 +30,6 @@ extend Semantic:
                         return false
 
 
-        def type_is_readonly_ref(expression: Ast::Expr) -> bool:
-            can Abort.Panic:
-                # A DECLARED read-only reference stays read-only, heap or not. stage0
-                # narrows on the BINDING (analyzer_flow.go, e33dbd60): fresh storage is
-                # writable by construction and `mutable` is what keeps it writable, so
-                # `heap T&` without `mutable` is a read-only borrow exactly like `T&`.
-                # Excluding heap here let stage1 accept writes stage0 rejects.
-                return type_contains_ref(expression) and not type_is_mutable(expression) and not type_is_lmut(expression)
-
-
         def readonly_root_name(expression: Ast::Expr) -> sview:
             match expression:
                 Expr.Ident(name, line):
@@ -65,13 +55,6 @@ extend Semantic:
                     return readonly_root_name(inner)
                 _:
                     return ""
-
-
-        def readonly_name_index(names: darray[sview]&, name: sview) -> i64:
-            while index < names.count |index: usize = 0|:
-                index.i64() return if names[index] == name
-                index <- index + 1
-            return -1
 
 
         const READONLY_FUNCTION_ROW: u32 = 4294967295
@@ -227,35 +210,43 @@ extend Semantic:
                 return resolved
 
 
-        def collect_mutable_ref_params(table: lmut SymbolTable, declarations: darray[Ast::Decl], owner: sview, callee_names: mutable darray[sview]&, callee_owners: mutable darray[sview]&, positions: mutable darray[u32]&, type_names: mutable darray[sview]&) -> void:
+        def collect_mutable_ref_params(table: lmut SymbolTable, declarations: darray[Ast::Decl], owner: sview, callee_names: mutable darray[sview]&, callee_owners: mutable darray[sview]&, positions: mutable darray[u32]&, type_names: mutable darray[sview]&, bindings: mutable RefBindingScope&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations:
+                for declaration in declarations |bindings|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
                             # Keep every function declaration, including by-value signatures,
                             # so a same-named module-local function can shadow another module's
-                            # mutable-reference contract.
+                            # mutable-reference contract. `bindings.call_*` carries each row's
+                            # spelled type in lockstep: the return type on the function row.
+                            generic: bool = rbm_function_is_generic(line.line, table)
+                            returned: RefSpelling = rbm_signature_spelling(declared_return, generic) if return_type is declared_return else rbm_decline()
                             callee_names.push(name)
                             callee_owners.push(owner)
                             positions.push(READONLY_FUNCTION_ROW)
                             type_names.push("")
+                            bindings.call_elems <- bindings.call_elems.push(returned.elem)
+                            bindings.call_flags <- bindings.call_flags.push(returned.flags)
                             table <- table.record_readonly_function(name, owner)
-                            while position < params.count |position: usize = 0|:
+                            while position < params.count |bindings, position: usize = 0|:
                                 mutable_ref: bool = type_contains_ref(params[position].type_expression) and (type_is_mutable(params[position].type_expression) or type_is_lmut(params[position].type_expression))
+                                parameter_type: RefSpelling = rbm_signature_spelling(params[position].type_expression, generic)
                                 callee_names.push(name)
                                 callee_owners.push(owner)
                                 positions.push(position.u32())
                                 type_names.push(bare_type_name_through_ref(params[position].type_expression) if mutable_ref else "")
+                                bindings.call_elems <- bindings.call_elems.push(parameter_type.elem)
+                                bindings.call_flags <- bindings.call_flags.push(parameter_type.flags)
                                 position <- position + 1
                         Decl.Module(name, body, line):
-                            table <- table.collect_mutable_ref_params(body, name, callee_names, callee_owners, positions, type_names)
+                            table <- table.collect_mutable_ref_params(body, name, callee_names, callee_owners, positions, type_names, bindings)
                         Decl.Scoped(body, line):
-                            table <- table.collect_mutable_ref_params(body, owner, callee_names, callee_owners, positions, type_names)
+                            table <- table.collect_mutable_ref_params(body, owner, callee_names, callee_owners, positions, type_names, bindings)
                         _:
                             pass
 
 
-        def check_readonly_call(expression: Ast::Expr, readonly_names: darray[sview]&, readonly_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_readonly_call(expression: Ast::Expr, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
@@ -263,139 +254,126 @@ extend Semantic:
                         target_owner: mutable sview = ""
                         if readonly_callee_target(callee, callee_names, callee_owners, positions, lookup, table.current_module, &target_name, &target_owner, table):
                             while argument_index < arguments.count |table, cache_callees, cache_owners, cache_positions, cache_types, argument_index: usize = 0| -> table:
-                                argument_root: sview = readonly_root_name(arguments[argument_index])
-                                readonly_index: i64 = readonly_name_index(readonly_names, argument_root)
-                                # Only positional readonly arguments can produce this diagnostic.
-                                # Avoid scanning all parameter metadata for unrelated arguments.
-                                if readonly_index >= 0 and argument_names[argument_index] == "":
-                                    expected_type: sview = mutable_ref_param_type(callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, target_name, target_owner, argument_index)
-                                    actual_type: sview = readonly_types[readonly_index.usize()]
-                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgument, name: target_name, pos: Ast::expr_pos(arguments[argument_index]), line: line.line, expected: expected_type, actual: actual_type, expected_count: argument_index.u32() + 1}) if expected_type != ""
-                                    # stage0 suggests the writable spelling only when the two ref types
-                                    # differ solely in mutability (writableRefAssignableIgnoringMutability);
-                                    # for `expects mutable S&, got T&` it prints the sentence alone.
-                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgumentNote, name: target_name, pos: Ast::expr_pos(arguments[argument_index]), line: line.line, expected: expected_type, actual: actual_type, expected_count: argument_index.u32() + 1}) if expected_type != "" and expected_type == actual_type
+                                # Only positional arguments can produce this diagnostic.
+                                table <- rbm_check_argument(arguments[argument_index], argument_index, target_name, target_owner, line.line, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if argument_names[argument_index] == ""
                                 argument_index <- argument_index + 1
-                        table <- check_readonly_call(callee, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(callee, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         for argument in arguments |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
-                            table <- check_readonly_call(argument, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(argument, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Field(object, field, line):
-                        table <- check_readonly_call(object, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(object, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Index(object, index, line):
-                        table <- check_readonly_call(object, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                        table <- check_readonly_call(index, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(object, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(index, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- check_readonly_call(left, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                        table <- check_readonly_call(right, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(left, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(right, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Unary(operator, operand, line):
-                        table <- check_readonly_call(operand, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(operand, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     Expr.Paren(inner, line):
-                        table <- check_readonly_call(inner, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        table <- check_readonly_call(inner, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                     _:
                         pass
 
 
-        # A READONLY LOCAL IS READONLY FOR THE REST OF ITS BLOCK.
+        # EVERY BINDING HAS A CAPABILITY FOR THE REST OF ITS BLOCK (rule R).
         #
-        # This pass used to collect readonly names from function PARAMETERS only
-        # (see check_readonly_ref_declarations), so `local: T& = src` was never
-        # checked at all and a write through it was accepted -- while stage0
-        # rejects exactly that. Parameters were never the whole surface; they
-        # were just the half that had a list.
+        # A reference binding is readonly (R), writable through a fixed slot (W), rebindable
+        # but readonly (RB), writable and rebindable (WR), or -- the legacy `x: mutable T& =
+        # readonly_source` form -- rebindable and demoted to readonly (RL). check_ref_binding_
+        # modes.elisa classifies; check_ref_binding_rules.elisa checks.
         #
-        # The walk carries its OWN copy of the set and extends it as it goes, so
-        # a declaration is in scope for the statements after it and for nested
-        # blocks, and nothing leaks back out to the enclosing block. Nothing ever
-        # has to be removed: a block's locals do not outlive it (using one after
-        # its block is "undefined identifier") and a local may not shadow a
-        # parameter ("duplicate local ... already defined as param").
-        def check_readonly_statements(statements: darray[Ast::Stmt], readonly_names: darray[sview]&, readonly_types: darray[sview]&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        # The walk pushes each declaration AFTER its own initializer is checked (a declaration
+        # is not in scope for the value it binds) and truncates back to its mark when the block
+        # ends, so nothing leaks out of a block. A binding this pass does not type (`x = v`, a
+        # loop variable, a pattern name) is pushed OPAQUE so it hides any outer binding of the
+        # same name instead of inheriting its capability.
+        def check_readonly_statements(statements: darray[Ast::Stmt], bindings: mutable RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                scope_names: mutable darray[sview] = [entry for entry in readonly_names]
-                scope_types: mutable darray[sview] = [entry for entry in readonly_types]
-                for statement in statements |table, cache_callees, cache_owners, cache_positions, cache_types, scope_names, scope_types| -> table:
+                block_mark: usize = bindings.names.count
+                for statement in statements |table, cache_callees, cache_owners, cache_positions, cache_types, bindings| -> table:
                     match statement:
                         Stmt.Assign(target, operator, value, line):
-                            root: sview = readonly_root_name(target)
-                            readonly_index: i64 = readonly_name_index(scope_names, root)
-                            mutating: bool = is_mutating_assign_operator(operator)
-                            # This is the ONE owner of "cannot assign through readonly ref" for a
-                            # bare identifier (params and locals alike; resolve.elisa's copy for
-                            # locals was retired 2026-09-16 -- it doubled the sentence where
-                            # stage0 prints it once, and its exclusion of locals initialised from
-                            # a mutable-ref-returning call silently dropped the case stage0
-                            # reports). The span is the identifier's, as stage0's is (10:5-6).
-                            readonly_target_pos: Ast::Pos = readonly_ident_pos if target is Ast::Expr.Ident(_, readonly_ident_pos) else line
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutation, name: root, pos: readonly_target_pos, line: line.line, expected: scope_types[readonly_index.usize()], actual: ""}) if readonly_index >= 0 and mutating
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutationNote, name: root, pos: readonly_target_pos, line: line.line, expected: scope_types[readonly_index.usize()], actual: ""}) if readonly_index >= 0 and mutating
-                            table <- check_readonly_call(value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            if is_mutating_assign_operator(operator):
+                                table <- rbm_check_assign(target, operator, value, line, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            else:
+                                table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                                rbm_push_defined(target, bindings)
                         Stmt.Expr(expression, line):
-                            table <- check_readonly_call(expression, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(expression, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         Stmt.Return(value, line):
-                            table <- check_readonly_call(return_value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if value is return_value
+                            table <- check_readonly_call(return_value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if value is return_value
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- check_readonly_call(value, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            # Recorded AFTER its own initializer is checked: the
-                            # declaration is not in scope for the value it binds.
-                            # A leading `mutable name:` is a binding qualifier,
-                            # not a type qualifier.  The compact AST keeps that
-                            # source distinction in the semantic annotation
-                            # side table, so consult it before classifying the
-                            # local as a readonly write-through reference.
-                            # Without this check, the translator's correct
-                            # lowering of `const T *p` (`mutable p: T&?`) is
-                            # rejected even though the slot is intentionally
-                            # rebindable and the reference itself remains
-                            # readonly for writes through it.
-                            if type_is_readonly_ref(type_expression) and not local_binding_is_mutable(name, line.line, line.offset, type_expression, table):
-                                scope_names.push(name)
-                                scope_types.push(bare_type_name_through_ref(type_expression))
+                            table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            declared: RefBinding = rbm_local_binding(name, type_expression, value, line, bindings, callee_names, callee_owners, positions, lookup, table)
+                            rbm_push(bindings, name, declared)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_readonly_call(condition, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(then_body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(else_body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(condition, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            branch_mark: usize = bindings.names.count
+                            rbm_push_is_binders(condition, bindings)
+                            nonnull: mutable darray[sview] = []
+                            rbm_gather_nonnull(condition, &nonnull)
+                            rbm_push_proven(nonnull, bindings, table)
+                            table <- check_readonly_statements(then_body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            rbm_truncate(bindings, branch_mark)
+                            table <- check_readonly_statements(else_body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            # `if x == null: return` proves `x` for the rest of the block.
+                            if else_body.count == 0 and rbm_body_exits(then_body):
+                                exits: mutable darray[sview] = []
+                                rbm_gather_null_exit(condition, &exits)
+                                rbm_push_proven(exits, bindings, table)
                         Stmt.While(condition, body, line):
-                            table <- check_readonly_call(condition, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(condition, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            loop_mark: usize = bindings.names.count
+                            rbm_push_is_binders(condition, bindings)
+                            table <- check_readonly_statements(body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            rbm_truncate(bindings, loop_mark)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_readonly_call(iterable, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(iterable, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            for_mark: usize = bindings.names.count
+                            for variable in variables |bindings|:
+                                rbm_push_opaque(bindings, variable)
+                            table <- check_readonly_statements(body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            rbm_truncate(bindings, for_mark)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_readonly_statements(body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            block_binding_mark: usize = bindings.names.count
+                            rbm_push_opaque(bindings, binding)
+                            table <- check_readonly_statements(body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            rbm_truncate(bindings, block_binding_mark)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- check_readonly_call(scrutinee, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
-                            for arm in arms |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
-                                table <- check_readonly_statements(arm.body, scope_names, scope_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_call(scrutinee, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            for arm in arms |table, cache_callees, cache_owners, cache_positions, cache_types, bindings| -> table:
+                                arm_mark: usize = bindings.names.count
+                                arm_names: mutable darray[sview] = []
+                                gather_pattern_names(arm.pattern, &arm_names)
+                                for arm_name in arm_names |bindings|:
+                                    rbm_push_opaque(bindings, arm_name)
+                                table <- check_readonly_statements(arm.body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                                rbm_truncate(bindings, arm_mark)
                         _:
                             pass
+                rbm_truncate(bindings, block_mark)
 
 
-        def check_readonly_ref_declarations(declarations: darray[Ast::Decl], callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_readonly_ref_declarations(declarations: darray[Ast::Decl], bindings: mutable RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |table, cache_callees, cache_owners, cache_positions, cache_types| -> table:
+                for declaration in declarations |table, cache_callees, cache_owners, cache_positions, cache_types, bindings| -> table:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            readonly_names: mutable darray[sview] = []
-                            readonly_types: mutable darray[sview] = []
-                            for param in params |readonly_names, readonly_types|:
-                                # `mutable p: T&` makes the binding slot
-                                # rebindable while the reference capability
-                                # remains readonly.  The leading qualifier is
-                                # therefore orthogonal to this pass's
-                                # write-through check; only an unqualified
-                                # readonly-reference parameter belongs in the
-                                # readonly-through set.
-                                if type_is_readonly_ref(param.type_expression) and not param.is_mutable:
-                                    readonly_names.push(param.name)
-                                    readonly_types.push(bare_type_name_through_ref(param.type_expression))
-                            table <- check_readonly_statements(body, readonly_names, readonly_types, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            function_mark: usize = bindings.names.count
+                            for param in params |bindings|:
+                                rbm_push(bindings, param.name, rbm_param_binding(param))
+                            table <- check_readonly_statements(body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            rbm_truncate(bindings, function_mark)
+                        Decl.Const(name, type_expression, value, is_global, const_pos):
+                            table <- rbm_check_global_init(name, type_expression, value, const_pos, bindings, callee_names, callee_owners, positions, lookup, table) if is_global
                         Decl.Module(name, body, line):
                             outer_module: sview = table.current_module
                             table.current_module <- name
-                            table <- check_readonly_ref_declarations(body, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_ref_declarations(body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                             table.current_module <- outer_module
                         Decl.Scoped(body, line):
-                            table <- check_readonly_ref_declarations(body, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table <- check_readonly_ref_declarations(body, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                         _:
                             pass
 
@@ -539,8 +517,17 @@ extend Semantic:
                 cache_positions: mutable darray[u32] = []
                 cache_types: mutable darray[sview] = []
                 lookup: mutable ReadonlyFunctionIndex = ReadonlyFunctionIndex{heads: {}, next: [], declaration_heads: {}, declaration_next: []}
-                table <- table.collect_mutable_ref_params(declarations, "", callee_names, callee_owners, positions, type_names)
+                bindings: mutable RefBindingScope = RefBindingScope{names: [], elems: [], bares: [], modes: [], kinds: [], declared: [], current: [], proven: [], global_names: [], global_owners: [], global_elems: [], global_bares: [], global_modes: [], global_kinds: [], global_declared: [], global_heads: {}, global_next: [], field_heads: {}, field_next: [], call_elems: [], call_flags: []}
+                global_mutable_names: mutable darray[sview] = []
+                global_mutable_lines: mutable darray[u32] = []
+                for annotation in table.protocol_annotations |global_mutable_names, global_mutable_lines|:
+                    if annotation.name == "__global_mutable":
+                        global_mutable_names.push(annotation.owner)
+                        global_mutable_lines.push(annotation.line)
+                rbm_collect_globals(declarations, "", global_mutable_names, global_mutable_lines, &bindings)
+                rbm_build_field_index(&bindings, table)
+                table <- table.collect_mutable_ref_params(declarations, "", callee_names, callee_owners, positions, type_names, &bindings)
                 build_readonly_function_index(callee_names, &lookup)
                 build_readonly_declaration_index(table.readonly_function_names, &lookup)
-                table <- check_readonly_ref_declarations(declarations, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                table <- check_readonly_ref_declarations(declarations, &bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
                 table <- readonly_amp_check_declarations(declarations, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)

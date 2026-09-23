@@ -15,7 +15,10 @@ fail() { echo "assign-type smoke FAIL: $1" >&2; exit 1; }
 
 # 1. VarDecl with bool expecting literal int MUST flag TypeMismatch.
 out=$(printf 'def f() -> void:\n    x: bool = 5\n' | "$RPT")
-grep -q "expects bool, got i64" <<< "$out" || fail "VarDecl literal mismatch not flagged: $out"
+# The semantic oracle spells an unsuffixed integer literal `int`; older products rendered the
+# same firm scalar as `i64`. Accept both spellings—the invariant is the bool-vs-integer mismatch,
+# not the diagnostic alias chosen by the current type renderer.
+grep -qE "expects bool, got (i64|int)" <<< "$out" || fail "VarDecl literal mismatch not flagged: $out"
 
 # 2. VarDecl with i64 expecting literal bool MUST flag TypeMismatch.
 out=$(printf 'def f() -> void:\n    y: i64 = true\n' | "$RPT")
@@ -54,7 +57,7 @@ grep -q "return type expects bool" <<< "$out" && fail "false positive on matchin
 
 # 8. Field assignment type mismatch MUST flag.
 out=$(printf 'struct S:\n    x: bool\ndef f() -> void:\n    s: S = S{}\n    s.x <- 5\n' | "$RPT")
-grep -q "expects bool, got i64" <<< "$out" || fail "Field assign mismatch not flagged: $out"
+grep -qE "expects bool, got (i64|int)" <<< "$out" || fail "Field assign mismatch not flagged: $out"
 
 # 9. Structural generic-container mismatch MUST flag (darray <- dict).
 out=$(printf 'def f() -> void:\n    a: mutable darray[i64] = []\n    b: dict[cstr, i64] = {}\n    a <- b\n' | "$RPT")

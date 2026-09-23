@@ -45,6 +45,13 @@ def emit_ast_render_tokens(buffer: mutable darray[u8]&, tokens: darray[Lexer::To
             # That is the opposite of `permission P` below, which stage0 keeps verbatim, so
             # the two keywords cannot share a rule: skip this one rather than spacing it.
             continue if render_token.kind == Lexer::TokenKind.Ident and render_text == "errorset" and render_index + 1 < to_index and tokens[render_index + 1].kind == Lexer::TokenKind.Ident
+            # The compact AST printer uses dotted qualified names, including an
+            # error-set return such as `Executor::ExecError`; the source/interface
+            # projections retain `::`. Collapse the token pair only in this AST
+            # renderer and suppress the second colon.
+            if render_token.kind == Lexer::TokenKind.Scope:
+                buffer.push(46)
+                continue
             # An error-UNION return renders as `V error[...]` — one space before `error`.
             buffer.push(32) if render_index > from_index and render_token.kind == Lexer::TokenKind.Error
             # Function types use the same normalized gap as stage0's typeStr:
@@ -86,10 +93,32 @@ def emit_ast_line_range(tokens: darray[Lexer::Token]&, line: u32) -> (found: boo
     stop_index: mutable usize = start_index
     depth: mutable i64 = 0
     scanning: mutable bool = true
-    while scanning and stop_index < tokens.count |stop_index, depth, scanning, tokens, line|:
+    continuation: mutable bool = false
+    # Signatures may wrap while their parameter list is open.  The old line-only
+    # probe stopped at the first NEWLINE, so the self-hosted projections silently
+    # dropped every parameter after the first and often dropped the return/effect
+    # clause too.  Continue across layout tokens while nested; once the signature
+    # is back at depth zero, a newline is the end of a no-body declaration.
+    while scanning and stop_index < tokens.count |stop_index, depth, scanning, continuation, tokens, line|:
         stop_token: Lexer::Token = tokens[stop_index]
-        if stop_token.line != line or stop_token.kind == Lexer::TokenKind.Newline:
-            scanning <- false
+        if stop_token.kind == Lexer::TokenKind.Newline:
+            # A wrapped signature may close its parameter list at the end of one
+            # physical line and put the return arrow on the next line.  At depth
+            # zero a newline is normally the end of a declaration, but it is still
+            # part of the signature when the next non-layout token is `->`.
+            if depth == 0:
+                next_index: mutable usize = stop_index + 1
+                while next_index < tokens.count and (tokens[next_index].kind == Lexer::TokenKind.Newline or tokens[next_index].kind == Lexer::TokenKind.Indent or tokens[next_index].kind == Lexer::TokenKind.Dedent):
+                    next_index <- next_index + 1
+                continuation <- next_index < tokens.count and tokens[next_index].kind == Lexer::TokenKind.Arrow
+                scanning <- false if not continuation
+            stop_index <- stop_index + 1
+        elif stop_token.line != line and depth == 0:
+            # Layout tokens between the closing `)` and a continuation-line arrow
+            # belong to the same signature; the following real token decides
+            # whether this is continuation or the next declaration.
+            scanning <- false if not continuation and stop_token.kind != Lexer::TokenKind.Indent and stop_token.kind != Lexer::TokenKind.Dedent
+            stop_index <- stop_index + 1
         else:
             depth <- depth + 1 if stop_token.kind == Lexer::TokenKind.LParen or stop_token.kind == Lexer::TokenKind.LBracket
             depth <- depth - 1 if stop_token.kind == Lexer::TokenKind.RParen or stop_token.kind == Lexer::TokenKind.RBracket
@@ -98,6 +127,21 @@ def emit_ast_line_range(tokens: darray[Lexer::Token]&, line: u32) -> (found: boo
             else:
                 stop_index <- stop_index + 1
     return (true, start_index, stop_index)
+
+
+# Stage0's compact AST printer uses dotted error-set paths (`Outer.Inner.Error`),
+# while the source language and interface surface use `::`.  Error effects are
+# stored as normalized names rather than token spans, so normalize this one
+# projection at emission time.
+def emit_ast_effect_name(buffer: mutable darray[u8]&, effect: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    index: mutable usize = 0
+    while index < sview_len(effect) |index, buffer, effect|:
+        if sview_at(effect, index) == 58 and index + 1 < sview_len(effect) and sview_at(effect, index + 1) == 58:
+            buffer.push(46)
+            index <- index + 2
+        else:
+            buffer.push(sview_at(effect, index))
+            index <- index + 1
 
 
 
@@ -121,6 +165,9 @@ def emit_ast_range_at(tokens: darray[Lexer::Token]&, line: u32, offset: u32) -> 
             high <- mid
     emit_ast_line_range(tokens, line) return if low >= tokens.count or tokens[low].start != offset
     anchor_line: u32 = tokens[low].line
+    # Declaration positions normally point at `def`; prefer that token's physical
+    # line because a wrapped signature may store a later AST line for diagnostics.
+    return emit_ast_line_range(tokens, anchor_line) if tokens[low].kind == Lexer::TokenKind.Def
     emit_ast_line_range(tokens, line) return if anchor_line != line
     start_index: mutable usize = low
     while start_index > 0 |start_index, tokens, anchor_line|:
@@ -164,7 +211,22 @@ def emit_ast_return_segment(buffer: mutable darray[u8]&, tokens: darray[Lexer::T
                 arrow_found <- true
         return if not arrow_found
         stop_at: mutable usize = line_range.stop
-        for stop_probe in (arrow_index + 1)..<line_range.stop |stop_at, tokens, source, arrow_index|:
+        # `emit_ast_range_at` is intentionally conservative around layout.  If a
+        # continuation-line arrow is the last token in that recovered range, extend
+        # the return span to the first depth-zero body colon; otherwise the AST report
+        # emits `-> ` with no type even though the parser accepted the signature.
+        if stop_at <= arrow_index + 1:
+            fallback_stop: mutable usize = arrow_index + 1
+            fallback_depth: mutable i64 = 0
+            while fallback_stop < tokens.count |fallback_stop, fallback_depth, tokens|:
+                fallback_kind: Lexer::TokenKind = tokens[fallback_stop].kind
+                fallback_depth <- fallback_depth + 1 if fallback_kind == Lexer::TokenKind.LParen or fallback_kind == Lexer::TokenKind.LBracket
+                fallback_depth <- fallback_depth - 1 if fallback_kind == Lexer::TokenKind.RParen or fallback_kind == Lexer::TokenKind.RBracket
+                if fallback_kind == Lexer::TokenKind.Colon and fallback_depth == 0:
+                    stop_at <- fallback_stop
+                    break
+                fallback_stop <- fallback_stop + 1
+        for stop_probe in (arrow_index + 1)..<stop_at |stop_at, tokens, source, arrow_index|:
             continue if stop_at != 0 and stop_at < line_range.stop and stop_probe >= stop_at
             stop_probe_token: Lexer::Token = tokens[stop_probe]
             if stop_probe_token.kind == Lexer::TokenKind.Ident and Lexer::text_or_empty(stop_probe_token, source) == "can":

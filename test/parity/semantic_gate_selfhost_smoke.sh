@@ -2,7 +2,8 @@
 # The stage1-COMPILED semantic layer must analyse IDENTICALLY to the stage0-compiled one.
 #
 # This was the one blocker to running the analyzer by default, and it is CLOSED: the gate is
-# now ON unless ELISA_STAGE1_NO_SEMANTIC_GATE=1. The check stays because the property it
+# mandatory for executable output and has no environment-variable opt-out. The check stays
+# because the property it
 # guards is not self-evident — every generation of the bootstrap skips or runs the check
 # together, so a fixpoint cannot see a divergence in the checker itself. Only running the
 # SAME source through a stage0-built driver and a stage1-built one can.

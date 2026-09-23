@@ -54,11 +54,10 @@ library's runtime object, gated by `test/parity/self_host_runtime_smoke.sh` — 
 fixpoint cannot see, since every generation otherwise links the stage0-built runtime.
 Track with `scripts/self_host_gen2.sh`. Optional stage0 remains a parity oracle only.
 
-The semantic gate is ON by default: the driver analyses before it emits and refuses
-programs stage0 refuses (`ELISA_STAGE1_NO_SEMANTIC_GATE=1` turns it off for probes). Parity
-is held by `test/parity/run_all.sh --profile full` (~346 checks), which is the only profile
-a commit may rely on; see `IMPLEMENTATION_PLAN.md` (local, gitignored) for what is still
-open and why.
+The semantic gate is mandatory before executable output; environment variables cannot turn
+it off. Parity is held by `test/parity/run_all.sh --profile full` (~346 checks), which is the
+only profile a commit may rely on; see `IMPLEMENTATION_PLAN.md` (local, gitignored) for what
+is still open and why.
 
 Built **frontend-first**: lexer → parser → name resolution → typecheck → LLVM
 backend.

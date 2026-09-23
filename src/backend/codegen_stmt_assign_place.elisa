@@ -300,6 +300,8 @@ extend Backend:
                             view_data_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, view_assign_llvm, view_assign_slot, 0, "view.assign.data.ptr")
                             view_data: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), view_data_pointer, "view.assign.data")
                             if emit_expression(assign_index, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_index_value:
+                                view_len_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, view_assign_llvm, view_assign_slot, 1, "view.assign.len.ptr")
+                                emit_count_bounds_guard(view_index_value, LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), view_len_pointer, "view.assign.len"), runtime, m, ctx, builder)
                                 view_gep_indices: mutable darray[LLVMValueRef] = [view_index_value]
                                 view_gep_pointer: void& = (&view_gep_indices[0]).cast[void&] can Unsafe.PointerCast
                                 view_element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(view_assign_element, structs, ctx), view_data, view_gep_pointer, 1, "view.assign.elem")
@@ -472,37 +474,31 @@ extend Backend:
                     # pointer; load it, then store the value at the pointee type (a ref-typed
                     # `v` auto-dereferences to its value).
                     if target_declared_type.kind == TypeKind.Ref:
-                        # `r: mutable T& = v; r <- v2` — the LOCAL BINDING itself was
-                        # declared `mutable`, which stage0 treats as REBINDING the
-                        # reference (the assignment's target type is `T&` itself, not
-                        # its pointee) rather than writing through it. `v2` must
-                        # therefore be a T&-typed value; a plain T (e.g. `r <- 99` where
-                        # `r: mutable i64&`) correctly DECLINES here exactly as it
-                        # should reject at the type-check stage0 performs (`cannot
-                        # assign int to mutable i64&`) — emit_expression below simply
-                        # cannot produce a Ref-typed value from a plain scalar literal.
-                        # A non-mutable-declared local (the overwhelmingly common case,
-                        # `r: T& = v`) is UNCHANGED below: local_binding_is_mutable is
-                        # false for every local except this one annotation shape.
+                        # A `mutable` BINDING (`mutable r: T&`, or the legacy `r: mutable T&`
+                        # local) makes the SLOT rebindable; writing THROUGH it is the reference
+                        # TYPE's capability (stage0 rule R, assignmentTargetType). stage0 writes
+                        # through when the referent is a scalar and the value is a scalar
+                        # (mutableScalarRefTarget: `x: mutable i64& = &v; x <- 5` stores 5 into
+                        # v) and REBINDS the slot for every other value, which must then itself
+                        # be a reference. The semantic check has already rejected what fits
+                        # neither: a scalar through a read-only rebindable ref, a plain struct
+                        # into any ref.
+                        #
+                        # This used to rebind first, at the Ref type, and fall back to a fresh
+                        # temporary holding a plain value. Both were wrong: the Ref coercion
+                        # ADDRESSES a plain lvalue, so `x <- w` for an i64 `w` re-pointed x at w
+                        # instead of storing w's value (answer 18, stage0 66), and the temporary
+                        # left the referent untouched (`r <- 99` kept g at 42, stage0 99).
                         if local_binding_is_mutable(local_scope, target_name):
-                            if emit_expression_coerced(assign_value, target_declared_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rebind_ref_value:
-                                _ = LLVMBuildStore(builder, rebind_ref_value, slot)
-                                return EmitStatus.Open
-                            # A PLAIN value (`r <- 99` where `r: mutable i64&`): MEASURED
-                            # 2026-09-16, stage0 ACCEPTS it and REBINDS the reference to a fresh
-                            # temporary holding the value -- the original pointee is untouched
-                            # (`g` stays 100 in the adversarial corpus, `second` stays 7 in
-                            # test/repro/local_binding_qualifier). The comment above's claim that
-                            # stage0 rejects it was wrong; declining here left 3 corpus programs
-                            # stage0 builds and runs unbuildable.
-                            rebind_pointee: ValueType = ref_target_of(target_declared_type, structs)
-                            if emit_expression_coerced(assign_value, rebind_pointee, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rebind_plain_value:
-                                rebind_temp_storage: mutable darray[u8] = []
-                                rebind_temp: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(rebind_pointee, structs, ctx), sview_to_cstr("rebind.tmp", rebind_temp_storage))
-                                _ = LLVMBuildStore(builder, rebind_plain_value, rebind_temp)
-                                _ = LLVMBuildStore(builder, rebind_temp, slot)
-                                return EmitStatus.Open
-                            return EmitStatus.Declined
+                            if not rebindable_ref_assign_writes_through(assign_value, target_declared_type, local_scope, fns, structs, generics):
+                                # Never ADDRESS a plain value here: only a reference (or a
+                                # string, a byte reference) can be rebound into the slot.
+                                rebind_value_type: ValueType = expression_type(assign_value, local_scope, fns, structs, generics)
+                                EmitStatus.Declined return if rebind_value_type.kind != TypeKind.Ref and rebind_value_type.kind != TypeKind.CStr and rebind_value_type.kind != TypeKind.Unmodeled
+                                if emit_expression_coerced(assign_value, target_declared_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rebind_ref_value:
+                                    _ = LLVMBuildStore(builder, rebind_ref_value, slot)
+                                    return EmitStatus.Open
+                                return EmitStatus.Declined
                         ref_assign_pointee: ValueType = ref_target_of(target_declared_type, structs)
                         # A mutating receiver may be written with the rebind spelling
                         # (`lexer <- lexer.pending_push_back(token)`). The method changes
@@ -643,3 +639,38 @@ extend Backend:
                         return EmitStatus.Open
             matched <- false
             return EmitStatus.Declined
+
+
+
+
+        # Whether `r <- value` on a rebindable (`mutable`-bound) reference WRITES THROUGH
+        # it rather than rebinding the slot: stage0's mutableScalarRefTarget. The referent
+        # must be a number or bool, and the value a number or bool too -- a reference, a
+        # view or a string is never written through, it rebinds. An integer or float
+        # LITERAL tree has no type of its own (expression_type answers Unmodeled) and is a
+        # scalar wherever it lands, so `r <- 99` and `r <- -1.5` write through.
+        def rebindable_ref_assign_writes_through(value: Expr, ref_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            referent: ValueType = ref_target_of(ref_type, structs)
+            false return if not (is_numeric_type(referent) or referent.kind == TypeKind.Bool)
+            value_type: ValueType = expression_type(value, local_scope, fns, structs, generics)
+            true return if is_numeric_type(value_type) or value_type.kind == TypeKind.Bool
+            false return if value_type.kind != TypeKind.Unmodeled
+            return untyped_value_is_integer_literal_tree(value) or untyped_value_is_numeric_literal(value)
+
+
+
+
+        # A bare float literal, possibly negated or parenthesised: the other context-typed
+        # scalar spelling untyped_value_is_integer_literal_tree does not cover. (A float
+        # inside an ARITHMETIC tree already types as f64 through expression_type.)
+        def untyped_value_is_numeric_literal(value: Expr) -> bool:
+            match value:
+                Expr.FloatLit(_, _):
+                    return true
+                Expr.Paren(numeric_literal_inner, _):
+                    return untyped_value_is_numeric_literal(numeric_literal_inner)
+                Expr.Unary(numeric_literal_operator, numeric_literal_operand, _):
+                    return untyped_value_is_numeric_literal(numeric_literal_operand) if numeric_literal_operator == TokenKind.Minus or numeric_literal_operator == TokenKind.Plus else false
+                _:
+                    pass
+            return false

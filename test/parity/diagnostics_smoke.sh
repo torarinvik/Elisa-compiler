@@ -218,6 +218,29 @@ NAMES=(
     static_string_binding_ternary
     container_literal_block_tail
     discarded_loop_value
+    # --- rule R (2026-09-22): the TYPE's `mutable` is the write capability ---
+    ref_rebind_value
+    ref_legacy_readonly_source
+    ref_argument_capability
+    ref_readonly_path
+    ref_global_capability
+    ref_null_narrowing
+    ref_byte_pointer_store
+    ref_builtin_struct_field
+    ref_cast_capability
+    ref_cast_argument
+    ref_cstr_out_param
+    string_family_decl
+    string_family_assign
+    string_family_arg
+    string_family_return
+    string_family_push
+    string_family_field
+    string_family_ternary
+    string_family_optional
+    element_assign_wording
+    field_assign_wording
+    internal_runtime_carrier_param
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -402,6 +425,29 @@ EXPECTS=(
     "ternary branches are incompatible: static u8& and sview"
     "darray literal has no region to allocate in"
     "accumulator loop result \`valid\` is discarded; make the loop the final expression of its block"
+    # --- rule R (2026-09-22) ---
+    "cannot assign int to i64&"
+    "\"r\" was initialized from a read-only reference, so its \`mutable\` makes it rebindable, not writable"
+    "argument 1 to \"poke\" expects mutable u8&, got static u8&"
+    "cannot mutate through readonly ref"
+    "global \"g\" expects mutable u8&, got static u8&"
+    "argument 1 to \"poke\" expects mutable void&, got void&"
+    "cannot store a byte pointer (static u8&) through a byte reference"
+    "\"region\" was initialized from a read-only reference, so its \`mutable\` makes it rebindable, not writable"
+    "cannot assign void& to mutable void&?"
+    "argument 1 to \"poke\" expects mutable void&, got void&"
+    "cannot assign int to cstr"
+    "variable \"a\" expects sview, got cstr"
+    "cannot assign sview to cstr"
+    "argument 1 to \"take\" expects darray[u8], got cstr"
+    "return type expects cstr, got darray[u8]"
+    "darray push expects sview, got cstr"
+    "struct literal field \"name\" expects sview, got cstr"
+    "ternary branches are incompatible: cstr and sview"
+    "variable \"a\" expects sview?, got cstr"
+    "cannot assign bool to i64"
+    "cannot assign bool to i64"
+    "internal runtime carrier type \"DynArrayView\" is not supported in user-facing code"
 )
 
 total=0

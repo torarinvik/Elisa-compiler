@@ -1,0 +1,413 @@
+# The rule-R checks, per binding and per statement. check_ref_binding_modes.elisa classifies
+# bindings and spells types; check_readonly_ref.elisa walks the declarations and calls in here.
+#
+# Diagnostic order matches stage0's for one statement: the target's findings, then the
+# argument findings inside the value, then the byte-pointer store, the type mismatch, its
+# note, and last the augmented-assignment finding.
+extend Semantic:
+    private:
+        # A local declaration's binding. An explicit `mutable x:` makes the slot rebindable and
+        # an explicit `const x:` fixes it; only the TYPE's `mutable` writes through. The legacy
+        # form `x: mutable T& = init` writes through only when `init` does.
+        def rbm_local_binding(name: sview, type_expression: Ast::Expr, value: Ast::Expr, pos: Ast::Pos, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, table: SymbolTable&) -> RefBinding:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Absent:
+                        return rbm_opaque_binding()
+                    Expr.Invalid:
+                        return rbm_opaque_binding()
+                    _:
+                        pass
+                bare: sview = bare_type_name_through_ref(type_expression)
+                return RefBinding{mode: RBM_MODE_W, kind: RBM_KIND_LOCAL, elem: "", bare: bare, declared: RBM_REF, current: RBM_REF, proven: false} if type_is_lmut(type_expression)
+                spelled: RefSpelling = rbm_type_spelling(type_expression)
+                mutable_type: bool = (spelled.flags & RBM_MUTABLE) != 0
+                if (spelled.flags & RBM_REF) != 0:
+                    explicit_mode: i64 = local_binding_explicit_mode(name, pos.line, pos.offset, table)
+                    mode: mutable u32 = RBM_MODE_R
+                    current: mutable u32 = spelled.flags
+                    if explicit_mode > 0:
+                        mode <- RBM_MODE_WR if mutable_type else RBM_MODE_RB
+                    elif explicit_mode < 0:
+                        mode <- RBM_MODE_W if mutable_type else RBM_MODE_R
+                    elif mutable_type:
+                        if rbm_init_writable(value, bindings, callee_names, callee_owners, positions, lookup, table):
+                            mode <- RBM_MODE_WR
+                        else:
+                            mode <- RBM_MODE_RL
+                            current <- rbm_clear(spelled.flags, RBM_MUTABLE)
+                    return RefBinding{mode: mode, kind: RBM_KIND_LOCAL, elem: spelled.elem, bare: bare, declared: spelled.flags, current: current, proven: false}
+                value_mode: u32 = RBM_MODE_VALUE_MUTABLE if local_binding_is_mutable(name, pos.line, pos.offset, type_expression, table) else RBM_MODE_VALUE
+                value_elem: sview = "" if (spelled.flags & RBM_NULLABLE) != 0 else spelled.elem
+                return RefBinding{mode: value_mode, kind: RBM_KIND_LOCAL, elem: value_elem, bare: bare, declared: 0, current: 0, proven: false}
+
+
+        # A parameter's binding: `mutable p:` rebinds, the type's `mutable` writes through.
+        def rbm_param_binding(parameter: Ast::ParamDecl) -> RefBinding:
+            can Abort.Panic:
+                match parameter.type_expression:
+                    Expr.Absent:
+                        return rbm_opaque_binding()
+                    Expr.Invalid:
+                        return rbm_opaque_binding()
+                    _:
+                        pass
+                bare: sview = bare_type_name_through_ref(parameter.type_expression)
+                return RefBinding{mode: RBM_MODE_W, kind: RBM_KIND_PARAM, elem: "", bare: bare, declared: RBM_REF, current: RBM_REF, proven: false} if type_is_lmut(parameter.type_expression)
+                spelled: RefSpelling = rbm_type_spelling(parameter.type_expression)
+                mutable_type: bool = (spelled.flags & RBM_MUTABLE) != 0
+                if (spelled.flags & RBM_REF) != 0:
+                    mode: mutable u32 = RBM_MODE_R
+                    if parameter.is_mutable:
+                        mode <- RBM_MODE_WR if mutable_type else RBM_MODE_RB
+                    else:
+                        mode <- RBM_MODE_W if mutable_type else RBM_MODE_R
+                    return RefBinding{mode: mode, kind: RBM_KIND_PARAM, elem: spelled.elem, bare: bare, declared: spelled.flags, current: spelled.flags, proven: false}
+                value_mode: u32 = RBM_MODE_VALUE_MUTABLE if parameter.is_mutable or mutable_type else RBM_MODE_VALUE
+                value_elem: sview = "" if (spelled.flags & RBM_NULLABLE) != 0 else spelled.elem
+                return RefBinding{mode: value_mode, kind: RBM_KIND_PARAM, elem: value_elem, bare: bare, declared: 0, current: 0, proven: false}
+
+
+        def rbm_is_ref_mode(mode: u32) -> bool:
+            return mode == RBM_MODE_R or mode == RBM_MODE_RL or mode == RBM_MODE_RB or mode == RBM_MODE_W or mode == RBM_MODE_WR
+
+
+        def rbm_is_readonly_mode(mode: u32) -> bool:
+            return mode == RBM_MODE_R or mode == RBM_MODE_RL or mode == RBM_MODE_RB
+
+
+        def rbm_name_of(expression: Ast::Expr) -> sview:
+            match expression:
+                Expr.Ident(name, ident_pos):
+                    return "" if name == "null" else name
+                Expr.Paren(inner, paren_pos):
+                    return rbm_name_of(inner)
+                _:
+                    return ""
+
+
+        # The names `condition` proves non-null when it holds: `x != null`, `null != x`, and
+        # `and`-chains of them.
+        def rbm_gather_nonnull(condition: Ast::Expr, names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, binary_pos):
+                        if operator == TokenKind.And:
+                            rbm_gather_nonnull(left, names)
+                            rbm_gather_nonnull(right, names)
+                        elif operator == TokenKind.BangEq:
+                            left_name: sview = rbm_name_of(left)
+                            right_name: sview = rbm_name_of(right)
+                            names.push(left_name) if left_name != "" and expression_is_null(right)
+                            names.push(right_name) if right_name != "" and expression_is_null(left)
+                    Expr.Paren(inner, paren_pos):
+                        rbm_gather_nonnull(inner, names)
+                    _:
+                        pass
+
+
+        # The names `condition` proves null when it holds: `x == null`, `null == x`, and
+        # `or`-chains of them. After `if x == null: return`, `x` is non-null.
+        def rbm_gather_null_exit(condition: Ast::Expr, names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, binary_pos):
+                        if operator == TokenKind.Or:
+                            rbm_gather_null_exit(left, names)
+                            rbm_gather_null_exit(right, names)
+                        elif operator == TokenKind.EqEq:
+                            left_name: sview = rbm_name_of(left)
+                            right_name: sview = rbm_name_of(right)
+                            names.push(left_name) if left_name != "" and expression_is_null(right)
+                            names.push(right_name) if right_name != "" and expression_is_null(left)
+                    Expr.Paren(inner, paren_pos):
+                        rbm_gather_null_exit(inner, names)
+                    _:
+                        pass
+
+
+        # Shadow each named reference binding with a proven-non-null copy.
+        def rbm_push_proven(names: darray[sview]&, bindings: mutable RefBindingScope&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for name in names |bindings|:
+                    binding: RefBinding = rbm_lookup(bindings, name, table)
+                    if rbm_is_ref_mode(binding.mode):
+                        rbm_push(bindings, name, RefBinding{mode: binding.mode, kind: binding.kind, elem: binding.elem, bare: binding.bare, declared: binding.declared, current: binding.current, proven: true})
+
+
+        def rbm_body_exits(body: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                false return if body.count == 0
+                match body[body.count - 1]:
+                    Stmt.Return(value, return_pos):
+                        return true
+                    Stmt.Break(label, break_pos):
+                        return true
+                    Stmt.Continue(label, continue_pos):
+                        return true
+                    _:
+                        pass
+                return false
+
+
+        # Names an `is` test binds: `x is v`, `x is Variant(a, b)`; unmodeled, so OPAQUE.
+        def rbm_push_pattern_idents(pattern: Ast::Expr, bindings: mutable RefBindingScope&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Expr.Ident(name, ident_pos):
+                        rbm_push_opaque(bindings, name)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        for argument in arguments |bindings|:
+                            rbm_push_pattern_idents(argument, bindings)
+                    Expr.Tuple(elements, tuple_pos):
+                        for element in elements |bindings|:
+                            rbm_push_pattern_idents(element, bindings)
+                    Expr.Paren(inner, paren_pos):
+                        rbm_push_pattern_idents(inner, bindings)
+                    _:
+                        pass
+
+
+        def rbm_push_is_binders(condition: Ast::Expr, bindings: mutable RefBindingScope&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, binary_pos):
+                        if operator == TokenKind.Is:
+                            rbm_push_pattern_idents(right, bindings)
+                        elif operator == TokenKind.And or operator == TokenKind.Or:
+                            rbm_push_is_binders(left, bindings)
+                            rbm_push_is_binders(right, bindings)
+                    Expr.Paren(inner, paren_pos):
+                        rbm_push_is_binders(inner, bindings)
+                    Expr.Unary(operator, operand, unary_pos):
+                        rbm_push_is_binders(operand, bindings) if operator == TokenKind.Not
+                    _:
+                        pass
+
+
+        # `x = v` and `(a, b) = v` define bindings this pass does not type.
+        def rbm_push_defined(target: Ast::Expr, bindings: mutable RefBindingScope&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, ident_pos):
+                        rbm_push_opaque(bindings, name)
+                    Expr.Tuple(elements, tuple_pos):
+                        for element in elements |bindings|:
+                            rbm_push_defined(element, bindings)
+                    Expr.Paren(inner, paren_pos):
+                        rbm_push_defined(inner, bindings)
+                    _:
+                        pass
+
+
+        # "plain refs T& are readonly; use mutable T& ...". The spelled form carries storage
+        # and `?`; an element this pass cannot spell falls back to the bare type name.
+        def rbm_push_readonly_note(name: sview, pos: Ast::Pos, line: u32, elem: sview, flags: u32, bare: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if elem != "":
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutationNote, name: name, pos: pos, line: line, expected: elem, actual: "", expected_count: flags, actual_count: RBM_PRESENT})
+                else:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutationNote, name: name, pos: pos, line: line, expected: bare, actual: ""})
+
+
+        # The note after "cannot mutate through readonly ref": what made the path readonly.
+        # The outermost reference-typed field decides first (it is necessarily not `mutable`),
+        # else the root binding.
+        def rbm_push_path_note(path: Ast::Expr, pos: Ast::Pos, line: u32, bindings: RefBindingScope&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match path:
+                    Expr.Field(object, field, field_pos):
+                        row: u32 = rbm_field_row(bindings, rbm_expr_struct(object, bindings, table), field, table)
+                        if row != RBM_NONE and type_contains_ref(table.private_field_types[row.usize()]):
+                            field_type: RefSpelling = rbm_type_spelling(table.private_field_types[row.usize()])
+                            table <- rbm_push_readonly_note(field, pos, line, field_type.elem, field_type.flags, bare_type_name_through_ref(table.private_field_types[row.usize()]), table)
+                        else:
+                            table <- rbm_push_path_note(object, pos, line, bindings, table)
+                    Expr.Index(object, index, index_pos):
+                        table <- rbm_push_path_note(object, pos, line, bindings, table)
+                    Expr.IndexN(object, arguments, index_pos):
+                        table <- rbm_push_path_note(object, pos, line, bindings, table)
+                    Expr.Slice(object, low, high, slice_pos):
+                        table <- rbm_push_path_note(object, pos, line, bindings, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- rbm_push_path_note(inner, pos, line, bindings, table)
+                    Expr.Ident(name, ident_pos):
+                        binding: RefBinding = rbm_lookup(bindings, name, table)
+                        if binding.mode == RBM_MODE_R:
+                            table <- rbm_push_readonly_note(name, pos, line, binding.elem, binding.declared, binding.bare, table)
+                        elif binding.mode == RBM_MODE_RB or binding.mode == RBM_MODE_RL:
+                            state: u32 = 1 if binding.mode == RBM_MODE_RL else 0
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RebindableRefNote, name: name, pos: pos, line: line, expected: binding.elem, actual: "", expected_count: binding.declared, state_code: state}) if binding.elem != ""
+                    _:
+                        pass
+
+
+        # `x <- v` through a writable reference with a fixed slot (W): a write-through store.
+        def rbm_check_write_through(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                byte_pointer: bool = binding.elem == "u8" and (source.flags & RBM_PRESENT) != 0 and ((source.elem == "u8" and (source.flags & RBM_REF) != 0) or (source.elem == "cstr" and (source.flags & RBM_REF) == 0))
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.BytePointerStore, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, actual_count: source.flags | RBM_PRESENT}) if byte_pointer
+                target: RefSpelling = RefSpelling{elem: binding.elem, flags: RBM_PRESENT}
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: RBM_PRESENT, actual_count: source.flags | RBM_PRESENT}) if rbm_assignable(target, source, table) == RBM_NO
+
+
+        # `x <- v` on a rebindable-only binding (RB/RL): `v` must be a reference of the
+        # binding's CURRENT type. A value that would have been a valid write-through gets the
+        # note that `mutable` on the binding does not make it writable.
+        def rbm_check_rebind(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                target: RefSpelling = RefSpelling{elem: binding.elem, flags: binding.current}
+                return if rbm_assignable(target, source, table) != RBM_NO
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: binding.current, actual_count: source.flags | RBM_PRESENT})
+                through: RefSpelling = RefSpelling{elem: binding.elem, flags: RBM_PRESENT}
+                state: u32 = 1 if binding.mode == RBM_MODE_RL else 0
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RebindableRefNote, name: name, pos: pos, line: line, expected: binding.elem, actual: "", expected_count: binding.declared, state_code: state}) if (source.flags & RBM_REF) == 0 and rbm_assignable(through, source, table) == RBM_YES
+
+
+        # `x <- v` on a writable, rebindable binding (WR): a scalar value writes through, any
+        # other value must be a reference of the binding's type.
+        def rbm_check_writable_rebind(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                through: RefSpelling = RefSpelling{elem: binding.elem, flags: RBM_PRESENT}
+                scalar: bool = rbm_numeric(binding.elem) or binding.elem == "bool"
+                return if scalar and (source.flags & RBM_REF) == 0 and rbm_assignable(through, source, table) == RBM_YES
+                target: RefSpelling = RefSpelling{elem: binding.elem, flags: binding.current}
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: binding.current, actual_count: source.flags | RBM_PRESENT}) if rbm_assignable(target, source, table) == RBM_NO
+
+
+        # A `global mutable`-style global declared with a writable reference type must be
+        # initialised from a writable reference (stage0 checks the initializer; the global is
+        # never demoted).
+        def rbm_check_global_init(name: sview, type_expression: Ast::Expr, value: Ast::Expr, pos: Ast::Pos, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                spelled: RefSpelling = rbm_type_spelling(type_expression)
+                return if (spelled.flags & RBM_REF) == 0 or (spelled.flags & RBM_MUTABLE) == 0
+                source: RefSpelling = rbm_spell_value(value, bindings, callee_names, callee_owners, positions, lookup, table)
+                return if (source.flags & RBM_REF) == 0
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: pos.line, expected: spelled.elem, actual: source.elem, expected_count: spelled.flags, actual_count: source.flags | RBM_PRESENT, state_code: 1}) if rbm_assignable(spelled, source, table) == RBM_NO
+
+
+        # The pre-rule-R argument diagnostic, bare type names only: for a readonly binding
+        # whose type this pass cannot spell (a container, a generic).
+        def rbm_push_legacy_argument(argument: Ast::Expr, argument_index: usize, target_name: sview, target_owner: sview, call_line: u32, actual_type: sview, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                expected_type: sview = mutable_ref_param_type(callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, target_name, target_owner, argument_index)
+                return if expected_type == ""
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgument, name: target_name, pos: Ast::expr_pos(argument), line: call_line, expected: expected_type, actual: actual_type, expected_count: argument_index.u32() + 1})
+                # stage0 suggests the writable spelling only when the two ref types differ solely
+                # in mutability (writableRefAssignableIgnoringMutability).
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgumentNote, name: target_name, pos: Ast::expr_pos(argument), line: call_line, expected: expected_type, actual: actual_type, expected_count: argument_index.u32() + 1}) if expected_type == actual_type
+
+
+        # One positional argument against a `mutable` reference parameter. The sources this
+        # pass spells: a readonly or rebindable-only binding (narrowed by a `!= null` test), a
+        # string literal, `&x` of a value binding. `&recv.field` belongs to the amp walk.
+        def rbm_check_argument(argument: Ast::Expr, argument_index: usize, target_name: sview, target_owner: sview, call_line: u32, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                argument_pos: mutable Ast::Pos = Ast::expr_pos(argument)
+                source: mutable RefSpelling = rbm_decline()
+                cast_source: mutable bool = false
+                ident_name: sview = rbm_name_of(argument)
+                ident_binding: RefBinding = rbm_lookup(bindings, ident_name, table) if ident_name != "" else rbm_opaque_binding()
+                ident_source: bool = rbm_is_readonly_mode(ident_binding.mode)
+                if ident_source:
+                    flags: u32 = rbm_clear(ident_binding.current, RBM_NULLABLE) if ident_binding.proven else ident_binding.current
+                    source <- RefSpelling{elem: ident_binding.elem, flags: flags | RBM_PRESENT}
+                else:
+                    match argument:
+                        Expr.StringLit(text, literal_pos):
+                            source <- RefSpelling{elem: "u8", flags: RBM_PRESENT | RBM_REF | RBM_STATIC}
+                        Expr.Unary(operator, operand, unary_pos):
+                            if operator == TokenKind.Ampersand and operand is Ast::Expr.Ident(_, _):
+                                source <- rbm_spell_borrow(operand, bindings, table)
+                        Expr.Index(cast_object, cast_type, cast_pos):
+                            # `(&x).cast[T&]`: stage0 reports it at the `.` of `.cast`.
+                            if cast_object is Ast::Expr.Field(_, cast_field, cast_dot):
+                                if cast_field == "cast":
+                                    source <- rbm_spell_value(argument, bindings, callee_names, callee_owners, positions, lookup, table)
+                                    source <- rbm_decline() if (source.flags & RBM_REF) == 0
+                                    cast_source <- true
+                                    argument_pos <- cast_dot
+                        _:
+                            pass
+                if (source.flags & RBM_PRESENT) == 0:
+                    # A readonly root reached through a path (`r.field`, `r[i]`) keeps the
+                    # bare-name diagnostic.
+                    root: sview = readonly_root_name(argument)
+                    if root != "" and ident_name == "":
+                        root_binding: RefBinding = rbm_lookup(bindings, root, table)
+                        table <- rbm_push_legacy_argument(argument, argument_index, target_name, target_owner, call_line, root_binding.bare, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if root_binding.mode == RBM_MODE_R
+                    return
+                expected: RefSpelling = rbm_param_row(callee_names, callee_owners, positions, type_names, lookup, bindings, target_name, target_owner, argument_index)
+                return if (expected.flags & RBM_PRESENT) == 0
+                if expected.elem == "" or source.elem == "":
+                    table <- rbm_push_legacy_argument(argument, argument_index, target_name, target_owner, call_line, ident_binding.bare, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table) if ident_source and ident_binding.mode == RBM_MODE_R
+                    return
+                return if rbm_assignable(expected, source, table) != RBM_NO
+                relaxed: RefSpelling = RefSpelling{elem: expected.elem, flags: rbm_clear(expected.flags, RBM_MUTABLE)}
+                relaxed_fits: bool = rbm_assignable(relaxed, source, table) == RBM_YES
+                # A cast's other mismatches (element, storage) belong to the general argument check.
+                return if cast_source and not relaxed_fits
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgument, name: target_name, pos: argument_pos, line: call_line, expected: expected.elem, actual: source.elem, expected_count: argument_index.u32() + 1, state_code: expected.flags, actual_count: source.flags | RBM_PRESENT})
+                return if not relaxed_fits
+                if ident_source and ident_binding.mode != RBM_MODE_R:
+                    state: u32 = 1 if ident_binding.mode == RBM_MODE_RL else 0
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RebindableRefNote, name: ident_name, pos: argument_pos, line: call_line, expected: ident_binding.elem, actual: "", expected_count: ident_binding.declared, state_code: state})
+                else:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefArgumentNote, name: target_name, pos: argument_pos, line: call_line, expected: expected.elem, actual: source.elem, expected_count: argument_index.u32() + 1, state_code: relaxed.flags, actual_count: source.flags | RBM_PRESENT})
+
+
+        # A mutating assignment (`<-` or a compound operator).
+        def rbm_check_assign(target: Ast::Expr, operator: TokenKind, value: Ast::Expr, pos: Ast::Pos, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview]&, lookup: ReadonlyFunctionIndex&, cache_callees: mutable darray[sview]&, cache_owners: mutable darray[sview]&, cache_positions: mutable darray[u32]&, cache_types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                compound: bool = operator != TokenKind.LArrow
+                augmented: Diagnostic = Diagnostic{kind: DiagnosticKind.CompoundAssignNonNumeric, name: "", pos: pos, line: pos.line, expected: "", actual: ""}
+                match target:
+                    Expr.Ident(name, ident_pos):
+                        binding: RefBinding = rbm_lookup(bindings, name, table)
+                        if binding.mode == RBM_MODE_R:
+                            # The ONE owner of "cannot assign through readonly ref" for a bare
+                            # identifier; the span is the identifier's, as stage0's is.
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefMutation, name: name, pos: ident_pos, line: pos.line, expected: binding.bare, actual: ""})
+                            table <- rbm_push_readonly_note(name, ident_pos, pos.line, binding.elem, binding.declared, binding.bare, table)
+                            table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table.diagnostics <- table.diagnostics.push(augmented) if compound
+                            return
+                        table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                        return if binding.mode != RBM_MODE_W and binding.mode != RBM_MODE_WR and binding.mode != RBM_MODE_RB and binding.mode != RBM_MODE_RL
+                        if compound:
+                            table.diagnostics <- table.diagnostics.push(augmented) if binding.mode != RBM_MODE_W
+                            return
+                        source: RefSpelling = rbm_spell_value(value, bindings, callee_names, callee_owners, positions, lookup, table)
+                        if binding.mode == RBM_MODE_W:
+                            table <- rbm_check_write_through(name, ident_pos, pos.line, binding, source, table)
+                        elif binding.mode == RBM_MODE_WR:
+                            table <- rbm_check_writable_rebind(name, ident_pos, pos.line, binding, source, table)
+                        else:
+                            table <- rbm_check_rebind(name, ident_pos, pos.line, binding, source, table)
+                    Expr.Index(object, index, index_pos):
+                        object_name: sview = rbm_name_of(object)
+                        object_binding: RefBinding = rbm_lookup(bindings, object_name, table) if object_name != "" else rbm_opaque_binding()
+                        if rbm_is_ref_mode(object_binding.mode) and (object_binding.current & RBM_STATIC) != 0 and object_binding.elem == "u8":
+                            # A string literal's bytes: stage0 spells this one "readonly view".
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyViewIndexAssign, name: object_name, pos: Ast::expr_pos(target), line: pos.line, expected: "", actual: "", state_code: 1})
+                            table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                            table.diagnostics <- table.diagnostics.push(augmented) if compound
+                            return
+                        if not rbm_path_writable(object, bindings, table):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefPathMutation, name: readonly_root_name(object), pos: Ast::expr_pos(object), line: pos.line, expected: "", actual: ""})
+                            table <- rbm_push_path_note(object, Ast::expr_pos(object), pos.line, bindings, table)
+                        table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                    Expr.Field(object, field, field_pos):
+                        if not rbm_path_writable(object, bindings, table):
+                            row: u32 = rbm_field_row(bindings, rbm_expr_struct(object, bindings, table), field, table)
+                            # The same finding check_field_immutable_assign raises later, pushed
+                            # first so it prints in stage0's order; the later copy dedups. It
+                            # reads the SOURCE flag, as that pass does, not rbm_field_mutable.
+                            if row != RBM_NONE:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FieldImmutableAssign, name: field, pos: field_pos, line: pos.line, expected: "", actual: ""}) if not table.struct_field_mutable[row.usize()]
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefPathMutation, name: readonly_root_name(object), pos: Ast::expr_pos(object), line: pos.line, expected: "", actual: ""})
+                            table <- rbm_push_path_note(object, Ast::expr_pos(object), pos.line, bindings, table)
+                        table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)
+                    _:
+                        table <- check_readonly_call(value, bindings, callee_names, callee_owners, positions, type_names, lookup, cache_callees, cache_owners, cache_positions, cache_types, table)

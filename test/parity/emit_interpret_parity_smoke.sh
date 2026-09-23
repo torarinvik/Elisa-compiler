@@ -25,11 +25,10 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
 # frame_filter_contracts (2026-09-16): stage0's interpreter answers 0 where BOTH compilers'
 # native backends answer 42 (measured: stage0 -emit obj + link + run = 42, stage1 = 42).
-# local_binding_qualifier (2026-09-16): `writable_view: mutable i64& = &second; writable_view <- 9`
-# REBINDS the reference under stage0's native rule, leaving `second` at 7 (stage0 -emit obj + run =
-# 7; stage1 = 7 once it stopped declining the plain-value rebind); stage0's interpreter writes
-# through and answers 9.
-EXPECTED_DIVERGENT="generic_default_argument uintptr_corpus_probe frame_filter_contracts local_binding_qualifier"
+# local_binding_qualifier left this list 2026-09-22: `writable_view: mutable i64& = &second;
+# writable_view <- 9` WRITES THROUGH under rule R (the TYPE's `mutable` is the write capability),
+# so the native backends now answer 9 like stage0's interpreter always did.
+EXPECTED_DIVERGENT="generic_default_argument uintptr_corpus_probe frame_filter_contracts"
 
 same=0
 differ=0

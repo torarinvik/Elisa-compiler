@@ -37,7 +37,7 @@ BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 # snapshot's product. Preserving that wrapper as BIN makes the product re-enter
 # this script recursively through ELISA_STAGE1_SELF. Normalize wrapper overrides
 # to the product in the same snapshot before exporting the self path below.
-if [[ -n "${ELISA_STAGE1_BIN:-}" && -f "$BIN" && "$(head -n 1 "$BIN" 2>/dev/null)" == "#!/usr/bin/env bash" ]]; then
+if [[ -n "${ELISA_STAGE1_BIN:-}" && -f "$BIN" ]] && grep -a -q '^#!/usr/bin/env bash$' "$BIN"; then
   BIN="$ROOT/bin/elisac-stage1"
 fi
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"

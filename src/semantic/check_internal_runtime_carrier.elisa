@@ -1,3 +1,22 @@
+# The internal-runtime-carrier surface (stage0 semantic/runtime_carrier_warnings.go).
+#
+# stage0 calls maybeRejectRuntimeCarrierTypeUse from resolveType, so EVERY type position that
+# names a runtime carrier draws one finding at that name's own span. MEASURED against 875d, one
+# shape per file (a source under a real, non-internal path):
+#   warns:  a parameter (by value, `&`, `mutable &`, `lmut`, `?`), a return type, a struct field,
+#           a `global`, a local at any nesting depth, a generic argument (`darray[ArenaMark]`),
+#           a `.cast[T&]` / specialization argument, and `size_of(T)` / `align_of(T)`.
+#   silent: a construction head (`ArenaMark{...}`) and an `alias M = ArenaMark` target.
+# `Arena`/`ArenaMark` are WARNINGS (the migration target is a region scope, not a type);
+# `StringView`/`DynArray`/`DynArrayView`/`DynDict` are ERRORS. stage1 used to cover only a
+# by-value `Arena` local and an `Arena` parameter of an empty function, so it ACCEPTED every
+# error-level carrier stage0 rejects.
+#
+# Lambda and fn-type parameter/return types are not in the AST (a lambda keeps parameter NAMES
+# only); the parser keeps each full type expression in `fn_type_param_exprs` /
+# `fn_type_return_exprs`, so those side tables are walked instead. A value lambda's bare `fn(v)`
+# records the NAME `v` there, which can never be a carrier name.
+# Not modelled: stage0's temp-directory exemption for the two warning-level carriers.
 extend Semantic:
     private:
         def runtime_carrier_replacement(type_name: sview) -> sview:
@@ -5,83 +24,126 @@ extend Semantic:
                 "sview[...]" return if type_name == "StringView"
                 "darray[T, shape]" return if type_name == "DynArray"
                 "view[T]" return if type_name == "DynArrayView"
+                "dict[K, V]" return if type_name == "DynDict"
                 "region scopes and inferred container regions" return if type_name == "Arena"
+                "region scopes/checkpoints" return if type_name == "ArenaMark"
                 return ""
 
-        # A body that does nothing — every statement is a `pass` (Stmt.Expr of Expr.Invalid) or empty.
-        # An `Arena` parameter is only a surfaced carrier when it is not put to work; a function that
-        # actually uses `owner` (as a region owner in `Type[owner]`, `@owner`, `new[owner]`, …) has a
-        # non-trivial body, so this gate cleanly excludes the legitimate region-owner idiom.
-        def irc_body_trivial(statements: darray[Ast::Stmt]) -> bool:
+        def irc_push(table: lmut SymbolTable, type_name: sview, pos: Ast::Pos) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
-                    match statement:
-                        Stmt.Expr(expression, line):
-                            match expression:
-                                Expr.Invalid:
-                                    pass
-                                _:
-                                    return false
-                        _:
-                            return false
-                return true
+                replacement: sview = runtime_carrier_replacement(type_name)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InternalRuntimeCarrier, name: type_name, line: pos.line, pos: pos, expected: replacement, actual: ""}) if replacement != ""
 
-        # A by-value `Arena` LOCAL is the deprecated `in <arena>:` surface itself, and stage0 warns
-        # at the local's type token whatever the body does. MEASURED one spelling at a time:
-        # `arena: Arena = zeroed` warns, `arena: mutable Arena = zeroed` warns, `lmut Arena` does
-        # NOT, and an `Arena&` local/param is a caller-owned handle, not a carrier. So `mutable`
-        # is the only wrapper looked through. Without this, a fixture pinning the arena-grow
-        # use-after-free could not pass diagnostics_diff: stage0's warning had no stage1 twin.
-        def irc_arena_local_type_ident(type_expression: Ast::Expr) -> (found: bool, pos: Ast::Pos):
-            can Abort.Panic:
-                match type_expression:
-                    Expr.Unary(operator, operand, unary_line):
-                        return irc_arena_local_type_ident(operand) if operator == TokenKind.Mutable else (false, Ast::pos_at_line(0))
-                    Expr.Paren(inner, paren_line):
-                        return irc_arena_local_type_ident(inner)
+        # A TYPE expression: every carrier name in it, through the wrappers the parser builds
+        # (`mutable`/`&`/`?` are Unary, `T[A]`/`T[A, B]` are Index/IndexN, a tuple type is Tuple).
+        def irc_type(expression: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
                     Expr.Ident(type_name, ident_pos):
-                        return (type_name == "Arena", ident_pos)
+                        table <- irc_push(table, type_name, ident_pos)
+                    Expr.Unary(operator, operand, unary_pos):
+                        table <- irc_type(operand, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- irc_type(inner, table)
+                    Expr.Index(object, index, index_pos):
+                        table <- irc_type(object, table)
+                        table <- irc_type(index, table)
+                    Expr.IndexN(object, arguments, indexn_pos):
+                        table <- irc_type(object, table)
+                        for argument in arguments |table| -> table:
+                            table <- irc_type(argument, table)
+                    Expr.Tuple(elements, tuple_pos):
+                        for element in elements |table| -> table:
+                            table <- irc_type(element, table)
+                    Expr.Refinement(base, predicate, refinement_pos):
+                        table <- irc_type(base, table)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        # `T @region`: the region name is not a type.
+                        table <- irc_type(left, table)
                     _:
-                        return (false, Ast::pos_at_line(0))
+                        pass
 
-        def check_carrier_locals(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+        # A VALUE expression: only its type-taking sub-forms are types. A bracket argument in
+        # value position is a type for `.cast[T]` and a specialization, and an index value
+        # otherwise -- walking it as a type is exact for the carrier names, which are never
+        # values. A construction head is NOT a type use (measured).
+        def irc_value(expression: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        type_call: mutable bool = false
+                        if callee is Expr.Ident(callee_name, callee_pos):
+                            type_call <- callee_name == "size_of" or callee_name == "align_of"
+                        table <- irc_value(callee, table)
+                        for argument in arguments |table| -> table:
+                            table <- irc_type(argument, table) if type_call
+                            table <- irc_value(argument, table) if not type_call
+                    Expr.Index(object, index, index_pos):
+                        table <- irc_value(object, table)
+                        table <- irc_type(index, table)
+                    Expr.IndexN(object, arguments, indexn_pos):
+                        table <- irc_value(object, table)
+                        for argument in arguments |table| -> table:
+                            table <- irc_type(argument, table)
+                    Expr.Field(object, field, field_pos):
+                        table <- irc_value(object, table)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        table <- irc_value(left, table)
+                        table <- irc_value(right, table)
+                    Expr.Unary(operator, operand, unary_pos):
+                        table <- irc_value(operand, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- irc_value(inner, table)
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        table <- irc_value(condition, table)
+                        table <- irc_value(then_expr, table)
+                        table <- irc_value(else_expr, table)
+                    Expr.Array(elements, array_pos):
+                        for element in elements |table| -> table:
+                            table <- irc_value(element, table)
+                    Expr.Tuple(elements, tuple_pos):
+                        for element in elements |table| -> table:
+                            table <- irc_value(element, table)
+                    Expr.Construct(construct_type, fields, construct_pos):
+                        for field_init in fields |table| -> table:
+                            table <- irc_value(field_init.value, table)
+                    Expr.Lambda(lambda_params, lambda_body, lambda_pos):
+                        table <- irc_statements(lambda_body, table)
+                    Expr.Block(block_statements, block_value, block_captures, block_pos):
+                        table <- irc_statements(block_statements, table)
+                        table <- irc_value(block_value, table)
+                    _:
+                        pass
+
+        def irc_statements(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            arena_ident: (found: bool, pos: Ast::Pos) = irc_arena_local_type_ident(type_expression)
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InternalRuntimeCarrier, name: sview("Arena", 0, 5), line: arena_ident.pos.line, pos: arena_ident.pos, expected: sview("region scopes and inferred container regions", 0, 44), actual: ""}) if arena_ident.found
+                            table <- irc_type(type_expression, table)
+                            table <- irc_value(value, table)
+                        Stmt.Expr(expression, line):
+                            table <- irc_value(expression, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- irc_value(value, table)
+                        Stmt.Return(value, line):
+                            table <- irc_value(returned, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_carrier_locals(then_body, table)
-                            table <- check_carrier_locals(else_body, table)
+                            table <- irc_value(condition, table)
+                            table <- irc_statements(then_body, table)
+                            table <- irc_statements(else_body, table)
                         Stmt.While(condition, while_body, line):
-                            table <- check_carrier_locals(while_body, table)
+                            table <- irc_value(condition, table)
+                            table <- irc_statements(while_body, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- check_carrier_locals(for_body, table)
+                            table <- irc_value(iterable, table)
+                            table <- irc_statements(for_body, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_carrier_locals(body, table)
+                            table <- irc_statements(body, table)
                         Stmt.Match(scrutinee, arms, line):
+                            table <- irc_value(scrutinee, table)
                             for arm in arms |table| -> table:
-                                table <- check_carrier_locals(arm.body, table)
-                        _:
-                            pass
-
-        # An `Arena`-typed parameter in a user-facing function with a trivial (do-nothing) body is an
-        # internal runtime carrier surfacing in user code (extern params are handled separately, above).
-        def check_carrier_func_params(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |table| -> table:
-                    match declaration:
-                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            table <- check_carrier_locals(body, table)
-                            if irc_body_trivial(body):
-                                for parameter in parameters |table| -> table:
-                                    if bare_type_name(parameter.type_expression) == "Arena":
-                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InternalRuntimeCarrier, name: sview("Arena", 0, 5), line: line.line, expected: sview("region scopes and inferred container regions", 0, 44), actual: ""})
-                        Decl.Module(module_name, module_body, module_line):
-                            table <- check_carrier_func_params(module_body, table)
-                        Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_carrier_func_params(scoped_body, table)
+                                table <- irc_statements(arm.body, table)
                         _:
                             pass
 
@@ -89,6 +151,19 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            for parameter in parameters |table| -> table:
+                                table <- irc_type(parameter.type_expression, table)
+                            table <- irc_type(declared_return, table) if return_type is declared_return
+                            table <- irc_statements(body, table)
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                            for member in members |table| -> table:
+                                table <- irc_type(member.type_expression, table)
+                        Decl.Const(const_name, type_expression, value, is_mutable, const_pos):
+                            table <- irc_type(type_expression, table)
+                            table <- irc_value(value, table)
+                        # Extern parameter types are kept as bare names without a span, so these
+                        # findings are line-only.
                         Decl.Extern(name, param_start, arity, variadic, callable, _, decorators, line):
                             while position < arity |position: u32 = 0, table|:
                                 index: usize = (param_start + position).usize()
@@ -105,7 +180,15 @@ extend Semantic:
                             pass
 
     public:
+        # Whether a carrier finding is stage0's WARNING (`Arena`/`ArenaMark`) rather than an error.
+        def internal_runtime_carrier_is_warning(type_name: sview) -> bool:
+            can Abort.Panic:
+                return type_name == "Arena" or type_name == "ArenaMark"
+
         def check_internal_runtime_carrier(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 table <- check_internal_runtime_carrier_declarations(file.top_decls, file.extern_params, table)
-                table <- check_carrier_func_params(file.top_decls, table)
+                for fn_param_type in file.fn_type_param_exprs |table| -> table:
+                    table <- irc_type(fn_param_type, table)
+                for fn_return_type in file.fn_type_return_exprs |table| -> table:
+                    table <- irc_type(fn_return_type, table)

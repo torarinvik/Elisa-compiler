@@ -1,10 +1,14 @@
-# Stage1 semantic — extern calls, stale views, and the check entry (`extend Semantic:
-# private:`). Flags extern calls made without a grant and views read after their backing
-# container was mutated, then `check_strict_unsafe_ops` drives every part. Continues
-# check_strict_unsafe_ops_requires.elisa; split out to keep each part under 600 lines.
+# Stage1 semantic — unsafe-effect calls, extern calls, stale views, and the check entry
+# (`extend Semantic: private:`). Checks caller obligations for direct unsafe-effect calls,
+# flags raw extern calls without a grant, and detects views read after backing mutation.
+# `check_strict_unsafe_ops` drives every part. Continues check_strict_unsafe_ops_requires.elisa.
 
 extend Semantic:
     private:
+        struct StrictUnsafeCallEffectBinding:
+            name: sview
+            effect: sview
+
         # Names of every `extern` function anywhere in the tree. stage0 marks each extern
         # fnType with an unconditional `Unsafe.RawExtern` permission ref (markRawExternFuncType,
         # gated only on enforceUnsafePermissions), so EVERY call to one requires the grant.
@@ -21,72 +25,300 @@ extend Semantic:
                         _:
                             pass
 
-        # Flag a direct call to a raw extern (`c_puts(text)`) outside any effect grant. A
-        # METHOD/UFCS callee (`x.f()`) is not a bare extern name; only Ident callees match.
-        def strict_extern_call_expression(expression: Ast::Expr, line: u32, extern_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+        def strict_unsafe_call_has_diagnostic(table: SymbolTable&, callee: sview, line: u32, effect: sview) -> bool:
+            can Abort.Panic:
+                return any diagnostic in table.diagnostics where diagnostic.kind == DiagnosticKind.UngrantedEffectCall and diagnostic.name == callee and diagnostic.line == line and diagnostic.expected == effect
+
+        def strict_unsafe_effect_refs_for_type(type_expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Lambda(parameters, body, position):
+                        effects: mutable darray[sview] = []
+                        for annotation in annotations |effects, position|:
+                            effects.push(annotation.name) if annotation.owner == "__fn_type_effect" and annotation.offset == position.offset
+                        return effects
+                    Expr.Unary(operator, operand, position) | Expr.Paren(operand, position):
+                        return strict_unsafe_effect_refs_for_type(operand, annotations)
+                    Expr.Refinement(base, predicate, position):
+                        return strict_unsafe_effect_refs_for_type(base, annotations)
+                    _:
+                        return []
+
+        def strict_unsafe_effect_refs_for_value(expression: Ast::Expr, bindings: darray[StrictUnsafeCallEffectBinding]&, table: SymbolTable&) -> darray[sview]:
             can Memory.Allocate, Abort.Panic:
                 match expression:
-                    Expr.Call(callee, arguments, argument_names, call_line):
-                        called: sview = ident_name_of(callee)
-                        is_extern: bool = called != "" and (any e in extern_names where e == called)
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: called, line: line, expected: "Unsafe.RawExtern", actual: "Unsafe"}) if is_extern and not in_grant
-                        for argument in arguments |table| -> table:
-                            table <- strict_extern_call_expression(argument, line, extern_names, in_grant, table)
-                    Expr.Binary(left, operator, right, binary_line):
-                        table <- strict_extern_call_expression(left, line, extern_names, in_grant, table)
-                        table <- strict_extern_call_expression(right, line, extern_names, in_grant, table)
-                    Expr.Unary(operator, operand, unary_line):
-                        table <- strict_extern_call_expression(operand, line, extern_names, in_grant, table)
-                    Expr.Paren(inner, paren_line):
-                        table <- strict_extern_call_expression(inner, line, extern_names, in_grant, table)
+                    Expr.Ident(name, position):
+                        if any binding in bindings where binding.name == name:
+                            return [binding.effect for binding in bindings if binding.name == name and binding.effect != ""]
+                        return function_effect_refs(table, name)
+                    Expr.Scope(base, name, position):
+                        return function_effect_refs(table, name)
+                    Expr.Paren(inner, position) | Expr.Move(inner, position):
+                        return strict_unsafe_effect_refs_for_value(inner, bindings, table)
+                    _:
+                        return []
+
+        def strict_unsafe_call_bind_local(bindings: mutable darray[StrictUnsafeCallEffectBinding]&, name: sview, type_expression: Ast::Expr, value: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                effects: mutable darray[sview] = []
+                declared_effects: darray[sview] = strict_unsafe_effect_refs_for_type(type_expression, annotations)
+                value_effects: darray[sview] = strict_unsafe_effect_refs_for_value(value, bindings, table)
+                for effect in declared_effects |effects|:
+                    add: bool = effect != "" and effect_ref_family(effect) == "Unsafe" and not (any known in effects where known == effect)
+                    effects.push(effect) if add
+                for effect in value_effects |effects|:
+                    add: bool = effect != "" and effect_ref_family(effect) == "Unsafe" and not (any known in effects where known == effect)
+                    effects.push(effect) if add
+                bindings <- [binding for binding in bindings if binding.name != name]
+                bindings.push(StrictUnsafeCallEffectBinding{name: name, effect: ""})
+                for effect in effects |bindings|:
+                    bindings.push(StrictUnsafeCallEffectBinding{name: name, effect: effect})
+
+        def strict_unsafe_call_shadow_local(bindings: mutable darray[StrictUnsafeCallEffectBinding]&, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # No declared or inferred Unsafe effects: this local deliberately hides any
+                # same-spelled outer callback or global function in its lexical scope.
+                bindings <- [binding for binding in bindings if binding.name != name]
+                bindings.push(StrictUnsafeCallEffectBinding{name: name, effect: ""})
+
+        def strict_unsafe_call_bindings_copy(bindings: darray[StrictUnsafeCallEffectBinding]&) -> darray[StrictUnsafeCallEffectBinding]:
+            can Memory.Allocate:
+                return [binding for binding in bindings]
+
+        # A branch or loop may assign a different callable to an outer local. Preserve the
+        # union of possible Unsafe rows for bindings that existed on entry; locals introduced
+        # inside the branch do not escape its lexical scope.
+        def strict_unsafe_call_bindings_merge(bindings: mutable darray[StrictUnsafeCallEffectBinding]&, base: darray[StrictUnsafeCallEffectBinding]&, branch: darray[StrictUnsafeCallEffectBinding]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for candidate in branch |bindings, base|:
+                    if candidate.effect != "" and (any original in base where original.name == candidate.name) and not (any known in bindings where known.name == candidate.name and known.effect == candidate.effect):
+                        bindings.push(candidate)
+
+        # The value flowing into a local callback may have an Unsafe effect even when the
+        # variable's source annotation omitted that row. Keep every possible row until a
+        # typed effect-preserving assignment analysis can prove a narrower target set.
+        def strict_unsafe_call_rebind_local(bindings: mutable darray[StrictUnsafeCallEffectBinding]&, name: sview, value: Ast::Expr, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == "" or not (any binding in bindings where binding.name == name)
+                value_effects: darray[sview] = strict_unsafe_effect_refs_for_value(value, bindings, table)
+                for effect in value_effects |bindings|:
+                    add: bool = effect != "" and effect_ref_family(effect) == "Unsafe" and not (any known in bindings where known.name == name and known.effect == effect)
+                    bindings.push(StrictUnsafeCallEffectBinding{name: name, effect: effect}) if add
+
+        # An unsafe effect on a function value is a caller obligation too. Check it at the
+        # call site against the active lexical grants; an unrelated `can Memory.Allocate:`
+        # block cannot launder a call to a function requiring `Unsafe.PointerCast`. Signature
+        # rows are deliberately not copied into active_grants: they describe what callers owe.
+        def strict_unsafe_effect_call_expression(expression: Ast::Expr, fallback_line: u32, extern_names: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, active_grants: darray[sview]&, bindings: mutable darray[StrictUnsafeCallEffectBinding]&, enforce_raw_unsafe: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee_expression, arguments, argument_names, call_position):
+                        callee: sview = called_function_name(expression)
+                        local_name: sview = match callee_expression:
+                            Expr.Ident(name, position): name
+                            _: ""
+                        local_binding: bool = local_name != "" and (any binding in bindings where binding.name == local_name)
+                        effect_callee: sview = local_name if local_binding else callee
+                        is_extern: bool = not local_binding and effect_callee != "" and (any extern_name in extern_names where extern_name == effect_callee)
+                        call_line: u32 = call_position.line if call_position.line != 0 else fallback_line
+                        if effect_callee != "":
+                            required_effects: mutable darray[sview] = []
+                            if local_binding:
+                                for binding in bindings |required_effects, effect_callee|:
+                                    required_effects.push(binding.effect) if binding.name == effect_callee and binding.effect != ""
+                            else:
+                                required_effects <- function_effect_refs(table, effect_callee)
+                            for required in required_effects |table, effect_callee, call_line, is_extern, enforce_raw_unsafe, active_grants|:
+                                continue if effect_ref_family(required) != "Unsafe"
+                                # Direct extern calls already have the dedicated RawExtern
+                                # checker, and RawExtern remains gated by the explicit #unsafe
+                                # mode. User wrappers carrying this effect are checked here.
+                                continue if required == "Unsafe.RawExtern" and (is_extern or not enforce_raw_unsafe)
+                                continue if strict_unsafe_grant_covers(active_grants, required)
+                                continue if strict_unsafe_call_has_diagnostic(table, effect_callee, call_line, required)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: effect_callee, line: call_line, expected: required, actual: "Unsafe"})
+                        table <- strict_unsafe_effect_call_expression(callee_expression, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        for argument in arguments |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(argument, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Field(object, field, field_line) | Expr.Scope(object, field, field_line):
+                        table <- strict_unsafe_effect_call_expression(object, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
                     Expr.Index(object, index, index_line):
-                        table <- strict_extern_call_expression(object, line, extern_names, in_grant, table)
-                        table <- strict_extern_call_expression(index, line, extern_names, in_grant, table)
+                        table <- strict_unsafe_effect_call_expression(object, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(index, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.IndexN(object, indices, index_line):
+                        table <- strict_unsafe_effect_call_expression(object, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        for index in indices |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(index, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Slice(object, low, high, slice_line):
+                        table <- strict_unsafe_effect_call_expression(object, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(low, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(high, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- strict_unsafe_effect_call_expression(left, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(right, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Unary(operator, operand, unary_line) | Expr.Move(operand, move_line) | Expr.RegionNew(operand, _, move_line) | Expr.Paren(operand, move_line):
+                        table <- strict_unsafe_effect_call_expression(operand, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Array(elements, array_line) | Expr.Tuple(elements, array_line) | Expr.SetLit(elements, array_line):
+                        for element in elements |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(element, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.DictLit(entries, dict_line):
+                        for entry in entries |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(entry.key, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            table <- strict_unsafe_effect_call_expression(entry.value, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Construct(type_expression, fields, construct_line):
+                        table <- strict_unsafe_effect_call_expression(type_expression, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        for field in fields |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(field.value, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.RecordUpdate(base, fields, update_line):
+                        table <- strict_unsafe_effect_call_expression(base, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        for field in fields |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(field.value, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.If(condition, then_value, else_value, if_line):
+                        table <- strict_unsafe_effect_call_expression(condition, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                        then_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                        else_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                        table <- strict_unsafe_effect_call_expression(then_value, fallback_line, extern_names, annotations, active_grants, then_bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(else_value, fallback_line, extern_names, annotations, active_grants, else_bindings, enforce_raw_unsafe, table)
+                        strict_unsafe_call_bindings_merge(bindings, base_bindings, then_bindings)
+                        strict_unsafe_call_bindings_merge(bindings, base_bindings, else_bindings)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_line):
+                        table <- strict_unsafe_effect_call_expression(iterable, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(condition, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(body, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Refinement(base, predicate, refinement_line):
+                        table <- strict_unsafe_effect_call_expression(base, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(predicate, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.GetElse(guarded, recovery, get_line):
+                        table <- strict_unsafe_effect_call_expression(guarded, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                        recovery_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                        table <- strict_unsafe_effect_call_statements(recovery, extern_names, annotations, active_grants, recovery_bindings, enforce_raw_unsafe, table)
+                        strict_unsafe_call_bindings_merge(bindings, base_bindings, recovery_bindings)
+                    Expr.Block(statements, value, captures, block_line):
+                        base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                        block_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                        table <- strict_unsafe_effect_call_statements(statements, extern_names, annotations, active_grants, block_bindings, enforce_raw_unsafe, table)
+                        table <- strict_unsafe_effect_call_expression(value, fallback_line, extern_names, annotations, active_grants, block_bindings, enforce_raw_unsafe, table)
+                        strict_unsafe_call_bindings_merge(bindings, base_bindings, block_bindings)
+                    Expr.Match(scrutinee, arms, match_line):
+                        table <- strict_unsafe_effect_call_expression(scrutinee, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                        for arm in arms |table, bindings| -> table:
+                            arm_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            arm_names: mutable darray[sview] = []
+                            pattern_bound_names(arm.pattern, arm_names)
+                            for name in arm_names |arm_bindings|:
+                                strict_unsafe_call_shadow_local(arm_bindings, name)
+                            table <- strict_unsafe_effect_call_expression(arm.guard, fallback_line, extern_names, annotations, active_grants, arm_bindings, enforce_raw_unsafe, table)
+                            table <- strict_unsafe_effect_call_statements(arm.body, extern_names, annotations, active_grants, arm_bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, arm_bindings)
+                    Expr.Catch(guarded, arms, catch_line):
+                        table <- strict_unsafe_effect_call_expression(guarded, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                        for arm in arms |table, bindings| -> table:
+                            arm_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            arm_names: mutable darray[sview] = []
+                            pattern_bound_names(arm.pattern, arm_names)
+                            for name in arm_names |arm_bindings|:
+                                strict_unsafe_call_shadow_local(arm_bindings, name)
+                            table <- strict_unsafe_effect_call_expression(arm.guard, fallback_line, extern_names, annotations, active_grants, arm_bindings, enforce_raw_unsafe, table)
+                            table <- strict_unsafe_effect_call_statements(arm.body, extern_names, annotations, active_grants, arm_bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, arm_bindings)
+                    Expr.StaticEffectCall(effect_type, operation_name, candidates, arguments, argument_names, call_position):
+                        for argument in arguments |table, bindings| -> table:
+                            table <- strict_unsafe_effect_call_expression(argument, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                        for candidate in candidates |table, bindings| -> table:
+                            for capture in candidate.captures |table, bindings| -> table:
+                                table <- strict_unsafe_effect_call_expression(capture, fallback_line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                    Expr.Lambda(parameters, body, lambda_line):
+                        no_grants: darray[sview] = []
+                        lambda_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                        for name in parameters |lambda_bindings|:
+                            strict_unsafe_call_shadow_local(lambda_bindings, name)
+                        table <- strict_unsafe_effect_call_statements(body, extern_names, annotations, no_grants, lambda_bindings, enforce_raw_unsafe, table)
                     _:
                         pass
 
-        def strict_extern_call_walk(statements: darray[Ast::Stmt], extern_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+        def strict_unsafe_effect_call_statements(statements: darray[Ast::Stmt], extern_names: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, active_grants: darray[sview]&, bindings: mutable darray[StrictUnsafeCallEffectBinding]&, enforce_raw_unsafe: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                for statement in statements |table, bindings| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- strict_extern_call_expression(expression, line.line, extern_names, in_grant, table)
+                            table <- strict_unsafe_effect_call_expression(expression, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- strict_extern_call_expression(value, line.line, extern_names, in_grant, table)
+                            table <- strict_unsafe_effect_call_expression(value, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bind_local(bindings, name, type_expression, value, annotations, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- strict_extern_call_expression(target, line.line, extern_names, in_grant, table)
-                            table <- strict_extern_call_expression(value, line.line, extern_names, in_grant, table)
+                            table <- strict_unsafe_effect_call_expression(target, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            table <- strict_unsafe_effect_call_expression(value, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_rebind_local(bindings, target_name, value, table) if target is Expr.Ident(target_name, _) and operator == TokenKind.LArrow
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- strict_extern_call_expression(returned, line.line, extern_names, in_grant, table)
+                                table <- strict_unsafe_effect_call_expression(returned, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- strict_extern_call_expression(condition, line.line, extern_names, in_grant, table)
-                            table <- strict_extern_call_walk(then_body, extern_names, in_grant, table)
-                            table <- strict_extern_call_walk(else_body, extern_names, in_grant, table)
+                            table <- strict_unsafe_effect_call_expression(condition, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                            then_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            else_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            table <- strict_unsafe_effect_call_statements(then_body, extern_names, annotations, active_grants, then_bindings, enforce_raw_unsafe, table)
+                            table <- strict_unsafe_effect_call_statements(else_body, extern_names, annotations, active_grants, else_bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, then_bindings)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, else_bindings)
                         Stmt.While(condition, body, line):
-                            table <- strict_extern_call_expression(condition, line.line, extern_names, in_grant, table)
-                            table <- strict_extern_call_walk(body, extern_names, in_grant, table)
+                            table <- strict_unsafe_effect_call_expression(condition, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                            loop_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            table <- strict_unsafe_effect_call_statements(body, extern_names, annotations, active_grants, loop_bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, loop_bindings)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- strict_extern_call_walk(body, extern_names, in_grant, table)
+                            table <- strict_unsafe_effect_call_expression(iterable, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                            loop_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            for name in variables |loop_bindings|:
+                                strict_unsafe_call_shadow_local(loop_bindings, name)
+                            table <- strict_unsafe_effect_call_statements(body, extern_names, annotations, active_grants, loop_bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, loop_bindings)
                         Stmt.Block(kind, clause, binding, body, line):
-                            grant_here: bool = in_grant or kind == "can" or kind == "trusted"
-                            table <- strict_extern_call_walk(body, extern_names, grant_here, table)
+                            grants_here: mutable darray[sview] = []
+                            grants_here.extend(active_grants)
+                            grants_here.extend(clause) if kind == "can" or kind == "trusted"
+                            base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                            block_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                            strict_unsafe_call_shadow_local(block_bindings, binding) if binding != ""
+                            table <- strict_unsafe_effect_call_statements(body, extern_names, annotations, grants_here, block_bindings, enforce_raw_unsafe, table)
+                            strict_unsafe_call_bindings_merge(bindings, base_bindings, block_bindings)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- strict_unsafe_effect_call_expression(scrutinee, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
+                            base_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(bindings)
+                            for arm in arms |table, bindings| -> table:
+                                arm_bindings: mutable darray[StrictUnsafeCallEffectBinding] = strict_unsafe_call_bindings_copy(base_bindings)
+                                arm_names: mutable darray[sview] = []
+                                pattern_bound_names(arm.pattern, arm_names)
+                                for name in arm_names |arm_bindings|:
+                                    strict_unsafe_call_shadow_local(arm_bindings, name)
+                                table <- strict_unsafe_effect_call_expression(arm.guard, line.line, extern_names, annotations, active_grants, arm_bindings, enforce_raw_unsafe, table)
+                                table <- strict_unsafe_effect_call_statements(arm.body, extern_names, annotations, active_grants, arm_bindings, enforce_raw_unsafe, table)
+                                strict_unsafe_call_bindings_merge(bindings, base_bindings, arm_bindings)
+                        Stmt.Contract(kind, expression, line):
+                            table <- strict_unsafe_effect_call_expression(expression, line.line, extern_names, annotations, active_grants, bindings, enforce_raw_unsafe, table)
                         _:
                             pass
 
-        # Every raw-extern call obligation: skip functions with signature effects (a
-        # conservative over-grant, mirroring the bounds/alias pass) and grant blocks.
-        def strict_extern_call_decls(declarations: darray[Ast::Decl], extern_names: darray[sview]&, table: lmut SymbolTable) -> void:
+        def strict_unsafe_effect_call_decls(declarations: darray[Ast::Decl], extern_names: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, enforce_raw_unsafe: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            continue if effects.count > 0
-                            table <- strict_extern_call_walk(body, extern_names, false, table)
+                            no_local_grants: darray[sview] = []
+                            bindings: mutable darray[StrictUnsafeCallEffectBinding] = []
+                            for parameter in parameters |bindings, annotations, table|:
+                                strict_unsafe_call_bind_local(bindings, parameter.name, parameter.type_expression, Ast::Expr.Invalid, annotations, table)
+                            table <- strict_unsafe_effect_call_statements(body, extern_names, annotations, no_local_grants, bindings, enforce_raw_unsafe, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- strict_extern_call_decls(module_body, extern_names, table)
+                            table <- strict_unsafe_effect_call_decls(module_body, extern_names, annotations, enforce_raw_unsafe, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- strict_extern_call_decls(scoped_body, extern_names, table)
+                            table <- strict_unsafe_effect_call_decls(scoped_body, extern_names, annotations, enforce_raw_unsafe, table)
                         _:
                             pass
 
@@ -175,16 +407,11 @@ extend Semantic:
         # mark them stale at the container's first mutator call, and flag any read through a
         # stale view NOT covered by a `Unsafe.StaleRef` grant. `stale_granted` is inherited
         # from an enclosing `can/trusted Unsafe.StaleRef:` (a DIFFERENT grant does not
-        # discharge it). view_names/view_srcs/view_stale are parallel; state is
-        # function-scoped, so nested blocks share and mutate it.
-        def stale_view_walk(statements: darray[Ast::Stmt], containers: darray[sview]&, view_names: mutable darray[sview]&, view_srcs: mutable darray[sview]&, view_stale: mutable darray[bool]&, stale_granted: bool, table: lmut SymbolTable) -> void:
+        # discharge it). view_names/view_srcs/stale_now are function-scoped, so nested blocks
+        # share invalidation facts while the grant itself remains lexically scoped.
+        def stale_view_walk(statements: darray[Ast::Stmt], containers: darray[sview]&, view_names: mutable darray[sview]&, view_srcs: mutable darray[sview]&, stale_now: mutable darray[sview]&, stale_granted: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                stale_now: mutable darray[sview] = []
-                probe0: mutable usize = 0
-                while probe0 < view_names.count |stale_now, probe0, view_names, view_stale|:
-                    stale_now.push(view_names[probe0]) if view_stale[probe0]
-                    probe0 <- probe0 + 1
-                for statement in statements |table, view_names, view_srcs, view_stale, stale_now| -> table:
+                for statement in statements |table, view_names, view_srcs, stale_now| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line.line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and expression_reads_stale_view(value, stale_now)
@@ -192,7 +419,6 @@ extend Semantic:
                             if is_view_annotation(type_expression) and source != "":
                                 view_names.push(name)
                                 view_srcs.push(source)
-                                view_stale.push(false)
                         Stmt.Assign(target, operator, value, line):
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line.line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and (expression_reads_stale_view(value, stale_now) or expression_reads_stale_view(target, stale_now))
                         Stmt.Expr(expression, line):
@@ -200,24 +426,23 @@ extend Semantic:
                             mutated: sview = mutating_container(expression)
                             if mutated != "":
                                 mark_probe: mutable usize = 0
-                                while mark_probe < view_names.count |mark_probe, mutated, view_srcs, view_stale, stale_now|:
+                                while mark_probe < view_names.count |mark_probe, mutated, view_srcs, stale_now|:
                                     if view_srcs[mark_probe] == mutated:
-                                        view_stale[mark_probe] <- true
                                         stale_now.push(view_names[mark_probe])
                                     mark_probe <- mark_probe + 1
                         Stmt.Return(value, line):
                             if value is returned:
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line.line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and expression_reads_stale_view(returned, stale_now)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- stale_view_walk(then_body, containers, view_names, view_srcs, view_stale, stale_granted, table)
-                            table <- stale_view_walk(else_body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                            table <- stale_view_walk(then_body, containers, view_names, view_srcs, stale_now, stale_granted, table)
+                            table <- stale_view_walk(else_body, containers, view_names, view_srcs, stale_now, stale_granted, table)
                         Stmt.While(condition, body, line):
-                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, stale_now, stale_granted, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, stale_now, stale_granted, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            grants_stale: bool = stale_granted or ((kind == "can" or kind == "trusted") and (any grant in clause where grant == "Unsafe.StaleRef" or grant == "StaleRef"))
-                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, grants_stale, table)
+                            grants_stale: bool = stale_granted or ((kind == "can" or kind == "trusted") and strict_unsafe_grant_covers(clause, "Unsafe.StaleRef"))
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, stale_now, grants_stale, table)
                         _:
                             pass
 
@@ -226,15 +451,14 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            continue if effects.count > 0
                             containers: mutable darray[sview] = []
                             for parameter in parameters |containers|:
                                 containers.push(parameter.name) if param_is_mutable_ref(parameter)
                             continue if containers.count == 0
                             view_names: mutable darray[sview] = []
                             view_srcs: mutable darray[sview] = []
-                            view_stale: mutable darray[bool] = []
-                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, false, table)
+                            stale_now: mutable darray[sview] = []
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, stale_now, false, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- stale_view_decls(module_body, table)
                         Decl.Scoped(scoped_body, scoped_line):
@@ -255,6 +479,7 @@ extend Semantic:
                 collect_writable_globals(all_globals, file.enum_annotations, mutable_globals)
                 extern_names: mutable darray[sview] = []
                 collect_extern_names(file.top_decls, extern_names)
+                table <- strict_unsafe_effect_call_decls(file.top_decls, extern_names, file.enum_annotations, enforce_raw_unsafe, table)
                 table <- strict_extern_call_decls(file.top_decls, extern_names, table) if enforce_raw_unsafe and extern_names.count > 0
                 table <- stale_view_decls(file.top_decls, table) if enforce_raw_unsafe
                 checked_get_lines: mutable darray[u32] = []

@@ -66,6 +66,11 @@ REGRESSIONS = [
     # `recover(count: mutable&)`. Stage0 rejects the missing pointee type; stage1 must
     # reject the same cast-marker placeholder before backend type lowering can trap.
     ("malformed_mutable_ref_annotation", open(os.path.join(ROOT, "test/repro/try_void_recovery_paths.elisa")).read().replace("def recover(count: mutable i64&)", "def recover(count: mutable&)")),
+    # A malformed extern return marker (`-> &?`) used to survive the Stage1 parser as a
+    # void-looking extern.  A later call then asked LLVM for the ABI alignment of an invalid
+    # return type and trapped in DataLayout::getABITypeAlign.  Stage1 must reject the header
+    # normally, just as Stage0 does, without reaching backend codegen.
+    ("malformed_extern_pointer_return", "struct SDL_Window:\n    opaque: u8\n\n@link_name(\"sdlWindow\")\nextern sdlWindow: mutable SDL_Window&?\n\nglobal mutable sdlWindow: SDL_Window&? = zeroed\n\nextern SDL_CreateWindow(title: u8&?, w: i32, h: i32, flags: u64) -> &?\n\ndef main() -> i64:\n    return 0\n"),
 ]
 
 OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")), "opt")

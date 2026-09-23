@@ -17,26 +17,18 @@ from adversarial_harness import ROOT
 
 
 def gen_mutable_ref_local_rebind():
-    """`r: mutable T& = v; r <- v2` -- the LOCAL BINDING itself was declared `mutable`,
-    which stage0 treats as REBINDING the reference (assigning a new T&-typed value to
-    the binding) rather than writing through it -- a plain non-Ref value on the RHS is
-    rejected ("cannot assign int to mutable i64&"). stage1's codegen had no way to tell
-    a mutable-declared local from a non-mutable one (Scope tracked name/slot/type only,
-    no mutability bit at all) and performed write-through unconditionally for ANY
-    Ref-typed `<-` target -- a genuine PERMISSIVE divergence (stage1 silently ACCEPTED
-    and ran `ref <- 5` on a `mutable i64&` local, writing 5 through instead of
-    rejecting), confirmed to predate this entire session via a throwaway worktree.
+    """`r: mutable T& = v; r <- v2` on a LOCAL whose TYPE spells `mutable`.
 
-    Fixed by adding Scope.local_is_mutable, a bit set ONLY at the one VarDecl shape that
-    can spell `mutable` on a Ref-typed annotation at all (type_contains_token already
-    existed in the backend for exactly this check); every other local stays at the
-    pushed default `false`, so the pre-existing write-through behavior for a
-    non-mutable-declared Ref local (the overwhelmingly common case) is unchanged by
-    construction. See defer-function-cleanup-scope-gap and mutable-ref-local-rebind-gap
-    in the memory notes for how this was found (interaction-axis testing) and the
-    corrected-vs-original write-through-ref-gap record.
+    Rule R (stage0 875d75bd, 2026-09-22): the `mutable` in the reference TYPE is the
+    write capability; the binding's own `mutable x:` qualifier is what makes the slot
+    rebindable. The legacy spelling `r: mutable T& = init` stays writable when `init`
+    is a writable reference (`&g` of a mutable global, a `-> mutable T&` call), and on
+    such a binding a scalar value WRITES THROUGH (`r <- 5` sets the pointee) while a
+    reference value REBINDS (`r <- &g2`). Before rule R stage0 rejected the plain value
+    ("cannot assign int to mutable i64&") and stage1 wrote through unconditionally; the
+    history is in the mutable-ref-local-rebind-gap and ref-capability-rule-r memory notes.
     """
-    yield ("mutable_ref_local_rebind_rejects_plain_value", """
+    yield ("mutable_ref_local_plain_value_writes_through", """
 global mutable g: mutable i64 = 100
 
 def main() -> i64:
@@ -44,7 +36,7 @@ def main() -> i64:
     ref <- 5
     return g
 """)
-    yield ("mutable_ref_local_rebind_via_call_result_rejects_plain_value", """
+    yield ("mutable_ref_local_call_result_plain_value_writes_through", """
 global mutable g: i64 = 42
 
 def get_ref() -> mutable i64&:

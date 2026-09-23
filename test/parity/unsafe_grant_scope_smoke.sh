@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# Operation-specific unsafe capabilities must be lexical and must not leak across grants.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+STAGE1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
+
+python3 - "$STAGE1" "$REPO_ROOT" <<'PY'
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+stage1 = sys.argv[1]
+repo = pathlib.Path(sys.argv[2])
+
+cases = {
+    "alias unrelated grant": (
+        "# strict\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&) -> void:\n"
+        "    can Memory.Allocate:\n        pair(x, x)\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "alias wrong unsafe capability": (
+        "# strict\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&) -> void:\n"
+        "    can Unsafe.PointerArithmetic:\n        pair(x, x)\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "alias exact grant": (
+        "# strict\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&) -> void:\n"
+        "    can Unsafe.Alias:\n        pair(x, x)\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "alias in match arm": (
+        "# strict\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "    match flag:\n"
+        "        true:\n            pair(x, x)\n"
+        "        false:\n            pass\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "alias in match arm under exact grant": (
+        "# strict\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "    match flag:\n"
+        "        true:\n"
+        "            can Unsafe.Alias:\n                pair(x, x)\n"
+        "        false:\n            pass\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "local alias in match arm": (
+        "# strict\n"
+        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "    alias: mutable i64& = get_ref(x)\n"
+        "    match flag:\n"
+        "        true:\n            pair(alias, x)\n"
+        "        false:\n            pass\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "local alias in match arm under exact grant": (
+        "# strict\n"
+        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "    alias: mutable i64& = get_ref(x)\n"
+        "    match flag:\n"
+        "        true:\n"
+        "            can Unsafe.Alias:\n                pair(alias, x)\n"
+        "        false:\n            pass\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "signature effect is not local authority": (
+        "# strict\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "def bad(x: mutable i64&) -> void can[Unsafe.Alias]:\n    pair(x, x)\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "unsafe function call unrelated grant": (
+        "# strict\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def wrapper() -> void:\n"
+        "    can Memory.Allocate:\n        unsafe_api()\n"
+        "def main() -> i64:\n"
+        "    can Unsafe.PointerCast:\n        wrapper()\n"
+        "    return 0\n",
+        'call to "unsafe_api" requires can[Unsafe]',
+    ),
+    "unsafe function call wrong unsafe capability": (
+        "# strict\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def wrapper() -> void:\n"
+        "    can Unsafe.Alias:\n        unsafe_api()\n"
+        "def main() -> i64:\n"
+        "    can Unsafe.PointerCast:\n        wrapper()\n"
+        "    return 0\n",
+        'call to "unsafe_api" requires can[Unsafe]',
+    ),
+    "unsafe signature does not locally authorize its call": (
+        "# strict\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def wrapper() -> void can[Unsafe.PointerCast]:\n"
+        "    can Memory.Allocate:\n        unsafe_api()\n"
+        "def main() -> i64:\n"
+        "    can Unsafe.PointerCast:\n        wrapper()\n"
+        "    return 0\n",
+        'call to "unsafe_api" requires can[Unsafe]',
+    ),
+    "unsafe function call exact local grant": (
+        "# strict\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def wrapper() -> void can[Unsafe.PointerCast]:\n"
+        "    can Unsafe.PointerCast:\n        unsafe_api()\n"
+        "def main() -> i64:\n"
+        "    can Unsafe.PointerCast:\n        wrapper()\n"
+        "    return 0\n",
+        None,
+    ),
+    "contract expression unsafe call": (
+        "# strict\n"
+        "def unsafe_predicate() -> bool can[Unsafe.PointerCast]:\n    return true\n"
+        "def caller() -> void:\n    requires unsafe_predicate()\n    return\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "unsafe_predicate" requires can[Unsafe]',
+    ),
+    "contract expression exact grant": (
+        "# strict\n"
+        "def unsafe_predicate() -> bool can[Unsafe.PointerCast]:\n    return true\n"
+        "def caller() -> void:\n"
+        "    can Unsafe.PointerCast:\n        requires unsafe_predicate()\n"
+        "    return\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "unsafe function parameter call": (
+        "# strict\n"
+        "def call(callback: fn() -> void can[Unsafe.PointerCast]) -> void:\n    callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "callback" requires can[Unsafe]',
+    ),
+    "unsafe function parameter unrelated grant": (
+        "# strict\n"
+        "def call(callback: fn() -> void can[Unsafe.PointerCast]) -> void:\n"
+        "    can Memory.Allocate:\n        callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "callback" requires can[Unsafe]',
+    ),
+    "unsafe function parameter exact grant": (
+        "# strict\n"
+        "def call(callback: fn() -> void can[Unsafe.PointerCast]) -> void:\n"
+        "    can Unsafe.PointerCast:\n        callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "unsafe local callback alias": (
+        "# strict\n"
+        "def call(callback: fn() -> void can[Unsafe.PointerCast]) -> void:\n"
+        "    local_callback: fn() -> void can[Unsafe.PointerCast] = callback\n"
+        "    local_callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "local_callback" requires can[Unsafe]',
+    ),
+    "unsafe local callback alias unrelated grant": (
+        "# strict\n"
+        "def call(callback: fn() -> void can[Unsafe.PointerCast]) -> void:\n"
+        "    local_callback: fn() -> void can[Unsafe.PointerCast] = callback\n"
+        "    can Memory.Allocate:\n        local_callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "local_callback" requires can[Unsafe]',
+    ),
+    "unsafe local callback alias exact grant": (
+        "# strict\n"
+        "def call(callback: fn() -> void can[Unsafe.PointerCast]) -> void:\n"
+        "    local_callback: fn() -> void can[Unsafe.PointerCast] = callback\n"
+        "    can Unsafe.PointerCast:\n        local_callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "unsafe callback local rebind": (
+        "# strict\n"
+        "def safe_api() -> void:\n    return\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def call() -> void:\n"
+        "    mutable callback: fn() -> void = safe_api\n"
+        "    callback <- unsafe_api\n"
+        "    callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "callback" requires can[Unsafe]',
+    ),
+    "unsafe callback local rebind unrelated grant": (
+        "# strict\n"
+        "def safe_api() -> void:\n    return\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def call() -> void:\n"
+        "    mutable callback: fn() -> void = safe_api\n"
+        "    callback <- unsafe_api\n"
+        "    can Memory.Allocate:\n        callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "callback" requires can[Unsafe]',
+    ),
+    "unsafe callback local rebind exact grant": (
+        "# strict\n"
+        "def safe_api() -> void:\n    return\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def call() -> void:\n"
+        "    mutable callback: fn() -> void = safe_api\n"
+        "    callback <- unsafe_api\n"
+        "    can Unsafe.PointerCast:\n        callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "unsafe callback rebind branch join": (
+        "# strict\n"
+        "def safe_api() -> void:\n    return\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def call(flag: bool) -> void:\n"
+        "    mutable callback: fn() -> void = safe_api\n"
+        "    if flag:\n        callback <- unsafe_api\n"
+        "    can Memory.Allocate:\n        callback()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "callback" requires can[Unsafe]',
+    ),
+    "unchecked index unrelated grant": (
+        "# strict\n"
+        "def bad(xs: array[i64, 8], i: i64) -> i64:\n"
+        "    can Memory.Allocate:\n        return xs[i]\n"
+        "def main() -> i64:\n    return 0\n",
+        "unchecked index requires",
+    ),
+    "unchecked index exact grant": (
+        "# strict\n"
+        "def bad(xs: array[i64, 8], i: i64) -> i64:\n"
+        "    can Unsafe.UncheckedIndex:\n        return xs[i]\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "mutable global unrelated grant": (
+        "# strict\n"
+        "global mutable hot: i64 = 0\n"
+        "def bad() -> i64:\n    can Memory.Allocate:\n        return hot\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable global access requires",
+    ),
+    "mutable global nested in array initializer": (
+        "# strict\n"
+        "global mutable hot: i64 = 0\n"
+        "def bad() -> i64:\n"
+        "    values: i64[1] = [hot]\n"
+        "    return values[0]\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable global access requires",
+    ),
+    "mutable global exact grant": (
+        "# strict\n"
+        "global mutable hot: i64 = 0\n"
+        "def bad() -> i64:\n    can Unsafe.MutableGlobal:\n        return hot\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic unrelated grant": (
+        "# strict\n"
+        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "    can Unsafe.PointerCast:\n        pointer + offset\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic exact grant": (
+        "# strict\n"
+        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n        pointer + offset\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic in match arm": (
+        "# strict\n"
+        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "    match offset:\n"
+        "        0:\n            pointer + offset\n"
+        "        _:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic in match arm under unrelated grant": (
+        "# strict\n"
+        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "    can Memory.Allocate:\n"
+        "        match offset:\n"
+        "            0:\n                pointer + offset\n"
+        "            _:\n                pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic in match arm under exact grant": (
+        "# strict\n"
+        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "    match offset:\n"
+        "        0:\n"
+        "            can Unsafe.PointerArithmetic:\n"
+        "                pointer + offset\n"
+        "        _:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "extern unrelated grant": (
+        "# strict\n# unsafe\n"
+        "extern foreign() -> i64\n"
+        "def bad() -> i64:\n    can Memory.Allocate:\n        return foreign()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "foreign" requires can[Unsafe]',
+    ),
+    "extern exact grant": (
+        "# strict\n# unsafe\n"
+        "extern foreign() -> i64\n"
+        "def bad() -> i64:\n    can Unsafe.RawExtern:\n        return foreign()\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "extern in match arm": (
+        "# strict\n# unsafe\n"
+        "extern foreign() -> i64\n"
+        "def bad(flag: bool) -> i64:\n"
+        "    match flag:\n"
+        "        true:\n            return foreign()\n"
+        "        false:\n            return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "foreign" requires can[Unsafe]',
+    ),
+    "extern in match arm under exact grant": (
+        "# strict\n# unsafe\n"
+        "extern foreign() -> i64\n"
+        "def bad(flag: bool) -> i64:\n"
+        "    match flag:\n"
+        "        true:\n"
+        "            can Unsafe.RawExtern:\n                return foreign()\n"
+        "        false:\n            return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer cast unrelated grant": (
+        "# strict\n"
+        "def bad(pointer: i64&) -> void:\n"
+        "    can Memory.Allocate:\n        erased: void& = pointer.cast[void&]\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer cast requires",
+    ),
+    "pointer cast exact grant": (
+        "# strict\n"
+        "def bad(pointer: i64&) -> void:\n"
+        "    can Unsafe.PointerCast:\n        erased: void& = pointer.cast[void&]\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "stale view unrelated nested grant": (
+        "# strict\n# unsafe\n"
+        "def bad(values: mutable darray[i64]&) -> i64:\n"
+        "    window: view[i64] = values[0:values.count]\n"
+        "    can Memory.Allocate:\n        values.push(1)\n"
+        "    return window[0]\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "stale reference" requires can[Unsafe]',
+    ),
+    "stale view wrong unsafe capability": (
+        "# strict\n# unsafe\n"
+        "def bad(values: mutable darray[i64]&) -> i64:\n"
+        "    window: view[i64] = values[0:values.count]\n"
+        "    can Memory.Allocate:\n        values.push(1)\n"
+        "    can Unsafe.PointerCast:\n        return window[0]\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "stale reference" requires can[Unsafe]',
+    ),
+    "stale view exact grant": (
+        "# strict\n# unsafe\n"
+        "def bad(values: mutable darray[i64]&) -> i64:\n"
+        "    window: view[i64] = values[0:values.count]\n"
+        "    can Memory.Allocate:\n        values.push(1)\n"
+        "    can Unsafe.StaleRef:\n        return window[0]\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "buffer reinterpret needs separate capability": (
+        "# strict\n"
+        "def bad() -> void:\n"
+        "    can Memory.Allocate:\n"
+        "        buffer: mutable darray[u8] = []\n"
+        "        buffer.push(0)\n"
+        "        erased: static u8& = (&buffer[0]).cast[static u8&]\n"
+        "def main() -> i64:\n    return 0\n",
+        "buffer reinterpret cast requires",
+    ),
+    "pointer grant does not grant buffer reinterpret": (
+        "# strict\n"
+        "def bad() -> void:\n"
+        "    can Memory.Allocate:\n"
+        "        buffer: mutable darray[u8] = []\n"
+        "        buffer.push(0)\n"
+        "        can Unsafe.PointerCast:\n"
+        "            erased: static u8& = (&buffer[0]).cast[static u8&]\n"
+        "def main() -> i64:\n    return 0\n",
+        "buffer reinterpret cast requires",
+    ),
+    "buffer grant does not grant pointer cast": (
+        "# strict\n"
+        "def bad() -> void:\n"
+        "    can Memory.Allocate:\n"
+        "        buffer: mutable darray[u8] = []\n"
+        "        buffer.push(0)\n"
+        "        can Unsafe.BufferReinterpret:\n"
+        "            erased: static u8& = (&buffer[0]).cast[static u8&]\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer cast requires",
+    ),
+    "buffer reinterpret exact pair": (
+        "# strict\n"
+        "def bad() -> void:\n"
+        "    can Memory.Allocate:\n"
+        "        buffer: mutable darray[u8] = []\n"
+        "        buffer.push(0)\n"
+        "        can Unsafe.PointerCast, Unsafe.BufferReinterpret:\n"
+        "            erased: static u8& = (&buffer[0]).cast[static u8&]\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "buffer reference parameter still needs buffer capability": (
+        "# strict\n# unsafe\n"
+        "def bad(buffer: mutable darray[u8]&) -> void:\n"
+        "    can Memory.Allocate:\n"
+        "        buffer.push(0)\n"
+        "        can Unsafe.PointerCast:\n"
+        "            erased: static u8& = (&buffer[0]).cast[static u8&]\n"
+        "def main() -> i64:\n    return 0\n",
+        "buffer reinterpret cast requires",
+    ),
+    "buffer reference parameter exact capability pair": (
+        "# strict\n# unsafe\n"
+        "def bad(buffer: mutable darray[u8]&) -> void:\n"
+        "    can Memory.Allocate:\n"
+        "        buffer.push(0)\n"
+        "        can Unsafe.PointerCast, Unsafe.BufferReinterpret:\n"
+        "            erased: static u8& = (&buffer[0]).cast[static u8&]\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+}
+
+with tempfile.TemporaryDirectory(prefix="elisa-unsafe-grants-") as temp:
+    directory = pathlib.Path(temp)
+    for name, (source, expected) in cases.items():
+        path = directory / (name.replace(" ", "_") + ".elisa")
+        path.write_text(source)
+        result = subprocess.run(
+            [stage1, "-emit", "interpret", "-o", "/dev/null", str(path)],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=90,
+        )
+        output = result.stdout
+        if result.returncode not in (0, 1):
+            raise SystemExit(f"{name}: compiler failed ({result.returncode})\n{output}")
+        if expected is None and any(
+            message in output
+            for message in (
+                "mutable alias requires",
+                "unchecked index requires",
+                "mutable global access requires",
+                "pointer arithmetic requires",
+                'call to "foreign" requires can[Unsafe]',
+                "pointer cast requires",
+                "buffer reinterpret cast requires",
+                'call to "stale reference" requires can[Unsafe]',
+                'call to "unsafe_api" requires can[Unsafe]',
+                'call to "unsafe_predicate" requires can[Unsafe]',
+                'call to "callback" requires can[Unsafe]',
+                'call to "local_callback" requires can[Unsafe]',
+            )
+        ):
+            raise SystemExit(f"{name}: exact grant was rejected\n{output}")
+        if expected is not None and expected not in output:
+            raise SystemExit(f"{name}: expected {expected!r}\n{output}")
+
+print(f"unsafe grant scope smoke OK: {len(cases)} unrelated, exact, and signature-effect cases")
+PY
