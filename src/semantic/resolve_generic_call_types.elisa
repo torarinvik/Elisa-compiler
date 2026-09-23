@@ -1,0 +1,192 @@
+# Call-site instantiation of structural generic return types.
+# Region arguments have to survive this substitution: returning the uninstantiated
+# `Handle[r]` scheme or dropping it to Unknown can let an initializer relabel a borrow.
+
+extend Semantic:
+    private:
+        # Initializer checks need a call's instantiated result shape so a declared
+        # `Handle[other]` cannot relabel a generic call that actually returns
+        # `Handle[arena]`. Keep this specialized to initializer boundaries; the general
+        # inference walker retains its bounded historical lookup for arbitrary expressions.
+        def initializer_structural_type_id_of(expression: Ast::Expr, expected_type_id: u32, names: darray[sview]&, types: darray[sview]&, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                return structural_type_id_of(expression, names, types, table) if not type_id_contains_region(expected_type_id, table)
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Ident(function_name, function_line):
+                                return function_call_return_type_id(table, function_name, arguments, argument_names, expected_type_id, names, types)
+                            _:
+                                pass
+                    _:
+                        pass
+                return structural_type_id_of(expression, names, types, table)
+
+
+        def function_call_return_type_id(table: SymbolTable&, function_name: sview, arguments: darray[Ast::Expr]&, argument_names: darray[sview]&, expected_type_id: u32, names: darray[sview]&, types: darray[sview]&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                symbol_row: mutable u32 = 4294967295
+                cursor: mutable u32 = symbol_chain_head(table, function_name)
+                while cursor != 4294967295 |symbol_row, cursor, table, function_name|:
+                    symbol: Symbol = table.symbols[cursor.usize()]
+                    if symbol.name == function_name and symbol.kind == SymbolKind.Func:
+                        return 0 if symbol_row != 4294967295
+                        symbol_row <- cursor
+                    cursor <- table.symbol_name_next[cursor.usize()]
+                return 0 if symbol_row == 4294967295
+
+                callee: Symbol = table.symbols[symbol_row.usize()]
+                return_type_id: u32 = callee.return_type_id
+                return 0 if return_type_id == 0
+                return 0 if interned_kind(return_type_id, table) != SemTypeKind.Container or interned_kind(expected_type_id, table) != SemTypeKind.Container or interned_name(return_type_id, table) != interned_name(expected_type_id, table)
+                # A same-head concrete container does not need call-site substitution;
+                # only inspect arguments when the result contains a region parameter.
+                return function_return_type_id(table, function_name) if not type_id_contains_region(return_type_id, table)
+
+                # Snapshot AST payloads before recursively asking for argument TypeIds.
+                # The active Semantic walk may otherwise invalidate destructured lists.
+                argument_handles: mutable darray[Ast::Expr] = []
+                argument_handles.extend(arguments)
+                argument_name_handles: mutable darray[sview] = []
+                argument_name_handles.extend(argument_names)
+                from_ids: mutable darray[u32] = []
+                to_ids: mutable darray[u32] = []
+                positional_index: mutable u32 = 0
+                valid_substitution: mutable bool = true
+
+                for argument_index in 0..<argument_handles.count |positional_index, from_ids, to_ids, valid_substitution, table, names, types|:
+                    argument_name: sview = argument_name_handles[argument_index] if argument_index < argument_name_handles.count else ""
+                    parameter_row: u32 = function_param_row_for_call(table, function_name, positional_index, argument_name)
+                    positional_index <- positional_index + 1 if argument_name == ""
+                    if parameter_row != 4294967295:
+                        parameter_type_id: u32 = table.function_param_type_id[parameter_row.usize()]
+                        needs_type_substitution: bool = type_id_contains_region(parameter_type_id, table) or type_id_contains_function_generic(parameter_type_id, callee.line, table)
+                        if needs_type_substitution:
+                            argument_type_id: u32 = structural_type_id_of(argument_handles[argument_index], names, types, table)
+                            valid_substitution <- collect_call_type_substitutions(parameter_type_id, argument_type_id, callee.line, from_ids, to_ids, table)
+                        for tie_row in 0..<table.function_param_region_line.count |valid_substitution, from_ids, to_ids, table, callee, parameter_row, argument_handles, argument_index|:
+                            if table.function_param_region_line[tie_row] == callee.line and table.function_param_region_name[tie_row] == table.function_param_name[parameter_row.usize()]:
+                                formal_region: u32 = region_type_id(table.function_param_region[tie_row], table)
+                                actual_region: u32 = call_argument_region_type_id(argument_handles[argument_index], table)
+                                valid_substitution <- collect_call_type_substitutions(formal_region, actual_region, callee.line, from_ids, to_ids, table) if formal_region != 0 and actual_region != 0
+
+                return 0 if not valid_substitution
+                return 0 if type_id_has_unmapped_callee_scheme(return_type_id, callee.line, from_ids, table)
+                instantiated: u32 = substitute_type_id_existing(return_type_id, from_ids, to_ids, table)
+                return 0 if instantiated == 0
+                return instantiated
+
+
+        def function_param_row_for_call(table: SymbolTable&, function_name: sview, positional_index: u32, argument_name: sview) -> u32:
+            can Abort.Panic:
+                positional_seen: mutable u32 = 0
+                cursor: mutable u32 = function_param_chain_head(table, function_name)
+                while cursor != 4294967295 |positional_seen, cursor, table, function_name, positional_index, argument_name|:
+                    row: usize = cursor.usize()
+                    if table.function_param_owner[row] == function_name:
+                        if argument_name != "" and table.function_param_name[row] == argument_name:
+                            return cursor
+                        if argument_name == "" and positional_seen == positional_index:
+                            return cursor
+                        positional_seen <- positional_seen + 1 if argument_name == ""
+                    cursor <- table.function_param_name_next[row]
+                return 4294967295
+
+
+        def region_type_id(region_name: sview, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                0 return if region_name == ""
+                no_elems: darray[u32] = []
+                return existing_type_id(SemTypeKind.Region, region_name, no_elems, table)
+
+
+        def existing_type_id(kind: SemTypeKind, name: sview, elems: darray[u32]&, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                while row < table.type_row_kind.count |row: usize = 0, kind, name, elems, table|:
+                    return (row + 1).u32() if table.type_row_kind[row] == kind and table.type_row_name[row] == name and type_row_elements_match(row, elems, table)
+                    row <- row + 1
+                return 0
+
+
+        def type_row_elements_match(row: usize, elems: darray[u32]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if table.type_row_elem_count[row].usize() != elems.count
+                row_start: usize = table.type_row_elem_start[row].usize()
+                for position in 0..<elems.count:
+                    return false if table.type_elem_pool[row_start + position] != elems[position]
+                return true
+
+
+        def substitute_type_id_existing(type_id: u32, from_ids: darray[u32]&, to_ids: darray[u32]&, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                return 0 if from_ids.count != to_ids.count
+                for substitution_index in 0..<from_ids.count:
+                    to_ids[substitution_index] return if from_ids[substitution_index] == type_id
+                return 0 if type_id == 0
+                child_count: usize = interned_elem_count(type_id, table).usize()
+                return type_id if child_count == 0
+                children: mutable darray[u32] = []
+                for child_position in 0..<child_count |children, table|:
+                    child_id: u32 = substitute_type_id_existing(interned_elem(type_id, child_position.u32(), table), from_ids, to_ids, table)
+                    return 0 if child_id == 0
+                    children.push(child_id)
+                return existing_type_id(interned_kind(type_id, table), interned_name(type_id, table), children, table)
+
+
+        def call_argument_region_type_id(argument: Ast::Expr, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, paren_line):
+                        return call_argument_region_type_id(inner, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        return call_argument_region_type_id(operand, table) if operator == TokenKind.Ampersand or operator == TokenKind.Mutable or operator == TokenKind.Lmut
+                    Expr.Ident(argument_name, ident_line):
+                        return region_type_id(argument_name, table) if any known_region in table.region_names where known_region == argument_name
+                    _:
+                        pass
+                return 0
+
+
+        # Match a formal scheme against one actual structural type, recording only
+        # generic type/region leaves. A shape mismatch supplies no substitution; another
+        # checker owns ordinary call type errors. Conflicting evidence for one leaf makes
+        # this call's structural result unknown rather than selecting one argument.
+        def collect_call_type_substitutions(formal_id: u32, actual_id: u32, function_line: u32, from_ids: mutable darray[u32]&, to_ids: mutable darray[u32]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if formal_id == 0 or actual_id == 0
+                formal_kind: SemTypeKind = interned_kind(formal_id, table)
+                actual_kind: SemTypeKind = interned_kind(actual_id, table)
+                is_region_parameter: bool = formal_kind == SemTypeKind.Region
+                is_type_parameter: bool = formal_kind == SemTypeKind.Named and function_generic_param_named(table, function_line, interned_name(formal_id, table))
+                if is_region_parameter or is_type_parameter:
+                    return true if is_region_parameter and actual_kind != SemTypeKind.Region
+                    while map_index < from_ids.count |map_index: usize = 0, from_ids, to_ids, formal_id, actual_id|:
+                        if from_ids[map_index] == formal_id:
+                            return to_ids[map_index] == actual_id
+                        map_index <- map_index + 1
+                    from_ids.push(formal_id)
+                    to_ids.push(actual_id)
+                    return true
+                return true if formal_id == actual_id
+                return true if formal_kind != actual_kind or interned_name(formal_id, table) != interned_name(actual_id, table)
+                return true if interned_elem_count(formal_id, table) != interned_elem_count(actual_id, table)
+                for element_position in 0..<interned_elem_count(formal_id, table) |from_ids, to_ids, table, formal_id, actual_id, function_line|:
+                    return false if not collect_call_type_substitutions(interned_elem(formal_id, element_position, table), interned_elem(actual_id, element_position, table), function_line, from_ids, to_ids, table)
+                return true
+
+
+        # Every scheme leaf in the callee's return must have been observed in an actual
+        # argument before substitution. Check the original scheme so a caller-side region
+        # whose spelling happens to match a different formal cannot satisfy it accidentally.
+        def type_id_has_unmapped_callee_scheme(type_id: u32, function_line: u32, from_ids: darray[u32]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if type_id == 0
+                kind: SemTypeKind = interned_kind(type_id, table)
+                scheme_leaf: bool = kind == SemTypeKind.Region or (kind == SemTypeKind.Named and function_generic_param_named(table, function_line, interned_name(type_id, table)))
+                if scheme_leaf:
+                    for substitution_index in 0..<from_ids.count:
+                        return false if from_ids[substitution_index] == type_id
+                    return true
+                for element_position in 0..<interned_elem_count(type_id, table):
+                    return true if type_id_has_unmapped_callee_scheme(interned_elem(type_id, element_position, table), function_line, from_ids, table)
+                return false

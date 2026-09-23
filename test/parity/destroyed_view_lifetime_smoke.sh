@@ -16,6 +16,7 @@ BAD="$ROOT/test/repro/sview_region_use_after_destroy.elisa"
 GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
+JSON_REGION_MISMATCH_BAD="$ROOT/test/repro/json_handle_region_mismatch.elisa"
 JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
 ARENA_VIEW_BAD="$ROOT/test/repro/manual_arena_free_use_after_region.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
@@ -72,6 +73,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$json_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected stale JSON handle at O$optimization" >&2; exit 1; }
+
+    json_mismatch_output="$WORK/json-handle-region-mismatch-O$optimization"
+    json_mismatch_log="$json_mismatch_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$json_mismatch_output.ll" "$JSON_REGION_MISMATCH_BAD" >"$json_mismatch_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a JSON handle parameterized by a different arena at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'variable "value" expects JsonValueHandle, got JsonValueHandle' "$json_mismatch_log" || {
+        echo "destroyed view lifetime smoke: cross-arena generic return lost its source lifetime at O$optimization" >&2
+        cat "$json_mismatch_log" >&2
+        exit 1
+    }
+    [[ ! -e "$json_mismatch_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected cross-arena JSON handle at O$optimization" >&2; exit 1; }
 
     json_view_output="$WORK/json-view-after-arena-free-O$optimization"
     json_view_log="$json_view_output.log"
@@ -150,4 +164,4 @@ for optimization in 0 2; do
     }
 done
 
-echo "destroyed view lifetime smoke OK: stale copied views are rejected; live and last-use-before-destroy controls pass at O0/O2"
+echo "destroyed view lifetime smoke OK: stale uses and cross-arena generic handles are rejected; live and last-use-before-destroy controls pass at O0/O2"
