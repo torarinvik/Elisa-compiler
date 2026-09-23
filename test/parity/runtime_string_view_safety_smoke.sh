@@ -81,10 +81,10 @@ for case_name in invalid-length; do
 done
 
 check_nullable_view_rejected() {
-    local compiler="$1" stage="$2" mode="$3"
+    local compiler="$1" stage="$2" mode="$3" fixture="$4"
     local output="$WORK/null-backed-view-$stage"
     local log="$output.compile.log"
-    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/parity/fixtures/runtime_string_view_null_data.elisa" >"$log" 2>&1; then
+    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/parity/fixtures/$fixture" >"$log" 2>&1; then
         echo "runtime string view smoke: $stage accepted a null-backed sview" >&2
         exit 1
     fi
@@ -95,26 +95,28 @@ check_nullable_view_rejected() {
     }
 }
 
-check_nullable_view_rejected "$STAGE1" stage1 exe
-check_nullable_view_rejected "$STAGE0" stage0 c-archive
+for fixture in runtime_string_view_null_data.elisa runtime_string_view_null_data_conditional.elisa; do
+    check_nullable_view_rejected "$STAGE1" stage1 exe "$fixture"
+    check_nullable_view_rejected "$STAGE0" stage0 c-archive "$fixture"
+done
 
-check_view_backing_is_immutable() {
+check_view_length_is_immutable() {
     local compiler="$1" stage="$2" mode="$3"
-    local output="$WORK/mutable-view-backing-$stage"
+    local output="$WORK/mutable-view-length-$stage"
     local log="$output.compile.log"
-    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/parity/fixtures/runtime_string_view_mutable_data.elisa" >"$log" 2>&1; then
-        echo "runtime string view smoke: $stage allowed StringView.data reassignment" >&2
+    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/parity/fixtures/runtime_string_view_mutable_length.elisa" >"$log" 2>&1; then
+        echo "runtime string view smoke: $stage allowed sview.len widening" >&2
         exit 1
     fi
     rg -qi 'immutable|read.only|cannot assign' "$log" || {
-        echo "runtime string view smoke: $stage rejected StringView.data reassignment for an unexpected reason" >&2
+        echo "runtime string view smoke: $stage rejected sview.len widening for an unexpected reason" >&2
         cat "$log" >&2
         exit 1
     }
 }
 
-check_view_backing_is_immutable "$STAGE1" stage1 exe
-check_view_backing_is_immutable "$STAGE0" stage0 c-archive
+check_view_length_is_immutable "$STAGE1" stage1 exe
+check_view_length_is_immutable "$STAGE0" stage0 c-archive
 
 check_region_lifetime() {
     local compiler="$1" stage="$2" mode="$3"
@@ -170,4 +172,4 @@ check_region_lifetime() {
 check_region_lifetime "$STAGE1" stage1 exe
 check_region_lifetime "$STAGE0" stage0 c-archive
 
-echo "runtime string view smoke OK: backing is non-null and immutable; malformed lengths fail closed; region lifetimes agree on stage0/stage1"
+echo "runtime string view smoke OK: backing and length are non-null/immutable; malformed lengths fail closed; region lifetimes agree on stage0/stage1"
