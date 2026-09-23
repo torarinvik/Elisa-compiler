@@ -18,6 +18,7 @@ from scripts.wasm_build import (
     WasmBuildError,
     js_bindings,
     load_export_scan,
+    main,
     parse_exports,
     runtime_cache_path,
     type_declaration,
@@ -359,6 +360,40 @@ class WasmExportScanClientTests(unittest.TestCase):
 
 
 class ExportScannerSelectionTests(unittest.TestCase):
+    def test_cli_uses_elisascript_scanner_environment_defaults(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ELISASCRIPT_PUBLIC_LAUNCHER": "/opt/elisa/bin/elisascript",
+                    "ELISASCRIPT_EXPORT_SCAN_SCRIPT": "/opt/elisa/scripts/wasm_export_scan.elisascript",
+                },
+                clear=True,
+            ),
+            patch(
+                "sys.argv",
+                [
+                    "wasm_build.py",
+                    "--root",
+                    "/tmp/root",
+                    "--compiler",
+                    "/tmp/compiler",
+                    "--source",
+                    "/tmp/input.elisa",
+                    "--output",
+                    "/tmp/output.wasm",
+                ],
+            ),
+            patch("scripts.wasm_build.build") as build,
+        ):
+            self.assertEqual(main(), 0)
+        args = build.call_args.args[0]
+        self.assertEqual(args.export_scan_launcher, "/opt/elisa/bin/elisascript")
+        self.assertEqual(
+            args.export_scan_script,
+            "/opt/elisa/scripts/wasm_export_scan.elisascript",
+        )
+
     def test_default_keeps_the_python_scanner_path(self) -> None:
         source_path = Path("/tmp/input.elisa")
         flattened = "export fn answer() -> i32 = answer_impl\n"

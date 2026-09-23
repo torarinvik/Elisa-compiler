@@ -402,11 +402,19 @@ def main() -> int:
     parser.add_argument("--wasm-component-ld")
     parser.add_argument(
         "--export-scan-launcher",
-        help="absolute Elisascript launcher path for the opt-in WASM export scan",
+        default=os.environ.get("ELISASCRIPT_PUBLIC_LAUNCHER"),
+        help=(
+            "absolute Elisascript launcher path for the opt-in WASM export scan "
+            "(or ELISASCRIPT_PUBLIC_LAUNCHER)"
+        ),
     )
     parser.add_argument(
         "--export-scan-script",
-        help="absolute path to scripts/wasm_export_scan.elisascript",
+        default=os.environ.get("ELISASCRIPT_EXPORT_SCAN_SCRIPT"),
+        help=(
+            "absolute path to scripts/wasm_export_scan.elisascript "
+            "(or ELISASCRIPT_EXPORT_SCAN_SCRIPT)"
+        ),
     )
     parser.add_argument("--component-type", dest="component_types", action="append", default=[])
     parser.add_argument("--wasm-only", action="store_true")
