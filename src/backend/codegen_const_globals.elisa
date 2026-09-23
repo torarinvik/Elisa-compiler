@@ -8,6 +8,15 @@ extend Backend:
 
         def const_aggregate_value(value_expression: Expr, value_type: ValueType, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, ok: mutable bool&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             aggregate_failure: LLVMValueRef = zeroed
+            # `null` is a valid absent value for an optional. In aggregate globals it
+            # must be materialized with that field's representation (a zero tag for a
+            # tagged optional or a null pointer for a niche optional), not treated as an
+            # unsupported field and not confused with a non-optional reference.
+            if is_null_literal(value_expression):
+                if value_type.kind == TypeKind.Optional:
+                    return LLVMConstNull(llvm_type_of(value_type, structs, ctx))
+                ok <- false
+                return aggregate_failure
             # Enum members can arrive here as a field expression or as a dotted identifier
             # depending on whether the initializer was parsed through the aggregate literal
             # path. Resolve both spellings directly; relying only on the general scalar folder
@@ -119,9 +128,13 @@ extend Backend:
                         pass
                 ok <- false
                 return aggregate_failure
-            if value_type.kind == TypeKind.Struct:
+            if value_type.kind == TypeKind.Struct or value_type.kind == TypeKind.Arena:
                 if value_expression is Expr.Construct(construct_type, construct_fields, construct_line):
-                    struct_index: usize = value_type.bits.usize()
+                    aggregate_struct_type: ValueType = arena_user_struct(structs) if value_type.kind == TypeKind.Arena else value_type
+                    if aggregate_struct_type.kind != TypeKind.Struct:
+                        ok <- false
+                        return aggregate_failure
+                    struct_index: usize = aggregate_struct_type.bits.usize()
                     field_count: usize = structs.field_count[struct_index]
                     field_values: mutable darray[LLVMValueRef] = []
                     for field_offset in 0..<field_count |field_values, structs, ctx, struct_index|:
@@ -140,6 +153,8 @@ extend Backend:
                             field_values[field_position.usize()] <- field_value if field_ok
                     if fields_ok:
                         field_values_pointer: void& = (&field_values[0]).cast[void&] can Unsafe.PointerCast
+                        if value_type.kind == TypeKind.Arena:
+                            return LLVMConstStructInContext(ctx, field_values_pointer, field_count.u32(), 0)
                         return LLVMConstNamedStruct(llvm_type_of(value_type, structs, ctx), field_values_pointer, field_count.u32())
                 ok <- false
                 return aggregate_failure
@@ -324,9 +339,6 @@ extend Backend:
                         return fold_global_scalar_expr(source_expression, top, structs, ok)
                 return fold_const_expr(expression, structs, ok)
 
-
-
-
         def materialize_mutable_globals(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # MODULE members too. register_const already descends into `module M:` (see
             # codegen_module), but materialization did not — so a `module M: global g: T`
@@ -361,17 +373,17 @@ extend Backend:
                     global_symbol: cstr = sview_to_cstr(global_name, global_name_storage) if owner == "" else qualified_name_cstr(owner, global_name, global_name_storage)
                     global_handle: LLVMValueRef = LLVMAddGlobal(m, global_llvm_type, global_symbol)
                     initializer: mutable LLVMValueRef = LLVMConstNull(global_llvm_type)
-                    aggregate_initialized: mutable bool = false
+                    initializer_materialized: mutable bool = false
                     # Text-shaped globals go through the same constant path as
                     # aggregates. Without this a `global mutable p: cstr = "x"`
                     # fell through to LLVMConstNull and became a null pointer,
                     # which links and runs but hands every reader nothing.
-                    if (global_type.kind == TypeKind.Array or global_type.kind == TypeKind.Struct or global_type.kind == TypeKind.CStr or global_type.kind == TypeKind.SView) and global_value is not Expr.Invalid:
+                    if (global_type.kind == TypeKind.Array or global_type.kind == TypeKind.Struct or global_type.kind == TypeKind.Arena or global_type.kind == TypeKind.CStr or global_type.kind == TypeKind.SView) and global_value is not Expr.Invalid:
                         aggregate_ok: mutable bool = true
                         aggregate_initializer: LLVMValueRef = const_aggregate_value(global_value, global_type, top, structs, m, ctx, aggregate_ok)
                         if aggregate_ok:
                             initializer <- aggregate_initializer
-                            aggregate_initialized <- true
+                            initializer_materialized <- true
                     # Float literals are not folded by fold_global_scalar_expr. Preserve
                     # their source spelling here, including the Unary wrapper used for a
                     # leading sign, or a valid negative global silently retains LLVM's
@@ -381,7 +393,7 @@ extend Backend:
                             Expr.FloatLit(global_float_text, _):
                                 global_float_storage: mutable darray[u8] = []
                                 initializer <- LLVMConstRealOfString(global_llvm_type, sview_to_cstr(global_float_text, global_float_storage))
-                                aggregate_initialized <- true
+                                initializer_materialized <- true
                             Expr.Unary(global_float_operator, global_float_operand, _):
                                 match global_float_operand:
                                     Expr.FloatLit(global_signed_float_text, _):
@@ -389,7 +401,7 @@ extend Backend:
                                             global_signed_float_storage: mutable darray[u8] = []
                                             global_signed_float_storage.push(45) if global_float_operator == TokenKind.Minus
                                             initializer <- LLVMConstRealOfString(global_llvm_type, sview_to_cstr(global_signed_float_text, global_signed_float_storage))
-                                            aggregate_initialized <- true
+                                            initializer_materialized <- true
                                     _:
                                         pass
                             _:
@@ -398,26 +410,28 @@ extend Backend:
                         # float constants use the same fold as `const` declarations. The
                         # integer global folder cannot represent these values, and leaving
                         # its zero default in place silently changes accepted programs.
-                        if not aggregate_initialized and global_value is not Expr.Invalid:
+                        if not initializer_materialized and global_value is not Expr.Invalid:
                             global_float_fold_ok: mutable bool = true
                             global_float_folded: f64 = fold_const_float_expr(global_value, structs, global_float_fold_ok)
                             if global_float_fold_ok:
                                 initializer <- LLVMConstReal(global_llvm_type, global_float_folded)
-                                aggregate_initialized <- true
-                    if global_value is not Expr.Invalid and not aggregate_initialized and not (global_value is Expr.FloatLit(_, _)):
+                                initializer_materialized <- true
+                    if global_value is not Expr.Invalid and not initializer_materialized:
                         initializer_ok: mutable bool = true
                         initializer_value: i64 = fold_global_scalar_expr(global_value, top, structs, initializer_ok)
                         if initializer_ok and (is_integer_type(global_type) or global_type.kind == TypeKind.Bool):
                             initializer <- LLVMConstInt(global_llvm_type, initializer_value.u64(), 0)
-                        elif not initializer_ok and global_value is Expr.Unary(global_init_operator, _, _) and global_init_operator == TokenKind.Ampersand and structs.unsupported_global_initializer == "":
-                            # Stage0 rejects non-constant forms such as `global p: T& = &x`
-                            # during global LLVM emission. Leaving LLVM's default null here
-                            # used to compile successfully and silently change the program.
-                            structs.unsupported_global_initializer <- global_name
-                            declined_name: mutable darray[u8] = []
-                            _ = dbg_push_sview(declined_name, "global initializer ")
-                            _ = dbg_push_sview(declined_name, global_name)
-                            record_declined_function(sview(&declined_name[0], 0, declined_name.count.i64()), m, ctx)
+                            initializer_materialized <- true
+                    # Do not turn a nontrivial initializer that this backend cannot lower
+                    # into a valid LLVM constant into the type's all-zero representation.
+                    # Stage0 rejects such initializers; the old address-of-only guard left
+                    # optional payloads, calls, and other unsupported forms silently absent.
+                    if global_value is not Expr.Invalid and not initializer_materialized and not is_zeroed_literal(global_value) and not is_null_literal(global_value) and structs.unsupported_global_initializer == "":
+                        structs.unsupported_global_initializer <- global_name
+                        declined_name: mutable darray[u8] = []
+                        _ = dbg_push_sview(declined_name, "global initializer ")
+                        _ = dbg_push_sview(declined_name, global_name)
+                        record_declined_function(sview(&declined_name[0], 0, declined_name.count.i64()), m, ctx)
                     LLVMSetInitializer(global_handle, initializer)
                     global_alignment: u32 = struct_alignment(global_type, structs)
                     LLVMSetAlignment(global_handle, global_alignment) if global_alignment != 0
