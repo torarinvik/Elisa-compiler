@@ -14,6 +14,10 @@ ulimit -c 0 || true
 
 BAD="$ROOT/test/repro/sview_region_use_after_destroy.elisa"
 GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
+MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
+JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
+JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
+ARENA_VIEW_BAD="$ROOT/test/repro/manual_arena_free_use_after_region.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
 for optimization in 0 2; do
@@ -41,6 +45,59 @@ for optimization in 0 2; do
         cat "$generic_log" >&2
         exit 1
     }
+    [[ ! -e "$generic_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected generic wrapper at O$optimization" >&2; exit 1; }
+
+    multi_generic_output="$WORK/multiple-generic-O$optimization"
+    multi_generic_log="$multi_generic_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$multi_generic_output.ll" "$MULTI_GENERIC_BAD" >"$multi_generic_log" 2>&1; then
+        echo "destroyed view lifetime smoke: Stage1 accepted the first of two stale generic region dependencies at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "first"' "$multi_generic_log" || {
+        echo "destroyed view lifetime smoke: multiple generic dependencies lost the destroyed first region at O$optimization" >&2
+        cat "$multi_generic_log" >&2
+        exit 1
+    }
+    [[ ! -e "$multi_generic_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected multi-region wrapper at O$optimization" >&2; exit 1; }
+
+    json_output="$WORK/json-handle-O$optimization"
+    json_log="$json_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$json_output.ll" "$JSON_HANDLE_BAD" >"$json_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted JSON handle access after its backing arena was freed at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "arena"' "$json_log" || {
+        echo "destroyed view lifetime smoke: JSON handle rejection lost its arena dependency at O$optimization" >&2
+        cat "$json_log" >&2
+        exit 1
+    }
+    [[ ! -e "$json_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected stale JSON handle at O$optimization" >&2; exit 1; }
+
+    json_view_output="$WORK/json-view-after-arena-free-O$optimization"
+    json_view_log="$json_view_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$json_view_output.ll" "$JSON_VIEW_BAD" >"$json_view_log" 2>&1; then
+        echo "destroyed view lifetime smoke: Stage1 accepted a copied JSON string view after its arena was freed at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "arena"' "$json_view_log" || {
+        echo "destroyed view lifetime smoke: JSON string view rejection lost its freed arena dependency at O$optimization" >&2
+        cat "$json_view_log" >&2
+        exit 1
+    }
+    [[ ! -e "$json_view_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected post-free JSON view at O$optimization" >&2; exit 1; }
+
+    arena_view_output="$WORK/view-after-arena-free-O$optimization"
+    arena_view_log="$arena_view_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_view_output.ll" "$ARENA_VIEW_BAD" >"$arena_view_log" 2>&1; then
+        echo "destroyed view lifetime smoke: Stage1 accepted an explicitly arena-bound view after arena_free at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "arena"' "$arena_view_log" || {
+        echo "destroyed view lifetime smoke: explicit arena-bound view rejection lost the arena dependency at O$optimization" >&2
+        cat "$arena_view_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_view_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected arena-bound view at O$optimization" >&2; exit 1; }
 
     good_output="$WORK/good-O$optimization"
     good_log="$good_output.log"
