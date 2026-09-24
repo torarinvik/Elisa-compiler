@@ -42,7 +42,7 @@ cases = {
     ),
     "alias grant does not escape into closure": (
         "# strict\n"
-        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def get_ref[@r](x: mutable i64& @r) -> mutable i64& @r:\n    return x\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
         "def bad(x: mutable i64&) -> void:\n"
         "    can Unsafe.Alias:\n"
@@ -55,7 +55,7 @@ cases = {
     ),
     "closure may grant its own alias operation": (
         "# strict\n"
-        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def get_ref[@r](x: mutable i64& @r) -> mutable i64& @r:\n    return x\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
         "def bad(x: mutable i64&) -> void:\n"
         "    callback: fn() -> void = fn():\n"
@@ -68,46 +68,46 @@ cases = {
     "alias in match arm": (
         "# strict\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
-        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "def bad(x: mutable i64&, flag: i64) -> void:\n"
         "    match flag:\n"
-        "        true:\n            pair(x, x)\n"
-        "        false:\n            pass\n"
+        "        0:\n            pair(x, x)\n"
+        "        1:\n            pass\n"
         "def main() -> i64:\n    return 0\n",
         "mutable alias requires",
     ),
     "alias in match arm under exact grant": (
         "# strict\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
-        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "def bad(x: mutable i64&, flag: i64) -> void:\n"
         "    match flag:\n"
-        "        true:\n"
+        "        0:\n"
         "            can Unsafe.Alias:\n                pair(x, x)\n"
-        "        false:\n            pass\n"
+        "        1:\n            pass\n"
         "def main() -> i64:\n    return 0\n",
         None,
     ),
     "local alias in match arm": (
         "# strict\n"
-        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def get_ref[@r](x: mutable i64& @r) -> mutable i64& @r:\n    return x\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
-        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "def bad(x: mutable i64&, flag: i64) -> void:\n"
         "    alias: mutable i64& = get_ref(x)\n"
         "    match flag:\n"
-        "        true:\n            pair(alias, x)\n"
-        "        false:\n            pass\n"
+        "        0:\n            pair(alias, x)\n"
+        "        1:\n            pass\n"
         "def main() -> i64:\n    return 0\n",
         "mutable alias requires",
     ),
     "local alias in match arm under exact grant": (
         "# strict\n"
-        "def get_ref(x: mutable i64&) -> mutable i64&:\n    return x\n"
+        "def get_ref[@r](x: mutable i64& @r) -> mutable i64& @r:\n    return x\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
-        "def bad(x: mutable i64&, flag: bool) -> void:\n"
+        "def bad(x: mutable i64&, flag: i64) -> void:\n"
         "    alias: mutable i64& = get_ref(x)\n"
         "    match flag:\n"
-        "        true:\n"
+        "        0:\n"
         "            can Unsafe.Alias:\n                pair(alias, x)\n"
-        "        false:\n            pass\n"
+        "        1:\n            pass\n"
         "def main() -> i64:\n    return 0\n",
         None,
     ),
@@ -301,7 +301,7 @@ cases = {
     ),
     "pointer arithmetic unrelated grant": (
         "# strict\n"
-        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
         "    can Unsafe.PointerCast:\n        pointer + offset\n"
         "    return 0\n"
         "def main() -> i64:\n    return 0\n",
@@ -309,15 +309,88 @@ cases = {
     ),
     "pointer arithmetic exact grant": (
         "# strict\n"
-        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
         "    can Unsafe.PointerArithmetic:\n        pointer + offset\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic through local ref alias": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    alias: u8& = pointer\n"
+        "    return alias + offset\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through local ref alias exact grant": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    alias: u8& = pointer\n"
+        "    can Unsafe.PointerArithmetic:\n        return alias + offset\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic with compound integer offset": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    return pointer + (offset + 1)\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic with compound integer offset under unrelated grant": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
+        "    can Memory.Allocate:\n        pointer + (offset + 1)\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic with compound integer offset exact grant": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n        pointer + (offset + 1)\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic with local integer alias": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    cursor: usize = offset\n"
+        "    return pointer + (cursor + 1)\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through reference-returning call": (
+        "# strict\n"
+        "def identity(pointer: u8&) -> u8&:\n    return pointer\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    return identity(pointer) + (offset + 1)\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic with integer-returning call": (
+        "# strict\n"
+        "def step(offset: usize) -> usize:\n    return offset + 1\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    return pointer + step(offset)\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic ignores a shadowed reference name": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
+        "    if true:\n"
+        "        pointer: usize = 0\n"
+        "        pointer + offset\n"
         "    return 0\n"
         "def main() -> i64:\n    return 0\n",
         None,
     ),
     "pointer arithmetic in match arm": (
         "# strict\n"
-        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
         "    match offset:\n"
         "        0:\n            pointer + offset\n"
         "        _:\n            pass\n"
@@ -327,7 +400,7 @@ cases = {
     ),
     "pointer arithmetic in match arm under unrelated grant": (
         "# strict\n"
-        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
         "    can Memory.Allocate:\n"
         "        match offset:\n"
         "            0:\n                pointer + offset\n"
@@ -338,7 +411,7 @@ cases = {
     ),
     "pointer arithmetic in match arm under exact grant": (
         "# strict\n"
-        "def bad(pointer: i64&, offset: i64) -> i64:\n"
+        "def bad(pointer: u8&, offset: usize) -> i64:\n"
         "    match offset:\n"
         "        0:\n"
         "            can Unsafe.PointerArithmetic:\n"
@@ -365,21 +438,23 @@ cases = {
     "extern in match arm": (
         "# strict\n# unsafe\n"
         "extern foreign() -> i64\n"
-        "def bad(flag: bool) -> i64:\n"
+        "def bad(flag: i64) -> i64:\n"
         "    match flag:\n"
-        "        true:\n            return foreign()\n"
-        "        false:\n            return 0\n"
+        "        0:\n            return foreign()\n"
+        "        1:\n            return 0\n"
+        "        _:\n            return 0\n"
         "def main() -> i64:\n    return 0\n",
         'call to "foreign" requires can[Unsafe]',
     ),
     "extern in match arm under exact grant": (
         "# strict\n# unsafe\n"
         "extern foreign() -> i64\n"
-        "def bad(flag: bool) -> i64:\n"
+        "def bad(flag: i64) -> i64:\n"
         "    match flag:\n"
-        "        true:\n"
+        "        0:\n"
         "            can Unsafe.RawExtern:\n                return foreign()\n"
-        "        false:\n            return 0\n"
+        "        1:\n            return 0\n"
+        "        _:\n            return 0\n"
         "def main() -> i64:\n    return 0\n",
         None,
     ),
@@ -505,6 +580,8 @@ with tempfile.TemporaryDirectory(prefix="elisa-unsafe-grants-") as temp:
         output = result.stdout
         if result.returncode not in (0, 1):
             raise SystemExit(f"{name}: compiler failed ({result.returncode})\n{output}")
+        if expected is None and result.returncode != 0:
+            raise SystemExit(f"{name}: expected an accepted program, compiler exited {result.returncode}\n{output}")
         if expected is None and any(
             message in output
             for message in (

@@ -1,25 +1,74 @@
-# Pointer arithmetic needs its own lexical capability in strict mode. The general strict walk
-# diagnoses it when no grant is present; this pass diagnoses it under an unrelated grant. The
-# function's effect row remains the caller's obligation and never authorizes the function body.
+# Pointer arithmetic has one lexical authority check in strict mode. This walk diagnoses
+# both missing grants and unrelated grants, using a conservative scoped type environment so
+# local reference aliases and compound integer offsets cannot bypass the capability boundary.
 extend Semantic:
     private:
-        def pag_is_ref_param(name: sview, ref_params: darray[sview]&) -> bool:
+        # Latest binding wins, including kind 0, which deliberately masks an outer typed
+        # binding when a nested scope shadows it with a value of unknown type.
+        def pag_binding_kind(name: sview, binding_names: darray[sview]&, binding_kinds: darray[u8]&) -> u8:
             can Abort.Panic:
-                return name != "" and (any p in ref_params where p == name)
+                while binding_index > 0 |binding_index: usize = binding_names.count|:
+                    binding_index <- binding_index - 1
+                    binding_kinds[binding_index] return if binding_names[binding_index] == name
+                return 0
 
-        def pag_is_int_operand(expression: Ast::Expr, int_params: darray[sview]&) -> bool:
-            can Abort.Panic:
-                return match expression:
-                    Expr.IntLit(value, _): true
-                    Expr.Ident(name, line): any p in int_params where p == name
-                    _: false
-
-        def pag_pointer_arith_binary(left: Ast::Expr, operator: TokenKind, right: Ast::Expr, ref_params: darray[sview]&, int_params: darray[sview]&) -> bool:
+        def pag_bind(name: sview, kind: u8, binding_names: mutable darray[sview]&, binding_kinds: mutable darray[u8]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                left_ref: bool = pag_is_ref_param(ident_name_of(left), ref_params)
-                right_ref: bool = pag_is_ref_param(ident_name_of(right), ref_params)
+                binding_names.push(name)
+                binding_kinds.push(kind)
+
+        def pag_is_ref_operand(expression: Ast::Expr, binding_names: darray[sview]&, binding_kinds: darray[u8]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return pag_binding_kind(name, binding_names, binding_kinds) == 1
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return pag_is_ref_operand(inner, binding_names, binding_kinds, table)
+                    Expr.Unary(operator, operand, _):
+                        # Address-of creates a reference. Numeric unary operators do not
+                        # preserve pointer identity, so do not classify them as a ref.
+                        return operator == TokenKind.Ampersand
+                    Expr.Call(callee, _, _, _):
+                        match callee:
+                            Expr.Ident(name, _):
+                                return interned_kind(function_return_type_id(table, name), table) == SemTypeKind.Ref
+                            _:
+                                return false
+                    _:
+                        return false
+
+        def pag_is_integer_operator(operator: TokenKind) -> bool:
+            can Abort.Panic:
+                return operator in {TokenKind.Plus, TokenKind.Minus, TokenKind.Star, TokenKind.Slash, TokenKind.Percent, TokenKind.LShift, TokenKind.RShift, TokenKind.Pipe, TokenKind.Caret, TokenKind.Ampersand}
+
+        def pag_is_int_operand(expression: Ast::Expr, binding_names: darray[sview]&, binding_kinds: darray[u8]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _):
+                        return true
+                    Expr.Ident(name, _):
+                        return pag_binding_kind(name, binding_names, binding_kinds) == 2 or interned_kind(global_type_id_of(name, table), table) == SemTypeKind.Int
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return pag_is_int_operand(inner, binding_names, binding_kinds, table)
+                    Expr.Unary(operator, operand, _):
+                        return (operator == TokenKind.Plus or operator == TokenKind.Minus or operator == TokenKind.Tilde) and pag_is_int_operand(operand, binding_names, binding_kinds, table)
+                    Expr.Binary(left, operator, right, _):
+                        return pag_is_integer_operator(operator) and pag_is_int_operand(left, binding_names, binding_kinds, table) and pag_is_int_operand(right, binding_names, binding_kinds, table)
+                    Expr.Call(callee, _, _, _):
+                        match callee:
+                            Expr.Ident(name, _):
+                                return interned_kind(function_return_type_id(table, name), table) == SemTypeKind.Int
+                            _:
+                                return false
+                    _:
+                        return false
+
+        def pag_pointer_arith_binary(left: Ast::Expr, operator: TokenKind, right: Ast::Expr, binding_names: darray[sview]&, binding_kinds: darray[u8]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                left_ref: bool = pag_is_ref_operand(left, binding_names, binding_kinds, table)
+                right_ref: bool = pag_is_ref_operand(right, binding_names, binding_kinds, table)
                 is_add: bool = operator == TokenKind.Plus
-                return ((is_add or operator == TokenKind.Minus) and left_ref and pag_is_int_operand(right, int_params)) or (is_add and right_ref and pag_is_int_operand(left, int_params))
+                return ((is_add or operator == TokenKind.Minus) and left_ref and pag_is_int_operand(right, binding_names, binding_kinds, table)) or (is_add and right_ref and pag_is_int_operand(left, binding_names, binding_kinds, table))
 
         # Whether a grant block's clause covers pointer arithmetic: a blanket `Unsafe`, or an
         # explicit `Unsafe.PointerArithmetic` / `PointerArithmetic`.
@@ -27,119 +76,156 @@ extend Semantic:
             can Abort.Panic:
                 return any entry in clause where entry == "Unsafe" or entry == "Unsafe.PointerArithmetic" or entry == "PointerArithmetic"
 
-        def pag_expr(expression: Ast::Expr, ref_params: darray[sview]&, int_params: darray[sview]&, in_grant: bool, covers: bool, line: u32, table: lmut SymbolTable) -> void:
+        def pag_expr(expression: Ast::Expr, binding_names: darray[sview]&, binding_kinds: darray[u8]&, in_grant: bool, covers: bool, line: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Binary(left, operator, right, binary_line):
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PointerArithmeticUngranted, name: "", line: line, expected: "", actual: ""}) if in_grant and not covers and pag_pointer_arith_binary(left, operator, right, ref_params, int_params)
-                        table <- pag_expr(left, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(right, ref_params, int_params, in_grant, covers, line, table)
+                        pointer_arithmetic: bool = pag_pointer_arith_binary(left, operator, right, binding_names, binding_kinds, table)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PointerArithmeticUngranted, name: "", line: line, expected: "", actual: ""}) if pointer_arithmetic and (not in_grant or not covers)
+                        table <- pag_expr(left, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(right, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Unary(operator, operand, unary_line) | Expr.Move(operand, unary_line) | Expr.RegionNew(operand, _, unary_line) | Expr.Paren(operand, unary_line):
-                        table <- pag_expr(operand, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(operand, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        table <- pag_expr(callee, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(callee, binding_names, binding_kinds, in_grant, covers, line, table)
                         for argument in arguments |table| -> table:
-                            table <- pag_expr(argument, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(argument, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_line):
                         for argument in arguments |table| -> table:
-                            table <- pag_expr(argument, ref_params, int_params, in_grant, covers, line, table)
-                        for candidate in candidates |table| -> table:
-                            table <- pag_expr(candidate.effect_type, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(argument, binding_names, binding_kinds, in_grant, covers, line, table)
+                        for candidate in candidates |table|:
+                            table <- pag_expr(candidate.effect_type, binding_names, binding_kinds, in_grant, covers, line, table)
                             for capture in candidate.captures |table| -> table:
-                                table <- pag_expr(capture, ref_params, int_params, in_grant, covers, line, table)
+                                table <- pag_expr(capture, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Field(object, field, field_line):
-                        table <- pag_expr(object, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(object, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Scope(base, name, scope_line):
                         if base is not Expr.Ident(_, _):
-                            table <- pag_expr(base, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(base, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Index(object, index, index_line):
-                        table <- pag_expr(object, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(index, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(object, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(index, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Slice(object, low, high, slice_line):
-                        table <- pag_expr(object, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(low, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(high, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(object, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(low, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(high, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.IndexN(object, arguments, index_line):
-                        table <- pag_expr(object, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(object, binding_names, binding_kinds, in_grant, covers, line, table)
                         for argument in arguments |table| -> table:
-                            table <- pag_expr(argument, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(argument, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Array(elements, array_line) | Expr.Tuple(elements, array_line) | Expr.SetLit(elements, array_line):
                         for element in elements |table| -> table:
-                            table <- pag_expr(element, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(element, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.DictLit(entries, dict_line):
                         for entry in entries |table| -> table:
-                            table <- pag_expr(entry.key, ref_params, int_params, in_grant, covers, line, table)
-                            table <- pag_expr(entry.value, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(entry.key, binding_names, binding_kinds, in_grant, covers, line, table)
+                            table <- pag_expr(entry.value, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Construct(type_expression, fields, construct_line):
                         for field in fields |table| -> table:
-                            table <- pag_expr(field.value, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(field.value, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.RecordUpdate(base, fields, update_line):
-                        table <- pag_expr(base, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(base, binding_names, binding_kinds, in_grant, covers, line, table)
                         for field in fields |table| -> table:
-                            table <- pag_expr(field.value, ref_params, int_params, in_grant, covers, line, table)
+                            table <- pag_expr(field.value, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.If(condition, then_value, else_value, if_line):
-                        table <- pag_expr(condition, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(then_value, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(else_value, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(condition, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(then_value, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(else_value, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Match(scrutinee, arms, match_line) | Expr.Catch(scrutinee, arms, match_line):
-                        table <- pag_expr(scrutinee, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(scrutinee, binding_names, binding_kinds, in_grant, covers, line, table)
                         for arm in arms |table|:
-                            table <- pag_expr(arm.guard, ref_params, int_params, in_grant, covers, line, table)
-                            table <- pag_walk(arm.body, ref_params, int_params, in_grant, covers, table)
+                            table <- pag_expr(arm.guard, binding_names, binding_kinds, in_grant, covers, line, table)
+                            arm_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
+                            arm_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
+                            arm_pattern_names: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm.pattern, arm_pattern_names)
+                            for pattern_name in arm_pattern_names |arm_names, arm_kinds|:
+                                pag_bind(pattern_name, 0, arm_names, arm_kinds)
+                            table <- pag_walk(arm.body, arm_names, arm_kinds, in_grant, covers, table)
                     Expr.Comprehension(variable, iterable, condition, body, comprehension_line):
-                        table <- pag_expr(iterable, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(condition, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(body, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(iterable, binding_names, binding_kinds, in_grant, covers, line, table)
+                        comp_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
+                        comp_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
+                        pag_bind(variable, 0, comp_names, comp_kinds)
+                        table <- pag_expr(condition, comp_names, comp_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(body, comp_names, comp_kinds, in_grant, covers, line, table)
                     Expr.Refinement(base, predicate, refinement_line):
-                        table <- pag_expr(base, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_expr(predicate, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_expr(base, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_expr(predicate, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.GetElse(guarded, recovery, getelse_line):
-                        table <- pag_expr(guarded, ref_params, int_params, in_grant, covers, line, table)
-                        table <- pag_walk(recovery, ref_params, int_params, in_grant, covers, table)
+                        table <- pag_expr(guarded, binding_names, binding_kinds, in_grant, covers, line, table)
+                        table <- pag_walk(recovery, binding_names, binding_kinds, in_grant, covers, table)
                     Expr.Block(statements, value, captures, block_line):
-                        table <- pag_walk(statements, ref_params, int_params, in_grant, covers, table)
-                        table <- pag_expr(value, ref_params, int_params, in_grant, covers, line, table)
+                        table <- pag_walk(statements, binding_names, binding_kinds, in_grant, covers, table)
+                        table <- pag_expr(value, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Lambda(parameters, body, lambda_line):
-                        table <- pag_walk(body, ref_params, int_params, false, false, table)
+                        lambda_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
+                        lambda_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
+                        for parameter_name in parameters |lambda_names, lambda_kinds|:
+                            pag_bind(parameter_name, 0, lambda_names, lambda_kinds)
+                        table <- pag_walk(body, lambda_names, lambda_kinds, false, false, table)
                     _:
                         pass
 
-        def pag_walk(statements: darray[Ast::Stmt], ref_params: darray[sview]&, int_params: darray[sview]&, in_grant: bool, covers: bool, table: lmut SymbolTable) -> void:
+        def pag_walk(statements: darray[Ast::Stmt], inherited_names: darray[sview]&, inherited_kinds: darray[u8]&, in_grant: bool, covers: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                # Each block gets a private environment. Sequential declarations update this
+                # copy, while branches, loops, grants, and match arms cannot leak bindings.
+                binding_names: mutable darray[sview] = [bound_name for bound_name in inherited_names]
+                binding_kinds: mutable darray[u8] = [bound_kind for bound_kind in inherited_kinds]
+                for statement in statements |table, binding_names, binding_kinds| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- pag_expr(expression, ref_params, int_params, in_grant, covers, line.line, table)
+                            table <- pag_expr(expression, binding_names, binding_kinds, in_grant, covers, line.line, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- pag_expr(value, ref_params, int_params, in_grant, covers, line.line, table)
+                            table <- pag_expr(value, binding_names, binding_kinds, in_grant, covers, line.line, table)
+                            binding_kind: mutable u8 = 0
+                            binding_kind <- 1 if type_marker_present_here(type_expression, TokenKind.Ampersand)
+                            binding_kind <- 2 if binding_kind == 0 and is_integer_type_name(bare_type_name(type_expression))
+                            binding_kind <- 1 if binding_kind == 0 and pag_is_ref_operand(value, binding_names, binding_kinds, table)
+                            binding_kind <- 2 if binding_kind == 0 and pag_is_int_operand(value, binding_names, binding_kinds, table)
+                            pag_bind(name, binding_kind, binding_names, binding_kinds)
                         Stmt.Assign(target, operator, value, line):
-                            table <- pag_expr(target, ref_params, int_params, in_grant, covers, line.line, table)
-                            table <- pag_expr(value, ref_params, int_params, in_grant, covers, line.line, table)
+                            table <- pag_expr(target, binding_names, binding_kinds, in_grant, covers, line.line, table)
+                            table <- pag_expr(value, binding_names, binding_kinds, in_grant, covers, line.line, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- pag_expr(returned, ref_params, int_params, in_grant, covers, line.line, table)
+                                table <- pag_expr(returned, binding_names, binding_kinds, in_grant, covers, line.line, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- pag_expr(condition, ref_params, int_params, in_grant, covers, line.line, table)
-                            table <- pag_walk(then_body, ref_params, int_params, in_grant, covers, table)
-                            table <- pag_walk(else_body, ref_params, int_params, in_grant, covers, table)
+                            table <- pag_expr(condition, binding_names, binding_kinds, in_grant, covers, line.line, table)
+                            table <- pag_walk(then_body, binding_names, binding_kinds, in_grant, covers, table)
+                            table <- pag_walk(else_body, binding_names, binding_kinds, in_grant, covers, table)
                         Stmt.While(condition, body, line):
-                            table <- pag_expr(condition, ref_params, int_params, in_grant, covers, line.line, table)
-                            table <- pag_walk(body, ref_params, int_params, in_grant, covers, table)
+                            table <- pag_expr(condition, binding_names, binding_kinds, in_grant, covers, line.line, table)
+                            table <- pag_walk(body, binding_names, binding_kinds, in_grant, covers, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- pag_expr(iterable, ref_params, int_params, in_grant, covers, line.line, table)
-                            table <- pag_walk(body, ref_params, int_params, in_grant, covers, table)
+                            table <- pag_expr(iterable, binding_names, binding_kinds, in_grant, covers, line.line, table)
+                            loop_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
+                            loop_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
+                            for variable in variables |loop_names, loop_kinds|:
+                                pag_bind(variable, 0, loop_names, loop_kinds)
+                            table <- pag_walk(body, loop_names, loop_kinds, in_grant, covers, table)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- pag_expr(scrutinee, ref_params, int_params, in_grant, covers, line.line, table)
-                            for arm in arms |table, line, ref_params, int_params, in_grant, covers|:
-                                table <- pag_expr(arm.guard, ref_params, int_params, in_grant, covers, line.line, table)
-                                table <- pag_walk(arm.body, ref_params, int_params, in_grant, covers, table)
+                            table <- pag_expr(scrutinee, binding_names, binding_kinds, in_grant, covers, line.line, table)
+                            for arm in arms |table, line, binding_names, binding_kinds, in_grant, covers|:
+                                arm_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
+                                arm_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
+                                arm_pattern_names: mutable darray[sview] = []
+                                collect_pattern_binding_names(arm.pattern, arm_pattern_names)
+                                for pattern_name in arm_pattern_names |arm_names, arm_kinds|:
+                                    pag_bind(pattern_name, 0, arm_names, arm_kinds)
+                                table <- pag_expr(arm.guard, arm_names, arm_kinds, in_grant, covers, line.line, table)
+                                table <- pag_walk(arm.body, arm_names, arm_kinds, in_grant, covers, table)
                         Stmt.Block(kind, clause, binding, body, line):
                             is_grant: bool = kind == "can" or kind == "trusted"
                             grant_here: bool = in_grant or is_grant
                             covers_here: bool = covers or (is_grant and pag_clause_covers(clause))
-                            table <- pag_walk(body, ref_params, int_params, grant_here, covers_here, table)
+                            block_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
+                            block_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
+                            pag_bind(binding, 0, block_names, block_kinds) if binding != ""
+                            table <- pag_walk(body, block_names, block_kinds, grant_here, covers_here, table)
                         Stmt.Contract(kind, expression, line):
-                            table <- pag_expr(expression, ref_params, int_params, in_grant, covers, line.line, table)
+                            table <- pag_expr(expression, binding_names, binding_kinds, in_grant, covers, line.line, table)
                         _:
                             pass
 
@@ -148,14 +234,14 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
-                            ref_params: mutable darray[sview] = []
-                            int_params: mutable darray[sview] = []
-                            for parameter in parameters |ref_params, int_params|:
-                                ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
-                                int_params.push(parameter.name) if is_integer_type_name(bare_type_name(parameter.type_expression))
-                            # Function effects are obligations for callers; the function still
-                            # needs a local grant before performing this operation.
-                            table <- pag_walk(body, ref_params, int_params, false, false, table)
+                            binding_names: mutable darray[sview] = []
+                            binding_kinds: mutable darray[u8] = []
+                            for parameter in parameters |binding_names, binding_kinds|:
+                                parameter_kind: u8 = 1 if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand) else (2 if is_integer_type_name(bare_type_name(parameter.type_expression)) else 0)
+                                pag_bind(parameter.name, parameter_kind, binding_names, binding_kinds)
+                            # Function effects are obligations for callers; they do not authorize
+                            # pointer arithmetic inside the function body.
+                            table <- pag_walk(body, binding_names, binding_kinds, false, false, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_pointer_arith_grant_decls(module_body, table)
                         Decl.Scoped(scoped_body, scoped_line):
