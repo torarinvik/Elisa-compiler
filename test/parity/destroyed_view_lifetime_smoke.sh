@@ -29,6 +29,7 @@ ARENA_ALIAS_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_reset_live.elisa"
 ARENA_ALIAS_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_rebind_reset_leak.elisa"
 ARENA_ALIAS_REBIND_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_rebind_reset_live.elisa"
 ARENA_ALIAS_CONDITIONAL_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_conditional_rebind_reset_leak.elisa"
+ARENA_ALIAS_COPY_CONDITIONAL_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_copy_conditional_rebind_reset_leak.elisa"
 ARENA_ALIAS_CONDITIONAL_REBIND_LIVE="$ROOT/test/parity/fixtures/arena_alias_conditional_rebind_unrelated_live.elisa"
 ARENA_HELPER_RESET_BAD="$ROOT/test/repro/arena_helper_reset_leak.elisa"
 ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elisa"
@@ -287,6 +288,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_alias_conditional_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after conditional Arena& rebind at O$optimization" >&2; exit 1; }
+
+    arena_alias_copy_conditional_output="$WORK/arena-alias-copy-conditional-O$optimization"
+    arena_alias_copy_conditional_log="$arena_alias_copy_conditional_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_alias_copy_conditional_output.ll" "$ARENA_ALIAS_COPY_CONDITIONAL_REBIND_RESET_BAD" >"$arena_alias_copy_conditional_log" 2>&1; then
+        echo "destroyed view lifetime smoke: copying a branch-rebound Arena& dropped a possible stale owner at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "first"' "$arena_alias_copy_conditional_log" || {
+        echo "destroyed view lifetime smoke: copied conditional alias failed to retain the original owner root at O$optimization" >&2
+        cat "$arena_alias_copy_conditional_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_alias_copy_conditional_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale copied alias at O$optimization" >&2; exit 1; }
 
     arena_alias_conditional_live_output="$WORK/arena-alias-conditional-live-O$optimization"
     arena_alias_conditional_live_log="$arena_alias_conditional_live_output.log"
