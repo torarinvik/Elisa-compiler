@@ -12,6 +12,10 @@ DARRAY_ALIAS_BAD="$ROOT/test/parity/fixtures/sview_darray_copy_alias_stale.elisa
 AGGREGATE_BAD="$ROOT/test/repro/sview_aggregate_field_after_growth.elisa"
 AGGREGATE_COPY_BAD="$ROOT/test/repro/sview_aggregate_copy_after_growth.elisa"
 AGGREGATE_GOOD="$ROOT/test/parity/fixtures/sview_aggregate_field_unrelated_growth.elisa"
+CLOSURE_BAD="$ROOT/test/repro/sview_closure_after_growth.elisa"
+CLOSURE_GOOD="$ROOT/test/parity/fixtures/sview_closure_unrelated_growth_live.elisa"
+CLOSURE_PARAM_SHADOW_GOOD="$ROOT/test/parity/fixtures/sview_closure_parameter_shadow_live.elisa"
+CLOSURE_LOCAL_SHADOW_GOOD="$ROOT/test/parity/fixtures/sview_closure_local_shadow_live.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-relocation.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -66,12 +70,29 @@ check_stage1_alias_stale "$CROSS_FIELD_BAD" 'storage dependency facts were inval
 check_stage1_alias_stale "$DARRAY_ALIAS_BAD" 'storage dependency facts were invalidated by darray push of alias' darray-copy-alias
 check_stage1_alias_stale "$AGGREGATE_BAD" 'storage dependency facts were invalidated by darray push of values' aggregate-field-alias
 check_stage1_alias_stale "$AGGREGATE_COPY_BAD" 'storage dependency facts were invalidated by darray push of values' nested-aggregate-copy-alias
+check_stage1_alias_stale "$CLOSURE_BAD" 'storage dependency facts were invalidated by darray push of values' closure-captured-view-alias
 
 for optimization in 0 2; do
     aggregate_good_output="$WORK/aggregate-unrelated-growth-O$optimization.ll"
     aggregate_good_log="$aggregate_good_output.log"
     "$STAGE1" -emit llvm "-O$optimization" -o "$aggregate_good_output" "$AGGREGATE_GOOD" >"$aggregate_good_log" 2>&1 \
         || fail "Stage1 rejected an aggregate-held view when only an unrelated darray grew at O$optimization: $(tail -n 8 "$aggregate_good_log")"
+    for closure_control in "$CLOSURE_GOOD" "$CLOSURE_PARAM_SHADOW_GOOD" "$CLOSURE_LOCAL_SHADOW_GOOD"; do
+        closure_output="$WORK/closure-control-$(basename "$closure_control").O$optimization.ll"
+        closure_log="$closure_output.log"
+        if [[ "$closure_control" == "$CLOSURE_LOCAL_SHADOW_GOOD" ]]; then
+            if ! "$STAGE1" -emit llvm "-O$optimization" -o "$closure_output" "$closure_control" >"$closure_log" 2>&1; then
+                rg -Fq 'backend could not produce a linkable unit' "$closure_log" \
+                    || fail "Stage1 rejected the body-local shadow control before backend lowering at O$optimization: $(tail -n 8 "$closure_log")"
+                rg -Fq 'storage dependency facts were invalidated' "$closure_log" \
+                    && fail "Stage1 confused a body-local view with the outer captured view at O$optimization"
+                [[ ! -e "$closure_output" ]] || fail "Stage1 emitted LLVM after declining the body-local shadow control at O$optimization"
+            fi
+        else
+            "$STAGE1" -emit llvm "-O$optimization" -o "$closure_output" "$closure_control" >"$closure_log" 2>&1 \
+                || fail "Stage1 rejected a closure whose captured storage is live or parameter-shadowed at O$optimization: $(tail -n 8 "$closure_log")"
+        fi
+    done
 done
 
-echo "sview relocation smoke OK: chained/optional, cross-field, copied-container, aggregate-field, and nested aggregate-copy aliases invalidate after backing growth; unrelated growth stays live"
+echo "sview relocation smoke OK: stale closure captures invalidate after backing growth, unrelated growth and parameter shadows stay live, and body-local shadows do not trigger stale-view diagnostics"

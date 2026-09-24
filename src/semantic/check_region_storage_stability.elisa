@@ -210,10 +210,11 @@ extend Semantic:
                 # get their explicit source dependencies from collect_sources above.
                 if storage_view_type_is_darray(type_expression) and sources.count == 0:
                     storage_view_append_value_sources(value, alias_names, alias_sources, alias_is_view, view_fns, sources)
+                captures_storage: bool = value is Expr.Lambda(_, _, _) and sources.count > 0
                 for source in sources |alias_names, alias_sources, alias_is_view, name|:
                     alias_names.push(name)
                     alias_sources.push(source)
-                    alias_is_view.push(return_type_is_view(type_expression) or storage_view_type_is_reference(type_expression) or storage_view_expr_carries_borrow(value, alias_names, alias_is_view))
+                    alias_is_view.push(return_type_is_view(type_expression) or storage_view_type_is_reference(type_expression) or captures_storage or storage_view_expr_carries_borrow(value, alias_names, alias_is_view))
 
         def storage_view_collect_statement(statement: Ast::Stmt, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, view_fns: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -240,6 +241,246 @@ extend Semantic:
                         for arm in arms |alias_names, alias_sources, alias_is_view, view_fns|:
                             for nested in arm.body |alias_names, alias_sources, alias_is_view, view_fns|:
                                 storage_view_collect_statement(nested, alias_names, alias_sources, alias_is_view, view_fns)
+                    _:
+                        pass
+
+        # A lambda's storage dependencies are its lexically resolved free variables,
+        # not every identifier spelling in its body. Declarations are visited in source
+        # order and nested scopes restore their binders so same-named lambda parameters,
+        # locals, loop variables, and pattern bindings cannot be mistaken for outer views.
+        def storage_view_lambda_capture_name(name: sview, bound_names: mutable darray[sview]&, alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == "" or any bound_name in bound_names where bound_name == name
+                had_source: mutable bool = false
+                for alias_index in 0..<alias_names.count |alias_names, alias_sources, name, out, had_source|:
+                    if alias_names[alias_index] == name and alias_index < alias_sources.count:
+                        storage_view_push_source(alias_sources[alias_index], out)
+                        had_source <- true
+                # A closure may capture a container owner directly and build a view only
+                # when invoked. Preserve that owner as a relocation dependency too.
+                storage_view_push_source(name, out) if not had_source
+
+        def storage_view_lambda_capture_unknown_pattern(alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for alias_index in 0..<alias_names.count |alias_names, alias_sources, out|:
+                    storage_view_push_source(alias_names[alias_index], out)
+                    storage_view_push_source(alias_sources[alias_index], out) if alias_index < alias_sources.count
+
+        def storage_view_lambda_bind_pattern_expression(expression: Ast::Expr, bound_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        bound_names.push(name) if name != ""
+                    Expr.Call(callee, arguments, argument_names, line):
+                        storage_view_lambda_bind_pattern_expression(callee, bound_names)
+                        for argument in arguments |bound_names|:
+                            storage_view_lambda_bind_pattern_expression(argument, bound_names)
+                    Expr.Field(object, field, line) | Expr.Scope(object, field, line):
+                        storage_view_lambda_bind_pattern_expression(object, bound_names)
+                    Expr.Paren(inner, line) | Expr.Unary(_, inner, line) | Expr.Move(inner, line):
+                        storage_view_lambda_bind_pattern_expression(inner, bound_names)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line):
+                        for element in elements |bound_names|:
+                            storage_view_lambda_bind_pattern_expression(element, bound_names)
+                    Expr.Binary(left, operator, right, line):
+                        storage_view_lambda_bind_pattern_expression(left, bound_names)
+                        storage_view_lambda_bind_pattern_expression(right, bound_names)
+                    Expr.Construct(type_expression, fields, line):
+                        for field in fields |bound_names|:
+                            storage_view_lambda_bind_pattern_expression(field.value, bound_names)
+                    _:
+                        pass
+
+        def storage_view_lambda_bind_condition(condition: Ast::Expr, bound_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, line):
+                        storage_view_lambda_bind_condition(left, bound_names)
+                        storage_view_lambda_bind_pattern_expression(right, bound_names) if operator == TokenKind.Is
+                        storage_view_lambda_bind_condition(right, bound_names) if operator != TokenKind.Is
+                    _:
+                        pass
+
+        def storage_view_lambda_bind_pattern(pattern: Ast::Pattern, bound_names: mutable darray[sview]&, alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.TypeBind(_, name) | Pattern.Rest(name):
+                        bound_names.push(name) if name != ""
+                    Pattern.Pin(name):
+                        storage_view_lambda_capture_name(name, bound_names, alias_names, alias_sources, out)
+                    Pattern.As(name, inner):
+                        bound_names.push(name) if name != ""
+                        for nested in inner |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_bind_pattern(nested, bound_names, alias_names, alias_sources, out)
+                    Pattern.Variant(_, fields) | Pattern.Struct(_, fields) | Pattern.Field(_, fields) | Pattern.Tuple(fields) | Pattern.Or(fields):
+                        for nested in fields |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_bind_pattern(nested, bound_names, alias_names, alias_sources, out)
+                    Pattern.Other(_):
+                        # Unknown pattern syntax could bind or pin a name not represented
+                        # structurally. Fail closed by retaining every known storage root.
+                        storage_view_lambda_capture_unknown_pattern(alias_names, alias_sources, out)
+                    _:
+                        pass
+
+        def storage_view_lambda_statements(statements: darray[Ast::Stmt], bound_names: mutable darray[sview]&, alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |bound_names, alias_names, alias_sources, out|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            storage_view_lambda_expression(expression, bound_names, alias_names, alias_sources, out)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            storage_view_lambda_expression(type_expression, bound_names, alias_names, alias_sources, out)
+                            storage_view_lambda_expression(value, bound_names, alias_names, alias_sources, out)
+                            bound_names.push(name) if name != ""
+                        Stmt.Assign(target, operator, value, line):
+                            if operator == TokenKind.Assign:
+                                storage_view_lambda_expression(value, bound_names, alias_names, alias_sources, out)
+                                assigned_name: sview = ident_name_of(target)
+                                if assigned_name != "":
+                                    bound_names.push(assigned_name)
+                                else:
+                                    storage_view_lambda_expression(target, bound_names, alias_names, alias_sources, out)
+                            else:
+                                storage_view_lambda_expression(target, bound_names, alias_names, alias_sources, out)
+                                storage_view_lambda_expression(value, bound_names, alias_names, alias_sources, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            mark: usize = bound_names.count
+                            bound_names.push(binding) if binding != ""
+                            storage_view_lambda_statements(body, bound_names, alias_names, alias_sources, out)
+                            bound_names <- bound_names.truncate(mark) if bound_names.count > mark
+                        Stmt.If(condition, then_body, else_body, line):
+                            storage_view_lambda_expression(condition, bound_names, alias_names, alias_sources, out)
+                            then_mark: usize = bound_names.count
+                            storage_view_lambda_bind_condition(condition, bound_names)
+                            storage_view_lambda_statements(then_body, bound_names, alias_names, alias_sources, out)
+                            bound_names <- bound_names.truncate(then_mark) if bound_names.count > then_mark
+                            else_mark: usize = bound_names.count
+                            storage_view_lambda_statements(else_body, bound_names, alias_names, alias_sources, out)
+                            bound_names <- bound_names.truncate(else_mark) if bound_names.count > else_mark
+                        Stmt.While(condition, body, line):
+                            storage_view_lambda_expression(condition, bound_names, alias_names, alias_sources, out)
+                            loop_mark: usize = bound_names.count
+                            storage_view_lambda_bind_condition(condition, bound_names)
+                            storage_view_lambda_statements(body, bound_names, alias_names, alias_sources, out)
+                            bound_names <- bound_names.truncate(loop_mark) if bound_names.count > loop_mark
+                        Stmt.For(bind, variables, iterable, body, line):
+                            storage_view_lambda_expression(iterable, bound_names, alias_names, alias_sources, out)
+                            loop_mark: usize = bound_names.count
+                            for variable in variables |bound_names|:
+                                bound_names.push(variable) if variable != ""
+                            storage_view_lambda_statements(body, bound_names, alias_names, alias_sources, out)
+                            bound_names <- bound_names.truncate(loop_mark) if bound_names.count > loop_mark
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                storage_view_lambda_expression(returned, bound_names, alias_names, alias_sources, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            storage_view_lambda_expression(scrutinee, bound_names, alias_names, alias_sources, out)
+                            for arm in arms |bound_names, alias_names, alias_sources, out|:
+                                arm_mark: usize = bound_names.count
+                                storage_view_lambda_bind_pattern(arm.pattern, bound_names, alias_names, alias_sources, out)
+                                storage_view_lambda_expression(arm.guard, bound_names, alias_names, alias_sources, out)
+                                storage_view_lambda_statements(arm.body, bound_names, alias_names, alias_sources, out)
+                                bound_names <- bound_names.truncate(arm_mark) if bound_names.count > arm_mark
+                        Stmt.Contract(kind, expression, line):
+                            storage_view_lambda_expression(expression, bound_names, alias_names, alias_sources, out)
+                        _:
+                            pass
+
+        def storage_view_lambda_expression(expression: Ast::Expr, bound_names: mutable darray[sview]&, alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        storage_view_lambda_capture_name(name, bound_names, alias_names, alias_sources, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        match callee:
+                            Expr.Ident(callable_name, callable_line):
+                                # A bare declaration call does not capture a value. A local
+                                # callable can carry storage only when it has an alias row.
+                                if any alias_name in alias_names where alias_name == callable_name:
+                                    storage_view_lambda_capture_name(callable_name, bound_names, alias_names, alias_sources, out)
+                            _:
+                                storage_view_lambda_expression(callee, bound_names, alias_names, alias_sources, out)
+                        for argument in arguments |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_expression(argument, bound_names, alias_names, alias_sources, out)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        storage_view_lambda_expression(effect_type, bound_names, alias_names, alias_sources, out)
+                        for argument in arguments |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_expression(argument, bound_names, alias_names, alias_sources, out)
+                    Expr.Field(object, field, line) | Expr.Scope(object, field, line):
+                        storage_view_lambda_expression(object, bound_names, alias_names, alias_sources, out)
+                    Expr.Index(object, index, line):
+                        storage_view_lambda_expression(object, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(index, bound_names, alias_names, alias_sources, out)
+                    Expr.Slice(object, low, high, line):
+                        storage_view_lambda_expression(object, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(low, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(high, bound_names, alias_names, alias_sources, out)
+                    Expr.IndexN(object, arguments, line):
+                        storage_view_lambda_expression(object, bound_names, alias_names, alias_sources, out)
+                        for argument in arguments |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_expression(argument, bound_names, alias_names, alias_sources, out)
+                    Expr.Binary(left, operator, right, line):
+                        storage_view_lambda_expression(left, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(right, bound_names, alias_names, alias_sources, out)
+                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line) | Expr.RegionNew(operand, _, line):
+                        storage_view_lambda_expression(operand, bound_names, alias_names, alias_sources, out)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_expression(element, bound_names, alias_names, alias_sources, out)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_expression(entry.key, bound_names, alias_names, alias_sources, out)
+                            storage_view_lambda_expression(entry.value, bound_names, alias_names, alias_sources, out)
+                    Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
+                        storage_view_lambda_expression(type_expression, bound_names, alias_names, alias_sources, out)
+                        for field in fields |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_expression(field.value, bound_names, alias_names, alias_sources, out)
+                    Expr.If(condition, then_value, else_value, line):
+                        storage_view_lambda_expression(condition, bound_names, alias_names, alias_sources, out)
+                        then_mark: usize = bound_names.count
+                        storage_view_lambda_bind_condition(condition, bound_names)
+                        storage_view_lambda_expression(then_value, bound_names, alias_names, alias_sources, out)
+                        bound_names <- bound_names.truncate(then_mark) if bound_names.count > then_mark
+                        else_mark: usize = bound_names.count
+                        storage_view_lambda_expression(else_value, bound_names, alias_names, alias_sources, out)
+                        bound_names <- bound_names.truncate(else_mark) if bound_names.count > else_mark
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        storage_view_lambda_expression(scrutinee, bound_names, alias_names, alias_sources, out)
+                        for arm in arms |bound_names, alias_names, alias_sources, out|:
+                            arm_mark: usize = bound_names.count
+                            storage_view_lambda_bind_pattern(arm.pattern, bound_names, alias_names, alias_sources, out)
+                            storage_view_lambda_expression(arm.guard, bound_names, alias_names, alias_sources, out)
+                            storage_view_lambda_statements(arm.body, bound_names, alias_names, alias_sources, out)
+                            bound_names <- bound_names.truncate(arm_mark) if bound_names.count > arm_mark
+                    Expr.Comprehension(variable, iterable, condition, body, line):
+                        storage_view_lambda_expression(iterable, bound_names, alias_names, alias_sources, out)
+                        comp_mark: usize = bound_names.count
+                        bound_names.push(variable) if variable != ""
+                        storage_view_lambda_expression(condition, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(body, bound_names, alias_names, alias_sources, out)
+                        bound_names <- bound_names.truncate(comp_mark) if bound_names.count > comp_mark
+                    Expr.Refinement(base, predicate, line):
+                        storage_view_lambda_expression(base, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(predicate, bound_names, alias_names, alias_sources, out)
+                    Expr.GetElse(guarded, recovery, line):
+                        storage_view_lambda_expression(guarded, bound_names, alias_names, alias_sources, out)
+                        recovery_mark: usize = bound_names.count
+                        storage_view_lambda_statements(recovery, bound_names, alias_names, alias_sources, out)
+                        bound_names <- bound_names.truncate(recovery_mark) if bound_names.count > recovery_mark
+                    Expr.Lambda(parameters, body, line):
+                        lambda_mark: usize = bound_names.count
+                        for parameter in parameters |bound_names|:
+                            bound_names.push(parameter) if parameter != ""
+                        storage_view_lambda_statements(body, bound_names, alias_names, alias_sources, out)
+                        bound_names <- bound_names.truncate(lambda_mark) if bound_names.count > lambda_mark
+                    Expr.Block(statements, value, captures, line):
+                        block_mark: usize = bound_names.count
+                        for capture in captures |bound_names, alias_names, alias_sources, out|:
+                            storage_view_lambda_capture_name(capture, bound_names, alias_names, alias_sources, out)
+                            bound_names.push(capture) if capture != ""
+                        storage_view_lambda_statements(statements, bound_names, alias_names, alias_sources, out)
+                        storage_view_lambda_expression(value, bound_names, alias_names, alias_sources, out)
+                        bound_names <- bound_names.truncate(block_mark) if bound_names.count > block_mark
                     _:
                         pass
 
@@ -309,6 +550,11 @@ extend Semantic:
                         storage_view_collect_sources(guarded, alias_names, alias_sources, alias_is_view, view_fns, out)
                         for statement in recovery |alias_names, alias_sources, alias_is_view, view_fns|:
                             storage_view_collect_statement(statement, alias_names, alias_sources, alias_is_view, view_fns)
+                    Expr.Lambda(parameters, body, line):
+                        bound_names: mutable darray[sview] = []
+                        for parameter in parameters |bound_names|:
+                            bound_names.push(parameter) if parameter != ""
+                        storage_view_lambda_statements(body, bound_names, alias_names, alias_sources, out)
                     _:
                         pass
 
