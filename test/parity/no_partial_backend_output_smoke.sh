@@ -30,6 +30,24 @@ for mode in llvm obj bc exe; do
     [[ ! -e "$output" && ! -e "$output.o" ]] || { echo "partial backend output smoke: wrote output despite declining a body for $mode" >&2; exit 1; }
 done
 
+archive="$WORK/declined-c-archive.a"
+archive_log="$archive.log"
+if "$STAGE1" -emit c-archive -o "$archive" "$DECLINED" >"$archive_log" 2>&1; then
+    echo "partial backend output smoke: stage1 accepted an incomplete C archive" >&2
+    cat "$archive_log" >&2
+    exit 1
+fi
+rg -Fq 'error: backend declined 1 function body(ies); the archive does not define: create' "$archive_log" || {
+    echo "partial backend output smoke: missing declined-body diagnostic for c-archive" >&2
+    cat "$archive_log" >&2
+    exit 1
+}
+rg -Fq 'no archive was written' "$archive_log" || { echo "partial backend output smoke: missing no-archive guarantee" >&2; cat "$archive_log" >&2; exit 1; }
+[[ ! -e "$archive" && ! -e "$WORK/declined-c-archive.h" && ! -e "$WORK/declined-c-archive.unsafe.txt" && ! -e "$WORK/declined-c-archive.elisa-abi.json" ]] || {
+    echo "partial backend output smoke: wrote C archive or sidecars despite a declined body" >&2
+    exit 1
+}
+
 CONTROL="$ROOT/test/parity/fixtures/backend_decline_control.elisa"
 for optimization in 0 2; do
     executable="$WORK/control-O$optimization"
@@ -46,4 +64,4 @@ for optimization in 0 2; do
     [[ "$run_status" -eq 0 ]] || { echo "partial backend output smoke: valid control failed at runtime (status $run_status)" >&2; cat "$log" >&2; exit 1; }
 done
 
-echo "partial backend output smoke OK: partial LLVM/object/bitcode/executable emission is rejected before writing; valid controls pass at O0/O2"
+echo "partial backend output smoke OK: partial LLVM/object/bitcode/executable/C-archive emission is rejected before writing; valid controls pass at O0/O2"
