@@ -429,6 +429,108 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "pointer arithmetic through reference-valued for binder": (
+        "# strict\n"
+        "def bad(values: darray[u8&], offset: usize) -> i64:\n"
+        "    for pointer in values:\n        pointer + offset\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through reference-valued for binder exact grant": (
+        "# strict\n"
+        "def bad(values: darray[u8&], offset: usize) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        for pointer in values:\n            pointer + offset\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic through tuple-destructured for binders": (
+        "# strict\n"
+        "def bad(values: darray[(pointer: u8&, step: usize)]) -> i64:\n"
+        "    for pointer, step in values:\n        pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through tuple-destructured for binders exact grant": (
+        "# strict\n"
+        "def bad(values: darray[(pointer: u8&, step: usize)]) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        for pointer, step in values:\n            pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic through dict-destructured for binders": (
+        "# strict\n"
+        "def bad(values: dict[u8&, usize]) -> i64:\n"
+        "    for pointer, step in values:\n        pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through dict-destructured for binders exact grant": (
+        "# strict\n"
+        "def bad(values: dict[u8&, usize]) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        for pointer, step in values:\n            pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic with range for index": (
+        "# strict\n"
+        "def bad(pointer: u8&, count: usize) -> i64:\n"
+        "    for index in 0..<count:\n        pointer + index\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic with range for index exact grant": (
+        "# strict\n"
+        "def bad(pointer: u8&, count: usize) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        for index in 0..<count:\n            pointer + index\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic through reference-valued comprehension binder": (
+        "# strict\n"
+        "def bad(values: darray[u8&], offset: usize) -> i64:\n"
+        "    result: darray[u8&] = [pointer + offset for pointer in values]\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through reference-valued comprehension binder exact grant": (
+        "# strict\n"
+        "def bad(values: darray[u8&], offset: usize) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        result: darray[u8&] = [pointer + offset for pointer in values]\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic with range comprehension index": (
+        "# strict\n"
+        "def bad(pointer: u8&, count: usize) -> i64:\n"
+        "    result: darray[u8&] = [pointer + index for index in 0..<count]\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic with range comprehension index exact grant": (
+        "# strict\n"
+        "def bad(pointer: u8&, count: usize) -> i64:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        result: darray[u8&] = [pointer + index for index in 0..<count]\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "pointer arithmetic ignores a shadowed reference name": (
         "# strict\n"
         "def bad(pointer: u8&, offset: usize) -> i64:\n"
