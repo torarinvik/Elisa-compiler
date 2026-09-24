@@ -31,23 +31,189 @@ extend Semantic:
                     pass
             return ""
 
+        def storage_view_place_root(expression: Ast::Expr) -> sview:
+            return match expression:
+                Expr.Ident(name, line): name
+                Expr.Field(object, field, line): storage_view_place_root(object)
+                Expr.Index(object, index, line): storage_view_place_root(object)
+                Expr.IndexN(object, indices, line): storage_view_place_root(object)
+                Expr.Slice(object, start, end, line): storage_view_place_root(object)
+                Expr.Paren(inner, line) | Expr.Move(inner, line): storage_view_place_root(inner)
+                Expr.Unary(TokenKind.Ampersand, operand, line): storage_view_place_root(operand)
+                _: ""
+
+        def storage_view_push_source(source: sview, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out.push(source) if source != "" and not any existing in out where existing == source
+
+        # A view-producing call inherits dependencies from its source arguments. An argument
+        # already recorded as a view alias contributes its original backing containers.
+        def storage_view_sources_from_argument(expression: Ast::Expr, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, view_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        found_alias: mutable bool = false
+                        for alias_index in 0..<alias_names.count |found_alias, alias_names, alias_sources, name, out|:
+                            if alias_names[alias_index] == name and alias_index < alias_sources.count:
+                                storage_view_push_source(alias_sources[alias_index], out)
+                                found_alias <- true
+                        storage_view_push_source(name, out) if not found_alias
+                    Expr.Unary(operator, operand, line):
+                        borrowed_place: sview = interior_reference_place(operand) if operator == TokenKind.Ampersand else ""
+                        storage_view_push_source(borrowed_place, out) if borrowed_place != ""
+                        storage_view_collect_sources(operand, alias_names, alias_sources, view_fns, out) if borrowed_place == ""
+                    Expr.Field(object, field, line) | Expr.Index(object, index, line) | Expr.IndexN(object, indices, line) | Expr.Slice(object, start, end, line):
+                        root: sview = storage_view_place_root(expression)
+                        storage_view_push_source(root, out) if root != ""
+                        storage_view_collect_sources(object, alias_names, alias_sources, view_fns, out)
+                    Expr.Paren(inner, line) | Expr.Move(inner, line):
+                        storage_view_sources_from_argument(inner, alias_names, alias_sources, view_fns, out)
+                    _:
+                        storage_view_collect_sources(expression, alias_names, alias_sources, view_fns, out)
+
+        def storage_view_record_alias(name: sview, value: Ast::Expr, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, view_fns: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == ""
+                sources: mutable darray[sview] = []
+                storage_view_collect_sources(value, alias_names, alias_sources, view_fns, sources)
+                for source in sources |alias_names, alias_sources, name|:
+                    alias_names.push(name)
+                    alias_sources.push(source)
+
+        def storage_view_record_typed_alias(name: sview, type_expression: Ast::Expr, value: Ast::Expr, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, view_fns: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == ""
+                sources: mutable darray[sview] = []
+                storage_view_collect_sources(value, alias_names, alias_sources, view_fns, sources)
+                # Explicitly typed borrowed views retain their producer arguments even when
+                # the helper is supplied by an include and absent from file.top_decls.
+                if return_type_is_view(type_expression):
+                    match value:
+                        Expr.Call(callee, arguments, argument_names, line):
+                            for argument in arguments |alias_names, alias_sources, view_fns, sources|:
+                                source: sview = storage_view_place_root(argument)
+                                storage_view_push_source(source, sources) if source != ""
+                                storage_view_sources_from_argument(argument, alias_names, alias_sources, view_fns, sources)
+                        _:
+                            pass
+                for source in sources |alias_names, alias_sources, name|:
+                    alias_names.push(name)
+                    alias_sources.push(source)
+
+        def storage_view_collect_statement(statement: Ast::Stmt, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, view_fns: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.VarDecl(name, type_expression, value, line):
+                        storage_view_record_typed_alias(name, type_expression, value, alias_names, alias_sources, view_fns)
+                    Stmt.Assign(target, operator, value, line):
+                        storage_view_record_alias(storage_view_place_root(target), value, alias_names, alias_sources, view_fns) if operator == TokenKind.Assign
+                    Stmt.If(condition, then_body, else_body, line):
+                        for nested in then_body |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(nested, alias_names, alias_sources, view_fns)
+                        for nested in else_body |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(nested, alias_names, alias_sources, view_fns)
+                    Stmt.While(condition, body, line):
+                        for nested in body |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(nested, alias_names, alias_sources, view_fns)
+                    Stmt.For(bind, variables, iterable, body, line):
+                        for nested in body |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(nested, alias_names, alias_sources, view_fns)
+                    Stmt.Block(kind, clause, binding, body, line):
+                        for nested in body |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(nested, alias_names, alias_sources, view_fns)
+                    Stmt.Match(scrutinee, arms, line):
+                        for arm in arms |alias_names, alias_sources, view_fns|:
+                            for nested in arm.body |alias_names, alias_sources, view_fns|:
+                                storage_view_collect_statement(nested, alias_names, alias_sources, view_fns)
+                    _:
+                        pass
+
+        def storage_view_collect_sources(expression: Ast::Expr, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, view_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        for alias_index in 0..<alias_names.count |alias_names, alias_sources, name, out|:
+                            storage_view_push_source(alias_sources[alias_index], out) if alias_names[alias_index] == name and alias_index < alias_sources.count
+                    Expr.Paren(inner, line) | Expr.Move(inner, line):
+                        storage_view_collect_sources(inner, alias_names, alias_sources, view_fns, out)
+                    Expr.Unary(operator, operand, line):
+                        borrowed_place: sview = interior_reference_place(operand) if operator == TokenKind.Ampersand else ""
+                        storage_view_push_source(borrowed_place, out) if borrowed_place != ""
+                        storage_view_collect_sources(operand, alias_names, alias_sources, view_fns, out) if borrowed_place == ""
+                    Expr.Call(callee, arguments, argument_names, line):
+                        called: sview = ident_name_of(callee)
+                        # The runtime string helpers are compiler-visible through stdlib
+                        # includes, but may not be present in file.top_decls on every path.
+                        # Keep their borrowed-storage contract explicit as well as collecting
+                        # user-defined view-returning functions below.
+                        returns_view: bool = called == "bytes_view" or called == "bytes_view_range" or called == "bytes_view_range_ref" or any view_fn in view_fns where view_fn == called
+                        if returns_view:
+                            for argument in arguments |alias_names, alias_sources, view_fns, out|:
+                                storage_view_sources_from_argument(argument, alias_names, alias_sources, view_fns, out)
+                        match callee:
+                            Expr.Field(receiver, method, field_line):
+                                is_view_method: bool = method == "view" or method == "as_sview" or method == "as_view" or method == "as_slice" or method == "as_str" or method == "as_cstr" or any view_fn in view_fns where view_fn == method
+                                storage_view_sources_from_argument(receiver, alias_names, alias_sources, view_fns, out) if is_view_method
+                            _:
+                                pass
+                    Expr.Slice(object, start, end, line):
+                        storage_view_sources_from_argument(object, alias_names, alias_sources, view_fns, out)
+                    Expr.Field(object, field, line) | Expr.Index(object, index, line) | Expr.IndexN(object, indices, line):
+                        storage_view_collect_sources(object, alias_names, alias_sources, view_fns, out)
+                    Expr.If(condition, then_value, else_value, line):
+                        storage_view_collect_sources(then_value, alias_names, alias_sources, view_fns, out)
+                        storage_view_collect_sources(else_value, alias_names, alias_sources, view_fns, out)
+                    Expr.Tuple(elements, line) | Expr.Array(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |alias_names, alias_sources, view_fns, out|:
+                            storage_view_collect_sources(element, alias_names, alias_sources, view_fns, out)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |alias_names, alias_sources, view_fns, out|:
+                            storage_view_collect_sources(entry.key, alias_names, alias_sources, view_fns, out)
+                            storage_view_collect_sources(entry.value, alias_names, alias_sources, view_fns, out)
+                    Expr.Construct(type_expression, fields, line):
+                        for field in fields |alias_names, alias_sources, view_fns, out|:
+                            storage_view_collect_sources(field.value, alias_names, alias_sources, view_fns, out)
+                    Expr.RecordUpdate(base, fields, line):
+                        storage_view_collect_sources(base, alias_names, alias_sources, view_fns, out)
+                        for field in fields |alias_names, alias_sources, view_fns, out|:
+                            storage_view_collect_sources(field.value, alias_names, alias_sources, view_fns, out)
+                    Expr.Block(statements, value, captures, line):
+                        for statement in statements |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(statement, alias_names, alias_sources, view_fns)
+                        storage_view_collect_sources(value, alias_names, alias_sources, view_fns, out)
+                    Expr.Match(scrutinee, arms, line):
+                        for arm in arms |alias_names, alias_sources, view_fns, out|:
+                            for statement in arm.body |alias_names, alias_sources, view_fns|:
+                                storage_view_collect_statement(statement, alias_names, alias_sources, view_fns)
+                    Expr.Catch(guarded, arms, line):
+                        storage_view_collect_sources(guarded, alias_names, alias_sources, view_fns, out)
+                        for arm in arms |alias_names, alias_sources, view_fns, out|:
+                            for statement in arm.body |alias_names, alias_sources, view_fns|:
+                                storage_view_collect_statement(statement, alias_names, alias_sources, view_fns)
+                    Expr.GetElse(guarded, recovery, line):
+                        storage_view_collect_sources(guarded, alias_names, alias_sources, view_fns, out)
+                        for statement in recovery |alias_names, alias_sources, view_fns|:
+                            storage_view_collect_statement(statement, alias_names, alias_sources, view_fns)
+                    _:
+                        pass
+
         def growth_call_target(expression: Ast::Expr) -> sview:
             match expression:
                 Expr.Call(callee, arguments, argument_names, line):
                     match callee:
                         Expr.Field(receiver, method, field_line):
-                            match receiver:
-                                Expr.Ident(name, ident_line):
-                                    return name if method in {"push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate"} else ""
-                                _:
-                                    pass
+                            root: sview = storage_view_place_root(receiver)
+                            return root if method in {"push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate"} else ""
+                        Expr.Ident(method, ident_line):
+                            if method in {"darray_push", "darray_extend", "darray_append", "darray_append_many", "darray_insert", "darray_reserve", "darray_resize", "darray_clear", "darray_truncate", "push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate"} and arguments.count > 0:
+                                return storage_view_place_root(arguments[0])
                         _:
                             pass
                 _:
                     pass
             return ""
 
-        def invalidated_alias_in_expression(expression: Ast::Expr, invalidated: darray[sview]&) -> sview:
+        def invalidated_alias_in_expression(expression: Ast::Expr, invalidated: darray[sview]&) -> sview can[Memory.Allocate, Abort.Panic]:
             match expression:
                 Expr.Ident(name, line):
                     return name if fresh_wrapper_name_exists(invalidated, name) else ""
@@ -61,8 +227,29 @@ extend Semantic:
                     return invalidated_alias_in_expression(operand, invalidated)
                 Expr.Paren(inner, line):
                     return invalidated_alias_in_expression(inner, invalidated)
+                Expr.Call(callee, arguments, argument_names, line):
+                    from_callee: sview = invalidated_alias_in_expression(callee, invalidated)
+                    return from_callee if from_callee != ""
+                    return invalidated_alias_in_arguments(arguments, invalidated)
+                Expr.Binary(left, operator, right, line):
+                    found_left: sview = invalidated_alias_in_expression(left, invalidated)
+                    return found_left if found_left != ""
+                    return invalidated_alias_in_expression(right, invalidated)
+                Expr.If(condition, then_value, else_value, line):
+                    found_then: sview = invalidated_alias_in_expression(then_value, invalidated)
+                    return found_then if found_then != ""
+                    return invalidated_alias_in_expression(else_value, invalidated)
+                Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                    return invalidated_alias_in_arguments(elements, invalidated)
                 _:
                     return ""
+
+        def invalidated_alias_in_arguments(arguments: darray[Ast::Expr]&, invalidated: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable sview = ""
+                for argument in arguments |found, invalidated|:
+                    found <- invalidated_alias_in_expression(argument, invalidated) if found == ""
+                return found
 
         def diagnose_invalidated_alias(expression: Ast::Expr, invalidated: darray[sview]&, invalidated_by: darray[sview]&, line: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -88,51 +275,55 @@ extend Semantic:
                     invalidated_by.push(target) if source == target and invalidated_by.count < invalidated.count
                     index <- index + 1
 
-        def walk_region_storage_stability(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def walk_region_storage_stability(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview]&, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |stable_regions, alias_names, alias_sources, invalidated, table|:
                     match statement:
-                        Stmt.Block("region", clause, binding, body, line):
-                            has_stable_backing: bool = destroyed_region_contains(clause, "reserve_commit") or destroyed_region_contains(clause, "fixed")
+                        Stmt.Block(kind, clause, binding, body, line):
+                            has_stable_backing: bool = kind == "region" and (destroyed_region_contains(clause, "reserve_commit") or destroyed_region_contains(clause, "fixed"))
                             stable_region: mutable sview = binding
                             # Block-form regions keep the name in clause[0] and leave the
                             # generic binding slot empty; statement-form regions do the reverse.
                             stable_region <- clause[0] if stable_region == "" and has_stable_backing and clause.count > 0
                             stable_regions.push(stable_region) if stable_region != "" and has_stable_backing and not destroyed_region_contains(stable_regions, stable_region)
-                            table <- walk_region_storage_stability(body, annotations, function_line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
-                            source: sview = interior_reference_source(value)
-                            alias_names.push(name) if source != ""
-                            alias_sources.push(source) if source != ""
+                            storage_view_record_typed_alias(name, type_expression, value, alias_names, alias_sources, view_fns)
                         Stmt.Expr(expression, line):
                             table <- diagnose_invalidated_alias(expression, invalidated, invalidated_by, line.line, table)
                             invalidate_growth_aliases(growth_call_target(expression), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, invalidated, invalidated_by)
+                            match expression:
+                                Expr.Block(statements, value, captures, block_line):
+                                    table <- walk_region_storage_stability(statements, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                                _:
+                                    pass
                         Stmt.Assign(target, operator, value, line):
-                            if operator == TokenKind.PlusEq:
-                                invalidate_growth_aliases(growth_call_target(collection_append_call(target, value, line)), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, invalidated, invalidated_by)
+                            invalidate_growth_aliases(growth_call_target(target), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, invalidated, invalidated_by)
+                            invalidate_growth_aliases(growth_call_target(value), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, invalidated, invalidated_by)
+                            invalidate_growth_aliases(growth_call_target(collection_append_call(target, value, line)), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, invalidated, invalidated_by) if operator == TokenKind.PlusEq
                             table <- diagnose_invalidated_alias(target, invalidated, invalidated_by, line.line, table)
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
                         Stmt.Return(value, line):
                             table <- diagnose_invalidated_alias(returned, invalidated, invalidated_by, line.line, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
                             table <- diagnose_invalidated_alias(condition, invalidated, invalidated_by, line.line, table)
-                            table <- walk_region_storage_stability(then_body, annotations, function_line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
-                            table <- walk_region_storage_stability(else_body, annotations, function_line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(then_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(else_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
                         Stmt.While(condition, while_body, line):
                             table <- diagnose_invalidated_alias(condition, invalidated, invalidated_by, line.line, table)
-                            table <- walk_region_storage_stability(while_body, annotations, function_line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(while_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
                             table <- diagnose_invalidated_alias(iterable, invalidated, invalidated_by, line.line, table)
-                            table <- walk_region_storage_stability(for_body, annotations, function_line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(for_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
                         Stmt.Match(scrutinee, arms, line):
                             table <- diagnose_invalidated_alias(scrutinee, invalidated, invalidated_by, line.line, table)
                             for arm in arms |table, stable_regions, alias_names, alias_sources, invalidated, invalidated_by| -> table:
-                                table <- walk_region_storage_stability(arm.body, annotations, function_line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                                table <- walk_region_storage_stability(arm.body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
                         _:
                             pass
 
-        def check_region_storage_stability_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+        def check_region_storage_stability_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
@@ -142,15 +333,17 @@ extend Semantic:
                             alias_sources: mutable darray[sview] = []
                             invalidated: mutable darray[sview] = []
                             invalidated_by: mutable darray[sview] = []
-                            table <- walk_region_storage_stability(body, annotations, line.line, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(body, annotations, line.line, view_fns, stable_regions, alias_names, alias_sources, invalidated, invalidated_by, table)
                         Decl.Module(name, body, line):
-                            table <- check_region_storage_stability_declarations(body, annotations, table)
+                            table <- check_region_storage_stability_declarations(body, annotations, view_fns, table)
                         Decl.Scoped(body, line):
-                            table <- check_region_storage_stability_declarations(body, annotations, table)
+                            table <- check_region_storage_stability_declarations(body, annotations, view_fns, table)
                         _:
                             pass
 
     public:
         def check_region_storage_stability(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- check_region_storage_stability_declarations(file.top_decls, file.local_region_annotations, table)
+                view_fns: mutable darray[sview] = []
+                collect_view_returning_fns(file.top_decls, view_fns)
+                table <- check_region_storage_stability_declarations(file.top_decls, file.local_region_annotations, view_fns, table)
