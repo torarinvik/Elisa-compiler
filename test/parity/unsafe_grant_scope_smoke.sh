@@ -641,6 +641,56 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "pointer arithmetic through nested enum payload pattern": (
+        "# strict\n"
+        "enum InnerPointerOffset:\n    Offset(pointer: u8&, step: usize)\n    Empty\n"
+        "enum OuterPointerOffset:\n    Wrapped(inner: InnerPointerOffset)\n    Empty\n"
+        "def bad(value: OuterPointerOffset) -> i64:\n"
+        "    match value:\n"
+        "        OuterPointerOffset.Wrapped(InnerPointerOffset.Offset(pointer, step)):\n            pointer + step\n"
+        "        OuterPointerOffset.Wrapped(_):\n            pass\n"
+        "        OuterPointerOffset.Empty:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through nested enum payload pattern exact grant": (
+        "# strict\n"
+        "enum InnerPointerOffset:\n    Offset(pointer: u8&, step: usize)\n    Empty\n"
+        "enum OuterPointerOffset:\n    Wrapped(inner: InnerPointerOffset)\n    Empty\n"
+        "def bad(value: OuterPointerOffset) -> i64:\n"
+        "    match value:\n"
+        "        OuterPointerOffset.Wrapped(InnerPointerOffset.Offset(pointer, step)):\n"
+        "            can Unsafe.PointerArithmetic:\n                pointer + step\n"
+        "        OuterPointerOffset.Wrapped(_):\n            pass\n"
+        "        OuterPointerOffset.Empty:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic through tuple enum payload pattern": (
+        "# strict\n"
+        "enum TuplePointerOffset:\n    Offset(pair: (u8&, usize))\n    Empty\n"
+        "def bad(value: TuplePointerOffset) -> i64:\n"
+        "    match value:\n"
+        "        TuplePointerOffset.Offset([pointer, step]):\n            pointer + step\n"
+        "        TuplePointerOffset.Empty:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through tuple enum payload pattern exact grant": (
+        "# strict\n"
+        "enum TuplePointerOffset:\n    Offset(pair: (u8&, usize))\n    Empty\n"
+        "def bad(value: TuplePointerOffset) -> i64:\n"
+        "    match value:\n"
+        "        TuplePointerOffset.Offset([pointer, step]):\n"
+        "            can Unsafe.PointerArithmetic:\n                pointer + step\n"
+        "        TuplePointerOffset.Empty:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "extern unrelated grant": (
         "# strict\n# unsafe\n"
         "extern foreign() -> i64\n"
