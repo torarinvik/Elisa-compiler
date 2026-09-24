@@ -35,6 +35,21 @@ ARENA_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_callback_reset_leak.elisa"
 ARENA_FORWARDED_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_forwarded_callback_reset_leak.elisa"
 ARENA_CAPTURED_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_captured_callback_reset_leak.elisa"
 ARENA_STATIC_EFFECT_RESET_BAD="$ROOT/test/repro/arena_static_effect_capture_reset_leak.elisa"
+ARENA_CLOSURE_ALIAS_RESET_BAD="$ROOT/test/repro/arena_closure_alias_after_free.elisa"
+ARENA_CLOSURE_ASSIGNMENT_RESET_BAD="$ROOT/test/repro/arena_closure_assignment_after_free.elisa"
+ARENA_RETURNED_CLOSURE_RESET_BAD="$ROOT/test/repro/arena_returned_closure_after_free.elisa"
+ARENA_CLOSURE_INTERNAL_RESET_BAD="$ROOT/test/repro/arena_closure_internal_reset_then_read.elisa"
+INLINE_CLOSURE_STALE_BAD="$ROOT/test/repro/sview_region_inline_callback_after_destroy.elisa"
+ARENA_TUPLE_CLOSURE_UNSUPPORTED="$ROOT/test/repro/arena_tuple_closure_after_free.elisa"
+ARENA_CAPTURED_CLOSURE_LIVE="$ROOT/test/parity/fixtures/arena_captured_closure_live.elisa"
+CONDITION_IF_BAD="$ROOT/test/repro/sview_region_condition_after_destroy.elisa"
+CONDITION_WHILE_BAD="$ROOT/test/repro/sview_region_while_condition_after_destroy.elisa"
+CONDITION_FOR_BAD="$ROOT/test/repro/sview_region_for_iterable_after_destroy.elisa"
+CONDITION_MATCH_BAD="$ROOT/test/repro/sview_region_match_scrutinee_after_destroy.elisa"
+VALUE_BLOCK_BAD="$ROOT/test/repro/sview_region_value_block_after_destroy.elisa"
+VALUE_MATCH_BAD="$ROOT/test/repro/sview_region_match_value_after_destroy.elisa"
+VALUE_BLOCK_READ_BAD="$ROOT/test/repro/sview_region_value_block_read_after_destroy.elisa"
+VALUE_MATCH_READ_BAD="$ROOT/test/repro/sview_region_match_read_after_destroy.elisa"
 ARENA_BLOCK_RESET_BAD="$ROOT/test/repro/arena_block_expression_reset_leak.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
@@ -354,6 +369,141 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_static_effect_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a static-effect captured-arena reset at O$optimization" >&2; exit 1; }
+
+    for closure_case in alias assignment returned; do
+        case "$closure_case" in
+            alias) closure_source="$ARENA_CLOSURE_ALIAS_RESET_BAD"; closure_region="alloc" ;;
+            assignment) closure_source="$ARENA_CLOSURE_ASSIGNMENT_RESET_BAD"; closure_region="alloc" ;;
+            returned) closure_source="$ARENA_RETURNED_CLOSURE_RESET_BAD"; closure_region="arena" ;;
+        esac
+        closure_output="$WORK/closure-$closure_case-O$optimization"
+        closure_log="$closure_output.log"
+        if "$STAGE1" -emit llvm "-O$optimization" -o "$closure_output.ll" "$closure_source" >"$closure_log" 2>&1; then
+            echo "destroyed view lifetime smoke: accepted a closure with an arena-invalidated capture ($closure_case) at O$optimization" >&2
+            exit 1
+        fi
+        rg -Fq "region dependency facts were invalidated by destroy of region \"$closure_region\"" "$closure_log" || {
+            echo "destroyed view lifetime smoke: closure capture rejection lost its arena dependency ($closure_case) at O$optimization" >&2
+            cat "$closure_log" >&2
+            exit 1
+        }
+        [[ ! -e "$closure_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting an arena-invalidated closure capture ($closure_case) at O$optimization" >&2; exit 1; }
+    done
+
+    closure_internal_output="$WORK/closure-internal-reset-O$optimization"
+    closure_internal_log="$closure_internal_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$closure_internal_output.ll" "$ARENA_CLOSURE_INTERNAL_RESET_BAD" >"$closure_internal_log" 2>&1; then
+        echo "destroyed view lifetime smoke: emitted LLVM for a closure that resets its captured arena before reading its captured view at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$closure_internal_log" || {
+        echo "destroyed view lifetime smoke: closure-internal reset rejection lost its captured arena dependency at O$optimization" >&2
+        cat "$closure_internal_log" >&2
+        exit 1
+    }
+    [[ ! -e "$closure_internal_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a closure-internal stale read at O$optimization" >&2; exit 1; }
+
+    inline_closure_output="$WORK/inline-closure-stale-O$optimization"
+    inline_closure_log="$inline_closure_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$inline_closure_output.ll" "$INLINE_CLOSURE_STALE_BAD" >"$inline_closure_log" 2>&1; then
+        echo "destroyed view lifetime smoke: emitted LLVM for an inline callback capturing a destroyed view at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "scratch"' "$inline_closure_log" || {
+        echo "destroyed view lifetime smoke: inline callback rejection lost its captured region at O$optimization" >&2
+        cat "$inline_closure_log" >&2
+        exit 1
+    }
+    [[ ! -e "$inline_closure_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting an inline stale callback at O$optimization" >&2; exit 1; }
+
+    captured_closure_live_output="$WORK/captured-closure-live-O$optimization"
+    captured_closure_live_log="$captured_closure_live_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$captured_closure_live_output" "$ARENA_CAPTURED_CLOSURE_LIVE" >"$captured_closure_live_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: rejected a closure called while its captured arena was live, despite freeing only an unrelated arena, at O$optimization" >&2
+        cat "$captured_closure_live_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$captured_closure_live_output" >"$captured_closure_live_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: live captured-closure control returned $run_status at O$optimization, expected 65" >&2
+        cat "$captured_closure_live_log.run" >&2
+        exit 1
+    }
+
+    tuple_closure_output="$WORK/tuple-closure-unsupported-O$optimization"
+    tuple_closure_log="$tuple_closure_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$tuple_closure_output.ll" "$ARENA_TUPLE_CLOSURE_UNSUPPORTED" >"$tuple_closure_log" 2>&1; then
+        echo "destroyed view lifetime smoke: emitted LLVM for a tuple containing a capturing closure after its arena was freed at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'backend could not produce a linkable unit' "$tuple_closure_log" || {
+        echo "destroyed view lifetime smoke: tuple closure was rejected for an unexpected reason at O$optimization" >&2
+        cat "$tuple_closure_log" >&2
+        exit 1
+    }
+    [[ ! -e "$tuple_closure_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for an unsupported tuple closure at O$optimization" >&2; exit 1; }
+
+    for condition_case in if while for match; do
+        case "$condition_case" in
+            if) condition_source="$CONDITION_IF_BAD" ;;
+            while) condition_source="$CONDITION_WHILE_BAD" ;;
+            for) condition_source="$CONDITION_FOR_BAD" ;;
+            match) condition_source="$CONDITION_MATCH_BAD" ;;
+        esac
+        condition_output="$WORK/condition-$condition_case-O$optimization"
+        condition_log="$condition_output.log"
+        if "$STAGE1" -emit llvm "-O$optimization" -o "$condition_output.ll" "$condition_source" >"$condition_log" 2>&1; then
+            echo "destroyed view lifetime smoke: accepted a stale view used only in a $condition_case condition/iterable at O$optimization" >&2
+            exit 1
+        fi
+        rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$condition_log" || {
+            echo "destroyed view lifetime smoke: stale $condition_case expression lost its destroyed-region diagnostic at O$optimization" >&2
+            cat "$condition_log" >&2
+            exit 1
+        }
+        [[ ! -e "$condition_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a stale $condition_case expression at O$optimization" >&2; exit 1; }
+    done
+
+    for value_case in block match; do
+        case "$value_case" in
+            block) value_source="$VALUE_BLOCK_BAD" ;;
+            match) value_source="$VALUE_MATCH_BAD" ;;
+        esac
+        value_output="$WORK/value-$value_case-O$optimization"
+        value_log="$value_output.log"
+        if "$STAGE1" -emit llvm "-O$optimization" -o "$value_output.ll" "$value_source" >"$value_log" 2>&1; then
+            echo "destroyed view lifetime smoke: accepted a view derived through a $value_case value expression after its region was destroyed at O$optimization" >&2
+            exit 1
+        fi
+        rg -Fq 'region dependency facts were invalidated by destroy of region "scratch"' "$value_log" || {
+            echo "destroyed view lifetime smoke: stale $value_case result lost its destroyed-region diagnostic at O$optimization" >&2
+            cat "$value_log" >&2
+            exit 1
+        }
+        [[ ! -e "$value_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a stale $value_case result at O$optimization" >&2; exit 1; }
+    done
+
+    for read_case in block match; do
+        case "$read_case" in
+            block) read_source="$VALUE_BLOCK_READ_BAD" ;;
+            match) read_source="$VALUE_MATCH_READ_BAD" ;;
+        esac
+        read_output="$WORK/value-read-$read_case-O$optimization"
+        read_log="$read_output.log"
+        if "$STAGE1" -emit llvm "-O$optimization" -o "$read_output.ll" "$read_source" >"$read_log" 2>&1; then
+            echo "destroyed view lifetime smoke: accepted a stale read nested in a scalar-valued $read_case expression at O$optimization" >&2
+            exit 1
+        fi
+        rg -Fq 'region dependency facts were invalidated by destroy of region "scratch"' "$read_log" || {
+            echo "destroyed view lifetime smoke: nested $read_case read lost its destroyed-region diagnostic at O$optimization" >&2
+            cat "$read_log" >&2
+            exit 1
+        }
+        [[ ! -e "$read_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a nested stale $read_case read at O$optimization" >&2; exit 1; }
+    done
 
     arena_block_reset_output="$WORK/arena-block-reset-O$optimization"
     arena_block_reset_log="$arena_block_reset_output.log"
