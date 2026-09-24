@@ -7,10 +7,26 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 BAD="$ROOT/test/parity/fixtures/sview_chained_growth_stale.elisa"
 OPTIONAL_BAD="$ROOT/test/parity/fixtures/sview_optional_chained_growth_stale.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_unrelated_growth_live.elisa"
+CROSS_FIELD_BAD="$ROOT/test/parity/fixtures/sview_cross_field_alias_stale.elisa"
+DARRAY_ALIAS_BAD="$ROOT/test/parity/fixtures/sview_darray_copy_alias_stale.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-relocation.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 fail() { echo "sview relocation smoke FAIL: $1" >&2; exit 1; }
+
+check_stage1_alias_stale() {
+    local fixture="$1" expected="$2" label="$3"
+    for optimization in 0 2; do
+        output="$WORK/$label-stage1-O$optimization.ll"
+        log="$output.log"
+        if "$STAGE1" -emit llvm "-O$optimization" -o "$output" "$fixture" >"$log" 2>&1; then
+            fail "Stage1 accepted $label after its shared darray backing was grown at O$optimization"
+        fi
+        rg -Fq "$expected" "$log" || fail "Stage1 rejected $label for an unrelated reason at O$optimization: $(tail -n 8 "$log")"
+        [[ ! -e "$output" ]] || fail "Stage1 emitted LLVM for stale $label at O$optimization"
+    done
+}
+
 [[ -x "$STAGE0" ]] || fail "missing Stage0 compiler: $STAGE0"
 [[ -x "$STAGE1" ]] || fail "missing Stage1 compiler: $STAGE1"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0"
@@ -43,4 +59,7 @@ for stage in stage0 stage1; do
         || fail "$stage rejected a view whose backing was not mutated when an unrelated darray grew: $(tail -n 8 "$good_log")"
 done
 
-echo "sview relocation smoke OK: chained backing growth invalidates present views and unrelated container growth preserves them under both stages"
+check_stage1_alias_stale "$CROSS_FIELD_BAD" 'storage dependency facts were invalidated by darray push of parser' cross-field-alias
+check_stage1_alias_stale "$DARRAY_ALIAS_BAD" 'storage dependency facts were invalidated by darray push of alias' darray-copy-alias
+
+echo "sview relocation smoke OK: chained/optional backing growth, cross-field and copied-container aliases invalidate views; unrelated growth stays live"
