@@ -24,6 +24,8 @@ JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
 ARENA_VIEW_BAD="$ROOT/test/repro/manual_arena_free_use_after_region.elisa"
 ARENA_OWNER_SHADOW_BAD="$ROOT/test/repro/arena_owner_shadow_reset_leak.elisa"
 ARENA_OWNER_SHADOW_GOOD="$ROOT/test/parity/fixtures/arena_owner_shadow_reset_live.elisa"
+ARENA_ALIAS_RESET_BAD="$ROOT/test/repro/arena_alias_reset_leak.elisa"
+ARENA_ALIAS_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_reset_live.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
@@ -185,6 +187,36 @@ for optimization in 0 2; do
     [[ "$run_status" -eq 65 ]] || {
         echo "destroyed view lifetime smoke: live outer view returned $run_status at O$optimization, expected 65" >&2
         cat "$arena_owner_shadow_live_log.run" >&2
+        exit 1
+    }
+
+    arena_alias_reset_output="$WORK/arena-alias-reset-O$optimization"
+    arena_alias_reset_log="$arena_alias_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_alias_reset_output.ll" "$ARENA_ALIAS_RESET_BAD" >"$arena_alias_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted an outer view after resetting its Arena through a copied alias at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_alias_reset_log" || {
+        echo "destroyed view lifetime smoke: Arena& alias reset lost the source owner identity at O$optimization" >&2
+        cat "$arena_alias_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_alias_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after alias reset at O$optimization" >&2; exit 1; }
+
+    arena_alias_reset_live_output="$WORK/arena-alias-reset-live-O$optimization"
+    arena_alias_reset_live_log="$arena_alias_reset_live_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$arena_alias_reset_live_output" "$ARENA_ALIAS_RESET_GOOD" >"$arena_alias_reset_live_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: resetting an independent inner arena through its alias invalidated an outer view at O$optimization" >&2
+        cat "$arena_alias_reset_live_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$arena_alias_reset_live_output" >"$arena_alias_reset_live_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: independent outer view returned $run_status at O$optimization, expected 65" >&2
+        cat "$arena_alias_reset_live_log.run" >&2
         exit 1
     }
 

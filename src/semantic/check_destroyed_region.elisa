@@ -39,6 +39,106 @@ extend Semantic:
                 return found
 
 
+        # Arena handles are copyable references to the same backing arena. Keep a canonical
+        # binder row for simple local aliases so reset/free through any alias invalidates
+        # views tied to the original owner. The root is stored at declaration time, after
+        # resolving the initializer in its lexical scope; it is never recovered from spelling
+        # alone at the later invalidation site.
+        def destroyed_owner_alias_root(binding_id: u32, alias_ids: darray[u32]&, alias_roots: darray[u32]&) -> u32:
+            can Abort.Panic:
+                for alias_index in 0..<alias_ids.count |alias_ids, alias_roots, binding_id|:
+                    if alias_ids[alias_index] == binding_id and alias_index < alias_roots.count:
+                        return alias_roots[alias_index]
+                return binding_id
+
+
+        def destroyed_arena_owner_source_name(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.Ident(name, line): name
+                    Expr.Paren(inner, line) | Expr.Move(inner, line): destroyed_arena_owner_source_name(inner)
+                    Expr.Unary(operator, operand, line):
+                        return destroyed_arena_owner_source_name(operand) if operator == TokenKind.Ampersand
+                        sview("", 0, 0)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        match callee:
+                            Expr.Field(receiver, method, field_line):
+                                if method == "cast":
+                                    return destroyed_arena_owner_source_name(receiver)
+                                return sview("", 0, 0)
+                            _:
+                                sview("", 0, 0)
+                    _:
+                        sview("", 0, 0)
+
+
+        def destroyed_type_is_arena_reference(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        return destroyed_type_is_arena_reference(operand) if operator == TokenKind.Mutable or operator == TokenKind.Lmut
+                        false return if operator != TokenKind.Ampersand
+                        return match operand:
+                            Expr.Ident(name, type_line): name == "Arena"
+                            Expr.Paren(inner, paren_line): destroyed_type_is_arena_reference(inner)
+                            _: false
+                    Expr.Paren(inner, line): destroyed_type_is_arena_reference(inner)
+                    _: false
+
+
+        def destroyed_push_region_id(destroyed: mutable darray[u32]&, region_id: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                destroyed.push(region_id) if not any existing in destroyed where existing == region_id
+
+
+        def destroyed_mark_region_binding(destroyed: mutable darray[u32]&, binding_id: u32, alias_ids: darray[u32]&, alias_roots: darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                root_id: u32 = destroyed_owner_alias_root(binding_id, alias_ids, alias_roots) if binding_id != NO_REGION_BINDING else DESTROYED_REGION_ALL
+                if root_id == NO_REGION_BINDING:
+                    destroyed_push_all(destroyed)
+                    return
+                destroyed_push_region_id(destroyed, root_id)
+                for alias_index in 0..<alias_ids.count |destroyed, alias_ids, alias_roots, root_id|:
+                    if alias_index < alias_roots.count and alias_roots[alias_index] == root_id:
+                        destroyed_push_region_id(destroyed, alias_ids[alias_index])
+
+
+        def destroyed_push_all(destroyed: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                destroyed.push(DESTROYED_REGION_ALL) if not any existing in destroyed where existing == DESTROYED_REGION_ALL
+
+
+        def destroyed_register_arena_owner_alias(name: sview, value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, params: darray[Ast::ParamDecl]&, function_line: u32, line: u32, destroyed: mutable darray[u32]&, alias_ids: mutable darray[u32]&, alias_roots: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                binding_id: u32 = region_binding_id_at(annotations, name, function_line, line)
+                return if binding_id == NO_REGION_BINDING or binding_id.usize() > annotations.count
+                owner_annotation: Ast::LocalRegionAnnotation = annotations[(binding_id - 1).usize()]
+                return if owner_annotation.name != "__region_arena_local" or owner_annotation.line != line
+                source_name: sview = destroyed_arena_owner_source_name(value)
+                root_id: mutable u32 = binding_id if source_name != "" else NO_REGION_BINDING
+                if source_name != "":
+                    target_id: mutable u32 = region_binding_id_at(annotations, source_name, function_line, line)
+                    if target_id == NO_REGION_BINDING:
+                        target_annotation: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, source_name, line)
+                        if target_annotation is target_region and target_region.region != "":
+                            target_id <- region_binding_id_at(annotations, target_region.region, function_line, line)
+                    if target_id != NO_REGION_BINDING:
+                        root_id <- destroyed_owner_alias_root(target_id, alias_ids, alias_roots)
+                    elif any parameter in params where parameter.name == source_name and destroyed_type_is_arena_reference(parameter.type_expression):
+                        # A reference parameter without a region tie may alias any caller
+                        # arena. A later reset through it must conservatively invalidate all.
+                        root_id <- DESTROYED_REGION_ALL
+                alias_ids.push(binding_id)
+                alias_roots.push(root_id)
+                if root_id == NO_REGION_BINDING:
+                    # This is a known Arena& declaration with an initializer shape we cannot
+                    # relate to an owner. If anything has already been invalidated, it may be
+                    # one of those owners; retain that uncertainty rather than guess.
+                    destroyed_push_all(destroyed) if destroyed.count > 0
+                elif root_id != DESTROYED_REGION_ALL and destroyed_region_id_contains(destroyed, root_id):
+                    destroyed_push_region_id(destroyed, binding_id)
+
+
         def region_binding_name(binding_id: u32, annotations: darray[Ast::LocalRegionAnnotation]&) -> sview:
             can Abort.Panic:
                 return annotations[(binding_id - 1).usize()].region if binding_id > 0 and binding_id.usize() <= annotations.count
@@ -252,13 +352,12 @@ extend Semantic:
                     _:
                         return ""
 
-        def destroyed_apply_arena_invalidation(expression: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, use_line: u32, destroyed: mutable darray[u32]&) -> void:
+        def destroyed_apply_arena_invalidation(expression: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, use_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 arena_region: sview = destroyed_arena_invalidation(expression)
                 return if arena_region == ""
                 binding_id: u32 = region_binding_id_at(annotations, arena_region, function_line, use_line)
-                invalidated_region: u32 = binding_id if binding_id != NO_REGION_BINDING else DESTROYED_REGION_ALL
-                destroyed.push(invalidated_region) if not any region in destroyed where region == invalidated_region
+                destroyed_mark_region_binding(destroyed, binding_id, alias_ids, alias_roots)
 
         def collect_lambda_statement_idents(statement: Ast::Stmt, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -329,15 +428,15 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        def walk_destroyed_region_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, view_fns: darray[sview]&, function_line: u32, destroyed: mutable darray[u32]&, borrow_names: mutable darray[sview]&, borrow_regions: mutable darray[u32]&, lambda_dep_names: mutable darray[sview]&, lambda_dep_regions: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+        def walk_destroyed_region_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, view_fns: darray[sview]&, params: darray[Ast::ParamDecl]&, function_line: u32, destroyed: mutable darray[u32]&, borrow_names: mutable darray[sview]&, borrow_regions: mutable darray[u32]&, lambda_dep_names: mutable darray[sview]&, lambda_dep_regions: mutable darray[u32]&, arena_owner_alias_ids: mutable darray[u32]&, arena_owner_alias_roots: mutable darray[u32]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |destroyed, lambda_dep_names, lambda_dep_regions, table|:
+                for statement in statements |destroyed, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table|:
                     match statement:
                         Stmt.Block("destroy", clause, binding, body, line):
                             binding_id: u32 = region_binding_id_at(annotations, clause[0], function_line, line.line) if clause.count > 0 else NO_REGION_BINDING
-                            invalidated_region: u32 = binding_id if binding_id != NO_REGION_BINDING else DESTROYED_REGION_ALL
-                            destroyed.push(invalidated_region) if clause.count > 0 and not any region in destroyed where region == invalidated_region
+                            destroyed_mark_region_binding(destroyed, binding_id, arena_owner_alias_ids, arena_owner_alias_roots) if clause.count > 0
                         Stmt.VarDecl(name, type_expression, value, line):
+                            destroyed_register_arena_owner_alias(name, value, annotations, params, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
                             allocation_region: sview = allocation_region_at(allocation_regions, allocation_lines, line.line)
                             allocation_region_id: u32 = region_binding_id_at(annotations, allocation_region, function_line, line.line) if allocation_region != "" else NO_REGION_BINDING
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DestroyedRegionUse, name: name, pos: Ast::expr_pos(value), line: line.line, expected: "allocate", actual: region_binding_name(allocation_region_id, annotations)}) if allocation_region_id != NO_REGION_BINDING and destroyed_region_id_contains(destroyed, allocation_region_id)
@@ -381,24 +480,24 @@ extend Semantic:
                                 for region in regions:
                                     borrow_names.push(target_name)
                                     borrow_regions.push(region)
-                            destroyed_apply_arena_invalidation(value, annotations, function_line, line.line, destroyed)
+                            destroyed_apply_arena_invalidation(value, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
                         Stmt.Expr(expression, line):
                             table <- diagnose_destroyed_expression(expression, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
-                            destroyed_apply_arena_invalidation(expression, annotations, function_line, line.line, destroyed)
+                            destroyed_apply_arena_invalidation(expression, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
                         Stmt.Return(value, line):
                             table <- diagnose_destroyed_expression(returned, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_destroyed_region_statements(then_body, annotations, allocation_regions, allocation_lines, view_fns, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
-                            table <- walk_destroyed_region_statements(else_body, annotations, allocation_regions, allocation_lines, view_fns, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
+                            table <- walk_destroyed_region_statements(then_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
+                            table <- walk_destroyed_region_statements(else_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
                         Stmt.While(condition, body, line):
-                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
+                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
+                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
+                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |destroyed, table|:
-                                table <- walk_destroyed_region_statements(arm.body, annotations, allocation_regions, allocation_lines, view_fns, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
+                                table <- walk_destroyed_region_statements(arm.body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
                         _:
                             pass
 
@@ -412,6 +511,8 @@ extend Semantic:
                             borrow_regions: mutable darray[u32] = []
                             lambda_dep_names: mutable darray[sview] = []
                             lambda_dep_regions: mutable darray[u32] = []
+                            arena_owner_alias_ids: mutable darray[u32] = []
+                            arena_owner_alias_roots: mutable darray[u32] = []
                             view_fns: mutable darray[sview] = []
                             collect_view_returning_fns(file.top_decls, view_fns)
                             for parameter in params:
@@ -423,7 +524,7 @@ extend Semantic:
                                     for parameter_region in parameter_regions:
                                         borrow_names.push(parameter.name)
                                         borrow_regions.push(parameter_region)
-                            table <- walk_destroyed_region_statements(body, file.local_region_annotations, file.allocation_region_names, file.allocation_region_lines, view_fns, line.line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, table)
+                            table <- walk_destroyed_region_statements(body, file.local_region_annotations, file.allocation_region_names, file.allocation_region_lines, view_fns, params, line.line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table)
                         Decl.Module(name, body, line):
                             table <- check_destroyed_region_declarations(body, file, table)
                         Decl.Scoped(body, line):
