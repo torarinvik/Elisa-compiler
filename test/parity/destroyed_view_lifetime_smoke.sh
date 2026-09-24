@@ -34,6 +34,7 @@ ARENA_OPAQUE_RESET_BAD="$ROOT/test/repro/arena_opaque_reset_leak.elisa"
 ARENA_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_callback_reset_leak.elisa"
 ARENA_FORWARDED_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_forwarded_callback_reset_leak.elisa"
 ARENA_CAPTURED_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_captured_callback_reset_leak.elisa"
+ARENA_STATIC_EFFECT_RESET_BAD="$ROOT/test/repro/arena_static_effect_capture_reset_leak.elisa"
 ARENA_BLOCK_RESET_BAD="$ROOT/test/repro/arena_block_expression_reset_leak.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
@@ -340,6 +341,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_captured_callback_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a captured arena callback at O$optimization" >&2; exit 1; }
+
+    arena_static_effect_reset_output="$WORK/arena-static-effect-reset-O$optimization"
+    arena_static_effect_reset_log="$arena_static_effect_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_static_effect_reset_output.ll" "$ARENA_STATIC_EFFECT_RESET_BAD" >"$arena_static_effect_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a stale view after a static-effect handler reset its captured arena at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_static_effect_reset_log" || {
+        echo "destroyed view lifetime smoke: static-effect handler rejection lost its captured arena dependency at O$optimization" >&2
+        cat "$arena_static_effect_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_static_effect_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a static-effect captured-arena reset at O$optimization" >&2; exit 1; }
 
     arena_block_reset_output="$WORK/arena-block-reset-O$optimization"
     arena_block_reset_log="$arena_block_reset_output.log"

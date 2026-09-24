@@ -86,6 +86,31 @@ extend Semantic:
                     Expr.Paren(inner, line): destroyed_type_is_arena_reference(inner)
                     _: false
 
+
+        def destroyed_is_generated_effect_call(name: sview) -> bool:
+            can Abort.Panic:
+                return true if sview_len(name) >= 10.usize() and name[0:10] == "__effect__"
+                return true if sview_len(name) >= 11.usize() and name[0:11] == "__handler__"
+                return false
+
+
+        # Generic direct calls retain their type application in the callee AST
+        # (`reset[T](...)` is IndexN(Ident("reset"), ...)). Recover only the
+        # statically named direct-call forms used by the summary table. Generated
+        # handler clones may be qualified Scope nodes, so admit those private names
+        # as well; ordinary qualified methods remain outside this summary namespace.
+        def destroyed_direct_call_name(callee: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match callee:
+                    Expr.Ident(name, line): return name
+                    Expr.Index(base, _, line) | Expr.IndexN(base, _, line) | Expr.Paren(base, line) | Expr.Move(base, line): return destroyed_direct_call_name(base)
+                    Expr.Scope(_, name, line):
+                        return name if destroyed_is_generated_effect_call(name)
+                        return ""
+                    _:
+                        return ""
+
+
         def destroyed_push_region_id(destroyed: mutable darray[u32]&, region_id: u32) -> void:
             can Memory.Allocate, Abort.Panic:
                 destroyed.push(region_id) if not any existing in destroyed where existing == region_id
@@ -342,7 +367,7 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
-                        operation: sview = ident_name_of(callee)
+                        operation: sview = destroyed_direct_call_name(callee)
                         invalidates_all: bool = operation == "arena_free" or operation == "arena_reset" or operation == "arena_rewind"
                         if invalidates_all and arguments.count > 0:
                             return destroyed_use_root_name(arguments[0])
@@ -534,7 +559,11 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
-                        operation: sview = ident_name_of(callee)
+                        operation: sview = destroyed_direct_call_name(callee)
+                        # Generic handler specialization lowers abstract operations to
+                        # generated direct calls. Their capture parameters are not present
+                        # in the source call's ordinary argument list.
+                        out.push(NO_ARENA_SUMMARY_PARAM) if destroyed_is_generated_effect_call(operation) and not any existing in out where existing == NO_ARENA_SUMMARY_PARAM
                         if operation == "arena_free" or operation == "arena_reset" or operation == "arena_rewind":
                             if arguments.count > 0:
                                 sources: mutable darray[u32] = []
@@ -570,10 +599,28 @@ extend Semantic:
                             out.push(NO_ARENA_SUMMARY_PARAM) if not any existing in out where existing == NO_ARENA_SUMMARY_PARAM
                             for parameter_index in 0..<params.count |out, params|:
                                 out.push(parameter_index.u32()) if destroyed_type_is_arena_reference(params[parameter_index].type_expression) and not any existing in out where existing == parameter_index.u32()
+                        is_arena_primitive: bool = operation == "arena_free" or operation == "arena_reset" or operation == "arena_rewind"
+                        is_known_local: bool = any function_name in local_function_names where function_name == operation
+                        is_known_external: bool = any external_name in opaque_function_names where external_name == operation
+                        # Handler rewrites and compiler-generated adapters may call a
+                        # non-declaration target while forwarding a captured Arena&. Carry
+                        # that explicit owner through this summary just as call-site
+                        # invalidation does; otherwise the hidden callee breaks the effect
+                        # chain between the specialized clone and its caller.
+                        if not is_arena_primitive and not is_known_local and not is_known_external:
+                            for argument in arguments |params, alias_names, alias_params, out|:
+                                sources: mutable darray[u32] = []
+                                destroyed_summary_source_parameters(destroyed_arena_owner_source_name(argument), params, alias_names, alias_params, sources)
+                                for parameter_index in sources |out|:
+                                    out.push(parameter_index) if not any existing in out where existing == parameter_index
                         destroyed_summary_collect_expression(callee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
                         for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
                             destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
                     Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        # Candidate handler bodies are not yet represented in the local
+                        # function-summary table. They may mutate an arena captured by the
+                        # installed handler even when the operation has no Arena& arguments.
+                        out.push(NO_ARENA_SUMMARY_PARAM) if not any existing in out where existing == NO_ARENA_SUMMARY_PARAM
                         for argument in arguments |out, params, alias_names, alias_params|:
                             sources: mutable darray[u32] = []
                             destroyed_summary_source_parameters(destroyed_arena_owner_source_name(argument), params, alias_names, alias_params, sources)
@@ -715,7 +762,11 @@ extend Semantic:
                         if arena_region != "":
                             binding_id: u32 = region_binding_id_at(annotations, arena_region, function_line, use_line)
                             destroyed_mark_region_binding(destroyed, binding_id, alias_ids, alias_roots)
-                        operation: sview = ident_name_of(callee)
+                        operation: sview = destroyed_direct_call_name(callee)
+                        # Static handler clones use private generated call targets. The
+                        # current AST side tables do not attach candidate capture effects
+                        # to those edges, so fail closed across helper boundaries.
+                        destroyed_push_all(destroyed) if destroyed_is_generated_effect_call(operation)
                         is_local_callable_call: bool = match callee:
                             Expr.Ident(name, _): any local_reference in local_reference_names where local_reference == name
                             _: false
@@ -748,6 +799,11 @@ extend Semantic:
                         for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
                             destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        # The selected handler can reset storage through an installation
+                        # capture, which is invisible among the operation's explicit args.
+                        # Until candidate effect summaries are part of the semantic facts,
+                        # fail closed for all tracked arena dependencies.
+                        destroyed_push_all(destroyed)
                         destroyed_apply_arena_invalidation(effect_type, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
                             destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
