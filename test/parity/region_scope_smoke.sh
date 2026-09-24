@@ -32,6 +32,26 @@ clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
 out=$(printf 'def f() -> void:\n    value: i32&? @missing = null\n' | "$RPT")
 grep -q 'unknown region qualifier "missing"' <<< "$out" || fail "unknown local region qualifier was not flagged: $out"
 
+# Arena& locals and `region NAME:` binders introduce names only within their lexical blocks. The
+# regression uses a later function, a sibling block, and a sibling after a closed region. Stage0
+# rejects the first two but currently accepts the last nested-block case; Stage1 must reject all
+# three under lexical-scope semantics. A live same-block Arena& control remains accepted.
+ARENA_OWNER_SCOPE_BAD="$REPO_ROOT/test/repro/region_arena_owner_scope_leak.elisa"
+ARENA_OWNER_SCOPE_LIVE="$REPO_ROOT/test/repro/region_arena_owner_scope_live.elisa"
+bad_stage0_rc=0
+bad_stage0_out="$("$ELISACORE_BIN" -emit semantic "$ARENA_OWNER_SCOPE_BAD" 2>&1)" || bad_stage0_rc=$?
+[[ "$bad_stage0_rc" -ne 0 ]] || fail "stage0 accepted Arena& region names after their lexical scope ended"
+bad_unknown_count="$(grep -Fc 'unknown region qualifier "alloc"' <<< "$bad_stage0_out" || true)"
+[[ "$bad_unknown_count" -eq 2 ]] || fail "stage0's established region-owner baseline changed unexpectedly: $bad_stage0_out"
+bad_stage1_out="$(cat "$ARENA_OWNER_SCOPE_BAD" | "$RPT")"
+grep -q 'unknown region qualifier "alloc"' <<< "$bad_stage1_out" || fail "stage1 accepted an Arena& region name after its lexical scope ended: $bad_stage1_out"
+[[ "$(grep -Fc 'unknown region qualifier "alloc"' <<< "$bad_stage1_out")" -eq 2 ]] || fail "stage1 did not reject both out-of-scope Arena& region uses: $bad_stage1_out"
+grep -q 'unknown region qualifier "inner"' <<< "$bad_stage1_out" || fail "stage1 accepted a region block name on its dedent sibling line: $bad_stage1_out"
+live_stage0_rc=0
+"$ELISACORE_BIN" -emit semantic "$ARENA_OWNER_SCOPE_LIVE" >/dev/null 2>&1 || live_stage0_rc=$?
+[[ "$live_stage0_rc" -eq 0 ]] || fail "stage0 rejected an Arena& region use within its lexical scope"
+clean "$(cat "$ARENA_OWNER_SCOPE_LIVE")"
+
 out=$(printf 'def f() -> void:\n    region left(64)\n    region right(64)\n    value: i32& @left = new[left] 1\n    other: i32& @right = value\n' | "$RPT")
 grep -q 'variable "other" expects i32& @right, got i32& @left' <<< "$out" || fail "mismatched local regions were not flagged: $out"
 clean $'def f() -> void:\n    region same(64)\n    value: i32& @same = new[same] 1\n    alias: i32& @same = value\n'
