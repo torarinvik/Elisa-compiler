@@ -15,6 +15,7 @@ ulimit -c 0 || true
 BAD="$ROOT/test/repro/sview_region_use_after_destroy.elisa"
 GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
+POOL_PROJECTION_BAD="$ROOT/test/repro/region_pool_projection_after_destroy.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
 JSON_REGION_MISMATCH_BAD="$ROOT/test/repro/json_handle_region_mismatch.elisa"
 SHADOW_REBIND_BAD="$ROOT/test/repro/shadowed_region_generic_rebind.elisa"
@@ -89,6 +90,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$generic_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected generic wrapper at O$optimization" >&2; exit 1; }
+
+    pool_projection_output="$WORK/region-pool-projection-O$optimization"
+    pool_projection_log="$pool_projection_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$pool_projection_output.ll" "$POOL_PROJECTION_BAD" >"$pool_projection_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a copied heap-qualified field pointer after its source region was destroyed at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'value "ptr" cannot be used: region dependency facts were invalidated by destroy of region "scratch"' "$pool_projection_log" || {
+        echo "destroyed view lifetime smoke: copied heap-qualified field pointer lost its source-region dependency at O$optimization" >&2
+        cat "$pool_projection_log" >&2
+        exit 1
+    }
+    [[ ! -e "$pool_projection_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected region-pool projection at O$optimization" >&2; exit 1; }
 
     multi_generic_output="$WORK/multiple-generic-O$optimization"
     multi_generic_log="$multi_generic_output.log"
