@@ -26,6 +26,9 @@ ARENA_OWNER_SHADOW_BAD="$ROOT/test/repro/arena_owner_shadow_reset_leak.elisa"
 ARENA_OWNER_SHADOW_GOOD="$ROOT/test/parity/fixtures/arena_owner_shadow_reset_live.elisa"
 ARENA_ALIAS_RESET_BAD="$ROOT/test/repro/arena_alias_reset_leak.elisa"
 ARENA_ALIAS_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_reset_live.elisa"
+ARENA_ALIAS_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_rebind_reset_leak.elisa"
+ARENA_ALIAS_REBIND_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_rebind_reset_live.elisa"
+ARENA_ALIAS_CONDITIONAL_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_conditional_rebind_reset_leak.elisa"
 ARENA_HELPER_RESET_BAD="$ROOT/test/repro/arena_helper_reset_leak.elisa"
 ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elisa"
 ARENA_NAMED_RESET_BAD="$ROOT/test/repro/arena_named_reset_leak.elisa"
@@ -257,6 +260,49 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_helper_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after helper reset at O$optimization" >&2; exit 1; }
+
+    arena_alias_rebind_output="$WORK/arena-alias-rebind-reset-O$optimization"
+    arena_alias_rebind_log="$arena_alias_rebind_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_alias_rebind_output.ll" "$ARENA_ALIAS_REBIND_RESET_BAD" >"$arena_alias_rebind_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a view after resetting the arena currently designated by a rebound Arena& at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "second"' "$arena_alias_rebind_log" || {
+        echo "destroyed view lifetime smoke: Arena& rebind did not transfer its invalidation identity at O$optimization" >&2
+        cat "$arena_alias_rebind_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_alias_rebind_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after Arena& rebind at O$optimization" >&2; exit 1; }
+
+    arena_alias_conditional_output="$WORK/arena-alias-conditional-rebind-O$optimization"
+    arena_alias_conditional_log="$arena_alias_conditional_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_alias_conditional_output.ll" "$ARENA_ALIAS_CONDITIONAL_REBIND_RESET_BAD" >"$arena_alias_conditional_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a stale view after a branch-dependent Arena& rebind at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "first"' "$arena_alias_conditional_log" || {
+        echo "destroyed view lifetime smoke: conditional Arena& rebind failed to retain the original owner possibility at O$optimization" >&2
+        cat "$arena_alias_conditional_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_alias_conditional_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after conditional Arena& rebind at O$optimization" >&2; exit 1; }
+
+    arena_alias_rebind_live_output="$WORK/arena-alias-rebind-live-O$optimization"
+    arena_alias_rebind_live_log="$arena_alias_rebind_live_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$arena_alias_rebind_live_output" "$ARENA_ALIAS_REBIND_RESET_GOOD" >"$arena_alias_rebind_live_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: rebinding an Arena& spuriously invalidated the old arena's view at O$optimization" >&2
+        cat "$arena_alias_rebind_live_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$arena_alias_rebind_live_output" >"$arena_alias_rebind_live_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: rebound-alias precision control returned $run_status at O$optimization, expected 65" >&2
+        cat "$arena_alias_rebind_live_log.run" >&2
+        exit 1
+    }
 
     arena_helper_live_output="$WORK/arena-helper-live-O$optimization"
     arena_helper_live_log="$arena_helper_live_output.log"
