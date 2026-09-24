@@ -31,6 +31,7 @@ ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elis
 ARENA_NAMED_RESET_BAD="$ROOT/test/repro/arena_named_reset_leak.elisa"
 ARENA_NAMED_RESET_GOOD="$ROOT/test/parity/fixtures/arena_named_reset_live.elisa"
 ARENA_OPAQUE_RESET_BAD="$ROOT/test/repro/arena_opaque_reset_leak.elisa"
+ARENA_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_callback_reset_leak.elisa"
 ARENA_BLOCK_RESET_BAD="$ROOT/test/repro/arena_block_expression_reset_leak.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
@@ -298,6 +299,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_opaque_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting an opaque external arena call at O$optimization" >&2; exit 1; }
+
+    arena_callback_reset_output="$WORK/arena-callback-reset-O$optimization"
+    arena_callback_reset_log="$arena_callback_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_callback_reset_output.ll" "$ARENA_CALLBACK_RESET_BAD" >"$arena_callback_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a stale view after an indirect callback received its Arena& at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_callback_reset_log" || {
+        echo "destroyed view lifetime smoke: indirect callback rejection lost the passed arena dependency at O$optimization" >&2
+        cat "$arena_callback_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_callback_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting an indirect arena callback at O$optimization" >&2; exit 1; }
 
     arena_block_reset_output="$WORK/arena-block-reset-O$optimization"
     arena_block_reset_log="$arena_block_reset_output.log"
