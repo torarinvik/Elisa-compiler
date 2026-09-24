@@ -10,6 +10,7 @@ GOOD="$ROOT/test/parity/fixtures/sview_unrelated_growth_live.elisa"
 CROSS_FIELD_BAD="$ROOT/test/parity/fixtures/sview_cross_field_alias_stale.elisa"
 DARRAY_ALIAS_BAD="$ROOT/test/parity/fixtures/sview_darray_copy_alias_stale.elisa"
 AGGREGATE_BAD="$ROOT/test/repro/sview_aggregate_field_after_growth.elisa"
+AGGREGATE_COPY_BAD="$ROOT/test/repro/sview_aggregate_copy_after_growth.elisa"
 AGGREGATE_GOOD="$ROOT/test/parity/fixtures/sview_aggregate_field_unrelated_growth.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-relocation.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -64,6 +65,7 @@ done
 check_stage1_alias_stale "$CROSS_FIELD_BAD" 'storage dependency facts were invalidated by darray push of parser' cross-field-alias
 check_stage1_alias_stale "$DARRAY_ALIAS_BAD" 'storage dependency facts were invalidated by darray push of alias' darray-copy-alias
 check_stage1_alias_stale "$AGGREGATE_BAD" 'storage dependency facts were invalidated by darray push of values' aggregate-field-alias
+check_stage1_alias_stale "$AGGREGATE_COPY_BAD" 'storage dependency facts were invalidated by darray push of values' nested-aggregate-copy-alias
 
 for optimization in 0 2; do
     aggregate_good_output="$WORK/aggregate-unrelated-growth-O$optimization.ll"
@@ -72,4 +74,4 @@ for optimization in 0 2; do
         || fail "Stage1 rejected an aggregate-held view when only an unrelated darray grew at O$optimization: $(tail -n 8 "$aggregate_good_log")"
 done
 
-echo "sview relocation smoke OK: chained/optional, cross-field, copied-container, and aggregate-field aliases invalidate after backing growth; unrelated growth stays live"
+echo "sview relocation smoke OK: chained/optional, cross-field, copied-container, aggregate-field, and nested aggregate-copy aliases invalidate after backing growth; unrelated growth stays live"
