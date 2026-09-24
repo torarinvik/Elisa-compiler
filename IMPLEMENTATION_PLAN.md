@@ -404,6 +404,8 @@ These are implementation decisions to settle with examples and compatibility dat
 
 **Acceptance:** deliberately wrong assertions/laws, solver timeout, stale caches, overflow edge cases, and mutated subjects cannot enable unchecked invalid operations. Every removed check has an inspectable valid justification.
 
+**Observed Stage1 slice (2026-09-24):** The struct-field refinement visitor now treats each actual `for` variable as a fresh unrefined binding, so a loop variable shadowing a refined parameter cannot inherit that parameter's fact. It traverses both statements and the value tail of capture-header `Expr.Block`s so those loop binders reach the statement visitor. The `struct_field_refinement_shadow_smoke.sh` regression checks the diagnostic for the shadowed loop and preserves a positive refined-parameter case. This remains a name-based visitor rather than canonical `BindingId` analysis, does not model every local or pattern binder, and emits a warning-level `PreconditionUnproven` diagnostic; emitting that warning does not itself prevent object generation or establish the field invariant. S15 acceptance and the related soundness checklist remain open.
+
 ### H.3 Effects and module/type correctness
 
 **S16 — close correctness gaps that undermine safety.**
