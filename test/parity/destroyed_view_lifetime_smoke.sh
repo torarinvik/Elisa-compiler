@@ -26,6 +26,8 @@ ARENA_OWNER_SHADOW_BAD="$ROOT/test/repro/arena_owner_shadow_reset_leak.elisa"
 ARENA_OWNER_SHADOW_GOOD="$ROOT/test/parity/fixtures/arena_owner_shadow_reset_live.elisa"
 ARENA_ALIAS_RESET_BAD="$ROOT/test/repro/arena_alias_reset_leak.elisa"
 ARENA_ALIAS_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_reset_live.elisa"
+ARENA_HELPER_RESET_BAD="$ROOT/test/repro/arena_helper_reset_leak.elisa"
+ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
@@ -217,6 +219,36 @@ for optimization in 0 2; do
     [[ "$run_status" -eq 65 ]] || {
         echo "destroyed view lifetime smoke: independent outer view returned $run_status at O$optimization, expected 65" >&2
         cat "$arena_alias_reset_live_log.run" >&2
+        exit 1
+    }
+
+    arena_helper_reset_output="$WORK/arena-helper-reset-O$optimization"
+    arena_helper_reset_log="$arena_helper_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_helper_reset_output.ll" "$ARENA_HELPER_RESET_BAD" >"$arena_helper_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted an outer view after a helper reset its Arena& parameter at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_helper_reset_log" || {
+        echo "destroyed view lifetime smoke: helper reset lost the source Arena& parameter identity at O$optimization" >&2
+        cat "$arena_helper_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_helper_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after helper reset at O$optimization" >&2; exit 1; }
+
+    arena_helper_live_output="$WORK/arena-helper-live-O$optimization"
+    arena_helper_live_log="$arena_helper_live_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$arena_helper_live_output" "$ARENA_HELPER_RESET_GOOD" >"$arena_helper_live_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: a non-resetting Arena& helper spuriously invalidated an outer view at O$optimization" >&2
+        cat "$arena_helper_live_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$arena_helper_live_output" >"$arena_helper_live_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: non-resetting helper control returned $run_status at O$optimization, expected 65" >&2
+        cat "$arena_helper_live_log.run" >&2
         exit 1
     }
 
