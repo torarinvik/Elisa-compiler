@@ -331,6 +331,27 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "pointer arithmetic in value block tail": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    result: u8& =\n"
+        "        alias: u8& = pointer\n"
+        "        alias + offset\n"
+        "    return result\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic in value block tail exact grant": (
+        "# strict\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        result: u8& =\n"
+        "            alias: u8& = pointer\n"
+        "            alias + offset\n"
+        "        return result\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "pointer arithmetic with compound integer offset": (
         "# strict\n"
         "def bad(pointer: u8&, offset: usize) -> u8&:\n"
