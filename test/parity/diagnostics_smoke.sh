@@ -215,6 +215,7 @@ NAMES=(
     rebind_discard_target
     static_string_binding_return
     static_string_binding_argument
+    static_string_binding_cstr_argument
     static_string_binding_declaration
     static_string_binding_ternary
     container_literal_block_tail
@@ -423,6 +424,7 @@ EXPECTS=(
     "undefined assignment target \"_\" (use = to introduce a new local; <- requires an existing mutable target)"
     "return type expects sview, got static u8&"
     "argument 1 to \"take\" expects sview, got static u8&"
+    "argument 1 to \"take_c\" expects cstr, got static u8&"
     "variable \"t\" expects sview, got static u8&"
     "ternary branches are incompatible: static u8& and sview"
     "darray literal has no region to allocate in"
