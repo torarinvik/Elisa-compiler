@@ -691,6 +691,27 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "pointer arithmetic through struct match pattern": (
+        "# strict\n"
+        "struct PointerOffsetFields:\n    pointer: u8&\n    step: usize\n"
+        "def bad(value: PointerOffsetFields) -> i64:\n"
+        "    match value:\n"
+        "        PointerOffsetFields{pointer, step}:\n            pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through struct match pattern exact grant": (
+        "# strict\n"
+        "struct PointerOffsetFields:\n    pointer: u8&\n    step: usize\n"
+        "def bad(value: PointerOffsetFields) -> i64:\n"
+        "    match value:\n"
+        "        PointerOffsetFields{pointer, step}:\n"
+        "            can Unsafe.PointerArithmetic:\n                pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "extern unrelated grant": (
         "# strict\n# unsafe\n"
         "extern foreign() -> i64\n"
