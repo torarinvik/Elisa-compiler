@@ -394,6 +394,20 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "pointer arithmetic through typed array element": (
+        "# strict\n"
+        "def bad(values: array[u8&, 4], offset: usize) -> u8&:\n"
+        "    return values[0] + offset\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through typed array element exact grant": (
+        "# strict\n"
+        "def bad(values: array[u8&, 4], offset: usize) -> u8&:\n"
+        "    can Unsafe.PointerArithmetic:\n        return values[0] + offset\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "pointer arithmetic ignores a shadowed reference name": (
         "# strict\n"
         "def bad(pointer: u8&, offset: usize) -> i64:\n"
