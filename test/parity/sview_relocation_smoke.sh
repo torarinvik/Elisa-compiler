@@ -13,9 +13,11 @@ AGGREGATE_BAD="$ROOT/test/repro/sview_aggregate_field_after_growth.elisa"
 AGGREGATE_COPY_BAD="$ROOT/test/repro/sview_aggregate_copy_after_growth.elisa"
 AGGREGATE_GOOD="$ROOT/test/parity/fixtures/sview_aggregate_field_unrelated_growth.elisa"
 CLOSURE_BAD="$ROOT/test/repro/sview_closure_after_growth.elisa"
+CLOSURE_ASSIGNMENT_BAD="$ROOT/test/repro/sview_closure_assignment_target_after_growth.elisa"
 CLOSURE_GOOD="$ROOT/test/parity/fixtures/sview_closure_unrelated_growth_live.elisa"
 CLOSURE_PARAM_SHADOW_GOOD="$ROOT/test/parity/fixtures/sview_closure_parameter_shadow_live.elisa"
 CLOSURE_LOCAL_SHADOW_GOOD="$ROOT/test/parity/fixtures/sview_closure_local_shadow_live.elisa"
+CLOSURE_SCALAR_GOOD="$ROOT/test/parity/fixtures/sview_closure_scalar_capture_unrelated_growth_live.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-relocation.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -71,13 +73,14 @@ check_stage1_alias_stale "$DARRAY_ALIAS_BAD" 'storage dependency facts were inva
 check_stage1_alias_stale "$AGGREGATE_BAD" 'storage dependency facts were invalidated by darray push of values' aggregate-field-alias
 check_stage1_alias_stale "$AGGREGATE_COPY_BAD" 'storage dependency facts were invalidated by darray push of values' nested-aggregate-copy-alias
 check_stage1_alias_stale "$CLOSURE_BAD" 'storage dependency facts were invalidated by darray push of values' closure-captured-view-alias
+check_stage1_alias_stale "$CLOSURE_ASSIGNMENT_BAD" 'storage dependency facts were invalidated by darray push of values' closure-assignment-target-capture
 
 for optimization in 0 2; do
     aggregate_good_output="$WORK/aggregate-unrelated-growth-O$optimization.ll"
     aggregate_good_log="$aggregate_good_output.log"
     "$STAGE1" -emit llvm "-O$optimization" -o "$aggregate_good_output" "$AGGREGATE_GOOD" >"$aggregate_good_log" 2>&1 \
         || fail "Stage1 rejected an aggregate-held view when only an unrelated darray grew at O$optimization: $(tail -n 8 "$aggregate_good_log")"
-    for closure_control in "$CLOSURE_GOOD" "$CLOSURE_PARAM_SHADOW_GOOD" "$CLOSURE_LOCAL_SHADOW_GOOD"; do
+    for closure_control in "$CLOSURE_GOOD" "$CLOSURE_PARAM_SHADOW_GOOD" "$CLOSURE_SCALAR_GOOD" "$CLOSURE_LOCAL_SHADOW_GOOD"; do
         closure_output="$WORK/closure-control-$(basename "$closure_control").O$optimization.ll"
         closure_log="$closure_output.log"
         if [[ "$closure_control" == "$CLOSURE_LOCAL_SHADOW_GOOD" ]]; then
@@ -95,4 +98,4 @@ for optimization in 0 2; do
     done
 done
 
-echo "sview relocation smoke OK: stale closure captures invalidate after backing growth, unrelated growth and parameter shadows stay live, and body-local shadows do not trigger stale-view diagnostics"
+echo "sview relocation smoke OK: stale closure captures and assignment targets invalidate after backing growth; unrelated growth, scalar captures, and parameter shadows stay live; body-local shadows do not trigger stale-view diagnostics"
