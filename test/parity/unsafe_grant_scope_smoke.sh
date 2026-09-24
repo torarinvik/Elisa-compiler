@@ -846,14 +846,14 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         'call to "stale reference" requires can[Unsafe]',
     ),
-    "stale view exact grant": (
+    "relocated view remains invalid under exact stale-ref grant": (
         "# strict\n# unsafe\n"
         "def bad(values: mutable darray[i64]&) -> i64:\n"
         "    window: view[i64] = values[0:values.count]\n"
         "    can Memory.Allocate:\n        values.push(1)\n"
         "    can Unsafe.StaleRef:\n        return window[0]\n"
         "def main() -> i64:\n    return 0\n",
-        None,
+        'view "window" cannot be used: storage dependency facts were invalidated by darray push of values',
     ),
     "buffer reinterpret needs separate capability": (
         "# strict\n"
