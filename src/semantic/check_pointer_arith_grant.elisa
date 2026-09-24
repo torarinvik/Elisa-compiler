@@ -61,6 +61,95 @@ extend Semantic:
                     return interned_elem(item_type_id, binding_index.u32(), table)
                 return 0
 
+        # The pattern path's final component is the variant name. Keeping this as a
+        # source-view slice avoids allocating a temporary spelling while matching
+        # qualified forms such as `module.Packet.Offset` and `.Offset`.
+        def pag_pattern_terminal_name(path: sview) -> sview:
+            can Abort.Panic:
+                path_length: usize = sview_len(path)
+                component_start: mutable usize = 0
+                for cursor in 0..<path_length |component_start, path|:
+                    component_start <- cursor + 1 if sview_at(path, cursor) == 46
+                return path[component_start:path_length]
+
+        # Look up a payload field's full structural type. Rows are stored in source
+        # declaration order and include function-local generated payload enums too.
+        # Conflicting duplicate owner/variant declarations conservatively yield Unknown.
+        def pag_enum_payload_type_id(owner: sview, variant_name: sview, field_index: usize, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                found: mutable u32 = 0
+                seen: mutable bool = false
+                ambiguous: mutable bool = false
+                for row in 0..<table.enum_payload_owner.count |found, seen, ambiguous, owner, variant_name, field_index, table|:
+                    if table.enum_payload_owner[row] == owner and table.enum_payload_variant[row] == variant_name and row < table.enum_payload_position.count and table.enum_payload_position[row].usize() == field_index:
+                        candidate_type_id: u32 = table.enum_payload_type_id[row] if row < table.enum_payload_type_id.count else 0
+                        ambiguous <- true if seen and found != candidate_type_id
+                        found <- candidate_type_id if not seen
+                        seen <- true
+                return 0 if ambiguous or not seen
+                return found
+
+        # Recover the type of `target_name` when a match pattern gives the value a
+        # structurally known shape. Unknown pattern forms, opaque enum payloads, and
+        # ambiguous declarations stay Unknown; the visitor never guesses a reference.
+        def pag_pattern_binding_type_id(pattern: Ast::Pattern, subject_type_id: u32, target_name: sview, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(binding_name):
+                        return subject_type_id if binding_name == target_name
+                    Pattern.TypeBind(type_name, binder):
+                        return subject_type_id if binder == target_name
+                    Pattern.As(as_name, inner):
+                        return subject_type_id if as_name == target_name
+                        if inner.count == 1:
+                            return pag_pattern_binding_type_id(inner[0], subject_type_id, target_name, table)
+                    Pattern.Tuple(elements):
+                        return 0 if interned_kind(subject_type_id, table) != SemTypeKind.Tuple or interned_elem_count(subject_type_id, table).usize() != elements.count
+                        for element_index in 0..<elements.count |table, subject_type_id, elements, target_name|:
+                            element_type_id: u32 = interned_elem(subject_type_id, element_index.u32(), table)
+                            element_binding_type_id: u32 = pag_pattern_binding_type_id(elements[element_index], element_type_id, target_name, table)
+                            return element_binding_type_id if element_binding_type_id != 0
+                        return 0
+                    Pattern.Variant(path, fields):
+                        return 0 if interned_kind(subject_type_id, table) != SemTypeKind.Named
+                        enum_owner: sview = interned_name(subject_type_id, table)
+                        variant_name: sview = pag_pattern_terminal_name(path)
+                        for field_index in 0..<fields.count |table, fields, enum_owner, variant_name, target_name|:
+                            payload_type_id: u32 = pag_enum_payload_type_id(enum_owner, variant_name, field_index, table)
+                            field_binding_type_id: u32 = pag_pattern_binding_type_id(fields[field_index], payload_type_id, target_name, table)
+                            return field_binding_type_id if field_binding_type_id != 0
+                        return 0
+                    Pattern.Field(selector, inner):
+                        if inner.count == 1:
+                            return pag_pattern_binding_type_id(inner[0], subject_type_id, target_name, table)
+                    Pattern.Or(options):
+                        # Every alternative must establish the same non-unknown type;
+                        # otherwise the binding is intentionally left unclassified.
+                        return 0 if options.count == 0
+                        common_type_id: mutable u32 = 0
+                        for option in options |common_type_id, subject_type_id, target_name, table|:
+                            option_type_id: u32 = pag_pattern_binding_type_id(option, subject_type_id, target_name, table)
+                            return 0 if option_type_id == 0
+                            return 0 if common_type_id != 0 and common_type_id != option_type_id
+                            common_type_id <- option_type_id
+                        return common_type_id
+                    _:
+                        pass
+                return 0
+
+        # Install every arm binding in both channels used by this pass. The structural
+        # TypeId detects refs produced by payloads/tuples; the compact kind also lets
+        # identifier-only fallback recognize integer binders.
+        def pag_bind_match_pattern(pattern: Ast::Pattern, subject_type_id: u32, binding_names: mutable darray[sview]&, binding_kinds: mutable darray[u8]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pattern_names: mutable darray[sview] = []
+                collect_pattern_binding_names(pattern, pattern_names)
+                for pattern_name in pattern_names |binding_names, binding_kinds, subject_type_id, pattern, table|:
+                    pattern_type_id: u32 = pag_pattern_binding_type_id(pattern, subject_type_id, pattern_name, table)
+                    pattern_kind: u8 = 1 if interned_kind(pattern_type_id, table) == SemTypeKind.Ref else (2 if interned_kind(pattern_type_id, table) == SemTypeKind.Int else 0)
+                    pag_bind(pattern_name, pattern_kind, binding_names, binding_kinds)
+                    note_local_type_id_direct(pattern_name, pattern_type_id, table)
+
         def pag_is_ref_operand(expression: Ast::Expr, binding_names: darray[sview]&, binding_kinds: darray[u8]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 expression_type_id: u32 = pag_structural_type_id(expression, table)
@@ -180,17 +269,14 @@ extend Semantic:
                         table <- pag_expr(then_value, binding_names, binding_kinds, in_grant, covers, line, table)
                         table <- pag_expr(else_value, binding_names, binding_kinds, in_grant, covers, line, table)
                     Expr.Match(scrutinee, arms, match_line) | Expr.Catch(scrutinee, arms, match_line):
+                        match_subject_type_id: u32 = pag_structural_type_id(scrutinee, table)
                         table <- pag_expr(scrutinee, binding_names, binding_kinds, in_grant, covers, line, table)
                         for arm in arms |table|:
                             arm_type_mark: usize = table.local_type_names.count
-                            table <- pag_expr(arm.guard, binding_names, binding_kinds, in_grant, covers, line, table)
                             arm_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
                             arm_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
-                            arm_pattern_names: mutable darray[sview] = []
-                            collect_pattern_binding_names(arm.pattern, arm_pattern_names)
-                            for pattern_name in arm_pattern_names |arm_names, arm_kinds, table|:
-                                pag_bind(pattern_name, 0, arm_names, arm_kinds)
-                                note_local_type_id_direct(pattern_name, 0, table)
+                            table <- pag_bind_match_pattern(arm.pattern, match_subject_type_id, arm_names, arm_kinds, table)
+                            table <- pag_expr(arm.guard, arm_names, arm_kinds, in_grant, covers, line, table)
                             table <- pag_walk(arm.body, arm_names, arm_kinds, in_grant, covers, Ast::Expr.Absent, line, table)
                             table.local_type_names <- table.local_type_names.truncate(arm_type_mark) if table.local_type_names.count > arm_type_mark
                             table.local_type_ids <- table.local_type_ids.truncate(arm_type_mark) if table.local_type_ids.count > arm_type_mark
@@ -281,16 +367,13 @@ extend Semantic:
                             table.local_type_names <- table.local_type_names.truncate(loop_type_mark) if table.local_type_names.count > loop_type_mark
                             table.local_type_ids <- table.local_type_ids.truncate(loop_type_mark) if table.local_type_ids.count > loop_type_mark
                         Stmt.Match(scrutinee, arms, line):
+                            match_subject_type_id: u32 = pag_structural_type_id(scrutinee, table)
                             table <- pag_expr(scrutinee, binding_names, binding_kinds, in_grant, covers, line.line, table)
                             for arm in arms |table, line, binding_names, binding_kinds, in_grant, covers|:
                                 arm_type_mark: usize = table.local_type_names.count
                                 arm_names: mutable darray[sview] = [bound_name for bound_name in binding_names]
                                 arm_kinds: mutable darray[u8] = [bound_kind for bound_kind in binding_kinds]
-                                arm_pattern_names: mutable darray[sview] = []
-                                collect_pattern_binding_names(arm.pattern, arm_pattern_names)
-                                for pattern_name in arm_pattern_names |arm_names, arm_kinds, table|:
-                                    pag_bind(pattern_name, 0, arm_names, arm_kinds)
-                                    note_local_type_id_direct(pattern_name, 0, table)
+                                table <- pag_bind_match_pattern(arm.pattern, match_subject_type_id, arm_names, arm_kinds, table)
                                 table <- pag_expr(arm.guard, arm_names, arm_kinds, in_grant, covers, line.line, table)
                                 table <- pag_walk(arm.body, arm_names, arm_kinds, in_grant, covers, Ast::Expr.Absent, line.line, table)
                                 table.local_type_names <- table.local_type_names.truncate(arm_type_mark) if table.local_type_names.count > arm_type_mark
