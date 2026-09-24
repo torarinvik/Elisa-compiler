@@ -32,6 +32,8 @@ ARENA_NAMED_RESET_BAD="$ROOT/test/repro/arena_named_reset_leak.elisa"
 ARENA_NAMED_RESET_GOOD="$ROOT/test/parity/fixtures/arena_named_reset_live.elisa"
 ARENA_OPAQUE_RESET_BAD="$ROOT/test/repro/arena_opaque_reset_leak.elisa"
 ARENA_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_callback_reset_leak.elisa"
+ARENA_FORWARDED_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_forwarded_callback_reset_leak.elisa"
+ARENA_CAPTURED_CALLBACK_RESET_BAD="$ROOT/test/repro/arena_captured_callback_reset_leak.elisa"
 ARENA_BLOCK_RESET_BAD="$ROOT/test/repro/arena_block_expression_reset_leak.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
@@ -312,6 +314,32 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_callback_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting an indirect arena callback at O$optimization" >&2; exit 1; }
+
+    arena_forwarded_callback_output="$WORK/arena-forwarded-callback-reset-O$optimization"
+    arena_forwarded_callback_log="$arena_forwarded_callback_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_forwarded_callback_output.ll" "$ARENA_FORWARDED_CALLBACK_RESET_BAD" >"$arena_forwarded_callback_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a stale view after a helper invoked its forwarded callback at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_forwarded_callback_log" || {
+        echo "destroyed view lifetime smoke: forwarded callback rejection lost the Arena& parameter summary at O$optimization" >&2
+        cat "$arena_forwarded_callback_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_forwarded_callback_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a forwarded callback at O$optimization" >&2; exit 1; }
+
+    arena_captured_callback_output="$WORK/arena-captured-callback-reset-O$optimization"
+    arena_captured_callback_log="$arena_captured_callback_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_captured_callback_output.ll" "$ARENA_CAPTURED_CALLBACK_RESET_BAD" >"$arena_captured_callback_log" 2>&1; then
+        echo "destroyed view lifetime smoke: emitted LLVM for a captured reset callback with a stale view at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "first"' "$arena_captured_callback_log" || {
+        echo "destroyed view lifetime smoke: captured callback rejection lost its captured arena dependency at O$optimization" >&2
+        cat "$arena_captured_callback_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_captured_callback_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a captured arena callback at O$optimization" >&2; exit 1; }
 
     arena_block_reset_output="$WORK/arena-block-reset-O$optimization"
     arena_block_reset_log="$arena_block_reset_output.log"
