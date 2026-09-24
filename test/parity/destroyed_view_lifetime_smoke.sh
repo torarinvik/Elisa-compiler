@@ -22,6 +22,8 @@ OPTIONAL_BAD="$ROOT/test/repro/sview_optional_region_use_after_destroy.elisa"
 SHADOW_BAD="$ROOT/test/repro/region_shadow_inner_use_after_destroy.elisa"
 JSON_VIEW_BAD="$ROOT/test/repro/json_view_after_arena_free.elisa"
 ARENA_VIEW_BAD="$ROOT/test/repro/manual_arena_free_use_after_region.elisa"
+ARENA_OWNER_SHADOW_BAD="$ROOT/test/repro/arena_owner_shadow_reset_leak.elisa"
+ARENA_OWNER_SHADOW_GOOD="$ROOT/test/parity/fixtures/arena_owner_shadow_reset_live.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
@@ -155,6 +157,36 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$arena_view_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected arena-bound view at O$optimization" >&2; exit 1; }
+
+    arena_owner_shadow_output="$WORK/arena-owner-shadow-reset-O$optimization"
+    arena_owner_shadow_log="$arena_owner_shadow_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_owner_shadow_output.ll" "$ARENA_OWNER_SHADOW_BAD" >"$arena_owner_shadow_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted an outer view after reset through its same-name Arena& owner at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_owner_shadow_log" || {
+        echo "destroyed view lifetime smoke: same-name Arena& owner reset lost the outer region identity at O$optimization" >&2
+        cat "$arena_owner_shadow_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_owner_shadow_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for an outer stale view after same-name owner reset at O$optimization" >&2; exit 1; }
+
+    arena_owner_shadow_live_output="$WORK/arena-owner-shadow-reset-live-O$optimization"
+    arena_owner_shadow_live_log="$arena_owner_shadow_live_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$arena_owner_shadow_live_output" "$ARENA_OWNER_SHADOW_GOOD" >"$arena_owner_shadow_live_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: rejected an outer view after only the inner same-name owner was reset at O$optimization" >&2
+        cat "$arena_owner_shadow_live_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$arena_owner_shadow_live_output" >"$arena_owner_shadow_live_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: live outer view returned $run_status at O$optimization, expected 65" >&2
+        cat "$arena_owner_shadow_live_log.run" >&2
+        exit 1
+    }
 
     for invalidation in reset rewind; do
         invalidation_source="$ROOT/test/repro/manual_arena_${invalidation}_use_after_region.elisa"
