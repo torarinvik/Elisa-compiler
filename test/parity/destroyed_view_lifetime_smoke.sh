@@ -32,6 +32,7 @@ ARENA_ALIAS_CONDITIONAL_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_condition
 ARENA_ALIAS_COPY_CONDITIONAL_REBIND_RESET_BAD="$ROOT/test/repro/arena_alias_copy_conditional_rebind_reset_leak.elisa"
 ARENA_ALIAS_CONTROL_JOIN_BAD="$ROOT/test/repro/arena_alias_control_join_reset_leaks.elisa"
 ARENA_ALIAS_CONDITIONAL_REBIND_LIVE="$ROOT/test/parity/fixtures/arena_alias_conditional_rebind_unrelated_live.elisa"
+ARENA_ALIAS_BOTH_IF_ARMS_LIVE="$ROOT/test/parity/fixtures/arena_alias_both_if_arms_rebind_live.elisa"
 ARENA_HELPER_RESET_BAD="$ROOT/test/repro/arena_helper_reset_leak.elisa"
 ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elisa"
 ARENA_NAMED_RESET_BAD="$ROOT/test/repro/arena_named_reset_leak.elisa"
@@ -332,6 +333,23 @@ for optimization in 0 2; do
     [[ "$run_status" -eq 67 ]] || {
         echo "destroyed view lifetime smoke: unrelated-arena conditional control returned $run_status at O$optimization, expected 67" >&2
         cat "$arena_alias_conditional_live_log.run" >&2
+        exit 1
+    }
+
+    arena_alias_both_arms_output="$WORK/arena-alias-both-arms-live-O$optimization"
+    arena_alias_both_arms_log="$arena_alias_both_arms_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$arena_alias_both_arms_output" "$ARENA_ALIAS_BOTH_IF_ARMS_LIVE" >"$arena_alias_both_arms_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: both if arms rebind away from the first owner, but it was still considered destroyable at O$optimization" >&2
+        cat "$arena_alias_both_arms_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$arena_alias_both_arms_output" >"$arena_alias_both_arms_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: both-arm rebind control returned $run_status at O$optimization, expected 65" >&2
+        cat "$arena_alias_both_arms_log.run" >&2
         exit 1
     }
 
