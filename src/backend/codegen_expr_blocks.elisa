@@ -6,6 +6,45 @@
 
 extend Backend:
     private:
+        # Dictionary-index fallback lowering lives outside the already-large expression
+        # dispatcher so self-hosted -O3 compilation does not build an outsized CFG for the
+        # general block-expression function. The operation mirrors Stage0: nullable lookup,
+        # load on hit, evaluate fallback on miss, and merge through a result slot.
+        def emit_dict_index_fallback(receiver: Expr, index: Expr, fallback: Expr, expected: ValueType, line: Pos, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            lookup_call: Expr = Expr.Call(Expr.Field(receiver, "get", line), [index], [""], line)
+            lookup_type: ValueType = expression_type(lookup_call, local_scope, fns, structs, generics)
+            lookup_payload_type: ValueType = optional_payload_of(lookup_type, structs)
+            null return if lookup_type.kind != TypeKind.Optional or lookup_payload_type.kind != TypeKind.Ref
+            element_type: ValueType = ref_target_of(lookup_payload_type, structs)
+            null return if element_type.kind == TypeKind.Unmodeled
+            if emit_expression(lookup_call, lookup_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is lookup_value:
+                lookup_tag: LLVMValueRef = optional_tag_of(lookup_value, lookup_type, structs, ctx, builder)
+                lookup_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                lookup_present: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lookup_function, "dict.index.present")
+                lookup_fallback: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lookup_function, "dict.index.fallback")
+                lookup_merge: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lookup_function, "dict.index.merge")
+                result_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                result_slot: LLVMValueRef = build_entry_alloca(builder, result_type, "dict.index.result")
+                _ = LLVMBuildCondBr(builder, lookup_tag, lookup_present, lookup_fallback)
+                LLVMPositionBuilderAtEnd(builder, lookup_present)
+                element_pointer: LLVMValueRef = optional_payload_value_of(lookup_value, lookup_type, structs, ctx, builder)
+                element_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), element_pointer, "dict.index.value")
+                element_output: mutable LLVMValueRef = element_value
+                if expected.kind != element_type.kind or expected.bits != element_type.bits:
+                    if emit_conversion(element_value, element_type, expected, structs, ctx, builder) is converted_value:
+                        element_output <- converted_value
+                    else:
+                        return null
+                _ = LLVMBuildStore(builder, element_output, result_slot)
+                _ = LLVMBuildBr(builder, lookup_merge)
+                LLVMPositionBuilderAtEnd(builder, lookup_fallback)
+                if emit_expression(fallback, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fallback_value:
+                    _ = LLVMBuildStore(builder, fallback_value, result_slot)
+                    _ = LLVMBuildBr(builder, lookup_merge)
+                    LLVMPositionBuilderAtEnd(builder, lookup_merge)
+                    return LLVMBuildLoad2(builder, result_type, result_slot, "dict.index.result.value")
+            return null
+
         # Leading declarations are visible to the tail, then disappear together.
         def emit_scoped_value_block(block_statements: darray[Stmt]&, block_value: Expr, expected: mutable ValueType&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             expected_value: ValueType = ValueType{kind: expected.kind, bits: expected.bits, enum_id: expected.enum_id}
@@ -200,6 +239,18 @@ extend Backend:
                         match gi_indexed:
                             Expr.Index(gi_receiver, gi_index, gi_index_line):
                                 gi_container_type: ValueType = iterable_darray_type(gi_receiver, local_scope, fns, structs, generics)
+                                # Dictionary indexing is a fallible `T&?` lookup, unlike a
+                                # darray's checked element access. Lower `get d[k] else value`
+                                # through the same generic `d.get(k)` method path as ordinary
+                                # dictionary reads, then branch on the optional reference. The
+                                # previous darray-only guard declined here even though Stage0
+                                # emits a null test and merges the element with the fallback.
+                                if gi_container_type.kind != TypeKind.DArray:
+                                    gi_dict_type: ValueType = expression_type(gi_receiver, local_scope, fns, structs, generics)
+                                    gi_dict_target: mutable ValueType = gi_dict_type
+                                    gi_dict_target <- ref_target_of(gi_dict_type, structs) if gi_dict_type.kind == TypeKind.Ref
+                                    if gi_dict_target.kind == TypeKind.Struct and synthesized_struct_base_is(structs, gi_dict_target, "DynDict"):
+                                        return emit_dict_index_fallback(gi_receiver, gi_index, gi_fallback, expected, gi_index_line, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                                 null return if gi_container_type.kind != TypeKind.DArray
                                 gi_element_type: ValueType = darray_element_of(gi_container_type, structs)
                                 null return if gi_element_type.kind == TypeKind.Unmodeled
