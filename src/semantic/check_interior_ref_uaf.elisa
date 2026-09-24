@@ -150,6 +150,30 @@ extend Semantic:
                 ref_names.push(name)
                 ref_owners.push(resolved_owner)
 
+        # Control-flow bodies are currently scanned in source order. Preserve a snapshot
+        # around them and join any ref alias whose owner changed with its incoming owner;
+        # otherwise a rebind in one possible arm can erase another arm's live owner.
+        def interior_copy_ref_state(source_names: darray[sview]&, source_owners: darray[sview]&, out_names: mutable darray[sview]&, out_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out_names.clear()
+                out_owners.clear()
+                for index in 0..<source_names.count |source_names, source_owners, out_names, out_owners|:
+                    out_names.push(source_names[index])
+                    out_owners.push(source_owners[index] if index < source_owners.count else interior_unknown_owner())
+
+        def interior_join_ref_state(snapshot_names: darray[sview]&, snapshot_owners: darray[sview]&, ref_names: mutable darray[sview]&, ref_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in 0..<snapshot_names.count |snapshot_names, snapshot_owners, ref_names, ref_owners|:
+                    name: sview = snapshot_names[index]
+                    has_later: mutable bool = false
+                    for later_index in 0..<snapshot_names.count |has_later, snapshot_names, index, name|:
+                        has_later <- true if later_index > index and snapshot_names[later_index] == name
+                    if name != "" and not has_later:
+                        before: sview = interior_lookup_ref_owner(snapshot_names, snapshot_owners, name)
+                        after: sview = interior_lookup_ref_owner(ref_names, ref_owners, name)
+                        if before != after:
+                            interior_update_ref_owner(name, interior_merge_owner(before, after), ref_names, ref_owners)
+
         def interior_rebind_local_name(target: Ast::Expr) -> sview:
             can Abort.Panic:
                 match target:
@@ -165,6 +189,44 @@ extend Semantic:
                     Expr.Ident(name, line): name
                     Expr.Paren(inner, line): interior_rebind_base_name(inner)
                     _: sview("", 0, 0)
+
+        def interior_mark_ref_owners_unknown(ref_names: darray[sview]&, ref_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while ref_owners.count < ref_names.count |ref_names, ref_owners|:
+                    ref_owners.push(interior_unknown_owner())
+                for index in 0..<ref_names.count |ref_names, ref_owners|:
+                    ref_owners[index] <- interior_unknown_owner()
+
+        def interior_statement_list_may_rebind_ref(statements: darray[Ast::Stmt], ref_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable bool = false
+                for statement in statements |found, ref_names|:
+                    found <- true if interior_statement_may_rebind_ref(statement, ref_names)
+                return found
+
+        def interior_match_may_rebind_ref(arms: darray[Ast::MatchArm], ref_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable bool = false
+                for arm in arms |found, ref_names|:
+                    found <- true if interior_statement_list_may_rebind_ref(arm.body, ref_names)
+                return found
+
+        def interior_statement_may_rebind_ref(statement: Ast::Stmt, ref_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match statement:
+                    Stmt.Assign(target, operator, value, line):
+                        rebound_name: sview = interior_rebind_local_name(target)
+                        rebound_name != "" and interior_name_present(ref_names, rebound_name)
+                    Stmt.If(condition, then_body, else_body, line):
+                        interior_statement_list_may_rebind_ref(then_body, ref_names) or interior_statement_list_may_rebind_ref(else_body, ref_names)
+                    Stmt.While(condition, body, line) | Stmt.For(_, _, _, body, line) | Stmt.Block(_, _, _, body, line):
+                        interior_statement_list_may_rebind_ref(body, ref_names)
+                    Stmt.Match(scrutinee, arms, line):
+                        interior_match_may_rebind_ref(arms, ref_names)
+                    Stmt.Expr(Expr.Block(statements, value, captures, block_line), line):
+                        interior_statement_list_may_rebind_ref(statements, ref_names)
+                    _:
+                        false
 
 
         # The owner of any already-known interior ref mentioned in EXPRESSION, or "".
@@ -338,25 +400,53 @@ extend Semantic:
                                 table <- interior_check_uses(returned, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                                 interior_record_consumes(returned, affine_locals, consumed_owners, consumed_calls)
                         Stmt.If(condition, then_body, else_body, line):
+                            ref_snapshot_names: mutable darray[sview] = []
+                            ref_snapshot_owners: mutable darray[sview] = []
+                            interior_copy_ref_state(ref_names, ref_owners, ref_snapshot_names, ref_snapshot_owners)
+                            may_rebind_ref: bool = interior_statement_list_may_rebind_ref(then_body, ref_names) or interior_statement_list_may_rebind_ref(else_body, ref_names)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
                             table <- interior_check_uses(condition, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                             interior_record_consumes(condition, affine_locals, consumed_owners, consumed_calls)
                             table <- interior_scan(then_body, ref_names, ref_owners, affine_locals, consumed_owners, consumed_calls, table)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
                             table <- interior_scan(else_body, ref_names, ref_owners, affine_locals, consumed_owners, consumed_calls, table)
+                            interior_join_ref_state(ref_snapshot_names, ref_snapshot_owners, ref_names, ref_owners)
                         Stmt.While(condition, body, line):
+                            ref_snapshot_names: mutable darray[sview] = []
+                            ref_snapshot_owners: mutable darray[sview] = []
+                            interior_copy_ref_state(ref_names, ref_owners, ref_snapshot_names, ref_snapshot_owners)
+                            may_rebind_ref: bool = interior_statement_list_may_rebind_ref(body, ref_names)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
                             table <- interior_check_uses(condition, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                             interior_record_consumes(condition, affine_locals, consumed_owners, consumed_calls)
                             table <- interior_scan(body, ref_names, ref_owners, affine_locals, consumed_owners, consumed_calls, table)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
+                            interior_join_ref_state(ref_snapshot_names, ref_snapshot_owners, ref_names, ref_owners)
                         Stmt.For(bind, variables, iterable, body, line):
+                            ref_snapshot_names: mutable darray[sview] = []
+                            ref_snapshot_owners: mutable darray[sview] = []
+                            interior_copy_ref_state(ref_names, ref_owners, ref_snapshot_names, ref_snapshot_owners)
+                            may_rebind_ref: bool = interior_statement_list_may_rebind_ref(body, ref_names)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
                             table <- interior_check_uses(iterable, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                             interior_record_consumes(iterable, affine_locals, consumed_owners, consumed_calls)
                             table <- interior_scan(body, ref_names, ref_owners, affine_locals, consumed_owners, consumed_calls, table)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
+                            interior_join_ref_state(ref_snapshot_names, ref_snapshot_owners, ref_names, ref_owners)
                         Stmt.Match(scrutinee, arms, line):
+                            ref_snapshot_names: mutable darray[sview] = []
+                            ref_snapshot_owners: mutable darray[sview] = []
+                            interior_copy_ref_state(ref_names, ref_owners, ref_snapshot_names, ref_snapshot_owners)
+                            may_rebind_ref: bool = interior_match_may_rebind_ref(arms, ref_names)
+                            interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
                             table <- interior_check_uses(scrutinee, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                             interior_record_consumes(scrutinee, affine_locals, consumed_owners, consumed_calls)
                             for arm in arms |ref_names, ref_owners, consumed_owners, consumed_calls, table| -> table:
+                                interior_mark_ref_owners_unknown(ref_names, ref_owners) if may_rebind_ref
                                 table <- interior_check_uses(arm.guard, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                                 interior_record_consumes(arm.guard, affine_locals, consumed_owners, consumed_calls)
                                 table <- interior_scan(arm.body, ref_names, ref_owners, affine_locals, consumed_owners, consumed_calls, table)
+                            interior_join_ref_state(ref_snapshot_names, ref_snapshot_owners, ref_names, ref_owners)
                         Stmt.Contract(kind, expression, line):
                             table <- interior_check_uses(expression, ref_names, ref_owners, consumed_owners, consumed_calls, table)
                             interior_record_consumes(expression, affine_locals, consumed_owners, consumed_calls)

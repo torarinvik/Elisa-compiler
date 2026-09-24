@@ -12,6 +12,7 @@ BAD="$ROOT/test/repro/region_pool_primitive_after_release.elisa"
 CONDITION_BAD="$ROOT/test/repro/region_pool_primitive_after_condition_release.elisa"
 NESTED_FIELD_BAD="$ROOT/test/repro/region_pool_nested_field_after_release.elisa"
 REBIND_BAD="$ROOT/test/repro/region_pool_alias_rebind_after_release.elisa"
+BRANCH_REBIND_BAD="$ROOT/test/repro/region_pool_branch_rebind_after_release.elisa"
 REBIND_GOOD="$ROOT/test/parity/fixtures/region_pool_alias_rebind_live.elisa"
 STRUCT_BAD="$ROOT/test/repro/region_pool_struct_after_release.elisa"
 PARAM_BAD="$ROOT/test/repro/region_pool_parameter_after_release.elisa"
@@ -74,6 +75,19 @@ for optimization in 0 2; do
     }
     [[ ! -e "$rebind_output" ]] || { echo "region-pool release lifetime smoke: wrote LLVM for a rejected rebound stale pointer at -O$optimization" >&2; exit 1; }
 
+    branch_rebind_output="$WORK/branch-rebind-after-release-O$optimization.ll"
+    branch_rebind_log="$branch_rebind_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$branch_rebind_output" "$BRANCH_REBIND_BAD" >"$branch_rebind_log" 2>&1; then
+        echo "region-pool release lifetime smoke: accepted a pointer whose conditional rebind can leave it owned by a released handle at -O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'interior reference "ptr" cannot be used: usage facts were consumed by argument to call "release"' "$branch_rebind_log" || {
+        echo "region-pool release lifetime smoke: missing conditional owner-join diagnostic at -O$optimization" >&2
+        cat "$branch_rebind_log" >&2
+        exit 1
+    }
+    [[ ! -e "$branch_rebind_output" ]] || { echo "region-pool release lifetime smoke: wrote LLVM for a pointer with a possibly released conditional owner at -O$optimization" >&2; exit 1; }
+
     rebind_good_output="$WORK/rebind-live-O$optimization.ll"
     "$STAGE1" -emit llvm "-O$optimization" -o "$rebind_good_output" "$REBIND_GOOD" >"$WORK/rebind-live-O$optimization.log" 2>&1 || {
         echo "region-pool release lifetime smoke: rejected an alias rebound from a released owner to a live handle at -O$optimization" >&2
@@ -125,4 +139,4 @@ for optimization in 0 2; do
     [[ -s "$good_output" ]] || { echo "region-pool release lifetime smoke: did not emit LLVM for the live-before-release control at -O$optimization" >&2; exit 1; }
 done
 
-echo "region-pool release lifetime smoke OK: copied pointers are invalidated by direct, conditional, nested-field, rebound, aggregate, and parameter release at -O0/-O2"
+echo "region-pool release lifetime smoke OK: copied pointers are invalidated by direct, conditional, nested-field, straight-line and branch-rebound, aggregate, and parameter release at -O0/-O2"
