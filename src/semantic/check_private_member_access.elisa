@@ -15,9 +15,94 @@
 # declaration is not that module.
 extend Semantic:
     private:
+        const PMA_HASH_COMPONENT_SEPARATOR: u64 = 255
+
+        struct PrivateImportSourceIndex:
+            heads: mutable dict[u64, u32]
+            lines: mutable darray[u32]
+            owners: mutable darray[sview]
+            next: mutable darray[u32]
+
         struct PrivateMemberIndex:
             names: mutable darray[sview]
             modules: mutable darray[sview]
+            name_heads: mutable dict[u64, u32]
+            name_next: mutable darray[u32]
+            import_heads: mutable dict[u64, u32]
+            import_owners: mutable darray[sview]
+            import_members: mutable darray[sview]
+            import_next: mutable darray[u32]
+
+        def pma_member_head(index: PrivateMemberIndex&, name: sview) -> u32:
+            can Abort.Panic:
+                return head if index.name_heads.get(name_hash(name)) is head else SYMBOL_INDEX_ROW_NONE
+
+        def pma_import_head(index: PrivateMemberIndex&, hash: u64) -> u32:
+            can Abort.Panic:
+                return head if index.import_heads.get(hash) is head else SYMBOL_INDEX_ROW_NONE
+
+        def pma_import_source_head(index: PrivateImportSourceIndex&, line: u32) -> u32:
+            can Abort.Panic:
+                return row if index.heads.get(line.u64()) is row else SYMBOL_INDEX_ROW_NONE
+
+        def pma_import_source_contains(index: PrivateImportSourceIndex&, line: u32, owner: sview) -> bool:
+            can Abort.Panic:
+                row: mutable u32 = pma_import_source_head(index, line)
+                while row != SYMBOL_INDEX_ROW_NONE |row, index, line, owner|:
+                    return true if index.lines[row.usize()] == line and index.owners[row.usize()] == owner
+                    row <- index.next[row.usize()]
+                return false
+
+        def pma_selective_import_hash(owner: sview, member: sview) -> u64:
+            can Abort.Panic:
+                # Separate the two byte strings before hashing. The resulting hash only
+                # selects a collision chain; exact owner/member equality remains authoritative.
+                hash: mutable u64 = name_hash(owner)
+                hash <- (hash ^ PMA_HASH_COMPONENT_SEPARATOR) * SEMANTIC_HASH_PRIME
+                for byte in member |hash|:
+                    hash <- (hash ^ byte.u64()) * SEMANTIC_HASH_PRIME
+                return hash
+
+        def pma_add_selective_import(index: mutable PrivateMemberIndex&, owner: sview, member: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                hash: u64 = pma_selective_import_hash(owner, member)
+                row: mutable u32 = pma_import_head(index, hash)
+                while row != SYMBOL_INDEX_ROW_NONE |row, index, owner, member|:
+                    return if index.import_owners[row.usize()] == owner and index.import_members[row.usize()] == member
+                    row <- index.import_next[row.usize()]
+                new_row: u32 = index.import_owners.count.u32()
+                previous: u32 = pma_import_head(index, hash)
+                index.import_owners.push(owner)
+                index.import_members.push(member)
+                index.import_next.push(previous)
+                index.import_heads <- index.import_heads.put(hash, new_row)
+
+        def pma_build_selective_import_index(annotations: darray[Ast::EnumAnnotation]&, index: mutable PrivateMemberIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                sources: mutable PrivateImportSourceIndex = PrivateImportSourceIndex{heads: {}, lines: [], owners: [], next: []}
+                # Build a line index once. The source/member relation is defined by the parser's
+                # paired source line, not by adjacency, so multiple annotations on one line keep
+                # the same conservative matching behavior as the previous checker.
+                for annotation in annotations |sources|:
+                    continue if annotation.owner != "__from_src"
+                    # A multi-member `from M import ...` repeats the same source annotation
+                    # for every member. Store that (line, owner) source once rather than
+                    # creating a quadratic cross-product when projecting its members.
+                    continue if pma_import_source_contains(sources, annotation.line, annotation.name)
+                    hash: u64 = annotation.line.u64()
+                    previous: u32 = pma_import_source_head(sources, annotation.line)
+                    row: u32 = sources.owners.count.u32()
+                    sources.lines.push(annotation.line)
+                    sources.owners.push(annotation.name)
+                    sources.next.push(previous)
+                    sources.heads <- sources.heads.put(hash, row)
+                for annotation in annotations |annotations, sources, index|:
+                    continue if annotation.owner != "__from_member"
+                    row: mutable u32 = pma_import_source_head(sources, annotation.line)
+                    while row != SYMBOL_INDEX_ROW_NONE |row, annotations, sources, annotation, index|:
+                        if sources.lines[row.usize()] == annotation.line:
+                            pma_add_selective_import(index, sources.owners[row.usize()], annotation.name)
+                        row <- sources.next[row.usize()]
 
         def pma_build_index(annotations: darray[Ast::EnumAnnotation]&, index: mutable PrivateMemberIndex&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -27,16 +112,22 @@ extend Semantic:
                     continue if annotation_index + 1 >= annotations.count
                     module_annotation: Ast::EnumAnnotation = annotations[annotation_index + 1]
                     continue if module_annotation.owner != "__private_member_module"
+                    row: u32 = index.names.count.u32()
+                    previous: u32 = pma_member_head(index, annotation.name)
                     index.names.push(annotation.name)
                     index.modules.push(module_annotation.name)
+                    index.name_next.push(previous)
+                    index.name_heads <- index.name_heads.put(name_hash(annotation.name), row)
 
         # Whether `module_name` declares `member` in a `private:` section. Each
         # `__private_member` entry is followed by a `__private_member_module` entry
         # naming its module, so the same member name in another module is unaffected.
         def pma_is_private(index: PrivateMemberIndex&, module_name: sview, member: sview) -> bool:
             can Abort.Panic:
-                for private_index in 0..<index.names.count:
-                    true return if index.names[private_index] == member and index.modules[private_index] == module_name
+                private_index: mutable u32 = pma_member_head(index, member)
+                while private_index != SYMBOL_INDEX_ROW_NONE |private_index, index, module_name, member|:
+                    true return if index.names[private_index.usize()] == member and index.modules[private_index.usize()] == module_name
+                    private_index <- index.name_next[private_index.usize()]
                 return false
 
         # Whether `candidate` is exactly `owner` + `::` + `member`. A NESTED module is
@@ -83,16 +174,17 @@ extend Semantic:
                     member_row <- table.member_name_next[member_row.usize()]
                 return symbol_count > member_count
 
-        # A selective `from Mod import member` carries the source module in a line-paired
-        # `__from_src` annotation. `table.imported_members` intentionally keeps only the
-        # spelling for ordinary name resolution, but using that spelling alone here would
-        # conflate `from B import hidden` with a private `hidden` in an unrelated module A.
-        def pma_selective_imports(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview) -> bool:
+        # `table.imported_members` intentionally keeps only the member spelling. The compact
+        # line-indexed pair projection preserves the source module without rescanning all
+        # annotations (and without conflating a private name from one module with an import
+        # from another module).
+        def pma_selective_imports(index: PrivateMemberIndex&, owner: sview, member: sview) -> bool:
             can Abort.Panic:
-                for member_row in annotations:
-                    continue if member_row.owner != "__from_member" or member_row.name != member
-                    for source_row in annotations:
-                        true return if source_row.owner == "__from_src" and source_row.line == member_row.line and source_row.name == owner
+                hash: u64 = pma_selective_import_hash(owner, member)
+                row: mutable u32 = pma_import_head(index, hash)
+                while row != SYMBOL_INDEX_ROW_NONE |row, index, owner, member|:
+                    true return if index.import_owners[row.usize()] == owner and index.import_members[row.usize()] == member
+                    row <- index.import_next[row.usize()]
                 return false
 
         # Is the accessing module INSIDE the owner's privacy boundary? A nested module is:
@@ -122,18 +214,18 @@ extend Semantic:
         # check, but `using M` makes `M::hidden` and `hidden` the same visibility
         # boundary. Keep the caller's lexical bindings in the query so a parameter
         # or local that shadows a private imported member is not misdiagnosed.
-        def pma_unqualified_owner(table: SymbolTable&, current_module: sview, private_index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, bound: darray[sview]&, member: sview) -> sview:
+        def pma_unqualified_owner(table: SymbolTable&, current_module: sview, private_index: PrivateMemberIndex&, bound: darray[sview]&, member: sview) -> sview:
             can Abort.Panic:
                 return "" if any bound_name in bound where bound_name == member
                 return "" if pma_has_global_value(table, member)
                 row: mutable u32 = member_chain_head(table, member)
-                while row != SYMBOL_INDEX_ROW_NONE |row, table, current_module, annotations, member|:
+                while row != SYMBOL_INDEX_ROW_NONE |row, table, current_module, member|:
                     index: usize = row.usize()
                     if table.module_member_name[index] == member:
                         owner: sview = table.module_member_owner[index]
                         if not pma_within_module(current_module, owner):
                             imported: mutable bool = any imported_module in table.imported_modules where imported_module == owner
-                            imported <- true if pma_selective_imports(table, annotations, owner, member)
+                            imported <- true if pma_selective_imports(private_index, owner, member)
                             return owner if imported and pma_is_private(private_index, owner, member) and pma_module_owns(table, owner, member)
                     row <- table.member_name_next[index]
                 return ""
@@ -167,11 +259,12 @@ extend Semantic:
         # (`Geo::Scalar`) be compared without materialising it.
         def pma_scope_owner(index: PrivateMemberIndex&, table: SymbolTable&, base: Ast::Expr, member: sview) -> sview:
             can Abort.Panic:
-                for private_index in 0..<index.names.count:
-                    continue if index.names[private_index] != member
-                    candidate: sview = index.modules[private_index]
-                    continue if not pma_chain_ends_at(base, candidate, sview_len(candidate))
-                    return candidate
+                private_index: mutable u32 = pma_member_head(index, member)
+                while private_index != SYMBOL_INDEX_ROW_NONE |private_index, index, base, member|:
+                    candidate: sview = index.modules[private_index.usize()]
+                    if index.names[private_index.usize()] == member and pma_chain_ends_at(base, candidate, sview_len(candidate)):
+                        return candidate
+                    private_index <- index.name_next[private_index.usize()]
                 return ""
 
         # The leftmost segment of a scope chain: stage0 reports a privacy error AT the head
@@ -188,7 +281,7 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Ident(member, ident_line):
-                        owner: sview = pma_unqualified_owner(table, current_module, index, annotations, bound, member)
+                        owner: sview = pma_unqualified_owner(table, current_module, index, bound, member)
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: ident_line, line: ident_line.line, expected: "", actual: owner}) if owner != ""
                     Expr.Scope(base, member, scope_line):
                         # The path is checked OUTSIDE-IN: a private module closes the door on
@@ -304,6 +397,7 @@ extend Semantic:
         def check_private_member_access(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 has_private: bool = any annotation in file.enum_annotations where annotation.owner == "__private_member"
-                private_index: mutable PrivateMemberIndex = PrivateMemberIndex{names: [], modules: []}
+                private_index: mutable PrivateMemberIndex = PrivateMemberIndex{names: [], modules: [], name_heads: {}, name_next: [], import_heads: {}, import_owners: [], import_members: [], import_next: []}
                 pma_build_index(file.enum_annotations, private_index) if has_private
+                pma_build_selective_import_index(file.enum_annotations, private_index) if has_private
                 table <- pma_walk_declarations(file.top_decls, "", private_index, file.enum_annotations, table) if has_private

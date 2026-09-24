@@ -79,4 +79,16 @@ def main() -> i64:
     return hidden + 1
 ELISA
 
+check_case selective_private_import reject <<'ELISA'
+module Vault:
+    private:
+        def hidden() -> i64:
+            return 41
+
+from Vault import hidden
+
+def main() -> i64:
+    return hidden()
+ELISA
+
 echo "private visibility smoke OK"
