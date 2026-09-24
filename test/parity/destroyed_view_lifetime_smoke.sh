@@ -16,6 +16,7 @@ BAD="$ROOT/test/repro/sview_region_use_after_destroy.elisa"
 GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
 POOL_PROJECTION_BAD="$ROOT/test/repro/region_pool_projection_after_destroy.elisa"
+POOL_PRIMITIVE_BAD="$ROOT/test/repro/region_pool_primitive_after_destroy.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
 JSON_REGION_MISMATCH_BAD="$ROOT/test/repro/json_handle_region_mismatch.elisa"
 SHADOW_REBIND_BAD="$ROOT/test/repro/shadowed_region_generic_rebind.elisa"
@@ -103,6 +104,24 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$pool_projection_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected region-pool projection at O$optimization" >&2; exit 1; }
+
+    pool_primitive_output="$WORK/region-pool-primitive-O$optimization"
+    pool_primitive_log="$pool_primitive_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$pool_primitive_output.ll" "$POOL_PRIMITIVE_BAD" >"$pool_primitive_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a RegionPool[Pooled] handle or copied pointer after destroying its backing arena at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'value "handle" cannot be used: region dependency facts were invalidated by destroy of region "scratch"' "$pool_primitive_log" || {
+        echo "destroyed view lifetime smoke: RegionPool/Pooled direct use lost its arena dependency at O$optimization" >&2
+        cat "$pool_primitive_log" >&2
+        exit 1
+    }
+    rg -Fq 'value "ptr" cannot be used: region dependency facts were invalidated by destroy of region "scratch"' "$pool_primitive_log" || {
+        echo "destroyed view lifetime smoke: RegionPool/Pooled projection copy lost its arena dependency at O$optimization" >&2
+        cat "$pool_primitive_log" >&2
+        exit 1
+    }
+    [[ ! -e "$pool_primitive_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected primitive region-pool handle at O$optimization" >&2; exit 1; }
 
     multi_generic_output="$WORK/multiple-generic-O$optimization"
     multi_generic_log="$multi_generic_output.log"
