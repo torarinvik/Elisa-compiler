@@ -1,9 +1,9 @@
 # A struct construction `Box{v: n}` whose field `v` carries a `where v > 0` refinement and whose
 # supplied value cannot establish it (a call/field/arithmetic expression, or a bare parameter that
-# is not itself refined) is unproven under the non-SMT prover — stage0 warns "where refinement on
-# field could not be proven". A literal value (`Box{v: 5}`) is discharged/violated elsewhere and a
-# refined-parameter value carries the fact, so both stay silent. Region-safe: leaf extractors for
-# StructMember/ParamDecl bindings, flat Decl walk (mirrors check_local_where_violated).
+# is not itself refined) is unproven under the non-SMT prover. Stage1 rejects the program because
+# emitting code would let an unvalidated value enter storage that promises the invariant. A
+# literal inside a recognized interval or a refined-parameter value carries enough evidence.
+# Region-safe: leaf extractors for StructMember/ParamDecl bindings, flat Decl walk.
 extend Semantic:
     private:
         def sfcu_member_where_refined(member: Ast::StructMember) -> bool:
@@ -24,8 +24,11 @@ extend Semantic:
                         struct_out.push(struct_name)
                         field_out.push(sfcu_member_name(members[index]))
                         window: (found: bool, lo: i64, hi: i64) = subject_interval(where_predicate_of_type(members[index].type_expression), members[index].name)
-                        lo_out.push(window.lo if window.found else (0 - 9223372036854775807 - 1))
-                        hi_out.push(window.hi if window.found else 9223372036854775807)
+                        # An unknown predicate is not the full integer range. The inverted
+                        # interval is a sentinel that prevents unrelated assertions from
+                        # accidentally discharging a non-interval invariant.
+                        lo_out.push(window.lo if window.found else 1)
+                        hi_out.push(window.hi if window.found else 0)
                     index <- index + 1
 
         def sfcu_collect_refined_fields(declarations: darray[Ast::Decl], struct_out: mutable darray[sview]&, field_out: mutable darray[sview]&, lo_out: mutable darray[i64]&, hi_out: mutable darray[i64]&) -> void:
@@ -108,6 +111,9 @@ extend Semantic:
         # Whether the established predicates prove `value` lies within [window_lo, window_hi].
         def sfcu_value_within_window(value: Ast::Expr, window_lo: i64, window_hi: i64, established: darray[Ast::Expr]&) -> bool:
             can Memory.Allocate, Abort.Panic:
+                false return if window_lo > window_hi
+                constant: (found: bool, value: i64) = fold_const_int(value)
+                return constant.found and constant.value >= window_lo and constant.value <= window_hi if constant.found
                 lo: mutable i64 = 0 - 9223372036854775807 - 1
                 hi: mutable i64 = 9223372036854775807
                 any_bound: mutable bool = false
@@ -127,25 +133,43 @@ extend Semantic:
         def sfcu_value_unprovable(value: Ast::Expr, param_names: darray[sview]&, param_refined: darray[bool]&) -> bool:
             can Abort.Panic:
                 match value:
-                    Expr.Call(callee, arguments, argument_names, call_line):
-                        return true
-                    Expr.Field(object, field, field_line):
-                        return true
-                    Expr.Binary(left, operator, right, binary_line):
-                        return true
-                    Expr.Unary(operator, operand, unary_line):
-                        return true
                     Expr.Ident(name, ident_line):
-                        slot: mutable i64 = -1
-                        probe: mutable usize = 0
-                        # Parallel rows form a lexical shadow stack: the newest matching
-                        # binding wins (loop/local/pattern binders may shadow parameters).
-                        while probe < param_names.count |slot, probe, name, param_names|:
-                            slot <- probe.i64() if param_names[probe] == name
-                            probe <- probe + 1
-                        return not param_refined[slot.usize()] if slot >= 0 else false
+                        # Even an annotated refined binding must be checked against the
+                        # destination field's predicate; an unrelated refinement is not enough.
+                        # `param_refined` remains in the walker's lexical rows for future
+                        # predicate entailment, but this interval-only proof does not trust it.
+                        return true
                     _:
-                        return false
+                        # This pass proves only constants, established interval facts, and
+                        # already-refined bindings. Unsupported expressions must fail closed.
+                        return true
+
+        # Facts are expressions over lexical names. A declaration or loop binder that shadows
+        # a name invalidates outer facts mentioning that name for the duration of that scope.
+        def sfcu_expr_mentions_name(expression: Ast::Expr, name: sview) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(ident, line):
+                        return ident == name
+                    Expr.Paren(inner, line):
+                        return sfcu_expr_mentions_name(inner, name)
+                    Expr.Unary(operator, operand, line):
+                        return sfcu_expr_mentions_name(operand, name)
+                    Expr.Binary(left, operator, right, line):
+                        return sfcu_expr_mentions_name(left, name) or sfcu_expr_mentions_name(right, name)
+                    Expr.Field(object, field, line):
+                        return sfcu_expr_mentions_name(object, name)
+                    _:
+                        # Unknown predicate shapes are dropped conservatively when a binding
+                        # shadows a name; keeping a potentially name-dependent fact is unsafe.
+                        return true
+
+        def sfcu_drop_facts_for_name(name: sview, established: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                snapshot: mutable darray[Ast::Expr] = [predicate for predicate in established]
+                established.truncate(0)
+                for predicate in snapshot |established|:
+                    established.push(predicate) if not sfcu_expr_mentions_name(predicate, name)
 
         def sfcu_walk_expr(expression: Ast::Expr, struct_names: darray[sview]&, field_names: darray[sview]&, field_lo: darray[i64]&, field_hi: darray[i64]&, param_names: mutable darray[sview]&, param_types: mutable darray[sview]&, param_refined: mutable darray[bool]&, established: mutable darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -158,15 +182,21 @@ extend Semantic:
                             # supplied value into the field's where-window discharges the obligation.
                             proven_by_fact: bool = sfcu_value_within_window(field_init.value, window.lo, window.hi, established)
                             fire: bool = sfcu_field_refined(struct_name, field_init.name, struct_names, field_names) and sfcu_value_unprovable(field_init.value, param_names, param_refined) and not proven_by_fact
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: "where refinement on field", pos: construct_line, line: construct_line.line, expected: "", actual: ""}) if fire
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StructFieldRefinementUnproven, name: field_init.name, pos: construct_line, line: construct_line.line, expected: struct_name, actual: ""}) if fire
                             table <- sfcu_walk_expr(field_init.value, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
                     # Capture-header loops are parsed as `Stmt.Expr(Expr.Block([decls…, loop], …))`.
                     # Visit both the block's statements and value so the ordinary statement
                     # visitor sees the actual loop binders and their lexical shadowing.
                     Expr.Block(block_statements, block_value, block_captures, block_line):
+                        name_mark: usize = param_names.count
+                        type_mark: usize = param_types.count
+                        refined_mark: usize = param_refined.count
                         block_established: mutable darray[Ast::Expr] = [p6 for p6 in established]
-                        table <- sfcu_walk_stmts(block_statements, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, block_established, table)
+                        table <- sfcu_walk_stmts(block_statements, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, block_established, table, true)
                         table <- sfcu_walk_expr(block_value, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, block_established, table)
+                        param_names.truncate(name_mark)
+                        param_types.truncate(type_mark)
+                        param_refined.truncate(refined_mark)
                     Expr.Binary(left, operator, right, binary_line):
                         table <- sfcu_walk_expr(left, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
                         table <- sfcu_walk_expr(right, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
@@ -175,6 +205,21 @@ extend Semantic:
                     Expr.Call(callee, arguments, argument_names, call_line):
                         for argument in arguments |table, param_names, param_types, param_refined, established| -> table:
                             table <- sfcu_walk_expr(argument, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
+                    Expr.Lambda(parameters, body, lambda_line):
+                        name_mark: usize = param_names.count
+                        type_mark: usize = param_types.count
+                        refined_mark: usize = param_refined.count
+                        for parameter in parameters |param_names, param_types, param_refined|:
+                            param_names.push(parameter)
+                            param_types.push("")
+                            param_refined.push(false)
+                        lambda_established: mutable darray[Ast::Expr] = [p7 for p7 in established]
+                        for parameter in parameters |lambda_established|:
+                            sfcu_drop_facts_for_name(parameter, lambda_established)
+                        table <- sfcu_walk_stmts(body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, lambda_established, table, false)
+                        param_names.truncate(name_mark)
+                        param_types.truncate(type_mark)
+                        param_refined.truncate(refined_mark)
                     _:
                         pass
 
@@ -205,8 +250,11 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        def sfcu_walk_stmts(statements: darray[Ast::Stmt], struct_names: darray[sview]&, field_names: darray[sview]&, field_lo: darray[i64]&, field_hi: darray[i64]&, param_names: mutable darray[sview]&, param_types: mutable darray[sview]&, param_refined: mutable darray[bool]&, established: mutable darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+        def sfcu_walk_stmts(statements: darray[Ast::Stmt], struct_names: darray[sview]&, field_names: darray[sview]&, field_lo: darray[i64]&, field_hi: darray[i64]&, param_names: mutable darray[sview]&, param_types: mutable darray[sview]&, param_refined: mutable darray[bool]&, established: mutable darray[Ast::Expr]&, table: lmut SymbolTable, preserve_bindings: bool) -> void:
             can Memory.Allocate, Abort.Panic:
+                name_mark: usize = param_names.count
+                type_mark: usize = param_types.count
+                refined_mark: usize = param_refined.count
                 for statement in statements |established, table, param_names, param_types, param_refined| -> table:
                     match statement:
                         # A straight-line `assert`/`requires` establishes its predicate as a fact
@@ -217,6 +265,13 @@ extend Semantic:
                             table <- sfcu_walk_expr(expression, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
                         Stmt.VarDecl(name, type_expression, value, decl_line):
                             table <- sfcu_walk_expr(value, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
+                            # A local shadows parameters from its declaration onward. Its
+                            # refinement is deliberately not assumed here: its initializer
+                            # must be proved before that fact can safely flow onward.
+                            sfcu_drop_facts_for_name(name, established)
+                            param_names.push(name)
+                            param_types.push(bare_type_name_through_ref(type_expression))
+                            param_refined.push(false)
                         Stmt.Assign(target, operator, value, assign_line):
                             # A field STORE `p.x <- v` where p's struct field x is where-refined
                             # and v cannot establish it — same unprovable rule as construction.
@@ -226,7 +281,7 @@ extend Semantic:
                             store_window: (lo: i64, hi: i64) = sfcu_field_window(store_struct, store_field, struct_names, field_names, field_lo, field_hi)
                             store_proven: bool = sfcu_value_within_window(value, store_window.lo, store_window.hi, established)
                             store_fire: bool = operator == TokenKind.LArrow and store_struct != "" and sfcu_field_refined(store_struct, store_field, struct_names, field_names) and sfcu_value_unprovable(value, param_names, param_refined) and not store_proven
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: "where refinement on field", line: assign_line.line, expected: "", actual: ""}) if store_fire
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StructFieldRefinementUnproven, name: store_field, line: assign_line.line, expected: store_struct, actual: ""}) if store_fire
                             table <- sfcu_walk_expr(value, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
                         Stmt.Return(value, return_line):
                             if value is returned_value:
@@ -234,11 +289,11 @@ extend Semantic:
                         Stmt.If(condition, then_body, else_body, if_line):
                             then_established: mutable darray[Ast::Expr] = [p for p in established]
                             else_established: mutable darray[Ast::Expr] = [p2 for p2 in established]
-                            table <- sfcu_walk_stmts(then_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, then_established, table)
-                            table <- sfcu_walk_stmts(else_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, else_established, table)
+                            table <- sfcu_walk_stmts(then_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, then_established, table, false)
+                            table <- sfcu_walk_stmts(else_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, else_established, table, false)
                         Stmt.While(while_condition, while_body, while_line):
                             while_established: mutable darray[Ast::Expr] = [p3 for p3 in established]
-                            table <- sfcu_walk_stmts(while_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, while_established, table)
+                            table <- sfcu_walk_stmts(while_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, while_established, table, false)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
                             # A for-loop variable is a fresh, unrefined binding, even when
                             # it reuses the name of a refined function parameter. `bind`
@@ -252,15 +307,21 @@ extend Semantic:
                                 param_types.push("")
                                 param_refined.push(false)
                             for_established: mutable darray[Ast::Expr] = [p4 for p4 in established]
-                            table <- sfcu_walk_stmts(for_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, for_established, table)
+                            for variable in variables |for_established|:
+                                sfcu_drop_facts_for_name(variable, for_established)
+                            table <- sfcu_walk_stmts(for_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, for_established, table, false)
                             param_names.truncate(name_mark)
                             param_types.truncate(type_mark)
                             param_refined.truncate(refined_mark)
                         Stmt.Block(kind, clause, binding, block_body, block_line):
                             block_established: mutable darray[Ast::Expr] = [p5 for p5 in established]
-                            table <- sfcu_walk_stmts(block_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, block_established, table)
+                            table <- sfcu_walk_stmts(block_body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, block_established, table, false)
                         _:
                             pass
+                if not preserve_bindings:
+                    param_names.truncate(name_mark)
+                    param_types.truncate(type_mark)
+                    param_refined.truncate(refined_mark)
 
         def sfcu_param_name(parameter: Ast::ParamDecl) -> sview:
             can Abort.Panic:
@@ -276,10 +337,17 @@ extend Semantic:
                             param_refined: mutable darray[bool] = []
                             for parameter in parameters |param_names, param_types, param_refined|:
                                 param_names.push(sfcu_param_name(parameter))
-                                param_types.push(bare_type_name(parameter.type_expression))
+                                param_types.push(bare_type_name_through_ref(parameter.type_expression))
                                 param_refined.push(sfcu_param_is_refined(parameter.type_expression))
                             established: mutable darray[Ast::Expr] = []
-                            table <- sfcu_walk_stmts(body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table)
+                            for parameter in parameters |established|:
+                                predicate: Ast::Expr = where_predicate_of_type(parameter.type_expression)
+                                match predicate:
+                                    Expr.Absent:
+                                        pass
+                                    _:
+                                        established.push(predicate)
+                            table <- sfcu_walk_stmts(body, struct_names, field_names, field_lo, field_hi, param_names, param_types, param_refined, established, table, false)
                         Decl.Module(module_name, module_body, module_line):
                             table <- sfcu_walk_decls(module_body, struct_names, field_names, field_lo, field_hi, table)
                         Decl.Scoped(scoped_body, scoped_line):
