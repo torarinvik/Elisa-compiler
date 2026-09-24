@@ -399,6 +399,27 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         "pointer arithmetic requires",
     ),
+    "pointer arithmetic through module-qualified typed calls": (
+        "# strict\n"
+        "module PointerOps:\n"
+        "    def as_pointer(value: u8&) -> u8&:\n        return value\n"
+        "    def as_offset(value: usize) -> usize:\n        return value\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    return PointerOps::as_pointer(pointer) + PointerOps::as_offset(offset)\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through module-qualified typed calls exact grant": (
+        "# strict\n"
+        "module PointerOps:\n"
+        "    def as_pointer(value: u8&) -> u8&:\n        return value\n"
+        "    def as_offset(value: usize) -> usize:\n        return value\n"
+        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
+        "    can Unsafe.PointerArithmetic:\n"
+        "        return PointerOps::as_pointer(pointer) + PointerOps::as_offset(offset)\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "pointer arithmetic through typed struct fields": (
         "# strict\n"
         "struct PointerPair:\n    pointer: u8&\n    offset: usize\n"
