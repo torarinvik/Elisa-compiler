@@ -712,6 +712,50 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "pointer arithmetic through referenced enum match pattern": (
+        "# strict\n"
+        "enum ReferencedPointerOffset:\n    Offset(pointer: u8&, step: usize)\n    Empty\n"
+        "def bad(value: ReferencedPointerOffset&) -> i64:\n"
+        "    match value:\n"
+        "        ReferencedPointerOffset.Offset(pointer, step):\n            pointer + step\n"
+        "        ReferencedPointerOffset.Empty:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through referenced enum match pattern exact grant": (
+        "# strict\n"
+        "enum ReferencedPointerOffset:\n    Offset(pointer: u8&, step: usize)\n    Empty\n"
+        "def bad(value: ReferencedPointerOffset&) -> i64:\n"
+        "    match value:\n"
+        "        ReferencedPointerOffset.Offset(pointer, step):\n"
+        "            can Unsafe.PointerArithmetic:\n                pointer + step\n"
+        "        ReferencedPointerOffset.Empty:\n            pass\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
+    "pointer arithmetic through referenced struct match pattern": (
+        "# strict\n"
+        "struct ReferencedPointerOffset:\n    pointer: u8&\n    step: usize\n"
+        "def bad(value: ReferencedPointerOffset&) -> i64:\n"
+        "    match value:\n"
+        "        ReferencedPointerOffset{pointer, step}:\n            pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through referenced struct match pattern exact grant": (
+        "# strict\n"
+        "struct ReferencedPointerOffset:\n    pointer: u8&\n    step: usize\n"
+        "def bad(value: ReferencedPointerOffset&) -> i64:\n"
+        "    match value:\n"
+        "        ReferencedPointerOffset{pointer, step}:\n"
+        "            can Unsafe.PointerArithmetic:\n                pointer + step\n"
+        "    return 0\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "extern unrelated grant": (
         "# strict\n# unsafe\n"
         "extern foreign() -> i64\n"
