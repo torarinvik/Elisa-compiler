@@ -28,6 +28,10 @@ ARENA_ALIAS_RESET_BAD="$ROOT/test/repro/arena_alias_reset_leak.elisa"
 ARENA_ALIAS_RESET_GOOD="$ROOT/test/parity/fixtures/arena_alias_reset_live.elisa"
 ARENA_HELPER_RESET_BAD="$ROOT/test/repro/arena_helper_reset_leak.elisa"
 ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elisa"
+ARENA_NAMED_RESET_BAD="$ROOT/test/repro/arena_named_reset_leak.elisa"
+ARENA_NAMED_RESET_GOOD="$ROOT/test/parity/fixtures/arena_named_reset_live.elisa"
+ARENA_OPAQUE_RESET_BAD="$ROOT/test/repro/arena_opaque_reset_leak.elisa"
+ARENA_BLOCK_RESET_BAD="$ROOT/test/repro/arena_block_expression_reset_leak.elisa"
 GOOD="$ROOT/test/parity/fixtures/sview_region_live_use.elisa"
 SHADOW_GOOD="$ROOT/test/parity/fixtures/region_shadow_outer_live_use.elisa"
 LAST_USE="$ROOT/test/repro/sview_region_last_use_before_destroy.elisa"
@@ -251,6 +255,62 @@ for optimization in 0 2; do
         cat "$arena_helper_live_log.run" >&2
         exit 1
     }
+
+    arena_named_reset_output="$WORK/arena-named-reset-O$optimization"
+    arena_named_reset_log="$arena_named_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_named_reset_output.ll" "$ARENA_NAMED_RESET_BAD" >"$arena_named_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: named helper arguments invalidated the wrong owner at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "first"' "$arena_named_reset_log" || {
+        echo "destroyed view lifetime smoke: named reset helper lost its target parameter identity at O$optimization" >&2
+        cat "$arena_named_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_named_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale view after named reset at O$optimization" >&2; exit 1; }
+
+    arena_named_live_output="$WORK/arena-named-reset-live-O$optimization"
+    arena_named_live_log="$arena_named_live_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$arena_named_live_output" "$ARENA_NAMED_RESET_GOOD" >"$arena_named_live_log" 2>&1 || {
+        echo "destroying the named second Arena invalidated a view tied to the named kept Arena at O$optimization" >&2
+        cat "$arena_named_live_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$arena_named_live_output" >"$arena_named_live_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 65 ]] || {
+        echo "destroyed view lifetime smoke: named independent-owner control returned $run_status at O$optimization, expected 65" >&2
+        cat "$arena_named_live_log.run" >&2
+        exit 1
+    }
+
+    arena_opaque_reset_output="$WORK/arena-opaque-reset-O$optimization"
+    arena_opaque_reset_log="$arena_opaque_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_opaque_reset_output.ll" "$ARENA_OPAQUE_RESET_BAD" >"$arena_opaque_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a stale view after an opaque external call received its Arena& at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_opaque_reset_log" || {
+        echo "destroyed view lifetime smoke: opaque external call lost the passed arena dependency at O$optimization" >&2
+        cat "$arena_opaque_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_opaque_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting an opaque external arena call at O$optimization" >&2; exit 1; }
+
+    arena_block_reset_output="$WORK/arena-block-reset-O$optimization"
+    arena_block_reset_log="$arena_block_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$arena_block_reset_output.ll" "$ARENA_BLOCK_RESET_BAD" >"$arena_block_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a stale view after a reset hidden in a block expression at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "alloc"' "$arena_block_reset_log" || {
+        echo "destroyed view lifetime smoke: block-expression reset lost its owner dependency at O$optimization" >&2
+        cat "$arena_block_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$arena_block_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM after rejecting a block-expression stale view at O$optimization" >&2; exit 1; }
 
     for invalidation in reset rewind; do
         invalidation_source="$ROOT/test/repro/manual_arena_${invalidation}_use_after_region.elisa"
