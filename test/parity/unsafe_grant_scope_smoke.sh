@@ -378,6 +378,22 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         "pointer arithmetic requires",
     ),
+    "pointer arithmetic through typed struct fields": (
+        "# strict\n"
+        "struct PointerPair:\n    pointer: u8&\n    offset: usize\n"
+        "def bad(pair: PointerPair&) -> u8&:\n"
+        "    return pair.pointer + pair.offset\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer arithmetic requires",
+    ),
+    "pointer arithmetic through typed struct fields exact grant": (
+        "# strict\n"
+        "struct PointerPair:\n    pointer: u8&\n    offset: usize\n"
+        "def bad(pair: PointerPair&) -> u8&:\n"
+        "    can Unsafe.PointerArithmetic:\n        return pair.pointer + pair.offset\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
     "pointer arithmetic ignores a shadowed reference name": (
         "# strict\n"
         "def bad(pointer: u8&, offset: usize) -> i64:\n"
