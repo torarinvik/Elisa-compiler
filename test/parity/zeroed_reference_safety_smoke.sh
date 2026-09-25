@@ -225,6 +225,27 @@ for level in 0 2; do
     }
 done
 
+# An unqualified alias imported lexically from an enclosing module keeps that declaration's
+# owner for any qualified relative path in its target, even if the use site has a shadowing
+# nested module with the same path.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-inherited-alias-owner-O$level.ll"
+    log="$WORK/stage1-zeroed-inherited-alias-owner-O$level.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_inherited_alias_owner_context.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted an inherited sview alias with a shadowed relative target at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed inherited-alias compilation left an LLVM artifact at -O$level" >&2
+        exit 1
+    }
+    rg -q 'variable "inherited_view" expects sview with valid backing' "$log" || {
+        echo "zeroed reference smoke: inherited alias target was not resolved from its declaration owner" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
 # A module path may be written relative to the current module or any enclosing module.
 # Exercise every classifier through those language-supported spellings; exact fully
 # qualified paths are covered above. These checks stay Stage1-only until Stage0 implements
