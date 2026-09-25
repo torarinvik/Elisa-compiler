@@ -70,6 +70,17 @@ mkdir -p "$WORK/driver" "$WORK/python"
 status=0
 compared=0
 
+sidecar_mtimes() {
+    python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+stem = pathlib.Path(sys.argv[1])
+for suffix in (".json", ".mjs", ".d.ts", ".d.mts"):
+    print(stem.with_name(stem.name + suffix).stat().st_mtime_ns)
+PY
+}
+
 compare_one() {
     local label="$1" source="$2"
 
@@ -105,6 +116,30 @@ compare_one() {
     else
         echo "wasm_python_parity FAIL: $label.wasm differs ($(wc -c <"$WORK/driver/$label.wasm") vs $(wc -c <"$WORK/python/$label.wasm") bytes)" >&2
         status=1
+    fi
+
+    # Re-run one real public-driver build and require identical sidecars to retain
+    # their timestamps. The process-tree supervisor bounds this extra compiler run.
+    if [ "$label" = demo ]; then
+        before_mtimes="$(sidecar_mtimes "$WORK/driver/$label")" || {
+            echo "wasm_python_parity FAIL: unable to snapshot sidecar timestamps" >&2
+            status=1
+            return
+        }
+        RUN "$WRAPPER" -emit wasm -o "$WORK/driver/$label.wasm" "$source" >"$WORK/driver-$label-noop.log" 2>&1 || {
+            echo "wasm_python_parity FAIL: repeated driver build of $label failed" >&2
+            sed -n '1,20p' "$WORK/driver-$label-noop.log" >&2
+            status=1; return
+        }
+        after_mtimes="$(sidecar_mtimes "$WORK/driver/$label")" || {
+            echo "wasm_python_parity FAIL: unable to recheck sidecar timestamps" >&2
+            status=1
+            return
+        }
+        if [ "$before_mtimes" != "$after_mtimes" ]; then
+            echo "wasm_python_parity FAIL: unchanged $label sidecars were rewritten" >&2
+            status=1
+        fi
     fi
 }
 

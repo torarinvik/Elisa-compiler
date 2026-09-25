@@ -62,9 +62,10 @@ class WasmBindingsTests(unittest.TestCase):
             self.assertTrue(write_text_if_changed(path, "export {};\n"))
             expected_mtime = 1_600_000_000_123_456_789
             os.utime(path, ns=(expected_mtime, expected_mtime))
+            original_mtime = path.stat().st_mtime_ns
 
             self.assertFalse(write_text_if_changed(path, "export {};\n"))
-            self.assertEqual(path.stat().st_mtime_ns, expected_mtime)
+            self.assertEqual(path.stat().st_mtime_ns, original_mtime)
             self.assertTrue(write_text_if_changed(path, "export const changed = true;\n"))
             self.assertEqual(path.read_bytes(), b"export const changed = true;\n")
 
