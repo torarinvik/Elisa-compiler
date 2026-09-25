@@ -55,6 +55,27 @@ for repro in \
     done
 done
 
+# A borrowed view must not acquire a zero representation through a qualified alias.
+# Stage0's matching alias resolver has not been qualified yet, so this regression runs on
+# Stage1 until that separate compiler-generation gap is closed.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-qualified-sview-O$level.ll"
+    log="$WORK/stage1-zeroed-qualified-sview-O$level.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_qualified_sview_alias.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted a module-qualified sview alias at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed qualified-sview compilation left an LLVM artifact" >&2
+        exit 1
+    }
+    rg -q 'sview with valid backing' "$log" || {
+        echo "zeroed reference smoke: qualified-sview rejection used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
 # Module-qualified aliases must resolve by their complete declaration identity. Keep this
 # Stage1-only check until Stage0's equivalent alias resolver is qualified as well.
 for level in 0 2; do
@@ -108,6 +129,7 @@ done
 
 for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_sview_alias.elisa"
 done
 
-echo "zeroed reference smoke OK: invalid non-null references reject through locals, aliases, globals, qualified module aliases, generic and ordinary structs, named tuples, and fixed arrays; initialized references and nullable/scalar-generic storage return 42 at -O0/-O2"
+echo "zeroed reference smoke OK: invalid non-null references and borrowed views reject through locals, aliases, globals, qualified module aliases, generic and ordinary structs, named tuples, and fixed arrays; initialized references and nullable/scalar-generic storage return 42 at -O0/-O2"
