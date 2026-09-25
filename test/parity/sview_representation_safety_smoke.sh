@@ -230,7 +230,7 @@ check_nullable_cstr_container_mutations_rejected() {
         echo "sview representation safety smoke: accepted raw nullable byte references in cstr? container mutation APIs at O$optimization" >&2
         exit 1
     fi
-    [[ "$(rg -F -c 'cannot assign reference to cstr?' "$log")" -eq 7 ]] || {
+    [[ "$(rg -F -c 'cannot assign reference to cstr?' "$log")" -eq 8 ]] || {
         echo "sview representation safety smoke: dict/set mutation APIs did not all reject raw nullable references at O$optimization" >&2
         cat "$log" >&2
         exit 1
