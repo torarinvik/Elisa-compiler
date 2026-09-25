@@ -126,6 +126,85 @@ for level in 0 2; do
     done
 done
 
+# An `extend Module:` block is a second AST module fragment with the same owner. Its aliases
+# share that module's namespace and can chain to aliases declared in the original fragment.
+# This Stage1-only regression covers all three invalid-zero classifiers; the pinned Stage0
+# currently reports these qualified aliases as unknown types.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-extended-module-alias-O$level.ll"
+    log="$WORK/stage1-zeroed-extended-module-alias-O$level.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_extended_module_alias_chain.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted invalid aliases split across a module extension at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed extended-module compilation left an LLVM artifact at -O$level" >&2
+        exit 1
+    }
+    rg -q 'sview with valid backing' "$log" || {
+        echo "zeroed reference smoke: extended-module sview alias used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    rg -q 'variable "nested_view" expects sview with valid backing' "$log" || {
+        echo "zeroed reference smoke: relative alias target was not resolved from its declaring module owner" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    rg -q 'cannot initialize non-null reference .* from zeroed' "$log" || {
+        echo "zeroed reference smoke: extended-module reference alias used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    rg -q 'use of uninitialized variable' "$log" || {
+        echo "zeroed reference smoke: extended-module handle alias used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
+# Relative lookup must honor the closest module that defines the requested alias. A
+# same-named outer alias must not make an inner scalar alias look like a borrowed view, and
+# a nearer borrowed-view alias must not be skipped in favor of an enclosing scalar alias.
+# The scalar shadow currently reaches a known Stage1 backend-decline path; accept either that
+# conservative decline (without an sview safety diagnostic) or successful future lowering.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-nearest-scalar-O$level.ll"
+    log="$WORK/stage1-zeroed-nearest-scalar-O$level.log"
+    if ! "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_relative_shadow_nearest_scalar.elisa" >"$log" 2>&1; then
+        [[ ! -e "$output" ]] || {
+            echo "zeroed reference smoke: backend decline left a nearest-scalar LLVM artifact at -O$level" >&2
+            exit 1
+        }
+        if rg -q 'sview with valid backing' "$log"; then
+            echo "zeroed reference smoke: outer borrowed-view alias shadowed the nearest scalar alias at -O$level" >&2
+            cat "$log" >&2
+            exit 1
+        fi
+        rg -q 'backend declined .*variable declaration' "$log" || {
+            echo "zeroed reference smoke: nearest-scalar control failed outside the known backend-decline path" >&2
+            cat "$log" >&2
+            exit 1
+        }
+    fi
+
+    output="$WORK/stage1-zeroed-nearest-sview-O$level.ll"
+    log="$WORK/stage1-zeroed-nearest-sview-O$level.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_relative_shadow_nearest_sview.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 skipped the nearest borrowed-view alias at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: nearest-sview rejection left an LLVM artifact at -O$level" >&2
+        exit 1
+    }
+    rg -q 'sview with valid backing' "$log" || {
+        echo "zeroed reference smoke: nearest borrowed-view alias used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
 # Module-qualified aliases must resolve by their complete declaration identity. Keep this
 # Stage1-only check until Stage0's equivalent alias resolver is qualified as well.
 for level in 0 2; do
