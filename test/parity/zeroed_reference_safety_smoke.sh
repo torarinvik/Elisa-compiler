@@ -97,6 +97,35 @@ for level in 0 2; do
     }
 done
 
+# Nested-module checks must resolve aliases against the file declaration tree while
+# retaining the current module's narrower struct-field lookup context.
+for level in 0 2; do
+    for repro in zeroed_nested_module_sview_alias.elisa zeroed_nested_module_handle_alias.elisa zeroed_nested_module_reference_alias.elisa; do
+        output="$WORK/stage1-$repro-O$level.ll"
+        log="$WORK/stage1-$repro-O$level.log"
+        if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/$repro" >"$log" 2>&1; then
+            echo "zeroed reference smoke: Stage1 accepted $repro at -O$level" >&2
+            exit 1
+        fi
+        [[ ! -e "$output" ]] || {
+            echo "zeroed reference smoke: failed nested-module compilation left an LLVM artifact for $repro" >&2
+            exit 1
+        }
+        expected='sview with valid backing'
+        if [[ "$repro" == zeroed_nested_module_handle_alias.elisa ]]; then
+            expected='use of uninitialized variable'
+        fi
+        if [[ "$repro" == zeroed_nested_module_reference_alias.elisa ]]; then
+            expected='cannot initialize non-null reference .* from zeroed'
+        fi
+        rg -q "$expected" "$log" || {
+            echo "zeroed reference smoke: nested-module rejection used the wrong diagnostic for $repro" >&2
+            cat "$log" >&2
+            exit 1
+        }
+    done
+done
+
 # Module-qualified aliases must resolve by their complete declaration identity. Keep this
 # Stage1-only check until Stage0's equivalent alias resolver is qualified as well.
 for level in 0 2; do
@@ -154,10 +183,12 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_sview_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nested_module_nullable_sview_alias.elisa"
     if [[ -x "$STAGE0" ]]; then
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_sview_alias.elisa"
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_nested_module_nullable_sview_alias.elisa"
     fi
 done
 
