@@ -47,6 +47,25 @@ class WasmBindingsTests(unittest.TestCase):
         self.assertIn("word(value: number): number", declarations)
         self.assertIn("wide(value: bigint): bigint", declarations)
 
+    def test_facade_preserves_narrow_integer_signedness(self) -> None:
+        cases = (
+            ("i8", "number", "((value << 24) >> 24)"),
+            ("u8", "number", "((value) & 0xff)"),
+            ("i16", "number", "((value << 16) >> 16)"),
+            ("u16", "number", "((value) & 0xffff)"),
+            ("i32", "number", "value"),
+            ("u32", "number", "((value) >>> 0)"),
+            ("i64", "bigint", "value"),
+            ("u64", "bigint", "value"),
+        )
+        for abi_type, declaration_type, output_expression in cases:
+            with self.subTest(abi_type=abi_type):
+                self.assertEqual(ts_type(abi_type, "wasm32"), declaration_type)
+                self.assertEqual(js_output(abi_type, "value"), output_expression)
+
+        self.assertEqual(js_input("i64", "value"), "BigInt(value)")
+        self.assertEqual(js_input("u64", "value"), "BigInt(value)")
+
     def test_cstr_is_a_high_level_string_binding(self) -> None:
         exports = parse_exports("export fn echo(value: cstr) -> cstr = echo_impl")
         self.assertEqual(exports[0]["parameters"][0]["binding"], "string")
