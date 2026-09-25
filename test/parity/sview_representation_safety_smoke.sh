@@ -222,6 +222,25 @@ check_nullable_cstr_storage_contexts_rejected() {
     }
 }
 
+check_nullable_cstr_container_mutations_rejected() {
+    local optimization="$1"
+    local output="$WORK/nullable-cstr-container-mutations-O$optimization.ll"
+    local log="$output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$output" "$ROOT/test/repro/raw_nullable_cstr_container_mutations_rejected.elisa" >"$log" 2>&1; then
+        echo "sview representation safety smoke: accepted raw nullable byte references in cstr? container mutation APIs at O$optimization" >&2
+        exit 1
+    fi
+    [[ "$(rg -F -c 'cannot assign reference to cstr?' "$log")" -eq 7 ]] || {
+        echo "sview representation safety smoke: dict/set mutation APIs did not all reject raw nullable references at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ ! -e "$output" ]] || {
+        echo "sview representation safety smoke: emitted LLVM for rejected cstr? container mutations at O$optimization" >&2
+        exit 1
+    }
+}
+
 check_nullable_cstr_storage_control() {
     local optimization="$1"
     local output="$WORK/nullable-cstr-storage-control-O$optimization"
@@ -237,6 +256,26 @@ check_nullable_cstr_storage_control() {
     set -e
     [[ "$run_status" -eq 0 ]] || {
         echo "sview representation safety smoke: valid optional C-string storage returned $run_status at O$optimization, expected 0" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
+check_nullable_cstr_container_mutations_control() {
+    local optimization="$1"
+    local output="$WORK/nullable-cstr-container-mutations-control-O$optimization"
+    local log="$output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/parity/fixtures/nullable_cstr_container_mutations_valid.elisa" >"$log" 2>&1 || {
+        echo "sview representation safety smoke: rejected valid optional C-string dict mutation at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$output" >"$log" 2>&1
+    local run_status=$?
+    set -e
+    [[ "$run_status" -eq 0 ]] || {
+        echo "sview representation safety smoke: valid optional C-string dict mutation returned $run_status at O$optimization, expected 0" >&2
         cat "$log" >&2
         exit 1
     }
@@ -277,11 +316,13 @@ for optimization in 0 2; do
     check_unbounded_cstr_scans_rejected "$optimization"
     check_nullable_cstr_contexts_rejected "$optimization"
     check_nullable_cstr_storage_contexts_rejected "$optimization"
+    check_nullable_cstr_container_mutations_rejected "$optimization"
     check_safe_literal "$optimization"
     check_typed_view_forwarding "$optimization"
     check_bounded_foreign_bytes "$optimization"
     check_cstr_scan_controls "$optimization"
     check_nullable_cstr_storage_control "$optimization"
+    check_nullable_cstr_container_mutations_control "$optimization"
     check_literal_cstr_out_parameter "$optimization"
 done
 
