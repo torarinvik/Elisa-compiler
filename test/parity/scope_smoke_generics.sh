@@ -309,3 +309,25 @@ def main() -> i64:
         return hit + bump(&f.slot) * 2 + bump(&s.slot) * 2 + 2
 EOF
 )" 42
+
+# A module-local alias must not capture a same-spelled top-level struct in an ownerless
+# declaration. Resolving the unrelated `Store.Handle = id[Slot]` alias first made both the
+# return annotation and the top-level struct constructor unlowerable in the backend.
+differential module_alias_does_not_shadow_top_level_struct "$(cat <<'EOF'
+module Store:
+    struct Slot:
+        value: mutable i64
+
+    type Handle = id[Slot]
+
+struct Handle:
+    value: mutable i64
+
+def make_handle() -> Handle:
+    return Handle{value: 42}
+
+def main() -> i64:
+    handle: Handle = make_handle()
+    return handle.value
+EOF
+)" 42
