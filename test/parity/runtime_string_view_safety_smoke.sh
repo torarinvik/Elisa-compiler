@@ -100,6 +100,70 @@ for fixture in runtime_string_view_null_data.elisa runtime_string_view_null_data
     check_nullable_view_rejected "$STAGE0" stage0 c-archive "$fixture"
 done
 
+check_unterminated_nullable_view_rejected() {
+    local compiler="$1" stage="$2" mode="$3" fixture="$4"
+    local output="$WORK/unterminated-nullable-sview-${stage}-${fixture%.elisa}"
+    local log="$output.compile.log"
+    if "$compiler" -emit "$mode" -O0 -o "$output" "$ROOT/test/repro/$fixture" >"$log" 2>&1; then
+        echo "runtime string view smoke: $stage accepted a raw optional byte pointer as a NUL-terminated string" >&2
+        exit 1
+    fi
+    rg -qi 'invalid cast from u8&\? to sview|expects cstr\?, got u8&\?|NUL-terminated cstr|unsupported|declined' "$log" || {
+        echo "runtime string view smoke: $stage rejected an unterminated nullable view cast for an unexpected reason" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ ! -e "$output" ]] || {
+        echo "runtime string view smoke: $stage emitted an artifact for an unterminated nullable view cast" >&2
+        exit 1
+    }
+    [[ ! -e "$output.a" ]] || {
+        echo "runtime string view smoke: $stage emitted an archive for an unterminated nullable view cast" >&2
+        exit 1
+    }
+}
+
+for fixture in sview_optional_unterminated_cast.elisa sview_optional_unterminated_constructor.elisa; do
+    check_unterminated_nullable_view_rejected "$STAGE1" stage1 exe "$fixture"
+    check_unterminated_nullable_view_rejected "$STAGE0" stage0 c-archive "$fixture"
+done
+
+check_postfix_sview_cast() {
+    local compiler="$1" stage="$2" mode="$3"
+    local output="$WORK/postfix-sview-cast-$stage"
+    local log="$output.compile.log"
+    if [[ "$mode" == exe ]]; then
+        "$compiler" -emit exe -O0 -o "$output" "$ROOT/test/repro/sview_postfix_cast.elisa" >"$log" 2>&1 || {
+            echo "runtime string view smoke: $stage rejected valid optional-cstr view construction" >&2
+            cat "$log" >&2
+            exit 1
+        }
+    else
+        "$compiler" -emit c-archive -O0 -o "$output.a" "$ROOT/test/repro/sview_postfix_cast.elisa" >"$log" 2>&1 || {
+            echo "runtime string view smoke: $stage rejected valid optional-cstr view construction" >&2
+            cat "$log" >&2
+            exit 1
+        }
+        clang -Wl,-dead_strip -o "$output" "$output.a" >"$log" 2>&1 || {
+            echo "runtime string view smoke: failed to link valid optional-cstr view for $stage" >&2
+            cat "$log" >&2
+            exit 1
+        }
+    fi
+    set +e
+    elisa_run_timeout 10 "$output" >"$log" 2>&1
+    local run_status=$?
+    set -e
+    [[ "$run_status" -eq 10 ]] || {
+        echo "runtime string view smoke: valid optional-cstr view returned $run_status on $stage (expected 10)" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
+check_postfix_sview_cast "$STAGE1" stage1 exe
+check_postfix_sview_cast "$STAGE0" stage0 c-archive
+
 check_view_length_is_immutable() {
     local compiler="$1" stage="$2" mode="$3"
     local output="$WORK/mutable-view-length-$stage"

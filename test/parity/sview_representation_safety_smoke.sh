@@ -71,6 +71,26 @@ check_typed_view_forwarding() {
     }
 }
 
+check_bounded_foreign_bytes() {
+    local optimization="$1"
+    local output="$WORK/bounded-foreign-bytes-O$optimization"
+    local log="$output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/repro/sview_bounded_foreign_bytes.elisa" >"$log" 2>&1 || {
+        echo "sview representation safety smoke: rejected an explicitly bounded foreign-byte view at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$output" >"$log" 2>&1
+    local run_status=$?
+    set -e
+    [[ "$run_status" -eq 3 ]] || {
+        echo "sview representation safety smoke: bounded foreign-byte view returned $run_status at O$optimization, expected 3" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
 for optimization in 0 2; do
     reject_case "$optimization" zeroed-view "$ROOT/test/repro/sview_zeroed_invalid.elisa" 'sview with valid backing'
     reject_case "$optimization" zeroed-view-alias "$ROOT/test/repro/sview_zeroed_alias_invalid.elisa" 'sview with valid backing'
@@ -82,6 +102,7 @@ for optimization in 0 2; do
     reject_case "$optimization" raw-pointer-cstr-cast "$ROOT/test/repro/cstr_pointer_cast_probe.elisa" 'can[Unsafe]'
     check_safe_literal "$optimization"
     check_typed_view_forwarding "$optimization"
+    check_bounded_foreign_bytes "$optimization"
 done
 
-echo "sview representation safety smoke OK: zeroed and forged StringView carriers, public carrier aliases, unbounded raw sview inputs, and raw-to-cstr conversions are rejected; a C-string literal view remains valid at O0/O2"
+echo "sview representation safety smoke OK: zeroed and forged StringView carriers, public carrier aliases, unbounded raw sview inputs, and raw-to-cstr conversions are rejected; C-string literal and explicitly bounded foreign-byte views remain valid at O0/O2"
