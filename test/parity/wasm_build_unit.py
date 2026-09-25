@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +42,17 @@ from scripts.wasm_export_scan_client import (
     run_flatten_source,
 )
 from scripts.wasm_facade import js_input, js_output, ts_type
+
+
+_BOUNDED_RUNNER_SPEC = importlib.util.spec_from_file_location(
+    "wasm_bounded_stage1_command",
+    ROOT / "test/parity/run_bounded_stage1_command.py",
+)
+assert _BOUNDED_RUNNER_SPEC is not None
+assert _BOUNDED_RUNNER_SPEC.loader is not None
+bounded_runner = importlib.util.module_from_spec(_BOUNDED_RUNNER_SPEC)
+sys.modules[_BOUNDED_RUNNER_SPEC.name] = bounded_runner
+_BOUNDED_RUNNER_SPEC.loader.exec_module(bounded_runner)
 
 
 class WasmBindingsTests(unittest.TestCase):
@@ -506,6 +521,106 @@ class ExportScannerSelectionTests(unittest.TestCase):
             runtime_source,
         )
         python_flatten.assert_not_called()
+
+
+class BoundedStage1CommandTests(unittest.TestCase):
+    def test_rss_limit_accepts_the_configured_boundary(self) -> None:
+        with patch.dict(os.environ, {"ELISA_STAGE1_MAX_RSS_KB": "2097152"}, clear=True):
+            self.assertEqual(bounded_runner.rss_limit_kb(), 2097152)
+
+    def test_rss_limit_fails_closed_for_missing_invalid_and_excessive_values(self) -> None:
+        for value, expected_status in (("", 125), ("not-a-number", 125), ("2097153", 2)):
+            with self.subTest(value=value):
+                with (
+                    patch.dict(os.environ, {"ELISA_STAGE1_MAX_RSS_KB": value}, clear=True),
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    bounded_runner.rss_limit_kb()
+                self.assertEqual(raised.exception.code, expected_status)
+
+    def test_process_snapshot_counts_group_and_descendants_once(self) -> None:
+        snapshot = """\
+101 1 101 100 S
+102 101 101 200 R
+103 102 999 300 S
+104 1 101 400 Z
+105 1 999 500 S
+"""
+        with (
+            patch.object(bounded_runner, "_child_pid", 101),
+            patch.object(bounded_runner, "_child_pgid", 101),
+            patch.object(
+                bounded_runner.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout=snapshot),
+            ) as run,
+        ):
+            self.assertEqual(bounded_runner.process_snapshot(), (1000, 2, True))
+        run.assert_called_once_with(
+            ["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="ascii",
+            errors="strict",
+        )
+
+    def test_process_snapshot_rejects_incomplete_rows(self) -> None:
+        with (
+            patch.object(bounded_runner, "_child_pid", 101),
+            patch.object(bounded_runner, "_child_pgid", 101),
+            patch.object(
+                bounded_runner.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout="101 1 101 100 S\nmalformed\n"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid row"):
+                bounded_runner.process_snapshot()
+
+    def test_stop_group_returns_after_terminated_members_exit(self) -> None:
+        with (
+            patch.object(bounded_runner, "_child_pgid", 812),
+            patch.object(
+                bounded_runner,
+                "process_snapshot",
+                side_effect=((0, 1, True), (0, 0, False)),
+            ),
+            patch.object(bounded_runner.os, "killpg") as killpg,
+            patch.object(bounded_runner.time, "sleep"),
+        ):
+            bounded_runner.stop_group()
+        killpg.assert_called_once_with(812, signal.SIGTERM)
+
+    def test_stop_group_escalates_when_grace_period_expires(self) -> None:
+        with (
+            patch.object(bounded_runner, "_child_pgid", 913),
+            patch.object(bounded_runner.time, "monotonic", side_effect=(0.0, 3.0)),
+            patch.object(bounded_runner, "process_snapshot") as snapshot,
+            patch.object(bounded_runner.os, "killpg") as killpg,
+            patch.object(bounded_runner.time, "sleep"),
+        ):
+            bounded_runner.stop_group()
+        snapshot.assert_not_called()
+        self.assertEqual(
+            killpg.call_args_list,
+            [call(913, signal.SIGTERM), call(913, signal.SIGKILL)],
+        )
+
+    def test_entry_point_refuses_to_launch_without_reauthorization(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["run_bounded_stage1_command.py", "/bin/true"]),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            bounded_runner.main()
+        self.assertEqual(raised.exception.code, 125)
+
+    def test_signal_exit_status_is_normalized(self) -> None:
+        self.assertEqual(bounded_runner.normalized_status(42), 42)
+        self.assertEqual(bounded_runner.normalized_status(-9), 137)
 
     def test_opt_in_launcher_and_script_must_be_paired(self) -> None:
         args = SimpleNamespace(export_scan_launcher="/bin/elisac")

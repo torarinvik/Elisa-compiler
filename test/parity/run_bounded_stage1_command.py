@@ -32,9 +32,11 @@ def fail(message: str, status: int = 125) -> NoReturn:
 
 def rss_limit_kb() -> int:
     raw = os.environ.get("ELISA_STAGE1_MAX_RSS_KB", "")
+    if not raw.isascii() or not raw.isdecimal():
+        fail("an explicit positive ELISA_STAGE1_MAX_RSS_KB is required")
     if len(raw) > 7:
         fail("RSS limit may not exceed 2097152 KB", 2)
-    if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+    if int(raw) <= 0:
         fail("an explicit positive ELISA_STAGE1_MAX_RSS_KB is required")
     value = int(raw)
     if value > MAX_RSS_KB:
