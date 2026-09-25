@@ -1,7 +1,7 @@
 #include <stdint.h>
 
-/* Characterization only: this C ABI stub does not match the raw LLVM aggregate-return ABI
- * currently emitted for Elisa error-set externs on this target. See IMPLEMENTATION_PLAN.md. */
+/* C representation used by the extern declaration: C returns this aggregate in the target's
+ * native C ABI registers while Elisa's internal error dispatcher uses its own aggregate form. */
 typedef struct {
     int32_t code;
     int32_t payload;
