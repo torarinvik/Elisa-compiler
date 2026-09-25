@@ -209,6 +209,10 @@ run_case generic_struct_nested 'struct Inner[T]:\n    v: mutable T\n\nstruct Out
 # One instantiation reused across two locals: emitted ONCE (a duplicate type would still
 # link, but the memo is what keeps `Box[i64]` a single type).
 run_case generic_struct_reuse  'struct Box[T]:\n    value: mutable T\n\ndef main() -> i64:\n    a: mutable Box[i64] = Box[i64]{value: 40}\n    b: mutable Box[i64] = Box[i64]{value: 2}\n    return a.value + b.value\n'  42
+# A generic UFCS call returning a large aggregate uses the hidden sret slot. The first
+# parameter is the receiver, so this exercises the generic-ufcs path as well as the
+# optional-presence handling for its result and destination slot.
+run_case generic_ufcs_large_sret 'struct Big[T]:\n    a: T\n    b: T\n    c: T\n    d: T\n    e: T\n\ndef identity[T](value: Big[T]) -> Big[T]:\n    return value\n\ndef main() -> i64:\n    value: Big[i64] = Big[i64]{a: 10, b: 10, c: 10, d: 10, e: 2}\n    copied: Big[i64] = value.identity()\n    return copied.a + copied.b + copied.c + copied.d + copied.e\n' 42
 # EMPTY DICT LITERAL `{}`: `dict[K,V]` is the runtime `DynDict[K,V]` template, and `{}` is
 # its zero value (null items, 0 count/…). A fresh dict reads count 0. (Full put/get needs the
 # std dict generics; this covers the type mapping + literal + field read.)
