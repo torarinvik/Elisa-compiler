@@ -31,10 +31,46 @@ for fixture in \
 done
 done
 
+# AtomicSlot is an internal storage type behind AtomicCell. Keep the raw operation
+# surface fenced after the runtime slot rename; compiling the included stdlib is not
+# the same as granting user code the runtime-std exemption.
+for optimization in 0 2; do
+    output="$WORK/atomic_slot_raw_access-O$optimization.o"
+    log="$WORK/atomic_slot_raw_access-O$optimization.log"
+    if "$STAGE1" -emit obj "-O$optimization" -o "$output" "$ROOT/test/repro/atomic_slot_raw_access.elisa" >"$log" 2>&1; then
+        echo "atomic invalid-order smoke: accepted public AtomicSlot access at O$optimization" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || { echo "atomic invalid-order smoke: emitted an object for raw AtomicSlot access at O$optimization" >&2; exit 1; }
+    grep -q 'raw concurrency surface removed: `load` is legacy raw atomic surface' "$log" || {
+        echo "atomic invalid-order smoke: raw AtomicSlot refusal had no expected diagnostic at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
+for optimization in 0 2; do
+    output="$WORK/atomic_same_named_slot_user_function-O$optimization"
+    log="$WORK/atomic_same_named_slot_user_function-O$optimization.log"
+    if ! "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/repro/atomic_same_named_slot_user_function.elisa" >"$log" 2>&1; then
+        echo "atomic invalid-order smoke: failed to compile the same-named user load at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    set +e
+    "$output"
+    result=$?
+    set -e
+    [[ "$result" -eq 42 ]] || {
+        echo "atomic invalid-order smoke: same-named user load returned $result at O$optimization, expected 42" >&2
+        exit 1
+    }
+done
+
 for optimization in 0 2; do
     output="$WORK/atomic_same_named_i32_load-O$optimization"
     log="$WORK/atomic_same_named_i32_load-O$optimization.log"
-    if ! ELISA_STAGE1_RUNTIME_STD=1 "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/repro/atomic_same_named_i32_load.elisa" >"$log" 2>&1; then
+    if ! "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/repro/atomic_same_named_i32_load.elisa" >"$log" 2>&1; then
         echo "atomic invalid-order smoke: failed to compile the i32 overload at O$optimization" >&2
         cat "$log" >&2
         exit 1
@@ -60,4 +96,4 @@ grep -Eq 'load atomic i64, .* seq_cst' "$ir" || {
     exit 1
 }
 
-echo "atomic order smoke OK: invalid literals fail closed, i32 overloads preserve their body at O0/O2, and typed MemoryOrder parameters remain atomic"
+echo "atomic order smoke OK: invalid literals and public AtomicSlot access fail closed, same-named and i32 user overloads preserve their bodies at O0/O2, and typed MemoryOrder parameters remain atomic"

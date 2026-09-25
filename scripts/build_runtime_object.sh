@@ -75,7 +75,10 @@ trap cleanup_runtime_build EXIT
 # The raw product, not the elisac_stage1.sh wrapper: the wrapper refuses a product older
 # than its sources, and this script is the wrapper's own last step of a seed -- the
 # freshness the wrapper would check is the freshness the caller is establishing.
-"$PRODUCT" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
+# This entrypoint intentionally compiles the trusted bundled runtime as a standalone unit.
+# The product driver normally infers runtime status from flattened compiler sources, but
+# direct product invocations do not always preserve include-origin markers.
+ELISA_STAGE1_RUNTIME_STD=1 "$PRODUCT" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
 bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
