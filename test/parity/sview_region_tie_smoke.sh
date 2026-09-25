@@ -77,6 +77,11 @@ for stage in stage0 stage1; do
         grep -Eq 'tied to region|sview parameter' "$WORK/$stage-$bad.log" \
             || fail "$stage rejected $bad for an unrelated reason: $(tail -n 8 "$WORK/$stage-$bad.log")"
     done
+    if "$compiler" -emit llvm -O0 -o "$WORK/$stage-tied-call-return.ll" "$ROOT/test/repro/sview_region_tied_call_return.elisa" >"$WORK/$stage-tied-call-return.log" 2>&1; then
+        fail "$stage accepted a view-producing method call that erased its @r parameter region"
+    fi
+    grep -Fq 'value tied to region parameter "r"' "$WORK/$stage-tied-call-return.log" \
+        || fail "$stage failed to explain the erased method-call lifetime: $(tail -n 8 "$WORK/$stage-tied-call-return.log")"
 done
 
 if "$STAGE1" -emit llvm -O0 -o "$WORK/stage1-typed-reference-field.ll" "$WORK/typed_reference_field.elisa" >"$WORK/stage1-typed-reference-field.log" 2>&1; then
