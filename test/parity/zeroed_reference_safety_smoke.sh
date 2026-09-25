@@ -146,6 +146,40 @@ for level in 0 2; do
     }
 done
 
+# A module path may be written relative to the current module or any enclosing module.
+# Exercise every classifier through those language-supported spellings; exact fully
+# qualified paths are covered above. These checks stay Stage1-only until Stage0 implements
+# the same declaration-owner lookup.
+for level in 0 2; do
+    for repro in \
+        zeroed_relative_nested_module_sview_alias.elisa \
+        zeroed_relative_sibling_module_sview_alias.elisa \
+        zeroed_relative_nested_module_reference_alias.elisa \
+        zeroed_relative_sibling_module_handle_alias.elisa; do
+        output="$WORK/stage1-$repro-O$level.ll"
+        log="$WORK/stage1-$repro-O$level.log"
+        if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/$repro" >"$log" 2>&1; then
+            echo "zeroed reference smoke: Stage1 accepted relative module alias $repro at -O$level" >&2
+            exit 1
+        fi
+        [[ ! -e "$output" ]] || {
+            echo "zeroed reference smoke: failed relative-alias compilation left an LLVM artifact for $repro" >&2
+            exit 1
+        }
+        expected='sview with valid backing'
+        if [[ "$repro" == zeroed_relative_nested_module_reference_alias.elisa ]]; then
+            expected='cannot initialize non-null reference .* from zeroed'
+        elif [[ "$repro" == zeroed_relative_sibling_module_handle_alias.elisa ]]; then
+            expected='use of uninitialized variable'
+        fi
+        rg -q "$expected" "$log" || {
+            echo "zeroed reference smoke: relative-alias rejection used the wrong diagnostic for $repro" >&2
+            cat "$log" >&2
+            exit 1
+        }
+    done
+done
+
 run_positive() {
     local compiler="$1" tag="$2" level="$3" source="$4"
     local name="$(basename -- "$source" .elisa)"
@@ -184,6 +218,7 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_sview_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nested_module_nullable_sview_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_relative_nullable_sview_alias.elisa"
     if [[ -x "$STAGE0" ]]; then
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
