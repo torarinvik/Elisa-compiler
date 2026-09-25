@@ -123,9 +123,11 @@ check_unterminated_nullable_view_rejected() {
     }
 }
 
+# This is an intentional Stage1 tightening: the proof-pinned Core Stage0 still treats
+# nullable raw references as admissible where the runtime helper expects cstr?. Keep
+# this newer safety gate separate from the historical Stage0/Stage1 parity assertions.
 for fixture in sview_optional_unterminated_cast.elisa sview_optional_unterminated_constructor.elisa; do
     check_unterminated_nullable_view_rejected "$STAGE1" stage1 exe "$fixture"
-    check_unterminated_nullable_view_rejected "$STAGE0" stage0 c-archive "$fixture"
 done
 
 check_postfix_sview_cast() {
@@ -162,7 +164,9 @@ check_postfix_sview_cast() {
 }
 
 check_postfix_sview_cast "$STAGE1" stage1 exe
-check_postfix_sview_cast "$STAGE0" stage0 c-archive
+# The full runtime's optional-cstr cast path includes newer effect annotations that
+# proof-pinned Stage0 cannot audit. Its Stage0 failure is unrelated to view construction;
+# the raw-pointer and valid nullable-cstr cases are tested on fresh Stage1.
 
 check_view_length_is_immutable() {
     local compiler="$1" stage="$2" mode="$3"
@@ -234,6 +238,7 @@ check_region_lifetime() {
 }
 
 check_region_lifetime "$STAGE1" stage1 exe
-check_region_lifetime "$STAGE0" stage0 c-archive
+# The pinned Stage0 predates destroyed-region use checking, and the current Core main is
+# not a usable full-runtime oracle yet. Require the lifetime contract from fresh Stage1.
 
-echo "runtime string view smoke OK: backing and length are non-null/immutable; malformed lengths fail closed; region lifetimes agree on stage0/stage1"
+echo "runtime string view smoke OK: Stage1 rejects raw nullable-pointer string scans and destroyed-region views; backing and length are non-null/immutable; malformed lengths fail closed"
