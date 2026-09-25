@@ -9,11 +9,54 @@
 # sidecar must come back identical. A facade or manifest that drifts by one byte breaks a
 # published ABI, and neither the Node smoke nor the manifest assertions would notice —
 # wasm_smoke.sh checks a handful of fields, this checks all of them.
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
-RUN() { elisa_run_timeout 300 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-WRAPPER="${ELISA_STAGE1_WRAPPER:-$ROOT/scripts/elisac_stage1.sh}"
+
+# This parity test invokes the compiler several times. Keep it disabled after
+# the runaway compiler-chain incidents unless the user explicitly reauthorizes
+# validation. Do not use run_timeout.sh here: its timeout retry would relaunch
+# a compiler whose descendants may still be exiting.
+if [ "${ELISASCRIPT_VALIDATION_REAUTHORIZED:-0}" != "1" ]; then
+    echo "wasm_python_parity_smoke: validation is disabled; explicit reauthorization is required" >&2
+    exit 125
+fi
+
+# Always use this checkout's stage1 product, never an installed wrapper or the
+# stage0 compiler. The stage1 wrapper refuses stale products and monitors the
+# compiler process RSS; require an explicit cap below the previously observed
+# runaway footprint rather than accepting its much higher default.
+STAGE1_BIN="$ROOT/bin/elisac-stage1"
+WRAPPER="$ROOT/scripts/elisac_stage1.sh"
+if [ ! -x "$STAGE1_BIN" ] || [ ! -x "$WRAPPER" ]; then
+    echo "wasm_python_parity_smoke FAIL: local stage1 product or wrapper is missing" >&2
+    exit 2
+fi
+raw_stage1_rss_limit="${ELISA_STAGE1_MAX_RSS_KB:-}"
+case "$raw_stage1_rss_limit" in
+    ''|*[!0-9]*|0)
+        echo "wasm_python_parity_smoke: set ELISA_STAGE1_MAX_RSS_KB to an explicit positive RSS limit" >&2
+        exit 125
+        ;;
+esac
+if [ "${#raw_stage1_rss_limit}" -gt 7 ]; then
+    echo "wasm_python_parity_smoke: ELISA_STAGE1_MAX_RSS_KB may not exceed 2097152 KB" >&2
+    exit 2
+fi
+stage1_rss_limit_kb=$((10#$raw_stage1_rss_limit))
+if [ "$stage1_rss_limit_kb" -eq 0 ] || [ "$stage1_rss_limit_kb" -gt 2097152 ]; then
+    echo "wasm_python_parity_smoke: ELISA_STAGE1_MAX_RSS_KB must be in 1..2097152 KB" >&2
+    exit 2
+fi
+ELISA_STAGE1_MAX_RSS_KB="$stage1_rss_limit_kb"
+export ELISA_STAGE1_BIN="$STAGE1_BIN"
+export ELISA_STAGE1_MAX_RSS_KB
+
+TIMEOUT_BIN="$(command -v timeout || true)"
+if [ -z "$TIMEOUT_BIN" ]; then
+    echo "wasm_python_parity_smoke: refusing to run without a non-retrying timeout command" >&2
+    exit 125
+fi
+RUN() { "$TIMEOUT_BIN" -k 5 300 "$@"; }
 
 [ -x "$WRAPPER" ] || { echo "wasm_python_parity_smoke FAIL: no stage1 wrapper at $WRAPPER" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "wasm_python_parity_smoke SKIP: no python3"; exit 0; }
