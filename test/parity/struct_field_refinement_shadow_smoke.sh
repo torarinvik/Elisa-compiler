@@ -27,6 +27,7 @@ BAD_ZEROED_IDENTITY_CALL="$ROOT/test/repro/struct_field_refinement_zeroed_identi
 BAD_ZEROED_RETURN="$ROOT/test/repro/struct_field_refinement_zeroed_return.elisa"
 GOOD="$ROOT/test/repro/struct_field_refinement_refined_param.elisa"
 GOOD_RETURN="$ROOT/test/repro/struct_field_refinement_valid_return.elisa"
+GOOD_RETURN="$ROOT/test/repro/struct_field_refinement_valid_return.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-field-refinement-shadow.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -42,6 +43,15 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -o "$WORK/good-stage1.o" "$GOOD" >"$WORK/good-stage1.log" 2>&1 || {
         cat "$WORK/good-stage1.log" >&2
+        exit 1
+    }
+"$STAGE0" -emit obj -O0 -o "$WORK/good-return-stage0.o" "$GOOD_RETURN" >"$WORK/good-return-stage0.log" 2>&1 || {
+    cat "$WORK/good-return-stage0.log" >&2
+    exit 1
+}
+ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -o "$WORK/good-return-stage1.o" "$GOOD_RETURN" >"$WORK/good-return-stage1.log" 2>&1 || {
+        cat "$WORK/good-return-stage1.log" >&2
         exit 1
     }
 
@@ -94,4 +104,4 @@ reject_stage1 "$BAD_ZEROED_CATCH" "bad-zeroed-catch"
 reject_stage1 "$BAD_ZEROED_IDENTITY_CALL" "bad-zeroed-identity-call"
 reject_stage1 "$BAD_ZEROED_RETURN" "bad-zeroed-return"
 
-echo "struct-field refinement shadow smoke OK: unproven construction, stores, record updates, zeroed values, compound mutations, and stale interval facts are rejected; proven zeroed values and refined parameters are accepted"
+echo "struct-field refinement shadow smoke OK: unproven construction, stores, record updates, zeroed values, refined calls and returns, compound mutations, and stale interval facts are rejected; proven values and refined parameters are accepted"
