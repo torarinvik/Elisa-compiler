@@ -101,6 +101,27 @@ def memory_pages_from_env(name: str, default: int) -> int:
     return value
 
 
+def write_text_if_changed(path: Path, contents: str) -> bool:
+    """Write UTF-8 text only when its exact bytes differ from the existing file.
+
+    Reading at most one byte beyond the generated value keeps comparison bounded
+    even when an existing output was replaced by an unexpectedly large file.
+    Byte writes also keep generated sidecars on deterministic LF line endings on
+    every host platform.
+    """
+    encoded = contents.encode("utf-8")
+    try:
+        with path.open("rb") as current:
+            existing = current.read(len(encoded) + 1)
+    except FileNotFoundError:
+        existing = None
+    if existing == encoded:
+        return False
+    with path.open("wb") as output:
+        output.write(encoded)
+    return True
+
+
 def find_wasm_ld(explicit: str | None) -> str:
     candidates = [explicit, os.environ.get("WASM_LD")]
     llvm_config = os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")
@@ -377,17 +398,17 @@ def build(args: argparse.Namespace) -> None:
         shutil.copyfile(wasm_path, output)
 
     manifest_path = output.with_name(f"{module_name}.json")
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    write_text_if_changed(manifest_path, json.dumps(manifest, indent=2) + "\n")
     if wasm_only:
         print(f"wasm: wrote {output} and {manifest_path}", file=sys.stderr)
     else:
         loader_path = output.with_name(f"{module_name}.mjs")
         types_path = output.with_name(f"{module_name}.d.ts")
         esm_types_path = output.with_name(f"{module_name}.d.mts")
-        loader_path.write_text(js_bindings(manifest, module_name), encoding="utf-8")
+        write_text_if_changed(loader_path, js_bindings(manifest, module_name))
         declarations = type_declaration(manifest, module_name)
-        types_path.write_text(declarations, encoding="utf-8")
-        esm_types_path.write_text(declarations, encoding="utf-8")
+        write_text_if_changed(types_path, declarations)
+        write_text_if_changed(esm_types_path, declarations)
         print(f"wasm: wrote {output}, {loader_path}, {types_path}, {esm_types_path}, and {manifest_path}", file=sys.stderr)
 
 

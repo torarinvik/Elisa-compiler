@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ from scripts.wasm_build import (
     parse_exports,
     runtime_cache_path,
     type_declaration,
+    write_text_if_changed,
 )
 from scripts.wasm_export_scan_client import (
     MAX_PROCESS_SNAPSHOT_ROWS,
@@ -38,6 +41,18 @@ from scripts.wasm_facade import js_input, js_output, ts_type
 
 
 class WasmBindingsTests(unittest.TestCase):
+    def test_generated_text_write_preserves_unchanged_output_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "demo.mjs"
+            self.assertTrue(write_text_if_changed(path, "export {};\n"))
+            expected_mtime = 1_600_000_000_123_456_789
+            os.utime(path, ns=(expected_mtime, expected_mtime))
+
+            self.assertFalse(write_text_if_changed(path, "export {};\n"))
+            self.assertEqual(path.stat().st_mtime_ns, expected_mtime)
+            self.assertTrue(write_text_if_changed(path, "export const changed = true;\n"))
+            self.assertEqual(path.read_bytes(), b"export const changed = true;\n")
+
     def test_int_is_a_wasm32_number_while_i64_stays_bigint(self) -> None:
         exports = parse_exports("export fn word(value: int) -> int = word_impl\nexport fn wide(value: i64) -> i64 = wide_impl")
         self.assertEqual(exports[0]["wasm_type"], "i32")
