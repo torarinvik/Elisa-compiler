@@ -24,6 +24,12 @@ for stage in stage0 stage1; do
         || fail "$stage rejected cstr construction: $(tail -n 12 "$log")"
     rg -Fq '@llvm.uadd.with.overflow' "$output" \
         || fail "$stage did not check count + terminator for overflow"
+    rg -Fq 'call void @llvm.trap' "$output" \
+        || fail "$stage did not emit a defined trap for overflow"
+    overflow_block="reserve.overflow"
+    [[ "$stage" != stage0 ]] || overflow_block="darray.cstr.needed.overflow.trap"
+    rg -Fq "$overflow_block" "$output" \
+        || fail "$stage did not branch overflow into its trap block"
 done
 
 echo "darray cstr checked-growth smoke OK: both backends trap instead of wrapping count + 1"
