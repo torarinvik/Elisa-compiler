@@ -161,6 +161,77 @@ check_nullable_cstr_contexts_rejected() {
     }
 }
 
+check_nullable_cstr_storage_contexts_rejected() {
+    local optimization="$1"
+    local output="$WORK/nullable-cstr-storage-contexts-O$optimization.ll"
+    local log="$output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$output" "$ROOT/test/repro/raw_nullable_ref_cstr_storage_contexts_rejected.elisa" >"$log" 2>&1; then
+        echo "sview representation safety smoke: accepted raw nullable byte references in stored cstr? values at O$optimization" >&2
+        exit 1
+    fi
+    [[ "$(rg -F -c 'variable "values" expects cstr?, got reference' "$log")" -eq 3 ]] || {
+        echo "sview representation safety smoke: raw references in dynamic/fixed-array/dictionary cstr? literals were not all rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    for variable in members pair generated; do
+        [[ "$(rg -F -c "variable \"$variable\" expects cstr?, got reference" "$log")" -eq 1 ]] || {
+            echo "sview representation safety smoke: raw reference in $variable cstr? storage was not rejected at O$optimization" >&2
+            cat "$log" >&2
+            exit 1
+        }
+    done
+    [[ "$(rg -F -c 'variable "value" expects cstr?, got reference' "$log")" -eq 1 ]] || {
+        echo "sview representation safety smoke: raw reference in a record-update field was not rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ "$(rg -F -c 'struct literal field "value" expects cstr, got reference' "$log")" -eq 1 ]] || {
+        echo "sview representation safety smoke: raw reference in a nested struct literal was not rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ "$(rg -F -c 'variable "texts" expects cstr?, got reference' "$log")" -eq 1 ]] || {
+        echo "sview representation safety smoke: raw reference in a nested container-valued struct field was not rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ "$(rg -F -c 'variable "nullable" expects cstr?, got reference' "$log")" -eq 1 ]] || {
+        echo "sview representation safety smoke: raw reference on one conditional cstr? branch was not rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ "$(rg -F -c 'cannot assign reference to cstr?' "$log")" -eq 3 ]] || {
+        echo "sview representation safety smoke: raw references in field, indexed, or push cstr? stores were not all rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    [[ ! -e "$output" ]] || {
+        echo "sview representation safety smoke: emitted LLVM for rejected nullable C-string storage at O$optimization" >&2
+        exit 1
+    }
+}
+
+check_nullable_cstr_storage_control() {
+    local optimization="$1"
+    local output="$WORK/nullable-cstr-storage-control-O$optimization"
+    local log="$output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/parity/fixtures/nullable_cstr_storage_valid.elisa" >"$log" 2>&1 || {
+        echo "sview representation safety smoke: rejected valid optional C-string field/container storage at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$output" >"$log" 2>&1
+    local run_status=$?
+    set -e
+    [[ "$run_status" -eq 0 ]] || {
+        echo "sview representation safety smoke: valid optional C-string storage returned $run_status at O$optimization, expected 0" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
 check_literal_cstr_out_parameter() {
     local optimization="$1"
     local output="$WORK/literal-cstr-out-O$optimization"
@@ -195,11 +266,13 @@ for optimization in 0 2; do
     reject_case "$optimization" nullable-runtime-strlen-unbounded "$ROOT/test/repro/runtime_strlen_unbounded_rejected.elisa" 'expects cstr'
     check_unbounded_cstr_scans_rejected "$optimization"
     check_nullable_cstr_contexts_rejected "$optimization"
+    check_nullable_cstr_storage_contexts_rejected "$optimization"
     check_safe_literal "$optimization"
     check_typed_view_forwarding "$optimization"
     check_bounded_foreign_bytes "$optimization"
     check_cstr_scan_controls "$optimization"
+    check_nullable_cstr_storage_control "$optimization"
     check_literal_cstr_out_parameter "$optimization"
 done
 
-echo "sview representation safety smoke OK: zeroed and forged StringView carriers, public carrier aliases, unbounded raw sview inputs, and raw-to-cstr conversions are rejected; C-string literal and explicitly bounded foreign-byte views remain valid at O0/O2"
+echo "sview representation safety smoke OK: forged StringView carriers, unbounded/raw-to-cstr conversions, and unsafe nullable C-string storage forms are rejected; bounded/literal controls pass at O0/O2"

@@ -139,6 +139,108 @@ extend Semantic:
                     # S1g: cstr/sview/dstr never convert implicitly (string_member_never_fits).
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignValueMismatch, name: "", pos: report_pos, line: report_pos.line, expected: diagnostic_type_spelling(type_name), actual: stage0_index_spelling(assigned_type)}) if string_member_never_fits(assigned_type, type_name)
 
+        # Preserve the string representation invariant at nested value-storage
+        # boundaries. A `u8&?` is not a nullable C string: the optional wrapper carries
+        # no proof that its referent is terminated. Walk literal/branch shapes using
+        # the expected structural TypeId so arrays, darrays, sets, dictionaries,
+        # tuples, and nested containers cannot hide a raw reference from the same check.
+        def check_string_storage_value(value: Ast::Expr, expected_type_id: u32, name: sview, report_pos: Ast::Pos, assignment: bool, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Follow transparent and value-producing control shapes BEFORE the
+                # string payload fast path. A conditional such as
+                # `raw if flag else null` is not itself a raw-reference expression, but
+                # its selected value still has to satisfy the same storage contract.
+                match value:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        table <- check_string_storage_value(inner, expected_type_id, name, Ast::expr_pos(inner), assignment, names, types, table)
+                        return
+                    Expr.If(_, then_value, else_value, _):
+                        table <- check_string_storage_value(then_value, expected_type_id, name, Ast::expr_pos(then_value), assignment, names, types, table)
+                        table <- check_string_storage_value(else_value, expected_type_id, name, Ast::expr_pos(else_value), assignment, names, types, table)
+                        return
+                    Expr.Block(_, block_value, _, _):
+                        table <- check_string_storage_value(block_value, expected_type_id, name, Ast::expr_pos(block_value), assignment, names, types, table)
+                        return
+                    _:
+                        pass
+                payload_id: u32 = string_payload_type_id(expected_type_id, table)
+                if payload_id != 0:
+                    if expression_is_raw_reference(value, names, types, table):
+                        optional_string: bool = interned_kind(expected_type_id, table) == SemTypeKind.Optional
+                        diagnostic_kind: DiagnosticKind = DiagnosticKind.AssignValueMismatch if assignment else DiagnosticKind.TypeMismatch
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: diagnostic_kind, name: name, pos: report_pos, line: report_pos.line, expected: diagnostic_name_of_row(payload_id, table), actual: "reference", detail3: "?" if optional_string else ""})
+                    return
+                if interned_kind(expected_type_id, table) == SemTypeKind.Optional and interned_elem_count(expected_type_id, table) == 1:
+                    table <- check_string_storage_value(value, interned_elem(expected_type_id, 0, table), name, report_pos, assignment, names, types, table)
+                    return
+                effective_id: u32 = expected_type_id
+                match value:
+                    Expr.Tuple(tuple_elements, tuple_line):
+                        if interned_kind(effective_id, table) == SemTypeKind.Tuple:
+                            for tuple_index in 0..<tuple_elements.count |tuple_index, effective_id, name, report_pos, assignment, names, types, table|:
+                                if tuple_index < interned_elem_count(effective_id, table):
+                                    table <- check_string_storage_value(tuple_elements[tuple_index], interned_elem(effective_id, tuple_index, table), name, Ast::expr_pos(tuple_elements[tuple_index]), assignment, names, types, table)
+                            return
+                    _:
+                        pass
+                match value:
+                    Expr.Array(elements, _):
+                        if interned_kind(effective_id, table) == SemTypeKind.Container and interned_elem_count(effective_id, table) > 0 and (interned_name(effective_id, table) == "array" or interned_name(effective_id, table) == "darray"):
+                            element_type_id: u32 = interned_elem(effective_id, 0, table)
+                            for element in elements |table, name, report_pos, assignment, names, types, element_type_id|:
+                                table <- check_string_storage_value(element, element_type_id, name, Ast::expr_pos(element), assignment, names, types, table)
+                    Expr.SetLit(elements, _):
+                        if interned_kind(effective_id, table) == SemTypeKind.Container and interned_name(effective_id, table) == "set" and interned_elem_count(effective_id, table) == 1:
+                            element_type_id: u32 = interned_elem(effective_id, 0, table)
+                            for element in elements |table, name, report_pos, assignment, names, types, element_type_id|:
+                                table <- check_string_storage_value(element, element_type_id, name, Ast::expr_pos(element), assignment, names, types, table)
+                    Expr.DictLit(entries, _):
+                        if interned_kind(effective_id, table) == SemTypeKind.Container and interned_name(effective_id, table) == "dict" and interned_elem_count(effective_id, table) == 2:
+                            key_type_id: u32 = interned_elem(effective_id, 0, table)
+                            value_type_id: u32 = interned_elem(effective_id, 1, table)
+                            for entry in entries |table, name, report_pos, assignment, names, types, key_type_id, value_type_id|:
+                                table <- check_string_storage_value(entry.key, key_type_id, name, Ast::expr_pos(entry.key), assignment, names, types, table)
+                                table <- check_string_storage_value(entry.value, value_type_id, name, Ast::expr_pos(entry.value), assignment, names, types, table)
+                    Expr.Construct(type_expression, fields, _):
+                        owner: sview = interned_name(effective_id, table) if interned_kind(effective_id, table) == SemTypeKind.Named else construct_type_name(type_expression)
+                        if owner != "":
+                            for field in fields |table, owner, name, report_pos, assignment, names, types|:
+                                field_type_id: u32 = field_type_id_of(table, owner, field.name)
+                                field_kind: SemTypeKind = interned_kind(field_type_id, table)
+                                direct_string_optional: bool = field_kind == SemTypeKind.Optional and string_payload_type_id(field_type_id, table) != 0
+                                if not direct_string_optional and (field_kind == SemTypeKind.Optional or field_kind == SemTypeKind.Container or field_kind == SemTypeKind.Tuple or field_kind == SemTypeKind.Named):
+                                    table <- check_string_storage_value(field.value, field_type_id, field.name, Ast::expr_pos(field.value), assignment, names, types, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        base_type_id: u32 = structural_type_id_of(base, names, types, table)
+                        owner: sview = interned_name(base_type_id, table) if interned_kind(base_type_id, table) == SemTypeKind.Named else interned_name(effective_id, table) if interned_kind(effective_id, table) == SemTypeKind.Named else ""
+                        if owner != "":
+                            for field in fields |table, owner, name, report_pos, assignment, names, types|:
+                                field_type_id: u32 = field_type_id_of(table, owner, field.name)
+                                field_kind: SemTypeKind = interned_kind(field_type_id, table)
+                                if field_kind == SemTypeKind.Optional or field_kind == SemTypeKind.Container or field_kind == SemTypeKind.Tuple or field_kind == SemTypeKind.Named:
+                                    table <- check_string_storage_value(field.value, field_type_id, field.name, Ast::expr_pos(field.value), assignment, names, types, table)
+                    Expr.Comprehension(_, _, _, body, _):
+                        if interned_kind(effective_id, table) == SemTypeKind.Container and interned_elem_count(effective_id, table) > 0:
+                            table <- check_string_storage_value(body, interned_elem(effective_id, 0, table), name, Ast::expr_pos(body), assignment, names, types, table)
+                    _:
+                        pass
+
+        # The darray `push` intrinsic is not always present in the ordinary function
+        # parameter table. Check its concrete receiver element type at the call site.
+        def check_darray_push_string_value(expression: Ast::Expr, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        match callee:
+                            Expr.Field(receiver, method, _):
+                                receiver_type_id: u32 = structural_type_id_of(receiver, names, types, table)
+                                if method == "push" and interned_kind(receiver_type_id, table) == SemTypeKind.Container and interned_name(receiver_type_id, table) == "darray" and interned_elem_count(receiver_type_id, table) == 1 and arguments.count > 0:
+                                    table <- check_string_storage_value(arguments[0], interned_elem(receiver_type_id, 0, table), "darray element", Ast::expr_pos(arguments[0]), true, names, types, table)
+                            _:
+                                pass
+                    _:
+                        pass
+
         # stage0's spelling of a destructured loop item that is certainly NOT a tuple: a
         # scalar (surface width kept, `u8`/`sview`), or a declared struct/enum. "" when the
         # item is not known that precisely -- a type parameter or an alias may still name a
@@ -168,8 +270,9 @@ extend Semantic:
                             # alter the local channel; contextual checking must not lose
                             # the VarDecl's own expected type at that boundary.
                             declared_type_id: u32 = annotation_type_id(type_expression, table)
-                            string_payload_id: u32 = string_payload_type_id(declared_type_id, table)
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: diagnostic_name_of_row(string_payload_id, table), actual: "reference", detail3: "?"}) if interned_kind(declared_type_id, table) == SemTypeKind.Optional and string_payload_id != 0 and expression_is_raw_reference(value, names, types, table)
+                            declared_kind: SemTypeKind = interned_kind(declared_type_id, table)
+                            table <- check_string_storage_value(value, declared_type_id, name, Ast::expr_pos(value), false, names, types, table) if declared_kind == SemTypeKind.Optional or declared_kind == SemTypeKind.Container or declared_kind == SemTypeKind.Tuple or declared_kind == SemTypeKind.Named
+                            table <- check_darray_push_string_value(value, names, types, table)
                             # A reference annotation is not represented by the legacy bare
                             # type-name channel, so it used to skip `check_value_against`.
                             # Still reject a firmly inferred non-reference value in that
@@ -220,6 +323,7 @@ extend Semantic:
                             table <- check_ternary_condition(value, names, types, table)
                             table <- check_operator_operands(value, names, types, table) if not (value is Expr.Block(_, _, _, _))
                             table <- check_value_match_exhaustive(value, names, types, table)
+                            table <- check_darray_push_string_value(value, names, types, table)
                             table <- check_parallel_rebind_threading(target, operator, value, names, types, table)
                             match target:
                                 Expr.Ident(target_name, target_line):
@@ -234,6 +338,9 @@ extend Semantic:
                                         note_local_type_id_direct(target_name, 0, table)
                                     if operator == TokenKind.LArrow:
                                         target_type: sview = local_type_of(names, types, target_name)
+                                        target_structural: u32 = local_type_id_of(target_name, table)
+                                        target_kind: SemTypeKind = interned_kind(target_structural, table)
+                                        table <- check_string_storage_value(value, target_structural, target_name, Ast::expr_pos(value), false, names, types, table) if target_kind == SemTypeKind.Optional or target_kind == SemTypeKind.Container or target_kind == SemTypeKind.Tuple or target_kind == SemTypeKind.Named
                                         if target_type != "" or value is Expr.Block(_, _, _, _):
                                             # An untyped target has no type to judge a block's tail against, but the
                                             # block's own statements are still walked (target_type is "" then).
@@ -245,9 +352,6 @@ extend Semantic:
                                             # OPTIONAL target legally accepts its base value and
                                             # never flags here. Both literal and firm-inferred
                                             # scalar values are walls; unknowns stay silent.
-                                            target_structural: u32 = local_type_id_of(target_name, table)
-                                            target_string_payload: u32 = string_payload_type_id(target_structural, table)
-                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: target_name, pos: line, line: line.line, expected: diagnostic_name_of_row(target_string_payload, table), actual: "reference", detail3: "?"}) if interned_kind(target_structural, table) == SemTypeKind.Optional and target_string_payload != 0 and expression_is_raw_reference(value, names, types, table)
                                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: target_name, line: line.line, expected: "non-null reference", actual: "null"}) if interned_kind(target_structural, table) == SemTypeKind.Ref and expression_is_null(value)
                                             source_structural: u32 = structural_type_id_of(value, names, types, table)
                                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: target_name, line: line.line, expected: interned_name(target_structural, table), actual: interned_name(source_structural, table)}) if interned_kind(target_structural, table) == SemTypeKind.Container and interned_kind(source_structural, table) == SemTypeKind.Container and not type_ids_compatible(target_structural, source_structural, table)
@@ -295,6 +399,9 @@ extend Semantic:
                                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DictIndexAssignToOptionalRef, name: "", line: line.line, expected: stage0_operand_spelling(value, infer_expression_type(value, names, types, table)), actual: dict_value_spelling}) if dict_value_spelling != ""
                                         if indexed_head == "darray" or indexed_head == "array":
                                             element_spelling: sview = surface_name_of_row(interned_elem(indexed_id, 0, table), table)
+                                            element_type_id: u32 = interned_elem(indexed_id, 0, table) if interned_elem_count(indexed_id, table) > 0 else 0
+                                            element_kind: SemTypeKind = interned_kind(element_type_id, table)
+                                            table <- check_string_storage_value(value, element_type_id, "element", Ast::expr_pos(value), true, names, types, table) if element_kind == SemTypeKind.Optional or element_kind == SemTypeKind.Container or element_kind == SemTypeKind.Tuple or element_kind == SemTypeKind.Named
                                             # stage0 words an element write like any mutation
                                             # ("cannot assign bool to i64") and spans the target's
                                             # head identifier; this used to print the declaration
@@ -306,6 +413,9 @@ extend Semantic:
                                         # type (a Field target is always a mutation, never a define).
                                         object_type: InferType = infer_expression_type(field_object, names, types, table)
                                         field_type: sview = field_type_of(table, object_type.name, target_field) if object_type.kind == SemTypeKind.Named else ""
+                                        field_type_id: u32 = field_type_id_of(table, object_type.name, target_field) if object_type.kind == SemTypeKind.Named else 0
+                                        field_kind: SemTypeKind = interned_kind(field_type_id, table)
+                                        table <- check_string_storage_value(value, field_type_id, target_field, Ast::expr_pos(value), true, names, types, table) if field_kind == SemTypeKind.Optional or field_kind == SemTypeKind.Container or field_kind == SemTypeKind.Tuple or field_kind == SemTypeKind.Named
                                         # Mutation wording and head span, as for an element write.
                                         table <- check_assigned_value_against(value, field_type, ident_extent_or_line(field_object, line.line), names, types, table) if field_type != ""
                                 _:
@@ -315,6 +425,8 @@ extend Semantic:
                                 table <- check_ternary_condition(return_expression, names, types, table)
                                 table <- check_operator_operands(return_expression, names, types, table) if not (return_expression is Expr.Block(_, _, _, _))
                                 table <- check_value_match_exhaustive(return_expression, names, types, table)
+                                table <- check_string_storage_value(return_expression, return_type_id, "return", Ast::expr_pos(return_expression), false, names, types, table) if interned_kind(return_type_id, table) == SemTypeKind.Optional or interned_kind(return_type_id, table) == SemTypeKind.Container or interned_kind(return_type_id, table) == SemTypeKind.Tuple or interned_kind(return_type_id, table) == SemTypeKind.Named
+                                table <- check_darray_push_string_value(return_expression, names, types, table)
                                 # docs/119 §2.1 `return` + block: the tail is the returned value.
                                 table <- check_block_value_against(return_expression, return_type_name, "return", line, false, return_type_name, return_type_id, names, types, table)
                             # `return null` from a function whose return type cannot hold null.
@@ -355,9 +467,6 @@ extend Semantic:
                                 optional_family <- infer_family(optionally_returned, names, types, table) if optional_family == ""
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: optional_base, actual: stage0_expr_spelling(optionally_returned, infer_expression_type(optionally_returned, names, types, table)), detail3: "?"}) if optional_base != "" and interned_elem_count(return_type_id, table) == 1 and (firm_never_fits(optional_family, optional_surface) or string_member_never_fits(infer_expression_type(optionally_returned, names, types, table), optional_surface))
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: "non-null reference", actual: "null"}) if interned_kind(return_type_id, table) == SemTypeKind.Ref and value is null_return and expression_is_null(null_return)
-                            return_string_payload: u32 = string_payload_type_id(return_type_id, table)
-                            return_is_optional_string: bool = interned_kind(return_type_id, table) == SemTypeKind.Optional
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: Ast::expr_pos(return_expression), line: line.line, expected: diagnostic_name_of_row(return_string_payload, table) if return_string_payload != 0 else return_type_name, actual: "reference", detail3: "?" if return_is_optional_string else ""}) if value is return_expression and return_string_payload != 0 and expression_is_raw_reference(return_expression, names, types, table)
                         # NOTE (§5.1): the condition's own `Ast::Pos` is NOT stage0's span here
                         # (a Field/Call node carries its `.`/`(` token). MEASURED 2026-09-07:
                         # stage0 spans the chain's HEAD identifier (`b` in `b.names`,
@@ -457,6 +566,7 @@ extend Semantic:
                             # Bare expression statements (method calls like `xs.push(v)`)
                             # get the same operator/argument walk as value positions.
                             table <- check_operator_operands(expression, names, types, table) if not (expression is Expr.Block(_, _, _, _))
+                            table <- check_darray_push_string_value(expression, names, types, table)
                             # A loop header is represented as a value block around
                             # accumulator declarations and the loop. Check writes in
                             # that nested scope before discarding its locals; otherwise
