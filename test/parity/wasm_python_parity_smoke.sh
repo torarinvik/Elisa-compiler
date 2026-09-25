@@ -51,12 +51,12 @@ ELISA_STAGE1_MAX_RSS_KB="$stage1_rss_limit_kb"
 export ELISA_STAGE1_BIN="$STAGE1_BIN"
 export ELISA_STAGE1_MAX_RSS_KB
 
-TIMEOUT_BIN="$(command -v timeout || true)"
-if [ -z "$TIMEOUT_BIN" ]; then
-    echo "wasm_python_parity_smoke: refusing to run without a non-retrying timeout command" >&2
+BOUNDED_RUNNER="$ROOT/test/parity/run_bounded_stage1_command.py"
+if [ ! -f "$BOUNDED_RUNNER" ]; then
+    echo "wasm_python_parity_smoke: refusing to run without the process-tree RSS supervisor" >&2
     exit 125
 fi
-RUN() { "$TIMEOUT_BIN" -k 5 300 "$@"; }
+RUN() { python3 "$BOUNDED_RUNNER" "$@"; }
 
 [ -x "$WRAPPER" ] || { echo "wasm_python_parity_smoke FAIL: no stage1 wrapper at $WRAPPER" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "wasm_python_parity_smoke SKIP: no python3"; exit 0; }
