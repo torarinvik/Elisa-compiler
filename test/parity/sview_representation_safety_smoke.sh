@@ -206,6 +206,11 @@ check_nullable_cstr_storage_contexts_rejected() {
         cat "$log" >&2
         exit 1
     }
+    [[ "$(rg -F -c 'variable "caught" expects cstr?, got reference' "$log")" -eq 1 ]] || {
+        echo "sview representation safety smoke: raw reference on one catch cstr? branch was not rejected at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
     [[ "$(rg -F -c 'cannot assign reference to cstr?' "$log")" -eq 3 ]] || {
         echo "sview representation safety smoke: raw references in field, indexed, or push cstr? stores were not all rejected at O$optimization" >&2
         cat "$log" >&2
