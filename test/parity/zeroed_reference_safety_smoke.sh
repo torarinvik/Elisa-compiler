@@ -55,6 +55,26 @@ for repro in \
     done
 done
 
+# Module-qualified aliases must resolve by their complete declaration identity. Keep this
+# Stage1-only check until Stage0's equivalent alias resolver is qualified as well.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-qualified-reference-O$level.ll"
+    log="$WORK/stage1-zeroed-qualified-reference-O$level.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_qualified_nonnull_reference_alias.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted a module-qualified non-null reference alias at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed qualified-alias compilation left an LLVM artifact" >&2
+        exit 1
+    }
+    rg -q 'cannot initialize non-null reference .* from zeroed' "$log" || {
+        echo "zeroed reference smoke: qualified-alias rejection used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
 run_positive() {
     local compiler="$1" tag="$2" level="$3" source="$4"
     local name="$(basename -- "$source" .elisa)"
@@ -86,4 +106,8 @@ for level in 0 2; do
     fi
 done
 
-echo "zeroed reference smoke OK: invalid non-null references reject through locals, aliases, globals, generic and ordinary structs, named tuples, and fixed arrays; initialized references and safe generic scalar storage return 42 at -O0/-O2"
+for level in 0 2; do
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
+done
+
+echo "zeroed reference smoke OK: invalid non-null references reject through locals, aliases, globals, qualified module aliases, generic and ordinary structs, named tuples, and fixed arrays; initialized references and nullable/scalar-generic storage return 42 at -O0/-O2"
