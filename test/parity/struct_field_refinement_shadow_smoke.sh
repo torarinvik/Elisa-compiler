@@ -21,6 +21,8 @@ BAD_ZEROED_ASSIGNMENT="$ROOT/test/repro/struct_field_refinement_zeroed_assignmen
 BAD_ZEROED_GLOBAL="$ROOT/test/repro/struct_field_refinement_zeroed_global.elisa"
 BAD_ZEROED_CONDITIONAL="$ROOT/test/repro/struct_field_refinement_zeroed_conditional.elisa"
 BAD_ZEROED_NESTED_AGGREGATE="$ROOT/test/repro/struct_field_refinement_zeroed_nested_aggregate.elisa"
+BAD_ZEROED_MATCH="$ROOT/test/repro/struct_field_refinement_zeroed_match.elisa"
+BAD_ZEROED_CATCH="$ROOT/test/repro/struct_field_refinement_zeroed_catch.elisa"
 GOOD="$ROOT/test/repro/struct_field_refinement_refined_param.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-field-refinement-shadow.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -74,5 +76,7 @@ reject_stage1 "$BAD_ZEROED_ASSIGNMENT" "bad-zeroed-assignment"
 reject_stage1 "$BAD_ZEROED_GLOBAL" "bad-zeroed-global"
 reject_stage1 "$BAD_ZEROED_CONDITIONAL" "bad-zeroed-conditional"
 reject_stage1 "$BAD_ZEROED_NESTED_AGGREGATE" "bad-zeroed-nested-aggregate"
+reject_stage1 "$BAD_ZEROED_MATCH" "bad-zeroed-match"
+reject_stage1 "$BAD_ZEROED_CATCH" "bad-zeroed-catch"
 
 echo "struct-field refinement shadow smoke OK: unproven construction, stores, record updates, zeroed values, compound mutations, and stale interval facts are rejected; proven zeroed values and refined parameters are accepted"
