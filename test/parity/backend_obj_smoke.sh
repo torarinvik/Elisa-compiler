@@ -154,6 +154,9 @@ obj_case fn_value_nested 'def inc(x: i64) -> i64:\n    return x + 1\n\ndef twice
 # {code,env} closure flows through emit_fn_value_call's closure branch. Both = 42.
 obj_case lambda_nocapture 'def apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    return fn(value)\n\ndef main() -> i64:\n    return apply(fn(v) => v * 2, 21)\n' 42
 obj_case lambda_capture 'def apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    return fn(value)\n\ndef run() -> i64:\n    offset: i64 = 1\n    return apply(fn(v) => v + offset, 41)\n\ndef main() -> i64:\n    return run()\n' 42
+# Aggregate captures use the same synthesized environment layout, but exercise the
+# non-scalar LLVM field type and its checked optional presence separately.
+obj_case lambda_struct_capture 'struct Point:\n    x: i64\n    y: i64\n\ndef run() -> i64:\n    point: Point = Point{x: 20, y: 20}\n    fn: fn(i64) -> i64 = fn(value) => point.x + point.y + value\n    return fn(2)\n\ndef main() -> i64:\n    return run()\n' 42
 # HIGHER-ORDER RETURN: a function whose return type is a fn/closure, stored in a fn-typed
 # LOCAL and called. Needed a parser fix (a local `f: fn(A)->R =` type resolves as a fn-type,
 # not a call to a fn named `fn`) + arg emission at the fn's declared param types (so a literal
