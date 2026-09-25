@@ -76,6 +76,27 @@ for level in 0 2; do
     }
 done
 
+# A qualified handle alias is an invalid zero representation only when it is non-null.
+# The non-null value must remain uninitialized until assigned; an optional handle's zero
+# representation is valid and remains an accepted executable control.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-qualified-handle-O$level.ll"
+    log="$WORK/stage1-zeroed-qualified-handle-O$level.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_qualified_handle_alias.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted a returned module-qualified zeroed handle at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed qualified-handle compilation left an LLVM artifact" >&2
+        exit 1
+    }
+    rg -q 'use of uninitialized variable' "$log" || {
+        echo "zeroed reference smoke: qualified-handle rejection used the wrong diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
 # Module-qualified aliases must resolve by their complete declaration identity. Keep this
 # Stage1-only check until Stage0's equivalent alias resolver is qualified as well.
 for level in 0 2; do
@@ -118,18 +139,26 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_generic_phantom_scalar.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nested_generic_scalar.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nullable_string_struct_array.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nullable_reference_aggregate.elisa"
     if [[ -x "$STAGE0" ]]; then
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/valid_initialized_reference.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_generic_scalar_field.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_generic_phantom_scalar.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_nested_generic_scalar.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_nullable_string_struct_array.elisa"
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_nullable_reference_aggregate.elisa"
     fi
 done
 
 for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_sview_alias.elisa"
+    if [[ -x "$STAGE0" ]]; then
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_sview_alias.elisa"
+    fi
 done
 
-echo "zeroed reference smoke OK: invalid non-null references and borrowed views reject through locals, aliases, globals, qualified module aliases, generic and ordinary structs, named tuples, and fixed arrays; initialized references and nullable/scalar-generic storage return 42 at -O0/-O2"
+echo "zeroed reference smoke OK: invalid non-null references reject across direct, aliased, aggregate, and generic storage; qualified non-null handles and borrowed views reject; nullable references, handles, views, and reference-bearing aggregates return 42 at -O0/-O2"
