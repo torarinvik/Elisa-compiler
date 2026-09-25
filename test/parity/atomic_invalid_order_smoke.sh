@@ -31,4 +31,33 @@ for fixture in \
 done
 done
 
-echo "atomic invalid-order smoke OK: invalid load/store/fence/CAS orders fail closed at O0/O2"
+for optimization in 0 2; do
+    output="$WORK/atomic_same_named_i32_load-O$optimization"
+    log="$WORK/atomic_same_named_i32_load-O$optimization.log"
+    if ! ELISA_STAGE1_RUNTIME_STD=1 "$STAGE1" -emit exe "-O$optimization" -o "$output" "$ROOT/test/repro/atomic_same_named_i32_load.elisa" >"$log" 2>&1; then
+        echo "atomic invalid-order smoke: failed to compile the i32 overload at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    set +e
+    "$output"
+    result=$?
+    set -e
+    [[ "$result" -eq 42 ]] || { echo "atomic invalid-order smoke: i32 overload returned $result at O$optimization, expected 42" >&2; exit 1; }
+done
+
+# Keep this declaration-only helper at O0: the O2 pipeline correctly removes it as an
+# unreferenced internal function, which would make an IR-presence assertion meaningless.
+ir="$WORK/atomic_typed_order_parameter-O0.ll"
+log="$WORK/atomic_typed_order_parameter-O0.log"
+if ! ELISA_STAGE1_RUNTIME_STD=1 "$STAGE1" -emit llvm -O0 -o "$ir" "$ROOT/test/repro/atomic_typed_order_parameter.elisa" >"$log" 2>&1; then
+    echo "atomic invalid-order smoke: failed to lower a typed MemoryOrder parameter" >&2
+    cat "$log" >&2
+    exit 1
+fi
+grep -Eq 'load atomic i64, .* seq_cst' "$ir" || {
+    echo "atomic invalid-order smoke: typed MemoryOrder parameter did not retain atomic lowering" >&2
+    exit 1
+}
+
+echo "atomic order smoke OK: invalid literals fail closed, i32 overloads preserve their body at O0/O2, and typed MemoryOrder parameters remain atomic"
