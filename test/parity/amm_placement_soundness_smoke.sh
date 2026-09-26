@@ -54,6 +54,7 @@ check ref_alias_two_regions "$ROOT/test/fixtures/amm/ref_alias_two_regions.elisa
 check index_store_escape "$ROOT/test/fixtures/amm/index_store_escape.elisa" 164
 # A generic effect operation that grows the caller's darray (stage1-only feature).
 check static_effect_growth "$ROOT/test/fixtures/amm/static_effect_growth.elisa" 164
+check named_argument_forwarding "$ROOT/test/fixtures/amm/named_argument_forwarding.elisa" 169
 
 # After `r <- q` the reference may point into either caller region: no single arena
 # outlives both referents, so the function must decline LOUDLY rather than guess one.
