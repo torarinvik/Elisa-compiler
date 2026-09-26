@@ -63,6 +63,21 @@ for repro in \
     done
 done
 
+# Runtime inclusion must not suppress checks on invalid user values in the same unit.
+# Integration once proposed disabling the entire pass when this flag was enabled.
+for repro in zeroed_cstr_call_argument.elisa zeroed_nonnull_reference.elisa; do
+    for level in 0 2; do
+        output="$WORK/runtime-std-${repro%.elisa}-O$level.ll"
+        log="$output.log"
+        if ELISA_STAGE1_RUNTIME_STD=1 "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/$repro" >"$log" 2>&1; then
+            echo "zeroed reference smoke: runtime inclusion suppressed $repro at -O$level" >&2
+            exit 1
+        fi
+        [[ ! -e "$output" ]] || { echo "zeroed reference smoke: runtime inclusion left invalid LLVM output" >&2; exit 1; }
+        rg -q 'use of uninitialized variable|cannot initialize non-null reference' "$log" || { cat "$log" >&2; exit 1; }
+    done
+done
+
 # A borrowed view must not acquire a zero representation through a qualified alias.
 # Both compiler generations resolve the qualified alias; guard the rejection in both.
 for compiler in "${COMPILERS[@]}"; do
