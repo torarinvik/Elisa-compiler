@@ -94,6 +94,23 @@ extend Semantic:
                     Pattern.Binding(_): true
                     _: false
 
+        # A state mutation in an arm that cannot reach the join must not leak into
+        # the continuation after the match. Keep this deliberately conservative:
+        # only an explicit return (possibly after a nested block) proves that an arm
+        # does not fall through. Conditional termination is left as fall-through so
+        # this helper cannot hide a real destroyed-region use.
+        def destroyed_statements_terminate(statements: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Return(value, line):
+                            return true
+                        Stmt.Block(kind, clause, binding, body, line):
+                            return true if destroyed_statements_terminate(body)
+                        _:
+                            pass
+                return false
+
 
         def destroyed_arena_owner_source_name(expression: Ast::Expr) -> sview:
             can Memory.Allocate, Abort.Panic:
@@ -832,22 +849,62 @@ extend Semantic:
 
         # Resolver references carry a BindingId owner, so local callable values are
         # recognized in the current function without mistaking an identically named
-        # top-level function in another scope for an indirect call.
-        def destroyed_collect_local_reference_names(function_name: sview, function_position: Ast::Pos, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+        # top-level function in another scope. The resolver maintains the shared owner
+        # index as reference rows are recorded; fall back to the canonical scan if its
+        # shape is ever inconsistent.
+        def destroyed_scan_local_reference_names(function_owner: DeclId, table: SymbolTable&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                function_owner: mutable DeclId = DeclId{value: 0}
-                owner_found: mutable bool = false
-                for symbol_index in 0..<table.symbols.count |function_name, function_position, table, function_owner, owner_found|:
-                    symbol: Symbol& = &table.symbols[symbol_index]
-                    if symbol.kind == SymbolKind.Func and symbol.name == function_name and symbol.offset == function_position.offset:
-                        function_owner <- symbol.id
-                        owner_found <- true
-                return if not owner_found
                 for reference_index in 0..<table.ref_binding_ids.count |function_owner, table, out|:
                     binding: BindingId = table.ref_binding_ids[reference_index]
                     if binding.owner.value == function_owner.value and reference_index < table.ref_name.count:
                         name: sview = table.ref_name[reference_index]
                         out.push(name) if not any existing in out where existing == name
+
+
+        # Name chains keep the owner lookup proportional to same-spelled declarations,
+        # while the resolver-maintained bucket limits the reference walk to this function.
+        def destroyed_collect_local_reference_names(function_name: sview, function_position: Ast::Pos, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                function_owner: mutable DeclId = DeclId{value: 0}
+                owner_found: mutable bool = false
+                symbol_chain_valid: mutable bool = true
+                symbol_steps: mutable usize = 0
+                symbol_row: mutable u32 = symbol_chain_head(table, function_name)
+                while symbol_row != SYMBOL_INDEX_ROW_NONE and symbol_chain_valid and symbol_steps < table.symbols.count |symbol_row, function_name, function_position, table, function_owner, owner_found, symbol_chain_valid, symbol_steps|:
+                    symbol_index: usize = symbol_row.usize()
+                    if symbol_index >= table.symbols.count or symbol_index >= table.symbol_name_next.count:
+                        symbol_chain_valid <- false
+                    else:
+                        symbol: Symbol& = &table.symbols[symbol_index]
+                        if symbol.kind == SymbolKind.Func and symbol.name == function_name and symbol.offset == function_position.offset:
+                            function_owner <- symbol.id
+                            owner_found <- true
+                        symbol_row <- table.symbol_name_next[symbol_index]
+                    symbol_steps <- symbol_steps + 1
+                symbol_chain_valid <- false if symbol_row != SYMBOL_INDEX_ROW_NONE
+                if not symbol_chain_valid or not owner_found:
+                    function_owner <- function_declaration_id(table, function_name, function_position.offset)
+                    owner_found <- function_owner.value != SYMBOL_INDEX_ROW_NONE
+                return if not owner_found
+                owner_index: usize = function_owner.value.usize()
+                if not table.ref_owner_index_valid or owner_index >= table.symbols.count or table.ref_owner_next.count != table.ref_binding_ids.count:
+                    destroyed_scan_local_reference_names(function_owner, table, out)
+                    return
+                if owner_index >= table.ref_owner_heads.count:
+                    destroyed_scan_local_reference_names(function_owner, table, out)
+                    return
+                reference_index: mutable u32 = table.ref_owner_heads[owner_index]
+                reference_steps: mutable usize = 0
+                while reference_index != SYMBOL_INDEX_ROW_NONE |reference_index, table, out, reference_steps, function_owner|:
+                    reference_row: usize = reference_index.usize()
+                    if reference_row >= table.ref_owner_next.count or reference_steps >= table.ref_owner_next.count:
+                        destroyed_scan_local_reference_names(function_owner, table, out)
+                        return
+                    if reference_row < table.ref_name.count:
+                        name: sview = table.ref_name[reference_row]
+                        out.push(name) if not any existing in out where existing == name
+                    reference_index <- table.ref_owner_next[reference_row]
+                    reference_steps <- reference_steps + 1
 
 
         def destroyed_collect_opaque_function_signatures(declarations: darray[Ast::Decl], names: mutable darray[sview]&, starts: mutable darray[usize]&, arities: mutable darray[u32]&) -> void:
@@ -1699,13 +1756,22 @@ extend Semantic:
                             has_unguarded_catchall: mutable bool = false
                             for arm in arms |destroyed, table, base_alias_ids, base_alias_roots, merged_alias_ids, merged_alias_roots, has_unguarded_catchall, arena_owner_alias_ids, arena_owner_alias_roots|:
                                 if not has_unguarded_catchall:
+                                    arm_destroyed_before: mutable darray[u32] = []
+                                    arm_destroyed_before.extend(destroyed)
                                     arena_owner_alias_ids.clear()
                                     arena_owner_alias_roots.clear()
                                     destroyed_copy_owner_alias_roots(base_alias_ids, base_alias_roots, destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
                                     table <- diagnose_destroyed_expression(arm.guard, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
                                     destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                                     table <- walk_destroyed_region_statements(arm.body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, branch_sensitive, table)
-                                    destroyed_copy_owner_alias_roots(arena_owner_alias_ids, arena_owner_alias_roots, destroyed, merged_alias_ids, merged_alias_roots)
+                                    if destroyed_statements_terminate(arm.body):
+                                        # This arm returns; its invalidation facts are
+                                        # unreachable after the match and must not poison
+                                        # the following arms or the post-match continuation.
+                                        destroyed.clear()
+                                        destroyed.extend(arm_destroyed_before)
+                                    else:
+                                        destroyed_copy_owner_alias_roots(arena_owner_alias_ids, arena_owner_alias_roots, destroyed, merged_alias_ids, merged_alias_roots)
                                     has_unguarded_catchall <- true if destroyed_match_arm_is_unguarded_catchall(arm)
                             arena_owner_alias_ids.clear()
                             arena_owner_alias_roots.clear()
@@ -1722,7 +1788,7 @@ extend Semantic:
                         _:
                             pass
 
-        def check_destroyed_region_declarations(declarations: darray[Ast::Decl], file: Ast::File&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+        def check_destroyed_region_declarations(declarations: darray[Ast::Decl], file: Ast::File&, view_fns: darray[sview]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
@@ -1736,8 +1802,6 @@ extend Semantic:
                             arena_owner_alias_roots: mutable darray[u32] = []
                             local_reference_names: mutable darray[sview] = []
                             destroyed_collect_local_reference_names(name, line, table, local_reference_names)
-                            view_fns: mutable darray[sview] = []
-                            collect_view_returning_fns(file.top_decls, view_fns)
                             for parameter in params:
                                 if destroyed_type_is_view(parameter.type_expression):
                                     borrow_names.push(parameter.name)
@@ -1752,9 +1816,9 @@ extend Semantic:
                                         borrow_regions.push(UNKNOWN_REGION_DEPENDENCY)
                             table <- walk_destroyed_region_statements(body, file.local_region_annotations, file.allocation_region_names, file.allocation_region_lines, view_fns, params, line.line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
                         Decl.Module(name, body, line):
-                            table <- check_destroyed_region_declarations(body, file, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
+                            table <- check_destroyed_region_declarations(body, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
                         Decl.Scoped(body, line):
-                            table <- check_destroyed_region_declarations(body, file, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
+                            table <- check_destroyed_region_declarations(body, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
                         _:
                             pass
 
@@ -1764,14 +1828,16 @@ extend Semantic:
                 arena_invalidation_names: mutable darray[sview] = []
                 arena_invalidation_params: mutable darray[u32] = []
                 arena_invalidation_formals: mutable darray[sview] = []
+                view_fns: mutable darray[sview] = []
                 local_function_names: mutable darray[sview] = []
                 opaque_function_names: mutable darray[sview] = []
                 opaque_function_starts: mutable darray[usize] = []
                 opaque_function_arities: mutable darray[u32] = []
+                collect_view_returning_fns(file.top_decls, view_fns)
                 destroyed_collect_local_function_names(file.top_decls, local_function_names)
                 destroyed_collect_opaque_function_signatures(file.top_decls, opaque_function_names, opaque_function_starts, opaque_function_arities)
                 summaries_changed: mutable bool = true
                 while summaries_changed |summaries_changed, file, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities|:
                     summaries_changed <- false
                     destroyed_collect_arena_invalidation_summaries(file.top_decls, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, summaries_changed)
-                table <- check_destroyed_region_declarations(file.top_decls, file, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, file.extern_params, table)
+                table <- check_destroyed_region_declarations(file.top_decls, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, file.extern_params, table)
