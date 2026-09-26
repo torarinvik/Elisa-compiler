@@ -30,14 +30,67 @@ extend Backend:
                 structs.region_fact_buckets[bucket] <- remaining.i64()
 
 
+        # Load the reference aliases of the body about to be scanned. The table lives in
+        # `structs`, so it is refilled element by element: storing the local darray itself
+        # would escape this function's auto region (stage0 rejects that).
+        def region_load_aliases(body: darray[Stmt], structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                load_names: mutable darray[sview] = []
+                load_roots: mutable darray[sview] = []
+                ref_alias_collect(body, structs, load_names, load_roots)
+                structs.region_alias_names <- []
+                structs.region_alias_roots <- []
+                for load_index in 0..<load_names.count |structs, load_names, load_roots|:
+                    structs.region_alias_names <- structs.region_alias_names.push(load_names[load_index])
+                    structs.region_alias_roots <- structs.region_alias_roots.push(load_roots[load_index])
+
+
+
+
+        # A stored value that may carry storage from THIS function's arena: a named local
+        # (not a parameter, whose storage the caller already owns), a non-empty literal, or
+        # a call result (built in the call-site arena). `[]` allocates nothing.
+        def region_store_value_allocates(value: Expr, params: darray[ParamDecl]&) -> bool can[Abort.Panic]:
+            if value is Expr.Ident(store_value_name, store_value_pos):
+                for store_param in params |store_value_name|:
+                    false return if store_param.name == store_value_name
+                return true
+            if value is Expr.Array(store_elements, store_array_pos):
+                return store_elements.count > 0
+            if value is Expr.Paren(store_inner, store_paren_pos):
+                can Abort.Panic:
+                    return region_store_value_allocates(store_inner, params)
+            if value is Expr.Move(store_moved, store_move_pos):
+                can Abort.Panic:
+                    return region_store_value_allocates(store_moved, params)
+            if value is Expr.Call(store_callee, store_arguments, store_names, store_call_pos):
+                return true
+            return false
+
+
+
+
         def region_mark_root(root: sview, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                return if root == ""
+                region_mark_root_depth(root, params, flags, structs, 0)
+
+
+
+
+        # A root that is not a parameter may be a local reference ALIAS of one (`r = p`,
+        # `r = pick(p, q)`): growth through it grows the parameter's storage, so every
+        # parameter it may alias is flagged. The bound stops alias cycles.
+        def region_mark_root_depth(root: sview, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&, depth: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if root == "" or root == "?" or depth >= 8
                 for parameter_index in 0..<params.count |params, flags, root, structs|:
                     continue if params[parameter_index].name != root
                     parameter_type: ValueType = parameter_value_type(params[parameter_index].type_expression, structs)
                     flags[parameter_index] <- true if ref_type_can_grow(parameter_type, structs)
                     return
+                for alias_index in 0..<structs.region_alias_names.count |params, flags, root, structs, depth|:
+                    continue if structs.region_alias_names[alias_index] != root
+                    region_mark_root_depth(structs.region_alias_roots[alias_index], params, flags, structs, depth + 1)
 
 
 
@@ -154,6 +207,19 @@ extend Backend:
                                 append_scope.types.push(annotation_value_type(append_param.type_expression, structs))
                             if darray_type_behind_expr(region_assign_target, append_scope, structs).kind == TypeKind.DArray:
                                 region_mark_root(region_growth_root(region_assign_target), params, flags, structs)
+                        # STORING freshly built region storage into a parameter's place
+                        # (`rows[0] <- fresh`, `p.items <- built`) escapes it to the caller just
+                        # as growth does: without the caller's arena `fresh` died with this
+                        # function's (use-after-free; stage0 rejects "value escapes").
+                        if region_assign_target is Expr.Ident(store_target_name, store_target_pos):
+                            pass
+                        elif region_store_value_allocates(region_assign_value, params):
+                            store_scope: mutable Scope = Scope{names: [], types: [], slots: [], pool_names: [], group_names: [], deferred: []}
+                            for store_param in params |store_scope, structs|:
+                                store_scope.names.push(store_param.name)
+                                store_scope.types.push(annotation_value_type(store_param.type_expression, structs))
+                            if darray_type_behind_expr(region_assign_target, store_scope, structs).kind == TypeKind.DArray:
+                                region_mark_root(region_growth_root(region_assign_target), params, flags, structs)
                         # Replacing a growable output reference needs its caller arena.
                         # A scalar member write is not growth of the containing struct.
                         if region_assign_target is Expr.Ident(assigned_name, assigned_pos):
@@ -190,6 +256,7 @@ extend Backend:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 for _ in 0..<params.count |flags|:
                     flags.push(false)
+                region_load_aliases(body, structs)
                 region_scan_statements(body, params, flags, structs)
                 return
 
@@ -294,7 +361,19 @@ extend Backend:
 
         def region_mark_forwarded(root: sview, parameter_position: usize, callee_name: sview, callee_owner: sview, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                return if root == "" or callee_name == ""
+                region_mark_forwarded_depth(root, parameter_position, callee_name, callee_owner, params, structs, fact_row, changed, 0)
+
+
+
+
+        # Forwarding a local reference ALIAS of a parameter (`r = p; grow(r)`) forwards the
+        # parameter itself, as in region_mark_root_depth.
+        def region_mark_forwarded_depth(root: sview, parameter_position: usize, callee_name: sview, callee_owner: sview, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&, depth: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if root == "" or root == "?" or callee_name == "" or depth >= 8
+                for alias_index in 0..<structs.region_alias_names.count |root, parameter_position, callee_name, callee_owner, params, structs, fact_row, changed, depth|:
+                    continue if structs.region_alias_names[alias_index] != root
+                    region_mark_forwarded_depth(structs.region_alias_roots[alias_index], parameter_position, callee_name, callee_owner, params, structs, fact_row, changed, depth + 1)
                 for caller_position in 0..<params.count |params, structs, fact_row, root, changed|:
                     continue if params[caller_position].name != root
                     slot: usize = structs.region_fact_starts[fact_row] + caller_position
@@ -480,6 +559,7 @@ extend Backend:
                         if row >= 0:
                             previous_owner: sview = structs.current_owner
                             structs.current_owner <- owner
+                            region_load_aliases(region_forward_fact_body, structs)
                             region_scan_forwarding_statements(region_forward_fact_body, region_forward_fact_params, structs, row.usize(), changed)
                             structs.current_owner <- previous_owner
                     elif declaration is Decl.Module(region_forward_module_name, region_forward_module_body, region_forward_module_line):

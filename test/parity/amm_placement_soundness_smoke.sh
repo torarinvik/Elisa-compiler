@@ -44,6 +44,27 @@ for fixture in amm_optional_return_arena amm_stack_value_block_escape amm_addres
 done
 # stage0 rejects this one ("cannot infer region parameter"); 4 + 100*40 = 4004 = 164 mod 256.
 check local_ref_growth_arena "$ROOT/test/fixtures/amm/local_ref_growth_arena.elisa" 164
+# Growth and stores THROUGH a local alias of a parameter (stage0 rejects each; 160 = the UAF).
+check ref_alias_growth "$ROOT/test/fixtures/amm/ref_alias_growth.elisa" 164
+check ref_alias_forwarded_growth "$ROOT/test/fixtures/amm/ref_alias_forwarded_growth.elisa" 164
+check ref_alias_chain "$ROOT/test/fixtures/amm/ref_alias_chain.elisa" 164
+# inner[3] + outer[3] + 100*40 = 4 + 5 + 4000 = 4009 = 169 mod 256.
+check ref_alias_two_regions "$ROOT/test/fixtures/amm/ref_alias_two_regions.elisa" 169
+check index_store_escape "$ROOT/test/fixtures/amm/index_store_escape.elisa" 164
+
+# After `r <- q` the reference may point into either caller region: no single arena
+# outlives both referents, so the function must decline LOUDLY rather than guess one.
+ambiguous_source="$ROOT/test/fixtures/amm/ref_alias_rebind_ambiguous.elisa"
+if "$STAGE1" -emit obj -o "$WORK/ambiguous.o" "$ambiguous_source" > "$WORK/ambiguous.log" 2>&1; then
+    echo "FAIL ref_alias_rebind_ambiguous: stage1 guessed an arena instead of declining" >&2
+    failures=$((failures + 1))
+elif ! grep -q 'declined 1: fill@' "$WORK/ambiguous.log"; then
+    echo "FAIL ref_alias_rebind_ambiguous: rejected for another reason:" >&2
+    cat "$WORK/ambiguous.log" >&2
+    failures=$((failures + 1))
+else
+    echo "ref_alias_rebind_ambiguous: decline PASS"
+fi
 
 drop_source="$ROOT/test/fixtures/amm/drop_type_implicit_copy.elisa"
 if "$STAGE1" -emit obj -o "$WORK/drop.o" "$drop_source" > "$WORK/drop.log" 2>&1; then
