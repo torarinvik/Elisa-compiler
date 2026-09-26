@@ -54,6 +54,10 @@ struct CallbackTable layout(c):
     user: mutable void&?
     callback: fn(mutable void&?, i32) -> void
 
+# Return annotations precede export aliases and must never rename either
+# struct to the metadata owner __extern_return in the generated C header.
+extern acquire_pair() -> Pair&
+extern acquire_outer() -> Outer&
 export type Pair as Public
 export type Outer as PublicOuter
 export type Node as PublicNode
