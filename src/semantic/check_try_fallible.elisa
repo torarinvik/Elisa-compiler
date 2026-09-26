@@ -270,6 +270,137 @@ extend Semantic:
                 return if interned_kind(function_return_type_id(table, callee_name), table) != SemTypeKind.Void
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryFallbackVoid, name: callee_name, pos: site_pos, line: site_pos.line, expected: "void", actual: fallback_kind})
 
+        # The cast form is the first concrete fallback shape for which Stage1 can recover
+        # both sides' structural types without threading a second local-type environment
+        # through this checker. It covers the source form that previously escaped analysis:
+        # `try read_file(path) else "".cast[u8&]`. Unknown fallback shapes remain silent
+        # rather than manufacturing a type from a literal or an overloaded call.
+        def try_fallback_cast_target_id(expression: Ast::Expr, table: mutable SymbolTable&) -> u32:
+            can Abort.Panic:
+                match expression:
+                    Expr.Index(Expr.Field(receiver, selector, field_line), target, target_line):
+                        return annotation_type_id(target, table) if selector == "cast"
+                    Expr.Paren(inner, paren_line):
+                        return try_fallback_cast_target_id(inner, table)
+                    _:
+                        pass
+                return 0
+
+        # Recover the borrowed source spelling without allocating a new sview. The AST's
+        # identifier slices already point into the source buffer; the wrapper punctuation is
+        # carried separately in Diagnostic.detail so the renderer can print `u8&` without
+        # manufacturing a dangling view into a temporary darray.
+        def try_fallback_cast_target_base(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        return name
+                    Expr.Paren(inner, paren_line):
+                        return try_fallback_cast_target_base(inner)
+                    Expr.Unary(operator, operand, unary_line):
+                        return try_fallback_cast_target_base(operand)
+                    Expr.Index(indexed_head, index_argument, index_line):
+                        return ident_name_of(indexed_head)
+                    _:
+                        return sview("", 0, 0)
+
+        def try_fallback_cast_target_has_ref(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Index(Expr.Field(receiver, selector, field_line), target, target_line):
+                        if selector == "cast":
+                            return try_fallback_cast_target_has_ref(target)
+                    Expr.Unary(operator, operand, unary_line):
+                        return true if operator == TokenKind.Ampersand
+                        return try_fallback_cast_target_has_ref(operand)
+                    Expr.Paren(inner, paren_line):
+                        return try_fallback_cast_target_has_ref(inner)
+                    _:
+                        pass
+                return false
+
+        def try_fallback_cast_target_spelling(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(Expr.Field(receiver, selector, field_line), target, target_line):
+                        return try_fallback_cast_target_base(target) if selector == "cast"
+                    Expr.Paren(inner, paren_line):
+                        return try_fallback_cast_target_spelling(inner)
+                    _:
+                        pass
+                return sview("", 0, 0)
+
+        # Compare the compact spelling available for an extern return with the compact
+        # spelling recovered from a cast fallback. A pointer target is kept as `base` plus
+        # `detail` because the target expression itself is a borrowed AST view and the
+        # diagnostic renderer appends the reference marker separately.
+        def try_fallback_declared_name_matches(expected: sview, actual: sview, actual_detail: sview) -> bool:
+            can Abort.Panic:
+                return false if expected == "" or actual == ""
+                if actual_detail == "&":
+                    expected_length: usize = sview_len(expected)
+                    return false if expected_length < 2.usize() or sview_at(expected, expected_length - 1.usize()) != 38
+                    return expected[0:expected_length - 1.usize()] == actual
+                return expected == actual
+
+        # Callable extern declarations keep their return head in a parser annotation rather
+        # than in Symbol.return_type: the compact AST intentionally leaves that symbol field
+        # empty because the backend reconstructs pointer/heap/optional ABI shape from the
+        # parallel extern rows. Use the declaration line to pair the anonymous
+        # `__extern_return` row with the named callable. This helper is only a fallback for
+        # this compact checker; ordinary call inference must continue using its existing ABI
+        # path.
+        def try_fallback_extern_return_type(annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, name: sview) -> sview:
+            can Abort.Panic:
+                declaration_line: mutable u32 = 0
+                for symbol in table.symbols:
+                    if symbol.name == name and symbol.kind == SymbolKind.Func:
+                        declaration_line <- symbol.line
+                        break
+                return "" if declaration_line == 0
+                for annotation in annotations:
+                    return annotation.name if annotation.owner == "__extern_return" and annotation.line == declaration_line
+                return ""
+
+        # The `__extern_return` row is only the head name: `-> u8&` records `u8`, with the
+        # reference and `?` markers on companion rows keyed by extern name and line.
+        def try_fallback_extern_return_flag(annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, name: sview, owner: sview) -> bool:
+            can Abort.Panic:
+                declaration_line: mutable u32 = 0
+                for symbol in table.symbols:
+                    if symbol.name == name and symbol.kind == SymbolKind.Func:
+                        declaration_line <- symbol.line
+                        break
+                return false if declaration_line == 0
+                return any annotation in annotations where annotation.owner == owner and annotation.name == name and annotation.line == declaration_line
+
+        def check_try_fallback_type_site(fallback: Ast::Expr, guarded: Ast::Expr, site_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callee_name: sview = try_fallback_callee_name(guarded)
+                return if callee_name == ""
+                return if direct_function_count(table, callee_name) == 0
+                return if not callable_returns_error(annotations, annotations, callee_name, "", "")
+                expected_name: mutable sview = function_return_type(table, callee_name)
+                expected_name <- try_fallback_extern_return_type(annotations, table, callee_name) if expected_name == ""
+                return if expected_name == "" or expected_name == "void"
+                expected_id: u32 = function_return_type_id(table, callee_name)
+                return if expected_id != 0 and interned_kind(expected_id, table) == SemTypeKind.Void
+                actual_id: u32 = try_fallback_cast_target_id(fallback, table)
+                actual_name: sview = try_fallback_cast_target_spelling(fallback)
+                return if expected_name == "" or actual_name == ""
+                actual_detail: sview = "&" if try_fallback_cast_target_has_ref(fallback) else ""
+                if expected_id != 0:
+                    return if actual_id == 0 or type_ids_compatible(expected_id, actual_id, table)
+                else:
+                    # A pointer or optional extern return has no source spelling for its expected
+                    # side: the message can carry the fallback's `&` (detail) but not the
+                    # expected one, so a mismatch would print `expects u8` where stage0 prints
+                    # `expects u8&`. Stay silent rather than reject `-> u8&` met by `.cast[u8&]`.
+                    return if try_fallback_extern_return_flag(annotations, table, callee_name, "__extern_return_ptr")
+                    return if try_fallback_extern_return_flag(annotations, table, callee_name, "__extern_return_optional")
+                return if try_fallback_declared_name_matches(expected_name, actual_name, actual_detail)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryFallbackTypeMismatch, name: callee_name, pos: site_pos, line: site_pos.line, expected: expected_name, actual: actual_name, detail: actual_detail})
+
         def try_fallback_void_expression(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -279,6 +410,7 @@ extend Semantic:
                     # below is what keeps this from firing on one.)
                     Expr.Refinement(fallback, guarded, refinement_pos):
                         table <- check_try_fallback_void_site(fallback, guarded, refinement_pos, annotations, table)
+                        table <- check_try_fallback_type_site(fallback, guarded, refinement_pos, annotations, table)
                         table <- try_fallback_void_expression(fallback, annotations, table)
                         table <- try_fallback_void_expression(guarded, annotations, table)
                     Expr.Binary(left, operator, right, binary_pos):
