@@ -12,7 +12,7 @@ compilers=("$STAGE1")
 [[ ! -x "$STAGE0" ]] || compilers+=("$STAGE0")
 for compiler in "${compilers[@]}"; do
     for level in 0 2; do
-        for repro in enum_module_alias_payload enum_module_alias_reference enum_module_alias_nested enum_module_alias_chained enum_module_nested_direct enum_module_nested_deep; do
+        for repro in enum_module_alias_payload enum_module_alias_reference enum_module_alias_nested enum_module_alias_chained enum_module_nested_direct enum_module_nested_deep enum_module_ancestor_relative enum_module_ancestor_nearest enum_module_ancestor_deep enum_module_ancestor_mixed_type enum_module_ancestor_canonical_alias enum_module_ancestor_const_values enum_module_ancestor_packed; do
             "$compiler" -emit obj "-O$level" -o "$WORK/valid.o" "$ROOT/test/repro/$repro.elisa"
             "${ELISA_CLANG:-clang}" -fno-builtin -o "$WORK/valid" "$WORK/valid.o" "$RUNTIME" "$ROOT/scripts/pymodule_runtime_fallback.c" "$ROOT/test/parity/profile_hooks.c"
             set +e
@@ -23,7 +23,7 @@ for compiler in "${compilers[@]}"; do
             "$compiler" -emit llvm "-O$level" -o "$WORK/valid.ll" "$ROOT/test/repro/$repro.elisa"
             "${ELISA_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/valid.ll"
         done
-        for negative in enum_module_alias_wrong_owner enum_module_nested_wrong_owner enum_module_alias_chained_wrong_owner; do
+        for negative in enum_module_alias_wrong_owner enum_module_nested_wrong_owner enum_module_alias_chained_wrong_owner enum_module_ancestor_wrong_owner enum_module_ancestor_const_wrong_owner enum_module_ancestor_const_wrong_width enum_module_ancestor_const_invalid_literal enum_module_ancestor_const_invalid_cast enum_module_wrong_payload_pattern enum_module_wrong_payload_pattern_expr enum_module_wrong_nested_payload_pattern enum_module_wrong_payload_is_pattern; do
             for mode in llvm obj; do
                 output="$WORK/wrong-owner.$mode"
                 if "$compiler" -emit "$mode" "-O$level" -o "$output" "$ROOT/test/repro/$negative.elisa" > "$WORK/wrong-owner.log" 2>&1; then
@@ -31,7 +31,7 @@ for compiler in "${compilers[@]}"; do
                     exit 1
                 fi
                 [[ ! -e "$output" ]] || { echo 'wrong-owner rejection left an artifact' >&2; exit 1; }
-                rg -q 'return type expects|backend declined' "$WORK/wrong-owner.log" || { cat "$WORK/wrong-owner.log" >&2; exit 1; }
+                rg -q 'return type expects|match arm expects|backend declined|backend could not produce a linkable unit' "$WORK/wrong-owner.log" || { cat "$WORK/wrong-owner.log" >&2; exit 1; }
             done
         done
     done
