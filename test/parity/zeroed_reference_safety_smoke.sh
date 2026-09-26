@@ -280,6 +280,25 @@ for level in 0 2; do
     done
 done
 
+# Nominal field sets must follow qualified owner identity, including generic heads.
+for repro in zeroed_qualified_struct_identity.elisa zeroed_qualified_struct_reference_identity.elisa zeroed_qualified_generic_struct_identity.elisa zeroed_same_named_nested_structs.elisa; do
+    for level in 0 2; do
+        output="$WORK/${repro%.elisa}-O$level.ll"
+        log="$WORK/${repro%.elisa}-O$level.log"
+        if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/$repro" >"$log" 2>&1; then
+            echo "zeroed reference smoke: nominal identity accepted $repro at -O$level" >&2
+            exit 1
+        fi
+        [[ ! -e "$output" ]] || { echo "zeroed reference smoke: rejected nominal identity left LLVM" >&2; exit 1; }
+        expected='sview with valid backing'
+        [[ "$repro" != zeroed_qualified_struct_reference_identity.elisa ]] || expected='cannot initialize aggregate .* from zeroed: field .* requires a valid non-null value'
+        rg -q "$expected" "$log" || { cat "$log" >&2; exit 1; }
+        if [[ "$repro" == zeroed_qualified_struct_identity.elisa ]]; then
+            [[ $(rg -c 'sview with valid backing' "$log") -eq 2 ]] || { cat "$log" >&2; exit 1; }
+        fi
+    done
+done
+
 # Aggregate aliases must expose their resolved shape and declaration owner.
 for repro in zeroed_qualified_tuple_alias.elisa zeroed_qualified_tuple_alias_owner.elisa; do
     for level in 0 2; do
@@ -362,6 +381,8 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_tuple_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_scalar_tuple_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nested_nullable_tuple_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_struct_scalar_identity.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_generic_struct_scalar.elisa"
     if [[ -x "$STAGE0" ]]; then
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
