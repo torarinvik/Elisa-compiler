@@ -24,6 +24,7 @@ for repro in \
     zeroed_nonnull_reference_alias.elisa \
     zeroed_nonnull_reference_global.elisa \
     zeroed_nonnull_reference_return.elisa \
+    zeroed_cstr_call_argument.elisa \
     zeroed_generic_reference_return.elisa \
     zeroed_sview_return.elisa \
     zeroed_sview_field.elisa \
@@ -355,6 +356,7 @@ run_positive() {
 }
 
 for level in 0 2; do
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_cstr_initialized_call_argument.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/valid_initialized_reference.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_generic_scalar_field.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_generic_phantom_scalar.elisa"
@@ -362,6 +364,7 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nullable_string_struct_array.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_nullable_reference_aggregate.elisa"
     if [[ -x "$STAGE0" ]]; then
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_cstr_initialized_call_argument.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/valid_initialized_reference.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_generic_scalar_field.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_generic_phantom_scalar.elisa"
