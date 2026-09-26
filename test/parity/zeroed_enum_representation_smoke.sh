@@ -31,4 +31,4 @@ for compiler in "${compilers[@]}"; do
         [[ "$status" == 42 ]] || { echo "enum valid controls returned $status" >&2; exit 1; }
     done
 done
-echo 'zeroed enum representation smoke OK: active invalid payloads reject; inactive/scalar/constructed controls return 42 at O0/O2'
+echo 'zeroed enum representation smoke OK: active invalid payloads reject; inactive/nullable/scalar/constructed controls return 42 at O0/O2'
