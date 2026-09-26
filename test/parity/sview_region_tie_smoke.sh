@@ -22,6 +22,9 @@ def forward[@r](view: sview @r) -> sview @r:
 def plain_forward(view: sview) -> sview:
     return view
 
+def typed_forward(value: mutable i64&) -> mutable i64&:
+    return value
+
 def main() -> i64:
     return 0
 ELISA
@@ -64,30 +67,34 @@ def main() -> i64:
     return 0
 ELISA
 
+for opt in -O0 -O2; do
 for stage in stage0 stage1; do
     if [[ "$stage" == stage0 ]]; then compiler="$STAGE0"; else compiler="$STAGE1"; fi
-    "$compiler" -emit llvm -O0 -o "$WORK/$stage-good.ll" "$WORK/good.elisa" >"$WORK/$stage-good.log" 2>&1 \
+    "$compiler" -emit llvm "$opt" -o "$WORK/$stage-good.ll" "$WORK/good.elisa" >"$WORK/$stage-good.log" 2>&1 \
         || fail "$stage rejected lifetime-preserving or unannotated forwarding: $(tail -n 8 "$WORK/$stage-good.log")"
-    "$compiler" -emit llvm -O0 -o "$WORK/$stage-opaque-callback.ll" "$WORK/opaque_callback.elisa" >"$WORK/$stage-opaque-callback.log" 2>&1 \
+    "$compiler" -emit llvm "$opt" -o "$WORK/$stage-opaque-callback.ll" "$WORK/opaque_callback.elisa" >"$WORK/$stage-opaque-callback.log" 2>&1 \
         || fail "$stage rejected opaque void-pointer callback forwarding: $(tail -n 8 "$WORK/$stage-opaque-callback.log")"
     for bad in bad_drop bad_mismatch; do
-        if "$compiler" -emit llvm -O0 -o "$WORK/$stage-$bad.ll" "$WORK/$bad.elisa" >"$WORK/$stage-$bad.log" 2>&1; then
+        if "$compiler" -emit llvm "$opt" -o "$WORK/$stage-$bad.ll" "$WORK/$bad.elisa" >"$WORK/$stage-$bad.log" 2>&1; then
             fail "$stage accepted explicit sview region erasure in $bad"
         fi
         grep -Eq 'tied to region|sview parameter' "$WORK/$stage-$bad.log" \
             || fail "$stage rejected $bad for an unrelated reason: $(tail -n 8 "$WORK/$stage-$bad.log")"
     done
-    if "$compiler" -emit llvm -O0 -o "$WORK/$stage-tied-call-return.ll" "$ROOT/test/repro/sview_region_tied_call_return.elisa" >"$WORK/$stage-tied-call-return.log" 2>&1; then
+    if "$compiler" -emit llvm "$opt" -o "$WORK/$stage-tied-call-return.ll" "$ROOT/test/repro/sview_region_tied_call_return.elisa" >"$WORK/$stage-tied-call-return.log" 2>&1; then
         fail "$stage accepted a view-producing method call that erased its @r parameter region"
     fi
     grep -Fq 'value tied to region parameter "r"' "$WORK/$stage-tied-call-return.log" \
         || fail "$stage failed to explain the erased method-call lifetime: $(tail -n 8 "$WORK/$stage-tied-call-return.log")"
 done
 
-if "$STAGE1" -emit llvm -O0 -o "$WORK/stage1-typed-reference-field.ll" "$WORK/typed_reference_field.elisa" >"$WORK/stage1-typed-reference-field.log" 2>&1; then
+if "$STAGE1" -emit llvm "$opt" -o "$WORK/stage1-typed-reference-field.ll" "$WORK/typed_reference_field.elisa" >"$WORK/stage1-typed-reference-field.log" 2>&1; then
     fail "Stage1 accepted a region-erasing typed field-reference return"
 fi
+[[ ! -e "$WORK/stage1-typed-reference-field.ll" ]] || fail "Stage1 emitted LLVM for a rejected field-reference return"
 grep -Eq 'tied to region|reference parameter' "$WORK/stage1-typed-reference-field.log" \
     || fail "Stage1 rejected the typed field-reference return for an unrelated reason: $(tail -n 8 "$WORK/stage1-typed-reference-field.log")"
+
+done
 
 echo "sview region tie smoke OK: explicit lifetime erasure and mismatched returns are rejected"
