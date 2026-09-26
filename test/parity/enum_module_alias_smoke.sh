@@ -12,7 +12,7 @@ compilers=("$STAGE1")
 [[ ! -x "$STAGE0" ]] || compilers+=("$STAGE0")
 for compiler in "${compilers[@]}"; do
     for level in 0 2; do
-        for repro in enum_module_alias_payload enum_module_alias_reference enum_module_alias_nested; do
+        for repro in enum_module_alias_payload enum_module_alias_reference enum_module_alias_nested enum_module_nested_direct enum_module_nested_deep; do
             "$compiler" -emit obj "-O$level" -o "$WORK/valid.o" "$ROOT/test/repro/$repro.elisa"
             "${ELISA_CLANG:-clang}" -fno-builtin -o "$WORK/valid" "$WORK/valid.o" "$RUNTIME" "$ROOT/scripts/pymodule_runtime_fallback.c" "$ROOT/test/parity/profile_hooks.c"
             set +e
@@ -23,14 +23,16 @@ for compiler in "${compilers[@]}"; do
             "$compiler" -emit llvm "-O$level" -o "$WORK/valid.ll" "$ROOT/test/repro/$repro.elisa"
             "${ELISA_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/valid.ll"
         done
-        for mode in llvm obj; do
-            output="$WORK/wrong-owner.$mode"
-            if "$compiler" -emit "$mode" "-O$level" -o "$output" "$ROOT/test/repro/enum_module_alias_wrong_owner.elisa" > "$WORK/wrong-owner.log" 2>&1; then
-                echo 'accepted enum from the wrong declaring module' >&2
-                exit 1
-            fi
-            [[ ! -e "$output" ]] || { echo 'wrong-owner rejection left an artifact' >&2; exit 1; }
-            rg -q 'return type expects|backend declined' "$WORK/wrong-owner.log" || { cat "$WORK/wrong-owner.log" >&2; exit 1; }
+        for negative in enum_module_alias_wrong_owner enum_module_nested_wrong_owner; do
+            for mode in llvm obj; do
+                output="$WORK/wrong-owner.$mode"
+                if "$compiler" -emit "$mode" "-O$level" -o "$output" "$ROOT/test/repro/$negative.elisa" > "$WORK/wrong-owner.log" 2>&1; then
+                    echo 'accepted enum from the wrong declaring module' >&2
+                    exit 1
+                fi
+                [[ ! -e "$output" ]] || { echo 'wrong-owner rejection left an artifact' >&2; exit 1; }
+                rg -q 'return type expects|backend declined' "$WORK/wrong-owner.log" || { cat "$WORK/wrong-owner.log" >&2; exit 1; }
+            done
         done
     done
 done
