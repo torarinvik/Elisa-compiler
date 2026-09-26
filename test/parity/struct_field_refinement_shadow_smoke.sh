@@ -7,6 +7,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 BAD="$ROOT/test/repro/struct_field_refinement_shadowed_loop.elisa"
+BAD_SHADOWED_PARAM="$ROOT/test/repro/field_ref_shadowed_param.elisa"
 BAD_STORE="$ROOT/test/repro/struct_field_refinement_unproven_store.elisa"
 BAD_COMPOUND="$ROOT/test/repro/struct_field_refinement_unproven_compound_store.elisa"
 BAD_REFINED="$ROOT/test/repro/struct_field_refinement_mismatched_param.elisa"
@@ -87,6 +88,7 @@ reject_stage1() {
 }
 
 reject_stage1 "$BAD" "bad-construction"
+reject_stage1 "$BAD_SHADOWED_PARAM" "bad-shadowed-refined-parameter"
 reject_stage1 "$BAD_STORE" "bad-store"
 reject_stage1 "$BAD_COMPOUND" "bad-compound-store"
 reject_stage1 "$BAD_REFINED" "bad-mismatched-refinement"
@@ -108,4 +110,4 @@ reject_stage1 "$BAD_ZEROED_NAMED_CALL" "bad-zeroed-named-call"
 reject_stage1 "$BAD_ZEROED_GENERIC_CALL" "bad-zeroed-generic-call"
 reject_stage1 "$BAD_ZEROED_RETURN" "bad-zeroed-return"
 
-echo "struct-field refinement shadow smoke OK: unproven construction, stores, record updates, zeroed values, refined calls and returns, compound mutations, and stale interval facts are rejected; proven values and refined parameters are accepted"
+echo "struct-field refinement shadow smoke OK: unproven construction including same-name refined-parameter shadows, stores, record updates, zeroed values, refined calls and returns, compound mutations, and stale interval facts are rejected; proven values and refined parameters are accepted"
