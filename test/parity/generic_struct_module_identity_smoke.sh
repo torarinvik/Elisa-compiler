@@ -27,8 +27,10 @@ for level in 0 2; do
     done
     negatives=(generic_struct_recursive_optional_layout generic_struct_recursive_array_layout)
     # Pinned Stage0 overflows its stack on mutual by-value recursion. Track that
-    # upstream defect separately; Stage1 must report a bounded backend decline.
-    [[ "$compiler" != "$STAGE1" ]] || negatives+=(generic_struct_recursive_mutual_layout)
+    # upstream fix separately; enable its Stage0 control for a fixed Core binary.
+    if [[ "$compiler" == "$STAGE1" || "${ELISA_STAGE0_RECURSIVE_LAYOUT:-0}" == 1 ]]; then
+        negatives+=(generic_struct_recursive_mutual_layout)
+    fi
     for repro in "${negatives[@]}"; do
         output="$WORK/$tag-$repro-O$level.ll"
         log="$WORK/$tag-$repro-O$level.log"
