@@ -65,7 +65,34 @@ extend Backend:
                     return region_store_value_allocates(store_moved, params)
             if value is Expr.Call(store_callee, store_arguments, store_names, store_call_pos):
                 return true
+            if value is Expr.StaticEffectCall(store_effect_type, store_effect_operation, store_effect_candidates, store_effect_arguments, store_effect_names, store_effect_pos):
+                return true
             return false
+
+        # A generic effect operation (`Sink[T].put(out, v)`) lowers at EMIT time to a direct
+        # call of the selected handler operation (lower_static_effect_call), with the
+        # handler's captures prepended. The pre-pass never saw that call, so a handler that
+        # grew `out` left this function without the caller's arena: the clone received the
+        # null no-region placeholder and passed it on (segfault). Scan every candidate as the
+        # call it may become -- over-approximating the selection only moves storage UP the
+        # placement ladder, which is always sound.
+        def region_static_effect_candidate_calls(expression: Expr) -> darray[Expr] can[Abort.Panic, Memory.Allocate]:
+            calls: mutable darray[Expr] = []
+            if expression is Expr.StaticEffectCall(effect_type, effect_operation, effect_candidates, effect_arguments, effect_argument_names, effect_position):
+                for effect_candidate in effect_candidates |calls, effect_arguments, effect_argument_names, effect_position|:
+                    candidate_arguments: mutable darray[Expr] = []
+                    candidate_names: mutable darray[sview] = []
+                    for effect_capture in effect_candidate.captures |candidate_arguments, candidate_names|:
+                        candidate_arguments.push(effect_capture)
+                        candidate_names.push("")
+                    for effect_index in 0..<effect_arguments.count |candidate_arguments, candidate_names, effect_arguments, effect_argument_names|:
+                        candidate_arguments.push(effect_arguments[effect_index])
+                        candidate_names.push(effect_argument_names[effect_index] if effect_index < effect_argument_names.count else "")
+                    candidate_callee: mutable Expr = Expr.Ident(effect_candidate.callee, Ast::pos_at_line(0))
+                    if effect_candidate.callee_owner != "":
+                        candidate_callee <- Expr.Scope(Expr.Ident(effect_candidate.callee_owner, Ast::pos_at_line(0)), effect_candidate.callee, Ast::pos_at_line(0))
+                    calls.push(Expr.Call(candidate_callee, candidate_arguments, candidate_names, effect_position))
+            return calls
 
 
 
@@ -187,6 +214,10 @@ extend Backend:
                     region_scan_statements(region_block_statements, params, flags, structs)
                     region_scan_expression(region_block_value, params, flags, structs)
                     return
+                if expression is Expr.StaticEffectCall(region_effect_type, region_effect_operation, region_effect_candidates, region_effect_arguments, region_effect_names, region_effect_line):
+                    for region_effect_call in region_static_effect_candidate_calls(expression) |params, flags, structs|:
+                        region_scan_expression(region_effect_call, params, flags, structs)
+                    return
 
 
 
@@ -263,6 +294,19 @@ extend Backend:
 
 
 
+        # The name under an explicit instantiation's head (`f`, `M::f`, `recv.f`).
+        def region_callee_head_name(head: Expr) -> sview can[Abort.Panic]:
+            if head is Expr.Ident(region_head_ident, region_head_ident_line):
+                return region_head_ident
+            if head is Expr.Field(region_head_object, region_head_field, region_head_field_line):
+                return region_head_field
+            if head is Expr.Scope(region_head_base, region_head_scope, region_head_scope_line):
+                return region_head_scope
+            return ""
+
+
+
+
         def region_callee_name(callee: Expr) -> sview can[Abort.Panic]:
             if callee is Expr.Ident(region_callee_ident, region_callee_ident_line):
                 return region_callee_ident
@@ -270,6 +314,15 @@ extend Backend:
                 return region_callee_field
             if callee is Expr.Scope(region_callee_base, region_callee_scope, region_callee_scope_line):
                 return region_callee_scope
+            # `f[T](...)` / `f[K, V](...)`: an explicit instantiation calls the template `f`.
+            # Without this, forwarding a parameter into a generic that grows it was invisible:
+            # the caller took no arena and the generic grew its storage in the caller's own
+            # auto region, freed on return.
+            can Abort.Panic:
+                if callee is Expr.Index(region_callee_generic_head, region_callee_generic_arg, region_callee_generic_line):
+                    return region_callee_head_name(region_callee_generic_head)
+                if callee is Expr.IndexN(region_callee_generic_heads, region_callee_generic_args, region_callee_generic_lines):
+                    return region_callee_head_name(region_callee_generic_heads)
             return ""
 
 
@@ -490,6 +543,10 @@ extend Backend:
                     region_scan_forwarding_statements(region_forward_block_statements, params, structs, fact_row, changed)
                     region_scan_forwarding_expression(region_forward_block_value, params, structs, fact_row, changed)
                     return
+                if expression is Expr.StaticEffectCall(region_forward_effect_type, region_forward_effect_operation, region_forward_effect_candidates, region_forward_effect_arguments, region_forward_effect_names, region_forward_effect_line):
+                    for region_forward_effect_call in region_static_effect_candidate_calls(expression) |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_effect_call, params, structs, fact_row, changed)
+                    return
 
 
 
@@ -530,12 +587,38 @@ extend Backend:
 
 
 
-        def region_record_declarations(declarations: darray[Decl], owner: sview, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # A generic TEMPLATE is scanned before any instantiation exists, so its type
+        # parameters are unbound and `out: mutable darray[T]&` resolved Unmodeled -- never
+        # growable. Its fact row then said "no region" for a parameter the body pushes into:
+        # every instantiation took no arena slot and grew the caller's darray in its own auto
+        # region, freed on return (a silent 160 where stage0 gives 164). Bind each type
+        # parameter to a scalar placeholder for the scan; growability of a container
+        # reference does not depend on its element type. Returns the bindings pushed (0 for
+        # an ordinary function).
+        def region_bind_template_placeholders(name: sview, line: u32, generics: GenericTable&, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate]:
+            for template_slot in 0..<generics.names.count |generics, structs, name, line|:
+                continue if generics.names[template_slot] != name
+                template_line_matches: mutable bool = false
+                if generics.decls[template_slot] is Decl.Func(template_name, template_params, template_return, template_body, template_effects, template_decorators, template_line):
+                    template_line_matches <- template_line.line == line
+                continue if not template_line_matches
+                placeholders: mutable darray[ValueType] = []
+                for _ in 0..<generics.param_count[template_slot] |placeholders|:
+                    placeholders.push(scalar_type_of_name("i64"))
+                return push_type_bindings(generics, structs, template_slot, placeholders)
+            return 0
+
+
+
+
+        def region_record_declarations(declarations: darray[Decl], owner: sview, structs: mutable StructTable&, generics: GenericTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                for declaration in declarations |structs|:
+                for declaration in declarations |structs, generics|:
                     if declaration is Decl.Func(region_fact_name, region_fact_params, region_fact_return, region_fact_body, region_fact_effects, region_fact_decorators, region_fact_line):
                         flags: mutable darray[bool] = []
+                        placeholder_bound: usize = region_bind_template_placeholders(region_fact_name, region_fact_line.line, generics, structs)
                         body_region_parameter_flags(region_fact_params, region_fact_body, structs, flags)
+                        pop_type_bindings(structs, placeholder_bound)
                         structs.region_fact_names <- structs.region_fact_names.push(region_fact_name)
                         structs.region_fact_owners <- structs.region_fact_owners.push(owner)
                         structs.region_fact_lines <- structs.region_fact_lines.push(region_fact_line.line)
@@ -544,39 +627,41 @@ extend Backend:
                         for flag in flags |structs|:
                             structs.region_fact_params <- structs.region_fact_params.push(flag)
                     elif declaration is Decl.Module(region_fact_module_name, region_fact_module_body, region_fact_module_line):
-                        region_record_declarations(region_fact_module_body, region_fact_module_name, structs)
+                        region_record_declarations(region_fact_module_body, region_fact_module_name, structs, generics)
                     elif declaration is Decl.Scoped(region_fact_scoped_body, region_fact_scoped_line):
-                        region_record_declarations(region_fact_scoped_body, owner, structs)
+                        region_record_declarations(region_fact_scoped_body, owner, structs, generics)
 
 
 
 
-        def region_apply_forwarding_declarations(declarations: darray[Decl], owner: sview, structs: mutable StructTable&, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def region_apply_forwarding_declarations(declarations: darray[Decl], owner: sview, structs: mutable StructTable&, generics: GenericTable&, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                for declaration in declarations |structs, changed|:
+                for declaration in declarations |structs, generics, changed|:
                     if declaration is Decl.Func(region_forward_fact_name, region_forward_fact_params, region_forward_fact_return, region_forward_fact_body, region_forward_fact_effects, region_forward_fact_decorators, region_forward_fact_line):
                         row: i64 = region_fact_row(region_forward_fact_name, region_forward_fact_line.line, structs)
                         if row >= 0:
                             previous_owner: sview = structs.current_owner
                             structs.current_owner <- owner
+                            forward_placeholder_bound: usize = region_bind_template_placeholders(region_forward_fact_name, region_forward_fact_line.line, generics, structs)
                             region_load_aliases(region_forward_fact_body, structs)
                             region_scan_forwarding_statements(region_forward_fact_body, region_forward_fact_params, structs, row.usize(), changed)
+                            pop_type_bindings(structs, forward_placeholder_bound)
                             structs.current_owner <- previous_owner
                     elif declaration is Decl.Module(region_forward_module_name, region_forward_module_body, region_forward_module_line):
-                        region_apply_forwarding_declarations(region_forward_module_body, region_forward_module_name, structs, changed)
+                        region_apply_forwarding_declarations(region_forward_module_body, region_forward_module_name, structs, generics, changed)
                     elif declaration is Decl.Scoped(region_forward_scoped_body, region_forward_scoped_line):
-                        region_apply_forwarding_declarations(region_forward_scoped_body, owner, structs, changed)
+                        region_apply_forwarding_declarations(region_forward_scoped_body, owner, structs, generics, changed)
 
 
 
 
-        def register_region_abi_facts(top: darray[Decl], structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def register_region_abi_facts(top: darray[Decl], structs: mutable StructTable&, generics: GenericTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                region_record_declarations(top, "", structs)
+                region_record_declarations(top, "", structs, generics)
                 region_build_name_index(structs)
                 changed: mutable bool = true
                 rounds: mutable usize = 0
                 while changed and rounds <= structs.region_fact_names.count |structs, changed, rounds|:
                     changed <- false
-                    region_apply_forwarding_declarations(top, "", structs, changed)
+                    region_apply_forwarding_declarations(top, "", structs, generics, changed)
                     rounds <- rounds + 1

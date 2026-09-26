@@ -36,7 +36,8 @@ check() {
     done
 }
 
-for fixture in amm_optional_return_arena amm_stack_value_block_escape amm_address_of_growth_arena amm_drop_type_move; do
+for fixture in amm_optional_return_arena amm_stack_value_block_escape amm_address_of_growth_arena amm_drop_type_move \
+        amm_generic_ref_growth amm_generic_two_arena_growth amm_generic_error_growth; do
     source="$ROOT/test/differential/cases/$fixture.elisa"
     oracle="$(run "$STAGE0" "$source" -O0 "$fixture-0")"
     [[ "$oracle" != reject ]] || { echo "FAIL $fixture: stage0 rejects the fixture" >&2; failures=$((failures + 1)); continue; }
@@ -51,6 +52,8 @@ check ref_alias_chain "$ROOT/test/fixtures/amm/ref_alias_chain.elisa" 164
 # inner[3] + outer[3] + 100*40 = 4 + 5 + 4000 = 4009 = 169 mod 256.
 check ref_alias_two_regions "$ROOT/test/fixtures/amm/ref_alias_two_regions.elisa" 169
 check index_store_escape "$ROOT/test/fixtures/amm/index_store_escape.elisa" 164
+# A generic effect operation that grows the caller's darray (stage1-only feature).
+check static_effect_growth "$ROOT/test/fixtures/amm/static_effect_growth.elisa" 164
 
 # After `r <- q` the reference may point into either caller region: no single arena
 # outlives both referents, so the function must decline LOUDLY rather than guess one.

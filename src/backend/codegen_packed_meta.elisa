@@ -126,6 +126,8 @@ extend Backend:
                     # constructors gave it an implicit LOCAL store, read the caller's handles
                     # against an empty store and segfaulted.
                     instantiation_needs_store: bool = params_include_packed_ast(resolved_param_types, structs) or type_is_or_contains_packed_ast(return_value_type, 0, structs)
+                    instantiation_param_slots: mutable darray[i64] = []
+                    instantiation_arena_count: usize = instantiation_arena_layout(base, params, body, line.line, instantiation_needs_arena, structs, instantiation_param_slots)
                     pop_error_family_bindings(structs, error_bound)
                     pop_type_bindings(structs, bound)
                     null return if declined or return_value_type.kind == TypeKind.Unmodeled
@@ -149,7 +151,8 @@ extend Backend:
                     full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_sret
                     full_params.extend(llvm_params)
                     full_params.push(llvm_type_of(ValueType{kind: TypeKind.PackedStore, bits: 0}, structs, ctx)) if instantiation_needs_store
-                    full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_needs_arena
+                    for _ in 0..<instantiation_arena_count |full_params, ctx|:
+                        full_params.push(LLVMPointerTypeInContext(ctx, 0))
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                     if full_params.count != 0:
                         params_pointer: void& = (&full_params[0]).cast[void&] can Unsafe.PointerCast
@@ -167,7 +170,12 @@ extend Backend:
                     generics.inst_error_families <- generics.inst_error_families.push(error_family)
                     # The ABI fact this signature was BUILT with. Call sites read it back rather
                     # than recomputing (see GenericTable.inst_needs_arena).
-                    generics.inst_needs_arena <- generics.inst_needs_arena.push(instantiation_needs_arena)
+                    generics.inst_needs_arena <- generics.inst_needs_arena.push(instantiation_arena_count > 0)
+                    generics.inst_arena_counts <- generics.inst_arena_counts.push(instantiation_arena_count)
+                    generics.inst_arena_param_start <- generics.inst_arena_param_start.push(generics.inst_arena_param_slots.count)
+                    generics.inst_arena_param_counts <- generics.inst_arena_param_counts.push(instantiation_param_slots.count)
+                    for instantiation_param_slot in instantiation_param_slots |generics|:
+                        generics.inst_arena_param_slots <- generics.inst_arena_param_slots.push(instantiation_param_slot)
                     generics.inst_needs_store <- generics.inst_needs_store.push(instantiation_needs_store)
                     pending_arg_start: usize = generics.pending_args.count
                     for argument in type_args |generics|:
@@ -297,6 +305,110 @@ extend Backend:
         def call_site_store(runtime: Runtime&) -> LLVMValueRef? can[Abort.Panic]:
             null return if runtime.active_store_enum < 0
             return runtime.active_store
+
+
+
+
+        # The hidden-arena layout of a generic instantiation, in the ORDINARY function order
+        # (emit_direct_call_indexed): one slot per reference parameter the body grows or
+        # stores into, then the return slot when the result lives in the caller's region.
+        # Same body facts as signature_arena_count, which emit_function_body used to recompute
+        # while the declaration pushed only the return slot -- the body then read
+        # LLVMGetParam past the signature's end and the verifier segfaulted on any generic
+        # that grows a reference parameter (stage0 declares fill2__i64(a, b, ..., ptr, ptr)).
+        # Must be asked under the instantiation's type bindings. The std collection helpers
+        # take their Arena explicitly and get no parameter slots.
+        def instantiation_arena_layout(base: sview, params: darray[ParamDecl]&, body: darray[Stmt], line: u32, returns_region: bool, structs: mutable StructTable&, param_slots: mutable darray[i64]&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            flags: mutable darray[bool] = []
+            if not generic_helper_uses_explicit_allocator(base):
+                region_flags_for_function(params, body, line, structs, flags)
+            count: mutable usize = 0
+            for parameter_index in 0..<params.count |flags, count, param_slots|:
+                if parameter_index < flags.count and flags[parameter_index]:
+                    param_slots.push(count.i64())
+                    count <- count + 1
+                else:
+                    param_slots.push(-1)
+            return count + (1 if returns_region else 0)
+
+
+
+
+        # The row of the already-declared instantiation (slot, args), or -1.
+        def recorded_instantiation_index(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&) -> i64 can[Abort.Panic]:
+            for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
+                continue if generics.inst_slots[index] != slot
+                continue if generics.inst_arg_count[index] != type_args.count
+                row_start: usize = generics.inst_arg_start[index]
+                row_match: mutable bool = true
+                for k in 0..<type_args.count |generics, row_match, row_start, type_args|:
+                    row_match <- false if not value_type_identity_equal(generics.inst_args[row_start + k], type_args[k])
+                continue if not row_match
+                return index.i64()
+            return -1
+
+
+
+
+        # The row of the instantiation whose LLVM function IS `handle`, or -1 (an ordinary
+        # function). emit_function_body reads its arena layout back through this.
+        def instantiation_index_of_handle(generics: GenericTable&, handle: LLVMValueRef) -> i64 can[Abort.Panic]:
+            for index in 0..<generics.inst_handles.count |generics, handle|:
+                return index.i64() if generics.inst_handles[index] == handle
+            return -1
+
+
+
+
+        # How many hidden arena slots a call to the instantiation (slot, args) passes.
+        def instantiation_arena_count_at(count_slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate]:
+            row: i64 = recorded_instantiation_index(generics, count_slot, type_args)
+            if row >= 0 and row.usize() < generics.inst_arena_counts.count:
+                return generics.inst_arena_counts[row.usize()]
+            return 1 if instantiation_wants_arena_at(count_slot, type_args, generics, structs) else 0
+
+
+
+
+        # Push the hidden arenas of a call to a generic instantiation, in its RECORDED layout.
+        # `sources` holds the source expression bound to each declared parameter, positionally
+        # (Expr.Invalid for a defaulted one). A grown reference parameter gets the arena of
+        # the storage its argument names -- the rule emit_direct_call_indexed applies to an
+        # ordinary call -- and every other slot the call-site arena. False = decline: the
+        # argument's owner has no region to grow into (the null no-region placeholder).
+        def push_instantiation_arenas(argument_values: mutable darray[LLVMValueRef]&, arena_slot: usize, type_args: darray[ValueType]&, sources: darray[Expr]&, arguments: darray[Expr]&, local_scope: mutable Scope&, runtime: Runtime&, generics: mutable GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            row: i64 = recorded_instantiation_index(generics, arena_slot, type_args)
+            if row < 0 or row.usize() >= generics.inst_arena_counts.count:
+                argument_values.push(call_site_arena(arguments, local_scope, runtime, structs)) if instantiation_wants_arena_at(arena_slot, type_args, generics, structs)
+                return true
+            arena_count: usize = generics.inst_arena_counts[row.usize()]
+            true return if arena_count == 0
+            # Lay the slots out in place (every one OUR arena first), then overwrite each
+            # grown reference's slot. Staging them in a local darray and extending would copy
+            # pointers out of this call's auto region, which the escape check rejects.
+            fallback: LLVMValueRef = call_site_arena(arguments, local_scope, runtime, structs)
+            slot_base: usize = argument_values.count
+            for _ in 0..<arena_count |argument_values, fallback|:
+                argument_values.push(fallback)
+            param_start: usize = generics.inst_arena_param_start[row.usize()]
+            for position in 0..<generics.inst_arena_param_counts[row.usize()] |argument_values, slot_base, generics, param_start, sources, local_scope, runtime|:
+                parameter_slot: i64 = generics.inst_arena_param_slots[param_start + position]
+                continue if parameter_slot < 0 or position >= sources.count
+                continue if sources[position] is Expr.Invalid
+                direct: LLVMValueRef = growth_arena_for(sources[position], local_scope, runtime)
+                false return if llvm_value_is_null(direct)
+                argument_values[slot_base + parameter_slot.usize()] <- direct
+            return true
+
+
+
+
+        # push_instantiation_arenas for a call that names the generic by its base and passes
+        # its arguments positionally (the error-call lowerings).
+        def push_named_instantiation_arenas(argument_values: mutable darray[LLVMValueRef]&, base: sview, type_args: darray[ValueType]&, arguments: darray[Expr]&, local_scope: mutable Scope&, runtime: Runtime&, generics: mutable GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            named_slot: i64 = generic_index_of(generics, base)
+            true return if named_slot < 0
+            return push_instantiation_arenas(argument_values, named_slot.usize(), type_args, arguments, arguments, local_scope, runtime, generics, structs)
 
 
 
