@@ -30,6 +30,8 @@ for repro in \
     zeroed_cstr_assignment_one_branch.elisa \
     zeroed_cstr_reset_to_zeroed_before_read.elisa \
     zeroed_cstr_shadow_assignment_does_not_initialize_outer.elisa \
+    zeroed_cstr_match_one_arm_write.elisa \
+    zeroed_cstr_match_guarded_catchall_write.elisa \
     zeroed_generic_reference_return.elisa \
     zeroed_sview_return.elisa \
     zeroed_sview_field.elisa \
@@ -364,6 +366,8 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_cstr_initialized_call_argument.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_cstr_whole_assignment_call_argument.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_cstr_both_branches_call_argument.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_cstr_match_both_arms_call_argument.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_cstr_match_returning_arm_call_argument.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/valid_initialized_reference.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_generic_scalar_field.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_generic_phantom_scalar.elisa"
@@ -374,6 +378,8 @@ for level in 0 2; do
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_cstr_initialized_call_argument.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_cstr_whole_assignment_call_argument.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_cstr_both_branches_call_argument.elisa"
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_cstr_match_both_arms_call_argument.elisa"
+        run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_cstr_match_returning_arm_call_argument.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/valid_initialized_reference.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_generic_scalar_field.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_generic_phantom_scalar.elisa"
