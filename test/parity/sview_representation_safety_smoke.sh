@@ -71,6 +71,17 @@ check_typed_view_forwarding() {
     }
 }
 
+check_nullable_cstr_sview_forwarding() {
+    local optimization="$1"
+    local output="$WORK/nullable-cstr-sview-forward-O$optimization.o"
+    local log="$output.log"
+    "$STAGE1" -emit obj "-O$optimization" -o "$output" "$ROOT/test/repro/region_param_inference_with_std.elisa" >"$log" 2>&1 || {
+        echo "sview representation safety smoke: rejected nullable cstr forwarding through the trusted runtime at O$optimization" >&2
+        cat "$log" >&2
+        exit 1
+    }
+}
+
 check_bounded_foreign_bytes() {
     local optimization="$1"
     local output="$WORK/bounded-foreign-bytes-O$optimization"
@@ -319,6 +330,7 @@ for optimization in 0 2; do
     check_nullable_cstr_container_mutations_rejected "$optimization"
     check_safe_literal "$optimization"
     check_typed_view_forwarding "$optimization"
+    check_nullable_cstr_sview_forwarding "$optimization"
     check_bounded_foreign_bytes "$optimization"
     check_cstr_scan_controls "$optimization"
     check_nullable_cstr_storage_control "$optimization"
