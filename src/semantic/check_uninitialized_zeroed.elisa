@@ -1,11 +1,11 @@
 # Uninitialized `= zeroed` read (stage0 analyzer_flow_definite_assign). A local declared
 # `x: T = zeroed` where zero is an OPERATIONALLY INVALID value for T (a C string cstr, borrowed
 # view sview, or a handle id[T]) is seeded uninitialized; reading it before any assignment is a
-# null-deref / garbage-handle hazard. This Stage1 approximation tracks candidates by local name
-# and whole-function whole-binding assignment evidence, then checks direct returns and reads inside
-# call arguments. It is intentionally not described as CFG-complete: branch joins, binding
-# identity under shadowing, and callee write summaries still need a shared flow analysis. Types
-# with a usable zero (scalars/structs/containers/optionals) are not seeded by this check.
+# null-deref / garbage-handle hazard. The checker identifies candidates through resolver binding
+# IDs, checks value reads in source order, and intersects initialization facts at `if` joins. It
+# remains a conservative subset: loops do not export body writes, and match/expression joins,
+# callee write summaries, and broader representation families still need shared flow analysis.
+# Types with a usable zero (scalars/structs/containers/optionals) are not seeded by this check.
 extend Semantic:
     private:
         # Whether `zeroed` produces an operationally invalid value for this type: a C string,
@@ -782,171 +782,263 @@ extend Semantic:
                 return "zeroed" if zeroed_value_is_zeroed(value)
                 return "an omitted initializer"
 
-        # Record whole-binding assignment names as a conservative syntactic approximation.
-        # Projected writes and taking an address are not proof that the whole value is valid.
-        def zeroed_collect_initialized(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                for statement in statements |out|:
-                    match statement:
-                        Stmt.Assign(target, operator, value, line):
-                            root: sview = ident_name_of(target)
-                            out.push(root) if root != ""
-                        Stmt.If(condition, then_body, else_body, line):
-                            zeroed_collect_initialized(then_body, out)
-                            zeroed_collect_initialized(else_body, out)
-                        Stmt.While(condition, body, line):
-                            zeroed_collect_initialized(body, out)
-                        Stmt.For(bind, variables, iterable, body, line):
-                            zeroed_collect_initialized(body, out)
-                        Stmt.Block(kind, clause, binding, body, line):
-                            zeroed_collect_initialized(body, out)
-                        Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |out|:
-                                zeroed_collect_initialized(arm.body, out)
-                        _:
-                            pass
+        # Binding identities come from the resolver's parallel reference rows. Matching both
+        # owner and source position prevents a same-named shadow in another lexical scope from
+        # proving a zeroed binding initialized (or from receiving its diagnostic).
+        def zeroed_binding_for_reference(table: SymbolTable&, owner: DeclId, line: u32, name: sview) -> BindingId:
+            can Abort.Panic:
+                for index in 0..<table.ref_binding_ids.count:
+                    if index < table.ref_line.count and index < table.ref_name.count and index < table.ref_kind.count:
+                        binding: BindingId = table.ref_binding_ids[index]
+                        if binding.owner.value == owner.value and table.ref_line[index] == line and table.ref_name[index] == name and table.ref_kind[index] == 2:
+                            return binding
+                return BindingId{owner: DeclId{value: 4294967295}, serial: 0}
+
+        def zeroed_binding_equal(left: BindingId, right: BindingId) -> bool:
+            can Abort.Panic:
+                return left.owner.value == right.owner.value and left.serial == right.serial
+
+        def zeroed_binding_present(bindings: darray[BindingId]&, wanted: BindingId) -> bool:
+            can Abort.Panic:
+                return any binding in bindings where zeroed_binding_equal(binding, wanted)
 
         def zeroed_name_present(names: darray[sview]&, wanted: sview) -> bool:
             can Abort.Panic:
                 return any name in names where name == wanted
 
-        # Check a value expression for reads of invalid-zero candidates. `read_value` is false
-        # for a general expression walk and true for a direct returned value or call argument.
-        # Calls always analyze their arguments as reads, including when nested in other syntax.
-        def zeroed_check_read_expression(expression: Ast::Expr, read_value: bool, candidates: darray[sview]&, initialized: darray[sview]&, table: lmut SymbolTable) -> void:
+        def zeroed_candidate_matches(name: sview, binding: BindingId, candidate_names: darray[sview]&, candidates: darray[BindingId]&) -> bool:
+            can Abort.Panic:
+                unresolved_match: mutable bool = false
+                for index in 0..<candidate_names.count:
+                    if candidate_names[index] == name:
+                        if index >= candidates.count or candidates[index].owner.value == 4294967295 or binding.owner.value == 4294967295:
+                            unresolved_match <- true
+                        elif zeroed_binding_equal(candidates[index], binding):
+                            return true
+                return unresolved_match
+
+        def zeroed_add_initialized(initialized: mutable darray[BindingId]&, binding: BindingId) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if binding.owner.value != 4294967295 and not zeroed_binding_present(initialized, binding):
+                    initialized.push(binding)
+
+        def zeroed_remove_initialized(initialized: mutable darray[BindingId]&, binding: BindingId) -> void:
+            can Memory.Allocate, Abort.Panic:
+                remaining: mutable darray[BindingId] = []
+                for existing in initialized |remaining|:
+                    remaining.push(existing) if not zeroed_binding_equal(existing, binding)
+                initialized.truncate(0)
+                for existing in remaining |initialized|:
+                    initialized.push(existing)
+
+        def zeroed_replace_initialized(destination: mutable darray[BindingId]&, source: darray[BindingId]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                destination.truncate(0)
+                for binding in source |destination|:
+                    destination.push(binding)
+
+        def zeroed_intersect_initialized(initialized: mutable darray[BindingId]&, left: darray[BindingId]&, right: darray[BindingId]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                joined: mutable darray[BindingId] = []
+                for binding in left |joined|:
+                    joined.push(binding) if zeroed_binding_present(right, binding) and not zeroed_binding_present(joined, binding)
+                initialized.truncate(0)
+                for binding in joined |initialized|:
+                    initialized.push(binding)
+
+        def zeroed_bool_value(value: mutable bool&) -> bool:
+            can Abort.Panic:
+                return value
+
+        # Check expression reads against the facts valid at this program point. Expression
+        # sub-blocks are analyzed on a copy so they cannot unsafely export branch-local writes.
+        def zeroed_check_read_expression(expression: Ast::Expr, read_value: bool, owner: DeclId, candidate_names: darray[sview]&, candidates: darray[BindingId]&, initialized: darray[BindingId]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Ident(name, line):
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UninitializedZeroedRead, name: name, line: line.line, expected: "", actual: ""}) if read_value and name != "" and zeroed_name_present(candidates, name) and not zeroed_name_present(initialized, name)
+                        binding: BindingId = zeroed_binding_for_reference(table, owner, line.line, name)
+                        is_candidate: bool = zeroed_candidate_matches(name, binding, candidate_names, candidates)
+                        is_initialized: bool = zeroed_binding_present(initialized, binding) if binding.owner.value != 4294967295 else false
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UninitializedZeroedRead, name: name, line: line.line, expected: "", actual: ""}) if read_value and is_candidate and not is_initialized
                     Expr.Call(callee, arguments, argument_names, line):
-                        table <- zeroed_check_read_expression(callee, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(callee, read_value, owner, candidate_names, candidates, initialized, table)
                         for argument in arguments |table|:
-                            table <- zeroed_check_read_expression(argument, true, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(argument, true, owner, candidate_names, candidates, initialized, table)
                     Expr.StaticEffectCall(effect_type, operation, candidates_for_call, arguments, argument_names, line):
                         for argument in arguments |table|:
-                            table <- zeroed_check_read_expression(argument, true, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(argument, true, owner, candidate_names, candidates, initialized, table)
                     Expr.Field(object, field, line) | Expr.Scope(object, field, line):
-                        table <- zeroed_check_read_expression(object, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(object, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Index(object, index, line):
-                        table <- zeroed_check_read_expression(object, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(index, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(object, read_value, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(index, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Slice(object, low, high, line):
-                        table <- zeroed_check_read_expression(object, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(low, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(high, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(object, read_value, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(low, read_value, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(high, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.IndexN(object, arguments, line):
-                        table <- zeroed_check_read_expression(object, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(object, read_value, owner, candidate_names, candidates, initialized, table)
                         for argument in arguments |table|:
-                            table <- zeroed_check_read_expression(argument, read_value, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(argument, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- zeroed_check_read_expression(left, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(right, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(left, read_value, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(right, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Unary(operator, operand, line):
-                        # Taking an address evaluates the place, not the stored value. Keep
-                        # walking with false so nested calls are still checked, but do not
-                        # diagnose `&x` itself as a read of x.
-                        table <- zeroed_check_read_expression(operand, read_value and operator != TokenKind.Ampersand, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(operand, read_value and operator != TokenKind.Ampersand, owner, candidate_names, candidates, initialized, table)
                     Expr.Move(operand, line) | Expr.Paren(operand, line):
-                        table <- zeroed_check_read_expression(operand, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(operand, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.RegionNew(operand, region, line):
-                        table <- zeroed_check_read_expression(operand, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(operand, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Refinement(base, predicate, line):
-                        table <- zeroed_check_read_expression(base, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(predicate, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(base, read_value, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(predicate, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
                         for element in elements |table|:
-                            table <- zeroed_check_read_expression(element, read_value, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(element, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.DictLit(entries, line):
                         for entry in entries |table|:
-                            table <- zeroed_check_read_expression(entry.key, read_value, candidates, initialized, table)
-                            table <- zeroed_check_read_expression(entry.value, read_value, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(entry.key, read_value, owner, candidate_names, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(entry.value, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Construct(type_expression, fields, line):
                         for field in fields |table|:
-                            table <- zeroed_check_read_expression(field.value, read_value, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(field.value, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.RecordUpdate(base, fields, line):
-                        table <- zeroed_check_read_expression(base, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(base, read_value, owner, candidate_names, candidates, initialized, table)
                         for field in fields |table|:
-                            table <- zeroed_check_read_expression(field.value, read_value, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(field.value, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.If(condition, then_expression, else_expression, line):
-                        table <- zeroed_check_read_expression(condition, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(then_expression, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(else_expression, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(condition, true, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(then_expression, read_value, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(else_expression, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
-                        table <- zeroed_check_read_expression(scrutinee, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(scrutinee, true, owner, candidate_names, candidates, initialized, table)
                         for arm in arms |table|:
-                            table <- zeroed_check_read_expression(arm.guard, read_value, candidates, initialized, table)
-                            table <- zeroed_check_read_statements(arm.body, candidates, initialized, table)
+                            table <- zeroed_check_read_expression(arm.guard, true, owner, candidate_names, candidates, initialized, table)
+                            arm_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                            arm_falls_through: mutable bool = true
+                            table <- zeroed_check_read_statements(arm.body, owner, candidate_names, candidates, arm_initialized, arm_falls_through, table)
                     Expr.Comprehension(loop_variable, iterable, condition, body, line):
-                        table <- zeroed_check_read_expression(iterable, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(condition, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(body, read_value, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(iterable, true, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(condition, true, owner, candidate_names, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(body, read_value, owner, candidate_names, candidates, initialized, table)
                     Expr.GetElse(guarded, recovery, line):
-                        table <- zeroed_check_read_expression(guarded, read_value, candidates, initialized, table)
-                        table <- zeroed_check_read_statements(recovery, candidates, initialized, table)
+                        table <- zeroed_check_read_expression(guarded, true, owner, candidate_names, candidates, initialized, table)
+                        recovery_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                        recovery_falls_through: mutable bool = true
+                        table <- zeroed_check_read_statements(recovery, owner, candidate_names, candidates, recovery_initialized, recovery_falls_through, table)
                     Expr.Lambda(parameters, body, line):
-                        table <- zeroed_check_read_statements(body, candidates, initialized, table)
+                        lambda_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                        lambda_falls_through: mutable bool = true
+                        table <- zeroed_check_read_statements(body, owner, candidate_names, candidates, lambda_initialized, lambda_falls_through, table)
                     Expr.Block(statements, value, captures, line):
-                        table <- zeroed_check_read_statements(statements, candidates, initialized, table)
-                        table <- zeroed_check_read_expression(value, read_value, candidates, initialized, table)
+                        block_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                        block_falls_through: mutable bool = true
+                        table <- zeroed_check_read_statements(statements, owner, candidate_names, candidates, block_initialized, block_falls_through, table)
+                        table <- zeroed_check_read_expression(value, read_value, owner, candidate_names, candidates, block_initialized, table)
                     _:
                         pass
 
-        # Walk all statement positions so calls nested in initializers, conditions, assignment
-        # values, match arms, and blocks receive the same call-argument check.
-        def zeroed_check_read_statements(statements: darray[Ast::Stmt], candidates: darray[sview]&, initialized: darray[sview]&, table: lmut SymbolTable) -> void:
+        # Process statements in source order. Branch facts are intersected across every path
+        # that reaches the join; loops never establish facts outside the loop because they may
+        # execute zero times. Match and expression-level joins remain conservative.
+        def zeroed_check_read_statements(statements: darray[Ast::Stmt], owner: DeclId, candidate_names: darray[sview]&, candidates: darray[BindingId]&, initialized: mutable darray[BindingId]&, falls_through: mutable bool&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
-                    match statement:
-                        Stmt.Expr(expression, line):
-                            table <- zeroed_check_read_expression(expression, false, candidates, initialized, table)
-                        Stmt.VarDecl(name, type_expression, value, line):
-                            table <- zeroed_check_read_expression(value, false, candidates, initialized, table)
-                        Stmt.Assign(target, operator, value, line):
-                            table <- zeroed_check_read_expression(target, false, candidates, initialized, table)
-                            table <- zeroed_check_read_expression(value, false, candidates, initialized, table)
-                        Stmt.If(condition, then_body, else_body, line):
-                            table <- zeroed_check_read_expression(condition, false, candidates, initialized, table)
-                            table <- zeroed_check_read_statements(then_body, candidates, initialized, table)
-                            table <- zeroed_check_read_statements(else_body, candidates, initialized, table)
-                        Stmt.While(condition, body, line):
-                            table <- zeroed_check_read_expression(condition, false, candidates, initialized, table)
-                            table <- zeroed_check_read_statements(body, candidates, initialized, table)
-                        Stmt.For(bind, variables, iterable, body, line):
-                            table <- zeroed_check_read_expression(iterable, false, candidates, initialized, table)
-                            table <- zeroed_check_read_statements(body, candidates, initialized, table)
-                        Stmt.Block(kind, clause, binding, body, line):
-                            table <- zeroed_check_read_statements(body, candidates, initialized, table)
-                        Stmt.Match(scrutinee, arms, line):
-                            table <- zeroed_check_read_expression(scrutinee, false, candidates, initialized, table)
-                            for arm in arms |table|:
-                                table <- zeroed_check_read_expression(arm.guard, false, candidates, initialized, table)
-                                table <- zeroed_check_read_statements(arm.body, candidates, initialized, table)
-                        Stmt.Return(value, line):
-                            table <- zeroed_check_read_expression(returned, true, candidates, initialized, table) if value is returned
-                        Stmt.Contract(kind, expression, line):
-                            table <- zeroed_check_read_expression(expression, false, candidates, initialized, table)
-                        _:
-                            pass
+                falls_through <- true
+                for statement in statements |table, initialized, falls_through|:
+                    if zeroed_bool_value(falls_through):
+                        match statement:
+                            Stmt.Expr(expression, line):
+                                table <- zeroed_check_read_expression(expression, true, owner, candidate_names, candidates, initialized, table)
+                            Stmt.VarDecl(name, type_expression, value, line):
+                                table <- zeroed_check_read_expression(value, true, owner, candidate_names, candidates, initialized, table)
+                                binding: BindingId = zeroed_binding_for_reference(table, owner, line.line, name)
+                                zeroed_remove_initialized(initialized, binding) if zeroed_candidate_matches(name, binding, candidate_names, candidates)
+                            Stmt.Assign(target, operator, value, line):
+                                if operator != TokenKind.LArrow and operator != TokenKind.Assign:
+                                    table <- zeroed_check_read_expression(target, true, owner, candidate_names, candidates, initialized, table)
+                                else:
+                                    match target:
+                                        Expr.Ident(target_name, target_line):
+                                            pass
+                                        _:
+                                            table <- zeroed_check_read_expression(target, true, owner, candidate_names, candidates, initialized, table)
+                                table <- zeroed_check_read_expression(value, true, owner, candidate_names, candidates, initialized, table)
+                                match target:
+                                    Expr.Ident(target_name, target_line):
+                                        target_binding: BindingId = zeroed_binding_for_reference(table, owner, target_line.line, target_name)
+                                        if operator == TokenKind.LArrow and zeroed_candidate_matches(target_name, target_binding, candidate_names, candidates):
+                                            if zeroed_value_is_zeroed(value):
+                                                zeroed_remove_initialized(initialized, target_binding)
+                                            else:
+                                                zeroed_add_initialized(initialized, target_binding)
+                                    _:
+                                        pass
+                            Stmt.If(condition, then_body, else_body, line):
+                                table <- zeroed_check_read_expression(condition, true, owner, candidate_names, candidates, initialized, table)
+                                then_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                                else_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                                then_falls_through: mutable bool = true
+                                else_falls_through: mutable bool = true
+                                table <- zeroed_check_read_statements(then_body, owner, candidate_names, candidates, then_initialized, then_falls_through, table)
+                                table <- zeroed_check_read_statements(else_body, owner, candidate_names, candidates, else_initialized, else_falls_through, table)
+                                if then_falls_through and else_falls_through:
+                                    zeroed_intersect_initialized(initialized, then_initialized, else_initialized)
+                                elif then_falls_through:
+                                    zeroed_replace_initialized(initialized, then_initialized)
+                                elif else_falls_through:
+                                    zeroed_replace_initialized(initialized, else_initialized)
+                                else:
+                                    falls_through <- false
+                            Stmt.While(condition, body, line):
+                                table <- zeroed_check_read_expression(condition, true, owner, candidate_names, candidates, initialized, table)
+                                body_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                                body_falls_through: mutable bool = true
+                                table <- zeroed_check_read_statements(body, owner, candidate_names, candidates, body_initialized, body_falls_through, table)
+                            Stmt.For(bind, variables, iterable, body, line):
+                                table <- zeroed_check_read_expression(iterable, true, owner, candidate_names, candidates, initialized, table)
+                                body_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                                body_falls_through: mutable bool = true
+                                table <- zeroed_check_read_statements(body, owner, candidate_names, candidates, body_initialized, body_falls_through, table)
+                            Stmt.Block(kind, clause, binding, body, line):
+                                table <- zeroed_check_read_statements(body, owner, candidate_names, candidates, initialized, falls_through, table)
+                            Stmt.Match(scrutinee, arms, line):
+                                table <- zeroed_check_read_expression(scrutinee, true, owner, candidate_names, candidates, initialized, table)
+                                for arm in arms |table, initialized|:
+                                    table <- zeroed_check_read_expression(arm.guard, true, owner, candidate_names, candidates, initialized, table)
+                                    arm_initialized: mutable darray[BindingId] = [binding for binding in initialized]
+                                    arm_falls_through: mutable bool = true
+                                    table <- zeroed_check_read_statements(arm.body, owner, candidate_names, candidates, arm_initialized, arm_falls_through, table)
+                            Stmt.Return(value, line):
+                                table <- zeroed_check_read_expression(returned, true, owner, candidate_names, candidates, initialized, table) if value is returned
+                                falls_through <- false
+                            Stmt.Break(label, line) | Stmt.Continue(label, line):
+                                falls_through <- false
+                            Stmt.Contract(kind, expression, line):
+                                table <- zeroed_check_read_expression(expression, true, owner, candidate_names, candidates, initialized, table)
+                            _:
+                                pass
 
         # Collect must-init `= zeroed` local declarations (recursively).
-        def zeroed_collect_candidates(statements: darray[Ast::Stmt], alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], current_module: sview, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+        def zeroed_collect_candidates(statements: darray[Ast::Stmt], owner: DeclId, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], current_module: sview, table: SymbolTable&, out_names: mutable darray[sview]&, out_bindings: mutable darray[BindingId]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |out|:
+                for statement in statements |out_names, out_bindings|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            out.push(name) if zeroed_value_is_zeroed(value) and zeroed_invalid_type_via_alias(type_expression, alias_names, alias_values, declarations, alias_declarations, current_module, table) and not zeroed_is_sview_type_via_alias(type_expression, alias_names, alias_values, declarations, alias_declarations, current_module, table)
+                            if zeroed_value_is_zeroed(value) and zeroed_invalid_type_via_alias(type_expression, alias_names, alias_values, declarations, alias_declarations, current_module, table) and not zeroed_is_sview_type_via_alias(type_expression, alias_names, alias_values, declarations, alias_declarations, current_module, table):
+                                out_names.push(name)
+                                out_bindings.push(zeroed_binding_for_reference(table, owner, line.line, name))
                         Stmt.If(condition, then_body, else_body, line):
-                            zeroed_collect_candidates(then_body, alias_names, alias_values, declarations, alias_declarations, current_module, table, out)
-                            zeroed_collect_candidates(else_body, alias_names, alias_values, declarations, alias_declarations, current_module, table, out)
+                            zeroed_collect_candidates(then_body, owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, out_names, out_bindings)
+                            zeroed_collect_candidates(else_body, owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, out_names, out_bindings)
                         Stmt.While(condition, body, line):
-                            zeroed_collect_candidates(body, alias_names, alias_values, declarations, alias_declarations, current_module, table, out)
+                            zeroed_collect_candidates(body, owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, out_names, out_bindings)
                         Stmt.For(bind, variables, iterable, body, line):
-                            zeroed_collect_candidates(body, alias_names, alias_values, declarations, alias_declarations, current_module, table, out)
+                            zeroed_collect_candidates(body, owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, out_names, out_bindings)
                         Stmt.Block(kind, clause, binding, body, line):
-                            zeroed_collect_candidates(body, alias_names, alias_values, declarations, alias_declarations, current_module, table, out)
+                            zeroed_collect_candidates(body, owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, out_names, out_bindings)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |out|:
-                                zeroed_collect_candidates(arm.body, alias_names, alias_values, declarations, alias_declarations, current_module, table, out)
+                            for arm in arms |out_names, out_bindings|:
+                                zeroed_collect_candidates(arm.body, owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, out_names, out_bindings)
                         _:
                             pass
 
@@ -961,11 +1053,13 @@ extend Semantic:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             table <- zeroed_reject_nonnull_ref_declarations(body, return_type, line.line, declarations, alias_declarations, current_module, alias_names, alias_values, table)
-                            candidates: mutable darray[sview] = []
-                            zeroed_collect_candidates(body, alias_names, alias_values, declarations, alias_declarations, current_module, table, candidates)
-                            initialized: mutable darray[sview] = []
-                            zeroed_collect_initialized(body, initialized)
-                            table <- zeroed_check_read_statements(body, candidates, initialized, table)
+                            function_owner: DeclId = function_declaration_id(table, function_name, line.offset)
+                            candidate_names: mutable darray[sview] = []
+                            candidates: mutable darray[BindingId] = []
+                            zeroed_collect_candidates(body, function_owner, alias_names, alias_values, declarations, alias_declarations, current_module, table, candidate_names, candidates)
+                            initialized: mutable darray[BindingId] = []
+                            falls_through: mutable bool = true
+                            table <- zeroed_check_read_statements(body, function_owner, candidate_names, candidates, initialized, falls_through, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_uninitialized_zeroed(module_body, alias_declarations, module_name, alias_names, alias_values, table)
                         Decl.Scoped(scoped_body, scoped_line):
