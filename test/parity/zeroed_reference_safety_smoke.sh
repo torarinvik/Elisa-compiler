@@ -280,6 +280,26 @@ for level in 0 2; do
     done
 done
 
+# Aggregate aliases must expose their resolved shape and declaration owner.
+for repro in zeroed_qualified_tuple_alias.elisa zeroed_qualified_tuple_alias_owner.elisa; do
+    for level in 0 2; do
+        output="$WORK/${repro%.elisa}-O$level.ll"
+        log="$WORK/${repro%.elisa}-O$level.log"
+        if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/$repro" >"$log" 2>&1; then
+            echo "zeroed reference smoke: aggregate alias accepted $repro at -O$level" >&2
+            exit 1
+        fi
+        [[ ! -e "$output" ]] || { echo "zeroed reference smoke: rejected aggregate alias left LLVM" >&2; exit 1; }
+        rg -q 'sview.*zeroed|zeroed.*sview' "$log" || { cat "$log" >&2; exit 1; }
+        if [[ "$repro" == zeroed_qualified_tuple_alias.elisa ]]; then
+            rg -q 'cannot initialize aggregate .* from zeroed: field .* requires a valid non-null value' "$log" || { cat "$log" >&2; exit 1; }
+            for invalid_name in pair views imported_pair; do
+                rg -q "variable \"$invalid_name\".*sview.*zeroed|variable \"$invalid_name\".*zeroed.*sview" "$log" || { cat "$log" >&2; exit 1; }
+            done
+        fi
+    done
+done
+
 # Module import aliases must retain the representation of the target type alias.
 for repro in zeroed_using_module_alias.elisa zeroed_using_nested_module_alias.elisa zeroed_using_scoped_module_alias.elisa; do
     for level in 0 2; do
@@ -339,6 +359,9 @@ for level in 0 2; do
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_relative_nullable_sview_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_using_nullable_module_alias.elisa"
     run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_using_scalar_module_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_tuple_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_scalar_tuple_alias.elisa"
+    run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/zeroed_qualified_nested_nullable_tuple_alias.elisa"
     if [[ -x "$STAGE0" ]]; then
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_reference_alias.elisa"
         run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/zeroed_qualified_nullable_handle_alias.elisa"
