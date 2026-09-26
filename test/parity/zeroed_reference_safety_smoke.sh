@@ -56,24 +56,25 @@ for repro in \
 done
 
 # A borrowed view must not acquire a zero representation through a qualified alias.
-# Stage0's matching alias resolver has not been qualified yet, so this regression runs on
-# Stage1 until that separate compiler-generation gap is closed.
-for level in 0 2; do
-    output="$WORK/stage1-zeroed-qualified-sview-O$level.ll"
-    log="$WORK/stage1-zeroed-qualified-sview-O$level.log"
-    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_qualified_sview_alias.elisa" >"$log" 2>&1; then
-        echo "zeroed reference smoke: Stage1 accepted a module-qualified sview alias at -O$level" >&2
+# Both compiler generations resolve the qualified alias; guard the rejection in both.
+for compiler in "${COMPILERS[@]}"; do
+  for level in 0 2; do
+    output="$WORK/$(basename -- "$compiler")-zeroed-qualified-sview-O$level.ll"
+    log="$output.log"
+    if "$compiler" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_qualified_sview_alias.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: $compiler accepted a module-qualified sview alias at -O$level" >&2
         exit 1
     fi
     [[ ! -e "$output" ]] || {
         echo "zeroed reference smoke: failed qualified-sview compilation left an LLVM artifact" >&2
         exit 1
     }
-    rg -q 'sview with valid backing' "$log" || {
+    rg -q 'sview with valid backing|`zeroed` cannot construct an `sview`' "$log" || {
         echo "zeroed reference smoke: qualified-sview rejection used the wrong diagnostic" >&2
         cat "$log" >&2
         exit 1
     }
+  done
 done
 
 # A qualified handle alias is an invalid zero representation only when it is non-null.

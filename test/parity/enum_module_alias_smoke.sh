@@ -31,7 +31,7 @@ for compiler in "${compilers[@]}"; do
                     exit 1
                 fi
                 [[ ! -e "$output" ]] || { echo 'wrong-owner rejection left an artifact' >&2; exit 1; }
-                rg -q 'return type expects|match arm expects|backend declined|backend could not produce a linkable unit' "$WORK/wrong-owner.log" || { cat "$WORK/wrong-owner.log" >&2; exit 1; }
+                rg -q 'return type expects|match arm expects|nested match pattern expects enum|is expects a variant of enum|backend declined|backend could not produce a linkable unit' "$WORK/wrong-owner.log" || { cat "$WORK/wrong-owner.log" >&2; exit 1; }
             done
         done
     done
