@@ -86,7 +86,6 @@ DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=600
 DEFAULT_SELF_HOST_PROBE_POLL_SECONDS=0.05
 SELF_HOST_PROBE_TIMEOUT_SECONDS="${SELF_HOST_PROBE_TIMEOUT_SECONDS:-$DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS}"
 SELF_HOST_PROBE_POLL_SECONDS="${SELF_HOST_PROBE_POLL_SECONDS:-$DEFAULT_SELF_HOST_PROBE_POLL_SECONDS}"
-SELF_HOST_PROBE_TIMEOUT_POLLS="${SELF_HOST_PROBE_TIMEOUT_POLLS:-12000}"
 
 fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
 
@@ -108,9 +107,13 @@ terminate_guarded_pid() {
 # scripts/elisac_stage1.sh. This is an operational safety boundary, not a semantic fallback:
 # crossing it fails the smoke and leaves the compiler bug visible instead of freezing the host.
 run_guarded_request() {
-    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}" polls=0
+    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}" deadline
     "$binary" <"$request" >"$output" 2>&1 &
     pid=$!
+    # A WALL-CLOCK deadline. This used to count polls (a fixed 12000 x the poll sleep), which
+    # ignored SELF_HOST_PROBE_TIMEOUT_SECONDS entirely and overshot it by the `ps` fork each
+    # poll pays: a "600s" timeout fired well past 600s, and raising the seconds did nothing.
+    deadline=$((SECONDS + SELF_HOST_PROBE_TIMEOUT_SECONDS))
     while kill -0 "$pid" 2>/dev/null; do
         rss="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1}')" || rss=""
         if [[ -n "$rss" && "$rss" -gt "$peak" ]]; then
@@ -121,8 +124,7 @@ run_guarded_request() {
             terminate_guarded_pid "$pid"
             return 125
         fi
-        polls=$((polls + 1))
-        if [[ "$polls" -ge "$SELF_HOST_PROBE_TIMEOUT_POLLS" ]]; then
+        if [[ "$SECONDS" -ge "$deadline" ]]; then
             echo "self_host_gen3_smoke: timeout stopped pid $pid after ${SELF_HOST_PROBE_TIMEOUT_SECONDS}s" >&2
             terminate_guarded_pid "$pid"
             return 124
