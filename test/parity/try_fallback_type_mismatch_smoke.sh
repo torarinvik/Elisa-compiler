@@ -41,10 +41,13 @@ case_ def_mismatch 'try fallback expects i64, got u8&' \
   "${G_I64}"'def f(x: i64) -> i64:\n    v: i64 = try g(x) else "".cast[u8&]\n    return v\n\ndef main() -> i64:\n    return f(1)\n'
 case_ paren_mismatch 'try fallback expects i64, got u8&' \
   "${G_I64}"'def f(x: i64) -> i64:\n    return try g(x) else ("".cast[u8&])\n\ndef main() -> i64:\n    return f(1)\n'
-# stage1 spells the extern's expected side as its side-tabled head (`darray`, stage0 says
-# `darray[u8]`), so this case gates the verdict only.
-case_ extern_mismatch - \
+# An extern's darray payload is side-tabled as a bare `darray` head plus an element row;
+# both compilers spell it `darray[u8]`.
+case_ extern_mismatch 'try fallback expects darray[u8], got u8&' \
   'extern read_it(path: cstr) -> darray[u8] error[Problem]\n\ndef f(path: cstr) -> i64:\n    data: darray[u8] = try read_it(path) else "".cast[u8&]\n    return data.count.i64()\n\ndef main() -> i64:\n    return 0\n'
+# Same container, different element: the head alone would agree.
+case_ extern_elem_mismatch 'try fallback expects darray[u8], got darray[i32]' \
+  'extern read_it(path: cstr) -> darray[u8] error[Problem]\n\ndef f(path: cstr) -> i64:\n    data: darray[u8] = try read_it(path) else "".cast[darray[i32]]\n    return data.count.i64()\n\ndef main() -> i64:\n    return 0\n'
 case_ def_ref_match - \
   'def g(x: u8&) -> u8& error[Problem]:\n    raise Problem.Failed if x[0] == 0\n    return x\n\ndef f(x: u8&) -> u8&:\n    return try g(x) else "".cast[u8&]\n\ndef main() -> i64:\n    _ = f("a".cast[u8&])\n    return 0\n'
 case_ numeric_widen - \
@@ -60,4 +63,4 @@ while IFS= read -r f; do
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t try-fallback false positives across frontend+stdlib"
 
-echo "try-fallback-type-mismatch smoke OK: 6 cases agree with stage0 (3 rejections, 3 controls), 0 FP across frontend+stdlib"
+echo "try-fallback-type-mismatch smoke OK: 7 cases agree with stage0 (4 rejections, 3 controls), 0 FP across frontend+stdlib"
