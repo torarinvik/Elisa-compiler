@@ -47,9 +47,18 @@ if grep -q 'field access requires proven non-null reference' <<< "$nullable_whil
     exit 1
 fi
 
-# Rebinding a different local does not alter a copied pointer value.
-copied_alias=$(printf 'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\ndef ok() -> i64:\n    box: mutable Box&? = maybe_box()\n    if box == null:\n        return 0\n    alias: Box&? = box\n    box <- null\n    return alias.field\n' | "$RPT")
-grep -q '^D 0$' <<< "$copied_alias"
+# Rebinding the ROOT of a nullable copy revokes the copy's proof (stage0 rejects
+# this; an earlier stage1 accepted it).
+check_rejected $'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\ndef bad() -> i64:\n    box: mutable Box&? = maybe_box()\n    if box == null:\n        return 0\n    alias: Box&? = box\n    box <- null\n    return alias.field\n' 'field access requires proven non-null reference'
+check_rejected $'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\nextern other_box() -> Box&\ndef bad() -> i64:\n    box: mutable Box&? = maybe_box()\n    if box == null:\n        return 0\n    alias: Box&? = box\n    box <- other_box()\n    return alias.field\n' 'field access requires proven non-null reference'
+
+# A check through an alias proves its root ...
+alias_proves_root=$(printf 'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\ndef ok() -> i64:\n    box: mutable Box&? = maybe_box()\n    alias: Box&? = box\n    if alias == null:\n        return 0\n    return box.field\n' | "$RPT")
+grep -q '^D 0$' <<< "$alias_proves_root"
+# ... but a check of the root says nothing about an earlier copy,
+check_rejected $'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\ndef bad() -> i64:\n    box: mutable Box&? = maybe_box()\n    alias: Box&? = box\n    if box == null:\n        return 0\n    return alias.field\n' 'field access requires proven non-null reference'
+# and rebinding the alias withdraws the proof it lent the root.
+check_rejected $'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\nextern other_box() -> Box&\ndef bad() -> i64:\n    box: mutable Box&? = maybe_box()\n    alias: mutable Box&? = box\n    if alias == null:\n        return 0\n    alias <- other_box()\n    return box.field\n' 'field access requires proven non-null reference'
 
 # Rebinding the copied name must not revoke the original binding's non-null fact.
 rebound_alias=$(printf 'struct Box:\n    field: i64\nextern maybe_box() -> Box&?\ndef ok() -> i64:\n    box: mutable Box&? = maybe_box()\n    if box == null:\n        return 0\n    alias: mutable Box&? = box\n    alias <- null\n    return box.field\n' | "$RPT")
