@@ -1,5 +1,32 @@
 # Elisa — Memory Safety, Correctness, and Language Completion Plan
 
+## Read this first — orientation (2026-09-26)
+
+**Two goals, one analysis.** This plan serves two goals:
+
+1. **Memory safety (§A).** A well-typed safe program cannot perform an invalid access.
+2. **Automatic manual memory management (§K.4, package S29).** The compiler decides where every allocation lives, when it is freed and when its storage is reused. It does this without a garbage collector or reference counting, and at least as well as a careful programmer managing memory by hand.
+
+Both goals consume the same facts: one typed place/loan/origin analysis with per-function summaries (§D.2–D.3, S02/S03). The checker rejects a program when those facts show a violation. The placement planner (the backend code that chooses storage) picks the cheapest storage those facts allow. A gap in the facts must mean *reject* for the checker and *longer-lived storage* for the planner. It never means "safe" or "no escape".
+
+**Where the work stands.** Priority order is:
+
+1. Contain confirmed invalid-value access (S04/S10/S15).
+2. Close the ABI adapter interactions (S18/S22).
+3. Close atomic identity (S17).
+4. Build the shared analysis (S01–S03), then migrate the checkers (S04–S08) **and** the automatic placement sites (S29) onto it.
+5. Qualify (S25–S28).
+
+§"Revised execution order" has the detail. The live package status is in §O.3. The acceptance bar is §R.
+
+**How to read this file.**
+
+- Everything from "Current gains review" down to §A is an **evidence ledger**: dated milestones with product hashes. Read it to find what was measured. Do not read it for what to do next.
+- The plan itself is §A–§R.
+- The historical stage1 plan after §R is reference only.
+- Add new evidence as a dated entry in the ledger, and update the matching §O.3 row. Do not grow this orientation block.
+- This file is tracked and other agents commit to it. Commit only your own hunks.
+
 **Active roadmap updated 2026-09-26.** This updates the existing implementation plan in place. The earlier stage1 porting roadmap and status ledger are preserved, verbatim, in the historical section at the end. The active roadmap takes precedence wherever the older plan prioritizes speed, diagnostic parity, permissive behavior, or presentation over safety.
 
 ## Repository work scope and validation boundaries
@@ -163,6 +190,11 @@ The detached proof-toolchain checkout remains clean at `4f3f7354`, an ancestor o
 
 4. **Consolidate the safety analyses (S01–S08/S15/S23).** Keep the successful containment checks while implementing the typed-place/CFG vertical slice in O.1. Use one binding/region/place identity and shared transfer/join rules for initialization, loans, invalidation, and refinement facts. Include branch-order and alpha-renaming tests, loops, hidden captures, and unknown calls. Replace a legacy checker only after obligation-by-obligation comparison proves its protections survive. Repeated additions of recognized syntax patterns alone cannot satisfy the plan's composition requirements.
 
+4a. **Treat automatic placement as a safety consumer (S29, §K.4).** The backend's placement decisions (stack, loop scratch, auto-region, caller arena, growth target) are memory-safety decisions. They produced four silent use-after-frees on 2026-09-26, fixed in `03d64618`.
+   - **Now:** audit every placement site so that it fails toward longer-lived storage, and land the placement on/off differential oracle. Neither needs stage0.
+   - **After the step-4 CFG slice exists:** migrate placement onto the same facts one rung at a time. The checker then consumes a gap as a reject; placement consumes it as longer-lived storage.
+   - **Performance work (reuse, early free, arena chunk caching) comes last.** Record its numbers only after the soundness gates are green.
+
 5. **Qualify the integrated state (S25–S28), then continue all remaining packages.** Re-run the actionable full-gate failures from M.5 against pinned current products, investigate each rather than copying old ratchets, then run the uncached full profile and bootstrap/runtime checks. Complete runtime failure injection and native/Python/Wasm/EASM boundary qualification. Preserve the entire roadmap; this priority order does not defer those packages out of scope.
 
 ### Evidence and worktree accounting changes
@@ -173,6 +205,56 @@ The detached proof-toolchain checkout remains clean at `4f3f7354`, an ancestor o
 - [x] Reconcile and classify registered and standalone worktrees. Compiler snapshots `4f3f7354` and `f7edb529`, plus Core snapshots `a3f3ea3d` and `ec851a72`, were clean with no commits absent from main. Proof pins now point to `e61d5943` and `2fd6766d`, both available from main; after checking open processes and path consumers, the four redundant worktrees were removed. Earlier standalone Core and linked candidates were audited commit-by-commit; the useful region/match fixes and generic-sview regression coverage are committed as `12e8eaa0`, `60267978`, `d6f9b77a`, and `5793517d`, while superseded parser/nested-container work and the stale `worktrees/elisa-compiler-nw` snapshot were removed. `/private/tmp/elisac-engine-validation-v2` also had no unique gains and was removed. The current compiler checkout has no registered extra worktrees; the empty untracked `.log` was inspected and intentionally excluded, while the field-shadow regression was promoted in `e16105ef`. Proof-project dogfood/source edits remain untouched.
 
 The milestone rule remains: commit each coherent, verified gain together with its evidence and residual obligations. A focused passing milestone is progress; completion still requires every applicable acceptance item in R.
+
+### Automatic memory placement soundness — 2026-09-26 (`03d64618`)
+
+**Observed:** four value-changing use-after-frees in stage1's *automation* layer. They all appeared as plausible wrong exit codes. None crashed, and self-hosting and every existing gate stayed green:
+
+1. **Optional/aggregate returns.** `mk() -> darray[i64]?` was allocated in the callee's auto-region. `value_type_returns_caller_region` ignored Optional, ErrorUnion, arrays, tuples and struct fields.
+2. **Value-block tail escape.** A stack-promoted buffer escaped through a value-block tail expression (`memory_emit_buffer`).
+3. **`&outer` growth roots.** `grow(&outer, n)` and `r = &outer` inside `region scratch` grew `outer` in the scratch arena: `growth_root_name` did not see through `&`/`move`, and a ref local fell to the innermost region.
+4. **Implicit copy of `__drop__` structs.** Such a struct was implicitly copyable, giving a double drop. stage0 rejects it as linear.
+
+**Fixed:**
+- `value_type_owns_region_storage` (transitive; stops at refs; fails closed past depth 32) drives both caller-region return inference and `signature_needs_arena`.
+- A tail that reads a buffer blocks stack promotion unless it consumes the buffer as a scalar.
+- Growth roots see through `&`/`move`.
+- Unknown-referent ref locals grow in the outermost arena.
+- `__drop__` structs are affine, with the stage0 message.
+
+**Evidence:** `test/parity/amm_placement_soundness_smoke.sh`, value-checked against stage0 at `-O0`/`-O2`, plus one fixed-answer case where stage0 rejects. The pre-fix product fails 9 checks and the fixed product passes all of them.
+
+**Not shown:** gen3 fixpoint. Both the baseline `28fc94b1` and `03d64618` decline 5 self-host functions (the machine-returned-enum shape that the main tree's in-flight work targets).
+
+**Plan impact:** new package S29 (§K.4). Placement sites are now audited as safety code, not as optimizations.
+
+### Automatic placement: ref aliases and generic instantiations — 2026-09-26 (`63870078`, `7587005f`)
+
+**Observed:** two more families of stage1-only automation defects. stage0 either rejects each shape or gets it right.
+
+1. **Growth through a local ref alias** (`r = p; r.push(..)`, `r = p; grow(r, n)`, chains, two aliases of two params). The forwarding pre-pass matched growth roots by NAME only, so the alias never took the caller arena: a silent use-after-free (exit 160 where 164 is right).
+2. **Generics that grow a `darray&` parameter.** Three failures:
+   - **Crash:** the compiler crashed, because an instantiation had at most one arena slot while its body indexed per-parameter slots.
+   - **Silent wrong answer:** forwarding into an explicit `f[T](..)` was invisible, because `region_callee_name` returned "" for an `Index`/`IndexN` callee.
+   - **Silent use-after-free:** inferred and UFCS calls on `darray[T]&` grew the caller's darray in the instantiation's own auto region. The template's region facts were computed with `T` unbound, so the parameter looked non-growable.
+
+**Fixed:**
+- Alias roots are collected once (`ref_alias_collect`) and shared by the pre-pass and emission. An alias whose referent could be either of two caller regions DECLINES loudly (`alias_growth_ambiguous`) instead of guessing.
+- Generic instantiations carry a per-instantiation arena layout (params first, return slot last). Every call path, including named arguments, UFCS and `try`, passes each grown reference the arena of the storage its argument names.
+- The region-fact pass binds template type parameters to a scalar placeholder. Container growability never depends on the element type.
+- A generic effect operation forwards the region too, and a null direct arena declines instead of emitting a null argument.
+
+**Evidence:**
+- `amm_placement_soundness_smoke.sh` now has 3 stage0-oracle generic fixtures plus 6 fixed-answer alias fixtures and 1 decline fixture. The pre-fix binary crashes on all three generic fixtures.
+- Self-host: gen3 == gen4 byte-identical and 40/40 deterministic runs, on `7587005f` plus the main tree's in-flight work.
+- Compiler self-compile signature diff: 33 functions GAINED an arena parameter and none lost one.
+
+**Still open:**
+- Error-call paths pass the call-site arena for every slot.
+- The forwarding pass maps NAMED arguments positionally.
+- The return slot shares `caller_arenas[0]`.
+- Truncate/pop self-assignments count as growth: an over-approximation, so a precision item, not a safety one.
+- The `auto_region` catch-all audit.
 
 ### Verified nested enum identity and payload-boundary follow-up — 2026-09-26
 
@@ -826,6 +908,107 @@ These are implementation decisions to settle with examples and compatibility dat
 
 **Acceptance:** no EASM/template/project path can label unverified machine code safe; every accepted safe memory operation satisfies the same memory invariants as ordinary Elisa lowering.
 
+### K.4 Automatic manual memory management — the compiler as memory planner
+
+**S29 — sound, explainable, better-than-hand automatic placement, freeing, and reuse.**
+
+**Goal.** Safe Elisa code should not need to choose storage by hand. The compiler places each allocation, frees it, and reuses its storage. Two things are ruled out:
+
+- **Runtime cost:** no tracing collector, no reference counts, no runtime ownership checks on the fast path.
+- **Unsoundness:** a placement that lets a value outlive its storage.
+
+The yardstick is a register allocator. It beats hand-written assembly because it sees every use and never gets tired, not because it takes risks. Explicit `@r` regions remain as an override and as an interface contract. They are never required for correctness.
+
+**The placement invariant (normative).** A value is never placed in storage that is freed before the value's last use.
+
+- If the compiler cannot prove how long a value lives, it uses the **longest-lived storage it has available**, or declines loudly.
+- Imprecision may cost speed. It may never cost soundness.
+- Every placement decision site must fail in the long-lived direction on an unknown AST case, a missing summary, an unresolved name, a depth bound, or an unrecognized callee.
+
+A `_:` catch-all that returns "does not escape" or "stack/scratch is fine" is a defect by definition.
+
+**Placement ladder, cheapest first.** A value may move down the ladder only with a proof that it does not outlive the chosen storage. Moving up is always sound.
+
+| Rung | Storage | Freed at | Current stage1 decision site |
+|---|---|---|---|
+| 0 | Register / SSA scalar (scalar replacement) | last use | LLVM, after the frontend proves no address is observed |
+| 1 | Entry-block stack | function return | `codegen_memory_speed.elisa` `memory_emit_buffer`, `memory_buffer_bound` (≤256 `i64`, one per function) |
+| 2 | Loop scratch region | reset every iteration | `codegen_loop_regions.elisa` `loop_scratch_candidate`, `scratch_summarize_declarations`; memory-speed helper inlining |
+| 3 | Function auto-region | function return | `codegen_auto_region.elisa` `auto_region_function_needs_arena` and friends |
+| 4 | Caller arena (hidden ABI parameter) | caller's region | `codegen_abi_regions.elisa` `signature_needs_arena`, `value_type_returns_caller_region`; `codegen_region_forwarding.elisa` `register_region_abi_facts` |
+| 5 | Growth target of an existing owner | the owner's region | `codegen_growth_arena.elisa` `growth_arena_for`, `growth_root_name`, `call_site_arena` |
+| 6 | Explicit `@r` / process lifetime | region scope / exit | programmer or runtime |
+
+Capacity inference (`reserve` synthesis) is not a rung. It still must never make a buffer observable at a size or address that a later use cannot tolerate.
+
+**Why this is a safety package, not an optimization footnote.**
+
+- **The 2026-09-26 audit.** Adversarial differential probes found four use-after-frees in this automation layer (evidence ledger: commit `03d64618`). Each one produced a *plausible wrong exit code*, not a crash. Self-hosting and every existing gate were green.
+- **Proofs are syntactic and per-site.** Every site on the ladder carries its own proof. Each proof covers the shapes its author thought of, and a missed shape falls through to "no escape".
+- **Name-keyed fact tables.** `region_fact_name_bucket` in `codegen_region_forwarding.elisa` and `growth_root_name` both key facts by name. Name-keyed facts are the same design limitation §B identifies for the checkers.
+
+Checker work (S04–S08) does not cover these sites. The backend consumes no checker facts when it places a value.
+
+**Steps.**
+
+- [x] **Restore the invariant at the four measured sites (2026-09-26, `03d64618`):**
+  - transitive region ownership of return types (Optional/ErrorUnion/array/tuple/struct fields; fails closed past depth 32);
+  - value-block tail escape blocks stack promotion;
+  - `&x`/`move x` growth roots;
+  - non-parameter ref locals grow in the outermost arena;
+  - `__drop__` structs are affine.
+
+  Gate: `test/parity/amm_placement_soundness_smoke.sh`. It checks values against stage0 at `-O0` and `-O2`, and the pre-fix binary fails 9 checks.
+- [ ] **Placement-site inventory and fail-direction audit.** For every function in the six files above:
+  - record what it decides, what proof it relies on, and which way it fails on each unknown input;
+  - turn every fail-open branch into fail-closed, with a value-checking regression that fails before the change.
+
+  Priorities:
+  - the name-keyed forwarding buckets (shadowing, same-named params and locals across nested functions or lambdas);
+  - `auto_region_*` catch-all arms;
+  - loop-scratch reset when a scalar summary misses a call that retains its argument;
+  - helper inlining whose helper-local names collide in nested scopes.
+- [ ] **Placement on/off differential oracle (stage0-independent).** Compile every executable corpus program with each automation stage enabled and then disabled. The existing switches are `ELISA_DISABLE_MEMORY_SPEED`, `_HELPER`, `_RESERVE` and `_STACK`. Add equivalent switches for loop scratch, auto-region and caller-arena narrowing where missing.
+  - Compare exit codes and output at `-O0` and `-O2`, and under the existing `munmap`→`mprotect` arena poisoning where available.
+  - Any disagreement is a placement bug by definition. This needs no stage0 and covers stage1-only features.
+- [ ] **Adversarial escape generator.** Write a small generator that plants one escape route into a placement-eligible allocation. Routes:
+  - return; tail expression; optional/error/tuple/struct wrapper; field store;
+  - container push; closure capture; `&`/`move`/ref-local alias;
+  - callee that retains its argument; loop-carried alias.
+
+  Run each generated program through the on/off oracle. The four 2026-09-26 bugs are exactly this shape; hand-picked fixtures found them in minutes.
+- [ ] **Migrate placement onto the shared facts (depends on S02/S03).** Each rung's eligibility becomes a query against the shared place/loan/origin facts: "no reaching use after the storage's free point." Delete the per-site syntactic proofs one rung at a time. Before each deletion, compare decisions obligation by obligation (the same discipline as checker migration in §D.2). Unknown call ⇒ the S03 conservative summary ⇒ the value stays at its current rung.
+- [ ] **Interprocedural escape summaries.** Per function, record which parameters are only read, which escape into the return value, and which escape into longer-lived storage (global, field of a parameter, container parameter, closure). The summary lets a caller keep an argument on a lower rung without inlining. It replaces "unknown call ⇒ decline" in the memory-speed proofs. Key summaries on the S01 identities, never on names.
+- [ ] **Placement solver.** Assign each allocation site the lowest rung whose free point comes after every reaching use. The current optimizations become solver cases, and the fail-closed default becomes the solver's default. Keep the solver's output deterministic and independent of declaration order (the §D.3 acceptance tests apply).
+- [ ] **Freeing and reuse** — the "better than hand" part. With explicit lifetimes:
+  - reset or free early inside long functions;
+  - reuse a dead buffer's capacity for the next compatible allocation (the compiler-level form of a free list);
+  - hoist loop allocations to one reserved buffer reset per iteration;
+  - elide copies whose source dies at the copy;
+  - cache arena chunks across calls to kill the `munmap` hot path: about 33% of self-host syscall time was measured there. The implementation exists and is blocked on a vendoring policy decision that belongs to the owner.
+
+  Every reuse needs the same proof as a rung move: the old value's last use precedes the new value's first write.
+- [ ] **Explanation.** `ELISA_EXPLAIN_MEMORY=1` reports, for every allocation site:
+  - the chosen rung;
+  - the fact that blocked the next rung down (for example "escapes via return at L42", "unknown callee `f`", "name not resolved");
+  - any reuse applied.
+
+  Automatic placement is only trustworthy if a person can audit it. The same report doubles as the regression artifact for decision drift.
+- [ ] **Measurement against hand-written baselines.** Define a corpus:
+  - the self-hosted compiler itself;
+  - the breadth programs;
+  - a set of paired programs with hand-written `@r`/`reserve`/stack code.
+
+  Track allocation calls, bytes requested, peak RSS, arena chunk syscalls and wall time for each. "Better than hand" is a measured claim per corpus program. Record the numbers only after the soundness gates pass, and never trade a gate for a number.
+
+**Acceptance:**
+
+- The placement on/off differential and the adversarial generator find no disagreement across the executable corpus at `-O0`/`-O2`.
+- Every placement site answers from the shared facts or fails closed. Grep finds no name-keyed placement fact.
+- `ELISA_EXPLAIN_MEMORY` justifies every non-default placement.
+- Automatic placement matches or beats the hand-written baselines on the measured corpus.
+- Explicit `@r` stays available but is not needed for any safe program to be correct.
+
 ## L. Compiler robustness and production artifact integrity
 
 ### L.1 The compiler itself handles hostile input safely
@@ -1018,7 +1201,7 @@ This is a multi-release language/compiler/runtime program. Sequence by risk and 
 | M2: semantic foundation | S01 identity, S02 typed CFG, S03 dataflow/summaries | C normative core | Exhaustive construct map, IR verifier, conservative fixed points, independent model slice. |
 | M3: sequential lifetime soundness | S04–S08 ownership, loans, region provenance, containers, captures | M2 | Feature interaction suite; compile-fail escapes/aliasing; valid programs execute correctly. |
 | M4: runtime and proof closure | S09–S16 complete bounds/arithmetic/runtime/cleanup/unsafe/proofs/effects | M2; ownership-dependent parts after M3 | Failure injection, instrumentation, cleanup model, no unclassified unsafe primitive. |
-| M5: backend preservation | S22–S24 metadata, optimization, EASM | M2–M4 rules | Target/optimization matrix, verifier checks, translation/model tests. |
+| M5: backend preservation | S22–S24 metadata, optimization, EASM; S29 automatic placement (fail-closed audit and on/off oracle may start now; solver/reuse after M2 summaries) | M2–M4 rules | Target/optimization matrix, verifier checks, translation/model tests; placement on/off differential clean at -O0/-O2. |
 | M6: boundaries and concurrency | S17–S21 threads, native/Python/Wasm, decode | M3–M5; ABI rules may start earlier | Transfer/race tests, boundary failure/reentry tests, target execution evidence. |
 | M7: production qualification | S25–S28 compiler hardening, artifacts, CI, assurance | All relevant packages | Fresh full gates, fuzz campaigns, bootstrap/runtime tests, published support/TCB ledger. |
 
@@ -1087,6 +1270,7 @@ The implementation has started. The statuses below distinguish verified slices f
 | S26 | Mandatory gates and complete safe artifacts | In progress — removed the `ELISA_STAGE1_NO_SEMANTIC_GATE` production opt-out and moved static-generation expansion, mandatory semantic validation, and executable/semantic dispatch into the required order for the reviewed driver paths. Targeted c-archive/test/interpret generated-code rejection, Python stub rejection, Python extension rejection, and successful extension output checks pass. Partial backend-body declines now fail before output creation in LLVM/object/bitcode/executable modes. Stage1 seed and absolute-path freshness pass. Complete entry-point, multi-artifact atomicity, generated-unit completeness, and failure-phase coverage remain open. Independent medium-MLAST validation still reports 10 Stage1 body declines while Stage0 emits/runs the O3 artifact; the Stage1-pinned parser smoke also safely declined its two `print` bodies and wrote no object. These are safe rejections but unresolved supported-feature coverage, not successful parity. |
 | S27 | Independent safety specification/test/CI program | In progress — `test/parity/unsafe_grant_scope_smoke.sh` passes 51 focused cases, including unsafe-function caller obligations, contract-expression calls, typed callback parameters/local aliases, mutable-local rebinds, conditional joins, Match-arm traversal, exact versus unrelated grants, and the closure grant-scope regression. Parser AST coverage verifies callback effect-row retention; independent model tests, full gate integration, and target matrix remain open. |
 | S28 | Core soundness argument and TCB assurance | Planned |
+| S29 | Automatic memory placement: sound, explainable, better-than-hand (§K.4) | In progress. `03d64618` fixed 4 automation-layer UAFs (optional/aggregate returns, value-block tail stack escape, `&x`/`move` and ref-local growth roots) and made `__drop__` structs affine. Gate: `amm_placement_soundness_smoke.sh`. Open: the site inventory and fail-direction audit (name-keyed forwarding first), the on/off differential oracle, the escape generator, migration onto S03 summaries, the solver, reuse, explanation, and measurement. `63870078` fixed growth through local ref aliases (ambiguous aliases decline); `7587005f` fixed generic instantiations that grow a ref (crash, silent wrong answer, silent UAF) with a per-instantiation arena layout. gen3 fixpoint shown on `7587005f` + in-flight main work. Enum-payload returns still decline loudly. Open next: per-slot arenas on error-call paths, named-argument forwarding, return-slot arena, truncate precision. |
 
 **Verified S09 StringView non-null carrier (2026-09-23):** the null-view probe initially crashed Stage0 at `-O0` in the direct `string_view_eq(view, "safe")` specialization when the compiler's runtime carrier admitted a null data pointer. `StringView.data` is now a non-null, immutable reference in both the source runtime and the Go compiler's builtin carrier. Semantic regressions accept a valid `u8&` backing pointer, reject nullable `u8&?` construction, and reject reassignment of the backing field; `runtime_string_view_safety_smoke.sh` confirms the last two on Stage0 and Stage1. During parity verification, Stage1 initially skipped the nullable check because reference fields have no bare primitive spelling; its struct-construction checker now uses structural field/local type IDs and rejects direct null and nullable-reference values before the primitive-only path. Runtime equality, indexing, slicing, copying, hashing, names, collections, context comparison, and Wasm comparison rely on the non-null type invariant, while signed and target-width length checks remain. The LLVM literal fast path also checks for non-null before byte comparisons as a defensive lowering guard. These guarantees cover safe construction only: unsafe casts and foreign boundaries can still forge invalid pointer/length pairs, so validated adapters and unsafe contracts remain necessary. Safe source can still forge an out-of-range non-null pointer/length pair because the public carrier has no extent provenance; full carrier opacity, FFI validation, target-width execution, and general pointer-range proofs remain open.
 
@@ -1297,6 +1481,7 @@ Do not describe Elisa as fully memory safe merely because this checklist exists 
 - [ ] Every unsafe primitive and safe wrapper has a reviewed contract and tests; unresolved TCB assumptions are published rather than hidden.
 - [ ] Native, Python, Wasm, and EASM boundaries preserve their declared ownership/lifetime/ABI contracts on every supported target/profile.
 - [ ] Every LLVM optimizer promise is justified; optimization/debug/tracing variants preserve observable semantics.
+- [ ] Every automatic placement decision (stack, loop scratch, auto-region, caller arena, growth target, reuse) is justified by the shared lifetime facts or falls back to longer-lived storage. The placement on/off differential agrees across the executable corpus at every supported optimization level.
 - [ ] All executable entry points reject unsupported required code and publish artifacts atomically with provenance.
 - [ ] Independent safety/model/fuzz/instrumentation suites pass with no untriaged safety findings; required missing/skipped target coverage blocks that target's qualification.
 - [ ] Full uncached repository gates, compiler self-host fixpoint, and runtime self-host checks pass against the qualified sources and toolchain.
