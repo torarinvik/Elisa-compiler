@@ -13,12 +13,16 @@ import json
 import os
 from pathlib import Path
 import re
-import selectors
 import signal
 import subprocess
 import threading
 import time
 from typing import Any
+
+from scripts.bounded_process_snapshot import (
+    BoundedProcessSnapshotError,
+    read_bounded_process_snapshot,
+)
 
 
 MAX_PROCESS_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -360,96 +364,18 @@ def _process_tree_rss_bytes(process: Any) -> int | None:
 
 
 def _read_process_snapshot() -> str | None:
-    """Read the host process table under both byte and time ceilings.
-
-    ``subprocess.run(stdout=PIPE)`` only checks row count after it has
-    buffered the complete output. Stream the snapshot instead so a huge or
-    wedged process table cannot make this frequent RSS probe allocate without
-    bound. A row-count check still follows decoding in the caller.
-    """
+    """Read the host process table under byte, row, and time ceilings."""
     try:
-        process = subprocess.Popen(
+        return read_bounded_process_snapshot(
             ["ps", "-axo", "pid=,ppid=,pgid=,rss="],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            start_new_session=(os.name == "posix"),
-            bufsize=0,
+            max_bytes=MAX_PROCESS_SNAPSHOT_BYTES,
+            max_rows=MAX_PROCESS_SNAPSHOT_ROWS,
+            timeout_seconds=PROCESS_RSS_QUERY_TIMEOUT_SECONDS,
+            kill_wait_seconds=PROCESS_KILL_WAIT_SECONDS,
+            chunk_bytes=OUTPUT_CHUNK_BYTES,
         )
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except BoundedProcessSnapshotError:
         return None
-
-    if process.stdout is None:
-        _kill_process_group(process)
-        try:
-            process.wait(timeout=PROCESS_KILL_WAIT_SECONDS)
-        except subprocess.SubprocessError:
-            pass
-        return None
-
-    snapshot = bytearray()
-    snapshot_rows = 0
-    deadline = time.monotonic() + PROCESS_RSS_QUERY_TIMEOUT_SECONDS
-    selector: selectors.BaseSelector | None = None
-    try:
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _kill_process_group(process)
-                return None
-            if not selector.select(remaining):
-                continue
-
-            read_size = min(
-                OUTPUT_CHUNK_BYTES,
-                MAX_PROCESS_SNAPSHOT_BYTES + 1 - len(snapshot),
-            )
-            chunk = os.read(process.stdout.fileno(), read_size)
-            if not chunk:
-                break
-            if len(snapshot) + len(chunk) > MAX_PROCESS_SNAPSHOT_BYTES:
-                _kill_process_group(process)
-                return None
-            snapshot_rows += chunk.count(b"\n")
-            if snapshot_rows > MAX_PROCESS_SNAPSHOT_ROWS:
-                _kill_process_group(process)
-                return None
-            snapshot.extend(chunk)
-
-        if snapshot and not snapshot.endswith(b"\n"):
-            snapshot_rows += 1
-            if snapshot_rows > MAX_PROCESS_SNAPSHOT_ROWS:
-                return None
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_process_group(process)
-            return None
-        try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(process)
-            return None
-        if returncode != 0:
-            return None
-        try:
-            return snapshot.decode("ascii")
-        except UnicodeDecodeError:
-            return None
-    except (OSError, ValueError):
-        _kill_process_group(process)
-        return None
-    finally:
-        if selector is not None:
-            selector.close()
-        if process.poll() is None:
-            _kill_process_group(process)
-            try:
-                process.wait(timeout=PROCESS_KILL_WAIT_SECONDS)
-            except subprocess.SubprocessError:
-                pass
-        process.stdout.close()
 
 
 def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:

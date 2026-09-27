@@ -296,8 +296,8 @@ class WasmExportScanClientTests(unittest.TestCase):
                     len(payload),
                 ),
                 patch("scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_ROWS", 1),
-                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
-                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+                patch("scripts.bounded_process_snapshot.subprocess.Popen", return_value=process),
+                patch("scripts.bounded_process_snapshot._kill_process_group") as kill,
             ):
                 self.assertEqual(_read_process_snapshot(), payload.decode("ascii"))
             kill.assert_not_called()
@@ -342,8 +342,8 @@ class WasmExportScanClientTests(unittest.TestCase):
             )
             with (
                 patch("scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_BYTES", 8),
-                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
-                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+                patch("scripts.bounded_process_snapshot.subprocess.Popen", return_value=process),
+                patch("scripts.bounded_process_snapshot._kill_process_group") as kill,
             ):
                 self.assertIsNone(_read_process_snapshot())
             kill.assert_called_once_with(process)
@@ -369,8 +369,8 @@ class WasmExportScanClientTests(unittest.TestCase):
             )
             with (
                 patch("scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_ROWS", 1),
-                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
-                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+                patch("scripts.bounded_process_snapshot.subprocess.Popen", return_value=process),
+                patch("scripts.bounded_process_snapshot._kill_process_group") as kill,
             ):
                 self.assertIsNone(_read_process_snapshot())
             kill.assert_called_once_with(process)
@@ -396,8 +396,8 @@ class WasmExportScanClientTests(unittest.TestCase):
                     "scripts.wasm_export_scan_client.PROCESS_RSS_QUERY_TIMEOUT_SECONDS",
                     0.001,
                 ),
-                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
-                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+                patch("scripts.bounded_process_snapshot.subprocess.Popen", return_value=process),
+                patch("scripts.bounded_process_snapshot._kill_process_group") as kill,
             ):
                 self.assertIsNone(_read_process_snapshot())
             kill.assert_called_once_with(process)
@@ -780,19 +780,19 @@ class BoundedStage1CommandTests(unittest.TestCase):
             patch.object(bounded_runner, "_child_pid", 101),
             patch.object(bounded_runner, "_child_pgid", 101),
             patch.object(
-                bounded_runner.subprocess,
-                "run",
-                return_value=SimpleNamespace(stdout=snapshot),
-            ) as run,
+                bounded_runner,
+                "read_bounded_process_snapshot",
+                return_value=snapshot,
+            ) as read_snapshot,
         ):
             self.assertEqual(bounded_runner.process_snapshot(), (1000, 2, True))
-        run.assert_called_once_with(
+        read_snapshot.assert_called_once_with(
             ["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="ascii",
-            errors="strict",
+            max_bytes=bounded_runner.MAX_PROCESS_SNAPSHOT_BYTES,
+            max_rows=bounded_runner.MAX_PROCESS_ROWS,
+            timeout_seconds=bounded_runner.PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+            kill_wait_seconds=bounded_runner.PROCESS_SNAPSHOT_KILL_WAIT_SECONDS,
+            chunk_bytes=bounded_runner.PROCESS_SNAPSHOT_CHUNK_BYTES,
         )
 
     def test_process_snapshot_rejects_incomplete_rows(self) -> None:
@@ -800,13 +800,33 @@ class BoundedStage1CommandTests(unittest.TestCase):
             patch.object(bounded_runner, "_child_pid", 101),
             patch.object(bounded_runner, "_child_pgid", 101),
             patch.object(
-                bounded_runner.subprocess,
-                "run",
-                return_value=SimpleNamespace(stdout="101 1 101 100 S\nmalformed\n"),
+                bounded_runner,
+                "read_bounded_process_snapshot",
+                return_value="101 1 101 100 S\nmalformed\n",
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "invalid row"):
                 bounded_runner.process_snapshot()
+
+    def test_process_snapshot_rejects_duplicate_process_ids(self) -> None:
+        snapshot = "101 1 101 524288 S\n101 1 101 0 S\n"
+        with (
+            patch.object(bounded_runner, "_child_pid", 101),
+            patch.object(bounded_runner, "_child_pgid", 101),
+            patch.object(bounded_runner, "read_bounded_process_snapshot", return_value=snapshot),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "duplicate process id"):
+                bounded_runner.process_snapshot()
+
+    def test_process_snapshot_rejects_an_empty_successful_table(self) -> None:
+        with patch.object(bounded_runner, "read_bounded_process_snapshot", return_value=""):
+            with self.assertRaisesRegex(RuntimeError, "process snapshot was empty"):
+                bounded_runner.process_snapshot()
+
+    def test_missing_live_root_does_not_block_wait(self) -> None:
+        child = SimpleNamespace(poll=lambda: None, wait=lambda: self.fail("blocking wait"))
+        with self.assertRaisesRegex(RuntimeError, "omitted a root that is still running"):
+            bounded_runner.child_status_after_snapshot(child, root_live=False)
 
     def test_stop_group_returns_after_terminated_members_exit(self) -> None:
         with (

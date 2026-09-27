@@ -14,13 +14,25 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import NoReturn
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.bounded_process_snapshot import (
+    BoundedProcessSnapshotError,
+    read_bounded_process_snapshot,
+)
 
 
 MAX_RSS_KB = 2 * 1024 * 1024
 MAX_SECONDS = 300
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_PROCESS_ROWS = 16_384
+MAX_PROCESS_SNAPSHOT_BYTES = 8 * 1024 * 1024
+PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
+PROCESS_SNAPSHOT_KILL_WAIT_SECONDS = 1
+PROCESS_SNAPSHOT_CHUNK_BYTES = 64 * 1024
 POLL_SECONDS = 0.05
 TERM_GRACE_SECONDS = 2.0
 
@@ -47,15 +59,15 @@ def rss_limit_kb() -> int:
 def process_snapshot() -> tuple[int, int, bool]:
     """Return (RSS KiB, live group member count, root is live)."""
     try:
-        result = subprocess.run(
+        snapshot = read_bounded_process_snapshot(
             ["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="ascii",
-            errors="strict",
+            max_bytes=MAX_PROCESS_SNAPSHOT_BYTES,
+            max_rows=MAX_PROCESS_ROWS,
+            timeout_seconds=PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+            kill_wait_seconds=PROCESS_SNAPSHOT_KILL_WAIT_SECONDS,
+            chunk_bytes=PROCESS_SNAPSHOT_CHUNK_BYTES,
         )
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+    except BoundedProcessSnapshotError as exc:
         raise RuntimeError(f"unable to read process snapshot: {exc}") from exc
 
     parents: dict[int, int] = {}
@@ -63,21 +75,36 @@ def process_snapshot() -> tuple[int, int, bool]:
     rss_by_pid: dict[int, int] = {}
     states: dict[int, str] = {}
     children: dict[int, list[int]] = {}
-    lines = result.stdout.splitlines()
+    lines = snapshot.splitlines()
+    if not lines:
+        raise RuntimeError("process snapshot was empty")
     if len(lines) > MAX_PROCESS_ROWS:
         raise RuntimeError("process snapshot exceeded the 16384-row limit")
     for line in lines:
         fields = line.split()
         if not fields:
             continue
-        if len(fields) != 5 or any(not field.isascii() or not field.isdecimal() for field in fields[:4]):
+        if (
+            len(fields) != 5
+            or any(
+                not field.isascii() or not field.isdecimal() or len(field) > 10
+                for field in fields[:4]
+            )
+        ):
             raise RuntimeError("process snapshot contained an invalid row")
         pid, ppid, pgid, rss = (int(field) for field in fields[:4])
+        if pid <= 0 or ppid < 0 or pgid <= 0:
+            raise RuntimeError("process snapshot contained an invalid row")
+        if pid in parents:
+            raise RuntimeError("process snapshot contained a duplicate process id")
         parents[pid] = ppid
         groups[pid] = pgid
         rss_by_pid[pid] = rss
         states[pid] = fields[4]
         children.setdefault(ppid, []).append(pid)
+
+    if not parents:
+        raise RuntimeError("process snapshot contained no process rows")
 
     root_pid = _child_pid
     process_group = _child_pgid
@@ -100,6 +127,16 @@ def process_snapshot() -> tuple[int, int, bool]:
     )
     root_live = root_pid in parents and not states[root_pid].startswith("Z")
     return total_rss, live_group, root_live
+
+
+def child_status_after_snapshot(child: subprocess.Popen[bytes], root_live: bool) -> int | None:
+    """Reap a vanished root only after nonblocking wait confirms it exited."""
+    if root_live:
+        return None
+    status = child.poll()
+    if status is None:
+        raise RuntimeError("process snapshot omitted a root that is still running")
+    return status
 
 
 _child_pid = 0
@@ -201,8 +238,14 @@ def main() -> int:
                 failure = str(exc)
                 break
 
-            if child_status is None and not root_live:
-                child_status = child.wait()
+            if child_status is None:
+                try:
+                    observed_status = child_status_after_snapshot(child, root_live)
+                except RuntimeError as exc:
+                    failure = str(exc)
+                    break
+                if observed_status is not None:
+                    child_status = observed_status
             if current_rss > limit:
                 failure = f"process-group RSS {current_rss} KB exceeded {limit} KB"
                 break
