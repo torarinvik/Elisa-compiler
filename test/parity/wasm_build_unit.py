@@ -308,6 +308,32 @@ class WasmExportScanClientTests(unittest.TestCase):
             if write_fd >= 0:
                 os.close(write_fd)
 
+    def test_rss_sampler_stops_when_process_snapshot_read_times_out(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            stdout = os.fdopen(read_fd, "rb", buffering=0)
+            read_fd = -1
+            process = SimpleNamespace(
+                pid=78,
+                stdout=stdout,
+                poll=lambda: 0,
+                wait=lambda **_kwargs: 0,
+            )
+            with (
+                patch(
+                    "scripts.wasm_export_scan_client.PROCESS_RSS_QUERY_TIMEOUT_SECONDS",
+                    0.001,
+                ),
+                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
+                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+            ):
+                self.assertIsNone(_read_process_snapshot())
+            kill.assert_called_once_with(process)
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+            os.close(write_fd)
+
     def test_rss_guard_constants_are_bounded(self) -> None:
         self.assertEqual(PROCESS_RSS_LIMIT_BYTES, 512 * 1024 * 1024)
         self.assertEqual(MAX_PROCESS_SNAPSHOT_ROWS, 65536)
