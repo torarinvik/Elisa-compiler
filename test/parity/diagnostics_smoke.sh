@@ -557,6 +557,14 @@ run_case local_view_escape_binding pos "$FIXTURES/local_view_escape_binding.pos.
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "escapes via return; the array dies at scope exit"
 run_case return_ref_local_in_block pos "$FIXTURES/return_ref_local_in_block.pos.elisa" "returning a reference into function-local storage"
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "returning a reference into function-local storage"
+echo "-- affine_move_sites --"
+run_case affine_move_nested_call pos "$FIXTURES/affine_move_nested_call.pos.elisa" 'linear value "t" must be moved explicitly before argument to call "sink"'
+run_case affine_move_struct_field pos "$FIXTURES/affine_move_struct_field.pos.elisa" 'linear value "t" must be moved explicitly before move into struct literal field "a"'
+run_case affine_move_tuple_element pos "$FIXTURES/affine_move_tuple_element.pos.elisa" 'linear value "t" must be moved explicitly before move into tuple element "_0"'
+run_case affine_move_array_element pos "$FIXTURES/affine_move_array_element.pos.elisa" 'linear value "t" must be moved explicitly before move into array literal element'
+run_case affine_move_darray_literal pos "$FIXTURES/affine_move_darray_literal.pos.elisa" 'linear value "t" must be moved explicitly before move into darray literal element'
+run_case affine_move_darray_push pos "$FIXTURES/affine_move_darray_push.pos.elisa" 'linear value "t" must be moved explicitly before move into darray push'
+run_case affine_move_sites neg "$FIXTURES/affine_move_sites.neg.elisa" "must be moved explicitly"
 
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
