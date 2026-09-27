@@ -308,6 +308,33 @@ class WasmExportScanClientTests(unittest.TestCase):
             if write_fd >= 0:
                 os.close(write_fd)
 
+    def test_rss_sampler_stops_when_process_snapshot_exceeds_row_limit(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"1 1 1 1\n2 1 1 1\n")
+            os.close(write_fd)
+            write_fd = -1
+            stdout = os.fdopen(read_fd, "rb", buffering=0)
+            read_fd = -1
+            process = SimpleNamespace(
+                pid=79,
+                stdout=stdout,
+                poll=lambda: 0,
+                wait=lambda **_kwargs: 0,
+            )
+            with (
+                patch("scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_ROWS", 1),
+                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
+                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+            ):
+                self.assertIsNone(_read_process_snapshot())
+            kill.assert_called_once_with(process)
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
     def test_rss_sampler_stops_when_process_snapshot_read_times_out(self) -> None:
         read_fd, write_fd = os.pipe()
         try:

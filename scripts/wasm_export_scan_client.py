@@ -383,6 +383,7 @@ def _read_process_snapshot() -> str | None:
         return None
 
     snapshot = bytearray()
+    snapshot_rows = 0
     deadline = time.monotonic() + PROCESS_RSS_QUERY_TIMEOUT_SECONDS
     selector: selectors.BaseSelector | None = None
     try:
@@ -406,8 +407,16 @@ def _read_process_snapshot() -> str | None:
             if len(snapshot) + len(chunk) > MAX_PROCESS_SNAPSHOT_BYTES:
                 _kill_process_group(process)
                 return None
+            snapshot_rows += chunk.count(b"\n")
+            if snapshot_rows > MAX_PROCESS_SNAPSHOT_ROWS:
+                _kill_process_group(process)
+                return None
             snapshot.extend(chunk)
 
+        if snapshot and not snapshot.endswith(b"\n"):
+            snapshot_rows += 1
+            if snapshot_rows > MAX_PROCESS_SNAPSHOT_ROWS:
+                return None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _kill_process_group(process)
