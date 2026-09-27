@@ -274,6 +274,38 @@ class WasmExportScanClientTests(unittest.TestCase):
         ):
             self.assertEqual(_process_tree_rss_bytes(process), (10 + 20 + 30) * 1024)
 
+    def test_rss_snapshot_reader_accepts_exact_byte_and_row_limits(self) -> None:
+        payload = b"100 1 100 10\n"
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, payload)
+            os.close(write_fd)
+            write_fd = -1
+            stdout = os.fdopen(read_fd, "rb", buffering=0)
+            read_fd = -1
+            process = SimpleNamespace(
+                pid=100,
+                stdout=stdout,
+                poll=lambda: 0,
+                wait=lambda **_kwargs: 0,
+            )
+            with (
+                patch(
+                    "scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_BYTES",
+                    len(payload),
+                ),
+                patch("scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_ROWS", 1),
+                patch("scripts.wasm_export_scan_client.subprocess.Popen", return_value=process),
+                patch("scripts.wasm_export_scan_client._kill_process_group") as kill,
+            ):
+                self.assertEqual(_read_process_snapshot(), payload.decode("ascii"))
+            kill.assert_not_called()
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
     def test_rss_sampler_fails_closed_on_malformed_snapshot(self) -> None:
         process = SimpleNamespace(pid=100)
         with patch(
