@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import subprocess
 import threading
@@ -33,6 +34,7 @@ PROCESS_RSS_LIMIT_BYTES = 512 * 1024 * 1024
 PROCESS_RSS_POLL_SECONDS = 0.05
 PROCESS_RSS_QUERY_TIMEOUT_SECONDS = 1
 MAX_PROCESS_SNAPSHOT_ROWS = 65536
+MAX_PROCESS_SNAPSHOT_BYTES = 8 * 1024 * 1024
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
 _TARGET = re.compile(r"[A-Za-z_][A-Za-z0-9_:]*\Z", re.ASCII)
@@ -315,22 +317,12 @@ def _process_tree_rss_bytes(process: Any) -> int | None:
     """
     if os.name != "posix":
         return None
-    try:
-        completed = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,pgid=,rss="],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-            timeout=PROCESS_RSS_QUERY_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
+    snapshot = _read_process_snapshot()
+    if snapshot is None:
         return None
 
     rows: dict[int, tuple[int, int, int]] = {}
-    for raw_line in completed.stdout.splitlines():
+    for raw_line in snapshot.splitlines():
         if not raw_line.strip():
             continue
         fields = raw_line.split()
@@ -360,6 +352,90 @@ def _process_tree_rss_bytes(process: Any) -> int | None:
                 owned.add(pid)
                 changed = True
     return sum(rows[pid][2] for pid in owned) * 1024
+
+
+def _read_process_snapshot() -> str | None:
+    """Read the host process table under both byte and time ceilings.
+
+    ``subprocess.run(stdout=PIPE)`` only checks row count after it has
+    buffered the complete output. Stream the snapshot instead so a huge or
+    wedged process table cannot make this frequent RSS probe allocate without
+    bound. A row-count check still follows decoding in the caller.
+    """
+    try:
+        process = subprocess.Popen(
+            ["ps", "-axo", "pid=,ppid=,pgid=,rss="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=(os.name == "posix"),
+            bufsize=0,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+    if process.stdout is None:
+        _kill_process_group(process)
+        try:
+            process.wait(timeout=PROCESS_KILL_WAIT_SECONDS)
+        except subprocess.SubprocessError:
+            pass
+        return None
+
+    snapshot = bytearray()
+    deadline = time.monotonic() + PROCESS_RSS_QUERY_TIMEOUT_SECONDS
+    selector: selectors.BaseSelector | None = None
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process_group(process)
+                return None
+            if not selector.select(remaining):
+                continue
+
+            read_size = min(
+                OUTPUT_CHUNK_BYTES,
+                MAX_PROCESS_SNAPSHOT_BYTES + 1 - len(snapshot),
+            )
+            chunk = os.read(process.stdout.fileno(), read_size)
+            if not chunk:
+                break
+            if len(snapshot) + len(chunk) > MAX_PROCESS_SNAPSHOT_BYTES:
+                _kill_process_group(process)
+                return None
+            snapshot.extend(chunk)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_process_group(process)
+            return None
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            return None
+        if returncode != 0:
+            return None
+        try:
+            return snapshot.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    except (OSError, ValueError):
+        _kill_process_group(process)
+        return None
+    finally:
+        if selector is not None:
+            selector.close()
+        if process.poll() is None:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=PROCESS_KILL_WAIT_SECONDS)
+            except subprocess.SubprocessError:
+                pass
+        process.stdout.close()
 
 
 def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:
