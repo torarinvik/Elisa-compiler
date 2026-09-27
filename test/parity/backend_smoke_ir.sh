@@ -89,6 +89,20 @@ stage1_ir_env_case() {
     fi
 }
 
+stage1_ir_env_absent_case() {
+    local name="$1" env_name="$2" env_value="$3" src="$4" pattern="$5"
+    total=$((total + 1))
+    local ll="$BUILD/s1irabs_${name}.ll"
+    if ! printf '%b' "$src" | env "$env_name=$env_value" "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL s1irabs_$name: stage1 declined"; return
+    fi
+    if grep -qE "$pattern" "$ll"; then
+        echo "  FAIL s1irabs_$name: stage1 IR unexpectedly contains /$pattern/"
+    else
+        pass=$((pass + 1))
+    fi
+}
+
 # The ABSENCE assertion needs its own helper: `grep -E` has no negative lookahead (that is
 # PCRE), so "must not contain" cannot be spelled as a pattern.
 stage1_ir_absent_case() {
@@ -96,6 +110,20 @@ stage1_ir_absent_case() {
     total=$((total + 1))
     local ll="$BUILD/s1irabs_$name.ll"
     if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL s1irabs_$name: stage1 declined"; return
+    fi
+    if grep -qE "$pattern" "$ll"; then
+        echo "  FAIL s1irabs_$name: stage1 IR unexpectedly contains /$pattern/"
+    else
+        pass=$((pass + 1))
+    fi
+}
+
+stage1_ir_env_file_absent_case() {
+    local name="$1" env_name="$2" env_value="$3" source_path="$4" pattern="$5"
+    total=$((total + 1))
+    local ll="$BUILD/s1irabs_${name}.ll"
+    if ! env "$env_name=$env_value" "$BUILD/emit_native" < "$ROOT/$source_path" > "$ll" 2>/dev/null; then
         echo "  FAIL s1irabs_$name: stage1 declined"; return
     fi
     if grep -qE "$pattern" "$ll"; then
@@ -172,7 +200,17 @@ stage1_ir_env_case index_guard_forced ELISACORE_FORCE_BOUNDS_CHECK 1 'def at(xs:
 stage1_ir_env_case disjoint_darray_scopes ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = []\n    axpy(&a, &b)\n    return 0\n' 'elisa\.disjoint\.axpy\.aa'
 stage1_ir_absent_case disjoint_alias_call 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    axpy(&a, &a)\n    return 0\n' 'elisa\.disjoint\.'
 stage1_ir_env_case disjoint_clone_call ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = clone[darray[f64]](a)\n    axpy(&a, &b)\n    return 0\n' 'elisa\.disjoint\.axpy\.aa'
-stage1_ir_env_case disjoint_forwarded_call ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef driver(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    axpy(y, x)\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = []\n    driver(&a, &b)\n    return 0\n' 'elisa\.disjoint\.driver\.aa'
+stage1_ir_env_absent_case disjoint_forwarded_without_mutation_summary ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef driver(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    axpy(y, x)\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = []\n    driver(&a, &b)\n    return 0\n' 'elisa\.disjoint\.driver\.aa'
+stage1_ir_env_file_absent_case disjoint_named_argument_reorder ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_named_argument_reorder.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_shadowed_callee ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_shadowed_callee.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_shadowed_fresh_names ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_shadowed_fresh_names.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_exported_entry ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_exported_entry.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_qualified_callee ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_qualified_callee.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_rebinding_parameter ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_rebinding_parameter.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_parameter_invalidated_by_reference_alias ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_parameter_invalidated_by_reference_alias.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_scope_index_out_of_range ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_scope_index_out_of_range.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_fresh_invalidated_by_call ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_fresh_invalidated_by_call.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_fresh_invalidated_across_loop ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_fresh_invalidated_across_loop.elisa' 'elisa\.disjoint\.update_pair\.'
 # A plain for-loop is NOT a comprehension build loop and must NOT be tagged: a marker there
 # would make -Wperf demand vectorization of a loop the language never promised to vectorize.
 stage1_ir_absent_case autovec_not_plain_loop 'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total - 3\n' 'elisa.autovec.expected'
