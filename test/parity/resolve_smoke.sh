@@ -376,9 +376,7 @@ echo "resolve smoke OK: loop-capture call initializers resolve without a danglin
 # cross-file and module-qualified references (`Lexer::foo`, `Ast::Node`) resolve.
 # This dogfooding measurement drove the resolver to ~zero (788 per-file -> 5):
 # modeling cross-file modules, struct-literal field labels (labels are selectors,
-# not references), and seeding language builtins. The residual 5 are degenerate
-# zero-ish identifier leaves produced at flat-concatenation file boundaries (not
-# real references; they do not occur under the real include structure).
+# not references), and seeding language builtins. It now reads 0.
 # GATING on a budget ceiling (RESOLVE_SELF_MAX, default 0) to lock in the result.
 # The frontend calls a few libc externs (getenv, ...) that the STD declares, not
 # the frontend itself. Concatenating only src/lexer|parser|semantic therefore
@@ -386,9 +384,18 @@ echo "resolve smoke OK: loop-capture call initializers resolve without a danglin
 # resolver. debug_referee.elisa declares getenv; collections.elisai declares
 # arena_free, used by frontend_parse to release parser scratch. Include the real
 # runtime interfaces so this counts missing references rather than omitted inputs.
+# The runtime string helpers (string_view_slice, ...) have no interface file, and
+# resolving their bodies would count the runtime's own references, so declare them:
+# one `extern` per top-level `def` signature, generated from the real file so it
+# cannot drift. Without it this read 5 -- every one a string_view_slice call in
+# check_uninitialized_zeroed.elisa, once misfiled as file-boundary artifacts.
+RUNTIME_STRINGS_IFACE="$WORK/runtime_strings.elisai"
+sed -nE 's/^def ([A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\(.*\)( -> .*)?):$/extern \1/p' \
+	"$REPO_ROOT/elisacore_std/elisacore_runtime_strings.elisa" > "$RUNTIME_STRINGS_IFACE"
 FRONTEND_FILES=()
 for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa \
-         "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai; do
+         "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \
+         "$RUNTIME_STRINGS_IFACE"; do
 	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
 done
 if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then

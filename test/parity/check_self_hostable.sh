@@ -105,9 +105,16 @@ clang "${link_flags[@]}"
 # resolver. debug_referee.elisa carries those declarations, so including it makes
 # the count mean "references nothing declares" again. Without it the measurement
 # read 1 (getenv, from src/lexer/lexer.elisa) against a ceiling of 0.
+# collections.elisai declares arena_free; the runtime string helpers
+# (string_view_slice, ...) get a generated declaration-only interface, one `extern`
+# per top-level `def` of the real file, so their bodies are not counted.
+RUNTIME_STRINGS_IFACE="$WORK/runtime_strings.elisai"
+sed -nE 's/^def ([A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\(.*\)( -> .*)?):$/extern \1/p' \
+	"$REPO_ROOT/elisacore_std/elisacore_runtime_strings.elisa" > "$RUNTIME_STRINGS_IFACE"
 FRONTEND_FILES=()
 for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa \
-         "$REPO_ROOT"/elisacore_std/debug_referee.elisa; do
+         "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \
+         "$RUNTIME_STRINGS_IFACE"; do
 	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
 done
 if [[ ${#FRONTEND_FILES[@]} -eq 0 ]]; then
