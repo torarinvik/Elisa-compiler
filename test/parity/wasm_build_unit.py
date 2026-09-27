@@ -9,6 +9,7 @@ import io
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -296,10 +297,19 @@ class WasmExportScanClientTests(unittest.TestCase):
                     len(payload),
                 ),
                 patch("scripts.wasm_export_scan_client.MAX_PROCESS_SNAPSHOT_ROWS", 1),
-                patch("scripts.bounded_process_snapshot.subprocess.Popen", return_value=process),
+                patch("scripts.bounded_process_snapshot.subprocess.Popen", return_value=process) as launch,
                 patch("scripts.bounded_process_snapshot._kill_process_group") as kill,
             ):
                 self.assertEqual(_read_process_snapshot(), payload.decode("ascii"))
+            launch.assert_called_once_with(
+                ["/bin/ps", "-axo", "pid=,ppid=,pgid=,rss="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={"LC_ALL": "C"},
+                start_new_session=(os.name == "posix"),
+                bufsize=0,
+            )
             kill.assert_not_called()
         finally:
             if read_fd >= 0:
@@ -787,7 +797,7 @@ class BoundedStage1CommandTests(unittest.TestCase):
         ):
             self.assertEqual(bounded_runner.process_snapshot(), (1000, 2, True))
         read_snapshot.assert_called_once_with(
-            ["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="],
+            ["-axo", "pid=,ppid=,pgid=,rss=,stat="],
             max_bytes=bounded_runner.MAX_PROCESS_SNAPSHOT_BYTES,
             max_rows=bounded_runner.MAX_PROCESS_ROWS,
             timeout_seconds=bounded_runner.PROCESS_SNAPSHOT_TIMEOUT_SECONDS,

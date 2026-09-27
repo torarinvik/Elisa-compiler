@@ -367,7 +367,7 @@ def _read_process_snapshot() -> str | None:
     """Read the host process table under byte, row, and time ceilings."""
     try:
         return read_bounded_process_snapshot(
-            ["ps", "-axo", "pid=,ppid=,pgid=,rss="],
+            ["-axo", "pid=,ppid=,pgid=,rss="],
             max_bytes=MAX_PROCESS_SNAPSHOT_BYTES,
             max_rows=MAX_PROCESS_SNAPSHOT_ROWS,
             timeout_seconds=PROCESS_RSS_QUERY_TIMEOUT_SECONDS,

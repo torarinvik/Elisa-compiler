@@ -10,6 +10,9 @@ import time
 from collections.abc import Sequence
 
 
+PROCESS_TABLE_EXECUTABLE = "/bin/ps"
+
+
 class BoundedProcessSnapshotError(RuntimeError):
     """The process-table probe failed or exceeded a configured bound."""
 
@@ -31,7 +34,7 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def read_bounded_process_snapshot(
-    command: Sequence[str],
+    arguments: Sequence[str],
     *,
     max_bytes: int,
     max_rows: int,
@@ -41,7 +44,7 @@ def read_bounded_process_snapshot(
 ) -> str:
     """Capture ASCII process-table output without buffering an unbounded pipe."""
     if (
-        not command
+        not arguments
         or max_bytes <= 0
         or max_rows <= 0
         or timeout_seconds <= 0
@@ -52,10 +55,11 @@ def read_bounded_process_snapshot(
 
     try:
         process = subprocess.Popen(
-            list(command),
+            [PROCESS_TABLE_EXECUTABLE, *arguments],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env={"LC_ALL": "C"},
             start_new_session=(os.name == "posix"),
             bufsize=0,
         )

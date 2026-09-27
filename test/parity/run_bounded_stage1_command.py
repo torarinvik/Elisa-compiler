@@ -60,7 +60,7 @@ def process_snapshot() -> tuple[int, int, bool]:
     """Return (RSS KiB, live group member count, root is live)."""
     try:
         snapshot = read_bounded_process_snapshot(
-            ["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="],
+            ["-axo", "pid=,ppid=,pgid=,rss=,stat="],
             max_bytes=MAX_PROCESS_SNAPSHOT_BYTES,
             max_rows=MAX_PROCESS_ROWS,
             timeout_seconds=PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
