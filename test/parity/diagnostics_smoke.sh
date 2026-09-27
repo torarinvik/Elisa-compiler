@@ -547,6 +547,39 @@ echo "-- region_returned_stored_borrow --"
 run_case region_returned_stored_borrow pos "$REPO_ROOT/test/repro/region_returned_stored_borrow.pos.elisa" "cannot be returned with a region-less type"
 run_case region_returned_stored_borrow neg "$REPO_ROOT/test/repro/region_returned_stored_borrow.neg.elisa" "cannot be returned with a region-less type"
 
+echo "-- shift_match_guards --"
+guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
+guard_neg="$FIXTURES/shift_match_guards.neg.elisa"
+guard_expectations=(
+    "shift count is out of range for every integer width (valid range 0..63)"
+    "shift count is negative"
+    "shift by zero has no effect"
+    "operator requires numeric operands"
+    "operator requires integral operands"
+)
+for guard_case in pos neg; do
+    guard_file="$guard_pos"
+    [[ "$guard_case" == "neg" ]] && guard_file="$guard_neg"
+    total=$((total + ${#guard_expectations[@]}))
+    guard_out="$("$RPT" < "$guard_file" 2>&1)"
+    if ! check_parses "$guard_file" "$guard_out"; then
+        failed=$((failed + ${#guard_expectations[@]}))
+        continue
+    fi
+    for guard_expect in "${guard_expectations[@]}"; do
+        guard_count="$(grep -oF -- "$guard_expect" <<< "$guard_out" | wc -l | tr -d ' ')"
+        if [[ "$guard_case" == "pos" && "$guard_count" -ge 2 ]]; then
+            echo "  PASS shift_match_guards.pos (found $guard_count: \"$guard_expect\")"
+        elif [[ "$guard_case" == "neg" && "$guard_count" -eq 0 ]]; then
+            echo "  PASS shift_match_guards.neg (silent: \"$guard_expect\")"
+        else
+            echo "  FAIL shift_match_guards.$guard_case for \"$guard_expect\" (found $guard_count)" >&2
+            echo "$guard_out" | sed 's/^/    /' >&2
+            failed=$((failed + 1))
+        fi
+    done
+done
+
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then
