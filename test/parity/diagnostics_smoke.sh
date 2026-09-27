@@ -249,6 +249,7 @@ NAMES=(
     aggregate_reference_return_helper_chain
     aggregate_reference_return_helper_local
     aggregate_reference_return_helper_assignment
+    aggregate_reference_multiple_lenders_escape
     aggregate_reference_field_return_escape
     aggregate_reference_field_assign_escape
     aggregate_reference_match_return_escape
@@ -463,6 +464,7 @@ EXPECTS=(
     "cannot assign bool to i64"
     "cannot assign bool to i64"
     "internal runtime carrier type \"DynArrayView\" is not supported in user-facing code"
+    "returning a reference into function-local storage; it dangles once the function returns"
     "returning a reference into function-local storage; it dangles once the function returns"
     "returning a reference into function-local storage; it dangles once the function returns"
     "returning a reference into function-local storage; it dangles once the function returns"
