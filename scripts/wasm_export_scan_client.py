@@ -322,6 +322,7 @@ def _process_tree_rss_bytes(process: Any) -> int | None:
         return None
 
     rows: dict[int, tuple[int, int, int]] = {}
+    children: dict[int, list[int]] = {}
     for raw_line in snapshot.splitlines():
         if not raw_line.strip():
             continue
@@ -337,20 +338,22 @@ def _process_tree_rss_bytes(process: Any) -> int | None:
         if len(rows) >= MAX_PROCESS_SNAPSHOT_ROWS:
             return None
         rows[pid] = (parent, group, rss_kib)
+        children.setdefault(parent, []).append(pid)
 
     root_pid = int(process.pid)
     if root_pid not in rows:
         return None
     owned: set[int] = {root_pid}
-    changed = True
-    while changed:
-        changed = False
-        for pid, (parent, group, _rss_kib) in rows.items():
-            if pid in owned:
-                continue
-            if parent in owned or group == root_pid:
-                owned.add(pid)
-                changed = True
+    for pid, (_parent, group, _rss_kib) in rows.items():
+        if group == root_pid:
+            owned.add(pid)
+    pending: list[int] = list(owned)
+    while pending:
+        parent = pending.pop()
+        for child in children.get(parent, []):
+            if child not in owned:
+                owned.add(child)
+                pending.append(child)
     return sum(rows[pid][2] for pid in owned) * 1024
 
 

@@ -266,7 +266,8 @@ class WasmExportScanClientTests(unittest.TestCase):
 
     def test_rss_sampler_sums_process_group_and_descendant_tree(self) -> None:
         process = SimpleNamespace(pid=100)
-        snapshot = "100 1 100 10\n101 100 100 20\n102 101 102 30\n200 1 200 99\n"
+        # Put descendants before parents: ownership must not depend on ps row order.
+        snapshot = "102 101 102 30\n101 100 100 20\n200 1 200 99\n100 1 100 10\n"
         with patch(
             "scripts.wasm_export_scan_client._read_process_snapshot",
             return_value=snapshot,
