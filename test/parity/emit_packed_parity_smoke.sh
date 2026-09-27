@@ -83,6 +83,27 @@ def main() -> i64:
 EOF
 exact "packed-commons" "$WORK/commons.elisa"
 
+# 4. RECURSIVE enums: EXACT parity. stage0 (packedModeForPackedEnum) gives the dynamic AoS
+# row ONLY to a plain `enum` promoted by recursion (RecursivePlain) without `layout(soa)`;
+# a declared `packed enum` and `layout(soa)` keep canonical variant-sparse. stage1 used to
+# put EVERY recursive enum in AoS (`aos`, 12 bytes vs stage0's `variant-sparse`, 16), counted
+# the AoS common prefix in 4-byte words instead of stage0's ceil-over-8, and sized sparse
+# payloads by FIELD count instead of ceil(ABI size / 8) (`A(x: i32, y: i32)` is one word).
+recursive_case() {
+    local label="$1"; shift
+    printf '%s\n' "$@" "" "def main() -> i64:" "    return 0" > "$WORK/$label.elisa"
+    exact "$label" "$WORK/$label.elisa"
+}
+recursive_case "recursive-packed" "packed enum Node:" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
+recursive_case "recursive-packed-inline-u32" "packed enum Node:" "    common:" "        @storage(inline)" "        t: u32" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
+recursive_case "recursive-packed-inline-u8-u32" "packed enum Node:" "    common:" "        @storage(inline)" "        t: u8" "        s: u32" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
+recursive_case "recursive-soa" "enum Node layout(soa):" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
+recursive_case "recursive-plain" "enum Node:" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
+recursive_case "recursive-plain-inline-i64" "enum Node:" "    common:" "        @storage(inline)" "        t: i64" "        s: u32" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
+recursive_case "packed-subword-payload" "packed enum E:" "    A(x: i32, y: i32)" "    B(z: i64)"
+# Report order is SOURCE order: the promoted plain enum registers after the packed one.
+recursive_case "recursive-plain-before-packed" "enum Tree:" "    Leaf(v: i64)" "    Pair(left: Tree, right: Tree)" "" "packed enum Shape:" "    common:" "        a: u32" "    Circle(r: i64)" "    Rect(w: i64, h: i64)"
+
 echo "emit_packed parity: $same exact, $differ divergent, $rejected rejected by stage1"
 [ "$differ" -eq 0 ] || { echo "emit_packed parity FAILED"; exit 1; }
 echo "emit_packed parity OK"
