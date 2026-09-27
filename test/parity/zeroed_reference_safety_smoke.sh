@@ -427,8 +427,10 @@ done
 
 # `zeroed` in a typed VALUE position (a call argument, or a conditional branch that
 # initializes a binding or a return) receives the zero bit pattern directly: no later
-# assignment can stage it. Both compilers reject every representation that forbids zero,
-# including through named, UFCS, qualified, nested, and generic calls.
+# assignment can stage it. The same holds for a struct literal field and for the place a
+# `<-` writes: a field, a rebindable local, or the referent of a reference parameter.
+# Both compilers reject every representation that forbids zero, including through named,
+# UFCS, qualified, nested, and generic calls.
 for repro in \
     zeroed_value_reference_argument.elisa \
     zeroed_value_conditional_binding.elisa \
@@ -443,7 +445,18 @@ for repro in \
     zeroed_value_implicit_generic_argument.elisa \
     zeroed_value_qualified_call_argument.elisa \
     zeroed_value_aggregate_argument.elisa \
-    zeroed_value_trusted_sview_argument.elisa; do
+    zeroed_value_trusted_sview_argument.elisa \
+    zeroed_value_reference_field_literal.elisa \
+    zeroed_value_sview_field_literal.elisa \
+    zeroed_value_generic_field_literal.elisa \
+    zeroed_value_reference_field_assignment.elisa \
+    zeroed_value_field_through_param_assignment.elisa \
+    zeroed_value_nested_field_assignment.elisa \
+    zeroed_value_qualified_field_assignment.elisa \
+    zeroed_value_sview_local_assignment.elisa \
+    zeroed_value_reference_rebind_assignment.elisa \
+    zeroed_value_sview_write_through_assignment.elisa \
+    zeroed_value_conditional_field_assignment.elisa; do
     for compiler in "${COMPILERS[@]}"; do
         for level in 0 2; do
             output="$WORK/$(basename -- "$compiler")-${repro%.elisa}-O$level.ll"
@@ -471,7 +484,8 @@ for level in 0 2; do
         zeroed_value_shadowed_optional_ok.elisa \
         zeroed_value_extern_optional_ok.elisa \
         zeroed_value_scalar_ok.elisa \
-        zeroed_value_trusted_reference_ok.elisa; do
+        zeroed_value_trusted_reference_ok.elisa \
+        zeroed_value_assignment_ok.elisa; do
         run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/$repro"
         if [[ -x "$STAGE0" ]]; then
             run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/$repro"
@@ -479,4 +493,4 @@ for level in 0 2; do
     done
 done
 
-echo "zeroed reference smoke OK: invalid non-null references reject across direct, aliased, aggregate, and generic storage; qualified non-null handles and borrowed views reject; zeroed call arguments and conditional values reject; nullable references, handles, views, and reference-bearing aggregates return 42 at -O0/-O2"
+echo "zeroed reference smoke OK: invalid non-null references reject across direct, aliased, aggregate, and generic storage; qualified non-null handles and borrowed views reject; zeroed call arguments, conditional values, struct literal fields, and assigned places reject; nullable references, handles, views, and reference-bearing aggregates return 42 at -O0/-O2"
