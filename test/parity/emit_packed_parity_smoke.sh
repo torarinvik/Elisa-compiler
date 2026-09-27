@@ -26,14 +26,22 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 same=0
 differ=0
+rejected=0
 
 exact() {
     local label="$1"; local src="$2"
     # STDOUT only: the report goes to stdout and semantic WARNINGS to stderr, so folding
     # them together made three corpus fixtures "diverge" on stage0's own warning text.
     "$ELISACORE_BIN" -emit packed "$src" </dev/null > "$WORK/s0" 2>/dev/null || { echo "SKIP $label (stage0 declined)"; return; }
+    # stage0's `-emit packed` skips the safety analyses, so a repro NEGATIVE reaches the report
+    # there while stage1 rejects it. This gate compares LAYOUT REPORTS: the defect it owns is
+    # stage1 declining `-emit packed` for a program its own full compile accepts. Whether the
+    # program should be accepted at all (stage1's stricter safety verdicts) is gated elsewhere.
     bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit packed -o "$WORK/s1" "$src" >/dev/null 2>&1 || {
-        differ=$((differ + 1)); echo "FAILED $label: stage1 emitted nothing"; return; }
+        if ! bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit obj -o "$WORK/s1.o" "$src" >/dev/null 2>&1; then
+            rejected=$((rejected + 1)); echo "SKIP $label (stage1 rejects the program)"; return
+        fi
+        differ=$((differ + 1)); echo "FAILED $label: stage1 compiles it but emitted no packed report"; return; }
     if cmp -s "$WORK/s0" "$WORK/s1"; then
         same=$((same + 1))
     else
@@ -75,6 +83,6 @@ def main() -> i64:
 EOF
 exact "packed-commons" "$WORK/commons.elisa"
 
-echo "emit_packed parity: $same exact, $differ divergent"
+echo "emit_packed parity: $same exact, $differ divergent, $rejected rejected by stage1"
 [ "$differ" -eq 0 ] || { echo "emit_packed parity FAILED"; exit 1; }
 echo "emit_packed parity OK"
