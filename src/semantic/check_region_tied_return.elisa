@@ -138,7 +138,200 @@ extend Semantic:
                         return sview("", 0, 0)
 
 
-        def rtr_check_returns(statements: darray[Ast::Stmt], ref_params: darray[sview]&, param_regions: darray[sview]&, table: lmut SymbolTable) -> void:
+        # A parameter is a direct reference parameter only when the reference operator is
+        # outside its container/aggregate type. This matters for `darray[T]&`: the pointee
+        # itself is a heap-backed type, but the parameter still borrows the caller's value.
+        def rtr_type_has_outer_reference(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == TokenKind.Ampersand
+                        return rtr_type_has_outer_reference(operand) if operator == TokenKind.Mutable or operator == TokenKind.Question
+                        return false
+                    Expr.Paren(inner, line):
+                        return rtr_type_has_outer_reference(inner)
+                    _:
+                        return false
+
+
+        # True when a container's ELEMENT type can retain a reference. Peel only wrappers
+        # around the container itself; a reference to a scalar darray (`darray[i64]&`) is
+        # not confused with a darray whose elements are references (`darray[i64&]`).
+        def rtr_type_contains_reference(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        return operator == TokenKind.Ampersand or rtr_type_contains_reference(operand)
+                    Expr.Index(object, argument, line):
+                        return rtr_type_contains_reference(argument)
+                    Expr.IndexN(object, arguments, line):
+                        return any argument in arguments where rtr_type_contains_reference(argument)
+                    Expr.Paren(inner, line):
+                        return rtr_type_contains_reference(inner)
+                    _:
+                        return false
+
+
+        def rtr_type_has_reference_element(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        if operator == TokenKind.Ampersand:
+                            return rtr_type_contains_reference(operand)
+                        return rtr_type_has_reference_element(operand) if operator == TokenKind.Mutable or operator == TokenKind.Question
+                        return false
+                    Expr.Index(object, argument, line):
+                        return rtr_type_contains_reference(argument)
+                    Expr.IndexN(object, arguments, line):
+                        return any argument in arguments where rtr_type_contains_reference(argument)
+                    Expr.Paren(inner, line):
+                        return rtr_type_has_reference_element(inner)
+                    _:
+                        return false
+
+
+        def rtr_expression_root(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Field(object, field, line) | Expr.Index(object, index, line) | Expr.Slice(object, low, high, line):
+                        return rtr_expression_root(object)
+                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line):
+                        return rtr_expression_root(operand)
+                    _:
+                        return sview("", 0, 0)
+
+
+        def rtr_param_has_reference_element(parameters: darray[Ast::ParamDecl]&, name: sview) -> bool:
+            can Abort.Panic:
+                for parameter in parameters:
+                    return rtr_type_has_reference_element(parameter.type_expression) if parameter.name == name
+                return false
+
+
+        def rtr_mutator_stores_argument(method: sview, argument_index: usize, argument_count: usize) -> bool:
+            can Abort.Panic:
+                return when method:
+                    "push" | "push_back" | "push_front" | "extend" | "append" | "append_many" | "add" -> argument_index == 0
+                    "insert" | "set" -> argument_count > 0 and argument_index + 1 == argument_count
+                    "put" | "get_or_insert" -> true
+                    _ -> false
+
+
+        def rtr_record_stored_borrow(target: sview, source: sview, targets: mutable darray[sview]&, sources: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if target == "" or source == ""
+                for index in 0..<targets.count:
+                    return if targets[index] == target and sources[index] == source
+                targets.push(target)
+                sources.push(source)
+
+
+        def rtr_collect_stored_borrows_expr(expression: Ast::Expr, parameters: darray[Ast::ParamDecl]&, ref_params: darray[sview]&, targets: mutable darray[sview]&, sources: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        match callee:
+                            Expr.Field(receiver, method, field_line):
+                                target: sview = rtr_expression_root(receiver)
+                                if rtr_param_has_reference_element(parameters, target):
+                                    for argument_index in 0..<arguments.count:
+                                        continue if not rtr_mutator_stores_argument(method, argument_index, arguments.count)
+                                        source: sview = rtr_return_root(arguments[argument_index], ref_params, true)
+                                        rtr_record_stored_borrow(target, source, targets, sources)
+                            _:
+                                pass
+                        rtr_collect_stored_borrows_expr(callee, parameters, ref_params, targets, sources)
+                        for argument in arguments |targets, sources|:
+                            rtr_collect_stored_borrows_expr(argument, parameters, ref_params, targets, sources)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        for argument in arguments |targets, sources|:
+                            rtr_collect_stored_borrows_expr(argument, parameters, ref_params, targets, sources)
+                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line) | Expr.RegionNew(operand, region, line):
+                        rtr_collect_stored_borrows_expr(operand, parameters, ref_params, targets, sources)
+                    Expr.Binary(left, operator, right, line):
+                        rtr_collect_stored_borrows_expr(left, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(right, parameters, ref_params, targets, sources)
+                    Expr.Field(object, field, line):
+                        rtr_collect_stored_borrows_expr(object, parameters, ref_params, targets, sources)
+                    Expr.Index(object, index, line):
+                        rtr_collect_stored_borrows_expr(object, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(index, parameters, ref_params, targets, sources)
+                    Expr.Slice(object, low, high, line):
+                        rtr_collect_stored_borrows_expr(object, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(low, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(high, parameters, ref_params, targets, sources)
+                    Expr.IndexN(object, indices, line):
+                        rtr_collect_stored_borrows_expr(object, parameters, ref_params, targets, sources)
+                        for index in indices |targets, sources|:
+                            rtr_collect_stored_borrows_expr(index, parameters, ref_params, targets, sources)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |targets, sources|:
+                            rtr_collect_stored_borrows_expr(element, parameters, ref_params, targets, sources)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |targets, sources|:
+                            rtr_collect_stored_borrows_expr(entry.key, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_expr(entry.value, parameters, ref_params, targets, sources)
+                    Expr.Construct(head, fields, line) | Expr.RecordUpdate(head, fields, line):
+                        rtr_collect_stored_borrows_expr(head, parameters, ref_params, targets, sources)
+                        for field in fields |targets, sources|:
+                            rtr_collect_stored_borrows_expr(field.value, parameters, ref_params, targets, sources)
+                    Expr.If(condition, then_value, else_value, line):
+                        rtr_collect_stored_borrows_expr(condition, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(then_value, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(else_value, parameters, ref_params, targets, sources)
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        rtr_collect_stored_borrows_expr(scrutinee, parameters, ref_params, targets, sources)
+                        for arm in arms |targets, sources|:
+                            rtr_collect_stored_borrows_expr(arm.guard, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_statements(arm.body, parameters, ref_params, targets, sources)
+                    Expr.Block(block_statements, value, captures, line):
+                        rtr_collect_stored_borrows_statements(block_statements, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(value, parameters, ref_params, targets, sources)
+                    Expr.Comprehension(variable, iterable, condition, body, line):
+                        rtr_collect_stored_borrows_expr(iterable, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(condition, parameters, ref_params, targets, sources)
+                        rtr_collect_stored_borrows_expr(body, parameters, ref_params, targets, sources)
+                    _:
+                        pass
+
+
+        def rtr_collect_stored_borrows_statements(statements: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl]&, ref_params: darray[sview]&, targets: mutable darray[sview]&, sources: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |targets, sources|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            rtr_collect_stored_borrows_expr(value, parameters, ref_params, targets, sources)
+                        Stmt.Assign(target, operator, value, line):
+                            rtr_collect_stored_borrows_expr(target, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_expr(value, parameters, ref_params, targets, sources)
+                        Stmt.Expr(expression, line):
+                            rtr_collect_stored_borrows_expr(expression, parameters, ref_params, targets, sources)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                rtr_collect_stored_borrows_expr(returned, parameters, ref_params, targets, sources)
+                        Stmt.If(condition, then_body, else_body, line):
+                            rtr_collect_stored_borrows_expr(condition, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_statements(then_body, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_statements(else_body, parameters, ref_params, targets, sources)
+                        Stmt.While(condition, body, line):
+                            rtr_collect_stored_borrows_expr(condition, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_statements(body, parameters, ref_params, targets, sources)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            rtr_collect_stored_borrows_expr(iterable, parameters, ref_params, targets, sources)
+                            rtr_collect_stored_borrows_statements(body, parameters, ref_params, targets, sources)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            rtr_collect_stored_borrows_statements(body, parameters, ref_params, targets, sources)
+                        Stmt.Match(scrutinee, arms, line):
+                            rtr_collect_stored_borrows_expr(scrutinee, parameters, ref_params, targets, sources)
+                            for arm in arms |targets, sources|:
+                                rtr_collect_stored_borrows_statements(arm.body, parameters, ref_params, targets, sources)
+                        _:
+                            pass
+
+
+        def rtr_check_returns(statements: darray[Ast::Stmt], ref_params: darray[sview]&, param_regions: darray[sview]&, return_region: sview, stored_targets: darray[sview]&, stored_sources: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
@@ -153,20 +346,34 @@ extend Semantic:
                                     while probe < ref_params.count |probe, declared, root, ref_params, param_regions|:
                                         declared <- param_regions[probe] if ref_params[probe] == root and declared == ""
                                         probe <- probe + 1
+                                    continue if declared != "" and declared == return_region
                                     # Unannotated references may be forwarded directly, but a
                                     # derived field borrow must preserve its inferred region.
                                     continue if declared == "" and rtr_return_root(returned, ref_params, false) == ""
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionTiedReturn, name: root, line: line.line, expected: declared, actual: ""})
+                                returned_root: sview = rtr_expression_root(returned)
+                                for stored_index in 0..<stored_targets.count |table, stored_targets, stored_sources, returned_root, param_regions, return_region|:
+                                    continue if stored_targets[stored_index] != returned_root
+                                    source_index: mutable usize = 0
+                                    source_found: mutable bool = false
+                                    for parameter_index in 0..<ref_params.count:
+                                        if ref_params[parameter_index] == stored_sources[stored_index]:
+                                            source_index <- parameter_index
+                                            source_found <- true
+                                    continue if not source_found or source_index >= param_regions.count
+                                    source_region: sview = param_regions[source_index]
+                                    continue if source_region != "" and source_region == return_region
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionTiedReturn, name: returned_root, line: line.line, expected: source_region, actual: ""})
                         Stmt.If(condition, then_body, else_body, if_line):
-                            table <- rtr_check_returns(then_body, ref_params, param_regions, table)
-                            table <- rtr_check_returns(else_body, ref_params, param_regions, table)
+                            table <- rtr_check_returns(then_body, ref_params, param_regions, return_region, stored_targets, stored_sources, table)
+                            table <- rtr_check_returns(else_body, ref_params, param_regions, return_region, stored_targets, stored_sources, table)
                         Stmt.While(condition, while_body, while_line):
-                            table <- rtr_check_returns(while_body, ref_params, param_regions, table)
+                            table <- rtr_check_returns(while_body, ref_params, param_regions, return_region, stored_targets, stored_sources, table)
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            table <- rtr_check_returns(block_body, ref_params, param_regions, table)
+                            table <- rtr_check_returns(block_body, ref_params, param_regions, return_region, stored_targets, stored_sources, table)
                         Stmt.Match(scrutinee, arms, match_line):
                             for arm in arms |table| -> table:
-                                table <- rtr_check_returns(arm.body, ref_params, param_regions, table)
+                                table <- rtr_check_returns(arm.body, ref_params, param_regions, return_region, stored_targets, stored_sources, table)
                         _:
                             pass
 
@@ -199,13 +406,16 @@ extend Semantic:
                                     declared_region <- annotation.region if matches and declared_region == ""
                                 # Explicit regions apply even to direct forwarding. Implicit
                                 # typed-reference regions apply only to derived field borrows.
-                                is_ref: bool = not runtime_std and not has_return_region and type_contains_operator(parameter.type_expression, TokenKind.Ampersand) and type_contains_operator(parameter.type_expression, TokenKind.Mutable) and not type_contains_heap(parameter.type_expression) and not rtr_type_has_void_pointee(parameter.type_expression)
+                                is_ref: bool = not runtime_std and rtr_type_has_outer_reference(parameter.type_expression) and not type_contains_operator(parameter.type_expression, TokenKind.Static) and not rtr_type_has_void_pointee(parameter.type_expression)
                                 is_region_source: bool = declared_region != "" and declared_region != return_region
                                 continue if not is_ref and not is_region_source
                                 ref_params.push(parameter.name)
                                 param_regions.push(declared_region)
-                            continue if ref_params.count == 0
-                            table <- rtr_check_returns(body, ref_params, param_regions, table)
+                            if ref_params.count > 0:
+                                stored_targets: mutable darray[sview] = []
+                                stored_sources: mutable darray[sview] = []
+                                rtr_collect_stored_borrows_statements(body, parameters, ref_params, stored_targets, stored_sources)
+                                table <- rtr_check_returns(body, ref_params, param_regions, return_region, stored_targets, stored_sources, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- rtr_walk(module_body, annotations, runtime_std, table)
                         Decl.Scoped(scoped_body, scoped_line):

@@ -465,19 +465,19 @@ EXPECTS=(
     "cannot assign bool to i64"
     "cannot assign bool to i64"
     "internal runtime carrier type \"DynArrayView\" is not supported in user-facing code"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
-    "returning a reference into function-local storage; it dangles once the function returns"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
+    "returning an aggregate or helper result that contains a reference into function-local storage"
 )
 
 total=0
@@ -542,6 +542,10 @@ while [[ "$index" -lt "$num_diagnostics" ]]; do
     run_case "$name" neg "$FIXTURES/$name.neg.elisa" "$expect"
     index=$((index + 1))
 done
+
+echo "-- region_returned_stored_borrow --"
+run_case region_returned_stored_borrow pos "$REPO_ROOT/test/repro/region_returned_stored_borrow.pos.elisa" "cannot be returned with a region-less type"
+run_case region_returned_stored_borrow neg "$REPO_ROOT/test/repro/region_returned_stored_borrow.neg.elisa" "cannot be returned with a region-less type"
 
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
