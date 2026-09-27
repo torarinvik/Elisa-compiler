@@ -56,6 +56,11 @@ for ln in lines:
     res.append(ln)
 print('extern ctx_hash_cstr(s: cstr) -> u64')
 print('extern ctx_hash_u64(value: u64) -> u64')
+# arena.elisa takes the shared region-cache lock (Elisa-core d4ce4c81); its definition
+# lives in elisacore_runtime_atomics.elisa, which this splice omits (raw atomics are
+# trusted only inside elisacore_std), so bind the exported runtime symbols instead.
+print('extern __elisa_arena_cache_lock_acquire() -> void')
+print('extern __elisa_arena_cache_lock_release() -> void')
 print('\n'.join(res))
 print('''$body''')
 PY
