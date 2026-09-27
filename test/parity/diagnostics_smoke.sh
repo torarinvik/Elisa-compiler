@@ -547,6 +547,17 @@ echo "-- region_returned_stored_borrow --"
 run_case region_returned_stored_borrow pos "$REPO_ROOT/test/repro/region_returned_stored_borrow.pos.elisa" "cannot be returned with a region-less type"
 run_case region_returned_stored_borrow neg "$REPO_ROOT/test/repro/region_returned_stored_borrow.neg.elisa" "cannot be returned with a region-less type"
 
+echo "-- view_return_escape --"
+region_return_msg="value escapes its \`in auto:\` scope via return; the inferred region is freed at scope exit"
+for escape_shape in darray binding tail tuple struct_field; do
+    run_case "view_return_escape_$escape_shape" pos "$FIXTURES/view_return_escape_$escape_shape.pos.elisa" "$region_return_msg"
+done
+run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "$region_return_msg"
+run_case local_view_escape_binding pos "$FIXTURES/local_view_escape_binding.pos.elisa" "view of local \"v\" escapes via return; the array dies at scope exit"
+run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "escapes via return; the array dies at scope exit"
+run_case return_ref_local_in_block pos "$FIXTURES/return_ref_local_in_block.pos.elisa" "returning a reference into function-local storage"
+run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "returning a reference into function-local storage"
+
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
 guard_neg="$FIXTURES/shift_match_guards.neg.elisa"

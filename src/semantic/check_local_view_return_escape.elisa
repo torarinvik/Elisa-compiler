@@ -1,17 +1,33 @@
-# A view into a FRAME-LOCAL fixed array RETURNED from the function that owns the frame:
+# A view into FRAME-LOCAL storage RETURNED from the function that owns the frame:
 #
 #     def leak() -> view[i64]:
 #         scratch: mutable i64[4] = zeroed
 #         return scratch[0:2]      # the array dies with the frame; the caller reads dead stack
 #
 # Both compilers accepted this (MEASURED 2026-09-07) and the program read a dead frame -- a
-# memory-unsafe SILENT miscompile no gate could see. Sound subset rejected here: the declared
-# return type is `view[...]`, and the returned value is a slice (through parentheses, or either
-# arm of an `if`) of a bare name declared in this function as a `T[N]`/`array[T, N]` local or a
-# by-VALUE `T[N]` parameter (a copy that lives in the callee's frame). A ref parameter (`T[N]&`)
-# is caller-owned and stays allowed, as does any global. A view bound to a local first
-# (`v = scratch[0:2]; return v`) is a second-order escape this check does not see. Every finding
-# is a genuine dangling view.
+# memory-unsafe SILENT miscompile no gate could see. The roots:
+#
+#   * a `T[N]`/`array[T, N]` local or a by-VALUE `T[N]` parameter (a copy that lives in the
+#     callee's frame) -- LocalViewEscapesReturn;
+#   * a by-value `darray[T]`/`dstr` local: its buffer lives in this call's inferred region, freed
+#     on return -- AutoRegionReturnEscape, stage0's `via return` region escape (MEASURED
+#     2026-09-28: stage0 rejected s1e/r2/r6/n4/n9, stage1 accepted and read freed memory).
+#
+# A value escapes when it is a slice of a root or of a view already carrying one, or a bare name
+# of such a view, through parentheses, either arm of an `if`, a struct-literal field or a tuple
+# element (`Holder{v: xs[0:2]}` dangles exactly like `xs[0:2]`). Views are tracked
+# flow-insensitively: a name ever bound to a dangling view is dangling (stage0 rejects the
+# rebind-to-param shape n2 too). A trailing expression statement is a return.
+#
+# Sound-subset boundaries (every finding is a genuine dangling view; misses are fail-open):
+#   * ref parameters (`T[N]&`, `darray[T]&`), by-value darray parameters and globals are
+#     caller-owned and stay allowed;
+#   * a name declared more than once with differing root-ness is skipped;
+#   * container roots are dropped when the function may ADOPT its caller's region (stage0's
+#     region-polymorphism): any returned leaf that is not a slice, a non-container name or a
+#     literal -- a returned container, a call, a fresh literal -- or an `Arena` parameter. There
+#     the buffer lives in the caller's arena and the view is sound (n10: `Both{items: xs,
+#     v: xs[0:2]}` runs correctly under both compilers).
 extend Semantic:
     private:
         # The declared type behind `mutable` and parentheses.
@@ -38,6 +54,27 @@ extend Semantic:
                     _:
                         return false
 
+        # A by-value `darray[T]` / `dstr` annotation (optionally `mutable`). A ref, a region
+        # qualifier or any other shape is not one (rvc_value_type answers Absent).
+        def lvre_container_value(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if rvc_is_absent(rvc_value_type(type_expression))
+                head: sview = dd_type_head_arg(type_expression).head
+                return head == "darray" or head == "dstr"
+
+        # An `Arena` parameter (by value or by ref): the function manages its own allocation.
+        def lvre_arena_param(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                pointee: Ast::Expr = rvc_ref_pointee(type_expression)
+                named: Ast::Expr = type_expression if rvc_is_absent(pointee) else pointee
+                return dd_type_head_arg(named).head == "Arena"
+
+        def lvre_has(names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                for entry in names:
+                    true return if entry == name
+                return false
+
         # The bare name a slice is taken of, through parentheses; "" for anything else.
         def lvre_slice_root(object: Ast::Expr) -> sview:
             can Memory.Allocate, Abort.Panic:
@@ -49,67 +86,210 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        # The frame array a returned VALUE is a slice of, if any: `scratch[0:2]`, `(scratch[0:2])`,
-        # either arm of `a[..] if c else b[..]` (the first escaping arm is named).
-        def lvre_escaping_name(value: Ast::Expr, names: darray[sview]&) -> (name: sview, pos: Ast::Pos, found: bool):
+        # The root a VALUE carries a dangling view of, if any: a slice of a frame array
+        # (`arrays`), of a container local (`containers`) or of a dangling view (`array_views` /
+        # `container_views`, by the root they carry); a view
+        # named bare; through parens, `if` arms, struct-literal fields and tuple elements (the
+        # first escaping one is named). `container` says the root is region-, not frame-owned.
+        def lvre_escaping_name(value: Ast::Expr, arrays: darray[sview]&, containers: darray[sview]&, array_views: darray[sview]&, container_views: darray[sview]&) -> (name: sview, pos: Ast::Pos, found: bool, container: bool):
             can Memory.Allocate, Abort.Panic:
                 match value:
                     Expr.Paren(inner, paren_pos):
-                        return lvre_escaping_name(inner, names)
+                        return lvre_escaping_name(inner, arrays, containers, array_views, container_views)
                     Expr.Slice(slice_object, slice_low, slice_high, slice_pos):
                         root: sview = lvre_slice_root(slice_object)
-                        for entry in names:
-                            if entry == root:
-                                return (root, slice_pos, true)
-                        return (sview("", 0, 0), slice_pos, false)
+                        (root, slice_pos, true, false) return if lvre_has(arrays, root)
+                        (root, slice_pos, true, true) return if lvre_has(containers, root)
+                        return lvre_escaping_name(slice_object, arrays, containers, array_views, container_views)
+                    Expr.Ident(name, ident_pos):
+                        (name, ident_pos, true, false) return if lvre_has(array_views, name)
+                        return (name, ident_pos, lvre_has(container_views, name), true)
                     Expr.If(condition, then_value, else_value, if_pos):
-                        then_arm: (name: sview, pos: Ast::Pos, found: bool) = lvre_escaping_name(then_value, names)
-                        return then_arm if then_arm.found else lvre_escaping_name(else_value, names)
+                        then_arm: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(then_value, arrays, containers, array_views, container_views)
+                        return then_arm if then_arm.found else lvre_escaping_name(else_value, arrays, containers, array_views, container_views)
+                    Expr.Construct(construct_type, construct_fields, construct_pos):
+                        for field in construct_fields:
+                            field_escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(field.value, arrays, containers, array_views, container_views)
+                            field_escape return if field_escape.found
+                        return (sview("", 0, 0), construct_pos, false, false)
+                    Expr.Tuple(tuple_elements, tuple_pos):
+                        for element in tuple_elements:
+                            element_escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(element, arrays, containers, array_views, container_views)
+                            element_escape return if element_escape.found
+                        return (sview("", 0, 0), tuple_pos, false, false)
                     _:
-                        return (sview("", 0, 0), Ast::pos_at_line(0), false)
+                        return (sview("", 0, 0), Ast::pos_at_line(0), false, false)
 
-        def lvre_statements(statements: darray[Ast::Stmt], names: darray[sview]&, table: lmut SymbolTable) -> void:
+        # Whether a returned value may make the function ADOPT its caller's region (see header):
+        # true unless every leaf -- through parens, `if` arms, struct-literal fields and tuple
+        # elements -- is a slice, a literal, or a name that is not a container local.
+        def lvre_adopting_value(value: Ast::Expr, containers: darray[sview]&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                # Lexical scoping for free: this list's declarations live in a copy that dies with it.
-                scope_names: mutable darray[sview] = [entry for entry in names]
-                for statement in statements |table, scope_names| -> table:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return lvre_adopting_value(inner, containers)
+                    Expr.Slice(slice_object, slice_low, slice_high, slice_pos):
+                        return false
+                    Expr.Ident(name, ident_pos):
+                        return lvre_has(containers, name)
+                    Expr.IntLit(int_text, int_pos):
+                        return false
+                    Expr.FloatLit(float_text, float_pos):
+                        return false
+                    Expr.StringLit(string_text, string_pos):
+                        return false
+                    Expr.CharLit(char_text, char_pos):
+                        return false
+                    Expr.BoolLit(bool_value, bool_pos):
+                        return false
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        return lvre_adopting_value(then_value, containers) or lvre_adopting_value(else_value, containers)
+                    Expr.Construct(construct_type, construct_fields, construct_pos):
+                        for field in construct_fields:
+                            true return if lvre_adopting_value(field.value, containers)
+                        return false
+                    Expr.Tuple(tuple_elements, tuple_pos):
+                        for element in tuple_elements:
+                            true return if lvre_adopting_value(element, containers)
+                        return false
+                    _:
+                        return true
+
+        # Every declaration in the body, flow-insensitively: `names[i]` is declared with
+        # root-ness `kinds[i]` (0 = not a root, 1 = frame array, 2 = container local). Bindings
+        # (`name: T = value` and `name = value` / `name <- value`) land in `bound`/`values`.
+        def lvre_collect(statements: darray[Ast::Stmt]&, names: mutable darray[sview]&, kinds: mutable darray[u8]&, bound: mutable darray[sview]&, values: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, kinds, bound, values|:
                     match statement:
-                        Stmt.VarDecl(name, type_expression, value, line):
+                        Stmt.VarDecl(name, type_expression, value, decl_pos):
+                            names.push(name)
                             if lvre_frame_array(type_expression):
-                                scope_names.push(name)
-                        Stmt.Return(value, return_pos):
-                            if value is returned:
-                                escape: (name: sview, pos: Ast::Pos, found: bool) = lvre_escaping_name(returned, scope_names)
-                                if escape.found:
-                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalViewEscapesReturn, name: escape.name, line: escape.pos.line, pos: escape.pos, expected: "", actual: ""})
-                        Stmt.Block(kind, clause, binding, body, line):
-                            table <- lvre_statements(body, scope_names, table)
-                        Stmt.If(condition, then_body, else_body, line):
-                            table <- lvre_statements(then_body, scope_names, table)
-                            table <- lvre_statements(else_body, scope_names, table)
-                        Stmt.While(condition, while_body, line):
-                            table <- lvre_statements(while_body, scope_names, table)
-                        Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- lvre_statements(for_body, scope_names, table)
-                        Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |table, scope_names| -> table:
-                                table <- lvre_statements(arm.body, scope_names, table)
+                                kinds.push(1)
+                            else:
+                                kinds.push(2 if lvre_container_value(type_expression) else 0)
+                            bound.push(name)
+                            values.push(value)
+                        Stmt.Assign(target, operator, value, assign_pos):
+                            match target:
+                                Expr.Ident(target_name, target_pos):
+                                    # `name = value` defines an unannotated local: never a root.
+                                    if operator == TokenKind.Assign:
+                                        names.push(target_name)
+                                        kinds.push(0)
+                                    bound.push(target_name)
+                                    values.push(value)
+                                _:
+                                    pass
+                        Stmt.Block(kind, clause, binding, body, block_pos):
+                            lvre_collect(body, names, kinds, bound, values)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            lvre_collect(then_body, names, kinds, bound, values)
+                            lvre_collect(else_body, names, kinds, bound, values)
+                        Stmt.While(condition, while_body, while_pos):
+                            lvre_collect(while_body, names, kinds, bound, values)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            for variable in variables |names, kinds|:
+                                names.push(variable)
+                                kinds.push(0)
+                            lvre_collect(for_body, names, kinds, bound, values)
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            for arm in arms |names, kinds, bound, values|:
+                                lvre_collect(arm.body, names, kinds, bound, values)
                         _:
                             pass
+
+        # Every returned value: `return EXPR` anywhere in the statement tree, plus the function's
+        # trailing expression statement (through a trailing clause block).
+        def lvre_returns(statements: darray[Ast::Stmt]&, is_tail: bool, out: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while statement_index < statements.count |statement_index: usize = 0, out|:
+                    last: bool = is_tail and statement_index + 1 == statements.count
+                    statement: Ast::Stmt = statements[statement_index]
+                    statement_index <- statement_index + 1
+                    match statement:
+                        Stmt.Return(value, return_pos):
+                            if value is returned:
+                                out.push(returned)
+                        Stmt.Expr(expression, expression_pos):
+                            out.push(expression) if last
+                        Stmt.Block(kind, clause, binding, body, block_pos):
+                            lvre_returns(body, last, out)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            lvre_returns(then_body, false, out)
+                            lvre_returns(else_body, false, out)
+                        Stmt.While(condition, while_body, while_pos):
+                            lvre_returns(while_body, false, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            lvre_returns(for_body, false, out)
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            for arm in arms |out|:
+                                lvre_returns(arm.body, false, out)
+                        _:
+                            pass
+
+        # The names whose every declaration has root-ness `kind`.
+        def lvre_roots(names: darray[sview]&, kinds: darray[u8]&, kind: u8) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                roots: mutable darray[sview] = []
+                while probe < names.count |probe: usize = 0, roots|:
+                    if kinds[probe] == kind and not lvre_has(roots, names[probe]):
+                        uniform: mutable bool = true
+                        while other < names.count |other: usize = 0, uniform|:
+                            uniform <- false if names[other] == names[probe] and kinds[other] != kind
+                            other <- other + 1
+                        roots.push(names[probe]) if uniform
+                    probe <- probe + 1
+                return roots
+
+        def lvre_function(parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                kinds: mutable darray[u8] = []
+                bound: mutable darray[sview] = []
+                values: mutable darray[Ast::Expr] = []
+                arena_param: mutable bool = false
+                for parameter in parameters |names, kinds, arena_param|:
+                    names.push(parameter.name)
+                    kinds.push(1 if lvre_frame_array(parameter.type_expression) else 0)
+                    arena_param <- true if lvre_arena_param(parameter.type_expression)
+                lvre_collect(body, names, kinds, bound, values)
+                arrays: darray[sview] = lvre_roots(names, kinds, 1)
+                containers: mutable darray[sview] = lvre_roots(names, kinds, 2)
+                returned: mutable darray[Ast::Expr] = []
+                lvre_returns(body, true, returned)
+                adopting: mutable bool = arena_param
+                for value in returned |adopting|:
+                    adopting <- true if lvre_adopting_value(value, containers)
+                containers <- [] if adopting
+                # Dangling views: a fixpoint over every binding (flow-insensitive).
+                array_views: mutable darray[sview] = []
+                container_views: mutable darray[sview] = []
+                changed: mutable bool = arrays.count > 0 or containers.count > 0
+                while changed |changed, array_views, container_views|:
+                    changed <- false
+                    while index < bound.count |index: usize = 0, changed, array_views, container_views|:
+                        if not lvre_has(array_views, bound[index]) and not lvre_has(container_views, bound[index]):
+                            carried: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(values[index], arrays, containers, array_views, container_views)
+                            if carried.found:
+                                if carried.container:
+                                    container_views.push(bound[index])
+                                else:
+                                    array_views.push(bound[index])
+                                changed <- true
+                        index <- index + 1
+                for value in returned |table| -> table:
+                    escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(value, arrays, containers, array_views, container_views)
+                    if escape.found:
+                        kind: DiagnosticKind = DiagnosticKind.AutoRegionReturnEscape if escape.container else DiagnosticKind.LocalViewEscapesReturn
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: kind, name: escape.name, line: escape.pos.line, pos: escape.pos, expected: "", actual: ""})
 
         def lvre_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            if return_type is declared_return:
-                                head_arg: (head: sview, argument: sview) = dd_type_head_arg(declared_return)
-                                if head_arg.head == "view":
-                                    frame_params: mutable darray[sview] = []
-                                    for parameter in parameters |frame_params|:
-                                        if lvre_frame_array(parameter.type_expression):
-                                            frame_params.push(parameter.name)
-                                    table <- lvre_statements(body, frame_params, table)
+                            table <- lvre_function(parameters, body, table) if return_type is declared_return
                         Decl.Module(module_name, module_body, module_line):
                             table <- lvre_walk(module_body, table)
                         Decl.Scoped(scoped_body, scoped_line):

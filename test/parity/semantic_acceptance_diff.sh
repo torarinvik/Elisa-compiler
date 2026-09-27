@@ -71,6 +71,12 @@ known_stage1_stricter_reason() {
         TestAnalyzePinsRuntimeStage1BuiltinPermissionContracts)
             printf '%s' 'pointer cast requires can\[Unsafe\]|mutable alias requires can\[Unsafe\]|warning: struct .* avoidable padding|warning: call to .* requires can\[Unsafe\]'
             ;;
+        # Stage0 accepts `part: view[i32] = values[1:3]; return part` with `values: i32[4]`
+        # by value: the view points into the callee frame. Linked and run, the caller reads
+        # garbage (rc=1 where 20 is expected), so this is a stage0 hole, not a stage1 bug.
+        TestAnalyzeAcceptsViewAliasForArraySlices)
+            printf '%s' 'view of local "part" escapes via return; the array dies at scope exit'
+            ;;
         *) printf '' ;;
     esac
 }
