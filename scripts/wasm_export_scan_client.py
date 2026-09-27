@@ -335,6 +335,8 @@ def _process_tree_rss_bytes(process: Any) -> int | None:
             return None
         if pid <= 0 or parent < 0 or group <= 0 or rss_kib < 0:
             return None
+        if pid in rows:
+            return None
         if len(rows) >= MAX_PROCESS_SNAPSHOT_ROWS:
             return None
         rows[pid] = (parent, group, rss_kib)

@@ -315,6 +315,17 @@ class WasmExportScanClientTests(unittest.TestCase):
         ):
             self.assertIsNone(_process_tree_rss_bytes(process))
 
+    def test_rss_sampler_fails_closed_on_duplicate_process_ids(self) -> None:
+        process = SimpleNamespace(pid=100)
+        # Overwriting the first row with a lower RSS value would undercount the
+        # scanner unless duplicate identities invalidate the whole snapshot.
+        snapshot = "100 1 100 524288\n100 1 100 0\n"
+        with patch(
+            "scripts.wasm_export_scan_client._read_process_snapshot",
+            return_value=snapshot,
+        ):
+            self.assertIsNone(_process_tree_rss_bytes(process))
+
     def test_rss_sampler_stops_when_process_snapshot_exceeds_byte_limit(self) -> None:
         read_fd, write_fd = os.pipe()
         try:
