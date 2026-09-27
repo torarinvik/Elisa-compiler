@@ -23,7 +23,7 @@ for compiler in "${compilers[@]}"; do
             "$compiler" -emit llvm "-O$level" -o "$WORK/valid.ll" "$ROOT/test/repro/$repro.elisa"
             "${ELISA_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/valid.ll"
         done
-        for negative in enum_module_alias_wrong_owner enum_module_nested_wrong_owner enum_module_alias_chained_wrong_owner enum_module_ancestor_wrong_owner enum_module_ancestor_const_wrong_owner enum_module_ancestor_const_wrong_width enum_module_ancestor_const_invalid_literal enum_module_ancestor_const_invalid_cast enum_module_wrong_payload_pattern enum_module_wrong_payload_pattern_expr enum_module_wrong_nested_payload_pattern enum_module_wrong_payload_is_pattern; do
+        for negative in enum_module_alias_wrong_owner enum_module_nested_wrong_owner enum_module_alias_chained_wrong_owner enum_module_ancestor_wrong_owner enum_module_ancestor_const_wrong_owner enum_module_ancestor_const_wrong_width enum_module_ancestor_const_invalid_literal enum_module_ancestor_const_negative_literal enum_module_ancestor_const_invalid_cast enum_module_wrong_payload_pattern enum_module_wrong_payload_pattern_expr enum_module_wrong_nested_payload_pattern enum_module_wrong_payload_is_pattern; do
             for mode in llvm obj; do
                 output="$WORK/wrong-owner.$mode"
                 if "$compiler" -emit "$mode" "-O$level" -o "$output" "$ROOT/test/repro/$negative.elisa" > "$WORK/wrong-owner.log" 2>&1; then
