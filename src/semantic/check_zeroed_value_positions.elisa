@@ -1,0 +1,347 @@
+# `zeroed` reaching a typed VALUE position other than a whole local/global initializer
+# (stage0 analyzeValueExpr): a call argument, or a branch of a conditional value that
+# initializes a binding or a return. A declaration may stage its initialization (the
+# uninitialized-read check tracks that); these positions cannot, because the zero bit
+# pattern IS the value the callee or binding receives. Every representation that forbids
+# zero — non-null references, `sview`, `cstr`, handles, and aggregates carrying one — is
+# rejected at the `zeroed` itself, sharing the declaration check's representation walk.
+# Callees resolve lexically (the innermost owner declaring a function of that name);
+# `recv.f(...)` considers every function or method named `f`, and a candidate that forbids
+# zero rejects. Calls that resolve to no declaration (function values, `using`-aliased
+# modules) stay outside this check.
+extend Semantic:
+    private:
+        # Whether VALUE is `zeroed` or a conditional/parenthesized value one of whose
+        # results is; FOUND receives that `zeroed` node for the diagnostic span.
+        def zeroed_value_reach(value: Ast::Expr, found: mutable Ast::Expr&) -> bool:
+            can Abort.Panic:
+                match value:
+                    Expr.Ident(name, _):
+                        false return if name != "zeroed"
+                        found <- value
+                        return true
+                    Expr.Paren(inner, _):
+                        return zeroed_value_reach(inner, found)
+                    Expr.If(condition, then_expr, else_expr, _):
+                        true return if zeroed_value_reach(then_expr, found)
+                        return zeroed_value_reach(else_expr, found)
+                    _:
+                        return false
+
+        # The zero-forbidding family of TYPE_EXPRESSION, or "" when zero is a valid value.
+        # Inside an Unsafe.PointerCast grant only the unconditional view invariant applies.
+        def zeroed_value_family(type_expression: Ast::Expr, generic_names: darray[sview]&, generic_values: darray[Ast::Expr]&, generic_owners: darray[sview]&, function_line: u32, owner: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], allow_invalid: bool, table: SymbolTable&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                view_visited: mutable darray[sview] = []
+                view_field: mutable sview = ""
+                "sview with valid backing" return if zeroed_type_expr_contains_nonnull_ref(type_expression, alias_names, alias_values, view_visited, view_field, table, declarations, alias_declarations, owner, generic_names, generic_values, generic_owners, function_line, 0, true)
+                "" return if allow_invalid
+                reference_visited: mutable darray[sview] = []
+                reference_field: mutable sview = ""
+                "non-null reference" return if zeroed_type_expr_contains_nonnull_ref(type_expression, alias_names, alias_values, reference_visited, reference_field, table, declarations, alias_declarations, owner, generic_names, generic_values, generic_owners, function_line, 0, false)
+                substituted: mutable Ast::Expr = type_expression
+                if type_expression is Expr.Ident(parameter_name, _):
+                    for mapping_index in 0..<generic_names.count |substituted|:
+                        substituted <- generic_values[mapping_index] if generic_names[mapping_index] == parameter_name
+                "C string or handle" return if zeroed_invalid_type_via_alias(substituted, alias_names, alias_values, declarations, alias_declarations, owner, table)
+                return ""
+
+        # An extern parameter keeps only its compact ABI shape.
+        def zeroed_extern_param_family(param: Ast::ExternParam&, allow_invalid: bool) -> sview:
+            can Abort.Panic:
+                "" return if param.optional
+                "sview with valid backing" return if param.type_name == "sview" and not param.is_ref
+                "" return if allow_invalid
+                "non-null reference" return if param.is_ref
+                "C string or handle" return if param.type_name == "cstr"
+                return ""
+
+        def zeroed_push_value_diagnostic(name: sview, family: sview, found: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                position: Ast::Pos = Ast::expr_pos(found)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InvalidZeroedValue, name: name, pos: position, line: position.line, expected: family, actual: "zeroed"})
+
+        # The byte length of CURRENT_MODULE's parent owner prefix (`A::B` -> `A`, `A` -> "").
+        def zeroed_parent_prefix(current_module: sview, prefix_length: usize) -> usize:
+            can Abort.Panic:
+                search_offset: mutable usize = prefix_length
+                while search_offset >= 2.usize() |search_offset|:
+                    return search_offset - 2.usize() if sview_at(current_module, search_offset - 2.usize()) == ':' and sview_at(current_module, search_offset - 1.usize()) == ':'
+                    search_offset <- search_offset - 1.usize()
+                return 0
+
+        # Functions and externs named NAME. Mode 0: declared directly in WANTED_OWNER;
+        # mode 1: in any owner; mode 2: in the owner MODULE_PATH names relative to the first
+        # PREFIX_LENGTH bytes of CURRENT_MODULE.
+        def zeroed_collect_callees(declarations: darray[Ast::Decl], walk_owner: sview, name: sview, mode: u8, wanted_owner: sview, current_module: sview, prefix_length: usize, module_path: darray[sview]&, callees: mutable darray[Ast::Decl]&, callee_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |callees, callee_owners|:
+                    match declaration:
+                        Decl.Func(function_name, _, _, _, _, _, _):
+                            if function_name == name and zeroed_callee_owner_matches(walk_owner, mode, wanted_owner, current_module, prefix_length, module_path):
+                                callees.push(declaration)
+                                callee_owners.push(walk_owner)
+                        Decl.Extern(extern_name, _, _, _, _, _, _, _):
+                            if extern_name == name and zeroed_callee_owner_matches(walk_owner, mode, wanted_owner, current_module, prefix_length, module_path):
+                                callees.push(declaration)
+                                callee_owners.push(walk_owner)
+                        Decl.Module(module_name, module_body, _):
+                            zeroed_collect_callees(module_body, module_name, name, mode, wanted_owner, current_module, prefix_length, module_path, callees, callee_owners)
+                        Decl.Scoped(scoped_body, _):
+                            zeroed_collect_callees(scoped_body, walk_owner, name, mode, wanted_owner, current_module, prefix_length, module_path, callees, callee_owners)
+                        _:
+                            pass
+
+        def zeroed_callee_owner_matches(walk_owner: sview, mode: u8, wanted_owner: sview, current_module: sview, prefix_length: usize, module_path: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if mode == 1
+                return walk_owner == wanted_owner if mode == 0
+                false return if walk_owner == ""
+                return zeroed_qualified_module_name_matches_relative_path(walk_owner, current_module, prefix_length, module_path)
+
+        def zeroed_resolve_callees(callee: Ast::Expr, current_module: sview, alias_declarations: darray[Ast::Decl], callees: mutable darray[Ast::Decl]&, callee_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                no_path: darray[sview] = []
+                match callee:
+                    Expr.Ident(name, _):
+                        prefix_length: mutable usize = sview_len(current_module)
+                        while callees.count == 0 |prefix_length, callees, callee_owners|:
+                            owner: sview = string_view_slice(current_module, 0, prefix_length.i64()) if prefix_length > 0 else ""
+                            zeroed_collect_callees(alias_declarations, "", name, 0, owner, current_module, 0, no_path, callees, callee_owners)
+                            break if prefix_length == 0
+                            prefix_length <- zeroed_parent_prefix(current_module, prefix_length)
+                    Expr.Field(_, name, _):
+                        zeroed_collect_callees(alias_declarations, "", name, 1, "", current_module, 0, no_path, callees, callee_owners)
+                    Expr.Scope(base, name, _):
+                        module_path: mutable darray[sview] = []
+                        return if not zeroed_collect_qualified_type_path(base, module_path)
+                        prefix_length: mutable usize = sview_len(current_module)
+                        while callees.count == 0 |prefix_length, callees, callee_owners|:
+                            zeroed_collect_callees(alias_declarations, "", name, 2, "", current_module, prefix_length, module_path, callees, callee_owners)
+                            break if prefix_length == 0
+                            prefix_length <- zeroed_parent_prefix(current_module, prefix_length)
+                    _:
+                        pass
+
+        # The parameter a positional or labelled argument binds, or PARAM_COUNT when none.
+        def zeroed_bound_param_index(position: usize, label: sview, param_count: usize, param_names: darray[sview]&) -> usize:
+            can Abort.Panic:
+                return position if label == ""
+                for candidate_index in 0..<param_names.count:
+                    candidate_index return if param_names[candidate_index] == label
+                return param_count
+
+        def zeroed_check_call(callee: Ast::Expr, arguments: darray[Ast::Expr], argument_names: darray[sview], current_module: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, allow_invalid: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                any_zeroed: mutable bool = false
+                probe: mutable Ast::Expr = callee
+                for argument in arguments |any_zeroed, probe|:
+                    any_zeroed <- true if zeroed_value_reach(argument, probe)
+                return if not any_zeroed
+                # `f[T](...)`: explicit type arguments substitute the callee's generics.
+                target: mutable Ast::Expr = callee
+                type_arguments: mutable darray[Ast::Expr] = []
+                match callee:
+                    Expr.Index(head, type_argument, _):
+                        target <- head
+                        type_arguments.push(type_argument)
+                    Expr.IndexN(head, head_arguments, _):
+                        target <- head
+                        type_arguments.extend(head_arguments)
+                    _:
+                        pass
+                receiver_shift: mutable usize = 0
+                if target is Expr.Field(_, _, _):
+                    receiver_shift <- 1
+                callees: mutable darray[Ast::Decl] = []
+                callee_owners: mutable darray[sview] = []
+                zeroed_resolve_callees(target, current_module, alias_declarations, callees, callee_owners)
+                return if callees.count == 0
+                for argument_index in 0..<arguments.count |table|:
+                    found: mutable Ast::Expr = arguments[argument_index]
+                    continue if not zeroed_value_reach(arguments[argument_index], found)
+                    label: sview = argument_names[argument_index] if argument_index < argument_names.count else ""
+                    reported: mutable bool = false
+                    for callee_index in 0..<callees.count |table, reported|:
+                        continue if reported
+                        match callees[callee_index]:
+                            Decl.Func(function_name, params, _, _, _, _, function_pos):
+                                param_names: mutable darray[sview] = []
+                                param_names.extend([param.name for param in params])
+                                param_index: usize = zeroed_bound_param_index(argument_index + receiver_shift, label, params.count, param_names)
+                                if param_index < params.count:
+                                    generic_names: mutable darray[sview] = []
+                                    generic_values: mutable darray[Ast::Expr] = []
+                                    generic_owners: mutable darray[sview] = []
+                                    for generic_index in 0..<table.generic_param_lines.count |generic_names, generic_values, generic_owners|:
+                                        if table.generic_param_lines[generic_index] == function_pos.line and generic_names.count < type_arguments.count:
+                                            generic_values.push(type_arguments[generic_names.count])
+                                            generic_names.push(table.generic_param_names[generic_index])
+                                            generic_owners.push(current_module)
+                                    family: sview = zeroed_value_family(params[param_index].type_expression, generic_names, generic_values, generic_owners, function_pos.line, callee_owners[callee_index], alias_names, alias_values, declarations, alias_declarations, allow_invalid, table)
+                                    if family != "":
+                                        table <- zeroed_push_value_diagnostic(params[param_index].name, family, found, table)
+                                        reported <- true
+                            Decl.Extern(extern_name, param_start, arity, _, _, _, _, _):
+                                param_names: mutable darray[sview] = []
+                                for param_offset in 0..<arity.usize() |param_names|:
+                                    param_names.push(extern_params[param_start.usize() + param_offset].name)
+                                param_index: usize = zeroed_bound_param_index(argument_index + receiver_shift, label, arity.usize(), param_names)
+                                if param_index < arity.usize():
+                                    param: Ast::ExternParam& = &extern_params[param_start.usize() + param_index]
+                                    family: sview = zeroed_extern_param_family(param, allow_invalid)
+                                    if family != "":
+                                        table <- zeroed_push_value_diagnostic(param.name, family, found, table)
+                                        reported <- true
+                            _:
+                                pass
+
+        # A declared local, global, or return whose value is a conditional with a `zeroed`
+        # result. A WHOLE `zeroed` initializer belongs to the declaration checks.
+        def zeroed_value_conditional(name: sview, type_expression: Ast::Expr, value: Ast::Expr, function_line: u32, current_module: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], allow_invalid: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if zeroed_value_is_zeroed(value)
+                return if (type_expression is Expr.Absent) or (type_expression is Expr.Invalid)
+                found: mutable Ast::Expr = value
+                return if not zeroed_value_reach(value, found)
+                no_generic_names: darray[sview] = []
+                no_generic_values: darray[Ast::Expr] = []
+                no_generic_owners: darray[sview] = []
+                family: sview = zeroed_value_family(type_expression, no_generic_names, no_generic_values, no_generic_owners, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, allow_invalid, table)
+                table <- zeroed_push_value_diagnostic(name, family, found, table) if family != ""
+
+        def zeroed_value_arms(arms: darray[Ast::MatchArm], return_type: Ast::Expr?, function_line: u32, current_module: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, allow_invalid: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |table|:
+                    table <- zeroed_value_expression(arm.guard, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    table <- zeroed_value_statements(arm.body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+
+        def zeroed_value_expressions(expressions: darray[Ast::Expr], return_type: Ast::Expr?, function_line: u32, current_module: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, allow_invalid: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for expression in expressions |table|:
+                    table <- zeroed_value_expression(expression, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+
+        def zeroed_value_expression(expression: Ast::Expr, return_type: Ast::Expr?, function_line: u32, current_module: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, allow_invalid: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, _):
+                        table <- zeroed_check_call(callee, arguments, argument_names, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(callee, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expressions(arguments, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                        table <- zeroed_value_expressions(arguments, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Field(object, _, _):
+                        table <- zeroed_value_expression(object, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Index(object, index, _):
+                        table <- zeroed_value_expression(object, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(index, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Slice(object, low, high, _):
+                        table <- zeroed_value_expression(object, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(low, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(high, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.IndexN(object, arguments, _):
+                        table <- zeroed_value_expression(object, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expressions(arguments, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Binary(left, _, right, _):
+                        table <- zeroed_value_expression(left, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(right, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.Paren(operand, _):
+                        table <- zeroed_value_expression(operand, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.RegionNew(operand, _, _):
+                        table <- zeroed_value_expression(operand, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        table <- zeroed_value_expressions(elements, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table|:
+                            table <- zeroed_value_expression(entry.key, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_expression(entry.value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |table|:
+                            table <- zeroed_value_expression(field.value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- zeroed_value_expression(base, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        for field in fields |table|:
+                            table <- zeroed_value_expression(field.value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.If(condition, then_expr, else_expr, _):
+                        table <- zeroed_value_expression(condition, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(then_expr, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(else_expr, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        table <- zeroed_value_expression(scrutinee, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_arms(arms, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Comprehension(_, iterable, condition, body, _):
+                        table <- zeroed_value_expression(iterable, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(condition, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.GetElse(guarded, recovery, _):
+                        table <- zeroed_value_expression(guarded, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_statements(recovery, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Lambda(_, body, _):
+                        # A lambda's `return` answers the lambda, whose result type is not declared here.
+                        lambda_return: Ast::Expr? = null
+                        table <- zeroed_value_statements(body, lambda_return, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    Expr.Block(statements, value, _, _):
+                        table <- zeroed_value_statements(statements, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        table <- zeroed_value_expression(value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                    _:
+                        pass
+
+        def zeroed_value_statements(statements: darray[Ast::Stmt], return_type: Ast::Expr?, function_line: u32, current_module: sview, alias_names: darray[sview]&, alias_values: darray[Ast::Expr]&, declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam]&, allow_invalid: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            table <- zeroed_value_expression(expression, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.VarDecl(name, type_expression, value, _):
+                            table <- zeroed_value_conditional(name, type_expression, value, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, allow_invalid, table)
+                            table <- zeroed_value_expression(value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.Assign(target, _, value, _):
+                            table <- zeroed_value_expression(target, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_expression(value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.If(condition, then_body, else_body, _):
+                            table <- zeroed_value_expression(condition, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_statements(then_body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_statements(else_body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.While(condition, body, _):
+                            table <- zeroed_value_expression(condition, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_statements(body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.For(_, _, iterable, body, _):
+                            table <- zeroed_value_expression(iterable, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_statements(body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.Return(value, _):
+                            if value is returned_value:
+                                if return_type is expected_return:
+                                    table <- zeroed_value_conditional("return", expected_return, returned_value, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, allow_invalid, table)
+                                table <- zeroed_value_expression(returned_value, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.Match(scrutinee, arms, _):
+                            table <- zeroed_value_expression(scrutinee, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                            table <- zeroed_value_arms(arms, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        Stmt.Block(kind, clause, _, body, _):
+                            grants_raw_zeroed: bool = (kind == "trusted" or kind == "can") and any grant in clause where grant == "Unsafe.PointerCast"
+                            table <- zeroed_value_statements(body, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid or grants_raw_zeroed, table)
+                        Stmt.Contract(_, expression, _):
+                            table <- zeroed_value_expression(expression, return_type, function_line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, allow_invalid, table)
+                        _:
+                            pass
+
+        def check_zeroed_value_positions(declarations: darray[Ast::Decl], alias_declarations: darray[Ast::Decl], current_module: sview, inherited_alias_names: darray[sview]&, inherited_alias_values: darray[Ast::Expr]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                alias_names: mutable darray[sview] = []
+                alias_values: mutable darray[Ast::Expr] = []
+                alias_names.extend(inherited_alias_names)
+                alias_values.extend(inherited_alias_values)
+                zeroed_collect_type_aliases(declarations, alias_names, alias_values)
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(_, _, return_type, body, _, _, line):
+                            table <- zeroed_value_statements(body, return_type, line.line, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, false, table)
+                        Decl.Module(module_name, module_body, _):
+                            table <- check_zeroed_value_positions(module_body, alias_declarations, module_name, alias_names, alias_values, extern_params, table)
+                        Decl.Scoped(scoped_body, _):
+                            table <- check_zeroed_value_positions(scoped_body, alias_declarations, current_module, alias_names, alias_values, extern_params, table)
+                        Decl.Const(name, type_expression, value, _, _):
+                            table <- zeroed_value_conditional(name, type_expression, value, 0, current_module, alias_names, alias_values, declarations, alias_declarations, false, table)
+                            no_return: Ast::Expr? = null
+                            table <- zeroed_value_expression(value, no_return, 0, current_module, alias_names, alias_values, declarations, alias_declarations, extern_params, false, table)
+                        _:
+                            pass
