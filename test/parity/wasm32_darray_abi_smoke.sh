@@ -44,6 +44,7 @@ grep -Eq 'define .*@mutate\(' "$WORK/stage1.ll"
 # Run both generated modules. The stage0 runtime's POSIX arena backend asks the host
 # for mmap/munmap; this deterministic bump allocator keeps allocations above __heap_base.
 ELISA_WASM_NO_CACHE=1 python3 "$ROOT/scripts/wasm_build.py" \
+    --python-reference-scanner \
     --root "$ROOT" --compiler "$STAGE0" --source "$FIXTURE" \
     --output "$WORK/stage0.wasm" --target wasm32-unknown-wasi
 ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \

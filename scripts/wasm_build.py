@@ -13,13 +13,13 @@ serves as the port's oracle: ``test/parity/wasm_python_parity_smoke.sh`` builds 
 sources both ways and requires every artifact — module included — to be byte-identical.
 Change one side and that smoke tells you the other has drifted.
 
-An explicit `--export-scan-launcher` plus `--export-scan-script` pair can
-exercise the Elisascript scanner for source flattening and export parsing, and
-its flatten-only payload for runtime-source cache hashing. The default remains
-the Python oracle; this opt-in does not replace the packager or establish
-runtime parity. Importing this module and selecting the opt-in path does not
-load the Python scanner module; the legacy import remains lazy for the default
-oracle path and compatibility re-exports.
+An explicit `--export-scan-launcher` plus `--export-scan-script` pair selects
+the Elisascript scanner for source flattening, export parsing, and runtime
+cache hashing. Normal packager runs require that pair (or its environment
+defaults) and never silently fall back to Python. The pinned Python scanner is
+available only through `--python-reference-scanner` for parity-oracle runs and
+compatibility re-exports. Selecting the Elisascript path does not load the
+Python scanner module.
 """
 
 
@@ -212,13 +212,19 @@ def runtime_cache_path(
     *,
     export_scan_launcher: str | None = None,
     export_scan_script: str | None = None,
+    python_reference_scanner: bool = False,
 ) -> Path:
-    if (export_scan_launcher is None) != (export_scan_script is None):
+    if python_reference_scanner:
+        flattened_runtime_source = read_flat_source(runtime_source)
+    elif export_scan_launcher is None and export_scan_script is None:
+        raise WasmBuildError(
+            "Elisascript export scanner is required; configure both scanner paths "
+            "or select --python-reference-scanner for a parity oracle run"
+        )
+    elif (export_scan_launcher is None) != (export_scan_script is None):
         raise WasmBuildError(
             "--export-scan-launcher and --export-scan-script must be supplied together"
         )
-    if export_scan_launcher is None and export_scan_script is None:
-        flattened_runtime_source = read_flat_source(runtime_source)
     elif export_scan_launcher is not None and export_scan_script is not None:
         try:
             flattened_runtime_source = run_flatten_source(
@@ -228,10 +234,6 @@ def runtime_cache_path(
             )
         except WasmExportScanClientError as error:
             raise WasmBuildError(str(error)) from error
-    else:
-        raise WasmBuildError(
-            "--export-scan-launcher and --export-scan-script must be supplied together"
-        )
 
     digest = hashlib.sha256()
     digest.update(target.encode("utf-8"))
@@ -249,16 +251,17 @@ def runtime_cache_path(
 def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
     launcher = getattr(args, "export_scan_launcher", None)
     scanner_script = getattr(args, "export_scan_script", None)
+    if getattr(args, "python_reference_scanner", False):
+        flat_source = read_flat_source(source)
+        return flat_source, parse_exports(flat_source, component=bool(getattr(args, "component_types", [])))
     if (launcher is None) != (scanner_script is None):
         raise WasmBuildError(
             "--export-scan-launcher and --export-scan-script must be supplied together"
         )
     if launcher is None and scanner_script is None:
-        flat_source = read_flat_source(source)
-        return flat_source, parse_exports(flat_source, component=bool(getattr(args, "component_types", [])))
-    if launcher is None or scanner_script is None:
         raise WasmBuildError(
-            "--export-scan-launcher and --export-scan-script must be supplied together"
+            "Elisascript export scanner is required; configure both scanner paths "
+            "or select --python-reference-scanner for a parity oracle run"
         )
     component = bool(getattr(args, "component_types", []))
     try:
@@ -271,11 +274,11 @@ def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[
 def build(args: argparse.Namespace) -> None:
     source = Path(args.source).resolve()
     output = Path(args.output).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
     target = args.target or "wasm32-unknown-unknown"
     if not target.startswith("wasm32"):
         raise WasmBuildError(f"-emit wasm currently targets wasm32 (got {target!r})")
     flat_source, exports = load_export_scan(source, args)
+    output.parent.mkdir(parents=True, exist_ok=True)
     wasm_only = args.wasm_only or bool(args.component_types)
     module_name = output.name[:-5] if output.name.endswith(".wasm") else output.name
     manifest: dict[str, Any] = {
@@ -323,6 +326,7 @@ def build(args: argparse.Namespace) -> None:
                 runtime_source,
                 export_scan_launcher=getattr(args, "export_scan_launcher", None),
                 export_scan_script=getattr(args, "export_scan_script", None),
+                python_reference_scanner=getattr(args, "python_reference_scanner", False),
             )
             if os.environ.get("ELISA_WASM_NO_CACHE"):
                 runtime_object = directory / "component-runtime.o"
@@ -345,6 +349,7 @@ def build(args: argparse.Namespace) -> None:
                 runtime_source,
                 export_scan_launcher=getattr(args, "export_scan_launcher", None),
                 export_scan_script=getattr(args, "export_scan_script", None),
+                python_reference_scanner=getattr(args, "python_reference_scanner", False),
             )
             if os.environ.get("ELISA_WASM_NO_CACHE"):
                 runtime_object = directory / "runtime.o"
@@ -425,7 +430,7 @@ def main() -> int:
         "--export-scan-launcher",
         default=os.environ.get("ELISASCRIPT_PUBLIC_LAUNCHER"),
         help=(
-            "absolute Elisascript launcher path for the opt-in WASM export scan "
+            "required absolute Elisascript launcher path for WASM export scanning "
             "(or ELISASCRIPT_PUBLIC_LAUNCHER)"
         ),
     )
@@ -436,6 +441,11 @@ def main() -> int:
             "absolute path to scripts/wasm_export_scan.elisascript "
             "(or ELISASCRIPT_EXPORT_SCAN_SCRIPT)"
         ),
+    )
+    parser.add_argument(
+        "--python-reference-scanner",
+        action="store_true",
+        help="use the pinned Python scanner explicitly for parity-oracle runs",
     )
     parser.add_argument("--component-type", dest="component_types", action="append", default=[])
     parser.add_argument("--wasm-only", action="store_true")

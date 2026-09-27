@@ -45,6 +45,7 @@ grep -Eq 'zext i32 %[^ ]+ to i64' "$WORK/stage1.ll"
 # Emit and execute both wasm artifacts; WebAssembly validation also rejects the
 # previous `.Lstrlen_bitcast_invalid` trap path when the ABI declarations differ.
 ELISA_WASM_NO_CACHE=1 python3 "$ROOT/scripts/wasm_build.py" \
+    --python-reference-scanner \
     --root "$ROOT" --compiler "$STAGE0" --source "$FIXTURE" \
     --output "$WORK/stage0.wasm" --target wasm32-unknown-wasi
 ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \

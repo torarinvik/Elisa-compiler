@@ -66,6 +66,7 @@ if [[ -n "$STAGE0" && -x "$STAGE0" ]]; then
 
         ELISA_WASM_NO_CACHE=1 \
           python3 "$ROOT/scripts/wasm_build.py" \
+          --python-reference-scanner \
           --root "$ROOT" \
           --compiler "$STAGE0" \
           --source "$source" \

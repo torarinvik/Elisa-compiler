@@ -22,6 +22,7 @@ build_component() {
     local name="$2"
     ELISA_WASM_NO_CACHE=1 \
       python3 "$ROOT/scripts/wasm_build.py" \
+      --python-reference-scanner \
       --root "$ROOT" \
       --compiler "$compiler" \
       --source "$SOURCE" \

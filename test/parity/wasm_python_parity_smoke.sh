@@ -90,6 +90,7 @@ compare_one() {
         status=1; return
     }
     RUN python3 "$ROOT/scripts/wasm_build.py" \
+        --python-reference-scanner \
         --root "$ROOT" --compiler "$WRAPPER" \
         --source "$source" --output "$WORK/python/$label.wasm" \
         >"$WORK/python-$label.log" 2>&1 || {

@@ -97,9 +97,12 @@ imports always win over generated defaults.
 
 `-emit wasm` is the compiler's own: it emits the `wasm32` object, builds the portable
 runtime object, runs the linker, and writes the manifest and the JS/TS facade itself. No
-Python is involved (`scripts/wasm_build.py` remains only as the packager for stage0, which
-has no `-emit wasm` of its own; `test/parity/wasm_python_parity_smoke.sh` holds the two
-byte-identical).
+Python is involved in that compiler path. `scripts/wasm_build.py` remains the packager for
+stage0, which has no `-emit wasm` of its own; normal stage0 runs now require the Elisascript
+scanner, configured with `--export-scan-launcher` and `--export-scan-script` or their
+`ELISASCRIPT_PUBLIC_LAUNCHER` and `ELISASCRIPT_EXPORT_SCAN_SCRIPT` environment variables.
+Use `--python-reference-scanner` only for explicit Python-oracle comparisons such as
+`test/parity/wasm_python_parity_smoke.sh`, which checks the two build paths byte-for-byte.
 
 The compiler locates `wasm-ld` next to `llvm-config`, on `PATH`, or through `WASM_LD` (or the
 explicit `--wasm-ld` option). The current product target is `wasm32-unknown-unknown`; pass

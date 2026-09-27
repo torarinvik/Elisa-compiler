@@ -38,6 +38,7 @@ ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
 "$CLANG" --target=wasm32-unknown-wasi -c "$WORK/stage1.ll" -o "$WORK/stage1-ir.o"
 
 ELISA_WASM_NO_CACHE=1 python3 "$ROOT/scripts/wasm_build.py" \
+    --python-reference-scanner \
     --root "$ROOT" --compiler "$STAGE0" --source "$FIXTURE" \
     --output "$WORK/stage0.wasm" --target wasm32-unknown-wasi
 ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
