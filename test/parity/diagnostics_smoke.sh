@@ -631,6 +631,11 @@ for dmr_case in "9 pop" "12 clear" "14 extend" "16 reserve" "18 push" "20 trunca
 done
 run_case darray_mutable_receiver pos "$dmr_pos" "L26 darray cstr requires a mutable darray receiver (it NUL-terminates in place)"
 run_case darray_mutable_receiver neg "$dmr_neg" "requires a mutable darray receiver"
+dba_pos="$FIXTURES/darray_builtin_arity.pos.elisa"
+for dba_case in "5 push expects 1 argument, got 2" "6 clear expects 0 arguments, got 1" "7 truncate expects 1 argument, got 0" "8 reserve expects 1 argument, got 3" "12 resize expects 1 argument, got 2" "13 extend expects 1 argument, got 0"; do
+    run_case darray_builtin_arity pos "$dba_pos" "L${dba_case%% *} darray ${dba_case#* }"
+done
+run_case darray_builtin_arity neg "$FIXTURES/darray_builtin_arity.neg.elisa" "darray push expects"
 # A `continue` is a second back edge; the neg (consumed then continue, per
 # iteration) must stay silent.
 acs_pos="$FIXTURES/affine_continue_state.pos.elisa"
