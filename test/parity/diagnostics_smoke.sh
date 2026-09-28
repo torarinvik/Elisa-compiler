@@ -621,6 +621,16 @@ atr_neg="$FIXTURES/affine_try_recovery.neg.elisa"
 run_case affine_try_recovery pos "$atr_pos" 'L15 linear handle value "h" declared outside the loop is consumed on every iteration'
 run_case affine_try_recovery pos "$atr_pos" 'L24 linear handle value "h" cannot be used after ownership was consumed'
 run_case affine_try_recovery neg "$atr_neg" "after ownership was consumed"
+# A builtin darray method that writes its receiver (push/pop/extend/reserve/
+# clear/truncate/as_cstr) through a readonly `T&` or onto a non-`mutable` field;
+# matches stage0 line for line.
+dmr_pos="$FIXTURES/darray_mutable_receiver.pos.elisa"
+dmr_neg="$FIXTURES/darray_mutable_receiver.neg.elisa"
+for dmr_case in "9 pop" "12 clear" "14 extend" "16 reserve" "18 push" "20 truncate" "22 push" "24 push" "29 clear"; do
+    run_case darray_mutable_receiver pos "$dmr_pos" "L${dmr_case% *} darray ${dmr_case#* } requires a mutable darray receiver"
+done
+run_case darray_mutable_receiver pos "$dmr_pos" "L26 darray cstr requires a mutable darray receiver (it NUL-terminates in place)"
+run_case darray_mutable_receiver neg "$dmr_neg" "requires a mutable darray receiver"
 # A `continue` is a second back edge; the neg (consumed then continue, per
 # iteration) must stay silent.
 acs_pos="$FIXTURES/affine_continue_state.pos.elisa"
