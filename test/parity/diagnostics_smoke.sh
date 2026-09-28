@@ -591,6 +591,13 @@ run_case affine_use_after_loop_move pos "$FIXTURES/affine_use_after_loop_move.po
 run_case affine_use_in_loop_after_move pos "$FIXTURES/affine_use_in_loop_after_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_move_in_loop neg "$FIXTURES/affine_move_in_loop.neg.elisa" "$loop_msg"
 run_case affine_move_in_loop neg "$FIXTURES/affine_move_in_loop.neg.elisa" "after ownership was consumed"
+abs_pos="$FIXTURES/affine_break_state.pos.elisa"
+abs_neg="$FIXTURES/affine_break_state.neg.elisa"
+run_case affine_break_state pos "$abs_pos" 'L16 linear handle value "t" cannot be used after ownership was consumed'
+run_case affine_break_state pos "$abs_pos" "L21 linear handle value \"t\" $loop_msg"
+run_case affine_break_state pos "$abs_pos" 'L33 linear handle value "t" cannot be used after ownership was consumed'
+run_case affine_break_state neg "$abs_neg" "$loop_msg"
+run_case affine_break_state neg "$abs_neg" "after ownership was consumed"
 run_case affine_move_after_if_move pos "$FIXTURES/affine_move_after_if_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_use_after_if_else_move pos "$FIXTURES/affine_use_after_if_else_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_move_conditional_in_loop pos "$FIXTURES/affine_move_conditional_in_loop.pos.elisa" "$loop_msg"
