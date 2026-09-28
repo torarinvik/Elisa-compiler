@@ -598,6 +598,23 @@ run_case affine_break_state pos "$abs_pos" "L21 linear handle value \"t\" $loop_
 run_case affine_break_state pos "$abs_pos" 'L33 linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_break_state neg "$abs_neg" "$loop_msg"
 run_case affine_break_state neg "$abs_neg" "after ownership was consumed"
+# Early exits (continue/break/return, also from a loop or a match arm) drop a live
+# linear local; matches stage0 (Elisa-core, exit-leak check) line for line.
+lel_pos="$FIXTURES/linear_exit_leak.pos.elisa"
+lel_neg="$FIXTURES/linear_exit_leak.neg.elisa"
+lel_msg='linear value "g" must be consumed before scope exit'
+for lel_line in 12 18 23 29 34; do
+    run_case linear_exit_leak pos "$lel_pos" "L$lel_line $lel_msg"
+done
+run_case linear_exit_leak neg "$lel_neg" "must be consumed before scope exit"
+# A `continue` is a second back edge; the neg (consumed then continue, per
+# iteration) must stay silent.
+acs_pos="$FIXTURES/affine_continue_state.pos.elisa"
+acs_neg="$FIXTURES/affine_continue_state.neg.elisa"
+run_case affine_continue_state neg "$acs_neg" "$loop_msg"
+run_case affine_continue_state neg "$acs_neg" "after ownership was consumed"
+run_case affine_continue_state pos "$acs_pos" "L11 linear handle value \"h\" $loop_msg"
+run_case affine_continue_state pos "$acs_pos" 'L16 linear handle value "h" cannot be used after ownership was consumed'
 run_case affine_move_after_if_move pos "$FIXTURES/affine_move_after_if_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_use_after_if_else_move pos "$FIXTURES/affine_use_after_if_else_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_move_conditional_in_loop pos "$FIXTURES/affine_move_conditional_in_loop.pos.elisa" "$loop_msg"

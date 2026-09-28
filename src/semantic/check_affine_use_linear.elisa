@@ -70,17 +70,26 @@ extend Semantic:
                         pass
 
 
-        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, broken: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, broken: mutable darray[sview]&, continued: mutable darray[sview]&, in_scope: mutable darray[sview]&, leaked: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |names, flags, consumed, partial, broken, table| -> table:
+                for statement in statements |names, flags, consumed, partial, broken, continued, in_scope, leaked, table| -> table:
                     match statement:
                         Stmt.Break(_, _):
                             # The state at a `break` skips the back edge but reaches the code after
                             # the loop: the enclosing walk_affine_loop_body folds it in there.
                             for broken_name in consumed |broken|:
                                 broken.push(broken_name) if not affine_consumed(broken, broken_name)
+                            # A `break` leaves the loop body's scope: a linear local declared in
+                            # it and still live here is dropped without being consumed.
+                            linear_exit_leaks(in_scope, consumed, leaked, true)
+                        Stmt.Continue(_, _):
+                            # The state at a `continue` skips the rest of the body (a reinitialization
+                            # after it does not happen on this path) and starts the next iteration.
+                            for continued_name in consumed |continued|:
+                                continued.push(continued_name) if not affine_consumed(continued, continued_name)
+                            linear_exit_leaks(in_scope, consumed, leaked, true)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- walk_affine_block_statements(value, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_block_statements(value, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                             table <- walk_affine_expression(value, names, flags, consumed, table)
                             # A declaration binds a fresh value: an earlier binding's consumption
                             # (say, in a sibling branch) says nothing about it.
@@ -88,8 +97,9 @@ extend Semantic:
                             partial <- [held for held in partial if held != name]
                             names.push(name)
                             flags.push(affine_type_expression(type_expression, table))
+                            in_scope.push(name) if linear_local_type(type_expression, value, linear_names, table) != ""
                         Stmt.Assign(target, operator, value, line):
-                            table <- walk_affine_block_statements(value, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_block_statements(value, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                             table <- walk_affine_expression(value, names, flags, consumed, table)
                             # `o <- K{...}` RE-INITIALISES `o`: its consumption is discharged and a
                             # later move is legal again, exactly as stage0 accepts.
@@ -102,8 +112,9 @@ extend Semantic:
                             assign_is_linear: bool = assign_name != "" and linear_local_type((Ast::Expr.Absent), value, linear_names, table) != ""
                             names.push(assign_name) if assign_is_linear
                             flags.push(true) if assign_is_linear
+                            in_scope.push(assign_name) if assign_is_linear
                         Stmt.Expr(expression, line):
-                            table <- walk_affine_block_statements(expression, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_block_statements(expression, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                             table <- walk_affine_expression(expression, names, flags, consumed, table)
                             # A consuming call `f(x)` (f drives x to a terminal typestate)
                             # completes x's protocol — mark the linear-local argument consumed.
@@ -124,20 +135,26 @@ extend Semantic:
                         Stmt.Return(value, line):
                             match value:
                                 returned:
-                                    table <- walk_affine_block_statements(returned, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                                    table <- walk_affine_block_statements(returned, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                                     table <- walk_affine_expression(returned, names, flags, consumed, table)
                                     returned_root: sview = affine_root(returned)
                                     consumed.push(returned_root) if returned_root != "" and affine_local(names, flags, returned_root) and not affine_consumed(consumed, returned_root)
                                 _:
                                     pass
+                            # Every linear local in scope that this path has not consumed is
+                            # dropped by the `return` (the value's own moves count first).
+                            linear_exit_leaks(in_scope, consumed, leaked, false)
                         Stmt.If(condition, then_body, else_body, line):
                             table <- walk_affine_expression(condition, names, flags, consumed, table)
                             then_consumed: mutable darray[sview] = []
                             else_consumed: mutable darray[sview] = []
                             then_consumed.extend(consumed)
                             else_consumed.extend(consumed)
-                            table <- walk_affine_statements(then_body, names, flags, then_consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
-                            table <- walk_affine_statements(else_body, names, flags, else_consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            if_scope_mark: usize = in_scope.count
+                            table <- walk_affine_statements(then_body, names, flags, then_consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
+                            in_scope.truncate(if_scope_mark)
+                            table <- walk_affine_statements(else_body, names, flags, else_consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
+                            in_scope.truncate(if_scope_mark)
                             # MAY-consumed, as stage0: a value either branch consumed is gone after the
                             # `if` (a one-branch `sink(move t)` then `sink(move t)` is a double move). A
                             # branch that always leaves (`return`/`break`) contributes nothing.
@@ -162,15 +179,17 @@ extend Semantic:
                                     consumed.push(else_name) if not else_exits and not affine_consumed(consumed, else_name)
                         Stmt.Block(kind, clause, binding, body, line):
                             moved_root: sview = move_block_root(kind, body)
-                            table <- walk_affine_statements(body, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            block_scope_mark: usize = in_scope.count
+                            table <- walk_affine_statements(body, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
+                            in_scope.truncate(block_scope_mark)
                             consumed.push(moved_root) if moved_root != "" and affine_local(names, flags, moved_root) and not affine_consumed(consumed, moved_root)
                         Stmt.While(condition, body, line):
                             table <- walk_affine_expression(condition, names, flags, consumed, table)
                             no_loop_variables: darray[sview] = []
-                            table <- walk_affine_loop_body(body, no_loop_variables, line, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_loop_body(body, no_loop_variables, line, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                         Stmt.For(bind, variables, iterable, body, line):
                             table <- walk_affine_expression(iterable, names, flags, consumed, table)
-                            table <- walk_affine_loop_body(body, variables, line, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_loop_body(body, variables, line, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                         Stmt.Match(scrutinee, arms, line):
                             matched_root: sview = affine_match_root(scrutinee)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: matched_root, line: line.line, expected: "match", actual: ""}) if matched_root != "" and affine_consumed(consumed, matched_root)
@@ -187,7 +206,9 @@ extend Semantic:
                             for arm in arms |table, consumed, partial, arms_merged, arms_merged_counts, falling_arms, any_arm_falls_through| -> table:
                                 arm_consumed: mutable darray[sview] = []
                                 arm_consumed.extend(consumed)
-                                table <- walk_affine_statements(arm.body, names, flags, arm_consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                                arm_scope_mark: usize = in_scope.count
+                                table <- walk_affine_statements(arm.body, names, flags, arm_consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
+                                in_scope.truncate(arm_scope_mark)
                                 if not affine_body_exits(arm.body):
                                     any_arm_falls_through <- true
                                     falling_arms <- falling_arms + 1
@@ -218,23 +239,39 @@ extend Semantic:
         # value, so the statements are walked here, ahead of it. Without this every move
         # inside a captured loop escaped tracking (`while c |c|: sink(move t)` was a silent
         # double move while the capture-less loop was rejected).
-        def walk_affine_block_statements(expression: Ast::Expr, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, broken: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def walk_affine_block_statements(expression: Ast::Expr, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, broken: mutable darray[sview]&, continued: mutable darray[sview]&, in_scope: mutable darray[sview]&, leaked: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Block(block_statements, block_value, block_captures, block_line):
-                        table <- walk_affine_statements(block_statements, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                        value_block_mark: usize = in_scope.count
+                        table <- walk_affine_statements(block_statements, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
+                        in_scope.truncate(value_block_mark)
                     _:
                         pass
 
-        # Whether control never reaches the end of `statements`: it ends in `return`/`break`,
-        # or in an `if` whose branches both do. `continue` starts the next iteration, so it
-        # does not count.
+        # Records in `leaked` every linear local in `in_scope` that `consumed` does not hold:
+        # the ones a `return` (all of them) or a `break`/`continue` (those above the innermost
+        # loop sentinel "") drops at this point.
+        def linear_exit_leaks(in_scope: darray[sview]&, consumed: darray[sview]&, leaked: mutable darray[sview]&, loop_only: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                stopped: mutable bool = false
+                scope_index: mutable usize = in_scope.count
+                while scope_index > 0 |scope_index, stopped, leaked, in_scope, consumed, loop_only|:
+                    scope_index <- scope_index - 1
+                    scope_name: sview = in_scope[scope_index]
+                    stopped <- true if scope_name == "" and loop_only
+                    leaked.push(scope_name) if not stopped and scope_name != "" and not affine_consumed(consumed, scope_name) and not affine_consumed(leaked, scope_name)
+
+        # Whether control never reaches the end of `statements`: it ends in `return`,
+        # `break` or `continue`, or in an `if` whose branches both do. After a `continue`
+        # the rest of the body does not run on that path, so it counts as leaving.
         def affine_body_exits(statements: darray[Ast::Stmt]&) -> bool:
             can Abort.Panic:
                 return false if statements.count == 0
                 return match statements[statements.count - 1]:
                     Stmt.Return(_, _): true
                     Stmt.Break(_, _): true
+                    Stmt.Continue(_, _): true
                     Stmt.If(_, then_body, else_body, _): affine_body_exits(then_body) and affine_body_exits(else_body)
                     Stmt.Block(_, _, _, block_body, _): affine_body_exits(block_body)
                     _: false
@@ -245,7 +282,7 @@ extend Semantic:
         # leaves the loop. Stage0 accepts that; this reports it. What the body consumed stays
         # consumed after the loop, as stage0 does (`while ...: sink(move t)` then `t.v`).
         # Names the body or the loop header declares are per-iteration and never leak out.
-        def walk_affine_loop_body(body: darray[Ast::Stmt], loop_variables: darray[sview]&, loop_pos: Ast::Pos, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, broken: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def walk_affine_loop_body(body: darray[Ast::Stmt], loop_variables: darray[sview]&, loop_pos: Ast::Pos, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, broken: mutable darray[sview]&, continued: mutable darray[sview]&, in_scope: mutable darray[sview]&, leaked: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 outer_count: usize = names.count
                 for loop_variable in loop_variables |names, flags|:
@@ -255,7 +292,13 @@ extend Semantic:
                 body_consumed.extend(consumed)
                 # States at this loop's own `break`s (a nested loop collects its own).
                 body_broken: mutable darray[sview] = []
-                table <- walk_affine_statements(body, names, flags, body_consumed, partial, body_broken, linear_names, consuming_fns, consuming_positions, table)
+                body_continued: mutable darray[sview] = []
+                # The sentinel "" marks where this body's scope starts: `break`/`continue`
+                # leave only the linear locals above it.
+                loop_scope_mark: usize = in_scope.count
+                in_scope.push("")
+                table <- walk_affine_statements(body, names, flags, body_consumed, partial, body_broken, body_continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
+                in_scope.truncate(loop_scope_mark)
                 body_exits: bool = affine_body_exits(body)
                 # After the loop a value is consumed if the fall-through end of the body (when
                 # it has one; `continue` paths merge into it) or any `break` consumed it. A body
@@ -272,11 +315,21 @@ extend Semantic:
                     # the whole function) sees it. It is out of scope after the loop, so no
                     # later use can observe this; one the body leaves unconsumed stays a leak.
                     consumed.push(consumed_name) if declared_inside and not affine_consumed(consumed, consumed_name)
+                # A `continue` state is a second back edge: consumed there and live on entry is
+                # consumed again by the next iteration, and it also reaches the code after the
+                # loop when that iteration is the last.
+                for continued_name in body_continued |consumed, table| -> table:
+                    continued_inside: mutable bool = false
+                    for continued_index in outer_count..<names.count:
+                        continued_inside <- true if names[continued_index] == continued_name
+                    if not continued_inside and not affine_consumed(consumed, continued_name):
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: continued_name, pos: loop_pos, line: loop_pos.line, expected: "loop", actual: ""})
+                        consumed.push(continued_name)
+                    # Discharged within its own iteration on this path (see body_consumed).
+                    consumed.push(continued_name) if continued_inside and not affine_consumed(consumed, continued_name)
+                # A body-declared name consumed at a `break` was discharged in its iteration.
                 for broken_name in body_broken |consumed|:
-                    broken_inside: mutable bool = false
-                    for broken_index in outer_count..<names.count:
-                        broken_inside <- true if names[broken_index] == broken_name
-                    consumed.push(broken_name) if not broken_inside and not affine_consumed(consumed, broken_name)
+                    consumed.push(broken_name) if not affine_consumed(consumed, broken_name)
 
         # Names of `linear struct`/`linear typestate` types (affinity "linear"): a value of such
         # a type must be consumed exactly once, so an unconsumed local is a leak.
@@ -421,6 +474,10 @@ extend Semantic:
                             partial: mutable darray[sview] = []
                             # A `break` outside any loop is rejected elsewhere; its state goes nowhere.
                             broken: mutable darray[sview] = []
+                            continued: mutable darray[sview] = []
+                            # Linear locals in lexical scope, and those an early exit dropped live.
+                            in_scope: mutable darray[sview] = []
+                            leaked: mutable darray[sview] = []
                             alias_names: mutable darray[sview] = []
                             alias_roots: mutable darray[sview] = []
                             shutdown_names: mutable darray[sview] = []
@@ -428,16 +485,17 @@ extend Semantic:
                             for param in params |names, flags|:
                                 names.push(param.name)
                                 flags.push(affine_type_expression(param.type_expression, table))
-                            table <- walk_affine_statements(body, names, flags, consumed, partial, broken, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_statements(body, names, flags, consumed, partial, broken, continued, in_scope, leaked, linear_names, consuming_fns, consuming_positions, table)
                             # Linear locals must be consumed on every path. The affine `consumed`
                             # set (built above, with branch-merge) is MAY-consumed; a linear local
                             # absent from it, or consumed on only some paths (`partial`), is
-                            # leaked at scope exit.
+                            # leaked at scope exit, as is one an early `return`/`break`/`continue`
+                            # dropped while still live (`leaked`).
                             linear_local_names: mutable darray[sview] = []
                             linear_local_lines: mutable darray[u32] = []
                             collect_linear_locals(body, linear_names, table, linear_local_names, linear_local_lines)
                             while linear_probe < linear_local_names.count |linear_probe: usize = 0, table| -> table:
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LinearScopeExit, name: linear_local_names[linear_probe], line: linear_local_lines[linear_probe], expected: "", actual: ""}) if not affine_consumed(consumed, linear_local_names[linear_probe]) or affine_consumed(partial, linear_local_names[linear_probe])
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LinearScopeExit, name: linear_local_names[linear_probe], line: linear_local_lines[linear_probe], expected: "", actual: ""}) if not affine_consumed(consumed, linear_local_names[linear_probe]) or affine_consumed(partial, linear_local_names[linear_probe]) or affine_consumed(leaked, linear_local_names[linear_probe])
                                 linear_probe <- linear_probe + 1
                             table <- linear_return_walk(body, linear_local_names, table)
                             lifecycle: u32 = lifecycle_statement_flags(body)
