@@ -669,6 +669,33 @@ else
 fi
 run_case affine_container_address neg "$aca_neg" "cannot take address"
 
+echo "-- affine_darray_consume --"
+adc_pos="$FIXTURES/affine_darray_consume.pos.elisa"
+adc_neg="$FIXTURES/affine_darray_consume.neg.elisa"
+adc_out="$("$RPT" < "$adc_pos" 2>&1)"
+total=$((total + 1))
+if [[ "$(grep -c 'must be consumed before scope exit' <<< "$adc_out")" == 6 && "$(grep -c 'would drop must-consume element' <<< "$adc_out")" == 5 ]]; then
+    echo "  PASS affine_darray_consume.pos (6 unconsumed containers, 5 element drops)"
+else
+    echo "  FAIL affine_darray_consume.pos: want 6 unconsumed + 5 drops: $adc_out" >&2
+    failed=$((failed + 1))
+fi
+run_case affine_darray_consume pos "$adc_pos" 'darray of must-consume elements (drain with `for x in move c:`) "xs" must be consumed before scope exit'
+run_case affine_darray_consume pos "$adc_pos" 'darray of must-consume elements (drain with `for x in move c:`) "d" must be consumed before scope exit'
+run_case affine_darray_consume pos "$adc_pos" 'indexed assignment would drop must-consume element(s) of type Handle'
+run_case affine_darray_consume pos "$adc_pos" 'darray clear would drop must-consume element(s) of type Tracked'
+run_case affine_darray_consume neg "$adc_neg" "must-consume"
+
+echo "-- affine_set_key --"
+ask_pos="$FIXTURES/affine_set_key.pos.elisa"
+ask_neg="$FIXTURES/affine_set_key.neg.elisa"
+run_case affine_set_key pos "$ask_pos" "set elements cannot contain linear handles, got Handle?"
+run_case affine_set_key pos "$ask_pos" "dict keys cannot contain linear handles, got Pair"
+run_case affine_set_key pos "$ask_pos" "set elements cannot contain linear handles, got darray[Handle]"
+run_case affine_set_key pos "$ask_pos" "dict keys cannot contain linear handles, got Handle?"
+run_case affine_set_key neg "$ask_neg" "cannot contain linear handles"
+run_case affine_set_key neg "$ask_neg" "must be consumed before scope exit"
+
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
 guard_neg="$FIXTURES/shift_match_guards.neg.elisa"
