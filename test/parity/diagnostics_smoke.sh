@@ -661,10 +661,10 @@ aca_pos="$FIXTURES/affine_container_address.pos.elisa"
 aca_neg="$FIXTURES/affine_container_address.neg.elisa"
 aca_out="$("$RPT" < "$aca_pos" 2>&1)"
 total=$((total + 1))
-if [[ "$(grep -c 'cannot take address of value containing linear handles' <<< "$aca_out")" == 2 ]]; then
-    echo "  PASS affine_container_address.pos (both &xs sites fired)"
+if [[ "$(grep -c 'cannot take address of value containing linear handles' <<< "$aca_out")" == 8 ]]; then
+    echo "  PASS affine_container_address.pos (all 8 address sites fired)"
 else
-    echo "  FAIL affine_container_address.pos: want both &xs sites: $aca_out" >&2
+    echo "  FAIL affine_container_address.pos: want all 8 address sites: $aca_out" >&2
     failed=$((failed + 1))
 fi
 run_case affine_container_address neg "$aca_neg" "cannot take address"
