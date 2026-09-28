@@ -696,6 +696,17 @@ run_case affine_set_key pos "$ask_pos" "dict keys cannot contain linear handles,
 run_case affine_set_key neg "$ask_neg" "cannot contain linear handles"
 run_case affine_set_key neg "$ask_neg" "must be consumed before scope exit"
 
+echo "-- affine_comprehension --"
+acm_pos="$FIXTURES/affine_comprehension.pos.elisa"
+acm_neg="$FIXTURES/affine_comprehension.neg.elisa"
+run_case affine_comprehension pos "$acm_pos" "list comprehension value iteration does not support affine element type Handle"
+run_case affine_comprehension pos "$acm_pos" "list comprehension value iteration does not support affine element type Pair"
+run_case affine_comprehension pos "$acm_pos" "linear value \"g\" must be moved explicitly before move into list comprehension element"
+run_case affine_comprehension neg "$acm_neg" "list comprehension"
+run_case affine_comprehension neg "$acm_neg" "consumed on every iteration"
+run_case affine_comprehension neg "$acm_neg" "must be consumed before scope exit"
+run_case affine_comprehension_repeat pos "$FIXTURES/affine_comprehension_repeat.pos.elisa" "consumed on every iteration"
+
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
 guard_neg="$FIXTURES/shift_match_guards.neg.elisa"
