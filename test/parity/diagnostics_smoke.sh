@@ -263,6 +263,7 @@ NAMES=(
     storage_dependency_whole_assignment
     mutate_while_iterating_reassignment
     mutate_while_iterating_plus_eq
+    storage_dependency_field_replacement
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -492,6 +493,7 @@ EXPECTS=(
     "storage dependency facts were invalidated for interior reference \"r\""
     "cannot mutate \"xs\" while it is being iterated: reassignment of xs"
     "cannot mutate \"xs\" while it is being iterated: darray push of xs"
+    "storage dependency facts were invalidated for interior reference \"r\""
 )
 
 total=0
