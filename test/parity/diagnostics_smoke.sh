@@ -624,6 +624,18 @@ run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the o
 run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "ys" through a call'
 run_case value_block_nested_loop neg "$vn_neg" "value block may not mutate"
 run_case value_block_nested_loop neg "$vn_neg" "names no binding in scope"
+echo "-- call_argument_alias --"
+ca_pos="$FIXTURES/call_argument_alias.pos.elisa"
+ca_neg="$FIXTURES/call_argument_alias.neg.elisa"
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "x" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "read_write" passes "y" to mutable reference parameter "a" while argument for "b" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "grow" passes "v" to mutable reference parameter "v" while argument for "first" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "whole" passes "p" to mutable reference parameter "p" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "q" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "w" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "z" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "r" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias neg "$ca_neg" "refers to overlapping memory"
 
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"

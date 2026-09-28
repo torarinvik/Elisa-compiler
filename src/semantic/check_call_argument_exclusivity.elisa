@@ -1,0 +1,354 @@
+# Same-call argument exclusivity: a `mutable T&` parameter must not alias another reference
+# argument of the same call.
+#
+# The backend stamps `noalias` on scalar `mutable T&` parameters under `-fnoalias`, so
+# `f(&x, &x)` with `def f(a: mutable i64&, b: mutable i64&)` was a SILENT MISCOMPILE in
+# both compilers: `a <- 1; b <- 2; return a` folded to `ret 1`. Without the flag it is still
+# a memory-safety hole: `g(&v, &v[0])` hands the callee an element reference that a push
+# through `v` leaves dangling.
+#
+# The rule is deliberately syntactic and conservative. Two arguments conflict when they are
+# both `&PLACE` (or both bare places) with the same root binding and overlapping paths, and at
+# least one of them lands in a `mutable T&` parameter while the other lands in any reference
+# parameter. Paths overlap when one is a prefix of the other, step by step, unless some step
+# pair is provably disjoint: two different field names, or two different integer-literal
+# indices. A non-literal index may overlap (`swap(&v[i], &v[j])` is rejected: i == j is
+# allowed at runtime). A `can Unsafe.Alias:` / `trusted Unsafe.Alias:` block (or a broad
+# `Unsafe` grant) opts its body out, as stage0's strict mode allows. Only calls that resolve by name to exactly one declared function are
+# checked; methods, externs and overloaded names are left alone rather than guessed at.
+extend Semantic:
+    private:
+        # The literal value of an index expression, when it is an integer literal.
+        def exclusivity_index_literal(index: Ast::Expr) -> (known: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match index:
+                    Expr.IntLit(value, position):
+                        return (true, value)
+                    Expr.Paren(inner, position):
+                        return exclusivity_index_literal(inner)
+                    _:
+                        return (false, 0)
+
+        # The root binding of a place expression, appending its steps (root outward) to the
+        # step tables: kind 0 = field NAME, 1 = literal index VALUE, 2 = unknown index/slice.
+        # Returns "" when EXPRESSION is not a place.
+        def exclusivity_place(expression: Ast::Expr, kinds: mutable darray[u8]&, names: mutable darray[sview]&, values: mutable darray[i64]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, position):
+                        return name
+                    Expr.Paren(inner, position):
+                        return exclusivity_place(inner, kinds, names, values)
+                    Expr.Field(object, field, position):
+                        field_root: sview = exclusivity_place(object, kinds, names, values)
+                        if field_root != "":
+                            kinds.push(0)
+                            names.push(field)
+                            values.push(0)
+                        return field_root
+                    Expr.Index(object, index, position):
+                        index_root: sview = exclusivity_place(object, kinds, names, values)
+                        if index_root != "":
+                            literal: (known: bool, value: i64) = exclusivity_index_literal(index)
+                            kinds.push(1 if literal.known else 2)
+                            names.push("")
+                            values.push(literal.value)
+                        return index_root
+                    Expr.Slice(object, low, high, position):
+                        slice_root: sview = exclusivity_place(object, kinds, names, values)
+                        if slice_root != "":
+                            kinds.push(2)
+                            names.push("")
+                            values.push(0)
+                        return slice_root
+                    _:
+                        return ""
+
+        # Whether the step paths [a_start, a_start+a_count) and [b_start, b_start+b_count)
+        # may name overlapping memory: no step pair on the common prefix is provably disjoint.
+        def exclusivity_paths_overlap(kinds: darray[u8]&, names: darray[sview]&, values: darray[i64]&, a_start: usize, a_count: usize, b_start: usize, b_count: usize) -> bool:
+            can Abort.Panic:
+                step: mutable usize = 0
+                while step < a_count and step < b_count:
+                    a_kind: u8 = kinds[a_start + step]
+                    b_kind: u8 = kinds[b_start + step]
+                    false return if a_kind == 0 and b_kind == 0 and names[a_start + step] != names[b_start + step]
+                    false return if a_kind == 1 and b_kind == 1 and values[a_start + step] != values[b_start + step]
+                    step <- step + 1
+                return true
+
+        # Whether PARAMETER's type is a reference of any mutability.
+        def exclusivity_param_is_ref(parameter: Ast::ParamDecl) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+
+        # Whether the referent of TYPE_EXPRESSION is a generic container instantiation
+        # (`darray[T]`, `dict[K, V]`, ...). The backend never stamps `noalias` on those, and a
+        # second reference to the same container header cannot dangle, so stage0 accepts an
+        # equal-place pair of them in every mode (its disjointness proof gates the attribute).
+        def exclusivity_pointee_is_container(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        return exclusivity_pointee_is_container(operand)
+                    Expr.Paren(inner, line):
+                        return exclusivity_pointee_is_container(inner)
+                    Expr.Index(object, index, line):
+                        return true
+                    Expr.IndexN(object, arguments, line):
+                        return true
+                    _:
+                        return false
+
+        # Every declared function in the file (all modules), flattened: NAME, its parameters at
+        # [start, start+count) of PARAMS.
+        def exclusivity_collect_functions(declarations: darray[Ast::Decl], function_names: mutable darray[sview]&, starts: mutable darray[usize]&, counts: mutable darray[usize]&, params: mutable darray[Ast::ParamDecl]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, position):
+                            function_names.push(name)
+                            starts.push(params.count)
+                            counts.push(parameters.count)
+                            params.extend(parameters)
+                        Decl.Module(module_name, module_body, module_position):
+                            exclusivity_collect_functions(module_body, function_names, starts, counts, params)
+                        Decl.Scoped(scoped_body, scoped_position):
+                            exclusivity_collect_functions(scoped_body, function_names, starts, counts, params)
+                        _:
+                            pass
+
+        # The one declared function named NAME, or function_names.count when there is none or
+        # the name is ambiguous.
+        def exclusivity_unique_function(function_names: darray[sview]&, name: sview) -> usize:
+            can Abort.Panic:
+                found: mutable usize = function_names.count
+                index: mutable usize = 0
+                while index < function_names.count:
+                    if function_names[index] == name:
+                        return function_names.count if found != function_names.count
+                        found <- index
+                    index <- index + 1
+                return found
+
+        # The parameter slot argument ARGUMENT_INDEX binds to: its label when named, else its
+        # position. PARAM_COUNT when it binds to none.
+        def exclusivity_argument_slot(argument_names: darray[sview]&, argument_index: usize, params: darray[Ast::ParamDecl]&, param_start: usize, param_count: usize) -> usize:
+            can Abort.Panic:
+                label: sview = argument_names[argument_index] if argument_index < argument_names.count else ""
+                return argument_index if label == "" else exclusivity_label_slot(label, params, param_start, param_count)
+
+        def exclusivity_label_slot(label: sview, params: darray[Ast::ParamDecl]&, param_start: usize, param_count: usize) -> usize:
+            can Abort.Panic:
+                slot: mutable usize = 0
+                while slot < param_count:
+                    return slot if params[param_start + slot].name == label
+                    slot <- slot + 1
+                return param_count
+
+        # Whether ARGUMENT is `&PLACE`, and the place expression either way.
+        def exclusivity_strip_address(argument: Ast::Expr) -> (address: bool, place: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Unary(operator, operand, position):
+                        return (true, operand) if operator == TokenKind.Ampersand
+                        return (false, argument)
+                    Expr.Paren(inner, position):
+                        return exclusivity_strip_address(inner)
+                    _:
+                        return (false, argument)
+
+        def exclusivity_check_call(callee_name: sview, arguments: darray[Ast::Expr], argument_names: darray[sview], function_names: darray[sview]&, starts: darray[usize]&, counts: darray[usize]&, params: darray[Ast::ParamDecl]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                function_index: usize = exclusivity_unique_function(function_names, callee_name)
+                return if function_index == function_names.count or arguments.count < 2
+                param_start: usize = starts[function_index]
+                param_count: usize = counts[function_index]
+                roots: mutable darray[sview] = []
+                addressed: mutable darray[bool] = []
+                slots: mutable darray[usize] = []
+                step_starts: mutable darray[usize] = []
+                step_counts: mutable darray[usize] = []
+                kinds: mutable darray[u8] = []
+                names: mutable darray[sview] = []
+                values: mutable darray[i64] = []
+                argument_index: mutable usize = 0
+                for argument in arguments |argument_index, roots, addressed, slots, step_starts, step_counts, kinds, names, values|:
+                    stripped: (address: bool, place: Ast::Expr) = exclusivity_strip_address(argument)
+                    first_step: usize = kinds.count
+                    roots.push(exclusivity_place(stripped.place, kinds, names, values))
+                    addressed.push(stripped.address)
+                    slots.push(exclusivity_argument_slot(argument_names, argument_index, params, param_start, param_count))
+                    step_starts.push(first_step)
+                    step_counts.push(kinds.count - first_step)
+                    argument_index <- argument_index + 1
+                later: mutable usize = 1
+                while later < arguments.count |later, table| -> table:
+                    earlier: mutable usize = 0
+                    while earlier < later |earlier, table| -> table:
+                        same_place_kind: bool = roots[later] != "" and roots[later] == roots[earlier] and addressed[later] == addressed[earlier] and slots[later] < param_count and slots[earlier] < param_count and slots[later] != slots[earlier]
+                        if same_place_kind:
+                            later_param: Ast::ParamDecl = params[param_start + slots[later]]
+                            earlier_param: Ast::ParamDecl = params[param_start + slots[earlier]]
+                            later_mutable: bool = param_is_mutable_ref(later_param)
+                            earlier_mutable: bool = param_is_mutable_ref(earlier_param)
+                            conflicting_params: bool = (later_mutable and exclusivity_param_is_ref(earlier_param)) or (earlier_mutable and exclusivity_param_is_ref(later_param))
+                            # A bare place names the reference it holds, so only an EQUAL path is
+                            # the same referent; `&PLACE` paths conflict on any prefix overlap.
+                            path_conflict: bool = exclusivity_paths_overlap(kinds, names, values, step_starts[earlier], step_counts[earlier], step_starts[later], step_counts[later]) and (addressed[later] or step_counts[later] == step_counts[earlier])
+                            # An EQUAL place under container-typed mutable params is a shared
+                            # header, not a noalias violation or a dangling element; a prefix
+                            # (`&v` with `&v[0]`) still dangles after growth and stays rejected.
+                            equal_path: bool = step_counts[later] == step_counts[earlier]
+                            container_only: bool = (not later_mutable or exclusivity_pointee_is_container(later_param.type_expression)) and (not earlier_mutable or exclusivity_pointee_is_container(earlier_param.type_expression))
+                            if conflicting_params and path_conflict and not (equal_path and container_only):
+                                mutable_param: sview = later_param.name if later_mutable else earlier_param.name
+                                other_param: sview = earlier_param.name if later_mutable else later_param.name
+                                at: Ast::Pos = Ast::expr_pos(arguments[later])
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.CallArgumentAlias, name: roots[later], pos: at, line: at.line, expected: mutable_param, actual: callee_name, detail: other_param})
+                        earlier <- earlier + 1
+                    later <- later + 1
+
+        def exclusivity_walk_expression(expression: Ast::Expr, function_names: darray[sview]&, starts: darray[usize]&, counts: darray[usize]&, params: darray[Ast::ParamDecl]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, position):
+                        callee_name: sview = exclusivity_callee_name(callee)
+                        table <- exclusivity_check_call(callee_name, arguments, argument_names, function_names, starts, counts, params, table) if callee_name != ""
+                        table <- exclusivity_walk_expression(callee, function_names, starts, counts, params, table)
+                        for argument in arguments |table| -> table:
+                            table <- exclusivity_walk_expression(argument, function_names, starts, counts, params, table)
+                    Expr.Binary(left, operator, right, position):
+                        table <- exclusivity_walk_expression(left, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(right, function_names, starts, counts, params, table)
+                    Expr.Unary(operator, operand, position):
+                        table <- exclusivity_walk_expression(operand, function_names, starts, counts, params, table)
+                    Expr.Move(operand, position):
+                        table <- exclusivity_walk_expression(operand, function_names, starts, counts, params, table)
+                    Expr.RegionNew(operand, region, position):
+                        table <- exclusivity_walk_expression(operand, function_names, starts, counts, params, table)
+                    Expr.Paren(inner, position):
+                        table <- exclusivity_walk_expression(inner, function_names, starts, counts, params, table)
+                    Expr.Field(object, field, position):
+                        table <- exclusivity_walk_expression(object, function_names, starts, counts, params, table)
+                    Expr.Index(object, index, position):
+                        table <- exclusivity_walk_expression(object, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(index, function_names, starts, counts, params, table)
+                    Expr.Slice(object, low, high, position):
+                        table <- exclusivity_walk_expression(object, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(low, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(high, function_names, starts, counts, params, table)
+                    Expr.IndexN(object, arguments, position):
+                        table <- exclusivity_walk_expression(object, function_names, starts, counts, params, table)
+                        for argument in arguments |table| -> table:
+                            table <- exclusivity_walk_expression(argument, function_names, starts, counts, params, table)
+                    Expr.Array(elements, position):
+                        for element in elements |table| -> table:
+                            table <- exclusivity_walk_expression(element, function_names, starts, counts, params, table)
+                    Expr.Tuple(elements, position):
+                        for element in elements |table| -> table:
+                            table <- exclusivity_walk_expression(element, function_names, starts, counts, params, table)
+                    Expr.SetLit(elements, position):
+                        for element in elements |table| -> table:
+                            table <- exclusivity_walk_expression(element, function_names, starts, counts, params, table)
+                    Expr.DictLit(entries, position):
+                        for entry in entries |table| -> table:
+                            table <- exclusivity_walk_expression(entry.key, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_expression(entry.value, function_names, starts, counts, params, table)
+                    Expr.Construct(type_expression, fields, position):
+                        for field in fields |table| -> table:
+                            table <- exclusivity_walk_expression(field.value, function_names, starts, counts, params, table)
+                    Expr.RecordUpdate(base, fields, position):
+                        table <- exclusivity_walk_expression(base, function_names, starts, counts, params, table)
+                        for field in fields |table| -> table:
+                            table <- exclusivity_walk_expression(field.value, function_names, starts, counts, params, table)
+                    Expr.If(condition, then_expression, else_expression, position):
+                        table <- exclusivity_walk_expression(condition, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(then_expression, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(else_expression, function_names, starts, counts, params, table)
+                    Expr.Comprehension(variable, iterable, condition, body, position):
+                        table <- exclusivity_walk_expression(iterable, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(condition, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(body, function_names, starts, counts, params, table)
+                    Expr.Lambda(lambda_params, body, position):
+                        table <- exclusivity_walk_statements(body, function_names, starts, counts, params, table)
+                    Expr.Block(statements, value, captures, position):
+                        table <- exclusivity_walk_statements(statements, function_names, starts, counts, params, table)
+                        table <- exclusivity_walk_expression(value, function_names, starts, counts, params, table)
+                    Expr.Match(scrutinee, arms, position):
+                        table <- exclusivity_walk_expression(scrutinee, function_names, starts, counts, params, table)
+                        for arm in arms |table| -> table:
+                            table <- exclusivity_walk_expression(arm.guard, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_statements(arm.body, function_names, starts, counts, params, table)
+                    _:
+                        pass
+
+        # A free-function callee's name: `f` or `Mod::f`. "" for anything else.
+        def exclusivity_callee_name(callee: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(name, position):
+                        return name
+                    Expr.Scope(base, name, position):
+                        return name
+                    _:
+                        return ""
+
+        def exclusivity_walk_statements(statements: darray[Ast::Stmt], function_names: darray[sview]&, starts: darray[usize]&, counts: darray[usize]&, params: darray[Ast::ParamDecl]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, position):
+                            table <- exclusivity_walk_expression(expression, function_names, starts, counts, params, table)
+                        Stmt.VarDecl(name, type_expression, value, position):
+                            table <- exclusivity_walk_expression(value, function_names, starts, counts, params, table)
+                        Stmt.Assign(target, operator, value, position):
+                            table <- exclusivity_walk_expression(target, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_expression(value, function_names, starts, counts, params, table)
+                        Stmt.If(condition, then_body, else_body, position):
+                            table <- exclusivity_walk_expression(condition, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_statements(then_body, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_statements(else_body, function_names, starts, counts, params, table)
+                        Stmt.While(condition, body, position):
+                            table <- exclusivity_walk_expression(condition, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_statements(body, function_names, starts, counts, params, table)
+                        Stmt.For(binding, variables, iterable, body, position):
+                            table <- exclusivity_walk_expression(iterable, function_names, starts, counts, params, table)
+                            table <- exclusivity_walk_statements(body, function_names, starts, counts, params, table)
+                        Stmt.Block(kind, clause, binding, body, position):
+                            # `can Unsafe.Alias:` / `trusted Unsafe.Alias:` (or a broad `Unsafe`)
+                            # is the explicit opt-out stage0's strict mode names in its message.
+                            granted: bool = (kind == "can" or kind == "trusted") and strict_unsafe_grant_covers(clause, "Unsafe.Alias")
+                            table <- exclusivity_walk_statements(body, function_names, starts, counts, params, table) if not granted
+                        Stmt.Match(scrutinee, arms, position):
+                            table <- exclusivity_walk_expression(scrutinee, function_names, starts, counts, params, table)
+                            for arm in arms |table| -> table:
+                                table <- exclusivity_walk_expression(arm.guard, function_names, starts, counts, params, table)
+                                table <- exclusivity_walk_statements(arm.body, function_names, starts, counts, params, table)
+                        Stmt.Return(value, position):
+                            table <- exclusivity_walk_expression(return_value, function_names, starts, counts, params, table) if value is return_value
+                        _:
+                            pass
+
+        def exclusivity_walk_declarations(declarations: darray[Ast::Decl], function_names: darray[sview]&, starts: darray[usize]&, counts: darray[usize]&, params: darray[Ast::ParamDecl]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, position):
+                            table <- exclusivity_walk_statements(body, function_names, starts, counts, params, table)
+                        Decl.Module(module_name, module_body, module_position):
+                            table <- exclusivity_walk_declarations(module_body, function_names, starts, counts, params, table)
+                        Decl.Scoped(scoped_body, scoped_position):
+                            table <- exclusivity_walk_declarations(scoped_body, function_names, starts, counts, params, table)
+                        _:
+                            pass
+
+    public:
+        def check_call_argument_exclusivity(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                function_names: mutable darray[sview] = []
+                starts: mutable darray[usize] = []
+                counts: mutable darray[usize] = []
+                params: mutable darray[Ast::ParamDecl] = []
+                exclusivity_collect_functions(file.top_decls, function_names, starts, counts, params)
+                table <- exclusivity_walk_declarations(file.top_decls, function_names, starts, counts, params, table)
