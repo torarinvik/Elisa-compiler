@@ -877,6 +877,22 @@ for guard_case in pos neg; do
     done
 done
 
+echo "-- local_borrow_container_escape --"
+lbe_pos="$FIXTURES/local_borrow_container_escape.pos.elisa"
+lbe_neg="$FIXTURES/local_borrow_container_escape.neg.elisa"
+for lbe_message in \
+    "L16 darray push stores a reference to function-local storage into longer-lived storage" \
+    "L22 darray push stores a reference to function-local storage into longer-lived storage" \
+    "L29 returning an aggregate or helper result that contains a reference into function-local storage" \
+    "L33 storing an aggregate that contains a reference to function-local storage into longer-lived storage" \
+    "L38 storing an aggregate that contains a reference to function-local storage into longer-lived storage" \
+    "L43 storing a forwarded reference into longer-lived storage"; do
+    run_case local_borrow_container_escape pos "$lbe_pos" "$lbe_message"
+done
+for lbe_message in "stores a reference to function-local storage" "storing an aggregate that contains" "storing a forwarded reference" "contains a reference into function-local storage"; do
+    run_case local_borrow_container_escape neg "$lbe_neg" "$lbe_message"
+done
+
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then
