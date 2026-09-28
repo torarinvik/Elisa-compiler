@@ -101,7 +101,120 @@ extend Semantic:
                     Expr.Index(index_head, index_argument, index_line): argument != ""
                     Expr.IndexN(indexn_head, indexn_arguments, indexn_line): argument != ""
                     _: true
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineReference, name: name, line: line, expected: head, actual: "", detail: argument}) if generic_ok and struct_is_unborrowable_affine(table, head)
+                if generic_ok and struct_is_unborrowable_affine(table, head):
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineReference, name: name, line: line, expected: head, actual: "", detail: argument})
+                    return
+                # A container, fixed array or generic instance holding linear handles
+                # (`darray[Handle]&`, `Handle[2]&`, `Box[Pair]&`): stage0's
+                # containsAffineHandleValues walks the pointee's element types. A declared owner
+                # (`linear struct Owner[T]`) stays borrowable whatever its arguments.
+                instance: bool = match pointee:
+                    Expr.Index(index_head, index_argument, index_line): true
+                    Expr.IndexN(indexn_head, indexn_arguments, indexn_line): true
+                    _: false
+                # A fixed array (`Handle[2]`) is not its element: the owner exemption is for a
+                # generic owner instance only.
+                fixed_array: bool = match pointee:
+                    Expr.Index(fixed_head, fixed_extent, fixed_line): affine_type_is_extent(fixed_extent)
+                    _: false
+                if instance and (fixed_array or not struct_is_borrowable_owner(table, head)) and affine_type_contains_handles(pointee, table):
+                    spelling: mutable darray[u8] = []
+                    rendered: bool = affine_type_render(pointee, &spelling)
+                    # text_storage never reallocates, so its bytes are a stable Diagnostic sview.
+                    start: usize = table.text_storage.count
+                    fits: bool = rendered and start + spelling.count <= 65536.usize()
+                    for byte in spelling |table| -> table:
+                        table.text_storage.push(byte) if fits
+                    text: sview = bytes_view_range(table.text_storage, start, spelling.count) if fits else head
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineReference, name: name, line: line, expected: text, actual: "", detail: ""})
+
+        def affine_type_is_extent(argument: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return match argument:
+                    Expr.IntLit(extent, extent_line): true
+                    _: false
+
+        # Whether values of `type_expression` hold a linear handle: an affine struct, or a
+        # container, optional, fixed array or generic instance whose element type does. A
+        # reference element (`darray[Handle&]`) borrows, so it holds none.
+        def affine_type_contains_handles(type_expression: Ast::Expr, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(type_name, ident_line):
+                        return struct_is_affine(table, type_name)
+                    Expr.Paren(inner, paren_line):
+                        return affine_type_contains_handles(inner, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        false return if operator == TokenKind.Ampersand
+                        return affine_type_contains_handles(operand, table)
+                    Expr.Index(head, argument, index_line):
+                        if argument is Expr.IntLit(extent, extent_line):
+                            return affine_type_contains_handles(head, table)
+                        true return if struct_is_affine(table, ident_name_of(head))
+                        return affine_type_contains_handles(argument, table)
+                    Expr.IndexN(head, arguments, indexn_line):
+                        true return if struct_is_affine(table, ident_name_of(head))
+                        for argument in arguments |table|:
+                            true return if affine_type_contains_handles(argument, table)
+                        return false
+                    _:
+                        return false
+                return false
+
+        # Appends stage0's spelling of `type_expression` (`dict[i64, Handle]`, `Handle[2]`,
+        # `darray[Handle?]`) to `out`. false (a partial append) for a shape it cannot spell;
+        # the caller then names the head alone.
+        def affine_type_render(type_expression: Ast::Expr, out: mutable darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(type_name, ident_line):
+                        for offset in 0..<sview_len(type_name) |out, type_name|:
+                            out.push(sview_at(type_name, offset))
+                        return true
+                    Expr.Paren(inner, paren_line):
+                        return affine_type_render(inner, out)
+                    Expr.IntLit(extent, extent_line):
+                        value: i64 = extent
+                        false return if value < 0
+                        divisor: mutable i64 = 1
+                        while divisor * 10 <= value |divisor, value|:
+                            divisor <- divisor * 10
+                        while divisor > 0 |divisor, value, out|:
+                            out.push((48 + (value / divisor) % 10).u8())
+                            divisor <- divisor / 10
+                        return true
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Mutable:
+                            return affine_type_render(operand, out)
+                        false return if operator != TokenKind.Question and operator != TokenKind.Ampersand
+                        false return if not affine_type_render(operand, out)
+                        out.push(63) if operator == TokenKind.Question
+                        out.push(38) if operator == TokenKind.Ampersand
+                        return true
+                    Expr.Index(head, argument, index_line):
+                        false return if not affine_type_render(head, out)
+                        out.push(91)
+                        false return if not affine_type_render(argument, out)
+                        out.push(93)
+                        return true
+                    Expr.IndexN(head, arguments, indexn_line):
+                        false return if not affine_type_render(head, out)
+                        out.push(91)
+                        spelled: mutable bool = true
+                        index: mutable usize = 0
+                        for argument in arguments |spelled, index, out|:
+                            if spelled:
+                                if index > 0:
+                                    out.push(44)
+                                    out.push(32)
+                                spelled <- affine_type_render(argument, out)
+                            index <- index + 1
+                        false return if not spelled
+                        out.push(93)
+                        return true
+                    _:
+                        return false
+                return false
 
         # The struct a binding holds, seen through a reference: `K`, `mutable K`, `K&` -> "K".
         def affine_binding_type(type_expression: Ast::Expr) -> sview:
@@ -368,6 +481,12 @@ extend Semantic:
                         table <- check_affine_moves(left, "array element", names, types, elems, refs, table)
                         table <- check_affine_moves(right, "array element", names, types, elems, refs, table)
                     Expr.Unary(operator, operand, unary_line):
+                        # `&xs` on a darray, view or fixed array of linear handles, wherever it
+                        # sits (`f(&xs)`, `(&xs).cast`): stage0 refuses the address; an element
+                        # borrow (`&xs[0]`) of a declared owner stays allowed.
+                        if operator == TokenKind.Ampersand and operand is Expr.Ident(addressed_name, addressed_line):
+                            addressed_element: sview = local_type_of(names, elems, addressed_name)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineAddress, name: "", line: addressed_line.line, expected: addressed_element, actual: "container"}) if addressed_element != "" and struct_is_affine(table, addressed_element) and not affine_local_is_ref(names, refs, addressed_name)
                         table <- check_affine_moves(operand, "array element", names, types, elems, refs, table)
                     Expr.Move(operand, move_line):
                         table <- check_affine_moves(operand, "array element", names, types, elems, refs, table)
@@ -439,7 +558,12 @@ extend Semantic:
                             # `u: K = p.h` copies the field out; `u: K& = p.h` is a type error, not a move.
                             projected_init: sview = affine_projection_type(value, names, types, elems, table)
                             table <- push_affine_projection_move(value, projected_init, projected_init, name, table) if projected_init != "" and not target_is_ref
-                            source_type: sview = addressed_affine_type(value, names, types, table)
+                            # `&xs` on a container of handles is check_affine_moves' to report.
+                            addressed_container: mutable bool = false
+                            if value is Expr.Unary(address_operator, address_operand, address_line):
+                                if address_operand is Expr.Ident(container_name, container_line):
+                                    addressed_container <- address_operator == TokenKind.Ampersand and local_type_of(names, elems, container_name) != ""
+                            source_type: sview = "" if addressed_container else addressed_affine_type(value, names, types, table)
                             builtin_handle: bool = source_type in {"Thread", "Task", "MutexGuard", "ThreadPool", "TaskGroup"}
                             # A borrowable owner may be addressed; an aggregate that merely contains
                             # one may not, and stage0 words that case differently.

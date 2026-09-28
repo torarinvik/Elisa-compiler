@@ -642,6 +642,32 @@ run_case call_argument_alias pos "$ca_pos" 'call "grow" passes "vv" to mutable r
 run_case call_argument_alias pos "$ca_pos" 'call "poke" passes "c" to mutable reference parameter "other" while argument for "self" refers to overlapping memory'
 run_case call_argument_alias pos "$ca_pos" 'call "f" passes "m" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
 run_case call_argument_alias neg "$ca_neg" "refers to overlapping memory"
+echo "-- affine_container_reference --"
+acr_pos="$FIXTURES/affine_container_reference.pos.elisa"
+acr_neg="$FIXTURES/affine_container_reference.neg.elisa"
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got darray[Handle]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got view[Handle]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got Handle[2]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got dict[i64, Handle]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got darray[darray[Handle]]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got darray[Handle?]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got darray[Pair]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got Box[Handle]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got Pair[2]&'
+run_case affine_container_reference pos "$acr_pos" 'references to values containing linear handles are not supported; got darray[Handle[2]]&'
+run_case affine_container_reference neg "$acr_neg" "references to values containing linear handles"
+echo "-- affine_container_address --"
+aca_pos="$FIXTURES/affine_container_address.pos.elisa"
+aca_neg="$FIXTURES/affine_container_address.neg.elisa"
+aca_out="$("$RPT" < "$aca_pos" 2>&1)"
+total=$((total + 1))
+if [[ "$(grep -c 'cannot take address of value containing linear handles' <<< "$aca_out")" == 2 ]]; then
+    echo "  PASS affine_container_address.pos (both &xs sites fired)"
+else
+    echo "  FAIL affine_container_address.pos: want both &xs sites: $aca_out" >&2
+    failed=$((failed + 1))
+fi
+run_case affine_container_address neg "$aca_neg" "cannot take address"
 
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
