@@ -262,6 +262,7 @@ NAMES=(
     aggregate_reference_branch_return_escape
     storage_dependency_whole_assignment
     mutate_while_iterating_reassignment
+    mutate_while_iterating_plus_eq
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -490,6 +491,7 @@ EXPECTS=(
     "returning an aggregate or helper result that contains a reference into function-local storage"
     "storage dependency facts were invalidated for interior reference \"r\""
     "cannot mutate \"xs\" while it is being iterated: reassignment of xs"
+    "cannot mutate \"xs\" while it is being iterated: darray push of xs"
 )
 
 total=0
