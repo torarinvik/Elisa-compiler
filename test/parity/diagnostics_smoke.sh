@@ -632,10 +632,16 @@ done
 run_case darray_mutable_receiver pos "$dmr_pos" "L26 darray cstr requires a mutable darray receiver (it NUL-terminates in place)"
 run_case darray_mutable_receiver neg "$dmr_neg" "requires a mutable darray receiver"
 dba_pos="$FIXTURES/darray_builtin_arity.pos.elisa"
-for dba_case in "5 push expects 1 argument, got 2" "6 clear expects 0 arguments, got 1" "7 truncate expects 1 argument, got 0" "8 reserve expects 1 argument, got 3" "12 resize expects 1 argument, got 2" "13 extend expects 1 argument, got 0"; do
+for dba_case in "6 push expects 1 argument, got 2" "7 clear expects 0 arguments, got 1" "8 truncate expects 1 argument, got 0" "9 reserve expects 1 argument, got 3" "13 resize expects 1 argument, got 2" "14 extend expects 1 argument, got 0"; do
     run_case darray_builtin_arity pos "$dba_pos" "L${dba_case%% *} darray ${dba_case#* }"
 done
 run_case darray_builtin_arity neg "$FIXTURES/darray_builtin_arity.neg.elisa" "darray push expects"
+dir_pos="$FIXTURES/darray_index_receiver.pos.elisa"
+for dir_case in "5 clear" "8 clear" "11 clear" "14 clear" "17 truncate"; do
+    run_case darray_index_receiver pos "$dir_pos" "L${dir_case% *} darray ${dir_case#* } requires a mutable darray receiver"
+done
+run_case darray_index_receiver pos "$dir_pos" "L20 darray push expects 1 argument, got 2"
+run_case darray_index_receiver neg "$FIXTURES/darray_index_receiver.neg.elisa" "requires a mutable darray receiver"
 # A `continue` is a second back edge; the neg (consumed then continue, per
 # iteration) must stay silent.
 acs_pos="$FIXTURES/affine_continue_state.pos.elisa"
