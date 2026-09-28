@@ -260,6 +260,8 @@ NAMES=(
     aggregate_reference_match_return_escape
     aggregate_reference_loop_return_escape
     aggregate_reference_branch_return_escape
+    storage_dependency_whole_assignment
+    mutate_while_iterating_reassignment
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -486,6 +488,8 @@ EXPECTS=(
     "returning an aggregate or helper result that contains a reference into function-local storage"
     "returning an aggregate or helper result that contains a reference into function-local storage"
     "returning an aggregate or helper result that contains a reference into function-local storage"
+    "storage dependency facts were invalidated for interior reference \"r\""
+    "cannot mutate \"xs\" while it is being iterated: reassignment of xs"
 )
 
 total=0
