@@ -565,6 +565,23 @@ run_case affine_move_array_element pos "$FIXTURES/affine_move_array_element.pos.
 run_case affine_move_darray_literal pos "$FIXTURES/affine_move_darray_literal.pos.elisa" 'linear value "t" must be moved explicitly before move into darray literal element'
 run_case affine_move_darray_push pos "$FIXTURES/affine_move_darray_push.pos.elisa" 'linear value "t" must be moved explicitly before move into darray push'
 run_case affine_move_sites neg "$FIXTURES/affine_move_sites.neg.elisa" "must be moved explicitly"
+run_case affine_move_enum_payload pos "$FIXTURES/affine_move_enum_payload.pos.elisa" 'linear value "t" must be moved explicitly before move into enum payload "Box.Full" argument 1'
+run_case affine_move_enum_payload_label pos "$FIXTURES/affine_move_enum_payload_label.pos.elisa" 'linear value "u" must be moved explicitly before move into enum payload "Box.Tagged.h"'
+run_case affine_move_discard pos "$FIXTURES/affine_move_discard.pos.elisa" 'linear value "t" must be moved explicitly before discard'
+run_case affine_move_enum_payload neg "$FIXTURES/affine_move_enum_payload.neg.elisa" "must be moved explicitly"
+run_case affine_move_dict_put pos "$FIXTURES/affine_move_dict_put.pos.elisa" 'linear value "t" must be moved explicitly before move into dict put'
+run_case affine_move_record_update pos "$FIXTURES/affine_move_record_update.pos.elisa" 'linear value "t" must be moved explicitly before move into record update field "a"'
+run_case affine_move_record_update pos "$FIXTURES/affine_move_record_update.pos.elisa" 'value containing linear handles "p" must be moved explicitly before record update'
+run_case affine_move_dict_record neg "$FIXTURES/affine_move_dict_record.neg.elisa" "must be moved explicitly"
+echo "-- affine_move_in_loop --"
+loop_msg='declared outside the loop is consumed on every iteration'
+run_case affine_move_in_for_loop pos "$FIXTURES/affine_move_in_for_loop.pos.elisa" "$loop_msg"
+run_case affine_move_in_while_loop pos "$FIXTURES/affine_move_in_while_loop.pos.elisa" "$loop_msg"
+run_case affine_move_in_loop_drop pos "$FIXTURES/affine_move_in_loop_drop.pos.elisa" "$loop_msg"
+run_case affine_use_after_loop_move pos "$FIXTURES/affine_use_after_loop_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
+run_case affine_use_in_loop_after_move pos "$FIXTURES/affine_use_in_loop_after_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
+run_case affine_move_in_loop neg "$FIXTURES/affine_move_in_loop.neg.elisa" "$loop_msg"
+run_case affine_move_in_loop neg "$FIXTURES/affine_move_in_loop.neg.elisa" "after ownership was consumed"
 
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
