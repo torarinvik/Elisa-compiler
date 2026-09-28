@@ -615,6 +615,15 @@ run_case linear_partial_consume pos "$lp_pos" 'linear value "h" must be consumed
 run_case linear_partial_consume pos "$lp_pos" 'linear value "m" must be consumed before scope exit'
 run_case linear_partial_consume neg "$lp_neg" "must be consumed before scope exit"
 run_case linear_partial_consume neg "$lp_neg" "cannot be used after ownership was consumed"
+echo "-- value_block_nested_loop --"
+vn_pos="$FIXTURES/value_block_nested_loop.pos.elisa"
+vn_neg="$FIXTURES/value_block_nested_loop.neg.elisa"
+run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "outer" (docs/119 E4)'
+run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "total" (docs/119 E4)'
+run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "deep" (docs/119 E4)'
+run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "ys" through a call'
+run_case value_block_nested_loop neg "$vn_neg" "value block may not mutate"
+run_case value_block_nested_loop neg "$vn_neg" "names no binding in scope"
 
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
