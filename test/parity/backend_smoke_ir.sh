@@ -160,6 +160,11 @@ stage1_ir_absent_case extern_optional_ptr_not_tagged 'extern malloc(n: usize) ->
 stage1_ir_case optional_plain_ref_niche_alloca 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' '%r = alloca ptr'
 stage1_ir_absent_case optional_plain_ref_not_tagged 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' 'store i1 true'
 stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' '^target triple = "arm64'
+
+# Address-taking a view element must lower through the view's `{data, len}` header
+# rather than decline the enclosing function or GEP through the header itself. This
+# is the backend regression behind `peek(&xs[0])` in the affine projection fixture.
+stage1_ir_case view_element_address 'struct Handle:\n    v: i64\n\ndef peek(h: Handle&) -> i64:\n    return h.v\n\ndef element_read(xs: view[Handle]) -> i64:\n    return peek(&xs[0])\n\ndef main() -> i64:\n    return 0\n' 'view\.elem\.ptr'
 stage1_ir_absent_case store_not_underaligned 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'store i64 %comp.var.value, ptr %comp.var, align 4'
 
 # The `-Wperf` autovec MARKER on a comprehension's latch branch. It rides in the IR so it
@@ -212,6 +217,7 @@ stage1_ir_env_file_absent_case disjoint_parameter_invalidated_by_reference_alias
 stage1_ir_env_file_absent_case disjoint_scope_index_out_of_range ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_scope_index_out_of_range.elisa' 'elisa\.disjoint\.update_pair\.'
 stage1_ir_env_file_absent_case disjoint_fresh_invalidated_by_call ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_fresh_invalidated_by_call.elisa' 'elisa\.disjoint\.update_pair\.'
 stage1_ir_env_file_absent_case disjoint_fresh_invalidated_across_loop ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_fresh_invalidated_across_loop.elisa' 'elisa\.disjoint\.update_pair\.'
+stage1_ir_env_file_absent_case disjoint_fresh_invalidated_by_reference_alias ELISACORE_NOALIAS_MUTABLE_REFS 1 'test/repro/disjoint_fresh_invalidated_by_reference_alias.elisa' 'elisa\.disjoint\.update_pair\.'
 # A plain for-loop is NOT a comprehension build loop and must NOT be tagged: a marker there
 # would make -Wperf demand vectorization of a loop the language never promised to vectorize.
 stage1_ir_absent_case autovec_not_plain_loop 'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total - 3\n' 'elisa.autovec.expected'
