@@ -573,6 +573,15 @@ run_case affine_move_dict_put pos "$FIXTURES/affine_move_dict_put.pos.elisa" 'li
 run_case affine_move_record_update pos "$FIXTURES/affine_move_record_update.pos.elisa" 'linear value "t" must be moved explicitly before move into record update field "a"'
 run_case affine_move_record_update pos "$FIXTURES/affine_move_record_update.pos.elisa" 'value containing linear handles "p" must be moved explicitly before record update'
 run_case affine_move_dict_record neg "$FIXTURES/affine_move_dict_record.neg.elisa" "must be moved explicitly"
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "p.h" must be moved explicitly before move into local "u"'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "o.p.h" must be moved explicitly before argument to call "sink"'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "p.h" must be moved explicitly before return'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "p.h" must be moved explicitly before assignment'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "p.h" must be moved explicitly before move into struct literal field "h"'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'must be moved explicitly before move into enum payload "Box.Full" argument 1'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "<value>" must be moved explicitly before argument to call "sink"'
+run_case affine_move_projection pos "$FIXTURES/affine_move_projection.pos.elisa" 'linear value "<value>" must be moved explicitly before move into local "u"'
+run_case affine_move_projection neg "$FIXTURES/affine_move_projection.neg.elisa" "must be moved explicitly"
 echo "-- affine_move_in_loop --"
 loop_msg='declared outside the loop is consumed on every iteration'
 run_case affine_move_in_for_loop pos "$FIXTURES/affine_move_in_for_loop.pos.elisa" "$loop_msg"
@@ -582,6 +591,30 @@ run_case affine_use_after_loop_move pos "$FIXTURES/affine_use_after_loop_move.po
 run_case affine_use_in_loop_after_move pos "$FIXTURES/affine_use_in_loop_after_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
 run_case affine_move_in_loop neg "$FIXTURES/affine_move_in_loop.neg.elisa" "$loop_msg"
 run_case affine_move_in_loop neg "$FIXTURES/affine_move_in_loop.neg.elisa" "after ownership was consumed"
+run_case affine_move_after_if_move pos "$FIXTURES/affine_move_after_if_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
+run_case affine_use_after_if_else_move pos "$FIXTURES/affine_use_after_if_else_move.pos.elisa" 'linear handle value "t" cannot be used after ownership was consumed'
+run_case affine_move_conditional_in_loop pos "$FIXTURES/affine_move_conditional_in_loop.pos.elisa" "$loop_msg"
+run_case affine_move_conditional neg "$FIXTURES/affine_move_conditional.neg.elisa" "after ownership was consumed"
+run_case affine_move_conditional neg "$FIXTURES/affine_move_conditional.neg.elisa" "$loop_msg"
+echo "-- captured_loop_checks --"
+cl_pos="$FIXTURES/captured_loop_checks.pos.elisa"
+cl_neg="$FIXTURES/captured_loop_checks.neg.elisa"
+run_case captured_loop_checks pos "$cl_pos" 'linear value "t" must be moved explicitly before argument to call "sink"'
+run_case captured_loop_checks pos "$cl_pos" 'cannot mutate "xs" while it is being iterated'
+run_case captured_loop_checks pos "$cl_pos" 'linear value "k" must be consumed before scope exit'
+run_case captured_loop_checks pos "$cl_pos" 'linear handle value "u" cannot be used after ownership was consumed'
+run_case captured_loop_checks neg "$cl_neg" "must be moved explicitly"
+run_case captured_loop_checks neg "$cl_neg" "while it is being iterated"
+run_case captured_loop_checks neg "$cl_neg" "must be consumed before scope exit"
+run_case captured_loop_checks neg "$cl_neg" "cannot be used after ownership was consumed"
+echo "-- linear_partial_consume --"
+lp_pos="$FIXTURES/linear_partial_consume.pos.elisa"
+lp_neg="$FIXTURES/linear_partial_consume.neg.elisa"
+run_case linear_partial_consume pos "$lp_pos" 'linear value "g" must be consumed before scope exit'
+run_case linear_partial_consume pos "$lp_pos" 'linear value "h" must be consumed before scope exit'
+run_case linear_partial_consume pos "$lp_pos" 'linear value "m" must be consumed before scope exit'
+run_case linear_partial_consume neg "$lp_neg" "must be consumed before scope exit"
+run_case linear_partial_consume neg "$lp_neg" "cannot be used after ownership was consumed"
 
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"

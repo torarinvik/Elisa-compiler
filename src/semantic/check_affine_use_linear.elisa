@@ -56,22 +56,27 @@ extend Semantic:
                         pass
 
 
-        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |names, flags, consumed, table| -> table:
+                for statement in statements |names, flags, consumed, partial, table| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- walk_affine_block_statements(value, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_block_statements(value, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                             table <- walk_affine_expression(value, names, flags, consumed, table)
+                            # A declaration binds a fresh value: an earlier binding's consumption
+                            # (say, in a sibling branch) says nothing about it.
+                            consumed <- [held for held in consumed if held != name]
+                            partial <- [held for held in partial if held != name]
                             names.push(name)
                             flags.push(affine_type_expression(type_expression, table))
                         Stmt.Assign(target, operator, value, line):
-                            table <- walk_affine_block_statements(value, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_block_statements(value, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                             table <- walk_affine_expression(value, names, flags, consumed, table)
                             # `o <- K{...}` RE-INITIALISES `o`: its consumption is discharged and a
                             # later move is legal again, exactly as stage0 accepts.
                             reinit_name: sview = ident_name_of(target)
                             consumed <- [held for held in consumed if held != reinit_name] if operator == TokenKind.LArrow and reinit_name != ""
+                            partial <- [held for held in partial if held != reinit_name] if operator == TokenKind.LArrow and reinit_name != ""
                             # An un-annotated `t = Ticket.new(...)` binds a fresh linear local (parsed
                             # as Assign, not VarDecl); register it so a later `move t` is tracked.
                             assign_name: sview = ident_name_of(target)
@@ -79,7 +84,7 @@ extend Semantic:
                             names.push(assign_name) if assign_is_linear
                             flags.push(true) if assign_is_linear
                         Stmt.Expr(expression, line):
-                            table <- walk_affine_block_statements(expression, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_block_statements(expression, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                             table <- walk_affine_expression(expression, names, flags, consumed, table)
                             # A consuming call `f(x)` (f drives x to a terminal typestate)
                             # completes x's protocol — mark the linear-local argument consumed.
@@ -100,7 +105,7 @@ extend Semantic:
                         Stmt.Return(value, line):
                             match value:
                                 returned:
-                                    table <- walk_affine_block_statements(returned, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                                    table <- walk_affine_block_statements(returned, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                                     table <- walk_affine_expression(returned, names, flags, consumed, table)
                                     returned_root: sview = affine_root(returned)
                                     consumed.push(returned_root) if returned_root != "" and affine_local(names, flags, returned_root) and not affine_consumed(consumed, returned_root)
@@ -112,27 +117,78 @@ extend Semantic:
                             else_consumed: mutable darray[sview] = []
                             then_consumed.extend(consumed)
                             else_consumed.extend(consumed)
-                            table <- walk_affine_statements(then_body, names, flags, then_consumed, linear_names, consuming_fns, consuming_positions, table)
-                            table <- walk_affine_statements(else_body, names, flags, else_consumed, linear_names, consuming_fns, consuming_positions, table)
-                            for consumed_name in then_consumed |consumed|:
-                                consumed.push(consumed_name) if affine_consumed(else_consumed, consumed_name) and not affine_consumed(consumed, consumed_name)
+                            table <- walk_affine_statements(then_body, names, flags, then_consumed, partial, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_statements(else_body, names, flags, else_consumed, partial, linear_names, consuming_fns, consuming_positions, table)
+                            # MAY-consumed, as stage0: a value either branch consumed is gone after the
+                            # `if` (a one-branch `sink(move t)` then `sink(move t)` is a double move). A
+                            # branch that always leaves (`return`/`break`) contributes nothing.
+                            then_exits: bool = affine_body_exits(then_body)
+                            else_exits: bool = affine_body_exits(else_body)
+                            if not (then_exits and else_exits):
+                                # MUST-consumed is what the scope-exit leak check needs: a value
+                                # newly consumed on one fall-through branch but not the other is
+                                # only PARTIALLY consumed (`if c: release(move g)` leaks g on the
+                                # else path). Recorded before the merge below widens `consumed`.
+                                for then_new in then_consumed |partial|:
+                                    partial.push(then_new) if not then_exits and not else_exits and not affine_consumed(consumed, then_new) and not affine_consumed(else_consumed, then_new) and not affine_consumed(partial, then_new)
+                                for else_new in else_consumed |partial|:
+                                    partial.push(else_new) if not then_exits and not else_exits and not affine_consumed(consumed, else_new) and not affine_consumed(then_consumed, else_new) and not affine_consumed(partial, else_new)
+                                # Both branch snapshots begin with the pre-if consumed state.
+                                # Add the names from every branch that can fall through; the
+                                # destination already retains all earlier consumptions, so no
+                                # destructive filter or temporary region-backed darray is needed.
+                                for then_name in then_consumed |consumed|:
+                                    consumed.push(then_name) if not then_exits and not affine_consumed(consumed, then_name)
+                                for else_name in else_consumed |consumed|:
+                                    consumed.push(else_name) if not else_exits and not affine_consumed(consumed, else_name)
                         Stmt.Block(kind, clause, binding, body, line):
                             moved_root: sview = move_block_root(kind, body)
-                            table <- walk_affine_statements(body, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_statements(body, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                             consumed.push(moved_root) if moved_root != "" and affine_local(names, flags, moved_root) and not affine_consumed(consumed, moved_root)
                         Stmt.While(condition, body, line):
                             table <- walk_affine_expression(condition, names, flags, consumed, table)
                             no_loop_variables: darray[sview] = []
-                            table <- walk_affine_loop_body(body, no_loop_variables, line, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_loop_body(body, no_loop_variables, line, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                         Stmt.For(bind, variables, iterable, body, line):
                             table <- walk_affine_expression(iterable, names, flags, consumed, table)
-                            table <- walk_affine_loop_body(body, variables, line, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_loop_body(body, variables, line, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                         Stmt.Match(scrutinee, arms, line):
                             matched_root: sview = affine_match_root(scrutinee)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: matched_root, line: line.line, expected: "match", actual: ""}) if matched_root != "" and affine_consumed(consumed, matched_root)
                             table <- walk_affine_expression(scrutinee, names, flags, consumed, table)
-                            for arm in arms |table, consumed| -> table:
-                                table <- walk_affine_statements(arm.body, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            # Each arm starts from the state before the `match` (arm B does not see arm
+                            # A's move); afterwards a value is consumed if any arm that falls through
+                            # consumed it.
+                            arms_merged: mutable darray[sview] = []
+                            # For each merged name, how many fall-through arms consumed it; one
+                            # consumed by fewer than all of them is only PARTIALLY consumed.
+                            arms_merged_counts: mutable darray[usize] = []
+                            falling_arms: mutable usize = 0
+                            any_arm_falls_through: mutable bool = false
+                            for arm in arms |table, consumed, partial, arms_merged, arms_merged_counts, falling_arms, any_arm_falls_through| -> table:
+                                arm_consumed: mutable darray[sview] = []
+                                arm_consumed.extend(consumed)
+                                table <- walk_affine_statements(arm.body, names, flags, arm_consumed, partial, linear_names, consuming_fns, consuming_positions, table)
+                                if not affine_body_exits(arm.body):
+                                    any_arm_falls_through <- true
+                                    falling_arms <- falling_arms + 1
+                                    for arm_name in arm_consumed |arms_merged, arms_merged_counts|:
+                                        merged_index: mutable usize = arms_merged.count
+                                        for probe_index in 0..<arms_merged.count |merged_index|:
+                                            merged_index <- probe_index if arms_merged[probe_index] == arm_name
+                                        if merged_index < arms_merged.count:
+                                            arms_merged_counts[merged_index] <- arms_merged_counts[merged_index] + 1
+                                        else:
+                                            arms_merged.push(arm_name)
+                                            arms_merged_counts.push(1)
+                            for count_index in 0..<arms_merged.count |partial|:
+                                partial_name: sview = arms_merged[count_index]
+                                partial.push(partial_name) if arms_merged_counts[count_index] < falling_arms and not affine_consumed(consumed, partial_name) and not affine_consumed(partial, partial_name)
+                            if any_arm_falls_through:
+                                # Add the union of the arms that fall through to the existing
+                                # consumed state; every arm snapshot began from that state.
+                                for arm_merged_name in arms_merged |consumed|:
+                                    consumed.push(arm_merged_name) if not affine_consumed(consumed, arm_merged_name)
                             consumed.push(matched_root) if matched_root != "" and affine_local(names, flags, matched_root) and not affine_consumed(consumed, matched_root)
                         _:
                             pass
@@ -143,11 +199,11 @@ extend Semantic:
         # value, so the statements are walked here, ahead of it. Without this every move
         # inside a captured loop escaped tracking (`while c |c|: sink(move t)` was a silent
         # double move while the capture-less loop was rejected).
-        def walk_affine_block_statements(expression: Ast::Expr, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def walk_affine_block_statements(expression: Ast::Expr, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Block(block_statements, block_value, block_captures, block_line):
-                        table <- walk_affine_statements(block_statements, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                        table <- walk_affine_statements(block_statements, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                     _:
                         pass
 
@@ -170,7 +226,7 @@ extend Semantic:
         # leaves the loop. Stage0 accepts that; this reports it. What the body consumed stays
         # consumed after the loop, as stage0 does (`while ...: sink(move t)` then `t.v`).
         # Names the body or the loop header declares are per-iteration and never leak out.
-        def walk_affine_loop_body(body: darray[Ast::Stmt], loop_variables: darray[sview]&, loop_pos: Ast::Pos, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def walk_affine_loop_body(body: darray[Ast::Stmt], loop_variables: darray[sview]&, loop_pos: Ast::Pos, names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, partial: mutable darray[sview]&, linear_names: darray[sview]&, consuming_fns: darray[sview]&, consuming_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 outer_count: usize = names.count
                 for loop_variable in loop_variables |names, flags|:
@@ -178,7 +234,7 @@ extend Semantic:
                     flags.push(false)
                 body_consumed: mutable darray[sview] = []
                 body_consumed.extend(consumed)
-                table <- walk_affine_statements(body, names, flags, body_consumed, linear_names, consuming_fns, consuming_positions, table)
+                table <- walk_affine_statements(body, names, flags, body_consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                 body_exits: bool = affine_body_exits(body)
                 for consumed_name in body_consumed |consumed, table| -> table:
                     declared_inside: mutable bool = false
@@ -187,6 +243,11 @@ extend Semantic:
                     if not declared_inside and not affine_consumed(consumed, consumed_name):
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: consumed_name, pos: loop_pos, line: loop_pos.line, expected: "loop", actual: ""}) if not body_exits
                         consumed.push(consumed_name)
+                    # A linear local the body declares AND consumes was discharged within its
+                    # own iteration; record it so the scope-exit leak check (keyed by name over
+                    # the whole function) sees it. It is out of scope after the loop, so no
+                    # later use can observe this; one the body leaves unconsumed stays a leak.
+                    consumed.push(consumed_name) if declared_inside and not affine_consumed(consumed, consumed_name)
 
         # Names of `linear struct`/`linear typestate` types (affinity "linear"): a value of such
         # a type must be consumed exactly once, so an unconsumed local is a leak.
@@ -328,6 +389,7 @@ extend Semantic:
                             names: mutable darray[sview] = []
                             flags: mutable darray[bool] = []
                             consumed: mutable darray[sview] = []
+                            partial: mutable darray[sview] = []
                             alias_names: mutable darray[sview] = []
                             alias_roots: mutable darray[sview] = []
                             shutdown_names: mutable darray[sview] = []
@@ -335,15 +397,16 @@ extend Semantic:
                             for param in params |names, flags|:
                                 names.push(param.name)
                                 flags.push(affine_type_expression(param.type_expression, table))
-                            table <- walk_affine_statements(body, names, flags, consumed, linear_names, consuming_fns, consuming_positions, table)
+                            table <- walk_affine_statements(body, names, flags, consumed, partial, linear_names, consuming_fns, consuming_positions, table)
                             # Linear locals must be consumed on every path. The affine `consumed`
-                            # set (built above, with branch-merge) is the sound consumption model;
-                            # a linear local absent from it is leaked at scope exit.
+                            # set (built above, with branch-merge) is MAY-consumed; a linear local
+                            # absent from it, or consumed on only some paths (`partial`), is
+                            # leaked at scope exit.
                             linear_local_names: mutable darray[sview] = []
                             linear_local_lines: mutable darray[u32] = []
                             collect_linear_locals(body, linear_names, table, linear_local_names, linear_local_lines)
                             while linear_probe < linear_local_names.count |linear_probe: usize = 0, table| -> table:
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LinearScopeExit, name: linear_local_names[linear_probe], line: linear_local_lines[linear_probe], expected: "", actual: ""}) if not affine_consumed(consumed, linear_local_names[linear_probe])
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LinearScopeExit, name: linear_local_names[linear_probe], line: linear_local_lines[linear_probe], expected: "", actual: ""}) if not affine_consumed(consumed, linear_local_names[linear_probe]) or affine_consumed(partial, linear_local_names[linear_probe])
                                 linear_probe <- linear_probe + 1
                             table <- linear_return_walk(body, linear_local_names, table)
                             lifecycle: u32 = lifecycle_statement_flags(body)
