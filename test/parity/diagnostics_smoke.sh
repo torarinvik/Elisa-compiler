@@ -263,6 +263,7 @@ NAMES=(
     storage_dependency_whole_assignment
     mutate_while_iterating_reassignment
     mutate_while_iterating_plus_eq
+    mutate_while_iterating_field_chain
     storage_dependency_field_replacement
 )
 EXPECTS=(
@@ -493,6 +494,7 @@ EXPECTS=(
     "storage dependency facts were invalidated for interior reference \"r\""
     "cannot mutate \"xs\" while it is being iterated: reassignment of xs"
     "cannot mutate \"xs\" while it is being iterated: darray push of xs"
+    "items\" while it is being iterated"
     "storage dependency facts were invalidated for interior reference \"r\""
 )
 
