@@ -1,0 +1,190 @@
+# Bulk copies into a darray whose element holds a linear handle. stage0
+# (analyzer_expr_builtin_collections) refuses both spellings, because a bulk copy
+# duplicates every handle in the source:
+#
+#   ys.extend(xs)      "darray extend does not support affine element type T; ..."
+#   ys.push(xs)        "bulk darray push does not support affine element type T; ..."
+#   ys.push([move h])
+#
+# A push is BULK when its argument is not assignable to the element but is a container
+# of it. stage1 decides that syntactically: a list literal, unless the element is itself
+# a container (`t.push([])` on `darray[darray[Handle]]` pushes one empty element), or a
+# local/param whose darray or fixed-array element is spelled the same as the receiver's.
+# Receivers are the function's locals and params; a field receiver (`self.items.extend`)
+# is not tracked.
+extend Semantic:
+    private:
+        # The element type of a `darray[E]` (`mutable`-wrapped ok) or a fixed array `E[N]`.
+        def bulk_container_element(type_expression: Ast::Expr) -> Ast::Expr?:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, argument, index_line):
+                        if ident_name_of(head) == "darray":
+                            return argument
+                        match argument:
+                            Expr.IntLit(extent, extent_line):
+                                return head
+                            _:
+                                return null
+                    Expr.IndexN(head, arguments, index_n_line):
+                        if ident_name_of(head) == "darray" and arguments.count > 0:
+                            return arguments[0]
+                        return null
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Mutable:
+                            return bulk_container_element(operand)
+                        return null
+                    Expr.Paren(inner, paren_line):
+                        return bulk_container_element(inner)
+                    _:
+                        return null
+
+        # Whether a type is a container a list literal could initialise (`darray[...]`, `E[N]`).
+        def bulk_type_is_container(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                element_opt: Ast::Expr? = bulk_container_element(type_expression)
+                if element_opt is element:
+                    return true
+                return false
+
+        # Stage0's spelling of a type into OUT, or false when it cannot be spelled.
+        def bulk_spelling(type_expression: Ast::Expr, out: mutable darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return affine_type_render(type_expression, out)
+
+        def bulk_same_spelling(left: Ast::Expr, right: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                left_bytes: mutable darray[u8] = []
+                right_bytes: mutable darray[u8] = []
+                false return if not bulk_spelling(left, &left_bytes)
+                false return if not bulk_spelling(right, &right_bytes)
+                false return if left_bytes.count != right_bytes.count
+                for offset in 0..<left_bytes.count |left_bytes, right_bytes|:
+                    false return if left_bytes[offset] != right_bytes[offset]
+                return true
+
+        def bulk_collect_locals(statements: darray[Ast::Stmt], out_names: mutable darray[sview]&, out_types: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_types|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if bulk_type_is_container(type_expression):
+                                out_names.push(name)
+                                out_types.push(type_expression)
+                        Stmt.If(condition, then_body, else_body, line):
+                            bulk_collect_locals(then_body, out_names, out_types)
+                            bulk_collect_locals(else_body, out_names, out_types)
+                        Stmt.While(condition, while_body, while_line):
+                            bulk_collect_locals(while_body, out_names, out_types)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            bulk_collect_locals(for_body, out_names, out_types)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            bulk_collect_locals(body, out_names, out_types)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out_names, out_types|:
+                                bulk_collect_locals(arm.body, out_names, out_types)
+                        _:
+                            pass
+
+        # The declared type of NAME among the collected containers (the last declaration wins).
+        def bulk_type_of(names: darray[sview]&, types: darray[Ast::Expr]&, name: sview) -> Ast::Expr?:
+            can Abort.Panic:
+                found: mutable Ast::Expr? = null
+                for probe in 0..<names.count |found|:
+                    found <- types[probe] if names[probe] == name
+                return found
+
+        # The local a bulk argument names: `xs`, `move xs` or `(xs)`; "" otherwise.
+        def bulk_argument_local(argument: Ast::Expr) -> sview:
+            can Abort.Panic:
+                return match argument:
+                    Expr.Ident(argument_name, argument_line): argument_name
+                    Expr.Move(moved, moved_line): bulk_argument_local(moved)
+                    Expr.Paren(inner, paren_line): bulk_argument_local(inner)
+                    _: ""
+
+        # Whether a push ARGUMENT is a whole container of ELEMENT rather than one element.
+        def bulk_push_argument(argument: Ast::Expr, element: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Array(elements, array_line):
+                        return not bulk_type_is_container(element)
+                    _:
+                        source: sview = bulk_argument_local(argument)
+                        source_type_opt: Ast::Expr? = bulk_type_of(names, types, source) if source != "" else null
+                        if source_type_opt is source_type:
+                            if bulk_container_element(source_type) is source_element:
+                                return bulk_same_spelling(source_element, element)
+                        return false
+
+        # Report a bulk copy in one statement expression: `recv.extend(a)` / bulk `recv.push(a)`.
+        def bulk_check_call(expression: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        table <- bulk_check_call(inner, names, types, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Field(receiver, method, field_line):
+                                receiver_name: sview = ident_name_of(receiver)
+                                tracked: bool = receiver_name != "" and arguments.count == 1 and (method == "extend" or method == "push")
+                                receiver_type_opt: Ast::Expr? = bulk_type_of(names, types, receiver_name) if tracked else null
+                                if receiver_type_opt is receiver_type:
+                                    if darray_holds_linear(receiver_type, table):
+                                        if bulk_container_element(receiver_type) is element:
+                                            if method == "extend" or bulk_push_argument(arguments[0], element, names, types):
+                                                spelling: mutable darray[u8] = []
+                                                rendered: bool = bulk_spelling(element, &spelling)
+                                                # text_storage never reallocates, so its bytes are a stable Diagnostic sview.
+                                                start: usize = table.text_storage.count
+                                                fits: bool = rendered and start + spelling.count <= 65536.usize()
+                                                for byte in spelling |table| -> table:
+                                                    table.text_storage.push(byte) if fits
+                                                text: sview = bytes_view_range(table.text_storage, start, spelling.count) if fits else receiver_name
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineBulkCopy, name: receiver_name, pos: field_line, line: call_line.line, expected: method, actual: text})
+                            _:
+                                pass
+                    _:
+                        pass
+
+        def bulk_walk(statements: darray[Ast::Stmt], names: darray[sview]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- bulk_check_call(expression, names, types, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- bulk_walk(then_body, names, types, table)
+                            table <- bulk_walk(else_body, names, types, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- bulk_walk(while_body, names, types, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- bulk_walk(for_body, names, types, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- bulk_walk(body, names, types, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- bulk_walk(arm.body, names, types, table)
+                        _:
+                            pass
+
+        def bulk_copy_funcs(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            names: mutable darray[sview] = []
+                            types: mutable darray[Ast::Expr] = []
+                            for param in params |names, types|:
+                                if bulk_type_is_container(param.type_expression):
+                                    names.push(param.name)
+                                    types.push(param.type_expression)
+                            bulk_collect_locals(body, names, types)
+                            if names.count > 0:
+                                table <- bulk_walk(body, names, types, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- bulk_copy_funcs(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- bulk_copy_funcs(scoped_body, table)
+                        _:
+                            pass

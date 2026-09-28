@@ -717,6 +717,19 @@ done
 run_case affine_container_return neg "$acr_neg" "must be moved explicitly before return"
 run_case affine_container_return neg "$acr_neg" "must be consumed before scope exit"
 
+echo "-- affine_bulk_copy --"
+abc_pos="$FIXTURES/affine_bulk_copy.pos.elisa"
+abc_neg="$FIXTURES/affine_bulk_copy.neg.elisa"
+for abc_element in Handle Pair; do
+    run_case affine_bulk_copy pos "$abc_pos" "darray extend does not support affine element type $abc_element; push elements individually with explicit move"
+done
+for abc_element in Handle "darray[Handle]"; do
+    run_case affine_bulk_copy pos "$abc_pos" "bulk darray push does not support affine element type $abc_element; push elements individually with explicit move"
+done
+run_case affine_bulk_copy pos "$abc_pos" "query expression value iteration does not support affine element type Handle"
+run_case affine_bulk_copy neg "$abc_neg" "darray extend does not support affine element type"
+run_case affine_bulk_copy neg "$abc_neg" "bulk darray push does not support affine element type"
+
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
 guard_neg="$FIXTURES/shift_match_guards.neg.elisa"
