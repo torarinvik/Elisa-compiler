@@ -180,6 +180,7 @@ NAMES=(
     region_match_return_escape
     region_block_return_escape
     region_index_return_escape
+    region_fixed_array_element_return_escape
     region_match_local_return_escape
     region_branch_tainted_aggregate_return
     region_nested_growth_escape
@@ -405,6 +406,7 @@ EXPECTS=(
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
     "cannot return value: region dependency facts include local region"
+    "escapes via return; the region is freed at scope exit"
     "match requires an enum"
     "value backed by scope-owned region \"scratch\" escapes via return; the region is freed at block exit"
     "darray push allocates into function-scoped region"
