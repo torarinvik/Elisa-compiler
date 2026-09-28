@@ -68,6 +68,7 @@ NAMES=(
     destroyed_region_use
     destroyed_region_allocate
     storage_dependency_invalidated
+    storage_dependency_callee_growth
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
@@ -289,6 +290,7 @@ EXPECTS=(
     "argument 2 to \"same\" expects darray[i32, pair], got darray[i32, shape_after#3]"
     "region dependency facts were invalidated by destroy of region \"scratch\""
     "cannot allocate from destroyed region \"scratch\""
+    "storage dependency facts were invalidated by darray push"
     "storage dependency facts were invalidated by darray push"
     "duplicate packed group member \"b\" in H.flags"
     "declares named states but is missing a derive state: block"

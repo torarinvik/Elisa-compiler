@@ -1,6 +1,8 @@
 extend Semantic:
     private:
-        # The place addressed by `&place` when PLACE is an index into a named container.
+        # The root of the container addressed by `&place` when PLACE is an index into it:
+        # `&xs[i]` -> "xs", `&bag.items[i]` -> "bag" (stage0 keys the latter on "bag.items"
+        # and matches a mutation of "bag"; keying on the root is the conservative superset).
         # Parentheses and `move` are transparent here, matching stage0's optimization-paren
         # stripping before it classifies an interior borrow.
         def interior_reference_place(expression: Ast::Expr) -> sview:
@@ -10,11 +12,7 @@ extend Semantic:
                 Expr.Move(inner, line):
                     return interior_reference_place(inner)
                 Expr.Index(object, index, index_line):
-                    match object:
-                        Expr.Ident(name, ident_line):
-                            return name
-                        _:
-                            pass
+                    return storage_view_place_root(object)
                 _:
                     pass
             return ""
@@ -564,15 +562,72 @@ extend Semantic:
                     match callee:
                         Expr.Field(receiver, method, field_line):
                             root: sview = storage_view_place_root(receiver)
-                            return root if method in {"push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate"} else ""
+                            return root if method in {"push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate", "pop", "as_cstr"} else ""
                         Expr.Ident(method, ident_line):
-                            if method in {"darray_push", "darray_extend", "darray_append", "darray_append_many", "darray_insert", "darray_reserve", "darray_resize", "darray_clear", "darray_truncate", "push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate"} and arguments.count > 0:
+                            if method in {"darray_push", "darray_extend", "darray_append", "darray_append_many", "darray_insert", "darray_reserve", "darray_resize", "darray_clear", "darray_truncate", "darray_pop", "push", "extend", "append", "append_many", "insert", "reserve", "resize", "clear", "truncate", "pop"} and arguments.count > 0:
                                 return storage_view_place_root(arguments[0])
                         _:
                             pass
                 _:
                     pass
             return ""
+
+        # Whether CALLEE's positional parameter POSITION is a `mutable T&` borrow whose type can
+        # hold relocatable storage. Only a scalar pointee is known not to: a darray, a struct
+        # with a darray field or a generic may be grown by the callee through the borrow.
+        def storage_callee_param_may_relocate(table: SymbolTable&, callee: sview, position: usize) -> bool:
+            can Abort.Panic:
+                seen: mutable usize = 0
+                result: mutable bool = false
+                cur: mutable u32 = function_param_chain_head(table, callee)
+                while cur != 4294967295:
+                    row: usize = cur.usize()
+                    if table.function_param_owner[row] == callee:
+                        result <- table.function_param_mutable_ref[row] and not storage_scalar_pointee(table.function_param_type_id[row], table) if seen == position
+                        seen <- seen + 1
+                    cur <- table.function_param_name_next[row]
+                return result
+
+        # Whether TYPE_ID, seen through its `&` rows, is a scalar. Unknown (0) is NOT scalar:
+        # an unmodeled parameter type must keep invalidating.
+        def storage_scalar_pointee(type_id: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                current: mutable u32 = type_id
+                while current != 0 and interned_kind(current, table) == SemTypeKind.Ref and interned_elem_count(current, table) == 1:
+                    current <- interned_elem(current, 0, table)
+                kind: SemTypeKind = interned_kind(current, table)
+                return current != 0 and (kind == SemTypeKind.Int or kind == SemTypeKind.Float or kind == SemTypeKind.Bool or kind == SemTypeKind.Char)
+
+        # Container roots a call relocates through a user function's `mutable T&` parameters
+        # (`grow(&xs)` where `def grow(ys: mutable darray[i64]&)` pushes). The callee is
+        # analysed in its own scope, so the call site is the only place that can see an
+        # interior reference into `xs` outlive the growth. Nested calls in arguments count.
+        def callee_relocation_targets(expression: Ast::Expr, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        callee_name: sview = ident_name_of(callee)
+                        for argument in arguments |position: usize = 0, out, callee_name, table|:
+                            callee_relocation_targets(argument, table, out)
+                            root: sview = storage_view_place_root(argument) if callee_name != "" else ""
+                            storage_view_push_source(root, out) if root != "" and storage_callee_param_may_relocate(table, callee_name, position)
+                            position <- position + 1
+                    Expr.Paren(inner, line):
+                        callee_relocation_targets(inner, table, out)
+                    Expr.Unary(operator, operand, line):
+                        callee_relocation_targets(operand, table, out)
+                    Expr.Binary(left, operator, right, line):
+                        callee_relocation_targets(left, table, out)
+                        callee_relocation_targets(right, table, out)
+                    _:
+                        pass
+
+        def invalidate_callee_relocations(expression: Ast::Expr, function_line: u32, line: u32, annotations: darray[Ast::LocalRegionAnnotation]&, stable_regions: darray[sview]&, alias_names: darray[sview]&, alias_sources: darray[sview]&, alias_is_view: darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                targets: mutable darray[sview] = []
+                callee_relocation_targets(expression, table, targets)
+                for target in targets |invalidated, invalidated_by|:
+                    invalidate_growth_aliases(target, function_line, line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
 
         def invalidated_alias_in_expression(expression: Ast::Expr, invalidated: darray[sview]&) -> sview can[Memory.Allocate, Abort.Panic]:
             match expression:
@@ -640,8 +695,39 @@ extend Semantic:
                         invalidated_by.push(target) if index < alias_names.count and index < alias_is_view.count and alias_is_view[index] and invalidated.count > invalidated_by.count
                     index <- index + 1
 
+        # A declaration introduces a new binding, so an invalidation recorded against an earlier
+        # binding of the same name no longer applies to later uses. The walk that owns the
+        # declaring body restores the marks on exit (`storage_view_restore_invalidated`), so an
+        # inner shadowing declaration cannot hide an invalidated outer binding.
+        def storage_view_forget_invalidated(name: sview, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not fresh_wrapper_name_exists(invalidated, name)
+                kept: mutable darray[sview] = []
+                kept_by: mutable darray[sview] = []
+                for index in 0..<invalidated.count |kept, kept_by, invalidated, invalidated_by, name|:
+                    if invalidated[index] != name:
+                        kept.push(invalidated[index])
+                        kept_by.push(invalidated_by[index]) if index < invalidated_by.count
+                invalidated.truncate(0)
+                invalidated_by.truncate(0)
+                for index in 0..<kept.count |kept, kept_by, invalidated, invalidated_by|:
+                    invalidated.push(kept[index])
+                    invalidated_by.push(kept_by[index]) if index < kept_by.count
+
+        def storage_view_restore_invalidated(saved: darray[sview]&, saved_by: darray[sview]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in 0..<saved.count |saved, saved_by, invalidated, invalidated_by|:
+                    if not fresh_wrapper_name_exists(invalidated, saved[index]):
+                        invalidated.push(saved[index])
+                        invalidated_by.push(saved_by[index]) if index < saved_by.count and invalidated.count > invalidated_by.count
+
         def walk_region_storage_stability(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview]&, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                saved_invalidated: mutable darray[sview] = []
+                saved_invalidated_by: mutable darray[sview] = []
+                for index in 0..<invalidated.count |saved_invalidated, saved_invalidated_by, invalidated, invalidated_by|:
+                    saved_invalidated.push(invalidated[index])
+                    saved_invalidated_by.push(invalidated_by[index]) if index < invalidated_by.count
                 for statement in statements |stable_regions, alias_names, alias_sources, alias_is_view, invalidated, table|:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
@@ -654,10 +740,14 @@ extend Semantic:
                             table <- walk_region_storage_stability(body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
+                            invalidate_growth_aliases(growth_call_target(value), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                            invalidate_callee_relocations(value, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            storage_view_forget_invalidated(name, invalidated, invalidated_by)
                             storage_view_record_typed_alias(name, type_expression, value, alias_names, alias_sources, alias_is_view, view_fns)
                         Stmt.Expr(expression, line):
                             table <- diagnose_invalidated_alias(expression, invalidated, invalidated_by, line.line, table)
                             invalidate_growth_aliases(growth_call_target(expression), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                            invalidate_callee_relocations(expression, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                             match expression:
                                 Expr.Block(statements, value, captures, block_line):
                                     table <- walk_region_storage_stability(statements, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
@@ -666,6 +756,7 @@ extend Semantic:
                         Stmt.Assign(target, operator, value, line):
                             invalidate_growth_aliases(growth_call_target(target), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             invalidate_growth_aliases(growth_call_target(value), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                            invalidate_callee_relocations(value, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                             invalidate_growth_aliases(growth_call_target(collection_append_call(target, value, line)), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) if operator == TokenKind.PlusEq
                             table <- diagnose_invalidated_alias(target, invalidated, invalidated_by, line.line, table)
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
@@ -688,6 +779,7 @@ extend Semantic:
                                 table <- walk_region_storage_stability(arm.body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                         _:
                             pass
+                storage_view_restore_invalidated(saved_invalidated, saved_invalidated_by, invalidated, invalidated_by)
 
         def check_region_storage_stability_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
