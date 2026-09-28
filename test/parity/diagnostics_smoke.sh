@@ -639,6 +639,8 @@ run_case call_argument_alias pos "$ca_pos" 'call "f" passes "s" to mutable refer
 run_case call_argument_alias pos "$ca_pos" 'call "f" passes "u" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
 run_case call_argument_alias pos "$ca_pos" 'call "f" passes "t" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
 run_case call_argument_alias pos "$ca_pos" 'call "grow" passes "vv" to mutable reference parameter "v" while argument for "first" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "poke" passes "c" to mutable reference parameter "other" while argument for "self" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "m" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
 run_case call_argument_alias neg "$ca_neg" "refers to overlapping memory"
 
 echo "-- shift_match_guards --"
