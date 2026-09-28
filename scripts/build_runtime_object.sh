@@ -79,8 +79,10 @@ trap cleanup_runtime_build EXIT
 # The product driver normally infers runtime status from flattened compiler sources, but
 # direct product invocations do not always preserve include-origin markers.
 ELISA_STAGE1_RUNTIME_STD=1 "$PRODUCT" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
-bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$HOOK_SOURCE"
-"$ELISA_CLANG_TOOL" -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
+# --host-callbacks: the object must link STANDALONE (`clang prog.o elisacore_runtime.o`),
+# not only through the driver, which adds its own weak callback shims and -dead_strip.
+bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" --host-callbacks >"$HOOK_SOURCE"
+"$ELISA_CLANG_TOOL" -fno-builtin -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
 if [[ "$INPUT_DIGEST" != "$(runtime_input_digest)" ]]; then
   echo "runtime inputs changed during build; keeping the previous runtime object" >&2
