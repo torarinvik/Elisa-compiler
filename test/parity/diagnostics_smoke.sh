@@ -607,6 +607,20 @@ for lel_line in 12 18 23 29 34; do
     run_case linear_exit_leak pos "$lel_pos" "L$lel_line $lel_msg"
 done
 run_case linear_exit_leak neg "$lel_neg" "must be consumed before scope exit"
+# Error exits (a propagating `try`, `raise`, `else return`/`else raise`, an
+# `else err:` block that returns) drop a live linear local too; a diverging
+# recovery consumes nothing on the fall-through path. Matches stage0 line for line.
+leel_pos="$FIXTURES/linear_error_exit_leak.pos.elisa"
+leel_neg="$FIXTURES/linear_error_exit_leak.neg.elisa"
+for leel_line in 16 21 26 32 37 42; do
+    run_case linear_error_exit_leak pos "$leel_pos" "L$leel_line $lel_msg"
+done
+run_case linear_error_exit_leak neg "$leel_neg" "must be consumed before scope exit"
+atr_pos="$FIXTURES/affine_try_recovery.pos.elisa"
+atr_neg="$FIXTURES/affine_try_recovery.neg.elisa"
+run_case affine_try_recovery pos "$atr_pos" 'L15 linear handle value "h" declared outside the loop is consumed on every iteration'
+run_case affine_try_recovery pos "$atr_pos" 'L24 linear handle value "h" cannot be used after ownership was consumed'
+run_case affine_try_recovery neg "$atr_neg" "after ownership was consumed"
 # A `continue` is a second back edge; the neg (consumed then continue, per
 # iteration) must stay silent.
 acs_pos="$FIXTURES/affine_continue_state.pos.elisa"
