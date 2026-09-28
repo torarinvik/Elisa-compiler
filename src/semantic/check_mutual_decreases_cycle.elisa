@@ -1,15 +1,219 @@
-# Mutually-recursive `decreases` cycle. A function that declares a `decreases` measure and sits in a
-# call cycle passing through at least one OTHER function (a -> b -> ... -> a) cannot have its measure
-# proven to strictly decrease across the cycle by the non-SMT prover — stage0 always errors ("cannot
-# prove the `decreases` measure strictly decreases across the mutually-recursive cycle containing X").
-# (Even measures on every cycle member do not help without the solver, so the structural presence of
-# a length>=2 cycle through a decreases-carrying function is exactly the trigger — a sound match.)
+# Mutually-recursive `decreases` cycle. A simple cycle is accepted only when every call edge that
+# participates in it passes the caller's positive integer measure, minus a positive literal, into the
+# callee's own positive integer measure parameter. Other shapes fail closed; one good edge must never
+# mask a non-decreasing edge elsewhere in the same cycle.
 extend Semantic:
     private:
-        # Record every function's name + whether it carries a `decreases` clause + that clause's line.
-        def mdc_collect_functions(declarations: darray[Ast::Decl], names: mutable darray[sview]&, has_decreases: mutable darray[bool]&, decreases_line: mutable darray[u32]&, measures: mutable darray[sview]&, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&) -> void:
+        const MUTUAL_DECREASES_SAFE_SINGLE_STEP: i64 = 1
+        const MUTUAL_DECREASES_EDGE_UNTRACKED_CALL: i64 = 0
+        const MUTUAL_DECREASES_EDGE_ACCEPTED: i64 = 1
+        const MUTUAL_DECREASES_EDGE_CALLER_UNSUPPORTED: i64 = 2
+        const MUTUAL_DECREASES_EDGE_INDIRECT_CALLEE: i64 = 3
+        const MUTUAL_DECREASES_EDGE_ARGUMENTS_UNALIGNED: i64 = 4
+        const MUTUAL_DECREASES_EDGE_CALLEE_AMBIGUOUS: i64 = 5
+        const MUTUAL_DECREASES_EDGE_CALLEE_MEASURE_UNSUPPORTED: i64 = 6
+        const MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_MISSING: i64 = 7
+        const MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_NOT_DECREASING: i64 = 8
+
+        def mdc_measure_name(expression: Ast::Expr) -> sview:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |names, has_decreases, decreases_line, measures, edge_from, edge_to|:
+                match expression:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Paren(inner, line):
+                        return mdc_measure_name(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        def mdc_measure_parameter_position(parameters: darray[Ast::ParamDecl], measure: sview) -> (found: bool, index: usize):
+            can Memory.Allocate, Abort.Panic:
+                found: mutable bool = false
+                selected: mutable usize = 0
+                for index in 0..<parameters.count |index, parameters, measure, found, selected|:
+                    if parameters[index].name == measure:
+                        return (false, 0) if found
+                        found <- true
+                        selected <- index
+                return (found, selected)
+
+        def mdc_integer_measure_type(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "i128" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "u128" or name == "usize" or name == "isize" or name == "int" or name == "uint" or name == "byte"
+                    _:
+                        return false
+
+        def mdc_requires_positive_measure(statements: darray[Ast::Stmt], measure: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            continue if kind != "requires"
+                            match expression:
+                                Expr.Binary(left, operator, right, binary_line):
+                                    right_literal: (found: bool, value: i64) = where_signed_literal(right)
+                                    return true if mdc_measure_name(left) == measure and operator == TokenKind.Gt and right_literal.found and right_literal.value == 0
+                                    left_literal: (found: bool, value: i64) = where_signed_literal(left)
+                                    return true if mdc_measure_name(right) == measure and operator == TokenKind.Lt and left_literal.found and left_literal.value == 0
+                                _:
+                                    pass
+                        _:
+                            pass
+                return false
+
+        def mdc_pattern_binds_name(pattern: Ast::Pattern, target: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name):
+                        return name == target
+                    Pattern.Rest(name):
+                        return name == target
+                    Pattern.TypeBind(type_name, binder):
+                        return binder == target
+                    Pattern.As(name, inner):
+                        return name == target or (any nested in inner where mdc_pattern_binds_name(nested, target))
+                    Pattern.Variant(path, fields):
+                        return any nested in fields where mdc_pattern_binds_name(nested, target)
+                    Pattern.Struct(path, fields):
+                        return any nested in fields where mdc_pattern_binds_name(nested, target)
+                    Pattern.Field(selector, inner):
+                        return any nested in inner where mdc_pattern_binds_name(nested, target)
+                    Pattern.Tuple(elements):
+                        return any nested in elements where mdc_pattern_binds_name(nested, target)
+                    Pattern.Or(options):
+                        return any nested in options where mdc_pattern_binds_name(nested, target)
+                    _:
+                        return false
+
+        # The syntactic measure is the parameter's value at function entry. A same-named local,
+        # lambda/comprehension binder, or pattern binder could silently replace that value at a
+        # recursive call. This conservative whole-body scan refuses that ambiguity.
+        def mdc_expr_shadows_measure(expression: Ast::Expr, measure: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        if mdc_expr_shadows_measure(callee, measure):
+                            return true
+                        return any argument in arguments where mdc_expr_shadows_measure(argument, measure)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        return true if mdc_expr_shadows_measure(effect_type, measure)
+                        for candidate in candidates:
+                            return true if mdc_expr_shadows_measure(candidate.effect_type, measure)
+                            return true if any capture in candidate.captures where mdc_expr_shadows_measure(capture, measure)
+                        return any argument in arguments where mdc_expr_shadows_measure(argument, measure)
+                    Expr.Field(object, field, line):
+                        return mdc_expr_shadows_measure(object, measure)
+                    Expr.Scope(base, name, line):
+                        return mdc_expr_shadows_measure(base, measure)
+                    Expr.Index(object, index, line):
+                        return mdc_expr_shadows_measure(object, measure) or mdc_expr_shadows_measure(index, measure)
+                    Expr.Slice(object, low, high, line):
+                        return mdc_expr_shadows_measure(object, measure) or mdc_expr_shadows_measure(low, measure) or mdc_expr_shadows_measure(high, measure)
+                    Expr.IndexN(object, arguments, line):
+                        return mdc_expr_shadows_measure(object, measure) or (any argument in arguments where mdc_expr_shadows_measure(argument, measure))
+                    Expr.Binary(left, operator, right, line):
+                        return mdc_expr_shadows_measure(left, measure) or mdc_expr_shadows_measure(right, measure)
+                    Expr.Unary(operator, operand, line):
+                        return mdc_expr_shadows_measure(operand, measure)
+                    Expr.Move(operand, line):
+                        return mdc_expr_shadows_measure(operand, measure)
+                    Expr.RegionNew(operand, region, line):
+                        return mdc_expr_shadows_measure(operand, measure)
+                    Expr.Paren(inner, line):
+                        return mdc_expr_shadows_measure(inner, measure)
+                    Expr.Array(elements, line):
+                        return any element in elements where mdc_expr_shadows_measure(element, measure)
+                    Expr.Tuple(elements, line):
+                        return any element in elements where mdc_expr_shadows_measure(element, measure)
+                    Expr.SetLit(elements, line):
+                        return any element in elements where mdc_expr_shadows_measure(element, measure)
+                    Expr.DictLit(entries, line):
+                        for entry in entries:
+                            return true if mdc_expr_shadows_measure(entry.key, measure) or mdc_expr_shadows_measure(entry.value, measure)
+                        return false
+                    Expr.Construct(type, fields, line):
+                        return true if mdc_expr_shadows_measure(type, measure)
+                        return any field in fields where mdc_expr_shadows_measure(field.value, measure)
+                    Expr.RecordUpdate(base, fields, line):
+                        return true if mdc_expr_shadows_measure(base, measure)
+                        return any field in fields where mdc_expr_shadows_measure(field.value, measure)
+                    Expr.If(condition, then_expr, else_expr, line):
+                        return mdc_expr_shadows_measure(condition, measure) or mdc_expr_shadows_measure(then_expr, measure) or mdc_expr_shadows_measure(else_expr, measure)
+                    Expr.Match(scrutinee, arms, line):
+                        return true if mdc_expr_shadows_measure(scrutinee, measure)
+                        for arm in arms:
+                            return true if mdc_pattern_binds_name(arm.pattern, measure) or mdc_expr_shadows_measure(arm.guard, measure) or mdc_statements_shadow_measure(arm.body, measure)
+                        return false
+                    Expr.Catch(guarded, arms, line):
+                        return true if mdc_expr_shadows_measure(guarded, measure)
+                        for arm in arms:
+                            return true if mdc_pattern_binds_name(arm.pattern, measure) or mdc_expr_shadows_measure(arm.guard, measure) or mdc_statements_shadow_measure(arm.body, measure)
+                        return false
+                    Expr.Comprehension(variable, iterable, condition, body, line):
+                        return true if variable == measure
+                        return mdc_expr_shadows_measure(iterable, measure) or mdc_expr_shadows_measure(condition, measure) or mdc_expr_shadows_measure(body, measure)
+                    Expr.Refinement(base, predicate, line):
+                        return mdc_expr_shadows_measure(base, measure) or mdc_expr_shadows_measure(predicate, measure)
+                    Expr.GetElse(guarded, recovery, line):
+                        return mdc_expr_shadows_measure(guarded, measure) or mdc_statements_shadow_measure(recovery, measure)
+                    Expr.Lambda(parameters, body, line):
+                        return true if any parameter in parameters where parameter == measure
+                        return mdc_statements_shadow_measure(body, measure)
+                    Expr.Block(statements, value, captures, line):
+                        # Captures refer to bindings in the surrounding scope; they do not
+                        # introduce a same-named local. Actual shadowing declarations inside
+                        # the block are detected by mdc_statements_shadow_measure below.
+                        return mdc_statements_shadow_measure(statements, measure) or mdc_expr_shadows_measure(value, measure)
+                    _:
+                        return false
+
+        def mdc_statements_shadow_measure(statements: darray[Ast::Stmt], measure: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            return true if mdc_expr_shadows_measure(expression, measure)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            return true if name == measure or mdc_expr_shadows_measure(type_expression, measure) or mdc_expr_shadows_measure(value, measure)
+                        Stmt.Assign(target, operator, value, line):
+                            return true if mdc_expr_shadows_measure(target, measure) or mdc_expr_shadows_measure(value, measure)
+                        Stmt.Return(value, line):
+                            return true if value is returned and mdc_expr_shadows_measure(returned, measure)
+                        Stmt.If(condition, then_body, else_body, line):
+                            return true if mdc_expr_shadows_measure(condition, measure) or mdc_statements_shadow_measure(then_body, measure) or mdc_statements_shadow_measure(else_body, measure)
+                        Stmt.While(condition, body, line):
+                            return true if mdc_expr_shadows_measure(condition, measure) or mdc_statements_shadow_measure(body, measure)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            return true if (any variable in variables where variable == measure) or mdc_expr_shadows_measure(iterable, measure) or mdc_statements_shadow_measure(body, measure)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            return true if binding == measure or mdc_statements_shadow_measure(body, measure)
+                        Stmt.Match(scrutinee, arms, line):
+                            return true if mdc_expr_shadows_measure(scrutinee, measure)
+                            for arm in arms:
+                                return true if mdc_pattern_binds_name(arm.pattern, measure) or mdc_expr_shadows_measure(arm.guard, measure) or mdc_statements_shadow_measure(arm.body, measure)
+                        Stmt.Contract(kind, expression, line):
+                            return true if mdc_expr_shadows_measure(expression, measure)
+                        _:
+                            pass
+                return false
+
+        def mdc_unique_function_index(name: sview, names: darray[sview]&) -> (found: bool, index: usize):
+            can Memory.Allocate, Abort.Panic:
+                found: mutable bool = false
+                selected: mutable usize = 0
+                for index in 0..<names.count |index, names, name, found, selected|:
+                    if names[index] == name:
+                        return (false, 0) if found
+                        found <- true
+                        selected <- index
+                return (found, selected)
+
+        # Record function measures first; call edges are collected in a second walk, once every
+        # callee's measure parameter position is available.
+        def mdc_collect_functions(declarations: darray[Ast::Decl], names: mutable darray[sview]&, has_decreases: mutable darray[bool]&, decreases_line: mutable darray[u32]&, measures: mutable darray[sview]&, measure_positions: mutable darray[usize]&, measure_valid: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, has_decreases, decreases_line, measures, measure_positions, measure_valid|:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             found_line: mutable u32 = 0
@@ -19,18 +223,23 @@ extend Semantic:
                                     Stmt.Contract(contract_kind, contract_expr, contract_line):
                                         if contract_kind == "decreases" and found_line == 0:
                                             found_line <- contract_line.line
-                                            measure <- ident_name_of(contract_expr)
+                                            measure <- mdc_measure_name(contract_expr)
                                     _:
                                         pass
                             names.push(function_name)
                             has_decreases.push(found_line != 0)
                             decreases_line.push(found_line)
                             measures.push(measure)
-                            mdc_collect_calls(body, function_name, edge_from, edge_to)
+                            parameter: (found: bool, index: usize) = mdc_measure_parameter_position(parameters, measure)
+                            supported: mutable bool = false
+                            if found_line != 0 and parameter.found and parameter.index < parameters.count:
+                                supported <- not parameters[parameter.index].is_mutable and mdc_integer_measure_type(parameters[parameter.index].type_expression) and mdc_requires_positive_measure(body, measure) and not mdc_statements_shadow_measure(body, measure)
+                            measure_positions.push(parameter.index)
+                            measure_valid.push(supported)
                         Decl.Module(module_name, module_body, module_line):
-                            mdc_collect_functions(module_body, names, has_decreases, decreases_line, measures, edge_from, edge_to)
+                            mdc_collect_functions(module_body, names, has_decreases, decreases_line, measures, measure_positions, measure_valid)
                         Decl.Scoped(scoped_body, scoped_line):
-                            mdc_collect_functions(scoped_body, names, has_decreases, decreases_line, measures, edge_from, edge_to)
+                            mdc_collect_functions(scoped_body, names, has_decreases, decreases_line, measures, measure_positions, measure_valid)
                         _:
                             pass
 
@@ -38,76 +247,39 @@ extend Semantic:
         def mdc_is_decrement(expression: Ast::Expr, measure: sview) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match expression:
+                    Expr.Paren(inner, line):
+                        return mdc_is_decrement(inner, measure)
                     Expr.Binary(left, operator, right, binary_line):
-                        if measure != "" and operator == TokenKind.Minus and ident_name_of(left) == measure:
+                        if measure != "" and operator == TokenKind.Minus and mdc_measure_name(left) == measure:
                             literal: (found: bool, value: i64) = where_signed_literal(right)
-                            return literal.found and literal.value > 0
+                            return literal.found and literal.value == MUTUAL_DECREASES_SAFE_SINGLE_STEP
                     _:
                         pass
                 return false
 
-        # Whether a function BODY makes a call `g(...)` — g among the decreases-carrying `decreasers`
-        # — that passes `measure - k` (k > 0) as some argument (the measure strictly decreases across
-        # that edge). This is the shape stage0's SMT prover discharges for a mutual cycle.
-        def mdc_body_has_good_call(statements: darray[Ast::Stmt], measure: sview, decreasers: darray[sview]&) -> bool:
+        # The progress argument must be passed to the callee's own declared measure parameter,
+        # not merely appear somewhere else in its argument list.
+        def mdc_call_decreases(caller_measure: sview, caller_valid: bool, callee_is_direct: bool, callee_name: sview, arguments: darray[Ast::Expr], argument_names: darray[sview], names: darray[sview]&, measures: darray[sview]&, measure_positions: darray[usize]&, measure_valid: darray[bool]&) -> i64:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
-                    call_expr: Ast::Expr = mdc_stmt_call(statement)
-                    match call_expr:
-                        Expr.Call(callee, arguments, argument_names, call_line):
-                            callee_name: sview = mdc_callee_name(call_expr)
-                            if callee_name != "" and (any d in decreasers where d == callee_name):
-                                for argument in arguments:
-                                    true return if mdc_is_decrement(argument, measure)
-                        _:
-                            pass
-                    match statement:
-                        Stmt.If(condition, then_body, else_body, if_line):
-                            true return if mdc_body_has_good_call(then_body, measure, decreasers)
-                            true return if mdc_body_has_good_call(else_body, measure, decreasers)
-                        Stmt.While(while_condition, while_body, while_line):
-                            true return if mdc_body_has_good_call(while_body, measure, decreasers)
-                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
-                            true return if mdc_body_has_good_call(block_body, measure, decreasers)
-                        Stmt.Match(scrutinee, arms, match_line):
-                            for arm in arms:
-                                true return if mdc_body_has_good_call(arm.body, measure, decreasers)
-                        _:
-                            pass
-                return false
-
-        # The direct call expression carried by a statement (return/expr/vardecl/assign value), or Invalid.
-        def mdc_stmt_call(statement: Ast::Stmt) -> Ast::Expr:
-            can Abort.Panic:
-                match statement:
-                    Stmt.Return(value, line):
-                        if value is returned:
-                            return returned
-                        return (Ast::Expr.Invalid)
-                    Stmt.Expr(expression, line):
-                        return expression
-                    Stmt.VarDecl(name, type_expression, value, line):
-                        return value
-                    Stmt.Assign(target, operator, value, line):
-                        return value
-                    _:
-                        return (Ast::Expr.Invalid)
-
-        # A function that, under SMT, provably decreases across its cycle edge: it carries a good
-        # decreasing call to another decreases-carrying function.
-        def mdc_good_under_smt(declarations: darray[Ast::Decl], target: sview, measure: sview, decreasers: darray[sview]&) -> bool:
-            can Memory.Allocate, Abort.Panic:
-                for declaration in declarations:
-                    match declaration:
-                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            true return if function_name == target and mdc_body_has_good_call(body, measure, decreasers)
-                        Decl.Module(module_name, module_body, module_line):
-                            true return if mdc_good_under_smt(module_body, target, measure, decreasers)
-                        Decl.Scoped(scoped_body, scoped_line):
-                            true return if mdc_good_under_smt(scoped_body, target, measure, decreasers)
-                        _:
-                            pass
-                return false
+                return MUTUAL_DECREASES_EDGE_CALLER_UNSUPPORTED if not caller_valid or caller_measure == ""
+                return MUTUAL_DECREASES_EDGE_INDIRECT_CALLEE if not callee_is_direct
+                return MUTUAL_DECREASES_EDGE_ARGUMENTS_UNALIGNED if arguments.count != argument_names.count
+                target: (found: bool, index: usize) = mdc_unique_function_index(callee_name, names)
+                return MUTUAL_DECREASES_EDGE_CALLEE_AMBIGUOUS if not target.found or target.index >= measures.count or target.index >= measure_positions.count or target.index >= measure_valid.count
+                return MUTUAL_DECREASES_EDGE_CALLEE_MEASURE_UNSUPPORTED if not measure_valid[target.index]
+                target_measure: sview = measures[target.index]
+                target_position: usize = measure_positions[target.index]
+                matched: mutable bool = false
+                decreases: mutable bool = false
+                for index in 0..<arguments.count |index, arguments, argument_names, caller_measure, target_measure, target_position, matched, decreases|:
+                    matches_measure: bool = argument_names[index] == target_measure if argument_names[index] != "" else index == target_position
+                    continue if not matches_measure
+                    return MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_MISSING if matched
+                    matched <- true
+                    decreases <- mdc_is_decrement(arguments[index], caller_measure)
+                return MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_MISSING if not matched
+                return MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_NOT_DECREASING if not decreases
+                return MUTUAL_DECREASES_EDGE_ACCEPTED
 
         # The callee name of a call expression: `f(..)` -> "f", UFCS `x.m(..)` -> "m".
         def mdc_callee_name(expression: Ast::Expr) -> sview:
@@ -117,6 +289,8 @@ extend Semantic:
                         match callee:
                             Expr.Ident(name, ident_line):
                                 return name
+                            Expr.Scope(base, name, scope_line):
+                                return name
                             Expr.Field(receiver, method_name, field_line):
                                 return method_name
                             _:
@@ -124,55 +298,185 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        def mdc_scan_expr(expression: Ast::Expr, caller: sview, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&) -> void:
+        # A `::` path rooted in identifiers is a statically named target just like a bare name.
+        # Do not treat member calls on arbitrary values as direct: their runtime target may be
+        # an override or function-valued field that the source-level graph cannot identify.
+        def mdc_static_function_path(expression: Ast::Expr) -> bool:
             can Memory.Allocate, Abort.Panic:
-                callee: sview = mdc_callee_name(expression)
-                if callee != "":
-                    edge_from.push(caller)
-                    edge_to.push(callee)
+                match expression:
+                    Expr.Ident(name, line):
+                        return true
+                    Expr.Scope(base, name, line):
+                        return mdc_static_function_path(base)
+                    _:
+                        return false
+
+        def mdc_is_direct_callee(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return true
+                    Expr.Scope(base, name, line):
+                        return mdc_static_function_path(base)
+                    _:
+                        return false
+
+        def mdc_scan_expr(expression: Ast::Expr, caller: sview, caller_measure: sview, caller_valid: bool, names: darray[sview]&, measures: darray[sview]&, measure_positions: darray[usize]&, measure_valid: darray[bool]&, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&, edge_decreases: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(call_callee, arguments, argument_names, call_line):
-                        mdc_scan_expr(call_callee, caller, edge_from, edge_to)
-                        for argument in arguments |edge_from, edge_to|:
-                            mdc_scan_expr(argument, caller, edge_from, edge_to)
-                    Expr.Binary(left, operator, right, binary_line):
-                        mdc_scan_expr(left, caller, edge_from, edge_to)
-                        mdc_scan_expr(right, caller, edge_from, edge_to)
-                    Expr.Unary(operator, operand, unary_line):
-                        mdc_scan_expr(operand, caller, edge_from, edge_to)
-                    Expr.Paren(inner, paren_line):
-                        mdc_scan_expr(inner, caller, edge_from, edge_to)
+                        callee_name: sview = mdc_callee_name(expression)
+                        if callee_name != "":
+                            direct_callee: bool = mdc_is_direct_callee(call_callee)
+                            edge_from.push(caller)
+                            edge_to.push(callee_name)
+                            edge_decreases.push(mdc_call_decreases(caller_measure, caller_valid, direct_callee, callee_name, arguments, argument_names, names, measures, measure_positions, measure_valid))
+                        mdc_scan_expr(call_callee, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for argument in arguments |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(argument, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_line):
+                        mdc_scan_expr(effect_type, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for candidate in candidates |caller, edge_from, edge_to, edge_decreases|:
+                            edge_from.push(caller)
+                            edge_to.push(candidate.callee)
+                            edge_decreases.push(MUTUAL_DECREASES_EDGE_UNTRACKED_CALL)
+                            mdc_scan_expr(candidate.effect_type, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            for capture in candidate.captures |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                                mdc_scan_expr(capture, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for argument in arguments |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(argument, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                     Expr.Field(object, field_name, field_line):
-                        mdc_scan_expr(object, caller, edge_from, edge_to)
+                        mdc_scan_expr(object, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Scope(base, member, line):
+                        mdc_scan_expr(base, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Index(object, index, line):
+                        mdc_scan_expr(object, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(index, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Slice(object, low, high, line):
+                        mdc_scan_expr(object, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(low, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(high, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.IndexN(object, arguments, line):
+                        mdc_scan_expr(object, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for argument in arguments |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(argument, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Binary(left, operator, right, line):
+                        mdc_scan_expr(left, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(right, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Unary(operator, operand, line):
+                        mdc_scan_expr(operand, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Move(operand, line):
+                        mdc_scan_expr(operand, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.RegionNew(operand, region, line):
+                        mdc_scan_expr(operand, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Paren(inner, line):
+                        mdc_scan_expr(inner, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Array(elements, line):
+                        for element in elements |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(element, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Tuple(elements, line):
+                        for element in elements |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(element, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.SetLit(elements, line):
+                        for element in elements |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(element, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(entry.key, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_scan_expr(entry.value, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Construct(type, fields, line):
+                        mdc_scan_expr(type, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for field in fields |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(field.value, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.RecordUpdate(base, fields, line):
+                        mdc_scan_expr(base, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for field in fields |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(field.value, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.If(condition, then_expr, else_expr, line):
+                        mdc_scan_expr(condition, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(then_expr, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(else_expr, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Match(scrutinee, arms, line):
+                        mdc_scan_expr(scrutinee, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for arm in arms |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(arm.guard, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(arm.body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Catch(guarded, arms, line):
+                        mdc_scan_expr(guarded, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        for arm in arms |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                            mdc_scan_expr(arm.guard, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(arm.body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Comprehension(var, iterable, condition, body, line):
+                        mdc_scan_expr(iterable, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(condition, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Refinement(base, predicate, line):
+                        mdc_scan_expr(base, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(predicate, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.GetElse(guarded, recovery, line):
+                        mdc_scan_expr(guarded, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_collect_calls(recovery, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Lambda(parameters, body, line):
+                        mdc_collect_calls(body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                    Expr.Block(statements, value, captures, line):
+                        mdc_collect_calls(statements, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        mdc_scan_expr(value, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                     _:
                         pass
 
-        def mdc_collect_calls(statements: darray[Ast::Stmt], caller: sview, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&) -> void:
+        def mdc_collect_calls(statements: darray[Ast::Stmt], caller: sview, caller_measure: sview, caller_valid: bool, names: darray[sview]&, measures: darray[sview]&, measure_positions: darray[usize]&, measure_valid: darray[bool]&, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&, edge_decreases: mutable darray[i64]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |edge_from, edge_to|:
+                for statement in statements |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
                     match statement:
                         Stmt.Expr(expression, line):
-                            mdc_scan_expr(expression, caller, edge_from, edge_to)
+                            mdc_scan_expr(expression, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            mdc_scan_expr(value, caller, edge_from, edge_to)
+                            mdc_scan_expr(value, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                         Stmt.Assign(target, operator, value, line):
-                            mdc_scan_expr(value, caller, edge_from, edge_to)
+                            mdc_scan_expr(target, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_scan_expr(value, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                         Stmt.Return(value, line):
-                            mdc_scan_expr(returned, caller, edge_from, edge_to) if value is returned
-                        Stmt.If(condition, then_body, else_body, if_line):
-                            mdc_scan_expr(condition, caller, edge_from, edge_to)
-                            mdc_collect_calls(then_body, caller, edge_from, edge_to)
-                            mdc_collect_calls(else_body, caller, edge_from, edge_to)
-                        Stmt.While(while_condition, while_body, while_line):
-                            mdc_scan_expr(while_condition, caller, edge_from, edge_to)
-                            mdc_collect_calls(while_body, caller, edge_from, edge_to)
-                        Stmt.For(bind, variables, iterable, for_body, for_line):
-                            mdc_collect_calls(for_body, caller, edge_from, edge_to)
-                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
-                            mdc_collect_calls(block_body, caller, edge_from, edge_to)
-                        Stmt.Match(scrutinee, arms, match_line):
-                            for arm in arms |edge_from, edge_to|:
-                                mdc_collect_calls(arm.body, caller, edge_from, edge_to)
+                            mdc_scan_expr(returned, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            mdc_scan_expr(condition, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(then_body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(else_body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Stmt.While(condition, body, line):
+                            mdc_scan_expr(condition, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            mdc_scan_expr(iterable, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Stmt.Contract(kind, expression, line):
+                            # Contracts are evaluated as part of checking calls/returns. A
+                            # recursive call hidden in one must not disappear from the graph.
+                            mdc_scan_expr(expression, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            mdc_collect_calls(body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Stmt.Match(scrutinee, arms, line):
+                            mdc_scan_expr(scrutinee, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            for arm in arms |caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                                mdc_scan_expr(arm.guard, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                                mdc_collect_calls(arm.body, caller, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        _:
+                            pass
+
+        def mdc_collect_call_edges(declarations: darray[Ast::Decl], names: darray[sview]&, measures: darray[sview]&, measure_positions: darray[usize]&, measure_valid: darray[bool]&, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&, edge_decreases: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            caller: (found: bool, index: usize) = mdc_unique_function_index(function_name, names)
+                            caller_measure: sview = measures[caller.index] if caller.found and caller.index < measures.count else ""
+                            caller_valid: bool = measure_valid[caller.index] if caller.found and caller.index < measure_valid.count else false
+                            for parameter in parameters |function_name, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases|:
+                                if parameter.has_default:
+                                    mdc_scan_expr(parameter.default_value, function_name, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                            mdc_collect_calls(body, function_name, caller_measure, caller_valid, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Decl.Module(module_name, module_body, line):
+                            mdc_collect_call_edges(module_body, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
+                        Decl.Scoped(body, line):
+                            mdc_collect_call_edges(body, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                         _:
                             pass
 
@@ -206,28 +510,57 @@ extend Semantic:
                     probe <- probe + 1
                 return result
 
+        # Every call edge from FN that lies on a cycle must carry a checked strict decrease.
+        # This rejects a cycle with one decreasing branch and another unchanged/increasing branch.
+        def mdc_cycle_edges_decrease(fn: sview, edge_from: darray[sview]&, edge_to: darray[sview]&, edge_decreases: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                found_cycle_edge: mutable bool = false
+                while probe < edge_from.count |probe, fn, edge_from, edge_to, edge_decreases, found_cycle_edge|:
+                    return false if probe >= edge_to.count or probe >= edge_decreases.count
+                    if edge_from[probe] == fn and mdc_reaches(edge_to[probe], fn, edge_from, edge_to):
+                        found_cycle_edge <- true
+                        return false if edge_decreases[probe] != MUTUAL_DECREASES_EDGE_ACCEPTED
+                    probe <- probe + 1
+                return found_cycle_edge
+
+        def mdc_first_non_decreasing_cycle_edge(fn: sview, edge_from: darray[sview]&, edge_to: darray[sview]&, edge_decreases: darray[i64]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                while probe < edge_from.count |probe, fn, edge_from, edge_to, edge_decreases|:
+                    return "invalid-call-graph" if probe >= edge_to.count or probe >= edge_decreases.count
+                    if edge_from[probe] == fn and mdc_reaches(edge_to[probe], fn, edge_from, edge_to) and edge_decreases[probe] != MUTUAL_DECREASES_EDGE_ACCEPTED:
+                        return "caller-measure-unsupported" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_CALLER_UNSUPPORTED
+                        return "indirect-callee" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_INDIRECT_CALLEE
+                        return "argument-arrays-unaligned" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_ARGUMENTS_UNALIGNED
+                        return "ambiguous-callee" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_CALLEE_AMBIGUOUS
+                        return "callee-measure-unsupported" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_CALLEE_MEASURE_UNSUPPORTED
+                        return "measure-argument-missing" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_MISSING
+                        return "measure-argument-not-decreasing" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_MEASURE_ARGUMENT_NOT_DECREASING
+                        return "untracked-call" if edge_decreases[probe] == MUTUAL_DECREASES_EDGE_UNTRACKED_CALL
+                        return "unknown-edge-status"
+                    probe <- probe + 1
+                return sview("", 0, 0)
+
     public:
-        def check_mutual_decreases_cycle(file: Ast::File&, enable_smt: bool, table: lmut SymbolTable) -> void:
+        def check_mutual_decreases_cycle(file: Ast::File&, _enable_smt: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 names: mutable darray[sview] = []
                 has_decreases: mutable darray[bool] = []
                 decreases_line: mutable darray[u32] = []
                 measures: mutable darray[sview] = []
+                measure_positions: mutable darray[usize] = []
+                measure_valid: mutable darray[bool] = []
                 edge_from: mutable darray[sview] = []
                 edge_to: mutable darray[sview] = []
-                mdc_collect_functions(file.top_decls, names, has_decreases, decreases_line, measures, edge_from, edge_to)
-                decreasers: mutable darray[sview] = []
-                names_probe: mutable usize = 0
-                while names_probe < names.count |names_probe, decreasers, names, has_decreases|:
-                    decreasers.push(names[names_probe]) if has_decreases[names_probe]
-                    names_probe <- names_probe + 1
+                edge_decreases: mutable darray[i64] = []
+                mdc_collect_functions(file.top_decls, names, has_decreases, decreases_line, measures, measure_positions, measure_valid)
+                mdc_collect_call_edges(file.top_decls, names, measures, measure_positions, measure_valid, edge_from, edge_to, edge_decreases)
                 index: mutable usize = 0
                 while index < names.count |index, table| -> table:
                     if has_decreases[index] and mdc_in_mutual_cycle(names[index], edge_from, edge_to):
-                        # Without SMT, stage0 cannot discharge ANY mutual cycle (even all-decrementing
-                        # measures) — always flag. With SMT, stage0 PROVES cycles whose every step passes
-                        # a strictly-smaller measure to a decreases-carrying partner — flag only when this
-                        # function lacks such a good decreasing call (a bad/absent measure edge).
-                        good: bool = enable_smt and mdc_good_under_smt(file.top_decls, names[index], measures[index], decreasers)
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutualDecreasesCycle, name: names[index], line: decreases_line[index], expected: "", actual: ""}) if not good
+                        measure_ok: bool = index < measure_valid.count and measure_valid[index]
+                        good: bool = measure_ok and mdc_cycle_edges_decrease(names[index], edge_from, edge_to, edge_decreases)
+                        actual: sview = mdc_first_non_decreasing_cycle_edge(names[index], edge_from, edge_to, edge_decreases) if measure_ok else "invalid-measure-or-precondition"
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutualDecreasesCycle, name: names[index], line: decreases_line[index], expected: "strict one-step decrease", actual: actual}) if not good
                     index <- index + 1
