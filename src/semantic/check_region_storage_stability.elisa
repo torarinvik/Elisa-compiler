@@ -721,14 +721,164 @@ extend Semantic:
                         invalidated.push(saved[index])
                         invalidated_by.push(saved_by[index]) if index < saved_by.count and invalidated.count > invalidated_by.count
 
-        def walk_region_storage_stability(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview]&, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        # Whether control never reaches the end of STATEMENTS and never loops back from them:
+        # the last statement returns, breaks or raises (or is an `if` whose branches both do)
+        # and no `continue` of this loop appears. A `continue` is a back edge, not a leave.
+        def storage_view_body_leaves(statements: darray[Ast::Stmt]&) -> bool:
+            can Abort.Panic:
+                return false if statements.count == 0 or storage_view_body_continues(statements)
+                return match statements[statements.count - 1]:
+                    Stmt.Return(_, _): true
+                    Stmt.Break(_, _): true
+                    Stmt.Expr(exit_expression, _): affine_is_raise(exit_expression)
+                    Stmt.If(_, then_body, else_body, _): storage_view_body_leaves(then_body) and storage_view_body_leaves(else_body)
+                    Stmt.Block(_, _, _, block_body, _): storage_view_body_leaves(block_body)
+                    _: false
+
+        # Whether a `continue` of the enclosing loop appears in STATEMENTS (nested loops own
+        # their own `continue`s).
+        def storage_view_body_continues(statements: darray[Ast::Stmt]&) -> bool:
+            can Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Continue(_, _):
+                            return true
+                        Stmt.If(_, then_body, else_body, _):
+                            true return if storage_view_body_continues(then_body) or storage_view_body_continues(else_body)
+                        Stmt.Block(_, _, _, block_body, _):
+                            true return if storage_view_body_continues(block_body)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms:
+                                true return if storage_view_body_continues(arm.body)
+                        _:
+                            pass
+                return false
+
+        # `r <- &xs[0]`: a plain assignment to a name whose value takes a fresh borrow rebinds the
+        # view, so it is not a use of the old referent and clears the old invalidation.
+        def storage_view_rebind_target(target: Ast::Expr, operator: TokenKind, value: Ast::Expr, alias_names: darray[sview]&, alias_is_view: darray[bool]&) -> sview:
             can Memory.Allocate, Abort.Panic:
+                return "" if operator != TokenKind.Assign and operator != TokenKind.LArrow
+                match target:
+                    Expr.Ident(name, line):
+                        return name if storage_view_expr_carries_borrow(value, alias_names, alias_is_view) else ""
+                    _:
+                        return ""
+
+        def storage_view_snapshot(invalidated: darray[sview]&, invalidated_by: darray[sview]&, out: mutable darray[sview]&, out_by: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out.truncate(0)
+                out_by.truncate(0)
+                for index in 0..<invalidated.count |invalidated, invalidated_by, out, out_by|:
+                    out.push(invalidated[index])
+                    out_by.push(invalidated_by[index]) if index < invalidated_by.count
+
+        # Walk a branch that leaves the loop (or function): its invalidations never reach the
+        # code after the branch or the loop's back edge, only the code after the loop, so they
+        # are parked in EXIT_MARKS until the enclosing loop ends.
+        def walk_region_storage_branch(body: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview]&, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, exit_marks: mutable darray[sview]&, exit_marks_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if not storage_view_body_leaves(body):
+                    table <- walk_region_storage_stability(body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
+                    return
+                before: mutable darray[sview] = []
+                before_by: mutable darray[sview] = []
+                storage_view_snapshot(invalidated, invalidated_by, before, before_by)
+                table <- walk_region_storage_stability(body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
+                for index in 0..<invalidated.count |invalidated, invalidated_by, before, exit_marks, exit_marks_by|:
+                    if not fresh_wrapper_name_exists(before, invalidated[index]) and not fresh_wrapper_name_exists(exit_marks, invalidated[index]):
+                        exit_marks.push(invalidated[index])
+                        exit_marks_by.push(invalidated_by[index]) if index < invalidated_by.count and exit_marks.count > exit_marks_by.count
+                storage_view_snapshot(before, before_by, invalidated, invalidated_by)
+
+        def storage_view_already_reported(name: sview, line: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for diagnostic in table.diagnostics:
+                    true return if diagnostic.kind == DiagnosticKind.StorageDependencyInvalidated and diagnostic.name == name and diagnostic.line == line
+                return false
+
+        # Record EXPRESSION's position in FOUND if it reads the view PROBE[0]; 1 when it does.
+        def storage_view_loop_use(expression: Ast::Expr, probe: darray[sview]&, line: u32, found_pos: mutable darray[Ast::Pos]&, found_line: mutable darray[u32]&) -> u8:
+            can Memory.Allocate, Abort.Panic:
+                return 0 if invalidated_alias_in_expression(expression, probe) == ""
+                found_pos.push(ident_extent_or_line(expression, line))
+                found_line.push(line)
+                return 1
+
+        # Find the first read of the view PROBE[0] in STATEMENTS, in walk order: 1 = found (its
+        # position is in FOUND), 2 = a declaration or rebind of the name ends this list first,
+        # 0 = neither. A nested list's 2 only ends that list (the other path still continues).
+        def storage_view_loop_first_use(statements: darray[Ast::Stmt], probe: darray[sview]&, alias_names: darray[sview]&, alias_is_view: darray[bool]&, found_pos: mutable darray[Ast::Pos]&, found_line: mutable darray[u32]&) -> u8:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable u8 = 0
+                for statement in statements |result, probe, alias_names, alias_is_view, found_pos, found_line|:
+                    break if result != 0
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            result <- storage_view_loop_use(value, probe, line.line, found_pos, found_line)
+                            result <- 2 if result == 0 and name == probe[0]
+                        Stmt.Expr(expression, line):
+                            result <- storage_view_loop_use(expression, probe, line.line, found_pos, found_line)
+                            match expression:
+                                Expr.Block(block_statements, value, captures, block_line):
+                                    result <- 1 if result == 0 and storage_view_loop_first_use(block_statements, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                                _:
+                                    pass
+                        Stmt.Assign(target, operator, value, line):
+                            rebound: sview = storage_view_rebind_target(target, operator, value, alias_names, alias_is_view)
+                            result <- storage_view_loop_use(target, probe, line.line, found_pos, found_line) if rebound == ""
+                            result <- storage_view_loop_use(value, probe, line.line, found_pos, found_line) if result == 0
+                            result <- 2 if result == 0 and rebound == probe[0]
+                        Stmt.Return(value, line):
+                            result <- storage_view_loop_use(returned, probe, line.line, found_pos, found_line) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            result <- storage_view_loop_use(condition, probe, line.line, found_pos, found_line)
+                            result <- 1 if result == 0 and storage_view_loop_first_use(then_body, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                            result <- 1 if result == 0 and storage_view_loop_first_use(else_body, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                        Stmt.While(condition, while_body, line):
+                            result <- storage_view_loop_use(condition, probe, line.line, found_pos, found_line)
+                            result <- 1 if result == 0 and storage_view_loop_first_use(while_body, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            result <- storage_view_loop_use(iterable, probe, line.line, found_pos, found_line)
+                            result <- 1 if result == 0 and storage_view_loop_first_use(for_body, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                        Stmt.Match(scrutinee, arms, line):
+                            result <- storage_view_loop_use(scrutinee, probe, line.line, found_pos, found_line)
+                            for arm in arms |result, probe, alias_names, alias_is_view, found_pos, found_line|:
+                                result <- 1 if result == 0 and storage_view_loop_first_use(arm.body, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            result <- 1 if storage_view_loop_first_use(block_body, probe, alias_names, alias_is_view, found_pos, found_line) == 1
+                        _:
+                            pass
+                return result
+
+        # A loop body runs again after its last statement: a view that the body invalidated (and
+        # did not rebind afterwards) is stale when the next iteration reaches its first read. The
+        # walk sees that read once, before the growth, so the back edge is checked here. BEFORE
+        # holds the marks at loop entry; CONDITION is re-evaluated each iteration (a `while`).
+        def check_storage_view_loop_back_edge(body: darray[Ast::Stmt], condition: Ast::Expr, has_condition: bool, loop_line: u32, before: darray[sview]&, alias_names: darray[sview]&, alias_is_view: darray[bool]&, invalidated: darray[sview]&, invalidated_by: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if storage_view_body_leaves(body)
+                for index in 0..<invalidated.count |table, body, condition, before, alias_names, alias_is_view, invalidated, invalidated_by|:
+                    if not fresh_wrapper_name_exists(before, invalidated[index]):
+                        probe: mutable darray[sview] = [invalidated[index]]
+                        found_pos: mutable darray[Ast::Pos] = []
+                        found_line: mutable darray[u32] = []
+                        found: u8 = storage_view_loop_use(condition, probe, loop_line, found_pos, found_line) if has_condition else 0
+                        rest: u8 = storage_view_loop_first_use(body, probe, alias_names, alias_is_view, found_pos, found_line) if found == 0 else 0
+                        by: sview = invalidated_by[index] if index < invalidated_by.count else ""
+                        if found_pos.count > 0 and not storage_view_already_reported(probe[0], found_line[0], table):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StorageDependencyInvalidated, name: probe[0], pos: found_pos[0], line: found_line[0], expected: by, actual: ""})
+
+        def walk_region_storage_stability(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview]&, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, exit_marks: mutable darray[sview]&, exit_marks_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                loop_entry: mutable darray[sview] = []
+                loop_entry_by: mutable darray[sview] = []
                 saved_invalidated: mutable darray[sview] = []
                 saved_invalidated_by: mutable darray[sview] = []
                 for index in 0..<invalidated.count |saved_invalidated, saved_invalidated_by, invalidated, invalidated_by|:
                     saved_invalidated.push(invalidated[index])
                     saved_invalidated_by.push(invalidated_by[index]) if index < invalidated_by.count
-                for statement in statements |stable_regions, alias_names, alias_sources, alias_is_view, invalidated, table|:
+                for statement in statements |stable_regions, alias_names, alias_sources, alias_is_view, invalidated, table, exit_marks, exit_marks_by, loop_entry, loop_entry_by|:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
                             has_stable_backing: bool = kind == "region" and (destroyed_region_contains(clause, "reserve_commit") or destroyed_region_contains(clause, "fixed"))
@@ -737,7 +887,7 @@ extend Semantic:
                             # generic binding slot empty; statement-form regions do the reverse.
                             stable_region <- clause[0] if stable_region == "" and has_stable_backing and clause.count > 0
                             stable_regions.push(stable_region) if stable_region != "" and has_stable_backing and not destroyed_region_contains(stable_regions, stable_region)
-                            table <- walk_region_storage_stability(body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_stability(body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
                             invalidate_growth_aliases(growth_call_target(value), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
@@ -750,7 +900,7 @@ extend Semantic:
                             invalidate_callee_relocations(expression, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                             match expression:
                                 Expr.Block(statements, value, captures, block_line):
-                                    table <- walk_region_storage_stability(statements, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                                    table <- walk_region_storage_stability(statements, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                                 _:
                                     pass
                         Stmt.Assign(target, operator, value, line):
@@ -758,25 +908,37 @@ extend Semantic:
                             invalidate_growth_aliases(growth_call_target(value), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             invalidate_callee_relocations(value, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                             invalidate_growth_aliases(growth_call_target(collection_append_call(target, value, line)), function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) if operator == TokenKind.PlusEq
-                            table <- diagnose_invalidated_alias(target, invalidated, invalidated_by, line.line, table)
+                            rebound: sview = storage_view_rebind_target(target, operator, value, alias_names, alias_is_view)
+                            table <- diagnose_invalidated_alias(target, invalidated, invalidated_by, line.line, table) if rebound == ""
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
+                            storage_view_forget_invalidated(rebound, invalidated, invalidated_by) if rebound != ""
                             storage_view_record_alias(storage_view_place_root(target), value, alias_names, alias_sources, alias_is_view, view_fns) if operator == TokenKind.Assign
                         Stmt.Return(value, line):
                             table <- diagnose_invalidated_alias(returned, invalidated, invalidated_by, line.line, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
                             table <- diagnose_invalidated_alias(condition, invalidated, invalidated_by, line.line, table)
-                            table <- walk_region_storage_stability(then_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
-                            table <- walk_region_storage_stability(else_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            table <- walk_region_storage_branch(then_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
+                            table <- walk_region_storage_branch(else_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                         Stmt.While(condition, while_body, line):
                             table <- diagnose_invalidated_alias(condition, invalidated, invalidated_by, line.line, table)
-                            table <- walk_region_storage_stability(while_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            storage_view_snapshot(invalidated, invalidated_by, loop_entry, loop_entry_by)
+                            loop_exit: mutable darray[sview] = []
+                            loop_exit_by: mutable darray[sview] = []
+                            table <- walk_region_storage_stability(while_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, loop_exit, loop_exit_by, table)
+                            table <- check_storage_view_loop_back_edge(while_body, condition, true, line.line, loop_entry, alias_names, alias_is_view, invalidated, invalidated_by, table)
+                            storage_view_restore_invalidated(loop_exit, loop_exit_by, invalidated, invalidated_by)
                         Stmt.For(bind, variables, iterable, for_body, line):
                             table <- diagnose_invalidated_alias(iterable, invalidated, invalidated_by, line.line, table)
-                            table <- walk_region_storage_stability(for_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            storage_view_snapshot(invalidated, invalidated_by, loop_entry, loop_entry_by)
+                            loop_exit: mutable darray[sview] = []
+                            loop_exit_by: mutable darray[sview] = []
+                            table <- walk_region_storage_stability(for_body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, loop_exit, loop_exit_by, table)
+                            table <- check_storage_view_loop_back_edge(for_body, iterable, false, line.line, loop_entry, alias_names, alias_is_view, invalidated, invalidated_by, table)
+                            storage_view_restore_invalidated(loop_exit, loop_exit_by, invalidated, invalidated_by)
                         Stmt.Match(scrutinee, arms, line):
                             table <- diagnose_invalidated_alias(scrutinee, invalidated, invalidated_by, line.line, table)
-                            for arm in arms |table, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by| -> table:
-                                table <- walk_region_storage_stability(arm.body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            for arm in arms |table, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by| -> table:
+                                table <- walk_region_storage_branch(arm.body, annotations, function_line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                         _:
                             pass
                 storage_view_restore_invalidated(saved_invalidated, saved_invalidated_by, invalidated, invalidated_by)
@@ -792,7 +954,9 @@ extend Semantic:
                             alias_is_view: mutable darray[bool] = []
                             invalidated: mutable darray[sview] = []
                             invalidated_by: mutable darray[sview] = []
-                            table <- walk_region_storage_stability(body, annotations, line.line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            exit_marks: mutable darray[sview] = []
+                            exit_marks_by: mutable darray[sview] = []
+                            table <- walk_region_storage_stability(body, annotations, line.line, view_fns, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                         Decl.Module(name, body, line):
                             table <- check_region_storage_stability_declarations(body, annotations, view_fns, table)
                         Decl.Scoped(body, line):
