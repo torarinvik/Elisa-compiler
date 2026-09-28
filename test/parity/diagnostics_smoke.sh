@@ -265,6 +265,7 @@ NAMES=(
     mutate_while_iterating_plus_eq
     mutate_while_iterating_field_chain
     mutate_while_iterating_enclosing_owner
+    auto_region_store_escape_nested
     storage_dependency_field_replacement
 )
 EXPECTS=(
@@ -497,6 +498,7 @@ EXPECTS=(
     "cannot mutate \"xs\" while it is being iterated: darray push of xs"
     "items\" while it is being iterated"
     "items\" while it is being iterated: reassignment of"
+    'value escapes its `in auto:` scope via store into longer-lived storage'
     "storage dependency facts were invalidated for interior reference \"r\""
 )
 

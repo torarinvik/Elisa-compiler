@@ -42,6 +42,24 @@ extend Semantic:
                         return false
 
 
+        # Whether a type annotation is a `darray[...]` of a scalar primitive, whose elements
+        # are copied by value, looking through `&` and `mutable` wrappers.
+        def annotation_is_scalar_darray(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(object, index, line):
+                        false return if ident_name_of(object) != "darray"
+                        return when ident_name_of(index):
+                            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" | "f32" | "f64" | "bool" | "char" -> true
+                            _ -> false
+                    Expr.Unary(operator, operand, line):
+                        return annotation_is_scalar_darray(operand)
+                    Expr.Paren(inner, paren_line):
+                        return annotation_is_scalar_darray(inner)
+                    _:
+                        return false
+
+
         # Names of top-level functions whose declared return type is a container, so a call
         # to one produces a value living in the CALLEE's inferred region.
         def collect_container_returning_fns(declarations: darray[Ast::Decl], enum_names: darray[sview]&, out: mutable darray[sview]&) -> void:
@@ -97,9 +115,9 @@ extend Semantic:
 
 
         # Local container declarations in a body, including nested blocks.
-        def collect_local_containers(body: darray[Ast::Stmt], container_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
+        def collect_local_containers(body: darray[Ast::Stmt], container_fns: darray[sview]&, out: mutable darray[sview]&, scalars: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in body |out|:
+                for statement in body |out, scalars|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
                             is_container_typed: bool = annotation_is_container(type_expression)
@@ -108,53 +126,85 @@ extend Semantic:
                             # Item.Row(make_vals(10))`).
                             initializer_local: bool = value_is_locally_created(value, out, container_fns)
                             out.push(name) if is_container_typed or initializer_local
+                            scalars.push(name) if annotation_is_scalar_darray(type_expression) and not initializer_local
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            collect_local_containers(block_body, container_fns, out)
+                            collect_local_containers(block_body, container_fns, out, scalars)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            collect_local_containers(then_body, container_fns, out)
-                            collect_local_containers(else_body, container_fns, out)
+                            collect_local_containers(then_body, container_fns, out, scalars)
+                            collect_local_containers(else_body, container_fns, out, scalars)
                         Stmt.While(condition, while_body, while_line):
-                            collect_local_containers(while_body, container_fns, out)
+                            collect_local_containers(while_body, container_fns, out, scalars)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                            collect_local_containers(for_body, container_fns, out, scalars)
+                        Stmt.Match(match_scrutinee, match_arms, match_line):
+                            for arm in match_arms |out, scalars|:
+                                collect_local_containers(arm.body, container_fns, out, scalars)
                         _:
                             pass
 
 
-        def auto_escape_walk(body: darray[Ast::Stmt], caller_params: darray[sview]&, local_containers: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def auto_escape_walk(body: darray[Ast::Stmt], caller_params: darray[sview]&, local_containers: darray[sview]&, scalar_containers: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in body |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- auto_escape_call(expression, line.line, caller_params, local_containers, container_fns, table)
+                            table <- auto_escape_call(expression, line.line, caller_params, local_containers, scalar_containers, container_fns, table)
                         # `_ = dst.put("k", make_item())` — the discarded-result form.
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- auto_escape_call(value, line.line, caller_params, local_containers, container_fns, table)
+                            table <- auto_escape_call(value, line.line, caller_params, local_containers, scalar_containers, container_fns, table)
                         # `b.field <- local_container` on a caller-owned struct param.
                         Stmt.Assign(target, operator, value, line):
-                            table <- auto_escape_call(collection_append_call(target, value, line), line.line, caller_params, local_containers, container_fns, table) if operator == TokenKind.PlusEq
+                            table <- auto_escape_call(collection_append_call(target, value, line), line.line, caller_params, local_containers, scalar_containers, container_fns, table) if operator == TokenKind.PlusEq
                             owner: sview = assign_target_owner(target)
                             stores_into_caller: bool = owner != "" and (any p in caller_params where p == owner)
                             escaping: bool = stores_into_caller and value_is_locally_created(value, local_containers, container_fns)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line.line, expected: "", actual: ""}) if escaping
                             # `_ = dst.put("k", make_item())` parses as an ASSIGN to `_`, so
                             # the escaping store lives in the assigned VALUE, not the target.
-                            table <- auto_escape_call(value, line.line, caller_params, local_containers, container_fns, table) if not escaping
+                            table <- auto_escape_call(value, line.line, caller_params, local_containers, scalar_containers, container_fns, table) if not escaping
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            table <- auto_escape_walk(block_body, caller_params, local_containers, container_fns, table)
+                            table <- auto_escape_walk(block_body, caller_params, local_containers, scalar_containers, container_fns, table)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            table <- auto_escape_walk(then_body, caller_params, local_containers, container_fns, table)
-                            table <- auto_escape_walk(else_body, caller_params, local_containers, container_fns, table)
+                            table <- auto_escape_walk(then_body, caller_params, local_containers, scalar_containers, container_fns, table)
+                            table <- auto_escape_walk(else_body, caller_params, local_containers, scalar_containers, container_fns, table)
                         Stmt.While(condition, while_body, while_line):
-                            table <- auto_escape_walk(while_body, caller_params, local_containers, container_fns, table)
+                            table <- auto_escape_walk(while_body, caller_params, local_containers, scalar_containers, container_fns, table)
+                        # A store in a loop body or a match arm escapes exactly like a
+                        # straight-line one (stage0 walks every nested body).
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                            table <- auto_escape_walk(for_body, caller_params, local_containers, scalar_containers, container_fns, table)
+                        Stmt.Match(match_scrutinee, match_arms, match_line):
+                            for arm in match_arms |table| -> table:
+                                table <- auto_escape_walk(arm.body, caller_params, local_containers, scalar_containers, container_fns, table)
                         _:
                             pass
 
 
-        # The base identifier a store TARGET writes through: `b.xs` -> "b", `b` -> "b".
+        # The identifier a place chain is rooted at, through fields, indexes and parens:
+        # `o.s.items` -> "o", `h.rows[0]` -> "h", `dst` -> "dst"; "" for any other root.
+        def auto_escape_place_root(place: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match place:
+                    Expr.Ident(root_name, root_line):
+                        return root_name
+                    Expr.Field(field_object, field_name, field_line):
+                        return auto_escape_place_root(field_object)
+                    Expr.Index(index_object, index_value, index_line):
+                        return auto_escape_place_root(index_object)
+                    Expr.Paren(paren_inner, paren_line):
+                        return auto_escape_place_root(paren_inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # The base identifier a store TARGET writes through: `b.xs` -> "b", `o.s.items` -> "o",
+        # `dst[0]` -> "dst". A bare `b` is a rebind of the local slot, not a store, -> "".
         def assign_target_owner(target: Ast::Expr) -> sview:
             can Abort.Panic:
                 match target:
                     Expr.Field(object, field, line):
-                        return ident_name_of(object)
+                        return auto_escape_place_root(object)
+                    Expr.Index(index_object, index_value, index_line):
+                        return auto_escape_place_root(index_object)
                     _:
                         return sview("", 0, 0)
 
@@ -179,17 +229,24 @@ extend Semantic:
 
 
         # `dst.push(VALUE)` / `dst.put(KEY, VALUE)` where `dst` is caller-owned.
-        def auto_escape_call(expression: Ast::Expr, line: u32, caller_params: darray[sview]&, local_containers: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def auto_escape_call(expression: Ast::Expr, line: u32, caller_params: darray[sview]&, local_containers: darray[sview]&, scalar_containers: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
                         match callee:
                             Expr.Field(object, method, field_line):
-                                receiver: sview = ident_name_of(object)
+                                # `dst.push(..)` and `h.rows.push(..)` both store into what the
+                                # chain's root parameter owns.
+                                receiver: sview = auto_escape_place_root(object)
                                 return if receiver == ""
                                 return if not (any p in caller_params where p == receiver)
                                 # `push`/`extend` take the stored value first; `put` second.
-                                stored_index: i64 = 0 if (method == "push" or method == "extend") and arguments.count == 1 else (1 if method == "put" and arguments.count == 2 else -1)
+                                # `extend` counts only on a bare receiver (the long-standing
+                                # shape): stage0 never flags extend, and a chain receiver such as
+                                # `scope.deferred[i].body.extend(tmp)` in the compiler itself is
+                                # caller-arena storage.
+                                extends_bare: bool = method == "extend" and ident_name_of(object) != ""
+                                stored_index: i64 = 0 if (method == "push" or extends_bare) and arguments.count == 1 else (1 if method == "put" and arguments.count == 2 else -1)
                                 return if stored_index < 0
                                 # With exactly ONE caller-owned ref param, region inference
                                 # unifies a fresh container's region with that param's, so
@@ -206,6 +263,19 @@ extend Semantic:
                                 # tried and broke the internal-suite oracle, whose case has
                                 # TWO ref params — that is the cell this count distinguishes.
                                 stored_value: Ast::Expr = arguments[stored_index.usize()]
+                                # `dst.extend(tmp)` with `tmp: darray[u32]` copies scalar
+                                # elements; nothing of THIS region is referenced (stage0 never
+                                # flags extend; a container-element extend stays flagged).
+                                # Every declaration of the name must be scalar: a same-named
+                                # container-of-containers elsewhere in the body keeps it flagged.
+                                extended_name: sview = ident_name_of(stored_value)
+                                scalar_decls: mutable usize = 0
+                                container_decls: mutable usize = 0
+                                for scalar_name in scalar_containers |scalar_decls|:
+                                    scalar_decls <- scalar_decls + 1 if scalar_name == extended_name
+                                for local_name in local_containers |container_decls|:
+                                    container_decls <- container_decls + 1 if local_name == extended_name
+                                return if method == "extend" and extended_name != "" and scalar_decls > 0 and scalar_decls == container_decls
                                 escaping: bool = value_is_directly_local(stored_value, local_containers, container_fns) if caller_params.count <= 1 else value_is_locally_created(stored_value, local_containers, container_fns)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line, expected: "", actual: ""}) if escaping
                             _:
@@ -236,8 +306,9 @@ extend Semantic:
                                 caller_params.push(parameter.name) if param_is_mutable_ref(parameter) and not region_tied
                             continue if caller_params.count == 0
                             local_containers: mutable darray[sview] = []
-                            collect_local_containers(body, container_fns, local_containers)
-                            table <- auto_escape_walk(body, caller_params, local_containers, container_fns, table)
+                            scalar_containers: mutable darray[sview] = []
+                            collect_local_containers(body, container_fns, local_containers, scalar_containers)
+                            table <- auto_escape_walk(body, caller_params, local_containers, scalar_containers, container_fns, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_auto_region_escape_walk(module_body, container_fns, table)
                         Decl.Scoped(scoped_body, scoped_line):
