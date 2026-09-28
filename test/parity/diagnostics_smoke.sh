@@ -707,6 +707,16 @@ run_case affine_comprehension neg "$acm_neg" "consumed on every iteration"
 run_case affine_comprehension neg "$acm_neg" "must be consumed before scope exit"
 run_case affine_comprehension_repeat pos "$FIXTURES/affine_comprehension_repeat.pos.elisa" "consumed on every iteration"
 
+echo "-- affine_container_return --"
+acr_pos="$FIXTURES/affine_container_return.pos.elisa"
+acr_neg="$FIXTURES/affine_container_return.neg.elisa"
+for acr_name in xs made t ps; do
+    run_case affine_container_return pos "$acr_pos" "value containing linear handles \"$acr_name\" must be moved explicitly before return"
+    run_case affine_container_return pos "$acr_pos" "\"$acr_name\" must be consumed before scope exit"
+done
+run_case affine_container_return neg "$acr_neg" "must be moved explicitly before return"
+run_case affine_container_return neg "$acr_neg" "must be consumed before scope exit"
+
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
 guard_neg="$FIXTURES/shift_match_guards.neg.elisa"
