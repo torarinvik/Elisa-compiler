@@ -730,6 +730,16 @@ run_case affine_bulk_copy pos "$abc_pos" "query expression value iteration does 
 run_case affine_bulk_copy neg "$abc_neg" "darray extend does not support affine element type"
 run_case affine_bulk_copy neg "$abc_neg" "bulk darray push does not support affine element type"
 
+echo "-- drain_discipline --"
+dd_pos="$FIXTURES/drain_discipline.pos.elisa"
+dd_neg="$FIXTURES/drain_discipline.neg.elisa"
+dd_message='a `for ... in move` drain must consume every element'
+for dd_line in 13 22 29 36 43; do
+    run_case drain_discipline pos "$dd_pos" "L$dd_line $dd_message"
+done
+run_case drain_discipline neg "$dd_neg" "$dd_message"
+run_case drain_discipline neg "$dd_neg" "must be consumed before scope exit"
+
 echo "-- shift_match_guards --"
 guard_pos="$FIXTURES/shift_match_guards.pos.elisa"
 guard_neg="$FIXTURES/shift_match_guards.neg.elisa"
