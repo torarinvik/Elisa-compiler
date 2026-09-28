@@ -166,6 +166,86 @@ extend Semantic:
                     _:
                         return false
 
+        # ARGUMENT seen through parens, `move` and a leading `&` (`&o.s` -> `o.s`).
+        def iter_owner_argument_place(argument: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                stripped: Ast::Expr = storage_view_strip_paren_move(argument)
+                match stripped:
+                    Expr.Unary(operator, operand, unary_line):
+                        return storage_view_strip_paren_move(operand) if operator == TokenKind.Ampersand
+                    _:
+                        pass
+                return stripped
+
+        # Whether ARGUMENT_PLACE STRICTLY encloses the iterated field-chain PLACE: `p` or `o.s`
+        # over `p.items` / `o.s.items`. The exact place is iter_call_passes_container_by_ref's case.
+        def iter_owner_encloses(argument_place: Ast::Expr, place: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return false if storage_view_same_place(argument_place, place)
+                return storage_view_place_encloses(argument_place, place)
+
+        # Whether position POSITION of CALLEE lets the callee write the argument: a `mutable T&`
+        # parameter or an `lmut` one (threading, `p <- p.step()`).
+        def iter_owner_position_writes(table: SymbolTable&, callee: sview, position: usize, lmut_position: u32) -> bool:
+            can Abort.Panic:
+                return frame_interproc_param_mutable_ref(table, callee, position) or lmut_threads_position(table, callee, lmut_position)
+
+        def iter_owner_report(argument: Ast::Expr, place: Ast::Expr, container: sview, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                owner_place: Ast::Expr = iter_owner_argument_place(argument)
+                if iter_owner_encloses(owner_place, place):
+                    rebind owner: sview, table = iter_place_text(owner_place, table)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.IterCalleeMutableRef, name: container, line: line, expected: owner, actual: ""}) if owner != ""
+
+        # Passing an OWNER of the iterated field chain into a writing parameter (`step(p)`,
+        # `p <- p.step()`, `grow(&o.s)` inside `for v in p.items:`) lets the callee
+        # push/clear/replace the field through it and relocate the buffer the loop walks (stage0
+        # checkIteratorInvalidationForEnclosingMutableRefArg). Walks every call in EXPRESSION.
+        def iter_owner_call_walk(expression: Ast::Expr, place: Ast::Expr, container: sview, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Ident(callee_name, ident_line):
+                                position: mutable usize = 0
+                                lmut_position: mutable u32 = 0
+                                for argument in arguments |table, position, lmut_position| -> table:
+                                    table <- iter_owner_report(argument, place, container, line, table) if iter_owner_position_writes(table, callee_name, position, lmut_position)
+                                    position <- position + 1
+                                    lmut_position <- lmut_position + 1
+                            Expr.Field(receiver, method_name, field_line):
+                                # UFCS `recv.m(a)`: the receiver is position 0, written arguments 1+.
+                                table <- iter_owner_report(receiver, place, container, line, table) if iter_owner_position_writes(table, method_name, 0, 0)
+                                table <- iter_owner_call_walk(receiver, place, container, line, table)
+                                position: mutable usize = 1
+                                lmut_position: mutable u32 = 1
+                                for argument in arguments |table, position, lmut_position| -> table:
+                                    table <- iter_owner_report(argument, place, container, line, table) if iter_owner_position_writes(table, method_name, position, lmut_position)
+                                    position <- position + 1
+                                    lmut_position <- lmut_position + 1
+                            _:
+                                pass
+                        for argument in arguments |table| -> table:
+                            table <- iter_owner_call_walk(argument, place, container, line, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- iter_owner_call_walk(left, place, container, line, table)
+                        table <- iter_owner_call_walk(right, place, container, line, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- iter_owner_call_walk(operand, place, container, line, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- iter_owner_call_walk(inner, place, container, line, table)
+                    Expr.If(condition, then_value, else_value, if_line):
+                        table <- iter_owner_call_walk(condition, place, container, line, table)
+                        table <- iter_owner_call_walk(then_value, place, container, line, table)
+                        table <- iter_owner_call_walk(else_value, place, container, line, table)
+                    Expr.Field(object, field, field_line):
+                        table <- iter_owner_call_walk(object, place, container, line, table)
+                    Expr.Index(object, index, index_line):
+                        table <- iter_owner_call_walk(object, place, container, line, table)
+                        table <- iter_owner_call_walk(index, place, container, line, table)
+                    _:
+                        pass
+
         # Walk a loop body for a growing mutation of `container`; recurses control flow but NOT a
         # nested `for ... in container` (that inner loop owns its own iterator check).
         def iter_body_mutates(statements: darray[Ast::Stmt], place: Ast::Expr, container: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&, table: lmut SymbolTable) -> void:
@@ -176,7 +256,9 @@ extend Semantic:
                             method: sview = iter_mutation_method(expression, place, container)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutateWhileIterating, name: container, line: line.line, expected: "", actual: method}) if method != ""
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.IterCalleeMutableRef, name: container, line: line.line, expected: "", actual: ""}) if method == "" and iter_call_passes_container_by_ref(expression, place, container, alias_names, alias_targets, table)
+                            table <- iter_owner_call_walk(expression, place, container, line.line, table)
                         Stmt.Assign(target, operator, value, line):
+                            table <- iter_owner_call_walk(value, place, container, line.line, table)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutateWhileIterating, name: container, line: line.line, expected: "", actual: "reassignment"}) if iter_whole_assignment_replaces(target, operator, value, place, container)
                             if container != "" and iter_enclosing_replacement(target, operator, value, place, table):
                                 rebind owner: sview, table = iter_place_text(storage_view_strip_paren_move(target), table)
@@ -184,16 +266,21 @@ extend Semantic:
                             # `xs += e` is the append spelling of `xs.push(e)`: stage0 reports any `+=`
                             # on the iterated name as a push, whatever the iterable's type.
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutateWhileIterating, name: container, line: line.line, expected: "", actual: "push"}) if operator == TokenKind.PlusEq and iter_place_hit(target, place, container)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- iter_owner_call_walk(value, place, container, line.line, table)
                         Stmt.If(condition, then_body, else_body, line):
+                            table <- iter_owner_call_walk(condition, place, container, line.line, table)
                             table <- iter_body_mutates(then_body, place, container, alias_names, alias_targets, table)
                             table <- iter_body_mutates(else_body, place, container, alias_names, alias_targets, table)
                         Stmt.While(condition, while_body, line):
+                            table <- iter_owner_call_walk(condition, place, container, line.line, table)
                             table <- iter_body_mutates(while_body, place, container, alias_names, alias_targets, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
                             table <- iter_body_mutates(for_body, place, container, alias_names, alias_targets, table) if not iter_place_hit(iterable, place, container)
                         Stmt.Block(block_kind, clause, binding, block_body, block_line):
                             table <- iter_body_mutates(block_body, place, container, alias_names, alias_targets, table)
                         Stmt.Match(scrutinee, arms, line):
+                            table <- iter_owner_call_walk(scrutinee, place, container, line.line, table)
                             for arm in arms |table| -> table:
                                 table <- iter_body_mutates(arm.body, place, container, alias_names, alias_targets, table)
                         _:
