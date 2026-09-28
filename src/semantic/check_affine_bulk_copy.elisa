@@ -11,10 +11,17 @@
 # of it. stage1 decides that syntactically: a list literal, unless the element is itself
 # a container (`t.push([])` on `darray[darray[Handle]]` pushes one empty element), or a
 # local/param whose darray or fixed-array element is spelled the same as the receiver's.
-# Receivers are the function's locals and params; a field receiver (`self.items.extend`)
-# is not tracked.
+# Receivers and sources are the function's locals and params, or a field chain rooted at
+# one (`b.items.extend(xs)`, `[...self.bag.items]`): each field's declared type comes from
+# the struct rows, so a non-generic struct field resolves like a local.
 extend Semantic:
     private:
+        # Every struct field's declared type as parallel (struct, field, type) rows.
+        struct BulkFieldRows:
+            structs: mutable darray[sview]
+            fields: mutable darray[sview]
+            types: mutable darray[Ast::Expr]
+
         # The element type of a `darray[E]` (`mutable`-wrapped ok) or a fixed array `E[N]`.
         def bulk_container_element(type_expression: Ast::Expr) -> Ast::Expr?:
             can Memory.Allocate, Abort.Panic:
@@ -69,9 +76,8 @@ extend Semantic:
                 for statement in statements |out_names, out_types|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            if bulk_type_is_container(type_expression):
-                                out_names.push(name)
-                                out_types.push(type_expression)
+                            out_names.push(name)
+                            out_types.push(type_expression)
                         Stmt.If(condition, then_body, else_body, line):
                             bulk_collect_locals(then_body, out_names, out_types)
                             bulk_collect_locals(else_body, out_names, out_types)
@@ -102,38 +108,76 @@ extend Semantic:
                     Expr.Ident(argument_name, argument_line): argument_name
                     Expr.Move(moved, moved_line): bulk_argument_local(moved)
                     Expr.Paren(inner, paren_line): bulk_argument_local(inner)
+                    Expr.Field(object, field, field_line): field
                     _: ""
 
+        # The struct a declared type names through `mutable`/`&`/`lmut` wrappers; "" otherwise
+        # (generic structs are not resolved).
+        def bulk_struct_owner(type_expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        bulk_struct_owner(operand) return if operator == TokenKind.Mutable or operator == TokenKind.Ampersand or operator == TokenKind.Lmut
+                        return ""
+                    Expr.Paren(inner, paren_line):
+                        return bulk_struct_owner(inner)
+                    Expr.Ident(type_name, ident_line):
+                        return type_name
+                    _:
+                        return ""
+
+        # The declared type of a bulk operand: a local/param (`xs`, `move xs`, `(xs)`) or a
+        # field chain rooted at one (`b.items`, `self.bag.items`), via the struct field rows.
+        def bulk_operand_type(operand: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, rows: BulkFieldRows&) -> Ast::Expr?:
+            can Memory.Allocate, Abort.Panic:
+                match operand:
+                    Expr.Ident(operand_name, ident_line):
+                        return bulk_type_of(names, types, operand_name)
+                    Expr.Move(moved, moved_line):
+                        return bulk_operand_type(moved, names, types, rows)
+                    Expr.Paren(inner, paren_line):
+                        return bulk_operand_type(inner, names, types, rows)
+                    Expr.Field(object, field, field_line):
+                        object_type_opt: Ast::Expr? = bulk_operand_type(object, names, types, rows)
+                        if object_type_opt is object_type:
+                            owner: sview = bulk_struct_owner(object_type)
+                            if owner != "":
+                                found: Ast::Expr = struct_law_field_type_of(owner, field, rows.structs, rows.fields, rows.types)
+                                null return if found is Ast::Expr.Absent
+                                return found
+                        return null
+                    _:
+                        return null
+
         # Whether a push ARGUMENT is a whole container of ELEMENT rather than one element.
-        def bulk_push_argument(argument: Ast::Expr, element: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&) -> bool:
+        def bulk_push_argument(argument: Ast::Expr, element: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, rows: BulkFieldRows&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match argument:
                     Expr.Array(elements, array_line):
                         return not bulk_type_is_container(element)
                     _:
-                        source: sview = bulk_argument_local(argument)
-                        source_type_opt: Ast::Expr? = bulk_type_of(names, types, source) if source != "" else null
+                        source_type_opt: Ast::Expr? = bulk_operand_type(argument, names, types, rows)
                         if source_type_opt is source_type:
                             if bulk_container_element(source_type) is source_element:
                                 return bulk_same_spelling(source_element, element)
                         return false
 
         # Report a bulk copy in one statement expression: `recv.extend(a)` / bulk `recv.push(a)`.
-        def bulk_check_call(expression: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+        def bulk_check_call(expression: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, rows: BulkFieldRows&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Paren(inner, paren_line):
-                        table <- bulk_check_call(inner, names, types, table)
+                        table <- bulk_check_call(inner, names, types, rows, table)
                     Expr.Call(callee, arguments, argument_names, call_line):
                         match callee:
                             Expr.Field(receiver, method, field_line):
-                                receiver_name: sview = ident_name_of(receiver)
+                                receiver_name: sview = bulk_argument_local(receiver)
                                 tracked: bool = receiver_name != "" and arguments.count == 1 and (method == "extend" or method == "push")
-                                receiver_type_opt: Ast::Expr? = bulk_type_of(names, types, receiver_name) if tracked else null
+                                receiver_type_opt: Ast::Expr? = bulk_operand_type(receiver, names, types, rows) if tracked else null
                                 if receiver_type_opt is receiver_type:
                                     if darray_holds_linear(receiver_type, table):
                                         if bulk_container_element(receiver_type) is element:
-                                            if method == "extend" or bulk_push_argument(arguments[0], element, names, types):
+                                            if method == "extend" or bulk_push_argument(arguments[0], element, names, types, rows):
                                                 spelling: mutable darray[u8] = []
                                                 rendered: bool = bulk_spelling(element, &spelling)
                                                 # text_storage never reallocates, so its bytes are a stable Diagnostic sview.
@@ -153,7 +197,7 @@ extend Semantic:
         # `extend` (stage0 checks it with the same compatibility rule), so it duplicates every
         # handle in the source. stage0's list-literal analysis rejects it with the same
         # containsAffineHandleValues test it applies to `extend`.
-        def bulk_check_spreads(expression: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+        def bulk_check_spreads(expression: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, rows: BulkFieldRows&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Array(elements, array_line):
@@ -162,7 +206,7 @@ extend Semantic:
                                 Expr.Unary(operator, operand, unary_line):
                                     if operator == TokenKind.Ellipsis:
                                         source: sview = bulk_argument_local(operand)
-                                        source_type_opt: Ast::Expr? = bulk_type_of(names, types, source) if source != "" else null
+                                        source_type_opt: Ast::Expr? = bulk_operand_type(operand, names, types, rows)
                                         if source_type_opt is source_type:
                                             if darray_holds_linear(source_type, table) or bulk_fixed_holds_linear(source_type, table):
                                                 if bulk_container_element(source_type) is source_element:
@@ -176,33 +220,33 @@ extend Semantic:
                                                     text: sview = bytes_view_range(table.text_storage, start, spelling.count) if fits else source
                                                     spread_pos: Ast::Pos = Ast::expr_pos(operand)
                                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineBulkCopy, name: source, pos: spread_pos, line: spread_pos.line, expected: "spread", actual: text})
-                                    table <- bulk_check_spreads(operand, names, types, table)
+                                    table <- bulk_check_spreads(operand, names, types, rows, table)
                                 _:
-                                    table <- bulk_check_spreads(element, names, types, table)
+                                    table <- bulk_check_spreads(element, names, types, rows, table)
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        table <- bulk_check_spreads(callee, names, types, table)
+                        table <- bulk_check_spreads(callee, names, types, rows, table)
                         for argument in arguments |table| -> table:
-                            table <- bulk_check_spreads(argument, names, types, table)
+                            table <- bulk_check_spreads(argument, names, types, rows, table)
                     Expr.Field(object, field, field_line):
-                        table <- bulk_check_spreads(object, names, types, table)
+                        table <- bulk_check_spreads(object, names, types, rows, table)
                     Expr.Paren(inner, paren_line):
-                        table <- bulk_check_spreads(inner, names, types, table)
+                        table <- bulk_check_spreads(inner, names, types, rows, table)
                     Expr.Move(inner, move_line):
-                        table <- bulk_check_spreads(inner, names, types, table)
+                        table <- bulk_check_spreads(inner, names, types, rows, table)
                     Expr.Unary(operator, inner, unary_line):
-                        table <- bulk_check_spreads(inner, names, types, table)
+                        table <- bulk_check_spreads(inner, names, types, rows, table)
                     Expr.Binary(left, operator, right, binary_line):
-                        table <- bulk_check_spreads(left, names, types, table)
-                        table <- bulk_check_spreads(right, names, types, table)
+                        table <- bulk_check_spreads(left, names, types, rows, table)
+                        table <- bulk_check_spreads(right, names, types, rows, table)
                     Expr.Tuple(elements, tuple_line):
                         for element in elements |table| -> table:
-                            table <- bulk_check_spreads(element, names, types, table)
+                            table <- bulk_check_spreads(element, names, types, rows, table)
                     Expr.Construct(type_expression, fields, construct_line):
                         for field in fields |table| -> table:
-                            table <- bulk_check_spreads(field.value, names, types, table)
+                            table <- bulk_check_spreads(field.value, names, types, rows, table)
                     Expr.If(condition, then_value, else_value, if_line):
-                        table <- bulk_check_spreads(then_value, names, types, table)
-                        table <- bulk_check_spreads(else_value, names, types, table)
+                        table <- bulk_check_spreads(then_value, names, types, rows, table)
+                        table <- bulk_check_spreads(else_value, names, types, rows, table)
                     _:
                         pass
 
@@ -224,36 +268,36 @@ extend Semantic:
                     _:
                         return false
 
-        def bulk_walk(statements: darray[Ast::Stmt], names: darray[sview]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+        def bulk_walk(statements: darray[Ast::Stmt], names: darray[sview]&, types: darray[Ast::Expr]&, rows: BulkFieldRows&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- bulk_check_call(expression, names, types, table)
-                            table <- bulk_check_spreads(expression, names, types, table)
+                            table <- bulk_check_call(expression, names, types, rows, table)
+                            table <- bulk_check_spreads(expression, names, types, rows, table)
                         Stmt.VarDecl(declared_name, declared_type, declared_value, declared_line):
-                            table <- bulk_check_spreads(declared_value, names, types, table)
+                            table <- bulk_check_spreads(declared_value, names, types, rows, table)
                         Stmt.Assign(assign_target, assign_operator, assign_value, assign_line):
-                            table <- bulk_check_spreads(assign_value, names, types, table)
+                            table <- bulk_check_spreads(assign_value, names, types, rows, table)
                         Stmt.Return(returned_opt, return_line):
                             if returned_opt is returned:
-                                table <- bulk_check_spreads(returned, names, types, table)
+                                table <- bulk_check_spreads(returned, names, types, rows, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- bulk_walk(then_body, names, types, table)
-                            table <- bulk_walk(else_body, names, types, table)
+                            table <- bulk_walk(then_body, names, types, rows, table)
+                            table <- bulk_walk(else_body, names, types, rows, table)
                         Stmt.While(condition, while_body, while_line):
-                            table <- bulk_walk(while_body, names, types, table)
+                            table <- bulk_walk(while_body, names, types, rows, table)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
-                            table <- bulk_walk(for_body, names, types, table)
+                            table <- bulk_walk(for_body, names, types, rows, table)
                         Stmt.Block(kind, clause, binding, body, block_line):
-                            table <- bulk_walk(body, names, types, table)
+                            table <- bulk_walk(body, names, types, rows, table)
                         Stmt.Match(scrutinee, arms, match_line):
                             for arm in arms |table| -> table:
-                                table <- bulk_walk(arm.body, names, types, table)
+                                table <- bulk_walk(arm.body, names, types, rows, table)
                         _:
                             pass
 
-        def bulk_copy_funcs(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def bulk_copy_funcs(declarations: darray[Ast::Decl], rows: BulkFieldRows&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -261,15 +305,13 @@ extend Semantic:
                             names: mutable darray[sview] = []
                             types: mutable darray[Ast::Expr] = []
                             for param in params |names, types|:
-                                if bulk_type_is_container(param.type_expression):
-                                    names.push(param.name)
-                                    types.push(param.type_expression)
+                                names.push(param.name)
+                                types.push(param.type_expression)
                             bulk_collect_locals(body, names, types)
-                            if names.count > 0:
-                                table <- bulk_walk(body, names, types, table)
+                            table <- bulk_walk(body, names, types, rows, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- bulk_copy_funcs(module_body, table)
+                            table <- bulk_copy_funcs(module_body, rows, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- bulk_copy_funcs(scoped_body, table)
+                            table <- bulk_copy_funcs(scoped_body, rows, table)
                         _:
                             pass

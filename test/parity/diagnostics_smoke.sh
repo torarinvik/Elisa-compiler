@@ -741,6 +741,16 @@ for asc_case in "22 Handle" "31 Handle" "32 Pair" "33 Handle" "34 Handle"; do
 done
 run_case affine_spread_copy neg "$asc_neg" "spread darray literal does not support affine element type"
 
+echo "-- affine_bulk_copy_field --"
+abf_pos="$FIXTURES/affine_bulk_copy_field.pos.elisa"
+abf_neg="$FIXTURES/affine_bulk_copy_field.neg.elisa"
+abf_tail=' does not support affine element type Handle; push elements individually with explicit move'
+run_case affine_bulk_copy_field pos "$abf_pos" "L23 darray extend$abf_tail"
+run_case affine_bulk_copy_field pos "$abf_pos" "L24 bulk darray push$abf_tail"
+run_case affine_bulk_copy_field pos "$abf_pos" "L25 spread darray literal$abf_tail"
+run_case affine_bulk_copy_field pos "$abf_pos" "L26 spread darray literal$abf_tail"
+run_case affine_bulk_copy_field neg "$abf_neg" "does not support affine element type"
+
 echo "-- drain_discipline --"
 dd_pos="$FIXTURES/drain_discipline.pos.elisa"
 dd_neg="$FIXTURES/drain_discipline.neg.elisa"
