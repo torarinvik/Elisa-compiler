@@ -893,6 +893,18 @@ for lbe_message in "stores a reference to function-local storage" "storing an ag
     run_case local_borrow_container_escape neg "$lbe_neg" "$lbe_message"
 done
 
+echo "-- local_borrow_ref_alias_store --"
+lra_pos="$FIXTURES/local_borrow_ref_alias_store.pos.elisa"
+lra_neg="$FIXTURES/local_borrow_ref_alias_store.neg.elisa"
+for lra_message in \
+    "L19 storing an aggregate that contains a reference to function-local storage into longer-lived storage" \
+    "L28 storing an aggregate that contains a reference to function-local storage into longer-lived storage" \
+    "L36 storing an aggregate that contains a reference to function-local storage into longer-lived storage" \
+    "L43 storing an aggregate that contains a reference to function-local storage into longer-lived storage"; do
+    run_case local_borrow_ref_alias_store pos "$lra_pos" "$lra_message"
+done
+run_case local_borrow_ref_alias_store neg "$lra_neg" "function-local storage"
+
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then

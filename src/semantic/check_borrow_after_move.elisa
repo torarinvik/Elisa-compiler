@@ -1081,6 +1081,134 @@ extend Semantic:
                     _:
                         pass
 
+        def bam_strip_paren(expression: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match expression:
+                    Expr.Paren(stripped_inner, _):
+                        return bam_strip_paren(stripped_inner)
+                    _:
+                        return expression
+
+        # `name = &place` links `name` to `place`; `name = other` where `other` is itself a
+        # linked reference local copies the reference, so `name` names what `other` names.
+        def bam_store_ref_link(name: sview, value: Ast::Expr, link_names: mutable darray[sview]&, link_targets: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                stripped: Ast::Expr = bam_strip_paren(value)
+                linked_root: mutable sview = bam_borrow_root(stripped)
+                match stripped:
+                    Expr.Ident(copied_name, _):
+                        linked_root <- copied_name if any known_link in link_names where known_link == copied_name
+                    _:
+                        pass
+                return if linked_root == "" or linked_root == name
+                link_names.push(name)
+                link_targets.push(linked_root)
+
+        # `al = &owner` / `al <- &owner`: the local `al` is a reference INTO `owner`, so a store
+        # through `al` (`al.begin <- &x`, `al <- v`) lands in `owner`'s storage. stage0's
+        # returnBorrowRefDeclLinks; a rebind adds a link rather than replacing one, so every
+        # place `al` may name receives the store.
+        def bam_store_ref_links(statements: darray[Ast::Stmt], link_names: mutable darray[sview]&, link_targets: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |link_names, link_targets|:
+                    match statement:
+                        Stmt.VarDecl(linked_name, _, linked_value, _):
+                            bam_store_ref_link(linked_name, linked_value, link_names, link_targets)
+                        Stmt.Assign(Expr.Ident(linked_name, _), _, linked_value, _):
+                            bam_store_ref_link(linked_name, linked_value, link_names, link_targets)
+                        Stmt.If(_, linked_then, linked_else, _):
+                            bam_store_ref_links(linked_then, link_names, link_targets)
+                            bam_store_ref_links(linked_else, link_names, link_targets)
+                        Stmt.While(_, linked_body, _):
+                            bam_store_ref_links(linked_body, link_names, link_targets)
+                        Stmt.For(_, _, _, linked_body, _):
+                            bam_store_ref_links(linked_body, link_names, link_targets)
+                        Stmt.Block(_, _, _, linked_body, _):
+                            bam_store_ref_links(linked_body, link_names, link_targets)
+                        Stmt.Match(_, linked_arms, _):
+                            for linked_arm in linked_arms |link_names, link_targets|:
+                                bam_store_ref_links(linked_arm.body, link_names, link_targets)
+                        _:
+                            pass
+
+        # `al <- &p` and `al <- other_alias` re-point the reference local; they write nothing.
+        def bam_store_is_rebind(value: Ast::Expr, link_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                stripped: Ast::Expr = bam_strip_paren(value)
+                return true if bam_borrow_root(stripped) != ""
+                match stripped:
+                    Expr.Ident(copied_name, _):
+                        return any known_link in link_names where known_link == copied_name
+                    _:
+                        return false
+
+        # A store through the reference local `name` adds `stored_roots` to every place it may
+        # name, keeping what those places already held (one field changes, not the whole owner).
+        def bam_store_forward(name: sview, stored_roots: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, seen: mutable darray[sview]&, escape_names: mutable darray[sview]&, escape_roots: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if stored_roots.count == 0
+                seen.push(name)
+                link_row: mutable usize = 0
+                while link_row < link_names.count |link_row, seen, escape_names, escape_roots|:
+                    target: sview = link_targets[link_row]
+                    if link_names[link_row] == name and not (any seen_name in seen where seen_name == target):
+                        existing_roots: darray[sview] = bam_escape_roots_for_binding(target, escape_names, escape_roots)
+                        escape_names.push(target)
+                        escape_roots.push("")
+                        for existing_root in existing_roots |escape_names, escape_roots|:
+                            escape_names.push(target)
+                            escape_roots.push(existing_root)
+                        for stored_root in stored_roots |escape_names, escape_roots, existing_roots|:
+                            if not (any known_root in existing_roots where known_root == stored_root):
+                                escape_names.push(target)
+                                escape_roots.push(stored_root)
+                        bam_store_forward(target, stored_roots, link_names, link_targets, seen, escape_names, escape_roots)
+                    link_row <- link_row + 1
+
+        # bam_escape_merge_branch, answering whether the path added a root to a binding that
+        # existed before it.
+        def bam_escape_merge_branch_grew(target_names: mutable darray[sview]&, target_roots: mutable darray[sview]&, branch_names: darray[sview]&, branch_roots: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                grew: mutable bool = false
+                base_names: mutable darray[sview] = []
+                merge_names: mutable darray[sview] = []
+                for target_name in target_names |base_names, merge_names|:
+                    base_names.push(target_name)
+                    merge_names.push(target_name) if not (any known_merge in merge_names where known_merge == target_name)
+                for branch_name in branch_names |base_names, merge_names|:
+                    merge_names.push(branch_name) if (any known_base in base_names where known_base == branch_name) and not (any known_merge in merge_names where known_merge == branch_name)
+                for merge_name in merge_names |target_names, target_roots, branch_names, branch_roots, grew|:
+                    target_values: darray[sview] = bam_escape_roots_for_binding(merge_name, target_names, target_roots)
+                    branch_values: darray[sview] = bam_escape_roots_for_binding(merge_name, branch_names, branch_roots)
+                    target_names.push(merge_name)
+                    target_roots.push("")
+                    for target_value in target_values |target_names, target_roots|:
+                        target_names.push(merge_name)
+                        target_roots.push(target_value)
+                    for branch_value in branch_values |target_names, target_roots, target_values, grew|:
+                        if not (any known_value in target_values where known_value == branch_value):
+                            target_names.push(merge_name)
+                            target_roots.push(branch_value)
+                            grew <- true
+                return grew
+
+        # A loop body also runs after its own earlier iterations: `h.a <- owner` then
+        # `al.begin <- &x` stores the borrow on the SECOND pass. Walk the body until the carried
+        # roots stop growing (roots only grow, so the last walk reports a superset of the earlier
+        # ones) and keep only that walk's diagnostics.
+        def bam_store_loop(body: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]&, escape_roots: mutable darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, round: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                diagnostic_mark: usize = table.diagnostics.count
+                loop_names: mutable darray[sview] = []
+                loop_roots: mutable darray[sview] = []
+                loop_names.extend(escape_names)
+                loop_roots.extend(escape_roots)
+                table <- bam_store_statements(body, locals, ref_params, ref_param_types, lend_names, lend_positions, loop_names, loop_roots, link_names, link_targets, table)
+                grew: bool = bam_escape_merge_branch_grew(escape_names, escape_roots, loop_names, loop_roots)
+                if grew and round < 8:
+                    table.diagnostics.truncate(diagnostic_mark)
+                    table <- bam_store_loop(body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, round + 1, table)
+
         # `out.p <- &local` where `out` is a REFERENCE parameter: the frame dies at the return
         # but the pointee it just published lives on in the caller's storage. stage0 reports
         # this from the same escape analysis as the return form, with its own sentence.
@@ -1088,7 +1216,7 @@ extend Semantic:
         # reaching it through a value: `out.push(&x)` into a reference-carrying darray
         # (state 1), an aggregate literal or alias holding `&x` (state 2), and a local
         # reference alias `r = &x; out.r <- r` (state 3).
-        def bam_store_statements(statements: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]&, escape_roots: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def bam_store_statements(statements: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]&, escape_roots: mutable darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table, escape_names, escape_roots| -> table:
                     match statement:
@@ -1108,8 +1236,27 @@ extend Semantic:
                                     anchor: Ast::Pos = bam_escape_anchor(store_value)
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StoreRefToLocal, name: target_root, pos: anchor, line: anchor.line, expected: "", actual: "", state_code: store_form})
                             bam_escape_track_assign(store_target, store_value, lend_names, lend_positions, escape_names, escape_roots)
+                            # A store THROUGH a reference local also lands in the place it names; its
+                            # own rebind (`al <- &p`) is a link, not a store.
+                            if target_root != "" and (bam_place_is_interior(store_target) or not bam_store_is_rebind(store_value, link_names)):
+                                forwarded_roots: mutable darray[sview] = []
+                                bam_escape_collect_roots(store_value, lend_names, lend_positions, escape_names, escape_roots, forwarded_roots)
+                                forward_seen: mutable darray[sview] = []
+                                bam_store_forward(target_root, forwarded_roots, link_names, link_targets, forward_seen, escape_names, escape_roots)
                         Stmt.Expr(push_call, _):
                             table <- bam_store_push(push_call, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, table)
+                            bam_escape_track_insert(push_call, lend_names, lend_positions, escape_names, escape_roots)
+                            match push_call:
+                                Expr.Call(Expr.Field(forward_receiver, forward_method, _), forward_arguments, _, _):
+                                    forward_root: sview = bam_place_root(forward_receiver)
+                                    if bam_is_container_insert(forward_method) and forward_root != "":
+                                        inserted_roots: mutable darray[sview] = []
+                                        for forward_argument in forward_arguments |inserted_roots|:
+                                            bam_escape_collect_roots(forward_argument, lend_names, lend_positions, escape_names, escape_roots, inserted_roots)
+                                        forward_seen: mutable darray[sview] = []
+                                        bam_store_forward(forward_root, inserted_roots, link_names, link_targets, forward_seen, escape_names, escape_roots)
+                                _:
+                                    pass
                         Stmt.If(branch_condition, branch_then, branch_else, branch_pos):
                             then_names: mutable darray[sview] = []
                             then_roots: mutable darray[sview] = []
@@ -1119,26 +1266,16 @@ extend Semantic:
                             then_roots.extend(escape_roots)
                             else_names.extend(escape_names)
                             else_roots.extend(escape_roots)
-                            table <- bam_store_statements(branch_then, locals, ref_params, ref_param_types, lend_names, lend_positions, then_names, then_roots, table)
-                            table <- bam_store_statements(branch_else, locals, ref_params, ref_param_types, lend_names, lend_positions, else_names, else_roots, table)
+                            table <- bam_store_statements(branch_then, locals, ref_params, ref_param_types, lend_names, lend_positions, then_names, then_roots, link_names, link_targets, table)
+                            table <- bam_store_statements(branch_else, locals, ref_params, ref_param_types, lend_names, lend_positions, else_names, else_roots, link_names, link_targets, table)
                             bam_escape_merge_branch(escape_names, escape_roots, then_names, then_roots)
                             bam_escape_merge_branch(escape_names, escape_roots, else_names, else_roots)
                         Stmt.While(loop_condition, loop_body, loop_pos):
-                            loop_names: mutable darray[sview] = []
-                            loop_roots: mutable darray[sview] = []
-                            loop_names.extend(escape_names)
-                            loop_roots.extend(escape_roots)
-                            table <- bam_store_statements(loop_body, locals, ref_params, ref_param_types, lend_names, lend_positions, loop_names, loop_roots, table)
-                            bam_escape_merge_branch(escape_names, escape_roots, loop_names, loop_roots)
+                            table <- bam_store_loop(loop_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, 0, table)
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
-                            loop_names: mutable darray[sview] = []
-                            loop_roots: mutable darray[sview] = []
-                            loop_names.extend(escape_names)
-                            loop_roots.extend(escape_roots)
-                            table <- bam_store_statements(for_body, locals, ref_params, ref_param_types, lend_names, lend_positions, loop_names, loop_roots, table)
-                            bam_escape_merge_branch(escape_names, escape_roots, loop_names, loop_roots)
+                            table <- bam_store_loop(for_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, 0, table)
                         Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
-                            table <- bam_store_statements(block_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, table)
+                            table <- bam_store_statements(block_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, table)
                         Stmt.Match(match_scrutinee, match_arms, match_pos):
                             base_names: mutable darray[sview] = []
                             base_roots: mutable darray[sview] = []
@@ -1149,7 +1286,7 @@ extend Semantic:
                                 arm_roots: mutable darray[sview] = []
                                 arm_names.extend(base_names)
                                 arm_roots.extend(base_roots)
-                                table <- bam_store_statements(match_arm.body, locals, ref_params, ref_param_types, lend_names, lend_positions, arm_names, arm_roots, table)
+                                table <- bam_store_statements(match_arm.body, locals, ref_params, ref_param_types, lend_names, lend_positions, arm_names, arm_roots, link_names, link_targets, table)
                                 bam_escape_merge_branch(escape_names, escape_roots, arm_names, arm_roots)
                         _:
                             pass
@@ -1241,8 +1378,11 @@ extend Semantic:
                                     ref_params.push(ref_parameter.name)
                                     ref_param_types.push(annotation_type_id(ref_parameter.type_expression, table))
                             store_names: mutable darray[sview] = []
+                            link_names: mutable darray[sview] = []
+                            link_targets: mutable darray[sview] = []
+                            bam_store_ref_links(function_body, link_names, link_targets)
                             store_roots: mutable darray[sview] = []
-                            table <- bam_store_statements(function_body, locals, ref_params, ref_param_types, lend_names, lend_positions, store_names, store_roots, table) if ref_params.count > 0 and locals.count > 0
+                            table <- bam_store_statements(function_body, locals, ref_params, ref_param_types, lend_names, lend_positions, store_names, store_roots, link_names, link_targets, table) if ref_params.count > 0 and locals.count > 0
                         Decl.Module(module_name, module_body, module_pos):
                             previous_module: sview = table.current_module
                             table.current_module <- module_name
