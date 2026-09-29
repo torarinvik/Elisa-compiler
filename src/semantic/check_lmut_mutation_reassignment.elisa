@@ -6,6 +6,13 @@
 # successor — stage0 flags it (docs/120 §10). SOUND, structural subset: a threading call whose
 # lmut argument is a bare Ident is a violation unless that name appears among the enclosing
 # assignment's targets. UFCS `recv.m(...)` threads its RECEIVER at position 0.
+#
+# The same rule covers a mutating BUILTIN collection method (stage0 checkValueBlockMutatingBuiltinMethod
+# -> checkLinearMutation): `p.items.clear()` on a darray/dict/set place rooted at an `lmut`
+# PARAMETER mutates `p` in place, so it must sit under a reassignment naming the root
+# (`p.items <- p.items.clear()`), or inside a `while … |p|:` loop that captures it. A `for`
+# capture does not license it (stage0 pushes the capture frame for `while` only), and a plain
+# field store `p.n <- …` is not a call and never reaches the rule.
 extend Semantic:
     private:
         def lmut_threads_position(table: SymbolTable&, callee: sview, position: u32) -> bool:
@@ -86,33 +93,225 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 out.extend([annotation.name for annotation in annotations if annotation.owner == "__lmut_rebind_claim" and annotation.line == line])
 
-        def lmut_mutation_check_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        # stage0 mutatingBuiltinCollectionMethods: the builtin darray/dict/set methods that
+        # change a container's contents or layout. `pop` is a stdlib method with a real
+        # `T&` self, so it is not in the set.
+        def lmr_mutating_builtin(method: sview) -> bool:
+            true return if method == "push" or method == "extend" or method == "reserve" or method == "resize"
+            true return if method == "clear" or method == "truncate" or method == "insert" or method == "remove"
+            return method == "set" or method == "put" or method == "add" or method == "get_or_insert"
+
+        # A type spelling with its reference and mode qualifiers peeled.
+        def lmr_strip_type(type_expression: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return lmr_strip_type(operand) if operator == TokenKind.Mutable or operator == TokenKind.Ampersand or operator == TokenKind.Lmut or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail
+                    Expr.Paren(inner, paren_pos):
+                        return lmr_strip_type(inner)
+                    _:
+                        pass
+                return type_expression
+
+        def lmr_is_lmut_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return operator == TokenKind.Lmut
+                    Expr.Paren(inner, paren_pos):
+                        return lmr_is_lmut_type(inner)
+                    _:
+                        return false
+
+        # stage0 receiverIsBuiltinCollection: a darray (incl. `dstr`), dict or set, peeling refs.
+        def lmr_is_builtin_collection(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match lmr_strip_type(type_expression):
+                    Expr.Ident(name, ident_pos):
+                        return name == "dstr"
+                    Expr.Index(object, argument, index_pos):
+                        container: sview = ident_name_of(object)
+                        return container == "darray" or container == "dict" or container == "set"
+                    Expr.IndexN(object_n, arguments, index_n_pos):
+                        return ident_name_of(object_n) == "dict"
+                    _:
+                        return false
+
+        # The declared type of a receiver place rooted at an `lmut` parameter (a field/index
+        # chain), or Expr.Invalid when this pass cannot name it -- nothing fires then.
+        def lmr_receiver_type(receiver: Ast::Expr, lmut_names: darray[sview]&, lmut_types: darray[Ast::Expr]&, table: SymbolTable&) -> Ast::Expr:
+            can Abort.Panic:
+                match receiver:
+                    Expr.Ident(name, ident_pos):
+                        while position < lmut_names.count |position: usize = 0|:
+                            return lmut_types[position] if lmut_names[position] == name
+                            position <- position + 1
+                    Expr.Paren(inner, paren_pos):
+                        return lmr_receiver_type(inner, lmut_names, lmut_types, table)
+                    Expr.Field(object, field, field_pos):
+                        owner: sview = owner_name if lmr_strip_type(lmr_receiver_type(object, lmut_names, lmut_types, table)) is Ast::Expr.Ident(owner_name, _) else ""
+                        if owner != "":
+                            row: i64 = struct_field_row_for_type(table, owner, field)
+                            return table.private_field_types[row.usize()] if row >= 0 and row.usize() < table.private_field_types.count
+                    Expr.Index(indexed, index, indexed_pos):
+                        match lmr_strip_type(lmr_receiver_type(indexed, lmut_names, lmut_types, table)):
+                            Expr.Index(container, element, container_pos):
+                                return element if ident_name_of(container) == "darray"
+                            Expr.IndexN(container_n, type_arguments, container_n_pos):
+                                return type_arguments[1] if ident_name_of(container_n) == "dict" and type_arguments.count == 2
+                            _:
+                                pass
+                    _:
+                        pass
+                return Ast::Expr.Invalid
+
+        # stage0 rootIdentName over the place shapes a receiver can take.
+        def lmr_place_root(place: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match place:
+                    Expr.Ident(name, ident_pos):
+                        return name
+                    Expr.Field(object, field, field_pos):
+                        return lmr_place_root(object)
+                    Expr.Index(indexed, index, index_pos):
+                        return lmr_place_root(indexed)
+                    Expr.Paren(inner, paren_pos):
+                        return lmr_place_root(inner)
+                    _:
+                        return ""
+
+        # Flag every mutating builtin call in VALUE whose receiver is a collection place rooted
+        # at an `lmut` parameter that is neither a target of the enclosing reassignment nor
+        # captured by an enclosing `while`. Descends the expression shapes a call can hide in;
+        # value blocks and lambdas are left to their own analyses (E4 rejects the uncaptured case).
+        def lmr_check_builtin_calls(value: Ast::Expr, targets: darray[sview]&, allowed: darray[sview]&, lmut_names: darray[sview]&, lmut_types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                return if lmut_names.count == 0
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(receiver, method, method_pos):
+                                root: sview = lmr_place_root(receiver)
+                                if root != "" and lmr_mutating_builtin(method) and not (any target in targets where target == root) and not (any name in allowed where name == root) and lmr_is_builtin_collection(lmr_receiver_type(receiver, lmut_names, lmut_types, table)):
+                                    receiver_pos: Ast::Pos = Ast::expr_pos(receiver)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LmutMutationNotReassignment, name: root, pos: receiver_pos, line: receiver_pos.line, expected: "", actual: "", expected_count: 1})
+                                table <- lmr_check_builtin_calls(receiver, targets, allowed, lmut_names, lmut_types, table)
+                            _:
+                                table <- lmr_check_builtin_calls(callee, targets, allowed, lmut_names, lmut_types, table)
+                        for argument in arguments |table| -> table:
+                            table <- lmr_check_builtin_calls(argument, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Field(object, field, field_pos):
+                        table <- lmr_check_builtin_calls(object, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Index(indexed, index, index_pos):
+                        table <- lmr_check_builtin_calls(indexed, targets, allowed, lmut_names, lmut_types, table)
+                        table <- lmr_check_builtin_calls(index, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- lmr_check_builtin_calls(inner, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        table <- lmr_check_builtin_calls(condition, targets, allowed, lmut_names, lmut_types, table)
+                        table <- lmr_check_builtin_calls(then_value, targets, allowed, lmut_names, lmut_types, table)
+                        table <- lmr_check_builtin_calls(else_value, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        table <- lmr_check_builtin_calls(left, targets, allowed, lmut_names, lmut_types, table)
+                        table <- lmr_check_builtin_calls(right, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Unary(unary_operator, operand, unary_pos):
+                        table <- lmr_check_builtin_calls(operand, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Array(elements, array_pos):
+                        for element in elements |table| -> table:
+                            table <- lmr_check_builtin_calls(element, targets, allowed, lmut_names, lmut_types, table)
+                    Expr.Tuple(tuple_elements, tuple_pos):
+                        for tuple_element in tuple_elements |table| -> table:
+                            table <- lmr_check_builtin_calls(tuple_element, targets, allowed, lmut_names, lmut_types, table)
+                    _:
+                        pass
+
+        # stage0 keys the reassignment exemption on the ROOT of a single target
+        # (`p.items <- …` licenses `p`) and on the bare names of a tuple target.
+        def lmr_target_roots(target: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Array(elements, array_pos):
+                        out.extend([ident_name_of(element) for element in elements if ident_name_of(element) != ""])
+                    _:
+                        root: sview = lmr_place_root(target)
+                        out.push(root) if root != ""
+
+        # Names the body declares itself: a local that shadows an `lmut` parameter is not
+        # that parameter, so the rule declines on every such name.
+        def lmr_collect_declared(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, pos):
+                            out.push(name)
+                        Stmt.For(bind, variables, iterable, for_body, pos):
+                            out.extend(variables)
+                            lmr_collect_declared(for_body, out)
+                        Stmt.Block(kind, clause, binding, body, pos):
+                            out.push(binding) if binding != ""
+                            lmr_collect_declared(body, out)
+                        Stmt.If(condition, then_body, else_body, pos):
+                            lmr_collect_declared(then_body, out)
+                            lmr_collect_declared(else_body, out)
+                        Stmt.While(condition, while_body, pos):
+                            lmr_collect_declared(while_body, out)
+                        Stmt.Match(scrutinee, arms, pos):
+                            for arm in arms |out|:
+                                lmr_collect_declared(arm.body, out)
+                        _:
+                            pass
+
+        # A captured-loop block (semantic_loop_view) whose loop is a `while`.
+        def lmr_block_is_while(body: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                return any statement in body where statement is Ast::Stmt.While(_, _, _)
+
+        def lmut_mutation_check_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, allowed: darray[sview]&, lmut_names: darray[sview]&, lmut_types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                no_targets: darray[sview] = []
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            no_targets: darray[sview] = []
                             table <- lmut_check_value(expression, no_targets, line.line, table)
+                            table <- lmr_check_builtin_calls(expression, no_targets, allowed, lmut_names, lmut_types, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             claimed: mutable darray[sview] = []
                             lmr_rebind_claims_at(annotations, line.line, claimed)
                             table <- lmut_check_value(value, claimed, line.line, table)
+                            table <- lmr_check_builtin_calls(value, claimed, allowed, lmut_names, lmut_types, table)
                         Stmt.Assign(target, operator, value, line):
                             targets: mutable darray[sview] = []
                             lmut_collect_target_names(target, targets)
                             table <- lmut_check_value(value, targets, line.line, table)
+                            roots: mutable darray[sview] = []
+                            lmr_target_roots(target, roots)
+                            table <- lmr_check_builtin_calls(value, roots, allowed, lmut_names, lmut_types, table)
+                        Stmt.Return(returned, line):
+                            if returned is returned_value:
+                                table <- lmr_check_builtin_calls(returned_value, no_targets, allowed, lmut_names, lmut_types, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- lmut_mutation_check_statements(then_body, annotations, table)
-                            table <- lmut_mutation_check_statements(else_body, annotations, table)
+                            table <- lmr_check_builtin_calls(condition, no_targets, allowed, lmut_names, lmut_types, table)
+                            table <- lmut_mutation_check_statements(then_body, annotations, allowed, lmut_names, lmut_types, table)
+                            table <- lmut_mutation_check_statements(else_body, annotations, allowed, lmut_names, lmut_types, table)
                         Stmt.While(condition, while_body, line):
-                            table <- lmut_mutation_check_statements(while_body, annotations, table)
+                            table <- lmr_check_builtin_calls(condition, no_targets, allowed, lmut_names, lmut_types, table)
+                            table <- lmut_mutation_check_statements(while_body, annotations, allowed, lmut_names, lmut_types, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- lmut_mutation_check_statements(for_body, annotations, table)
+                            table <- lmr_check_builtin_calls(iterable, no_targets, allowed, lmut_names, lmut_types, table)
+                            table <- lmut_mutation_check_statements(for_body, annotations, allowed, lmut_names, lmut_types, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- lmut_mutation_check_statements(body, annotations, table)
+                            if kind == "loop" and lmr_block_is_while(body):
+                                # stage0 loopCaptureAllowed: `while … |p|:` licenses `p`.
+                                widened: mutable darray[sview] = []
+                                widened.extend(allowed)
+                                widened.extend(clause)
+                                table <- lmut_mutation_check_statements(body, annotations, widened, lmut_names, lmut_types, table)
+                            else:
+                                table <- lmut_mutation_check_statements(body, annotations, allowed, lmut_names, lmut_types, table)
                         Stmt.Match(scrutinee, arms, line):
+                            table <- lmr_check_builtin_calls(scrutinee, no_targets, allowed, lmut_names, lmut_types, table)
                             for arm in arms |table| -> table:
-                                table <- lmut_mutation_check_statements(arm.body, annotations, table)
+                                table <- lmut_mutation_check_statements(arm.body, annotations, allowed, lmut_names, lmut_types, table)
                         _:
                             pass
 
@@ -121,7 +320,16 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            table <- lmut_mutation_check_statements(body, annotations, table)
+                            declared: mutable darray[sview] = []
+                            lmr_collect_declared(body, declared)
+                            lmut_names: mutable darray[sview] = []
+                            lmut_types: mutable darray[Ast::Expr] = []
+                            for parameter in parameters |lmut_names, lmut_types|:
+                                if lmr_is_lmut_type(parameter.type_expression) and not (any name in declared where name == parameter.name):
+                                    lmut_names.push(parameter.name)
+                                    lmut_types.push(parameter.type_expression)
+                            no_allowed: darray[sview] = []
+                            table <- lmut_mutation_check_statements(body, annotations, no_allowed, lmut_names, lmut_types, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- lmut_mutation_walk(module_body, annotations, table)
                         Decl.Scoped(scoped_body, scoped_line):

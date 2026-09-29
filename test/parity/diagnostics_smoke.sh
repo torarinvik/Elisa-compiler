@@ -905,6 +905,17 @@ for lra_message in \
 done
 run_case local_borrow_ref_alias_store neg "$lra_neg" "function-local storage"
 
+# A mutating builtin collection method on a field/index place rooted at an `lmut`
+# parameter (`p.items.clear()`) is a hidden mutation of `p`: it must be written as a
+# reassignment of the root. A `for` capture does not license it, a `while` capture
+# does; matches stage0 line for line (and column for column at the CLI).
+lfb_pos="$FIXTURES/lmut_field_builtin_mutation.pos.elisa"
+lfb_neg="$FIXTURES/lmut_field_builtin_mutation.neg.elisa"
+for lfb_line in 16 18 20 22 23 25 27 29 32; do
+    run_case lmut_field_builtin_mutation pos "$lfb_pos" "L$lfb_line mutation of \`lmut\` value \"p\" must be a reassignment (docs/120 §10): write \`p <- …\` so the dataflow is visible"
+done
+run_case lmut_field_builtin_mutation neg "$lfb_neg" "must be a reassignment"
+
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then
