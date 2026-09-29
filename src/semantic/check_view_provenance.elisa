@@ -1,0 +1,426 @@
+# View provenance escape: a view of a LOCAL owner reaches caller-owned storage through a
+# local CONTAINER (a filled local `caps`, a literal `[bytes_view(xs)]`, a comprehension, or a
+# call result), and an element read out of that container is stored into a `mutable` ref
+# parameter.
+#
+#     caps: mutable darray[sview] = []
+#     fill(caps)                 # fill pushes bytes_view(<its local>) into `caps`
+#     for c in caps:
+#         dst.push(c)            # the bytes die with this frame
+#
+# A DIRECT push of a local view into a parameter (`dst.push(bytes_view(xs))`) is accepted by
+# stage0 (the receiver ADOPTS the region), so only values that travelled through a local
+# container are reported. Mirrors stage0's region_local_container_elements.go /
+# region_return_element_summary.go, syntactically. Summaries (which top-level function fills
+# which parameter with local data, which returns local-derived elements) are computed by
+# fixpoint. Everything unclear stays silent.
+#
+# Per-local flags: 1 owns fresh storage, 2 direct view of a local owner, 4 element of a
+# container that holds local views, 8 poisoned (redeclared/reassigned), 16 store target,
+# 32 parameter, 64 local.
+extend Semantic:
+    private:
+        def vp_idx(sn: darray[sview]&, name: sview) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                i: mutable usize = sn.count
+                while i > 0:
+                    i <- i - 1
+                    return i if sn[i] == name
+                return sn.count
+
+        def vp_flags(sn: darray[sview]&, sf: darray[u32]&, name: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                idx: usize = vp_idx(sn, name)
+                return 0 if idx >= sn.count
+                return 0 if (sf[idx] & 8) != 0
+                return sf[idx]
+
+        def vp_set(sn: mutable darray[sview]&, sf: mutable darray[u32]&, sp: mutable darray[u32]&, sa: mutable darray[sview]&, name: sview, flag: u32, mask: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                idx: usize = vp_idx(sn, name)
+                if idx >= sn.count:
+                    sn.push(name)
+                    sf.push(flag)
+                    sp.push(mask)
+                    sa.push("")
+                else:
+                    sf[idx] <- sf[idx] | flag
+                    sp[idx] <- sp[idx] | mask
+
+        def vp_target(sn: darray[sview]&, sf: darray[u32]&, sa: darray[sview]&, name: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                idx: usize = vp_idx(sn, name)
+                return "" if idx >= sn.count
+                return "" if (sf[idx] & 8) != 0
+                return sa[idx] if sa[idx] != ""
+                return name if (sf[idx] & 16) != 0
+                return ""
+
+        def vp_param_index(pn: darray[sview]&, name: sview) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                i: mutable usize = 0
+                while i < pn.count:
+                    return i if pn[i] == name
+                    i <- i + 1
+                return pn.count
+
+        def vp_ret_flags(retn: darray[sview]&, retf: darray[u32]&, name: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                i: mutable usize = 0
+                while i < retn.count:
+                    return retf[i] if retn[i] == name
+                    i <- i + 1
+                return 0
+
+        def vp_has_fill(filln: darray[sview]&, filli: darray[usize]&, name: sview, index: usize) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                i: mutable usize = 0
+                while i < filln.count:
+                    return true if filln[i] == name and filli[i] == index
+                    i <- i + 1
+                return false
+
+        def vp_record_fill(cur: sview, index: usize, pn: darray[sview]&, filln: mutable darray[sview]&, filli: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if cur == "" or index >= pn.count
+                return if vp_has_fill(filln, filli, cur, index)
+                filln.push(cur)
+                filli.push(index)
+
+        def vp_record_ret(cur: sview, flags: u32, retn: mutable darray[sview]&, retf: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if cur == "" or flags == 0
+                i: mutable usize = 0
+                while i < retn.count:
+                    if retn[i] == cur:
+                        retf[i] <- retf[i] | flags
+                        return
+                    i <- i + 1
+                retn.push(cur)
+                retf.push(flags)
+
+        def vp_root_flags(expression: Ast::Expr, sn: darray[sview]&, sf: darray[u32]&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                root: sview = auto_escape_place_root(expression)
+                return 0 if root == ""
+                return vp_flags(sn, sf, root)
+
+        def vp_fresh(expression: Ast::Expr, fr: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Array(elements, array_pos):
+                        return true
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return true
+                    Expr.Paren(inner, paren_pos):
+                        return vp_fresh(inner, fr)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        callee_name: sview = ident_name_of(callee)
+                        return false if callee_name == ""
+                        return true if callee_name == "__fstr"
+                        return any fresh_name in fr where fresh_name == callee_name
+                    _:
+                        return false
+
+        # 0 none, 1 direct view of a local owner, 2 value that travelled through a local container.
+        def vp_kind(expression: Ast::Expr, sn: darray[sview]&, sf: darray[u32]&, retn: darray[sview]&, retf: darray[u32]&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_pos):
+                        flags: u32 = vp_flags(sn, sf, name)
+                        return 2 if (flags & 4) != 0
+                        return 1 if (flags & 2) != 0
+                        return 0
+                    Expr.Paren(inner, paren_pos):
+                        return vp_kind(inner, sn, sf, retn, retf)
+                    Expr.Unary(operator, operand, unary_pos):
+                        return vp_kind(operand, sn, sf, retn, retf)
+                    Expr.Index(object, index, index_pos):
+                        return 2 if vp_kind(object, sn, sf, retn, retf) == 2
+                        return 0
+                    Expr.Field(object, field, field_pos):
+                        return 2 if vp_kind(object, sn, sf, retn, retf) == 2
+                        return 0
+                    Expr.Array(elements, array_pos):
+                        for element in elements:
+                            return 2 if vp_kind(element, sn, sf, retn, retf) > 0
+                        return 0
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        for field in fields:
+                            return 1 if vp_kind(field.value, sn, sf, retn, retf) > 0
+                        return 0
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos):
+                        return 2 if vp_kind(iterable, sn, sf, retn, retf) == 2
+                        return 0
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Ident(callee_name, callee_pos):
+                                if (callee_name == "bytes_view" or callee_name == "bytes_view_range") and arguments.count > 0:
+                                    return 1 if (vp_root_flags(arguments[0], sn, sf) & 1) != 0
+                                    return 0
+                                ret: u32 = vp_ret_flags(retn, retf, callee_name)
+                                return 2 if (ret & 1) != 0
+                                j: mutable usize = 0
+                                while j < arguments.count and j < 15:
+                                    if (ret & (2 << j)) != 0:
+                                        k: u32 = vp_kind(arguments[j], sn, sf, retn, retf)
+                                        return k if k > 0
+                                    j <- j + 1
+                                return 0
+                            Expr.Field(receiver, method, method_pos):
+                                if method == "as_sview" and arguments.count == 0:
+                                    return 1 if (vp_root_flags(receiver, sn, sf) & 1) != 0
+                                if method == "pop" and arguments.count == 0:
+                                    return 2 if vp_kind(receiver, sn, sf, retn, retf) == 2
+                                return 0
+                            _:
+                                return 0
+                    _:
+                        return 0
+
+        # Bitmask of the parameters an expression's value is derived from.
+        def vp_pm(expression: Ast::Expr, sn: darray[sview]&, sf: darray[u32]&, sp: darray[u32]&, retn: darray[sview]&, retf: darray[u32]&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_pos):
+                        idx: usize = vp_idx(sn, name)
+                        return 0 if idx >= sn.count
+                        return 0 if (sf[idx] & 8) != 0
+                        return sp[idx]
+                    Expr.Paren(inner, paren_pos):
+                        return vp_pm(inner, sn, sf, sp, retn, retf)
+                    Expr.Unary(operator, operand, unary_pos):
+                        return vp_pm(operand, sn, sf, sp, retn, retf)
+                    Expr.Index(object, index, index_pos):
+                        return vp_pm(object, sn, sf, sp, retn, retf)
+                    Expr.Field(object, field, field_pos):
+                        return vp_pm(object, sn, sf, sp, retn, retf)
+                    Expr.Array(elements, array_pos):
+                        mask: mutable u32 = 0
+                        for element in elements |mask|:
+                            mask <- mask | vp_pm(element, sn, sf, sp, retn, retf)
+                        return mask
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos):
+                        return vp_pm(iterable, sn, sf, sp, retn, retf)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Ident(callee_name, callee_pos):
+                                if (callee_name == "bytes_view" or callee_name == "bytes_view_range") and arguments.count > 0:
+                                    return vp_pm(arguments[0], sn, sf, sp, retn, retf)
+                                ret: u32 = vp_ret_flags(retn, retf, callee_name)
+                                mask: mutable u32 = 0
+                                j: mutable usize = 0
+                                while j < arguments.count and j < 15:
+                                    mask <- mask | vp_pm(arguments[j], sn, sf, sp, retn, retf) if (ret & (2 << j)) != 0
+                                    j <- j + 1
+                                return mask
+                            Expr.Field(receiver, method, method_pos):
+                                return vp_pm(receiver, sn, sf, sp, retn, retf) if (method == "pop" or method == "as_sview") and arguments.count == 0
+                                return 0
+                            _:
+                                return 0
+                    _:
+                        return 0
+
+        def vp_report(line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                duplicate: bool = any existing in table.diagnostics where existing.kind == DiagnosticKind.AutoRegionStoreEscape and existing.line == line
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line, expected: "", actual: ""}) if not duplicate
+
+        # Effects of a call statement: pushes into targets/locals, fill callees.
+        def vp_call(expression: Ast::Expr, line: u32, cur: sview, pn: darray[sview]&, sn: mutable darray[sview]&, sf: mutable darray[u32]&, sp: mutable darray[u32]&, sa: mutable darray[sview]&, filln: mutable darray[sview]&, filli: mutable darray[usize]&, retn: darray[sview]&, retf: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(receiver, method, method_pos):
+                                return if method != "push" or arguments.count != 1
+                                receiver_name: sview = ident_name_of(receiver)
+                                return if receiver_name == ""
+                                target: sview = vp_target(sn, sf, sa, receiver_name)
+                                kind: u32 = vp_kind(arguments[0], sn, sf, retn, retf)
+                                mask: u32 = vp_pm(arguments[0], sn, sf, sp, retn, retf)
+                                if target != "":
+                                    table <- vp_report(line, table) if kind == 2
+                                    vp_record_fill(cur, vp_param_index(pn, target), pn, filln, filli) if kind > 0
+                                else:
+                                    receiver_flags: u32 = vp_flags(sn, sf, receiver_name)
+                                    if (receiver_flags & 64) != 0:
+                                        vp_set(sn, sf, sp, sa, receiver_name, 4 if kind > 0 else 0, mask)
+                            Expr.Ident(callee_name, callee_pos):
+                                j: mutable usize = 0
+                                while j < arguments.count:
+                                    arg_name: sview = ident_name_of(arguments[j])
+                                    if arg_name != "" and vp_has_fill(filln, filli, callee_name, j):
+                                        target: sview = vp_target(sn, sf, sa, arg_name)
+                                        if target != "":
+                                            vp_record_fill(cur, vp_param_index(pn, target), pn, filln, filli)
+                                        else:
+                                            arg_flags: u32 = vp_flags(sn, sf, arg_name)
+                                            vp_set(sn, sf, sp, sa, arg_name, 4, 0) if (arg_flags & 64) != 0
+                                    j <- j + 1
+                            _:
+                                pass
+                    _:
+                        pass
+
+        def vp_collect_decls(body: darray[Ast::Stmt], sn: mutable darray[sview]&, sf: mutable darray[u32]&, sp: mutable darray[u32]&, sa: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |sn, sf, sp, sa|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if vp_idx(sn, name) < sn.count:
+                                vp_set(sn, sf, sp, sa, name, 8, 0)
+                            else:
+                                vp_set(sn, sf, sp, sa, name, 0, 0)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                            loop_var: sview = for_variables[0] if for_variables.count > 0 else for_bind
+                            if vp_idx(sn, loop_var) < sn.count:
+                                vp_set(sn, sf, sp, sa, loop_var, 8, 0)
+                            else:
+                                vp_set(sn, sf, sp, sa, loop_var, 0, 0)
+                            vp_collect_decls(for_body, sn, sf, sp, sa)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            vp_collect_decls(block_body, sn, sf, sp, sa)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            vp_collect_decls(then_body, sn, sf, sp, sa)
+                            vp_collect_decls(else_body, sn, sf, sp, sa)
+                        Stmt.While(condition, while_body, while_line):
+                            vp_collect_decls(while_body, sn, sf, sp, sa)
+                        Stmt.Match(match_scrutinee, match_arms, match_line):
+                            for arm in match_arms |sn, sf, sp, sa|:
+                                vp_collect_decls(arm.body, sn, sf, sp, sa)
+                        _:
+                            pass
+
+        def vp_walk(body: darray[Ast::Stmt], cur: sview, pn: darray[sview]&, fr: darray[sview]&, sn: mutable darray[sview]&, sf: mutable darray[u32]&, sp: mutable darray[u32]&, sa: mutable darray[sview]&, filln: mutable darray[sview]&, filli: mutable darray[usize]&, retn: mutable darray[sview]&, retf: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |sn, sf, sp, sa, filln, filli, retn, retf, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- vp_call(value, line.line, cur, pn, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                            kind: u32 = vp_kind(value, sn, sf, retn, retf)
+                            mask: u32 = vp_pm(value, sn, sf, sp, retn, retf)
+                            flags: mutable u32 = 64
+                            flags <- flags | 2 if kind == 1
+                            flags <- flags | 4 if kind == 2
+                            flags <- flags | 1 if vp_fresh(value, fr)
+                            vp_set(sn, sf, sp, sa, name, flags, mask)
+                            alias_target: sview = vp_target(sn, sf, sa, ident_name_of(value))
+                            if alias_target != "":
+                                idx: usize = vp_idx(sn, name)
+                                sa[idx] <- alias_target
+                        Stmt.Expr(expression, line):
+                            table <- vp_call(expression, line.line, cur, pn, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        Stmt.Assign(assign_target, assign_operator, assign_value, assign_pos):
+                            table <- vp_call(assign_value, assign_pos.line, cur, pn, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                            assigned: sview = ident_name_of(assign_target)
+                            if assigned != "" and (vp_flags(sn, sf, assigned) & 32) == 0:
+                                vp_set(sn, sf, sp, sa, assigned, 8, 0)
+                        Stmt.Return(return_value, return_pos):
+                            if return_value is returned:
+                                table <- vp_call(returned, return_pos.line, cur, pn, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                                kind: u32 = vp_kind(returned, sn, sf, retn, retf)
+                                mask: u32 = vp_pm(returned, sn, sf, sp, retn, retf)
+                                vp_record_ret(cur, (1 if kind == 2 else 0) | ((mask & 32767) << 1), retn, retf)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                            loop_var: sview = for_variables[0] if for_variables.count > 0 else for_bind
+                            kind: u32 = vp_kind(for_iterable, sn, sf, retn, retf)
+                            mask: u32 = vp_pm(for_iterable, sn, sf, sp, retn, retf)
+                            flags: mutable u32 = 64
+                            flags <- flags | 4 if kind == 2
+                            owned_iterable: bool = (vp_root_flags(for_iterable, sn, sf) & 1) != 0
+                            flags <- flags | 1 if owned_iterable
+                            vp_set(sn, sf, sp, sa, loop_var, flags, mask)
+                            table <- vp_walk(for_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                            table <- vp_walk(for_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- vp_walk(block_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- vp_walk(then_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                            table <- vp_walk(else_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- vp_walk(while_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                            table <- vp_walk(while_body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        Stmt.Match(match_scrutinee, match_arms, match_line):
+                            for arm in match_arms |sn, sf, sp, sa, filln, filli, retn, retf, table| -> table:
+                                table <- vp_walk(arm.body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        _:
+                            pass
+
+        def vp_count_names(declarations: darray[Ast::Decl], name: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                total: mutable u32 = 0
+                for declaration in declarations |total|:
+                    match declaration:
+                        Decl.Func(fname, parameters, return_type, body, effects, decorators, line):
+                            total <- total + 1 if fname == name
+                        Decl.Module(module_name, module_body, module_line):
+                            total <- total + vp_count_names(module_body, name)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            total <- total + vp_count_names(scoped_body, name)
+                        _:
+                            pass
+                return total
+
+        def vp_collect_fresh(all_decls: darray[Ast::Decl], declarations: darray[Ast::Decl], fr: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |fr|:
+                    match declaration:
+                        Decl.Func(fname, parameters, return_type, body, effects, decorators, line):
+                            takes_container: bool = any parameter in parameters where annotation_is_container(parameter.type_expression)
+                            if return_type is declared_return:
+                                fr.push(fname) if annotation_is_scalar_darray(declared_return) and not takes_container and vp_count_names(all_decls, fname) == 1
+                        Decl.Module(module_name, module_body, module_line):
+                            vp_collect_fresh(all_decls, module_body, fr)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            vp_collect_fresh(all_decls, scoped_body, fr)
+                        _:
+                            pass
+
+        def vp_pass(all_decls: darray[Ast::Decl], declarations: darray[Ast::Decl], fr: darray[sview]&, filln: mutable darray[sview]&, filli: mutable darray[usize]&, retn: mutable darray[sview]&, retf: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |filln, filli, retn, retf, table| -> table:
+                    match declaration:
+                        Decl.Func(fname, parameters, return_type, body, effects, decorators, line):
+                            cur: sview = fname if vp_count_names(all_decls, fname) == 1 else ""
+                            pn: mutable darray[sview] = []
+                            sn: mutable darray[sview] = []
+                            sf: mutable darray[u32] = []
+                            sp: mutable darray[u32] = []
+                            sa: mutable darray[sview] = []
+                            for parameter in parameters |pn, sn, sf, sp, sa, table|:
+                                region_tied: bool = any tied_name in table.region_tied_param_names where tied_name == parameter.name
+                                flags: mutable u32 = 32
+                                flags <- flags | 16 if param_is_mutable_ref(parameter) and not region_tied and annotation_is_container(parameter.type_expression)
+                                bit: u32 = (1 << pn.count) if pn.count < 15 else 0
+                                pn.push(parameter.name)
+                                vp_set(sn, sf, sp, sa, parameter.name, flags, bit)
+                            vp_collect_decls(body, sn, sf, sp, sa)
+                            table <- vp_walk(body, cur, pn, fr, sn, sf, sp, sa, filln, filli, retn, retf, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- vp_pass(all_decls, module_body, fr, filln, filli, retn, retf, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- vp_pass(all_decls, scoped_body, fr, filln, filli, retn, retf, table)
+                        _:
+                            pass
+
+    public:
+        def check_view_provenance(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fr: mutable darray[sview] = []
+                filln: mutable darray[sview] = []
+                filli: mutable darray[usize] = []
+                retn: mutable darray[sview] = []
+                retf: mutable darray[u32] = []
+                vp_collect_fresh(declarations, declarations, fr)
+                round: mutable u32 = 0
+                while round < 6 |round, filln, filli, retn, retf, table| -> table:
+                    before: mutable u32 = filln.count.u32()
+                    for flag in retf |before|:
+                        before <- before + flag + 1
+                    table <- vp_pass(declarations, declarations, fr, filln, filli, retn, retf, table)
+                    after: mutable u32 = filln.count.u32()
+                    for flag in retf |after|:
+                        after <- after + flag + 1
+                    round <- 6 if after == before else round + 1
