@@ -52,6 +52,10 @@ build_fixture \
     "$ROOT/test/fixtures/wasm/component_enum_export.wit" \
     "$ROOT/test/fixtures/wasm/component_enum_export.elisa" \
     enum-export
+build_fixture \
+    "$ROOT/test/fixtures/wasm/component_bounded_sview.wit" \
+    "$ROOT/test/fixtures/wasm/component_bounded_sview.elisa" \
+    bounded-sview
 
 # Keep stage0's component ABI path covered as well.  This is optional so the
 # normal stage1 smoke remains runnable from a checkout that has not built a
@@ -92,6 +96,10 @@ if [[ -n "$STAGE0" && -x "$STAGE0" ]]; then
         "$ROOT/test/fixtures/wasm/component_arena_reuse.wit" \
         "$ROOT/test/fixtures/wasm/component_arena_reuse.elisa" \
         arena-reuse
+    build_stage0_fixture \
+        "$ROOT/test/fixtures/wasm/component_bounded_sview.wit" \
+        "$ROOT/test/fixtures/wasm/component_bounded_sview.elisa" \
+        bounded-sview
 fi
 
 if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name '*.d.mts' \) -print -quit | grep  . >/dev/null; then
@@ -99,4 +107,4 @@ if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name 
     exit 1
 fi
 
-echo "wasm component runtime smoke OK: canonical strings, lists, options, results, records, dynamic containers, scalar returns, and repeated arena lifetimes componentize with freestanding allocation and no JS/TS artifacts"
+echo "wasm component runtime smoke OK: bounded views, canonical strings, lists, options, results, records, dynamic containers, scalar returns, and repeated arena lifetimes componentize with freestanding allocation and no JS/TS artifacts"

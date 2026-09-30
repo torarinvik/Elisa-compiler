@@ -140,6 +140,10 @@ stage1_ir_env_file_absent_case() {
 # suite could see it -- stage0's module header is what gave it away.
 stage1_ir_case module_datalayout 'def main() -> i64:\n    return 42\n' '^target datalayout = ".+i64:64'
 
+# LSP declaration-span metadata is not an `export global` alias pair. Emitting it
+# as an external alias makes separately compiled guest/runtime objects collide.
+stage1_ir_absent_case lsp_decl_name_not_exported 'const DeclNameProbe = 1\n\ndef main() -> i64:\n    return DeclNameProbe\n' '^@__lsp_decl_name'
+
 # For a HEAP pointer, null IS the absent case, so the optional's tag must be a real null
 # test. A hardcoded `true` tag reports a FAILED allocation as present and hands the program
 # a null it believes is real -- unobservable in any exit code that does not allocate.
