@@ -1,0 +1,322 @@
+# Owned extraction escape: a value EXTRACTED from a container/struct that lives in THIS
+# function's inferred region and stored into caller-owned storage.
+#
+#     xs: mutable darray[darray[u8]] = [[65, 66]]
+#     out.push(xs[0])            # copies only the header; the bytes die with `interp`
+#
+# Reading `xs[0]`, `xs.pop()`, `b.items` or a `for` variable copies the element's HEADER; its
+# backing storage stays in the ROOT's region. Mirrors stage0's region_owned_extraction.go,
+# conservatively: the root must be a local built from a FRESH literal (so a container filled
+# only from parameter-derived values stays accepted), the extracted value must be typed as a
+# container, and the target must be a `mutable` container-of-container ref parameter. Pushing
+# a whole struct is accepted by stage0 and is not modeled. Anything unclear stays SILENT.
+extend Semantic:
+    private:
+        # Peel `mutable` / `&` / parentheses from a type annotation or place expression.
+        def oe_strip(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return oe_strip(operand)
+                    Expr.Paren(inner, paren_pos):
+                        return oe_strip(inner)
+                    _:
+                        return expression
+
+        # Element type of a `darray[X]` annotation, or Absent.
+        def oe_element_type(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                stripped: Ast::Expr = oe_strip(type_expression)
+                match stripped:
+                    Expr.Index(object, index, index_pos):
+                        return oe_strip(index) if ident_name_of(object) == "darray"
+                    _:
+                        pass
+                return Expr.Absent
+
+        # Latest declared type of a tracked local, or Absent.
+        def oe_local_type(name: sview, names: darray[sview]&, types: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                position: mutable usize = names.count
+                while position > 0:
+                    position <- position - 1
+                    return oe_strip(types[position]) if names[position] == name
+                return Expr.Absent
+
+        def oe_field_type(struct_name: sview, field: sview, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                position: mutable usize = 0
+                while position < f_struct.count:
+                    return oe_strip(f_type[position]) if f_struct[position] == struct_name and f_name[position] == field
+                    position <- position + 1
+                return Expr.Absent
+
+        # Static type of an extraction chain over tracked locals; Absent when unknown.
+        def oe_type(expression: Ast::Expr, names: darray[sview]&, types: darray[Ast::Expr]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_pos):
+                        return oe_local_type(name, names, types)
+                    Expr.Paren(inner, paren_pos):
+                        return oe_type(inner, names, types, f_struct, f_name, f_type)
+                    Expr.Field(object, field, field_pos):
+                        owner_type: Ast::Expr = oe_type(object, names, types, f_struct, f_name, f_type)
+                        return oe_field_type(bare_type_name(owner_type), field, f_struct, f_name, f_type)
+                    Expr.Index(object, index, index_pos):
+                        return oe_element_type(oe_type(object, names, types, f_struct, f_name, f_type))
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(receiver, method, method_pos):
+                                return oe_element_type(oe_type(receiver, names, types, f_struct, f_name, f_type)) if method == "pop" and arguments.count == 0
+                            _:
+                                pass
+                        return Expr.Absent
+                    _:
+                        return Expr.Absent
+
+        # The root local of an extraction chain that has AT LEAST ONE extraction step;
+        # "" when the expression is not an extraction.
+        def oe_extraction_root(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_pos):
+                        return oe_extraction_root(inner)
+                    Expr.Field(object, field, field_pos):
+                        return auto_escape_place_root(object)
+                    Expr.Index(object, index, index_pos):
+                        return auto_escape_place_root(object)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(receiver, method, method_pos):
+                                return auto_escape_place_root(receiver) if method == "pop" and arguments.count == 0
+                            _:
+                                pass
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # A value built from a literal in THIS region.
+        def oe_fresh(value: Ast::Expr, fresh_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Array(elements, array_pos):
+                        return elements.count > 0
+                    Expr.Ident(name, ident_pos):
+                        return any fresh_name in fresh_names where fresh_name == name
+                    Expr.Paren(inner, paren_pos):
+                        return oe_fresh(inner, fresh_names)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return any field in fields where oe_fresh(field.value, fresh_names)
+                    _:
+                        return false
+
+        def oe_report(line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                duplicate: bool = any existing in table.diagnostics where existing.kind == DiagnosticKind.AutoRegionStoreEscape and existing.line == line
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line, expected: "", actual: ""}) if not duplicate
+
+        # `target.push(VALUE)` where VALUE is an extraction from an owner local.
+        def oe_check_push(expression: Ast::Expr, line: u32, targets: darray[sview]&, names: darray[sview]&, types: darray[Ast::Expr]&, owners: darray[sview]&, derived: darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, lit_ok: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(object, method, method_pos):
+                                return if method != "push" or arguments.count != 1
+                                receiver: sview = ident_name_of(object)
+                                return if receiver == "" or not (any target in targets where target == receiver)
+                                value: Ast::Expr = arguments[0]
+                                # A struct literal pushed into caller-owned storage: a container literal in
+                                # one of its fields has no region here (stage0: "darray literal has no region").
+                                table <- oe_construct_literals(value, f_struct, f_name, f_type, table) if lit_ok
+                                extracted_ident: sview = ident_name_of(value)
+                                direct_derived: bool = extracted_ident != "" and (any derived_name in derived where derived_name == extracted_ident)
+                                root: sview = oe_extraction_root(value)
+                                rooted: bool = root != "" and (any owner in owners where owner == root)
+                                return if not (direct_derived or rooted)
+                                value_type: Ast::Expr = oe_type(value, names, types, f_struct, f_name, f_type)
+                                table <- oe_report(line, table) if annotation_is_container(value_type)
+                            _:
+                                pass
+                    _:
+                        pass
+
+        # A struct literal's container-literal FIELDS need a region. `Box{items: [65, 66]}` handed to
+        # caller-owned storage (`out.push(...)`, `out <- [...]`) is not a binding, so its field has no
+        # destination to take a region from; stage0 rejects it ("darray literal has no region"). Only
+        # a field whose declared type is region-bearing counts (clr_literal_needs_region), and an
+        # unknown struct or field stays silent.
+        def oe_construct_literals(value: Ast::Expr, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        table <- oe_construct_literals(inner, f_struct, f_name, f_type, table)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        struct_name: sview = bare_type_name(type_expression)
+                        for field in fields |table| -> table:
+                            field_type: Ast::Expr = oe_field_type(struct_name, field.name, f_struct, f_name, f_type)
+                            table <- clr_literal_needs_region(field.value, field_type, table)
+                            table <- oe_construct_literals(field.value, f_struct, f_name, f_type, table)
+                    _:
+                        pass
+
+        # Whether a value of this type owns arena storage: a container, or a struct with a container field.
+        def oe_owns_storage(type_expression: Ast::Expr, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if annotation_is_container(type_expression)
+                struct_name: sview = bare_type_name(type_expression)
+                return false if struct_name == ""
+                position: mutable usize = 0
+                while position < f_struct.count:
+                    return true if f_struct[position] == struct_name and annotation_is_container(f_type[position])
+                    position <- position + 1
+                return false
+
+        # `target <- [ELEMENTS]` on a caller-owned container parameter. The literal itself takes the
+        # target's region, so the ELEMENTS are what can dangle: a nested container literal has no region
+        # of its own (stage0 "darray literal has no region"), and an owner local or an extraction from
+        # one (`[b.items]`) stores a header whose bytes die with this function (stage0 "via a fresh
+        # container"). Anything unclear stays SILENT.
+        def oe_check_store(store_target: Ast::Expr, store_operator: TokenKind, value: Ast::Expr, line: u32, targets: darray[sview]&, names: darray[sview]&, types: darray[Ast::Expr]&, owners: darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, lit_ok: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if store_operator != TokenKind.LArrow
+                receiver: sview = ident_name_of(store_target)
+                return if receiver == "" or not (any target_name in targets where target_name == receiver)
+                match value:
+                    Expr.Array(elements, array_pos):
+                        element_type: Ast::Expr = oe_element_type(oe_local_type(receiver, names, types))
+                        for element in elements |table| -> table:
+                            if lit_ok:
+                                table <- clr_literal_needs_region(element, element_type, table)
+                                table <- oe_construct_literals(element, f_struct, f_name, f_type, table)
+                            element_ident: sview = ident_name_of(element)
+                            held: bool = element_ident != "" and (any owner in owners where owner == element_ident)
+                            root: sview = oe_extraction_root(element)
+                            rooted: bool = root != "" and (any owner in owners where owner == root)
+                            if held or rooted:
+                                value_type: Ast::Expr = oe_type(element, names, types, f_struct, f_name, f_type)
+                                table <- oe_report(line, table) if oe_owns_storage(value_type, f_struct, f_name, f_type)
+                    _:
+                        pass
+
+        def oe_walk(body: darray[Ast::Stmt], targets: darray[sview]&, names: mutable darray[sview]&, types: mutable darray[Ast::Expr]&, owners: mutable darray[sview]&, derived: mutable darray[sview]&, fresh_names: mutable darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, lit_ok: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |names, types, owners, derived, fresh_names, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- oe_check_push(value, line.line, targets, names, types, owners, derived, f_struct, f_name, f_type, lit_ok, table)
+                            names.push(name)
+                            types.push(type_expression)
+                            fresh: bool = oe_fresh(value, fresh_names)
+                            fresh_names.push(name) if fresh
+                            owners.push(name) if fresh
+                            root: sview = oe_extraction_root(value)
+                            aliases: bool = root != "" and (any owner in owners where owner == root)
+                            match value:
+                                # `ys: … = [x for x in xs]` over an owner copies each element's HEADER into a
+                                # new container in THIS region: `ys[0]` is an extraction from an owner.
+                                Expr.Comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_pos):
+                                    comp_source: sview = auto_escape_place_root(comp_iterable)
+                                    if comp_source != "" and auto_escape_place_root(comp_body) == comp_var and (any owner in owners where owner == comp_source):
+                                        owners.push(name)
+                                Expr.Unary(alias_op, alias_operand, alias_pos):
+                                    alias_root: sview = ident_name_of(alias_operand)
+                                    if alias_op == TokenKind.Ampersand and alias_root != "" and (any owner in owners where owner == alias_root):
+                                        owners.push(name)
+                                        derived.push(name)
+                                _:
+                                    pass
+                            if aliases:
+                                owners.push(name)
+                                derived.push(name)
+                        Stmt.Expr(expression, line):
+                            table <- oe_check_push(expression, line.line, targets, names, types, owners, derived, f_struct, f_name, f_type, lit_ok, table)
+                            # `xs.push(<fresh literal>)` makes a local container an owner.
+                            match expression:
+                                Expr.Call(callee, arguments, argument_names, call_pos):
+                                    match callee:
+                                        Expr.Field(object, method, method_pos):
+                                            pushed_to: sview = ident_name_of(object)
+                                            is_target: bool = any target in targets where target == pushed_to
+                                            if method == "push" and arguments.count == 1 and pushed_to != "" and not is_target and oe_fresh(arguments[0], fresh_names):
+                                                owners.push(pushed_to)
+                                        _:
+                                            pass
+                                _:
+                                    pass
+                        Stmt.Assign(assign_target, assign_operator, assign_value, line):
+                            table <- oe_check_store(assign_target, assign_operator, assign_value, line.line, targets, names, types, owners, f_struct, f_name, f_type, lit_ok, table)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                            iterable_name: sview = ident_name_of(for_iterable)
+                            loop_var: sview = for_variables[0] if for_variables.count > 0 else for_bind
+                            if iterable_name != "" and (any owner in owners where owner == iterable_name):
+                                names.push(loop_var)
+                                types.push(oe_element_type(oe_local_type(iterable_name, names, types)))
+                                owners.push(loop_var)
+                                derived.push(loop_var)
+                            table <- oe_walk(for_body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, lit_ok, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- oe_walk(block_body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, lit_ok and (kind == "can" or kind == "loop"), table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- oe_walk(then_body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, lit_ok, table)
+                            table <- oe_walk(else_body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, lit_ok, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- oe_walk(while_body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, lit_ok, table)
+                        Stmt.Match(match_scrutinee, match_arms, match_line):
+                            for arm in match_arms |names, types, owners, derived, fresh_names, table| -> table:
+                                table <- oe_walk(arm.body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, lit_ok, table)
+                        _:
+                            pass
+
+        def oe_collect_fields(declarations: darray[Ast::Decl], f_struct: mutable darray[sview]&, f_name: mutable darray[sview]&, f_type: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |f_struct, f_name, f_type|:
+                    match declaration:
+                        Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, line):
+                            for member in members |f_struct, f_name, f_type, name|:
+                                f_struct.push(name)
+                                f_name.push(member.name)
+                                f_type.push(member.type_expression)
+                        Decl.Module(module_name, module_body, module_line):
+                            oe_collect_fields(module_body, f_struct, f_name, f_type)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            oe_collect_fields(scoped_body, f_struct, f_name, f_type)
+                        _:
+                            pass
+
+        def check_owned_extraction_walk(declarations: darray[Ast::Decl], f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            targets: mutable darray[sview] = []
+                            for parameter in parameters |targets, table|:
+                                region_tied: bool = any tied_name in table.region_tied_param_names where tied_name == parameter.name
+                                nested_container: bool = annotation_is_container(parameter.type_expression) and not annotation_is_scalar_darray(parameter.type_expression)
+                                targets.push(parameter.name) if param_is_mutable_ref(parameter) and not region_tied and nested_container
+                            continue if targets.count == 0
+                            names: mutable darray[sview] = []
+                            types: mutable darray[Ast::Expr] = []
+                            # The written parameter types, so a store's target element type is known.
+                            for parameter in parameters |names, types|:
+                                names.push(parameter.name)
+                                types.push(parameter.type_expression)
+                            owners: mutable darray[sview] = []
+                            derived: mutable darray[sview] = []
+                            fresh_names: mutable darray[sview] = []
+                            table <- oe_walk(body, targets, names, types, owners, derived, fresh_names, f_struct, f_name, f_type, true, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_owned_extraction_walk(module_body, f_struct, f_name, f_type, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_owned_extraction_walk(scoped_body, f_struct, f_name, f_type, table)
+                        _:
+                            pass
+
+    public:
+        def check_owned_extraction(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                f_struct: mutable darray[sview] = []
+                f_name: mutable darray[sview] = []
+                f_type: mutable darray[Ast::Expr] = []
+                oe_collect_fields(declarations, f_struct, f_name, f_type)
+                table <- check_owned_extraction_walk(declarations, f_struct, f_name, f_type, table)

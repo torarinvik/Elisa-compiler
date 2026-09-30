@@ -13,6 +13,14 @@
 #     on return -- AutoRegionReturnEscape, stage0's `via return` region escape (MEASURED
 #     2026-09-28: stage0 rejected s1e/r2/r6/n4/n9, stage1 accepted and read freed memory).
 #
+#   * a fixed array held IN a by-value struct local or parameter (`s.buf[0:2]` with `buf: u8[4]`):
+#     the field lives in the struct, which lives in the frame -- LocalViewEscapesReturn (stage0
+#     sliceViewsFrameArray; MEASURED 2026-09-30: stage1 accepted it and the caller read a
+#     clobbered frame);
+#   * `d.as_sview()` / `bytes_view(d)` of a by-value container local when the function does not
+#     adopt its caller's region (a view-typed result has no hidden region slot in this ABI, so the
+#     buffer is freed before the caller reads it; MEASURED 2026-09-30: the caller read zeros).
+#
 # A value escapes when it is a slice of a root or of a view already carrying one, or a bare name
 # of such a view, through parentheses, either arm of an `if`, a struct-literal field or a tuple
 # element (`Holder{v: xs[0:2]}` dangles exactly like `xs[0:2]`). Views are tracked
@@ -75,6 +83,61 @@ extend Semantic:
                     true return if entry == name
                 return false
 
+        def lvre_pair_has(roots: darray[sview]&, fields: darray[sview]&, root: sview, field: sview) -> bool:
+            can Abort.Panic:
+                while index < roots.count |index: usize = 0|:
+                    true return if roots[index] == root and fields[index] == field
+                    index <- index + 1
+                return false
+
+        # Every by-value struct-typed declaration in the body (`s: S = ...`), flow-insensitively.
+        def lvre_struct_decls(statements: darray[Ast::Stmt]&, sr_names: mutable darray[sview]&, sr_types: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |sr_names, sr_types|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, decl_pos):
+                            declared: sview = bare_type_name(type_expression)
+                            if declared != "":
+                                sr_names.push(name)
+                                sr_types.push(declared)
+                        Stmt.Block(kind, clause, binding, body, block_pos):
+                            lvre_struct_decls(body, sr_names, sr_types)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            lvre_struct_decls(then_body, sr_names, sr_types)
+                            lvre_struct_decls(else_body, sr_names, sr_types)
+                        Stmt.While(condition, while_body, while_pos):
+                            lvre_struct_decls(while_body, sr_names, sr_types)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            lvre_struct_decls(for_body, sr_names, sr_types)
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            for arm in arms |sr_names, sr_types|:
+                                lvre_struct_decls(arm.body, sr_names, sr_types)
+                        _:
+                            pass
+
+        def lvre_count(names: darray[sview]&, name: sview) -> usize:
+            can Abort.Panic:
+                total: mutable usize = 0
+                for entry in names |total|:
+                    total <- total + 1 if entry == name
+                return total
+
+        # (root, field) pairs where `root` is a by-value struct local/parameter (every declaration
+        # of the name is one, all of the same struct type) and `field` is a fixed array held IN it:
+        # `root.field[a:b]` views the frame.
+        def lvre_struct_array_fields(names: darray[sview]&, sr_names: darray[sview]&, sr_types: darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, sroots: mutable darray[sview]&, sfields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for probe in 0..<sr_names.count |sroots, sfields|:
+                    continue if lvre_count(names, sr_names[probe]) != lvre_count(sr_names, sr_names[probe])
+                    uniform: mutable bool = true
+                    for other in 0..<sr_names.count |uniform|:
+                        uniform <- false if sr_names[other] == sr_names[probe] and sr_types[other] != sr_types[probe]
+                    continue if not uniform
+                    for field_index in 0..<f_struct.count |sroots, sfields|:
+                        if f_struct[field_index] == sr_types[probe] and lvre_frame_array(f_type[field_index]):
+                            sroots.push(sr_names[probe])
+                            sfields.push(f_name[field_index])
+
         # The bare name a slice is taken of, through parentheses; "" for anything else.
         def lvre_slice_root(object: Ast::Expr) -> sview:
             can Memory.Allocate, Abort.Panic:
@@ -86,26 +149,53 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
+        # The container a byte-view call borrows: `d.as_sview()` / `d.as_cstr()` (any receiver
+        # name) and `bytes_view(d)` / `bytes_view_range(d, ..)`; "" for any other call.
+        def lvre_view_call_root(value: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(receiver, method, method_pos):
+                                return lvre_slice_root(receiver) if (method == "as_sview" or method == "as_cstr") and arguments.count == 0
+                            Expr.Ident(callee_name, callee_pos):
+                                return lvre_slice_root(arguments[0]) if (callee_name == "bytes_view" or callee_name == "bytes_view_range") and arguments.count > 0
+                            _:
+                                pass
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
         # The root a VALUE carries a dangling view of, if any: a slice of a frame array
         # (`arrays`), of a container local (`containers`) or of a dangling view (`array_views` /
         # `container_views`, by the root they carry); a view
         # named bare; through parens, `if` arms, struct-literal fields and tuple elements (the
         # first escaping one is named). `container` says the root is region-, not frame-owned.
-        def lvre_escaping_name(value: Ast::Expr, arrays: darray[sview]&, containers: darray[sview]&, array_views: darray[sview]&, container_views: darray[sview]&) -> (name: sview, pos: Ast::Pos, found: bool, container: bool):
+        def lvre_escaping_name(value: Ast::Expr, arrays: darray[sview]&, containers: darray[sview]&, array_views: darray[sview]&, container_views: darray[sview]&, sroots: darray[sview]&, sfields: darray[sview]&) -> (name: sview, pos: Ast::Pos, found: bool, container: bool):
             can Memory.Allocate, Abort.Panic:
                 match value:
                     Expr.Paren(inner, paren_pos):
-                        return lvre_escaping_name(inner, arrays, containers, array_views, container_views)
+                        return lvre_escaping_name(inner, arrays, containers, array_views, container_views, sroots, sfields)
                     # `return move local_container` has the same backing storage as a bare
                     # return; moving the header does not move the auto-region allocation.  The
                     # old walker stopped at Expr.Move, so the local root was invisible here.
                     Expr.Move(inner, move_pos):
-                        return lvre_escaping_name(inner, arrays, containers, array_views, container_views)
+                        return lvre_escaping_name(inner, arrays, containers, array_views, container_views, sroots, sfields)
                     Expr.Slice(slice_object, slice_low, slice_high, slice_pos):
+                        match slice_object:
+                            Expr.Field(field_object, field_name, field_pos):
+                                field_root: sview = lvre_slice_root(field_object)
+                                (field_root, slice_pos, true, false) return if lvre_pair_has(sroots, sfields, field_root, field_name)
+                            _:
+                                pass
                         root: sview = lvre_slice_root(slice_object)
                         (root, slice_pos, true, false) return if lvre_has(arrays, root)
                         (root, slice_pos, true, true) return if lvre_has(containers, root)
-                        return lvre_escaping_name(slice_object, arrays, containers, array_views, container_views)
+                        return lvre_escaping_name(slice_object, arrays, containers, array_views, container_views, sroots, sfields)
+                    Expr.Call(call_callee, call_arguments, call_argument_names, call_pos):
+                        call_root: sview = lvre_view_call_root(value)
+                        (call_root, call_pos, true, true) return if call_root != "" and lvre_has(containers, call_root)
+                        return (sview("", 0, 0), call_pos, false, false)
                     Expr.Ident(name, ident_pos):
                         (name, ident_pos, true, false) return if lvre_has(array_views, name)
                         # Returning the container value itself is also an escape: moving or
@@ -115,16 +205,16 @@ extend Semantic:
                         (name, ident_pos, true, true) return if lvre_has(containers, name)
                         return (name, ident_pos, lvre_has(container_views, name), true)
                     Expr.If(condition, then_value, else_value, if_pos):
-                        then_arm: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(then_value, arrays, containers, array_views, container_views)
-                        return then_arm if then_arm.found else lvre_escaping_name(else_value, arrays, containers, array_views, container_views)
+                        then_arm: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(then_value, arrays, containers, array_views, container_views, sroots, sfields)
+                        return then_arm if then_arm.found else lvre_escaping_name(else_value, arrays, containers, array_views, container_views, sroots, sfields)
                     Expr.Construct(construct_type, construct_fields, construct_pos):
                         for field in construct_fields:
-                            field_escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(field.value, arrays, containers, array_views, container_views)
+                            field_escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(field.value, arrays, containers, array_views, container_views, sroots, sfields)
                             field_escape return if field_escape.found
                         return (sview("", 0, 0), construct_pos, false, false)
                     Expr.Tuple(tuple_elements, tuple_pos):
                         for element in tuple_elements:
-                            element_escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(element, arrays, containers, array_views, container_views)
+                            element_escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(element, arrays, containers, array_views, container_views, sroots, sfields)
                             element_escape return if element_escape.found
                         return (sview("", 0, 0), tuple_pos, false, false)
                     _:
@@ -163,6 +253,9 @@ extend Semantic:
                         return false
                     Expr.BoolLit(bool_value, bool_pos):
                         return false
+                    Expr.Call(call_callee, call_arguments, call_argument_names, call_pos):
+                        view_root: sview = lvre_view_call_root(value)
+                        return not (view_root != "" and lvre_has(containers, view_root))
                     Expr.If(condition, then_value, else_value, if_pos):
                         return lvre_adopting_value(then_value, containers) or lvre_adopting_value(else_value, containers)
                     Expr.Construct(construct_type, construct_fields, construct_pos):
@@ -263,7 +356,7 @@ extend Semantic:
                     probe <- probe + 1
                 return roots
 
-        def lvre_function(parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, table: lmut SymbolTable) -> void:
+        def lvre_function(parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 names: mutable darray[sview] = []
                 kinds: mutable darray[u8] = []
@@ -275,6 +368,17 @@ extend Semantic:
                     kinds.push(1 if lvre_frame_array(parameter.type_expression) else 0)
                     arena_param <- true if lvre_arena_param(parameter.type_expression)
                 lvre_collect(body, names, kinds, bound, values)
+                sr_names: mutable darray[sview] = []
+                sr_types: mutable darray[sview] = []
+                for parameter in parameters |sr_names, sr_types|:
+                    declared_type: sview = bare_type_name(parameter.type_expression)
+                    if declared_type != "":
+                        sr_names.push(parameter.name)
+                        sr_types.push(declared_type)
+                lvre_struct_decls(body, sr_names, sr_types)
+                sroots: mutable darray[sview] = []
+                sfields: mutable darray[sview] = []
+                lvre_struct_array_fields(names, sr_names, sr_types, f_struct, f_name, f_type, sroots, sfields)
                 arrays: darray[sview] = lvre_roots(names, kinds, 1)
                 containers: mutable darray[sview] = lvre_roots(names, kinds, 2)
                 returned: mutable darray[Ast::Expr] = []
@@ -286,12 +390,12 @@ extend Semantic:
                 # Dangling views: a fixpoint over every binding (flow-insensitive).
                 array_views: mutable darray[sview] = []
                 container_views: mutable darray[sview] = []
-                changed: mutable bool = arrays.count > 0 or containers.count > 0
+                changed: mutable bool = arrays.count > 0 or containers.count > 0 or sroots.count > 0
                 while changed |changed, array_views, container_views|:
                     changed <- false
                     while index < bound.count |index: usize = 0, changed, array_views, container_views|:
                         if not lvre_has(array_views, bound[index]) and not lvre_has(container_views, bound[index]):
-                            carried: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(values[index], arrays, containers, array_views, container_views)
+                            carried: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(values[index], arrays, containers, array_views, container_views, sroots, sfields)
                             if carried.found:
                                 if carried.container:
                                     container_views.push(bound[index])
@@ -300,25 +404,29 @@ extend Semantic:
                                 changed <- true
                         index <- index + 1
                 for value in returned |table| -> table:
-                    escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(value, arrays, containers, array_views, container_views)
+                    escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(value, arrays, containers, array_views, container_views, sroots, sfields)
                     if escape.found:
                         kind: DiagnosticKind = DiagnosticKind.AutoRegionReturnEscape if escape.container else DiagnosticKind.LocalViewEscapesReturn
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: kind, name: escape.name, line: escape.pos.line, pos: escape.pos, expected: "", actual: ""})
 
-        def lvre_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def lvre_walk(declarations: darray[Ast::Decl], f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            table <- lvre_function(parameters, body, table) if return_type is declared_return
+                            table <- lvre_function(parameters, body, f_struct, f_name, f_type, table) if return_type is declared_return
                         Decl.Module(module_name, module_body, module_line):
-                            table <- lvre_walk(module_body, table)
+                            table <- lvre_walk(module_body, f_struct, f_name, f_type, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- lvre_walk(scoped_body, table)
+                            table <- lvre_walk(scoped_body, f_struct, f_name, f_type, table)
                         _:
                             pass
 
     public:
         def check_local_view_return_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- lvre_walk(file.top_decls, table)
+                f_struct: mutable darray[sview] = []
+                f_name: mutable darray[sview] = []
+                f_type: mutable darray[Ast::Expr] = []
+                oe_collect_fields(file.top_decls, f_struct, f_name, f_type)
+                table <- lvre_walk(file.top_decls, f_struct, f_name, f_type, table)

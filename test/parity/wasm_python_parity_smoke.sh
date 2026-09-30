@@ -148,6 +148,34 @@ compare_one demo "$ROOT/test/repro/wasm_minimal.elisa"
 compare_one int-width "$ROOT/test/repro/int_width_abi.elisa"
 compare_one width-edges "$ROOT/test/repro/wasm_width_edges.elisa"
 compare_one missing-import "$ROOT/test/repro/wasm_missing_import.elisa"
+compare_one 'é' "$ROOT/test/repro/wasm_minimal.elisa"
+
+node --input-type=module - "$WORK/driver/é.mjs" <<'NODE'
+import assert from "node:assert/strict";
+
+const facade = await import(process.argv[2]);
+const observed = [];
+const imports = facade.createElisaImports({
+  initialPages: 1,
+  maximumPages: 2,
+  heapBase: 16,
+  onPrint: (text) => observed.push(text),
+});
+const memory = imports.env.memory;
+imports.env.puts(0);
+new Uint8Array(memory.buffer).set([111, 107, 0], 16);
+imports.env.puts(16);
+assert.throws(() => imports.env.puts(memory.buffer.byteLength), RangeError);
+new Uint8Array(memory.buffer)[memory.buffer.byteLength - 1] = 65;
+assert.throws(() => imports.env.puts(memory.buffer.byteLength - 1), /not NUL terminated/);
+memory.grow(1);
+const grown = new Uint8Array(memory.buffer);
+const grownString = grown.length - 2;
+grown[grownString] = 71;
+grown[grownString + 1] = 0;
+imports.env.puts(grownString);
+assert.deepEqual(observed, ["", "ok", "G"]);
+NODE
 
 if [ "$status" = 0 ]; then
     echo "wasm_python_parity ok: $compared artifacts identical across both packagers"

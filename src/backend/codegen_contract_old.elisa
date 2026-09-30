@@ -1,0 +1,144 @@
+# Stage1 backend — entry snapshots used by executable `old(EXPR)` postconditions.
+# Keep collection separate from emission: every snapshot is initialized in the function
+# prologue, before a lexically later ensure can follow a write through a reference.
+
+extend Backend:
+    private:
+        def codegen_collect_old_contract_expression(expression: Expr, calls: mutable darray[Expr]&, arguments: mutable darray[Expr]&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if depth >= 256
+            match expression:
+                Expr.Call(callee, call_arguments, _, _):
+                    if callee is Expr.Ident(old_name, _) and old_name == "old":
+                        return false if call_arguments.count != 1
+                        old_position: Ast::Pos = Ast::expr_pos(expression)
+                        for existing_index in 0..<calls.count |existing_index, calls, old_position|:
+                            existing_position: Ast::Pos = Ast::expr_pos(calls[existing_index])
+                            return true if existing_position.line == old_position.line and existing_position.column == old_position.column
+                        return false if not codegen_collect_old_contract_expression(call_arguments[0], calls, arguments, depth + 1)
+                        calls.push(expression)
+                        arguments.push(call_arguments[0])
+                        return true
+                    return false if not codegen_collect_old_contract_expression(callee, calls, arguments, depth + 1)
+                    for argument in call_arguments |calls, arguments, depth|:
+                        return false if not codegen_collect_old_contract_expression(argument, calls, arguments, depth + 1)
+                    return true
+                Expr.Paren(inner, _) | Expr.Unary(_, inner, _) | Expr.Move(inner, _) | Expr.RegionNew(inner, _, _):
+                    return codegen_collect_old_contract_expression(inner, calls, arguments, depth + 1)
+                Expr.Refinement(base, predicate, _):
+                    return false if not codegen_collect_old_contract_expression(base, calls, arguments, depth + 1)
+                    return codegen_collect_old_contract_expression(predicate, calls, arguments, depth + 1)
+                Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                    return codegen_collect_old_contract_expression(object, calls, arguments, depth + 1)
+                Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                    return false if not codegen_collect_old_contract_expression(object, calls, arguments, depth + 1)
+                    return codegen_collect_old_contract_expression(index, calls, arguments, depth + 1)
+                Expr.Slice(object, low, high, _):
+                    return false if not codegen_collect_old_contract_expression(object, calls, arguments, depth + 1)
+                    return false if not codegen_collect_old_contract_expression(low, calls, arguments, depth + 1)
+                    return codegen_collect_old_contract_expression(high, calls, arguments, depth + 1)
+                Expr.IndexN(object, indices, _):
+                    return false if not codegen_collect_old_contract_expression(object, calls, arguments, depth + 1)
+                    for index in indices |calls, arguments, depth|:
+                        return false if not codegen_collect_old_contract_expression(index, calls, arguments, depth + 1)
+                    return true
+                Expr.If(condition, then_value, else_value, _):
+                    return false if not codegen_collect_old_contract_expression(condition, calls, arguments, depth + 1)
+                    return false if not codegen_collect_old_contract_expression(then_value, calls, arguments, depth + 1)
+                    return codegen_collect_old_contract_expression(else_value, calls, arguments, depth + 1)
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements |calls, arguments, depth|:
+                        return false if not codegen_collect_old_contract_expression(element, calls, arguments, depth + 1)
+                    return true
+                _:
+                    # Expressions outside this collector's supported traversal are still
+                    # safe: if one contains `old`, its eventual emitter cannot find a capture
+                    # and declines the module instead of treating the post-state as old-state.
+                    return true
+
+
+        def codegen_collect_old_postconditions(body: darray[Stmt], calls: mutable darray[Expr]&, arguments: mutable darray[Expr]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            for statement in body |calls, arguments|:
+                match statement:
+                    Stmt.Contract(kind, predicate, _):
+                        if kind == "ensure":
+                            return false if not codegen_collect_old_contract_expression(predicate, calls, arguments, 0)
+                    _:
+                        pass
+            return calls.count == arguments.count
+
+
+        # Entry snapshots must not execute user code before the function body. Keep
+        # the admitted grammar to scalar places and literals; in particular, reject
+        # calls and protocol-overloaded indexing. Built-in indexing is safe to read
+        # once the receiver and index are themselves safe expressions.
+        def codegen_old_snapshot_expression_is_safe(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if depth >= 256
+            match expression:
+                Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _):
+                    return true
+                Expr.Paren(inner, _):
+                    return codegen_old_snapshot_expression_is_safe(inner, local_scope, fns, structs, generics, depth + 1)
+                Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                    return codegen_old_snapshot_expression_is_safe(object, local_scope, fns, structs, generics, depth + 1)
+                Expr.Index(object, index, _):
+                    return false if not codegen_old_snapshot_expression_is_safe(object, local_scope, fns, structs, generics, depth + 1)
+                    return false if not codegen_old_snapshot_expression_is_safe(index, local_scope, fns, structs, generics, depth + 1)
+                    return false if index_overload_type(object, index, local_scope, fns, structs, generics).kind != TypeKind.Unmodeled
+                    return index_overload_generic_type(object, index, local_scope, fns, structs, generics).kind == TypeKind.Unmodeled
+                _:
+                    return false
+
+
+        # Runtime contract emission can rebuild an expression node while preserving
+        # its meaning but shifting its source position. Match the restricted snapshot
+        # grammar structurally as a fallback to the fast source-position lookup.
+        def codegen_old_snapshot_expression_equal(first: Expr, second: Expr, depth: u32) -> bool:
+            return false if depth >= 256
+            match first:
+                Expr.IntLit(first_value, _):
+                    if second is Expr.IntLit(second_value, _):
+                        return first_value == second_value
+                Expr.FloatLit(first_value, _):
+                    if second is Expr.FloatLit(second_value, _):
+                        return first_value == second_value
+                Expr.BoolLit(first_value, _):
+                    if second is Expr.BoolLit(second_value, _):
+                        return first_value == second_value
+                Expr.Ident(first_name, _):
+                    if second is Expr.Ident(second_name, _):
+                        return first_name == second_name
+                Expr.Paren(first_inner, _):
+                    if second is Expr.Paren(second_inner, _):
+                        return codegen_old_snapshot_expression_equal(first_inner, second_inner, depth + 1)
+                Expr.Field(first_object, first_field, _):
+                    if second is Expr.Field(second_object, second_field, _):
+                        return first_field == second_field and codegen_old_snapshot_expression_equal(first_object, second_object, depth + 1)
+                Expr.Scope(first_base, first_member, _):
+                    if second is Expr.Scope(second_base, second_member, _):
+                        return first_member == second_member and codegen_old_snapshot_expression_equal(first_base, second_base, depth + 1)
+                Expr.Index(first_object, first_index, _):
+                    if second is Expr.Index(second_object, second_index, _):
+                        return codegen_old_snapshot_expression_equal(first_object, second_object, depth + 1) and codegen_old_snapshot_expression_equal(first_index, second_index, depth + 1)
+                _:
+                    pass
+            return false
+
+
+        # Emit each captured expression once at function entry, after parameter slots have
+        # been bound and before the first body statement can mutate through a reference.
+        # Scalar and floating values are the supported snapshot representation for now.
+        def emit_contract_old_snapshots(local_scope: mutable Scope&, calls: darray[Expr]&, arguments: darray[Expr]&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, snapshot_slots: mutable darray[LLVMValueRef]&, snapshot_types: mutable darray[ValueType]&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if calls.count != arguments.count
+            for snapshot_index in 0..<calls.count |snapshot_index, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                return false if not codegen_old_snapshot_expression_is_safe(arguments[snapshot_index], local_scope, fns, structs, generics, 0)
+                snapshot_type: ValueType = expression_type(arguments[snapshot_index], local_scope, fns, structs, generics)
+                if snapshot_type.kind != TypeKind.Signed and snapshot_type.kind != TypeKind.Unsigned and snapshot_type.kind != TypeKind.Bool and snapshot_type.kind != TypeKind.Float:
+                    return false
+                if emit_expression(arguments[snapshot_index], snapshot_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is snapshot_value:
+                    snapshot_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(snapshot_type, structs, ctx), "old.snapshot")
+                    _ = LLVMBuildStore(builder, snapshot_value, snapshot_slot)
+                    snapshot_slots.push(snapshot_slot)
+                    snapshot_types.push(snapshot_type)
+                else:
+                    return false
+            return true
