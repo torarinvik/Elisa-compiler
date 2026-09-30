@@ -67,17 +67,22 @@ def js_bindings(manifest: dict[str, Any], module_name: str) -> str:
     for item in manifest["exports"]:
         args = ", ".join(parameter["name"] for parameter in item["parameters"])
         raw_arguments: list[str] = []
+        declarations: list[str] = []
         setup: list[str] = []
         cleanup: list[str] = []
         for parameter in item["parameters"]:
             parameter_name = parameter["name"]
             if parameter["binding"] == "string":
                 local_name = f"__elisa_{parameter_name}"
+                declarations.append(f"      let {local_name};")
                 setup.append(
-                    f"      const {local_name} = typeof {parameter_name} === \"string\" "
+                    f"        {local_name} = typeof {parameter_name} === \"string\" "
                     f"? memoryTools.writeString({parameter_name}) : ({parameter_name} >>> 0);"
                 )
-                cleanup.append(f"        if (typeof {parameter_name} === \"string\") memoryTools.free({local_name});")
+                cleanup.append(
+                    f"        if (typeof {parameter_name} === \"string\" && {local_name} !== undefined) "
+                    f"memoryTools.free({local_name});"
+                )
                 raw_arguments.append(local_name)
             else:
                 raw_arguments.append(js_input(parameter["type"], parameter_name))
@@ -87,9 +92,11 @@ def js_bindings(manifest: dict[str, Any], module_name: str) -> str:
         if setup:
             functions.append(
                 f"    {item['name']}({args}) {{\n"
+                + "\n".join(declarations)
+                + "\n      try {\n"
                 + "\n".join(setup)
-                + f"\n      try {{ return {result}; }}\n"
-                + "      finally {\n"
+                + f"\n        return {result};\n"
+                + "      }\n      finally {\n"
                 + "\n".join(cleanup)
                 + "\n      }\n"
                 + "    }"
