@@ -108,6 +108,11 @@ class WasmBindingsTests(unittest.TestCase):
         generated = js_bindings(manifest, "demo")
         self.assertIn('typeof value === "string"', generated)
         self.assertIn("memoryTools.free(__elisa_value)", generated)
+        echo_binding = generated[generated.index("    echo(value) {"):]
+        self.assertLess(
+            echo_binding.index("return memoryTools.readString("),
+            echo_binding.index("memoryTools.free(__elisa_value)"),
+        )
         self.assertIn("Missing Elisa WASM imports", generated)
         self.assertIn('if (end >= data.length) throw new RangeError("Elisa WASM C string pointer is outside linear memory")', generated)
         self.assertIn('if (end === data.length) throw new RangeError("Elisa WASM C string is not NUL terminated")', generated)
