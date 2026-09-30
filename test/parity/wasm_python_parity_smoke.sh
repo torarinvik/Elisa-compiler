@@ -148,6 +148,7 @@ compare_one demo "$ROOT/test/repro/wasm_minimal.elisa"
 compare_one int-width "$ROOT/test/repro/int_width_abi.elisa"
 compare_one width-edges "$ROOT/test/repro/wasm_width_edges.elisa"
 compare_one missing-import "$ROOT/test/repro/wasm_missing_import.elisa"
+compare_one 'é' "$ROOT/test/repro/wasm_minimal.elisa"
 
 if [ "$status" = 0 ]; then
     echo "wasm_python_parity ok: $compared artifacts identical across both packagers"

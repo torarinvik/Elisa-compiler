@@ -122,6 +122,12 @@ class WasmBindingsTests(unittest.TestCase):
         declarations = type_declaration(manifest, "physics-engine")
         self.assertIn("interface physics_engineExports", declarations)
 
+    def test_non_ascii_output_name_normalizes_by_unicode_codepoint(self) -> None:
+        manifest = {"exports": [], "target": "wasm32-unknown-unknown"}
+        declarations = type_declaration(manifest, "é🌲")
+        self.assertIn("interface __Exports", declarations)
+        self.assertNotIn("interface ______Exports", declarations)
+
     def test_aggregate_export_has_an_actionable_error(self) -> None:
         with self.assertRaisesRegex(WasmBuildError, "export a scalar or pointer adapter"):
             parse_exports("export fn bad(values: darray[i32]) -> i32 = bad_impl")
