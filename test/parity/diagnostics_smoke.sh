@@ -68,6 +68,9 @@ NAMES=(
     destroyed_region_use
     destroyed_region_allocate
     storage_dependency_invalidated
+    storage_dependency_callee_growth
+    storage_dependency_loop_back_edge
+    storage_dependency_write_through
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
@@ -177,6 +180,7 @@ NAMES=(
     region_match_return_escape
     region_block_return_escape
     region_index_return_escape
+    region_fixed_array_element_return_escape
     region_match_local_return_escape
     region_branch_tainted_aggregate_return
     region_nested_growth_escape
@@ -256,6 +260,8 @@ NAMES=(
     aggregate_reference_match_return_escape
     aggregate_reference_loop_return_escape
     aggregate_reference_branch_return_escape
+    storage_dependency_whole_assignment
+    mutate_while_iterating_reassignment
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -289,6 +295,9 @@ EXPECTS=(
     "argument 2 to \"same\" expects darray[i32, pair], got darray[i32, shape_after#3]"
     "region dependency facts were invalidated by destroy of region \"scratch\""
     "cannot allocate from destroyed region \"scratch\""
+    "storage dependency facts were invalidated by darray push"
+    "storage dependency facts were invalidated by darray push"
+    "storage dependency facts were invalidated by darray push"
     "storage dependency facts were invalidated by darray push"
     "duplicate packed group member \"b\" in H.flags"
     "declares named states but is missing a derive state: block"
@@ -399,6 +408,7 @@ EXPECTS=(
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
     "cannot return value: region dependency facts include local region"
+    "escapes via return; the region is freed at scope exit"
     "match requires an enum"
     "value backed by scope-owned region \"scratch\" escapes via return; the region is freed at block exit"
     "darray push allocates into function-scoped region"
@@ -478,6 +488,8 @@ EXPECTS=(
     "returning an aggregate or helper result that contains a reference into function-local storage"
     "returning an aggregate or helper result that contains a reference into function-local storage"
     "returning an aggregate or helper result that contains a reference into function-local storage"
+    "storage dependency facts were invalidated for interior reference \"r\""
+    "cannot mutate \"xs\" while it is being iterated: reassignment of xs"
 )
 
 total=0
