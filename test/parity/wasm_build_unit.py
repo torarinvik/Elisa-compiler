@@ -108,9 +108,31 @@ class WasmBindingsTests(unittest.TestCase):
         generated = js_bindings(manifest, "demo")
         self.assertIn('typeof value === "string"', generated)
         self.assertIn("memoryTools.free(__elisa_value)", generated)
+        echo_binding = generated[generated.index("    echo(value) {"):]
+        self.assertLess(
+            echo_binding.index("return memoryTools.readString("),
+            echo_binding.index("memoryTools.free(__elisa_value)"),
+        )
         self.assertIn("Missing Elisa WASM imports", generated)
+        self.assertIn('if (end >= data.length) throw new RangeError("Elisa WASM C string pointer is outside linear memory")', generated)
+        self.assertIn('if (end === data.length) throw new RangeError("Elisa WASM C string is not NUL terminated")', generated)
         declarations = type_declaration(manifest, "demo")
         self.assertIn("echo(value: string | number): string", declarations)
+
+        pair_exports = parse_exports("export fn pair(left: cstr, right: cstr) -> cstr = pair_impl")
+        pair_manifest = {
+            "exports": pair_exports,
+            "target": "wasm32-unknown-unknown",
+            "memory_initial_pages": 16,
+            "memory_max_pages": 32,
+            "files": {"wasm": "demo.wasm"},
+        }
+        pair_generated = js_bindings(pair_manifest, "demo")
+        pair_binding = pair_generated[pair_generated.index("    pair(left, right) {"):]
+        self.assertLess(pair_binding.index("try {"), pair_binding.index("__elisa_left = typeof left"))
+        self.assertLess(pair_binding.index("try {"), pair_binding.index("__elisa_right = typeof right"))
+        self.assertIn('typeof left === "string" && __elisa_left !== undefined', pair_binding)
+        self.assertIn('typeof right === "string" && __elisa_right !== undefined', pair_binding)
 
     def test_facade_type_normalization_does_not_import_the_scanner(self) -> None:
         self.assertEqual(ts_type("mutable i64", "wasm32", parameter=True), "bigint")
@@ -121,6 +143,12 @@ class WasmBindingsTests(unittest.TestCase):
         manifest = {"exports": parse_exports("export fn answer() -> i32 = answer_impl"), "target": "wasm32-unknown-unknown"}
         declarations = type_declaration(manifest, "physics-engine")
         self.assertIn("interface physics_engineExports", declarations)
+
+    def test_non_ascii_output_name_normalizes_by_unicode_codepoint(self) -> None:
+        manifest = {"exports": [], "target": "wasm32-unknown-unknown"}
+        declarations = type_declaration(manifest, "é🌲")
+        self.assertIn("interface __Exports", declarations)
+        self.assertNotIn("interface ______Exports", declarations)
 
     def test_aggregate_export_has_an_actionable_error(self) -> None:
         with self.assertRaisesRegex(WasmBuildError, "export a scalar or pointer adapter"):
