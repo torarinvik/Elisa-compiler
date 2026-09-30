@@ -147,6 +147,8 @@ proofs — not compiler logic left unported.
       `alias.scope`/`noalias` element metadata), including fresh, clone, aliased, and
       forwarded-call cases under `-fnoalias`.
 - [x] Forced dereference/bounds guards (`-fbounds-check` / `ELISACORE_FORCE_BOUNDS_CHECK`).
+- [x] Signed-overflow traps at every optimization level by default; explicit whole-unit opt-out
+      `-foverflow=wrap` / `ELISACORE_OVERFLOW=wrap` (see `docs/integer-overflow.md`).
 - [ ] Remaining error-union value operations outside the covered local/parameter/struct clone,
       `try value else fallback`, and expression `catch value:` paths (notably broader generic
       and aggregate propagation forms).
