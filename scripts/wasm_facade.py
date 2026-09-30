@@ -126,7 +126,9 @@ export function createElisaImports(options = {{}}) {{
   const readCString = (pointer) => {{
     if (!pointer) return "";
     const data = bytes(); let end = pointer >>> 0;
+    if (end >= data.length) throw new RangeError("Elisa WASM C string pointer is outside linear memory");
     while (end < data.length && data[end] !== 0) end++;
+    if (end === data.length) throw new RangeError("Elisa WASM C string is not NUL terminated");
     return UTF8_DECODER.decode(data.subarray(pointer >>> 0, end));
   }};
   const coalesceFreeBlocks = () => {{

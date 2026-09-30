@@ -109,6 +109,8 @@ class WasmBindingsTests(unittest.TestCase):
         self.assertIn('typeof value === "string"', generated)
         self.assertIn("memoryTools.free(__elisa_value)", generated)
         self.assertIn("Missing Elisa WASM imports", generated)
+        self.assertIn('if (end >= data.length) throw new RangeError("Elisa WASM C string pointer is outside linear memory")', generated)
+        self.assertIn('if (end === data.length) throw new RangeError("Elisa WASM C string is not NUL terminated")', generated)
         declarations = type_declaration(manifest, "demo")
         self.assertIn("echo(value: string | number): string", declarations)
 
