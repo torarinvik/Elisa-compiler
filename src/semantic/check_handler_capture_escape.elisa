@@ -89,6 +89,19 @@ extend Semantic:
                     _:
                         return false
 
+        # Whether an element type is a struct with a container (or dstr) field: its values carry
+        # an interior region, so stage0 also prints a "via a by-value copy" line when one is stored.
+        def hce_element_has_container(element_type: Ast::Expr, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                struct_name: sview = bare_type_name(element_type)
+                return false if struct_name == ""
+                position: mutable usize = 0
+                while position < f_struct.count:
+                    field_type: Ast::Expr = oe_strip(f_type[position])
+                    return true if f_struct[position] == struct_name and (annotation_is_container(field_type) or bare_type_name(field_type) == "dstr")
+                    position <- position + 1
+                return false
+
         # Whether an element type can hold an sview: `sview` itself, or a struct with an sview field.
         def hce_element_holds_view(element_type: Ast::Expr, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&) -> bool:
             can Memory.Allocate, Abort.Panic:
@@ -114,11 +127,11 @@ extend Semantic:
                         return hce_local_derived(stripped, owners)
 
         # A call that may fill a tracked view container from a local owner: taint the container.
-        def hce_record_fill(expression: Ast::Expr, views: darray[sview]&, owners: darray[sview]&, byte_owners: darray[sview]&, tainted: mutable darray[sview]&, fns: darray[Ast::Decl]&, fn_index: HceMap&, annotations: darray[Ast::LocalRegionAnnotation]&) -> void:
+        def hce_record_fill(expression: Ast::Expr, views: darray[sview]&, owners: darray[sview]&, byte_owners: darray[sview]&, interior: darray[sview]&, tainted: mutable darray[sview]&, fns: darray[Ast::Decl]&, fn_index: HceMap&, annotations: darray[Ast::LocalRegionAnnotation]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Paren(inner, paren_pos):
-                        hce_record_fill(inner, views, owners, byte_owners, tainted, fns, fn_index, annotations)
+                        hce_record_fill(inner, views, owners, byte_owners, interior, tainted, fns, fn_index, annotations)
                         return
                     Expr.Call(callee, arguments, argument_names, call_pos):
                         # Positional arguments carry an empty label; skip only genuinely named calls.
@@ -153,7 +166,13 @@ extend Semantic:
                                     if hce_contains(views, filled) and param_is_mutable_ref(parameters[index]) and annotation_is_container(oe_strip(parameters[index].type_expression)):
                                         other: mutable usize = 0
                                         while other < effective.count |tainted|:
-                                            if other != index and (hce_fill_source_local(effective[other], owners, byte_owners) or hce_contains(tainted, ident_name_of(oe_strip(effective[other])))):
+                                            other_name: sview = ident_name_of(oe_strip(effective[other]))
+                                            # A container whose elements own storage (a struct with a
+                                            # container field) also takes the region of any local
+                                            # container argument with non-scalar, byte or view
+                                            # elements (stage0 ce1n; darray[i64]/[bool] do not).
+                                            interior_source: bool = hce_contains(interior, filled) and (hce_contains(owners, other_name) or hce_contains(views, other_name))
+                                            if other != index and (interior_source or hce_fill_source_local(effective[other], owners, byte_owners) or hce_contains(tainted, other_name)):
                                                 tainted.push(filled) if not hce_contains(tainted, filled)
                                             other <- other + 1
                                     index <- index + 1
@@ -458,11 +477,11 @@ extend Semantic:
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscapeVia, name: parameter, pos: pos, line: line, expected: "fresh container", actual: "<inferred>"}) if fresh
 
         # `P.….push(ELEMENT)` with P a parameter (and not a shadowing local).
-        def hce_check_push(expression: Ast::Expr, line: u32, params: darray[sview]&, locals: darray[sview]&, tainted: darray[sview]&, elements: darray[sview]&, owners: darray[sview]&, direct_views: darray[sview]&, table: lmut SymbolTable) -> void:
+        def hce_check_push(expression: Ast::Expr, line: u32, params: darray[sview]&, locals: darray[sview]&, tainted: darray[sview]&, elements: darray[sview]&, owners: darray[sview]&, direct_views: darray[sview]&, interior: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Paren(inner, paren_pos):
-                        table <- hce_check_push(inner, line, params, locals, tainted, elements, owners, direct_views, table)
+                        table <- hce_check_push(inner, line, params, locals, tainted, elements, owners, direct_views, interior, table)
                     Expr.Call(callee, arguments, argument_names, call_pos):
                         match callee:
                             Expr.Field(object, method, method_pos):
@@ -474,19 +493,28 @@ extend Semantic:
                                     return
                                 element_pos: Ast::Pos = hce_store_element_pos(arguments[0], tainted, elements, owners, direct_views)
                                 table <- hce_report(line, element_pos, root, hce_construct_direct(arguments[0], owners, direct_views), table) if element_pos.end_column != 0 or element_pos.line != 0
+                                # An element of a container whose elements own storage: stage0's
+                                # interior check adds its "via a by-value copy" line (ce1n).
+                                pushed: Ast::Expr = oe_strip(arguments[0])
+                                pushed_root: mutable sview = ident_name_of(pushed)
+                                if pushed is Expr.Index(index_object, index_value, index_pos):
+                                    pushed_root <- ident_name_of(oe_strip(index_object))
+                                if (element_pos.end_column != 0 or element_pos.line != 0) and hce_contains(interior, pushed_root):
+                                    by_value_seen: bool = any existing in table.diagnostics where existing.kind == DiagnosticKind.RegionStoreEscapeVia and existing.line == line
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscapeVia, name: root, pos: element_pos, line: line, expected: "by-value copy", actual: "<inferred>"}) if not by_value_seen
                             _:
                                 pass
                     _:
                         pass
 
-        def hce_walk(body: darray[Ast::Stmt], params: darray[sview]&, locals: mutable darray[sview]&, views: mutable darray[sview]&, owners: mutable darray[sview]&, byte_owners: mutable darray[sview]&, tainted: mutable darray[sview]&, elements: mutable darray[sview]&, direct_views: mutable darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, fns: darray[Ast::Decl]&, fn_index: HceMap&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+        def hce_walk(body: darray[Ast::Stmt], params: darray[sview]&, locals: mutable darray[sview]&, views: mutable darray[sview]&, owners: mutable darray[sview]&, byte_owners: mutable darray[sview]&, tainted: mutable darray[sview]&, elements: mutable darray[sview]&, direct_views: mutable darray[sview]&, interior: mutable darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, fns: darray[Ast::Decl]&, fn_index: HceMap&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in body |locals, views, owners, byte_owners, tainted, elements, direct_views, table| -> table:
+                for statement in body |locals, views, owners, byte_owners, tainted, elements, direct_views, interior, table| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, pos):
-                            hce_record_fill(value, views, owners, byte_owners, tainted, fns, fn_index, annotations)
+                            hce_record_fill(value, views, owners, byte_owners, interior, tainted, fns, fn_index, annotations)
                             hce_record_push(value, views, owners, params, tainted, elements)
-                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, owners, direct_views, table)
+                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, owners, direct_views, interior, table)
                             # A redeclaration starts clean (shadowing is legal).
                             hce_forget(tainted, name)
                             hce_forget(elements, name)
@@ -500,7 +528,10 @@ extend Semantic:
                             head: sview = bare_type_name(stripped)
                             if not annotated:
                                 element_type: Ast::Expr = oe_element_type(stripped)
-                                if annotation_is_container(stripped) and hce_element_holds_view(element_type, f_struct, f_name, f_type):
+                                hce_forget(interior, name)
+                                element_interior: bool = annotation_is_container(stripped) and hce_element_has_container(element_type, f_struct, f_name, f_type)
+                                interior.push(name) if element_interior
+                                if annotation_is_container(stripped) and (element_interior or hce_element_holds_view(element_type, f_struct, f_name, f_type)):
                                     views.push(name)
                                     tainted.push(name) if derived
                                 elif not annotation_is_container(stripped) and value_tainted and (head == "sview" or hce_element_holds_view(stripped, f_struct, f_name, f_type)):
@@ -509,13 +540,13 @@ extend Semantic:
                                 owners.push(name) if owning_darray or head == "dstr"
                                 byte_owners.push(name) if head == "dstr" or (annotation_is_container(stripped) and ident_name_of(element_type) == "u8")
                         Stmt.Expr(expression, pos):
-                            hce_record_fill(expression, views, owners, byte_owners, tainted, fns, fn_index, annotations)
+                            hce_record_fill(expression, views, owners, byte_owners, interior, tainted, fns, fn_index, annotations)
                             hce_record_push(expression, views, owners, params, tainted, elements)
-                            table <- hce_check_push(expression, pos.line, params, locals, tainted, elements, owners, direct_views, table)
+                            table <- hce_check_push(expression, pos.line, params, locals, tainted, elements, owners, direct_views, interior, table)
                         Stmt.Assign(target, operator, value, pos):
-                            hce_record_fill(value, views, owners, byte_owners, tainted, fns, fn_index, annotations)
+                            hce_record_fill(value, views, owners, byte_owners, interior, tainted, fns, fn_index, annotations)
                             hce_record_push(value, views, owners, params, tainted, elements)
-                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, owners, direct_views, table)
+                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, owners, direct_views, interior, table)
                             assigned: sview = ident_name_of(target)
                             if operator == TokenKind.LArrow and assigned != "" and hce_contains(locals, assigned) and not hce_contains(params, assigned):
                                 if hce_contains(views, assigned):
@@ -535,21 +566,22 @@ extend Semantic:
                         Stmt.For(bind, variables, iterable, for_body, pos):
                             loop_var: sview = variables[0] if variables.count == 1 else (bind if variables.count == 0 else "")
                             elements.push(loop_var) if loop_var != "" and hce_contains(tainted, ident_name_of(iterable))
+                            interior.push(loop_var) if loop_var != "" and hce_contains(tainted, ident_name_of(iterable)) and hce_contains(interior, ident_name_of(iterable))
                             for_before: usize = tainted.count
-                            table <- hce_walk(for_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(for_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                             table <- hce_check_loop_widening(for_body, tainted, for_before, table)
                         Stmt.Block(kind, clause, binding, block_body, pos):
-                            table <- hce_walk(block_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(block_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Stmt.If(condition, then_body, else_body, pos):
-                            table <- hce_walk(then_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
-                            table <- hce_walk(else_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(then_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(else_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Stmt.While(condition, while_body, pos):
                             while_before: usize = tainted.count
-                            table <- hce_walk(while_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(while_body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                             table <- hce_check_loop_widening(while_body, tainted, while_before, table)
                         Stmt.Match(scrutinee, arms, pos):
-                            for arm in arms |locals, views, owners, byte_owners, tainted, elements, direct_views, table| -> table:
-                                table <- hce_walk(arm.body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            for arm in arms |locals, views, owners, byte_owners, tainted, elements, direct_views, interior, table| -> table:
+                                table <- hce_walk(arm.body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         _:
                             pass
 
@@ -569,7 +601,8 @@ extend Semantic:
                             tainted: mutable darray[sview] = []
                             elements: mutable darray[sview] = []
                             direct_views: mutable darray[sview] = []
-                            table <- hce_walk(body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            interior: mutable darray[sview] = []
+                            table <- hce_walk(body, params, locals, views, owners, byte_owners, tainted, elements, direct_views, interior, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- hce_check_declarations(module_body, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Decl.Scoped(scoped_body, scoped_line):
