@@ -24,6 +24,13 @@
 #                                the views stored in it
 #   larrow_call/cast_view_grow   `s <- buf.as_sview()` / `c <- (&buf[0]).cast[cstr]`
 #   larrow_cast_branch_rebind    `name <- f(storage)` rebinds a value-typed local: not a use
+# Round 4 (field-path keys; a view of `p.storage` from `bytes_view_range`):
+#   field_sibling_*_grow.pos     growing/replacing a sibling `p.lines` whose darray element
+#                                type differs from the viewed field's keeps the view
+#   field_sibling_same_elem_*    same-typed siblings may share one buffer after a shallow
+#                                copy (`P{storage: b, lines: b}`, run-proven stale read), so
+#                                growing either still invalidates
+#   field_viewed_* / root_replace growing or replacing `p.storage`, or replacing `p`
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u
