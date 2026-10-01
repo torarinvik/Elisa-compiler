@@ -4,12 +4,20 @@
 # assert the program's real BEHAVIOR (exit code). This is the end-to-end proof that dict
 # — the last feature for stage0/stage1 backend parity — works, not just that it compiles.
 #
-# The std source is CONCATENATED (deque.elisa + collections.elisa) with `include` lines
-# stripped, because the driver reads a single program on stdin. The two `ctx_hash_u64`/
-# `ctx_hash_cstr` DEFINITIONS are dropped: elisacore_runtime.o already provides them, so
-# keeping the std copies would duplicate-symbol at link. (In a real stage1 pipeline the
-# driver's include resolution + a runtime that omits these would handle it; this harness
-# just links the extracted runtime object.)
+# The fixture `include`s the REAL std collections.elisa (stage0's tree, $ELISA_CORE) and is
+# compiled by BOTH compilers through their drivers, linked, and RUN. stage0 must produce the
+# expected exit code before stage1's answer is counted.
+#
+# It used to CONCATENATE hand-listed std files (include lines stripped) and feed stdin to
+# emit_native. That rotted silently twice: first arena.elisa went missing from the list, then
+# arena.elisa began including elisacore_runtime_atomics.elisa (the
+# __elisa_arena_cache_lock_acquire/_release definitions). Adding that file to the list is not
+# enough either: its raw `load`/`store` are legal only in a std SOURCE file, and the
+# concatenated program is not one, so stage0 rejected every case (0/18). Real includes keep
+# the std's own include graph and file identity.
+#
+# Linked WITHOUT elisacore_runtime.o (the included runtime defines those symbols; linking
+# both duplicates them), with no-op profiler hooks + ctx_streq from a C stub.
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
 RUN() { elisa_run_timeout 15 "$@"; }
 set -u
@@ -17,76 +25,50 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 STD="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/runtime/elisacore_std"
 
 [ -x "$ELISACORE_BIN" ] || { echo "dict_real_smoke FAIL: no elisac" >&2; exit 1; }
-[ -x "$LLVM_CONFIG" ] || { echo "dict_real_smoke FAIL: no llvm-config" >&2; exit 1; }
 [ -f "$STD/collections.elisa" ] || { echo "dict_real_smoke FAIL: no collections.elisa at $STD" >&2; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "dict_real_smoke SKIP: no python3"; exit 0; }
 
-LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$("$LLVM_CONFIG" --bindir)/llc"
-BUILD="$ROOT/build"; mkdir -p "$BUILD"
-EMIT="$BUILD/emit_native"
+BIN="${ELISAC_STAGE1:-$ROOT/bin/elisac-stage1}"
+[ -x "$BIN" ] || { echo "dict_real_smoke FAILED: no stage1 binary at $BIN"; exit 1; }
+# Not under /private/tmp: stage0 writes an empty object for those paths.
+TMP="$(mktemp -d "$HOME/.dict_real_smoke.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/stub.c" <<'C'
+#include <stdint.h>
+#include <string.h>
+void elisa_profile_allocation_event_v1(uint32_t a, uintptr_t b, size_t c, uintptr_t d, size_t e, uintptr_t f, size_t g) {}
+uint32_t elisa_profile_allocation_negotiate(uint32_t v) { return 0; }
+uint32_t elisa_profile_region_layout_negotiate(uint32_t v) { return 0; }
+void elisa_profile_region_layout_v1(void) {}
+_Bool ctx_streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
+C
+clang -c "$TMP/stub.c" -o "$TMP/stub.o" || { echo "dict_real_smoke FAILED: stub"; exit 1; }
 
-# Reuse the emitter + runtime object the backend smoke builds; build them if absent.
-# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
-ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
-[ -x "$EMIT" ] || { echo "dict_real_smoke FAILED: no emit_native"; exit 1; }
-RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
-if [ ! -f "$RUNTIME_OBJ" ]; then
-    mkdir -p "$BUILD/runtime"
-    printf 'def main() -> i64:\n    d: mutable darray[u8] = []\n    d.push(1)\n    return 0\n' > "$BUILD/runtime/probe.elisa"
-    ( cd "$BUILD/runtime" && "$ELISACORE_BIN" -emit c-archive -o probe.a probe.elisa 2>/dev/null && ar x probe.a elisacore_runtime.o 2>/dev/null )
-fi
-[ -f "$RUNTIME_OBJ" ] || { echo "dict_real_smoke FAILED: no elisacore_runtime.o"; exit 1; }
+# run_with <compiler> <src> <tag>: prints rc=N, or why there is no executable.
+run_with() {
+    local compiler="$1" src="$2" tag="$3"
+    "$compiler" -emit obj "$src" -o "$TMP/$tag.o" >"$TMP/$tag.log" 2>&1 || { echo "compile-fail"; return; }
+    [ -s "$TMP/$tag.o" ] || { echo "no-object"; return; }
+    clang -Wl,-dead_strip -o "$TMP/$tag" "$TMP/$tag.o" "$TMP/stub.o" 2>"$TMP/$tag.link" || { echo "link-fail"; return; }
+    RUN "$TMP/$tag" >/dev/null 2>&1; echo "rc=$?"
+}
 
 pass=0; total=0
 # dict_case <name> <main-body> <want-exit>
 dict_case() {
     local name="$1" body="$2" want="$3"; total=$((total + 1))
-    local src="$BUILD/dictreal_$name.elisa" ll="$BUILD/dictreal_$name.ll" obj="$BUILD/dictreal_$name.o" exe="$BUILD/dictreal_$name"
-    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
-import sys, re
-out = []
-for path in sys.argv[1:]:
-    for line in open(path):
-        if not line.startswith('include'): out.append(line)
-lines = ''.join(out).split('\n'); res = []; skip = False
-for ln in lines:
-    if re.match(r'def (ctx_hash_u64|ctx_hash_cstr)\b', ln): skip = True; continue
-    if skip:
-        if ln and not ln[0].isspace(): skip = False
-        else: continue
-    res.append(ln)
-# The two hash DEFINITIONS are stripped above (elisacore_runtime.o already provides them,
-# so keeping the std copies duplicate-symbol at link). Stripping alone is not enough:
-# stage0 then reports 'missing runtime function "ctx_hash_cstr"'. Re-declare them as
-# EXTERNs so both compilers see a signature and neither emits a body.
-print('extern ctx_hash_cstr(s: cstr) -> u64')
-print('extern ctx_hash_u64(value: u64) -> u64')
-print('\n'.join(res))
-print('''$body''')
-PY
-    # The fixture must be a program stage0 ACCEPTS before stage1's output means anything.
-    # Without this the concat silently dropped arena.elisa (which defines RuntimeError),
-    # so every case fed stage1 a program stage0 rejects outright -- and the gate reported
-    # backend failures ("llc rejected the IR") for a broken FIXTURE, pointing at the wrong
-    # compiler for as long as it was red.
-    if ! "$ELISACORE_BIN" -emit llvm -o /dev/null "$src" 2>"$BUILD/dictreal_$name.s0log"; then
-        echo "  FAIL $name: FIXTURE INVALID -- stage0 rejects the concatenated std:"
-        grep -v warning "$BUILD/dictreal_$name.s0log" | head -3 | sed 's/^/      /'
-        return; fi
-    if ! "$EMIT" < "$src" > "$ll" 2>/dev/null || head -1 "$ll" | grep -q UNSUPPORTED; then
-        echo "  FAIL $name: stage1 declined the real-std dict program"; return; fi
-    if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
-        echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
-        echo "  FAIL $name: link failed"; return; fi
-    RUN "$exe"; local got=$?
-    if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT"; return; fi
-    if [ "$got" -ne "$want" ]; then echo "  FAIL $name: exit $got, want $want"; return; fi
+    local src="$TMP/$name.elisa"
+    printf 'include "%s"\n\n%s\n' "$STD/collections.elisa" "$body" > "$src"
+    local s0; s0="$(run_with "$ELISACORE_BIN" "$src" "s0_$name")"
+    if [ "$s0" != "rc=$want" ]; then
+        echo "  FAIL $name: FIXTURE INVALID -- stage0 gives $s0, want rc=$want"
+        grep -v 'warning:' "$TMP/s0_$name.log" | head -3 | sed 's/^/      /'; return; fi
+    local s1; s1="$(run_with "$BIN" "$src" "s1_$name")"
+    if [ "$s1" != "rc=$want" ]; then
+        echo "  FAIL $name: stage1 gives $s1, want rc=$want"
+        grep -v 'warning:' "$TMP/s1_$name.log" | head -3 | sed 's/^/      /'; return; fi
     pass=$((pass + 1))
 }
 

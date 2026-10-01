@@ -3,6 +3,11 @@
 # silently is the failure these guard against.
 #
 # Sourced by backend_native_smoke.sh.
+# Run directly, this fragment has no driver (run_case, $BUILD, pass/total are defined by
+# backend_native_smoke.sh), so hand off to the driver instead of failing on `run_case`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    exec bash "$(cd -- "$(dirname -- "$0")" && pwd)/backend_native_smoke.sh" "$@"
+fi
 
 # An UNSUPPORTED input must be DECLINED, never silently mis-emitted.
 decline_case() {

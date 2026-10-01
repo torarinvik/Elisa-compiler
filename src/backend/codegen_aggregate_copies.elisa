@@ -1,0 +1,216 @@
+# Stage1 backend — lower copies of LARGE aggregates to `llvm.memmove`.
+# Part of `module Backend` (see codegen.elisa).
+#
+# The emitter copies a struct / fixed array / optional payload between places as a
+# first-class `load %T` + `store %T` (several hundred emit sites do this). That is fine
+# for small values, but LLVM's SelectionDAG scalarizes a first-class aggregate into one
+# node per leaf: a ~130 KB `History` (a fixed array of 64 structs of fixed arrays) became
+# tens of thousands of nodes, and FoldingSet CSE / DAGCombiner::visitSTORE went quadratic
+# (an -O2 build of mocap-cleaner's studio ran for over an hour). Rather than patch each
+# emit site, this module-level rewrite runs once on the finished module, before
+# verification and the optimiser, and turns every copy of an aggregate larger than
+# `LARGE_AGGREGATE_BYTES` whose source is a place into a memmove from that place:
+#
+#   %v = load %T, ptr %src          ; same block, no intervening write that may alias %src
+#   store %T %v, ptr %dst           ->  memmove(%dst, %src, sizeof T)
+#
+#   %o = load {i1, %T}, ptr %src
+#   %v = extractvalue {i1, %T} %o, 1
+#   store %T %v, ptr %dst           ->  memmove(%dst, gep %src 0 1, sizeof T)
+#
+#   store %T zeroinitializer, %dst  ->  memset(%dst, 0, sizeof T)
+#
+# and then splits a large load whose remaining users are all single-index extractvalues
+# (an optional's tag read next to its payload) into narrow loads of those fields. A copy
+# whose source is not a place (insertvalue chains, call results, phis) or that crosses a
+# call / possibly-aliasing store is left as it was. memmove, not memcpy: the emitter
+# does not prove the two places disjoint (`x <- x`).
+
+extend Backend:
+    private:
+        const LARGE_AGGREGATE_BYTES: u64 = 64
+        const OPCODE_ALLOCA: u32 = 26
+        const OPCODE_LOAD: u32 = 27
+        const OPCODE_STORE: u32 = 28
+        const OPCODE_GEP: u32 = 29
+        const OPCODE_EXTRACT_VALUE: u32 = 53
+
+        def is_large_aggregate_type(ty: LLVMTypeRef, target_data: LLVMTargetDataRef) -> bool:
+            kind: u32 = LLVMGetTypeKind(ty)
+            return false if kind != 10 and kind != 11
+            LLVMABISizeOfType(target_data, ty) > LARGE_AGGREGATE_BYTES
+
+        def is_instruction_with_opcode(value: LLVMValueRef, opcode: u32) -> bool:
+            if LLVMIsAInstruction(value) is instruction:
+                return LLVMGetInstructionOpcode(instruction) == opcode
+            false
+
+        # Strip GEPs down to the object a pointer is derived from.
+        def aggregate_copy_root(pointer: LLVMValueRef) -> LLVMValueRef:
+            root: mutable LLVMValueRef = pointer
+            while is_instruction_with_opcode(root, OPCODE_GEP) |root|:
+                root <- LLVMGetOperand(root, 0)
+            root
+
+        # An alloca or a global: two different ones never overlap.
+        def aggregate_copy_root_identified(root: LLVMValueRef) -> bool:
+            return true if is_instruction_with_opcode(root, OPCODE_ALLOCA)
+            if LLVMIsAInstruction(root) != null:
+                return false
+            LLVMIsAGlobalVariable(root) != null
+
+        # May anything strictly between `first` and `last` (same block) write the memory
+        # behind `source`? Only non-memory instructions and stores into a DIFFERENT
+        # identified object are allowed through.
+        def aggregate_copy_window_clobbers(first: LLVMValueRef, last: LLVMValueRef, source: LLVMValueRef) -> bool:
+            source_root: LLVMValueRef = aggregate_copy_root(source)
+            source_identified: bool = aggregate_copy_root_identified(source_root)
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(first)
+            while cursor is current |cursor, last, source_root, source_identified|:
+                return false if current == last
+                opcode: u32 = LLVMGetInstructionOpcode(current)
+                if opcode == OPCODE_STORE:
+                    return true if not source_identified
+                    target_root: LLVMValueRef = aggregate_copy_root(LLVMGetOperand(current, 1))
+                    return true if not aggregate_copy_root_identified(target_root)
+                    return true if target_root == source_root
+                elif opcode == 45 or opcode == 5 or opcode == 67 or opcode == 55 or opcode == 56 or opcode == 57 or opcode == 49:
+                    # call / invoke / callbr / fence / cmpxchg / atomicrmw / va_arg
+                    return true
+                cursor <- LLVMGetNextInstruction(current)
+            true
+
+        # The field index `extract` reads from its single-index struct operand, found by
+        # its (unique) result type; -1 when that is not determinable.
+        def aggregate_extract_field(extract: LLVMValueRef) -> i64:
+            return -1 if LLVMGetNumIndices(extract) != 1
+            aggregate_type: LLVMTypeRef = LLVMTypeOf(LLVMGetOperand(extract, 0))
+            return -1 if LLVMGetTypeKind(aggregate_type) != 10
+            result_type: LLVMTypeRef = LLVMTypeOf(extract)
+            found: mutable i64 = -1
+            count: u32 = LLVMCountStructElementTypes(aggregate_type)
+            for index in 0..<count |found, aggregate_type, result_type|:
+                if LLVMStructGetTypeAtIndex(aggregate_type, index) == result_type:
+                    return -1 if found >= 0
+                    found <- index.i64()
+            found
+
+        def erase_if_unused(value: LLVMValueRef) -> void:
+            if LLVMIsAInstruction(value) is instruction:
+                if LLVMGetFirstUse(instruction) != null:
+                    return
+                LLVMInstructionEraseFromParent(instruction)
+
+        # Rewrite one store if it copies a large aggregate from a place; true when done.
+        def lower_large_aggregate_store(store: LLVMValueRef, builder: LLVMBuilderRef, ctx: LLVMContextRef, target_data: LLVMTargetDataRef) -> bool:
+            return false if LLVMGetVolatile(store) != 0
+            value: LLVMValueRef = LLVMGetOperand(store, 0)
+            destination: LLVMValueRef = LLVMGetOperand(store, 1)
+            value_type: LLVMTypeRef = LLVMTypeOf(value)
+            return false if not is_large_aggregate_type(value_type, target_data)
+            size: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), LLVMABISizeOfType(target_data, value_type), 0)
+            store_align: u32 = LLVMGetAlignment(store)
+            if LLVMIsAConstant(value) != null:
+                return false if LLVMIsNull(value) == 0
+                LLVMPositionBuilderBefore(builder, store)
+                _ = LLVMBuildMemSet(builder, destination, LLVMConstInt(LLVMInt8TypeInContext(ctx), 0, 0), size, store_align)
+                LLVMInstructionEraseFromParent(store)
+                return true
+            return false if LLVMIsAInstruction(value) == null
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(store)
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            if opcode == OPCODE_LOAD:
+                return false if LLVMGetVolatile(value) != 0
+                return false if LLVMGetInstructionParent(value) != block
+                source: LLVMValueRef = LLVMGetOperand(value, 0)
+                return false if aggregate_copy_window_clobbers(value, store, source)
+                LLVMPositionBuilderBefore(builder, store)
+                _ = LLVMBuildMemMove(builder, destination, store_align, source, LLVMGetAlignment(value), size)
+                LLVMInstructionEraseFromParent(store)
+                erase_if_unused(value)
+                return true
+            if opcode == OPCODE_EXTRACT_VALUE:
+                outer: LLVMValueRef = LLVMGetOperand(value, 0)
+                return false if not is_instruction_with_opcode(outer, OPCODE_LOAD)
+                return false if LLVMGetVolatile(outer) != 0
+                return false if LLVMGetInstructionParent(outer) != block
+                field: i64 = aggregate_extract_field(value)
+                return false if field < 0
+                outer_source: LLVMValueRef = LLVMGetOperand(outer, 0)
+                return false if aggregate_copy_window_clobbers(outer, store, outer_source)
+                LLVMPositionBuilderBefore(builder, store)
+                field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, LLVMTypeOf(outer), outer_source, field.u32(), "agg.copy.field")
+                field_align: mutable u32 = LLVMABIAlignmentOfType(target_data, value_type)
+                field_align <- LLVMGetAlignment(outer) if LLVMGetAlignment(outer) < field_align
+                _ = LLVMBuildMemMove(builder, destination, store_align, field_pointer, field_align, size)
+                LLVMInstructionEraseFromParent(store)
+                erase_if_unused(value)
+                erase_if_unused(outer)
+                return true
+            false
+
+        # A large load whose every user is a resolvable single-index extractvalue reads
+        # each of those fields with its own narrow load instead.
+        def split_large_aggregate_load(load: LLVMValueRef, builder: LLVMBuilderRef, target_data: LLVMTargetDataRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMGetVolatile(load) != 0
+            load_type: LLVMTypeRef = LLVMTypeOf(load)
+            return false if LLVMGetTypeKind(load_type) != 10
+            return false if not is_large_aggregate_type(load_type, target_data)
+            users: mutable darray[LLVMValueRef] = []
+            use_opt: mutable LLVMUseRef? = LLVMGetFirstUse(load)
+            while use_opt is use |use_opt, users|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if not is_instruction_with_opcode(user, OPCODE_EXTRACT_VALUE)
+                return false if aggregate_extract_field(user) < 0
+                users.push(user)
+                use_opt <- LLVMGetNextUse(use)
+            return false if users.count == 0
+            source: LLVMValueRef = LLVMGetOperand(load, 0)
+            load_align: u32 = LLVMGetAlignment(load)
+            for user in users |builder, target_data, load, load_type, source, load_align|:
+                field: u32 = aggregate_extract_field(user).u32()
+                LLVMPositionBuilderBefore(builder, load)
+                field_type: LLVMTypeRef = LLVMTypeOf(user)
+                field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, load_type, source, field, "agg.field.ptr")
+                narrow: LLVMValueRef = LLVMBuildLoad2(builder, field_type, field_pointer, "agg.field")
+                field_align: mutable u32 = LLVMABIAlignmentOfType(target_data, field_type)
+                field_align <- load_align if load_align < field_align
+                LLVMSetAlignment(narrow, field_align)
+                LLVMReplaceAllUsesWith(user, narrow)
+                LLVMInstructionEraseFromParent(user)
+            LLVMInstructionEraseFromParent(load)
+            true
+
+    public:
+        # Module pass; see the header. Returns the number of copies rewritten.
+        def lower_large_aggregate_copies(m: LLVMModuleRef, ctx: LLVMContextRef, target_data: LLVMTargetDataRef) -> i64 can[Abort.Panic, Memory.Allocate]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+            rewritten: mutable i64 = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |function_opt, rewritten, builder, ctx, target_data|:
+                block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_opt is block |block_opt, rewritten, builder, ctx, target_data|:
+                    # Pass 1: stores. Collect first; rewriting erases instructions.
+                    stores: mutable darray[LLVMValueRef] = []
+                    instruction_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while instruction_opt is instruction |instruction_opt, stores|:
+                        opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                        stores.push(instruction) if opcode == OPCODE_STORE
+                        instruction_opt <- LLVMGetNextInstruction(instruction)
+                    for store in stores |rewritten, builder, ctx, target_data|:
+                        if lower_large_aggregate_store(store, builder, ctx, target_data):
+                            rewritten <- rewritten + 1
+                    # Pass 2: large loads now read only for narrow fields. A load erased
+                    # in pass 1 must not be touched, so re-walk the block for live ones.
+                    live_loads: mutable darray[LLVMValueRef] = []
+                    walk_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while walk_opt is walk |walk_opt, live_loads|:
+                        live_loads.push(walk) if LLVMGetInstructionOpcode(walk) == OPCODE_LOAD
+                        walk_opt <- LLVMGetNextInstruction(walk)
+                    for load in live_loads |rewritten, builder, target_data|:
+                        if split_large_aggregate_load(load, builder, target_data):
+                            rewritten <- rewritten + 1
+                    block_opt <- LLVMGetNextBasicBlock(block)
+                function_opt <- LLVMGetNextFunction(function)
+            LLVMDisposeBuilder(builder)
+            rewritten
