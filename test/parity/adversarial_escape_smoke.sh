@@ -7,6 +7,9 @@
 #                                it, or a `&` borrow of it (returned 0, not 65)
 #   enum_payload / tuple store   `out.push(Tok.Word(local_view))` / `out.push((1, v))`
 #   region_enum_escape           `t <- Tok.Word(buf.as_sview())` out of a region block
+#   enum_payload_view_grow       a view in an enum payload read after its source grows
+#   *ref_alias_interior_grow     `r = &b.items; x = &r[0]; b.items.push` (stale 41)
+#   enum_return_view*            a local view returned inside an enum payload (read 0)
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u
