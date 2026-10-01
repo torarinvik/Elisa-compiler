@@ -18,6 +18,12 @@
 #   *lambda_region_store         a closure capturing a region view stored out of the region
 #   nested_row_replace_view      `grid[0] <- [7]` while a view of grid[0] is live
 #   dstr_reassign_view           a dstr reassigned while a view of it is live
+# Round 3 (holders and rebinds; stage0 473e9c2c):
+#   field/index_store_view_grow  `h.s <- view` / `vs[0] <- view`, then the source grows
+#   holder_*copy_view_grow       a copy of a holder (`ws = vs`, `ws <- vs`, `g = h`) keeps
+#                                the views stored in it
+#   larrow_call/cast_view_grow   `s <- buf.as_sview()` / `c <- (&buf[0]).cast[cstr]`
+#   larrow_cast_branch_rebind    `name <- f(storage)` rebinds a value-typed local: not a use
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u
