@@ -516,41 +516,95 @@ extend Semantic:
                         printed_line <- Lexer::source_original_line(read_line[0]) if site.line != 0
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LoopElementReadWidened, name: name, pos: site, line: site.line, expected: "", actual: "", expected_count: printed_line}) if site.line != 0
 
-        def hce_report(line: u32, pos: Ast::Pos, parameter: sview, table: lmut SymbolTable) -> void:
+        # A DIRECT view of a local owner (`buf.as_sview()`, `buf[a:b]`, `&buf`); a bare owner
+        # name (`body: combined`) copies the container header and is not one.
+        def hce_direct_view(value: Ast::Expr, owners: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Ident(name, ident_pos):
+                        return false
+                    Expr.Paren(inner, paren_pos):
+                        return hce_direct_view(inner, owners)
+                    _:
+                        return hce_local_derived(value, owners)
+
+        # A struct literal with a field that is a direct local view, or a local bound to one
+        # (`v: sview = buf.as_sview()`): stage0 knows that field's region exactly and also
+        # prints its "via a fresh container" line.
+        def hce_construct_direct(value: Ast::Expr, owners: darray[sview]&, direct_views: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return hce_construct_direct(inner, owners, direct_views)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return any field in fields where hce_direct_view(field.value, owners) or hce_contains(direct_views, ident_name_of(field.value))
+                    _:
+                        return false
+
+        # The report position for a stored element: a tainted element, or a struct literal with a
+        # direct local view field (reported at the literal's type name, as stage0 does).
+        def hce_store_element_pos(value: Ast::Expr, tainted: darray[sview]&, elements: darray[sview]&, owners: darray[sview]&, direct_views: darray[sview]&) -> Ast::Pos:
+            can Memory.Allocate, Abort.Panic:
+                found: Ast::Pos = hce_tainted_element(value, tainted, elements)
+                return found if found.end_column != 0 or found.line != 0
+                match value:
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return Ast::expr_pos(type_expression) if hce_construct_direct(value, owners, direct_views)
+                    _:
+                        pass
+                return found
+
+        # Reports the dangling-reference line and, for a fresh struct literal, stage0's second
+        # "via a fresh container" line. That report replaces the column-less `in auto:` store
+        # line an earlier checker may have left on the same line, which stage0 does not print.
+        def hce_report(line: u32, pos: Ast::Pos, parameter: sview, fresh: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 duplicate: bool = any existing in table.diagnostics where existing.kind == DiagnosticKind.RegionStoreEscape and existing.line == line
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: parameter, pos: pos, line: line, expected: "__param_region", actual: "<inferred>"}) if not duplicate
+                return if duplicate
+                if fresh:
+                    # Remove in place (shift down, then truncate): the table owns its storage.
+                    write: mutable usize = 0
+                    for read in 0..<table.diagnostics.count |write, table|:
+                        existing: Diagnostic = table.diagnostics[read]
+                        continue if existing.kind == DiagnosticKind.AutoRegionStoreEscape and existing.line == line and existing.pos.line == 0
+                        table.diagnostics[write] <- existing if write != read
+                        write <- write + 1
+                    table.diagnostics <- table.diagnostics.truncate(write)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: parameter, pos: pos, line: line, expected: "__param_region", actual: "<inferred>"})
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscapeVia, name: parameter, pos: pos, line: line, expected: "fresh container", actual: "<inferred>"}) if fresh
 
         # `P.….push(ELEMENT)` with P a parameter (and not a shadowing local).
-        def hce_check_push(expression: Ast::Expr, line: u32, params: darray[sview]&, locals: darray[sview]&, tainted: darray[sview]&, elements: darray[sview]&, table: lmut SymbolTable) -> void:
+        def hce_check_push(expression: Ast::Expr, line: u32, params: darray[sview]&, locals: darray[sview]&, tainted: darray[sview]&, elements: darray[sview]&, owners: darray[sview]&, direct_views: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Paren(inner, paren_pos):
-                        table <- hce_check_push(inner, line, params, locals, tainted, elements, table)
+                        table <- hce_check_push(inner, line, params, locals, tainted, elements, owners, direct_views, table)
                     Expr.Call(callee, arguments, argument_names, call_pos):
                         match callee:
                             Expr.Field(object, method, method_pos):
                                 return if method != "push" or arguments.count != 1
                                 root: sview = auto_escape_place_root(object)
                                 return if not hce_contains(params, root) or hce_contains(locals, root)
-                                element_pos: Ast::Pos = hce_tainted_element(arguments[0], tainted, elements)
-                                table <- hce_report(line, element_pos, root, table) if element_pos.end_column != 0 or element_pos.line != 0
+                                element_pos: Ast::Pos = hce_store_element_pos(arguments[0], tainted, elements, owners, direct_views)
+                                table <- hce_report(line, element_pos, root, hce_construct_direct(arguments[0], owners, direct_views), table) if element_pos.end_column != 0 or element_pos.line != 0
                             _:
                                 pass
                     _:
                         pass
 
-        def hce_walk(body: darray[Ast::Stmt], params: darray[sview]&, locals: mutable darray[sview]&, views: mutable darray[sview]&, owners: mutable darray[sview]&, tainted: mutable darray[sview]&, elements: mutable darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, fns: darray[Ast::Decl]&, fn_index: HceMap&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+        def hce_walk(body: darray[Ast::Stmt], params: darray[sview]&, locals: mutable darray[sview]&, views: mutable darray[sview]&, owners: mutable darray[sview]&, tainted: mutable darray[sview]&, elements: mutable darray[sview]&, direct_views: mutable darray[sview]&, f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, fns: darray[Ast::Decl]&, fn_index: HceMap&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in body |locals, views, owners, tainted, elements, table| -> table:
+                for statement in body |locals, views, owners, tainted, elements, direct_views, table| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, pos):
                             hce_record_fill(value, views, owners, tainted, fns, fn_index, annotations)
                             hce_record_push(value, views, owners, params, tainted, elements)
-                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, table)
+                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, owners, direct_views, table)
                             # A redeclaration starts clean (shadowing is legal).
                             hce_forget(tainted, name)
                             hce_forget(elements, name)
+                            hce_forget(direct_views, name)
+                            direct_views.push(name) if hce_direct_view(value, owners)
                             derived: bool = hce_derived_tainted(value, views, owners, params, tainted, elements)
                             value_tainted: bool = hce_is_tainted(value, tainted, elements, owners)
                             locals.push(name)
@@ -569,11 +623,11 @@ extend Semantic:
                         Stmt.Expr(expression, pos):
                             hce_record_fill(expression, views, owners, tainted, fns, fn_index, annotations)
                             hce_record_push(expression, views, owners, params, tainted, elements)
-                            table <- hce_check_push(expression, pos.line, params, locals, tainted, elements, table)
+                            table <- hce_check_push(expression, pos.line, params, locals, tainted, elements, owners, direct_views, table)
                         Stmt.Assign(target, operator, value, pos):
                             hce_record_fill(value, views, owners, tainted, fns, fn_index, annotations)
                             hce_record_push(value, views, owners, params, tainted, elements)
-                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, table)
+                            table <- hce_check_push(value, pos.line, params, locals, tainted, elements, owners, direct_views, table)
                             assigned: sview = ident_name_of(target)
                             if operator == TokenKind.LArrow and assigned != "" and hce_contains(locals, assigned) and not hce_contains(params, assigned):
                                 if hce_contains(views, assigned):
@@ -582,32 +636,32 @@ extend Semantic:
                                     elements.push(assigned)
                             if operator == TokenKind.LArrow:
                                 root: sview = auto_escape_place_root(target)
-                                element_pos: Ast::Pos = hce_tainted_element(value, tainted, elements)
+                                element_pos: Ast::Pos = hce_store_element_pos(value, tainted, elements, owners, direct_views) if hce_is_param_index(target, params) else hce_tainted_element(value, tainted, elements)
                                 # An indexed store straight into a container parameter (`P[i] <- v`)
                                 # runs push's element checks (stage0 checkIndexedElementStoreEscape),
                                 # so a literal's fields count there; deeper places still check the
                                 # literal, not its fields.
                                 direct_indexed: bool = hce_is_param_index(target, params)
                                 if (direct_indexed or not hce_is_construct(value)) and ident_name_of(target) == "" and hce_contains(params, root) and not hce_contains(locals, root) and (element_pos.end_column != 0 or element_pos.line != 0):
-                                    table <- hce_report(pos.line, element_pos, root, table)
+                                    table <- hce_report(pos.line, element_pos, root, direct_indexed and hce_construct_direct(value, owners, direct_views), table)
                         Stmt.For(bind, variables, iterable, for_body, pos):
                             loop_var: sview = variables[0] if variables.count == 1 else (bind if variables.count == 0 else "")
                             elements.push(loop_var) if loop_var != "" and hce_contains(tainted, ident_name_of(iterable))
                             for_before: usize = tainted.count
-                            table <- hce_walk(for_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(for_body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                             table <- hce_check_loop_widening(for_body, tainted, for_before, table)
                         Stmt.Block(kind, clause, binding, block_body, pos):
-                            table <- hce_walk(block_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(block_body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Stmt.If(condition, then_body, else_body, pos):
-                            table <- hce_walk(then_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
-                            table <- hce_walk(else_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(then_body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(else_body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Stmt.While(condition, while_body, pos):
                             while_before: usize = tainted.count
-                            table <- hce_walk(while_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_walk(while_body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                             table <- hce_check_loop_widening(while_body, tainted, while_before, table)
                         Stmt.Match(scrutinee, arms, pos):
-                            for arm in arms |locals, views, owners, tainted, elements, table| -> table:
-                                table <- hce_walk(arm.body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            for arm in arms |locals, views, owners, tainted, elements, direct_views, table| -> table:
+                                table <- hce_walk(arm.body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         _:
                             pass
 
@@ -625,7 +679,8 @@ extend Semantic:
                             owners: mutable darray[sview] = []
                             tainted: mutable darray[sview] = []
                             elements: mutable darray[sview] = []
-                            table <- hce_walk(body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            direct_views: mutable darray[sview] = []
+                            table <- hce_walk(body, params, locals, views, owners, tainted, elements, direct_views, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- hce_check_declarations(module_body, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Decl.Scoped(scoped_body, scoped_line):
