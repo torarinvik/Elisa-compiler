@@ -405,6 +405,117 @@ extend Semantic:
                     _:
                         return false
 
+        # Whether an expression reads an element of NAME by index (`name[i]`).
+        def hce_reads_element(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(object, index, index_pos):
+                        return ident_name_of(object) == name or hce_reads_element(object, name) or hce_reads_element(index, name)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        return hce_reads_element(callee, name) or any argument in arguments where hce_reads_element(argument, name)
+                    Expr.Field(object, field, field_pos):
+                        return hce_reads_element(object, name)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        return hce_reads_element(left, name) or hce_reads_element(right, name)
+                    Expr.Unary(operator, operand, unary_pos) | Expr.Paren(operand, unary_pos) | Expr.Move(operand, unary_pos):
+                        return hce_reads_element(operand, name)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return any field in fields where hce_reads_element(field.value, name)
+                    Expr.Array(elements, array_pos) | Expr.Tuple(elements, array_pos):
+                        return any element in elements where hce_reads_element(element, name)
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        return hce_reads_element(condition, name) or hce_reads_element(then_value, name) or hce_reads_element(else_value, name)
+                    _:
+                        return false
+
+        # The line of the first `name[i]` read inside an expression (0 when none).
+        def hce_element_read_line(expression: Ast::Expr, name: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(object, index, index_pos):
+                        return Ast::expr_pos(object).line if ident_name_of(object) == name
+                    _:
+                        pass
+                return 0 if not hce_reads_element(expression, name)
+                return Ast::expr_pos(expression).line
+
+        # `name <- name.truncate(n)` / `name <- name[a:b]`: a reassignment built only from the
+        # container's own elements adds nothing new, so it cannot widen the element state.
+        def hce_self_narrowing(value: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return hce_self_narrowing(inner, name)
+                    Expr.Slice(object, low, high, slice_pos):
+                        return ident_name_of(object) == name
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(object, method, method_pos):
+                                return ident_name_of(object) == name and method != "push" and method != "extend" and method != "insert"
+                            _:
+                                return false
+                    _:
+                        return false
+
+        # The first element-adding site of NAME (`name <- v`, `name.push(v)`) that follows an
+        # element read of NAME, in source order; `read_line` carries the read's line across.
+        def hce_loop_widen_site(statements: darray[Ast::Stmt], name: sview, read_line: mutable darray[u32]&) -> Ast::Pos:
+            can Memory.Allocate, Abort.Panic:
+                none: Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+                for statement in statements |read_line|:
+                    site: mutable Ast::Pos = none
+                    match statement:
+                        Stmt.Assign(target, operator, value, assign_pos):
+                            if read_line[0] != 0 and operator == TokenKind.LArrow and ident_name_of(target) == name and not hce_self_narrowing(value, name):
+                                return Ast::expr_pos(target)
+                            read_line[0] <- hce_element_read_line(value, name) if read_line[0] == 0 and hce_reads_element(value, name)
+                        Stmt.Expr(expression, expr_pos):
+                            match expression:
+                                Expr.Call(callee, arguments, argument_names, call_pos):
+                                    match callee:
+                                        Expr.Field(object, method, method_pos):
+                                            return Ast::expr_pos(arguments[0]) if read_line[0] != 0 and method == "push" and arguments.count == 1 and ident_name_of(object) == name
+                                        _:
+                                            pass
+                                _:
+                                    pass
+                            read_line[0] <- hce_element_read_line(expression, name) if read_line[0] == 0 and hce_reads_element(expression, name)
+                        Stmt.VarDecl(var_name, type_expression, value, var_pos):
+                            read_line[0] <- hce_element_read_line(value, name) if read_line[0] == 0 and hce_reads_element(value, name)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            site <- hce_loop_widen_site(then_body, name, read_line)
+                            site <- hce_loop_widen_site(else_body, name, read_line) if site.line == 0
+                        Stmt.Block(kind, clause, binding, block_body, block_pos):
+                            site <- hce_loop_widen_site(block_body, name, read_line)
+                        Stmt.While(condition, while_body, while_pos):
+                            site <- hce_loop_widen_site(while_body, name, read_line)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            site <- hce_loop_widen_site(for_body, name, read_line)
+                        _:
+                            pass
+                    site return if site.line != 0
+                return none
+
+        # stage0 (region_local_container_loop_reads.go): a local container read by element
+        # inside a loop, then given borrowed-local elements later in the same loop body, lets the
+        # read see those elements on the next iteration although it was checked without them.
+        def hce_check_loop_widening(body: darray[Ast::Stmt], tainted: darray[sview]&, before_count: usize, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in before_count..<tainted.count |table| -> table:
+                    name: sview = tainted[index]
+                    continue if name == ""
+                    seen_before: mutable bool = false
+                    for earlier in 0..<before_count |seen_before|:
+                        seen_before <- true if tainted[earlier] == name
+                    continue if seen_before
+                    read_line: mutable darray[u32] = [0.u32()]
+                    site: Ast::Pos = hce_loop_widen_site(body, name, read_line)
+                    # The read line is a buffer line; the message prints it, so name the source line.
+                    printed_line: mutable u32 = read_line[0]
+                    can Unsafe.PointerCast:
+                        printed_line <- Lexer::source_original_line(read_line[0]) if site.line != 0
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LoopElementReadWidened, name: name, pos: site, line: site.line, expected: "", actual: "", expected_count: printed_line}) if site.line != 0
+
         def hce_report(line: u32, pos: Ast::Pos, parameter: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 duplicate: bool = any existing in table.diagnostics where existing.kind == DiagnosticKind.RegionStoreEscape and existing.line == line
@@ -466,7 +577,7 @@ extend Semantic:
                             assigned: sview = ident_name_of(target)
                             if operator == TokenKind.LArrow and assigned != "" and hce_contains(locals, assigned) and not hce_contains(params, assigned):
                                 if hce_contains(views, assigned):
-                                    tainted.push(assigned) if not hce_contains(tainted, assigned) and hce_derived_tainted(value, views, owners, params, tainted, elements)
+                                    tainted.push(assigned) if not hce_contains(tainted, assigned) and not hce_self_narrowing(value, assigned) and hce_derived_tainted(value, views, owners, params, tainted, elements)
                                 elif not hce_contains(elements, assigned) and hce_is_tainted(value, tainted, elements, owners):
                                     elements.push(assigned)
                             if operator == TokenKind.LArrow:
@@ -482,14 +593,18 @@ extend Semantic:
                         Stmt.For(bind, variables, iterable, for_body, pos):
                             loop_var: sview = variables[0] if variables.count == 1 else (bind if variables.count == 0 else "")
                             elements.push(loop_var) if loop_var != "" and hce_contains(tainted, ident_name_of(iterable))
+                            for_before: usize = tainted.count
                             table <- hce_walk(for_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_check_loop_widening(for_body, tainted, for_before, table)
                         Stmt.Block(kind, clause, binding, block_body, pos):
                             table <- hce_walk(block_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Stmt.If(condition, then_body, else_body, pos):
                             table <- hce_walk(then_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                             table <- hce_walk(else_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
                         Stmt.While(condition, while_body, pos):
+                            while_before: usize = tainted.count
                             table <- hce_walk(while_body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
+                            table <- hce_check_loop_widening(while_body, tainted, while_before, table)
                         Stmt.Match(scrutinee, arms, pos):
                             for arm in arms |locals, views, owners, tainted, elements, table| -> table:
                                 table <- hce_walk(arm.body, params, locals, views, owners, tainted, elements, f_struct, f_name, f_type, fns, fn_index, annotations, table)
