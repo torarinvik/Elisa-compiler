@@ -3,6 +3,11 @@
 # second implementation can say what the right result is.
 #
 # Sourced by backend_native_smoke.sh.
+# Run directly, this fragment has no driver (run_case, $BUILD, pass/total are defined by
+# backend_native_smoke.sh), so hand off to the driver instead of failing on `run_case`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    exec bash "$(cd -- "$(dirname -- "$0")" && pwd)/backend_native_smoke.sh" "$@"
+fi
 
 diff_object_case() {
     # Standalone scalar programs can use -emit obj on both compilers. Keep this separate

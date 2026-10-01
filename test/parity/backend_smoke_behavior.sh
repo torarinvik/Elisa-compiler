@@ -3,6 +3,11 @@
 #
 # Sourced by backend_native_smoke.sh, which owns the toolchain paths and the pass/total
 # counters these cases increment.
+# Run directly, this fragment has no driver (run_case, $BUILD, pass/total are defined by
+# backend_native_smoke.sh), so hand off to the driver instead of failing on `run_case`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    exec bash "$(cd -- "$(dirname -- "$0")" && pwd)/backend_native_smoke.sh" "$@"
+fi
 
 # run_case <name> <elisa-source> <expected-exit-code>
 run_case() {
