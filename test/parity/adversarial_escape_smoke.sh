@@ -10,6 +10,14 @@
 #   enum_payload_view_grow       a view in an enum payload read after its source grows
 #   *ref_alias_interior_grow     `r = &b.items; x = &r[0]; b.items.push` (stale 41)
 #   enum_return_view*            a local view returned inside an enum payload (read 0)
+# Round 2 (views stored into containers, closures, nested rows, dstr):
+#   container_*_view_grow        a view pushed/extended/`keep(&vs, s)` into a container,
+#                                then its source grows (stage0 segfaulted; fixed 0296d61e)
+#   container_push_closure_*     a closure capturing a view pushed into a container
+#   struct_lambda_return_view    `return H{f: fn() => s[0]}` with s a local view
+#   *lambda_region_store         a closure capturing a region view stored out of the region
+#   nested_row_replace_view      `grid[0] <- [7]` while a view of grid[0] is live
+#   dstr_reassign_view           a dstr reassigned while a view of it is live
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u
