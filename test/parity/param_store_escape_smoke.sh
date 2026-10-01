@@ -16,8 +16,9 @@
 #      no object written, and stage1's error lines (path stripped) equal stage0's exactly;
 #   2. every accepted/*.elisa is accepted by both and both write a non-empty object.
 #
-# accepted/assignStore.elisa (`diags[0] <- D{name: names[0]}`) is a real escape stage0 accepts;
-# it pins parity, not soundness.
+# rejected/assignStore.elisa (`diags[0] <- D{name: names[0]}`): an indexed `<-` store into a
+# container parameter runs push's element checks (stage0 3cbea2b9 checkIndexedElementStoreEscape);
+# accepted/indexed_store_param_element.elisa stores a parameter-backed element the same way.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
