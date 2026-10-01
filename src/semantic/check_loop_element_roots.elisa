@@ -1,0 +1,326 @@
+# In-loop element reads of a local container that a later push in the same loop WIDENS with
+# a different parameter's storage (stage0 region_local_container_loop_reads.go):
+#
+#     frontier: mutable darray[sview] = [origin]          # elements borrow `origin`
+#     while frontier.count > 0 |frontier, edge_to|:
+#         current: sview = frontier[0]                     # checked against {origin}
+#         frontier.push(edge_to[i])                        # adds `edge_to`: rejected
+#
+# The read's element state is an assumption; every later in-loop push must add nothing it
+# lacks. This port models the state as a set of ROOTS (parameter names; string literals and
+# the empty container add nothing). Local-storage roots are check_handler_capture_escape's
+# job. Anything unclear (a call result, a reassignment of the container, the container passed
+# to a call) stops tracking that container, so the check stays SILENT rather than guess.
+extend Semantic:
+    private:
+        struct ElrState:
+            params: mutable darray[sview]
+            scalars: mutable darray[sview]
+            # One row per (local name, root) for locals whose roots are known.
+            row_name: mutable darray[sview]
+            row_root: mutable darray[sview]
+            known: mutable darray[sview]
+            containers: mutable darray[sview]
+            # One assumption per (container, outermost loop): its roots at the first read.
+            as_name: mutable darray[sview]
+            as_loop: mutable darray[u32]
+            as_line: mutable darray[u32]
+            as_reported: mutable darray[bool]
+            as_row_index: mutable darray[usize]
+            as_row_root: mutable darray[sview]
+            loop_id: mutable u32
+            next_loop: mutable u32
+            # Structs with a direct `sview` field: only containers of these (or of sview) carry roots.
+            view_structs: mutable darray[sview]
+
+        def elr_has(names: darray[sview]&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return name != "" and (any existing in names where existing == name)
+
+        def elr_forget(names: mutable darray[sview]&, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index: mutable usize = 0
+                while index < names.count |index, names, name|:
+                    names[index] <- "" if names[index] == name
+                    index <- index + 1
+
+        def elr_forget_local(state: mutable ElrState&, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                elr_forget(state.known, name)
+                elr_forget(state.containers, name)
+                elr_forget(state.scalars, name)
+                index: mutable usize = 0
+                while index < state.row_name.count |index, state, name|:
+                    state.row_name[index] <- "" if state.row_name[index] == name
+                    index <- index + 1
+
+        def elr_add_root(out: mutable darray[sview]&, root: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out.push(root) if root != "" and not elr_has(out, root)
+
+        # The roots an expression's value borrows; false when they are not known.
+        def elr_roots(expression: Ast::Expr, state: ElrState&, out: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.StringLit(text, string_pos) | Expr.CharLit(text, string_pos) | Expr.FloatLit(text, string_pos):
+                        return true
+                    Expr.IntLit(int_value, int_pos):
+                        return true
+                    Expr.BoolLit(bool_value, bool_pos):
+                        return true
+                    Expr.Ident(name, ident_pos):
+                        if elr_has(state.params, name):
+                            elr_add_root(out, name)
+                            return true
+                        return true if elr_has(state.scalars, name)
+                        return false if not elr_has(state.known, name)
+                        index: mutable usize = 0
+                        while index < state.row_name.count |index, out, name, state|:
+                            elr_add_root(out, state.row_root[index]) if state.row_name[index] == name
+                            index <- index + 1
+                        return true
+                    Expr.Index(object, index_value, index_pos):
+                        return elr_roots(object, state, out)
+                    Expr.Field(object, field, field_pos):
+                        return elr_roots(object, state, out)
+                    Expr.Slice(object, low, high, slice_pos):
+                        return elr_roots(object, state, out)
+                    Expr.Paren(inner, paren_pos):
+                        return elr_roots(inner, state, out)
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        return elr_roots(then_value, state, out) and elr_roots(else_value, state, out)
+                    Expr.Array(elements, array_pos):
+                        return all element in elements where elr_roots(element, state, out)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return all field in fields where elr_roots(field.value, state, out)
+                    _:
+                        return false
+
+        # NAME appears as a bare call argument (`f(name)`, `f(&name)`): the callee may refill it.
+        def elr_passed(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        for argument in arguments |name|:
+                            return true if ident_name_of(oe_strip(argument)) == name or elr_passed(argument, name)
+                        return elr_passed(callee, name)
+                    Expr.Field(object, field, field_pos):
+                        return elr_passed(object, name)
+                    Expr.Index(object, index_value, index_pos):
+                        return elr_passed(object, name) or elr_passed(index_value, name)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        return elr_passed(left, name) or elr_passed(right, name)
+                    Expr.Unary(operator, operand, unary_pos) | Expr.Paren(operand, unary_pos) | Expr.Move(operand, unary_pos):
+                        return elr_passed(operand, name)
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        return elr_passed(condition, name) or elr_passed(then_value, name) or elr_passed(else_value, name)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return any field in fields where elr_passed(field.value, name) or ident_name_of(field.value) == name
+                    Expr.Array(elements, array_pos):
+                        return any element in elements where elr_passed(element, name) or ident_name_of(element) == name
+                    _:
+                        return false
+
+        # Every expression evaluation: element reads open assumptions, passing a container to a
+        # call stops tracking it.
+        def elr_visit(expression: Ast::Expr, state: mutable ElrState&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index: mutable usize = 0
+                while index < state.containers.count |index, state, expression|:
+                    name: sview = state.containers[index]
+                    if name != "" and elr_passed(expression, name):
+                        elr_forget_local(state, name)
+                    elif name != "" and state.loop_id != 0 and hce_reads_element(expression, name):
+                        open: mutable bool = false
+                        probe: mutable usize = 0
+                        while probe < state.as_name.count |probe, open, state, name|:
+                            open <- true if state.as_name[probe] == name and state.as_loop[probe] == state.loop_id
+                            probe <- probe + 1
+                        if not open:
+                            assumption: usize = state.as_name.count
+                            state.as_name.push(name)
+                            state.as_loop.push(state.loop_id)
+                            state.as_line.push(hce_element_read_line(expression, name))
+                            state.as_reported.push(false)
+                            row: mutable usize = 0
+                            while row < state.row_name.count |row, state, name, assumption|:
+                                if state.row_name[row] == name:
+                                    state.as_row_index.push(assumption)
+                                    state.as_row_root.push(state.row_root[row])
+                                row <- row + 1
+                    index <- index + 1
+
+        # `name.push(value)`: check the open assumptions of NAME, then widen its roots.
+        def elr_push(name: sview, value: Ast::Expr, state: mutable ElrState&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                roots: mutable darray[sview] = []
+                if not elr_roots(value, state, roots):
+                    elr_forget_local(state, name)
+                    return
+                assumption: mutable usize = 0
+                while assumption < state.as_name.count |assumption, state, table, roots| -> table:
+                    if state.as_name[assumption] == name and state.as_loop[assumption] == state.loop_id and state.loop_id != 0 and not state.as_reported[assumption]:
+                        widened: mutable bool = false
+                        for root in roots |widened, state, assumption|:
+                            covered: mutable bool = false
+                            row: mutable usize = 0
+                            while row < state.as_row_index.count |row, covered, state, assumption, root|:
+                                covered <- true if state.as_row_index[row] == assumption and state.as_row_root[row] == root
+                                row <- row + 1
+                            widened <- true if not covered
+                        if widened:
+                            state.as_reported[assumption] <- true
+                            site: Ast::Pos = Ast::expr_pos(value)
+                            printed_line: mutable u32 = state.as_line[assumption]
+                            can Unsafe.PointerCast:
+                                printed_line <- Lexer::source_original_line(state.as_line[assumption])
+                            duplicate: bool = any existing in table.diagnostics where existing.kind == DiagnosticKind.LoopElementReadWidened and existing.pos.line == site.line and existing.pos.column == site.column
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LoopElementReadWidened, name: name, pos: site, line: site.line, expected: "", actual: "", expected_count: printed_line}) if not duplicate
+                    assumption <- assumption + 1
+                for root in roots |state, name|:
+                    present: mutable bool = false
+                    row: mutable usize = 0
+                    while row < state.row_name.count |row, present, state, name, root|:
+                        present <- true if state.row_name[row] == name and state.row_root[row] == root
+                        row <- row + 1
+                    if not present:
+                        state.row_name.push(name)
+                        state.row_root.push(root)
+
+        def elr_scalar_type(head: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return head == "bool" or head == "usize" or head == "isize" or head == "u8" or head == "u16" or head == "u32" or head == "u64" or head == "i8" or head == "i16" or head == "i32" or head == "i64" or head == "f32" or head == "f64" or head == "char"
+
+        def elr_enter_loop(state: mutable ElrState&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                saved: u32 = state.loop_id
+                if state.loop_id == 0:
+                    state.next_loop <- state.next_loop + 1
+                    state.loop_id <- state.next_loop
+                return saved
+
+        def elr_walk(statements: darray[Ast::Stmt], state: mutable ElrState&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |state, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, pos):
+                            elr_visit(value, state)
+                            elr_forget_local(state, name)
+                            stripped: Ast::Expr = oe_strip(type_expression)
+                            roots: mutable darray[sview] = []
+                            if elr_scalar_type(bare_type_name(stripped)):
+                                state.scalars.push(name)
+                            elif elr_roots(value, state, roots):
+                                state.known.push(name)
+                                for root in roots |state, name|:
+                                    state.row_name.push(name)
+                                    state.row_root.push(root)
+                                match value:
+                                    Expr.Array(elements, array_pos):
+                                        state.containers.push(name) if annotation_is_container(stripped) and elr_holds_view(oe_element_type(stripped), state)
+                                    _:
+                                        pass
+                        Stmt.Expr(expression, pos):
+                            elr_visit(expression, state)
+                            match expression:
+                                Expr.Call(callee, arguments, argument_names, call_pos):
+                                    match callee:
+                                        Expr.Field(object, method, method_pos):
+                                            receiver: sview = ident_name_of(object)
+                                            if elr_has(state.containers, receiver):
+                                                if method == "push" and arguments.count == 1:
+                                                    table <- elr_push(receiver, arguments[0], state, table)
+                                                elif method == "extend" or method == "insert" or method == "append":
+                                                    elr_forget_local(state, receiver)
+                                        _:
+                                            pass
+                                _:
+                                    pass
+                        Stmt.Assign(target, operator, value, pos):
+                            elr_visit(value, state)
+                            assigned: sview = ident_name_of(target)
+                            if assigned != "" and not elr_has(state.scalars, assigned):
+                                elr_forget_local(state, assigned)
+                            elif assigned == "":
+                                # A store into a container element or field changes what it holds.
+                                elr_forget_local(state, auto_escape_place_root(target))
+                        Stmt.If(condition, then_body, else_body, pos):
+                            elr_visit(condition, state)
+                            table <- elr_walk(then_body, state, table)
+                            table <- elr_walk(else_body, state, table)
+                        Stmt.Block(kind, clause, binding, block_body, pos):
+                            table <- elr_walk(block_body, state, table)
+                        Stmt.While(condition, while_body, pos):
+                            saved: u32 = elr_enter_loop(state)
+                            elr_visit(condition, state)
+                            table <- elr_walk(while_body, state, table)
+                            state.loop_id <- saved
+                        Stmt.For(bind, variables, iterable, for_body, pos):
+                            elr_visit(iterable, state)
+                            saved: u32 = elr_enter_loop(state)
+                            for variable in variables |state|:
+                                elr_forget_local(state, variable)
+                            elr_forget_local(state, bind) if variables.count == 0
+                            table <- elr_walk(for_body, state, table)
+                            state.loop_id <- saved
+                        Stmt.Match(scrutinee, arms, pos):
+                            elr_visit(scrutinee, state)
+                            for arm in arms |state, table| -> table:
+                                table <- elr_walk(arm.body, state, table)
+                        _:
+                            pass
+
+        def elr_holds_view(element_type: Ast::Expr, state: ElrState&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if ident_name_of(element_type) == "sview"
+                struct_name: sview = bare_type_name(element_type)
+                return struct_name != "" and elr_has(state.view_structs, struct_name)
+
+        def elr_reset(state: mutable ElrState&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                state.params.clear()
+                state.scalars.clear()
+                state.row_name.clear()
+                state.row_root.clear()
+                state.known.clear()
+                state.containers.clear()
+                state.as_name.clear()
+                state.as_loop.clear()
+                state.as_line.clear()
+                state.as_reported.clear()
+                state.as_row_index.clear()
+                state.as_row_root.clear()
+                state.loop_id <- 0
+                state.next_loop <- 0
+
+        def elr_check_declarations(declarations: darray[Ast::Decl], state: mutable ElrState&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |state, table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            elr_reset(state)
+                            for parameter in parameters |state|:
+                                state.params.push(parameter.name)
+                            continue if state.params.count == 0
+                            table <- elr_walk(body, state, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- elr_check_declarations(module_body, state, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- elr_check_declarations(scoped_body, state, table)
+                        _:
+                            pass
+
+    public:
+        def check_loop_element_roots(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                f_struct: mutable darray[sview] = []
+                f_name: mutable darray[sview] = []
+                f_type: mutable darray[Ast::Expr] = []
+                oe_collect_fields(file.top_decls, f_struct, f_name, f_type)
+                state: mutable ElrState = ElrState{params: [], scalars: [], row_name: [], row_root: [], known: [], containers: [], as_name: [], as_loop: [], as_line: [], as_reported: [], as_row_index: [], as_row_root: [], loop_id: 0, next_loop: 0, view_structs: []}
+                position: mutable usize = 0
+                while position < f_struct.count |position, state|:
+                    if ident_name_of(oe_strip(f_type[position])) == "sview" and not elr_has(state.view_structs, f_struct[position]):
+                        state.view_structs.push(f_struct[position])
+                    position <- position + 1
+                table <- elr_check_declarations(file.top_decls, state, table)
