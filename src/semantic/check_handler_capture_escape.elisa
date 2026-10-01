@@ -277,14 +277,16 @@ extend Semantic:
                                 return if parameters.count != effective.count
                                 return if hce_callee_region_bound(parameters, line.line, annotations)
                                 visited: mutable HceMap = HceMap{rows: {}}
-                                return if hce_may_adopt(row, fns, fn_index, visited)
+                                # An adopting callee is untrusted for owner arguments, but a source
+                                # container already holding local views still taints what it fills.
+                                adopting: bool = hce_may_adopt(row, fns, fn_index, visited)
                                 index: mutable usize = 0
                                 while index < effective.count |tainted|:
                                     filled: sview = ident_name_of(oe_strip(effective[index]))
                                     if hce_contains(views, filled) and param_is_mutable_ref(parameters[index]) and annotation_is_container(oe_strip(parameters[index].type_expression)):
                                         other: mutable usize = 0
                                         while other < effective.count |tainted|:
-                                            if other != index and hce_local_derived(effective[other], owners):
+                                            if other != index and ((not adopting and hce_local_derived(effective[other], owners)) or hce_contains(tainted, ident_name_of(oe_strip(effective[other])))):
                                                 tainted.push(filled) if not hce_contains(tainted, filled)
                                             other <- other + 1
                                     index <- index + 1
@@ -293,8 +295,10 @@ extend Semantic:
                     _:
                         pass
 
-        # The position of a value that is an ELEMENT of a tainted container: a loop binder over
-        # one, or `c[i]`; an end_column of 0 when it is not.
+        # The position of a value that carries THIS frame's storage through a local: a loop
+        # binder over a tainted container, `c[i]`, a tainted sview/struct local, or a struct
+        # literal with such a field (reported at its type name, as stage0 does); an end_column of
+        # 0 when it does not. A DIRECT local view (`buf.as_sview()`) is the `in auto:` checker's.
         def hce_tainted_element(value: Ast::Expr, tainted: darray[sview]&, elements: darray[sview]&) -> Ast::Pos:
             can Memory.Allocate, Abort.Panic:
                 none: Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
@@ -305,9 +309,93 @@ extend Semantic:
                         return hce_tainted_element(inner, tainted, elements)
                     Expr.Index(object, index, index_pos):
                         return index_pos if hce_contains(tainted, ident_name_of(object))
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        for field in fields:
+                            field_pos: Ast::Pos = hce_tainted_element(field.value, tainted, elements)
+                            return Ast::expr_pos(type_expression) if field_pos.end_column != 0 or field_pos.line != 0
                     _:
                         pass
                 return none
+
+        def hce_is_tainted(value: Ast::Expr, tainted: darray[sview]&, elements: darray[sview]&, owners: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if hce_local_derived(value, owners)
+                match value:
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        return any field in fields where hce_is_tainted(field.value, tainted, elements, owners)
+                    _:
+                        pass
+                found: Ast::Pos = hce_tainted_element(value, tainted, elements)
+                return found.end_column != 0 or found.line != 0
+
+        # A local frame container named as a source: an owner or a view container that is not a
+        # parameter.
+        def hce_local_container(expression: Ast::Expr, views: darray[sview]&, owners: darray[sview]&, params: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                name: sview = ident_name_of(oe_strip(expression))
+                return (hce_contains(views, name) or hce_contains(owners, name)) and not hce_contains(params, name)
+
+        # stage0 derives a container's element region from its provenance: a comprehension over a
+        # local container, or a call result that received one, inherits that container's LOCAL
+        # region whatever its elements are; a ternary merges its branches; a literal merges its
+        # elements.
+        def hce_derived_tainted(value: Ast::Expr, views: darray[sview]&, owners: darray[sview]&, params: darray[sview]&, tainted: darray[sview]&, elements: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return hce_derived_tainted(inner, views, owners, params, tainted, elements)
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        return hce_derived_tainted(then_expr, views, owners, params, tainted, elements) or hce_derived_tainted(else_expr, views, owners, params, tainted, elements)
+                    Expr.Ident(name, ident_pos):
+                        return hce_contains(tainted, name)
+                    Expr.Comprehension(comp_var, iterable, condition, body, comp_pos):
+                        return hce_local_container(iterable, views, owners, params)
+                    Expr.Array(array_elements, array_pos):
+                        return any element in array_elements where hce_is_tainted(element, tainted, elements, owners)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(receiver, method, method_pos):
+                                return true if hce_local_container(receiver, views, owners, params)
+                            _:
+                                pass
+                        return any argument in arguments where hce_local_container(argument, views, owners, params) or hce_local_derived(argument, owners)
+                    _:
+                        return false
+
+        # `C.push(V)` / `C <- C.push(V)` on a local view container: V's taint flows to C's elements.
+        def hce_record_push(expression: Ast::Expr, views: darray[sview]&, owners: darray[sview]&, params: darray[sview]&, tainted: mutable darray[sview]&, elements: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_pos):
+                        hce_record_push(inner, views, owners, params, tainted, elements)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Field(object, method, method_pos):
+                                return if method != "push" or arguments.count != 1
+                                name: sview = ident_name_of(object)
+                                return if not hce_contains(views, name) or hce_contains(params, name) or hce_contains(tainted, name)
+                                tainted.push(name) if hce_is_tainted(arguments[0], tainted, elements, owners)
+                            _:
+                                pass
+                    _:
+                        pass
+
+        # Blank every row naming NAME (an empty name never matches hce_contains).
+        def hce_forget(names: mutable darray[sview]&, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                position: mutable usize = 0
+                while position < names.count |names, position|:
+                    names[position] <- "" if names[position] == name
+                    position <- position + 1
+
+        def hce_is_construct(value: Ast::Expr) -> bool:
+            match value:
+                Expr.Construct(type_expression, fields, construct_pos):
+                    return true
+                Expr.Paren(inner, paren_pos):
+                    return hce_is_construct(inner)
+                _:
+                    return false
 
         def hce_report(line: u32, pos: Ast::Pos, parameter: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -339,7 +427,13 @@ extend Semantic:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, pos):
                             hce_record_fill(value, views, owners, tainted, fns, fn_index, annotations)
+                            hce_record_push(value, views, owners, params, tainted, elements)
                             table <- hce_check_push(value, pos.line, params, locals, tainted, elements, table)
+                            # A redeclaration starts clean (shadowing is legal).
+                            hce_forget(tainted, name)
+                            hce_forget(elements, name)
+                            derived: bool = hce_derived_tainted(value, views, owners, params, tainted, elements)
+                            value_tainted: bool = hce_is_tainted(value, tainted, elements, owners)
                             locals.push(name)
                             annotated: bool = any annotation in annotations where annotation.name == name and annotation.line == pos.line and annotation.region != "" and not sview_starts_with(annotation.region, "__")
                             stripped: Ast::Expr = oe_strip(type_expression)
@@ -348,18 +442,30 @@ extend Semantic:
                                 element_type: Ast::Expr = oe_element_type(stripped)
                                 if annotation_is_container(stripped) and hce_element_holds_view(element_type, f_struct, f_name, f_type):
                                     views.push(name)
+                                    tainted.push(name) if derived
+                                elif not annotation_is_container(stripped) and value_tainted and (head == "sview" or hce_element_holds_view(stripped, f_struct, f_name, f_type)):
+                                    elements.push(name)
                                 owning_darray: bool = annotation_is_container(stripped) and ident_name_of(element_type) != "sview" and (ident_name_of(element_type) == "u8" or not annotation_is_scalar_darray(stripped))
                                 owners.push(name) if owning_darray or head == "dstr"
                         Stmt.Expr(expression, pos):
                             hce_record_fill(expression, views, owners, tainted, fns, fn_index, annotations)
+                            hce_record_push(expression, views, owners, params, tainted, elements)
                             table <- hce_check_push(expression, pos.line, params, locals, tainted, elements, table)
                         Stmt.Assign(target, operator, value, pos):
                             hce_record_fill(value, views, owners, tainted, fns, fn_index, annotations)
+                            hce_record_push(value, views, owners, params, tainted, elements)
                             table <- hce_check_push(value, pos.line, params, locals, tainted, elements, table)
+                            assigned: sview = ident_name_of(target)
+                            if operator == TokenKind.LArrow and assigned != "" and hce_contains(locals, assigned) and not hce_contains(params, assigned):
+                                if hce_contains(views, assigned):
+                                    tainted.push(assigned) if not hce_contains(tainted, assigned) and hce_derived_tainted(value, views, owners, params, tainted, elements)
+                                elif not hce_contains(elements, assigned) and hce_is_tainted(value, tainted, elements, owners):
+                                    elements.push(assigned)
                             if operator == TokenKind.LArrow:
                                 root: sview = auto_escape_place_root(target)
                                 element_pos: Ast::Pos = hce_tainted_element(value, tainted, elements)
-                                if ident_name_of(target) == "" and hce_contains(params, root) and not hce_contains(locals, root) and (element_pos.end_column != 0 or element_pos.line != 0):
+                                # stage0 checks `P[i] <- Struct{...}` by the literal, not its fields.
+                                if not hce_is_construct(value) and ident_name_of(target) == "" and hce_contains(params, root) and not hce_contains(locals, root) and (element_pos.end_column != 0 or element_pos.line != 0):
                                     table <- hce_report(pos.line, element_pos, root, table)
                         Stmt.For(bind, variables, iterable, for_body, pos):
                             loop_var: sview = variables[0] if variables.count == 1 else (bind if variables.count == 0 else "")
