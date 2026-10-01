@@ -15,8 +15,9 @@
 #   2. every accepted/*.elisa (and handler_capture_local_escape.pos.elisa) is accepted by both
 #      and both write a non-empty object.
 #
-# Known, deliberately not covered: a VOID callee that may adopt storage from an OWNER (stage1
-# drops tracking; a tainted source container still taints) and hc1p (stage0 lmut-alias rule).
+# A callee that may adopt (a void grower) still taints the filled container from a local
+# owner argument, as stage0 merges every argument's element state (pr2/void2).
+# Known, deliberately not covered: hc1p (stage0 lmut-alias rule).
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
