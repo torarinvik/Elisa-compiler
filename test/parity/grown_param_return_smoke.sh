@@ -11,9 +11,12 @@
 #   2. accepted/*.elisa: both accept with a non-empty object.
 #
 # Not covered (stage1 deliberately stricter, pinned by sview_region_tie_smoke): returning a
-# field borrow of an UNgrown by-ref param, which stage0 accepts. Also not covered: a
-# conditional alias (`v = p.name if c else "x"`), which stage0 rejects under its separate
-# scope-owned-region rule.
+# field borrow of an UNgrown by-ref param, which stage0 accepts.
+#
+# A CONDITIONAL alias (`v: sview = p.name if c else "x"`, `v <- ... if c else ...`, or an
+# alias of one) returned by name gets stage0's "value backed by scope-owned region
+# __rg_<param>" text instead (cond_alias_*). Returning the conditional directly, or a plain
+# `v <- p.name` reassignment, is accepted, as in stage0.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

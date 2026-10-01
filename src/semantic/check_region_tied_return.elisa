@@ -449,27 +449,62 @@ extend Semantic:
 
         # Locals bound (unconditionally) to a borrow of a grown param: `v: sview =
         # table.text.as_sview()`. A conditional initializer is a different stage0 rule.
-        def rtr_grown_aliases(statements: darray[Ast::Stmt], grown: darray[sview]&, alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&) -> void:
+        # Records NAME as an alias of a grown param when VALUE borrows one (directly or through
+        # an earlier alias). A conditional value (`p.name if c else "x"`) or an alias of a
+        # conditional alias is also listed in `cond_aliases`.
+        def rtr_note_alias(name: sview, value: Ast::Expr, grown: darray[sview]&, alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&, cond_aliases: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |alias_names, alias_roots|:
+                root: mutable sview = sview("", 0, 0)
+                conditional: mutable bool = false
+                match value:
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        root <- rtr_grown_return_root(then_value, grown, alias_names, alias_roots)
+                        root <- rtr_grown_return_root(else_value, grown, alias_names, alias_roots) if root == ""
+                        conditional <- true
+                    Expr.Paren(inner, paren_pos):
+                        rtr_note_alias(name, inner, grown, alias_names, alias_roots, cond_aliases)
+                        return
+                    _:
+                        root <- rtr_grown_return_root(value, grown, alias_names, alias_roots)
+                        source: sview = rtr_borrow_root(value)
+                        conditional <- any c in cond_aliases where c == source
+                return if root == ""
+                alias_names.push(name)
+                alias_roots.push(root)
+                cond_aliases.push(name) if conditional
+
+        # stage0 tracks a `<-` reassignment only for a conditional value; a plain `v <- p.name`
+        # leaves the binding untied.
+        def rtr_is_conditional(value: Ast::Expr) -> bool:
+            match value:
+                Expr.If(condition, then_value, else_value, if_pos):
+                    return true
+                Expr.Paren(inner, paren_pos):
+                    return rtr_is_conditional(inner)
+                _:
+                    return false
+
+        def rtr_grown_aliases(statements: darray[Ast::Stmt], grown: darray[sview]&, alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&, cond_aliases: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |alias_names, alias_roots, cond_aliases|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            root: sview = rtr_borrow_root(value)
-                            if root != "" and any g in grown where g == root:
-                                alias_names.push(name)
-                                alias_roots.push(root)
+                            rtr_note_alias(name, value, grown, alias_names, alias_roots, cond_aliases)
+                        Stmt.Assign(target, operator, value, line):
+                            assigned: sview = ident_name_of(target)
+                            rtr_note_alias(assigned, value, grown, alias_names, alias_roots, cond_aliases) if operator == TokenKind.LArrow and assigned != "" and rtr_is_conditional(value)
                         Stmt.If(condition, then_body, else_body, line):
-                            rtr_grown_aliases(then_body, grown, alias_names, alias_roots)
-                            rtr_grown_aliases(else_body, grown, alias_names, alias_roots)
+                            rtr_grown_aliases(then_body, grown, alias_names, alias_roots, cond_aliases)
+                            rtr_grown_aliases(else_body, grown, alias_names, alias_roots, cond_aliases)
                         Stmt.While(condition, body, line):
-                            rtr_grown_aliases(body, grown, alias_names, alias_roots)
+                            rtr_grown_aliases(body, grown, alias_names, alias_roots, cond_aliases)
                         Stmt.For(bind, variables, iterable, body, line):
-                            rtr_grown_aliases(body, grown, alias_names, alias_roots)
+                            rtr_grown_aliases(body, grown, alias_names, alias_roots, cond_aliases)
                         Stmt.Block(kind, clause, binding, body, line):
-                            rtr_grown_aliases(body, grown, alias_names, alias_roots)
+                            rtr_grown_aliases(body, grown, alias_names, alias_roots, cond_aliases)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |alias_names, alias_roots|:
-                                rtr_grown_aliases(arm.body, grown, alias_names, alias_roots)
+                            for arm in arms |alias_names, alias_roots, cond_aliases|:
+                                rtr_grown_aliases(arm.body, grown, alias_names, alias_roots, cond_aliases)
                         _:
                             pass
 
@@ -508,22 +543,26 @@ extend Semantic:
 
 
         # Report a return tied to a grown param; true when it was handled here.
-        def rtr_check_grown_return(returned: Ast::Expr, line: u32, grown: darray[sview]&, alias_names: darray[sview]&, alias_roots: darray[sview]&, view_return: bool, table: lmut SymbolTable) -> bool:
+        def rtr_check_grown_return(returned: Ast::Expr, line: u32, grown: darray[sview]&, alias_names: darray[sview]&, alias_roots: darray[sview]&, cond_aliases: darray[sview]&, view_return: bool, table: lmut SymbolTable) -> bool:
             can Memory.Allocate, Abort.Panic:
                 root: sview = rtr_grown_return_root(returned, grown, alias_names, alias_roots)
                 false return if root == ""
                 true return if view_return and grown.count == 1 and rtr_is_view_slice_of(returned, root)
+                returned_name: sview = rtr_borrow_root(returned)
+                if any c in cond_aliases where c == returned_name:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ScopeOwnedRegionReturnEscape, name: root, pos: Ast::expr_pos(returned), line: line, expected: "", actual: ""})
+                    return true
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamInferenceFailure, name: root, pos: Ast::expr_pos(returned), line: line, expected: "", actual: ""})
                 return true
 
 
-        def rtr_check_returns(statements: darray[Ast::Stmt], ref_params: darray[sview]&, param_regions: darray[sview]&, return_region: sview, stored_targets: darray[sview]&, stored_sources: darray[sview]&, grown: darray[sview]&, alias_names: darray[sview]&, alias_roots: darray[sview]&, view_return: bool, table: lmut SymbolTable) -> void:
+        def rtr_check_returns(statements: darray[Ast::Stmt], ref_params: darray[sview]&, param_regions: darray[sview]&, return_region: sview, stored_targets: darray[sview]&, stored_sources: darray[sview]&, grown: darray[sview]&, alias_names: darray[sview]&, alias_roots: darray[sview]&, cond_aliases: darray[sview]&, view_return: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Return(value, line):
                             if value is returned:
-                                rebind handled_grown: bool, table = rtr_check_grown_return(returned, line.line, grown, alias_names, alias_roots, view_return, table)
+                                rebind handled_grown: bool, table = rtr_check_grown_return(returned, line.line, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                                 continue if handled_grown
                                 root: sview = rtr_return_root(returned, ref_params, true)
                                 if root != "":
@@ -553,17 +592,17 @@ extend Semantic:
                                     continue if source_region != "" and source_region == return_region
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionTiedReturn, name: returned_root, line: line.line, expected: source_region, actual: ""})
                         Stmt.If(condition, then_body, else_body, if_line):
-                            table <- rtr_check_returns(then_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
-                            table <- rtr_check_returns(else_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
+                            table <- rtr_check_returns(then_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
+                            table <- rtr_check_returns(else_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                         Stmt.While(condition, while_body, while_line):
-                            table <- rtr_check_returns(while_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
+                            table <- rtr_check_returns(while_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
-                            table <- rtr_check_returns(for_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
+                            table <- rtr_check_returns(for_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            table <- rtr_check_returns(block_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
+                            table <- rtr_check_returns(block_body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                         Stmt.Match(scrutinee, arms, match_line):
                             for arm in arms |table| -> table:
-                                table <- rtr_check_returns(arm.body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
+                                table <- rtr_check_returns(arm.body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                         _:
                             pass
 
@@ -613,7 +652,8 @@ extend Semantic:
                             rtr_grown_statements(body, candidates, grown) if candidates.count > 0
                             alias_names: mutable darray[sview] = []
                             alias_roots: mutable darray[sview] = []
-                            rtr_grown_aliases(body, grown, alias_names, alias_roots) if grown.count > 0
+                            cond_aliases: mutable darray[sview] = []
+                            rtr_grown_aliases(body, grown, alias_names, alias_roots, cond_aliases) if grown.count > 0
                             view_return: mutable bool = false
                             if return_type is view_return_type:
                                 view_return <- rtr_type_is_view_family(view_return_type)
@@ -621,7 +661,7 @@ extend Semantic:
                                 stored_targets: mutable darray[sview] = []
                                 stored_sources: mutable darray[sview] = []
                                 rtr_collect_stored_borrows_statements(body, parameters, ref_params, stored_targets, stored_sources)
-                                table <- rtr_check_returns(body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, view_return, table)
+                                table <- rtr_check_returns(body, ref_params, param_regions, return_region, stored_targets, stored_sources, grown, alias_names, alias_roots, cond_aliases, view_return, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- rtr_walk(module_body, annotations, runtime_std, table)
                         Decl.Scoped(scoped_body, scoped_line):
