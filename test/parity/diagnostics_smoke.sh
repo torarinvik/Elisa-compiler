@@ -919,6 +919,15 @@ for lfb_line in 16 18 20 22 23 25 27 29 32; do
 done
 run_case lmut_field_builtin_mutation neg "$lfb_neg" "must be a reassignment"
 
+# Nested bodies have no contract prologue: stage0 rejects every `requires`/`ensure`
+# inside a block/if/loop/match arm, so wrapping one in `can E:` must not hide it.
+cnn_pos="$FIXTURES/contract_not_first_nested.pos.elisa"
+cnn_neg="$FIXTURES/contract_not_first_nested.neg.elisa"
+for cnn_line in 5 9 13 18 24 30; do
+    run_case contract_not_first_nested pos "$cnn_pos" "L$cnn_line \`requires\`/\`ensure\` contracts must be the first statements of the function body"
+done
+run_case contract_not_first_nested neg "$cnn_neg" "must be the first statements"
+
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then
