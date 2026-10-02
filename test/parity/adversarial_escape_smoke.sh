@@ -31,6 +31,15 @@
 #                                copy (`P{storage: b, lines: b}`, run-proven stale read), so
 #                                growing either still invalidates
 #   field_viewed_* / root_replace growing or replacing `p.storage`, or replacing `p`
+# Round 5 (call-derived views; callee return-origin summaries, view returns only):
+#   call_*_return                a local view returned through an identity/generic/protocol
+#                                callee (`return id(local_view)`)
+#   call_*_view_grow             a view obtained through a method/generic/protocol/field call,
+#                                read after its source grows; spawn args likewise
+#   comprehension/match_value    views carried through a comprehension body or match arm value
+#   darray_elem_*_alias          `P{lines: shared}` / `lines: darray[i8] = shared` with a
+#                                differently-typed scalar darray: two element types, one buffer
+#   call_field_view_sibling_grow.pos  a call-derived view of h.buf survives h.marks.push
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u

@@ -48,6 +48,12 @@ extend Semantic:
                         return ""
             return ""
 
+        def storage_view_root_is_param(root: sview, alias_names: darray[sview]&, alias_sources: darray[sview]&) -> bool:
+            can Abort.Panic:
+                for index in 0..<alias_names.count |root, alias_names, alias_sources|:
+                    return true if alias_names[index] == "[param]" and index < alias_sources.count and alias_sources[index] == root
+                return false
+
         def storage_view_push_source(source: sview, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 out.push(source) if source != "" and source != "[held]" and not any existing in out where existing == source
@@ -152,6 +158,8 @@ extend Semantic:
                             for entry in entries |pending|:
                                 pending.push(entry.key)
                                 pending.push(entry.value)
+                        Expr.Comprehension(variable, iterable, condition, body, line):
+                            pending.push(body)
                         Expr.Construct(type_expression, fields, line):
                             for field in fields |pending|:
                                 pending.push(field.value)
@@ -173,8 +181,9 @@ extend Semantic:
                 # dependency too. Retain old rows conservatively for uncertain control flow.
                 if sources.count == 0 and any existing in alias_names where existing == name:
                     storage_view_append_value_sources(value, alias_names, alias_sources, alias_is_view, view_fns, sources)
-                for source in sources |alias_names, alias_sources, alias_is_view, name, value|:
-                    origin: sview = storage_view_field_origin(value, source, alias_names)
+                origin_value: Ast::Expr = storage_view_call_field_value(value, view_fns)
+                for source in sources |alias_names, alias_sources, alias_is_view, name, value, origin_value|:
+                    origin: sview = storage_view_field_origin(origin_value, source, alias_names)
                     if origin != "" and origin != "[bare]":
                         alias_names.push("[field]")
                         alias_sources.push(origin)
@@ -244,8 +253,9 @@ extend Semantic:
                 captures_storage: bool = value is Expr.Lambda(_, _, _) and sources.count > 0
                 # An enum value whose payload holds a view carries that view's borrow.
                 payload_view: bool = storage_view_is_enum_construct(value) and sources.count > 0
-                for source in sources |alias_names, alias_sources, alias_is_view, name, value|:
-                    origin: sview = storage_view_field_origin(value, source, alias_names)
+                origin_value: Ast::Expr = storage_view_call_field_value(value, view_fns)
+                for source in sources |alias_names, alias_sources, alias_is_view, name, value, origin_value|:
+                    origin: sview = storage_view_field_origin(origin_value, source, alias_names)
                     if origin != "" and origin != "[bare]":
                         alias_names.push("[field]")
                         alias_sources.push(origin)
@@ -643,6 +653,59 @@ extend Semantic:
                     _:
                         pass
 
+        # The call's sources through the callee's return-origin rows: an "into" origin depends on
+        # the argument place itself, a "carry" origin on what the argument already borrows, and
+        # a thread handle on every argument. Receiver form `h.name()` passes `h` as parameter 0;
+        # the static form `T.name(x)` passes no receiver. Unknown or unsummarised: no sources.
+        def storage_view_call_origin_sources(callee: Ast::Expr, arguments: darray[Ast::Expr]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, view_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                name: mutable sview = ident_name_of(callee)
+                receiver: mutable Ast::Expr = Ast::Expr.Absent
+                shift: mutable usize = 0
+                if name == "":
+                    match callee:
+                        Expr.Field(object, method, field_line):
+                            if vro_status(view_fns, method, arguments.count + 1) != 0:
+                                name <- method
+                                receiver <- object
+                                shift <- 1
+                            elif vro_status(view_fns, method, arguments.count) != 0:
+                                name <- method
+                        _:
+                            pass
+                arity: usize = arguments.count + shift
+                return if vro_status(view_fns, name, arity) != 1
+                arity_tag: sview = vro_tag(arity)
+                while row + 4 < view_fns.count |row: usize = 0, alias_names, alias_sources, alias_is_view, out|:
+                    if view_fns[row] == name and view_fns[row + 1] == arity_tag:
+                        mode: sview = view_fns[row + 3]
+                        if mode == "thread":
+                            storage_view_collect_sources(receiver, alias_names, alias_sources, alias_is_view, view_fns, out) if shift == 1
+                            for argument in arguments |alias_names, alias_sources, alias_is_view, out|:
+                                storage_view_collect_sources(argument, alias_names, alias_sources, alias_is_view, view_fns, out)
+                        elif mode == "into" or mode == "carry":
+                            position: mutable usize = 16
+                            for candidate in 0..<16 |position, view_fns, row|:
+                                position <- candidate if vro_tag(candidate) == view_fns[row + 2]
+                            if position < arity:
+                                plain_argument: Ast::Expr = receiver if shift == 1 and position == 0 else arguments[position - shift]
+                                # A view a callee derives from a borrowed PARAMETER's storage is not
+                                # tracked: the caller owns that buffer and routinely reserves it up
+                                # front (the parser's name arenas), which this walk cannot see, and
+                                # stage0 does not trace callee view origins at all. Locals stay tracked.
+                                argument_root: sview = storage_view_place_root(plain_argument)
+                                # `return bytes_view_range(p.buf, ..)` views FIELD buf of the argument:
+                                # key it on that field so a sibling's growth stays harmless.
+                                field_name: sview = view_fns[row + 4]
+                                argument: Ast::Expr = Ast::Expr.Field(vro_strip_borrow(plain_argument), field_name, Ast::expr_pos(plain_argument)) if field_name != "" else plain_argument
+                                if argument_root != "" and storage_view_root_is_param(argument_root, alias_names, alias_sources):
+                                    pass
+                                elif mode == "into":
+                                    storage_view_sources_from_argument(argument, alias_names, alias_sources, alias_is_view, view_fns, out)
+                                else:
+                                    storage_view_collect_sources(argument, alias_names, alias_sources, alias_is_view, view_fns, out)
+                    row <- row + vro_row()
+
         def storage_view_collect_sources(expression: Ast::Expr, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, view_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -685,6 +748,12 @@ extend Semantic:
                                 storage_view_sources_from_argument(receiver, alias_names, alias_sources, alias_is_view, view_fns, out) if is_view_method
                             _:
                                 pass
+                        # A user function whose result borrows from its parameters (stage0
+                        # storageViewDependencyForUserCall): see view_return_origins.elisa.
+                        storage_view_call_origin_sources(callee, arguments, alias_names, alias_sources, alias_is_view, view_fns, out) if not returns_view and not enum_variant_callee(callee)
+                    Expr.Comprehension(variable, iterable, condition, body, line):
+                        # Every element is a value of BODY: `[buf.as_sview() for i in r]` holds views of buf.
+                        storage_view_collect_sources(body, alias_names, alias_sources, alias_is_view, view_fns, out)
                     Expr.Slice(object, start, end, line):
                         storage_view_sources_from_argument(object, alias_names, alias_sources, alias_is_view, view_fns, out)
                     Expr.Field(object, field, line) | Expr.Index(object, index, line) | Expr.IndexN(object, indices, line):
@@ -714,6 +783,13 @@ extend Semantic:
                         for arm in arms |alias_names, alias_sources, alias_is_view, view_fns, out|:
                             for statement in arm.body |alias_names, alias_sources, alias_is_view, view_fns|:
                                 storage_view_collect_statement(statement, alias_names, alias_sources, alias_is_view, view_fns)
+                            # The arm's value is its trailing expression (`v: sview = match n: 1: buf.as_sview()`).
+                            if arm.body.count > 0:
+                                match arm.body[arm.body.count - 1]:
+                                    Stmt.Expr(arm_value, arm_value_line):
+                                        storage_view_collect_sources(arm_value, alias_names, alias_sources, alias_is_view, view_fns, out)
+                                    _:
+                                        pass
                     Expr.Catch(guarded, arms, line):
                         storage_view_collect_sources(guarded, alias_names, alias_sources, alias_is_view, view_fns, out)
                         for arm in arms |alias_names, alias_sources, alias_is_view, view_fns, out|:
@@ -800,6 +876,25 @@ extend Semantic:
         # The single field through which VALUE mentions ROOT: "" when it never does, "[bare]"
         # when it mentions ROOT whole, through two different fields, through a known alias, or
         # in a shape this walk does not model.
+        # A summarised call whose result views exactly one argument THROUGH a field
+        # (`name(&h)` returning `bytes_view_range(self.buf, ..)`) is spelled as that field path
+        # (`h.buf`) for field-origin keying, so growing a sibling field keeps the view.
+        def storage_view_call_field_value(value: Ast::Expr, view_fns: darray[sview]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return storage_view_call_field_value(inner, view_fns)
+                    Expr.Call(callee, arguments, _, _):
+                        into_arguments: darray[Ast::Expr] = vro_origin_arguments(callee, arguments, view_fns, false)
+                        carry_arguments: darray[Ast::Expr] = vro_origin_arguments(callee, arguments, view_fns, true)
+                        value return if into_arguments.count + carry_arguments.count != 1
+                        fields: darray[sview] = vro_origin_fields(callee, arguments, view_fns, into_arguments.count == 0)
+                        value return if fields.count != 1 or fields[0] == ""
+                        argument: Ast::Expr = into_arguments[0] if into_arguments.count == 1 else carry_arguments[0]
+                        return Ast::Expr.Field(vro_strip_borrow(argument), fields[0], Ast::expr_pos(argument))
+                    _:
+                        return value
+
         def storage_view_field_origin(value: Ast::Expr, root: sview, alias_names: darray[sview]&) -> sview:
             can Memory.Allocate, Abort.Panic:
                 match value:
@@ -862,7 +957,7 @@ extend Semantic:
                                 out.push(elem)
 
         # The element of a `darray[E]` field type when E is a builtin scalar/string type or a
-        # declared struct, else "". Named rows key on their last `::` segment, so two structs
+        # declared struct or non-generic enum, else "". Named rows key on their last `::` segment, so two structs
         # sharing a name compare equal: a collision only costs precision.
         def storage_view_concrete_darray_elem(type_id: u32, table: SymbolTable&) -> sview:
             can Abort.Panic:
@@ -876,6 +971,10 @@ extend Semantic:
                 return "" if kind != SemTypeKind.Named
                 name: sview = storage_view_last_segment(interned_name(elem, table))
                 return name if name != "" and any owner in table.struct_field_owner where storage_view_last_segment(owner) == name
+                # A non-generic declared enum is as concrete as a struct: a darray of it can never
+                # share a buffer with a darray[u8] (stage0 storageViewConcreteElemKey).
+                return "" if name == "" or interned_elem_count(elem, table) != 0
+                return name if any owner in table.enum_variant_owner where storage_view_last_segment(owner) == name
                 return ""
 
         def storage_view_last_segment(name: sview) -> sview:
@@ -1717,6 +1816,12 @@ extend Semantic:
                             exit_marks_by: mutable darray[sview] = []
                             replace_names: mutable darray[sview] = []
                             other_names: mutable darray[sview] = []
+                            # ("[param]", name) marker rows: a call-derived view whose origin is a
+                            # borrowed PARAMETER is not tracked (see storage_view_call_origin_sources).
+                            for param in params |alias_names, alias_sources, alias_is_view|:
+                                alias_names.push("[param]")
+                                alias_sources.push(param.name)
+                                alias_is_view.push(false)
                             for param in params |replace_names, other_names|:
                                 if not param.is_mutable and storage_view_type_is_replaceable(param.type_expression, true):
                                     replace_names.push(param.name)
@@ -1748,5 +1853,5 @@ extend Semantic:
     public:
         def check_region_storage_stability(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                view_fns: mutable darray[sview] = []
+                view_fns: darray[sview] = view_return_origin_rows(file)
                 table <- check_region_storage_stability_declarations(file.top_decls, file.local_region_annotations, view_fns, table)
