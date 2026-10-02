@@ -1101,6 +1101,11 @@ extend Semantic:
                     return invalidated_alias_in_expression(else_value, invalidated)
                 Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
                     return invalidated_alias_in_arguments(elements, invalidated)
+                # `submit f(v)` / `await t` parse as a statement-less value block around the
+                # operand; without this arm a stale view handed to a task was never seen.
+                Expr.Block(block_statements, block_value, block_captures, line):
+                    return invalidated_alias_in_expression(block_value, invalidated) if block_statements.count == 0
+                    return ""
                 _:
                     return ""
 
@@ -1701,6 +1706,44 @@ extend Semantic:
                         if found_pos.count > 0 and not storage_view_already_reported(probe[0], found_line[0], table):
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StorageDependencyInvalidated, name: probe[0], pos: found_pos[0], line: found_line[0], expected: by, actual: ""})
 
+        # The task operands submitted anywhere inside a `nursery:`/`pool:` body. `submit f(v)`
+        # parses as a statement-less value block around the call (so does `await t`, whose
+        # operand is a task handle rather than a view, so including it cannot add a report).
+        def storage_view_collect_submits(statements: darray[Ast::Stmt]&, out: mutable darray[Ast::Expr]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out, out_lines|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            storage_view_collect_submit_expr(expression, line.line, out, out_lines)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            storage_view_collect_submit_expr(value, line.line, out, out_lines)
+                        Stmt.Assign(target, operator, value, line):
+                            storage_view_collect_submit_expr(value, line.line, out, out_lines)
+                        Stmt.If(condition, then_body, else_body, line):
+                            storage_view_collect_submits(then_body, out, out_lines)
+                            storage_view_collect_submits(else_body, out, out_lines)
+                        Stmt.While(condition, while_body, line):
+                            storage_view_collect_submits(while_body, out, out_lines)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            storage_view_collect_submits(for_body, out, out_lines)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out, out_lines|:
+                                storage_view_collect_submits(arm.body, out, out_lines)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            storage_view_collect_submits(body, out, out_lines)
+                        _:
+                            pass
+
+        def storage_view_collect_submit_expr(expression: Ast::Expr, line: u32, out: mutable darray[Ast::Expr]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Block(block_statements, block_value, block_captures, block_line):
+                        if block_statements.count == 0:
+                            out.push(block_value)
+                            out_lines.push(line)
+                    _:
+                        pass
+
         def walk_region_storage_stability(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview]&, replace_names: darray[sview]&, value_names: darray[sview]&, field_elems: darray[sview]&, field_views: darray[sview]&, field_view_heads: darray[Ast::Expr]&, stable_regions: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&, exit_marks: mutable darray[sview]&, exit_marks_by: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 loop_entry: mutable darray[sview] = []
@@ -1720,6 +1763,18 @@ extend Semantic:
                             stable_region <- clause[0] if stable_region == "" and has_stable_backing and clause.count > 0
                             stable_regions.push(stable_region) if stable_region != "" and has_stable_backing and not destroyed_region_contains(stable_regions, stable_region)
                             table <- walk_region_storage_stability(body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
+                            # A view handed to a task stays live until the nursery/pool joins, so
+                            # growing its backing anywhere later in the body (even after the
+                            # submit) races the worker's read. Re-check every submitted operand
+                            # against the state at the join and report at the submit site
+                            # (stage0 analyzePoolStmt JoinedViews).
+                            if kind == "nursery" or kind == "pool":
+                                submitted: mutable darray[Ast::Expr] = []
+                                submitted_lines: mutable darray[u32] = []
+                                storage_view_collect_submits(body, submitted, submitted_lines)
+                                for submit_index in 0..<submitted.count |table, submitted, submitted_lines|:
+                                    stale: sview = invalidated_alias_in_expression(submitted[submit_index], invalidated)
+                                    table <- diagnose_invalidated_alias(submitted[submit_index], invalidated, invalidated_by, submitted_lines[submit_index], table) if stale != "" and not storage_view_already_reported(stale, submitted_lines[submit_index], table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
                             invalidate_growth_aliases(growth_call_target(value), growth_call_target_field(value), field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)

@@ -42,6 +42,14 @@
 #   call_field_view_sibling_grow.pos  a call-derived view of h.buf survives h.marks.push
 #   darray_elem_call_*           a `darray[u8]` local passed to a `darray[i8]` / `darray[i8]&` /
 #                                `mutable darray[u64]&` parameter (generic and same-type twins pass)
+# Round 6 (walkers that skipped block bodies; nursery joins; region names):
+#   borrow_after_move_in_*_block a borrow read after its owner moved inside `can`/`region`/
+#                                `trusted` (bam_statements had no Block arm)
+#   fresh_shape_argument_in_can_block  the fresh-shape call check inside a `can` block
+#   nursery_submit_*             a view handed to `submit` whose backing grows before the
+#                                submit, or anywhere in the nursery body before the join
+#   same_name_nested_region_*    `region scratch:` inside `region scratch:` (run-proven stale
+#                                read); sibling regions may still share a name
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u
