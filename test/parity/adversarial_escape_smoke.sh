@@ -40,6 +40,8 @@
 #   darray_elem_*_alias          `P{lines: shared}` / `lines: darray[i8] = shared` with a
 #                                differently-typed scalar darray: two element types, one buffer
 #   call_field_view_sibling_grow.pos  a call-derived view of h.buf survives h.marks.push
+#   darray_elem_call_*           a `darray[u8]` local passed to a `darray[i8]` / `darray[i8]&` /
+#                                `mutable darray[u64]&` parameter (generic and same-type twins pass)
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u
