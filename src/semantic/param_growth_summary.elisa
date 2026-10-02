@@ -1,0 +1,394 @@
+# Which fields of a `mutable T&` parameter a user function may grow, relocate or replace.
+# A call `parser.resource_handle_name(...)` passes the whole parser, so the call site used
+# to treat EVERY buffer reachable from it as relocated -- a view of `parser.source` died
+# although the callee only grows `parser.module_name_storage`. The summary lets the call
+# site invalidate exactly the fields the callee (transitively) grows.
+#
+# Rows are flat triples (function, position, field):
+#   field "[k]" -- the parameter was summarised (a marker; it may grow nothing);
+#   field ""    -- the parameter may be grown as a WHOLE (every buffer under it);
+#   field f     -- the callee may grow / relocate / replace the buffer under `param.f`.
+# Every use of the parameter that cannot be classified counts as the WHOLE struct: passed
+# to an unknown call, bound to a ref, captured by a lambda or block clause, or an
+# unmatched statement / expression kind. Each darray buffer generation is its own lifetime:
+# a field that is pushed, reassigned, cleared or handed out mutably counts as grown.
+# Same-named functions are UNIONED (name-only resolution). The summary is the LEAST
+# fixpoint: every summarised parameter starts at "grows nothing" and rounds add fields
+# until no row changes. If it does not converge, no summary is published and every call
+# keeps the whole-root behaviour.
+extend Semantic:
+    private:
+        def pgs_row() -> usize:
+            return 3
+
+        def pgs_read_method(name: sview) -> bool:
+            return name in {"count", "len", "as_sview", "contains", "is_empty", "starts_with", "ends_with", "find", "index_of", "eq", "equals", "hash"}
+
+        def pgs_push(field: sview, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for existing in out |field|:
+                    return if existing == field
+                out.push(field)
+
+        # The first field after PARAM in a place rooted at it (`p.names[i].x` -> "names");
+        # "" when the place is PARAM itself or reaches a field only through an index.
+        def pgs_top_field(expression: Ast::Expr, param: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, _):
+                        match object:
+                            Expr.Ident(name, _):
+                                return field if name == param else ""
+                            _:
+                                return pgs_top_field(object, param)
+                    Expr.Index(object, _, _) | Expr.IndexN(object, _, _) | Expr.Slice(object, _, _, _):
+                        return pgs_top_field(object, param)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.Unary(TokenKind.Ampersand, inner, _):
+                        return pgs_top_field(inner, param)
+                    _:
+                        return ""
+
+        # Whether EXPRESSION is exactly PARAM (through parens / `&` / move).
+        def pgs_is_bare(expression: Ast::Expr, param: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name == param
+                    Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.Unary(TokenKind.Ampersand, inner, _):
+                        return pgs_is_bare(inner, param)
+                    _:
+                        return false
+
+        # A PARAM-rooted place in a growing context: its top field, or the whole parameter.
+        def pgs_place_grows(expression: Ast::Expr, param: sview, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pgs_push(pgs_top_field(expression, param), out)
+
+        # Index sub-expressions inside a place are read.
+        def pgs_place_indices(expression: Ast::Expr, param: sview, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, _, _):
+                        pgs_place_indices(object, param, prior, table, out)
+                    Expr.Index(object, index, _):
+                        pgs_place_indices(object, param, prior, table, out)
+                        pgs_expr(index, param, false, false, prior, table, out)
+                    Expr.IndexN(object, arguments, _):
+                        pgs_place_indices(object, param, prior, table, out)
+                        for argument in arguments |param, prior, table, out|:
+                            pgs_expr(argument, param, false, false, prior, table, out)
+                    Expr.Slice(object, low, high, _):
+                        pgs_place_indices(object, param, prior, table, out)
+                        pgs_expr(low, param, false, false, prior, table, out)
+                        pgs_expr(high, param, false, false, prior, table, out)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.Unary(TokenKind.Ampersand, inner, _):
+                        pgs_place_indices(inner, param, prior, table, out)
+                    _:
+                        pass
+
+        # Whether PRIOR summarised (callee, position); its grown fields go to FIELDS.
+        def pgs_callee_fields(callee: sview, position: usize, prior: darray[sview]&, fields: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                tag: sview = vro_tag(position)
+                false return if tag == "" or callee == ""
+                known: mutable bool = false
+                row: mutable usize = 0
+                while row + 2 < prior.count:
+                    if prior[row] == callee and prior[row + 1] == tag:
+                        if prior[row + 2] == "[k]":
+                            known <- true
+                        else:
+                            pgs_push(prior[row + 2], fields)
+                    row <- row + pgs_row()
+                return known
+
+        # One argument passed to a user function at POSITION.
+        def pgs_user_argument(callee: sview, position: usize, argument: Ast::Expr, param: sview, escape: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                rooted: bool = storage_view_place_root(argument) == param
+                if not rooted:
+                    pgs_expr(argument, param, false, false, prior, table, out)
+                    return
+                pgs_place_indices(argument, param, prior, table, out)
+                # The result is kept (bound, stored, returned): it may alias the argument.
+                if escape:
+                    pgs_place_grows(argument, param, out)
+                    return
+                return if not storage_callee_param_may_relocate(table, callee, position)
+                fields: mutable darray[sview] = []
+                if not pgs_callee_fields(callee, position, prior, fields):
+                    pgs_place_grows(argument, param, out)
+                    return
+                if pgs_is_bare(argument, param):
+                    for field in fields |out|:
+                        pgs_push(field, out)
+                elif fields.count > 0:
+                    pgs_place_grows(argument, param, out)
+
+        def pgs_is_user_function(table: SymbolTable&, name: sview) -> bool:
+            can Abort.Panic:
+                return name != "" and function_param_chain_head(table, name) != 4294967295
+
+        def pgs_call(callee: Ast::Expr, arguments: darray[Ast::Expr]&, argument_names: darray[sview]&, param: sview, escape: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                named: mutable bool = false
+                for argument_name in argument_names |named|:
+                    named <- true if argument_name != ""
+                match callee:
+                    Expr.Ident(name, _):
+                        if pgs_is_user_function(table, name) and not named:
+                            for argument in arguments |position: usize = 0, name, param, escape, prior, table, out|:
+                                pgs_user_argument(name, position, argument, param, escape, prior, table, out)
+                                position <- position + 1
+                            return
+                        reads: bool = vro_view_builtin(name) and not escape
+                        for argument in arguments |param, reads, prior, table, out|:
+                            pgs_expr(argument, param, not reads, false, prior, table, out)
+                        return
+                    Expr.Field(receiver, method, _):
+                        receiver_rooted: bool = storage_view_place_root(receiver) == param
+                        if pgs_is_user_function(table, method) and not named:
+                            if receiver_rooted:
+                                pgs_user_argument(method, 0, receiver, param, escape, prior, table, out)
+                                for argument in arguments |position: usize = 1, method, param, escape, prior, table, out|:
+                                    pgs_user_argument(method, position, argument, param, escape, prior, table, out)
+                                    position <- position + 1
+                                return
+                            # `T.m(args)` or `value.m(args)`: union both position readings.
+                            pgs_expr(receiver, param, false, false, prior, table, out)
+                            for argument in arguments |position: usize = 0, method, param, escape, prior, table, out|:
+                                pgs_user_argument(method, position, argument, param, escape, prior, table, out)
+                                pgs_user_argument(method, position + 1, argument, param, escape, prior, table, out)
+                                position <- position + 1
+                            return
+                        if receiver_rooted:
+                            pgs_place_indices(receiver, param, prior, table, out)
+                            pgs_place_grows(receiver, param, out) if escape or not pgs_read_method(method)
+                        else:
+                            pgs_expr(receiver, param, escape, false, prior, table, out)
+                        for argument in arguments |param, prior, table, out|:
+                            pgs_expr(argument, param, true, false, prior, table, out)
+                        return
+                    _:
+                        pgs_expr(callee, param, true, false, prior, table, out)
+                        for argument in arguments |param, prior, table, out|:
+                            pgs_expr(argument, param, true, false, prior, table, out)
+
+        # Classifies every use of PARAM in EXPRESSION. ESCAPE: the value is kept (bound,
+        # stored, returned, handed out mutably). CAPTURED: inside a lambda -- any use is whole.
+        def pgs_expr(expression: Ast::Expr, param: sview, escape: bool, captured: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.ShorthandMember(_, _) | Expr.Scope(_, _, _):
+                        pass
+                    Expr.Ident(name, _):
+                        pgs_push("", out) if name == param and (escape or captured)
+                    Expr.Field(object, _, _) | Expr.Index(object, _, _) | Expr.IndexN(object, _, _) | Expr.Slice(object, _, _, _):
+                        if pgs_scalar_length(expression, table):
+                            # `place.count` / `place.len` yields an integer, so the place under it
+                            # is only read even where the result escapes.
+                            pgs_expr(object, param, false, captured, prior, table, out)
+                        elif storage_view_place_root(expression) == param:
+                            pgs_place_indices(expression, param, prior, table, out)
+                            pgs_push("", out) if captured
+                            pgs_place_grows(expression, param, out) if escape
+                        else:
+                            pgs_expr(object, param, escape, captured, prior, table, out)
+                            pgs_place_indices(expression, param, prior, table, out)
+                    Expr.Paren(inner, _):
+                        pgs_expr(inner, param, escape, captured, prior, table, out)
+                    Expr.Move(inner, _) | Expr.RegionNew(inner, _, _):
+                        pgs_expr(inner, param, true, captured, prior, table, out)
+                    Expr.Unary(operator, operand, _):
+                        pgs_expr(operand, param, escape or operator == TokenKind.Ampersand or operator == TokenKind.Mutable, captured, prior, table, out)
+                    Expr.Binary(left, _, right, _):
+                        pgs_expr(left, param, false, captured, prior, table, out)
+                        pgs_expr(right, param, false, captured, prior, table, out)
+                    Expr.Call(callee, arguments, argument_names, _):
+                        if captured:
+                            pgs_expr(callee, param, true, true, prior, table, out)
+                            for argument in arguments |param, prior, table, out|:
+                                pgs_expr(argument, param, true, true, prior, table, out)
+                        else:
+                            pgs_call(callee, arguments, argument_names, param, escape, prior, table, out)
+                    Expr.StaticEffectCall(_, _, _, arguments, _, _) | Expr.Array(arguments, _) | Expr.Tuple(arguments, _) | Expr.SetLit(arguments, _):
+                        for argument in arguments |param, captured, prior, table, out|:
+                            pgs_expr(argument, param, true, captured, prior, table, out)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |param, captured, prior, table, out|:
+                            pgs_expr(entry.key, param, true, captured, prior, table, out)
+                            pgs_expr(entry.value, param, true, captured, prior, table, out)
+                    Expr.Construct(type_expression, fields, _):
+                        for field in fields |param, captured, prior, table, out|:
+                            pgs_expr(field.value, param, true, captured, prior, table, out)
+                    Expr.RecordUpdate(base, fields, _):
+                        pgs_expr(base, param, true, captured, prior, table, out)
+                        for field in fields |param, captured, prior, table, out|:
+                            pgs_expr(field.value, param, true, captured, prior, table, out)
+                    Expr.If(condition, then_value, else_value, _):
+                        pgs_expr(condition, param, false, captured, prior, table, out)
+                        pgs_expr(then_value, param, escape, captured, prior, table, out)
+                        pgs_expr(else_value, param, escape, captured, prior, table, out)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        # Arm binders may alias the scrutinee's storage.
+                        pgs_expr(scrutinee, param, true, captured, prior, table, out)
+                        for arm in arms |param, captured, prior, table, out|:
+                            pgs_expr(arm.guard, param, false, captured, prior, table, out)
+                            pgs_stmts(arm.body, param, captured, prior, table, out)
+                    Expr.Comprehension(_, iterable, condition, body, _):
+                        pgs_expr(iterable, param, true, captured, prior, table, out)
+                        pgs_expr(condition, param, false, captured, prior, table, out)
+                        pgs_expr(body, param, true, captured, prior, table, out)
+                    Expr.Refinement(base, predicate, _):
+                        pgs_expr(base, param, escape, captured, prior, table, out)
+                        pgs_expr(predicate, param, false, captured, prior, table, out)
+                    Expr.GetElse(guarded, recovery, _):
+                        pgs_expr(guarded, param, escape, captured, prior, table, out)
+                        pgs_stmts(recovery, param, captured, prior, table, out)
+                    Expr.Lambda(_, body, _):
+                        pgs_stmts(body, param, true, prior, table, out)
+                    Expr.Block(statements, value, captures, _):
+                        whole: mutable bool = captured
+                        for capture in captures |whole, param|:
+                            whole <- true if capture == param
+                        pgs_stmts(statements, param, whole, prior, table, out)
+                        pgs_expr(value, param, escape, whole, prior, table, out)
+                    _:
+                        pgs_push("", out)
+
+        # A `name: T = value` keeps a copy only: no alias when T is spelled without `&` / `mutable`.
+        def pgs_plain_type(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if type_expression is Expr.Absent
+                return not type_marker_present_here(type_expression, TokenKind.Ampersand) and not type_marker_present_here(type_expression, TokenKind.Mutable)
+
+        def pgs_stmts(statements: darray[Ast::Stmt]&, param: sview, captured: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |param, captured, prior, table, out|:
+                    pgs_stmt(statement, param, captured, prior, table, out)
+
+        def pgs_stmt(statement: Ast::Stmt, param: sview, captured: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, _):
+                        pgs_expr(expression, param, false, captured, prior, table, out)
+                    Stmt.VarDecl(_, type_expression, value, _):
+                        pgs_expr(value, param, not pgs_plain_type(type_expression), captured, prior, table, out)
+                    Stmt.Assign(target, _, value, _):
+                        if storage_view_place_root(target) == param:
+                            pgs_place_indices(target, param, prior, table, out)
+                            pgs_place_grows(target, param, out)
+                        else:
+                            pgs_expr(target, param, false, captured, prior, table, out)
+                        pgs_expr(value, param, true, captured, prior, table, out)
+                    Stmt.If(condition, then_body, else_body, _):
+                        pgs_expr(condition, param, false, captured, prior, table, out)
+                        pgs_stmts(then_body, param, captured, prior, table, out)
+                        pgs_stmts(else_body, param, captured, prior, table, out)
+                    Stmt.While(condition, body, _):
+                        pgs_expr(condition, param, false, captured, prior, table, out)
+                        pgs_stmts(body, param, captured, prior, table, out)
+                    Stmt.For(_, _, iterable, body, _):
+                        # Loop variables may alias the iterated storage.
+                        pgs_expr(iterable, param, true, captured, prior, table, out)
+                        pgs_stmts(body, param, captured, prior, table, out)
+                    Stmt.Return(value, _):
+                        if value is returned:
+                            pgs_expr(returned, param, true, captured, prior, table, out)
+                    Stmt.Break(_, _) | Stmt.Continue(_, _):
+                        pass
+                    Stmt.Match(scrutinee, arms, _):
+                        pgs_expr(scrutinee, param, true, captured, prior, table, out)
+                        for arm in arms |param, captured, prior, table, out|:
+                            pgs_expr(arm.guard, param, false, captured, prior, table, out)
+                            pgs_stmts(arm.body, param, captured, prior, table, out)
+                    Stmt.Contract(_, expression, _):
+                        pgs_expr(expression, param, false, captured, prior, table, out)
+                    Stmt.Block(_, clause, binding, body, _):
+                        whole: mutable bool = captured or binding == param
+                        for word in clause |whole, param|:
+                            whole <- true if word == param
+                        pgs_stmts(body, param, whole, prior, table, out)
+                    _:
+                        pgs_push("", out)
+
+        def pgs_integer_spelling(spelling: sview) -> bool:
+            can Abort.Panic:
+                return spelling == "usize" or spelling == "isize" or spelling == "u8" or spelling == "u16" or spelling == "u32" or spelling == "u64" or spelling == "i8" or spelling == "i16" or spelling == "i32" or spelling == "i64" or spelling == "mutable usize" or spelling == "mutable isize" or spelling == "mutable u32" or spelling == "mutable u64" or spelling == "mutable i32" or spelling == "mutable i64"
+
+        # `X.count` / `X.len` on a place, unless some struct declares a field of that name
+        # with a non-integer type (that field could hold storage, so it keeps the escape rule).
+        def pgs_scalar_length(expression: Ast::Expr, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, _):
+                        false return if field != "count" and field != "len"
+                        false return if object is Expr.Ident
+                        for index in 0..<table.struct_field_name.count:
+                            false return if table.struct_field_name[index] == field and not pgs_integer_spelling(table.struct_field_type[index])
+                        return true
+                    _:
+                        return false
+
+        def pgs_function(name: sview, params: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, markers_only: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for param in params |position: usize = 0, name, body, markers_only, prior, table, out|:
+                    tag: sview = vro_tag(position)
+                    if tag != "" and param_is_mutable_ref(param):
+                        out.push(name)
+                        out.push(tag)
+                        out.push("[k]")
+                        if not markers_only:
+                            fields: mutable darray[sview] = []
+                            pgs_stmts(body, param.name, false, prior, table, fields)
+                            for field in fields |name, tag, out|:
+                                out.push(name)
+                                out.push(tag)
+                                out.push(field)
+                    position <- position + 1
+
+        def pgs_collect(declarations: darray[Ast::Decl]&, markers_only: bool, prior: darray[sview]&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |markers_only, prior, table, out|:
+                    match declaration:
+                        Decl.Func(name, params, _, body, _, _, _):
+                            pgs_function(name, params, body, markers_only, prior, table, out)
+                        Decl.Module(_, body, _):
+                            pgs_collect(body, markers_only, prior, table, out)
+                        Decl.Scoped(body, _):
+                            pgs_collect(body, markers_only, prior, table, out)
+                        _:
+                            pass
+
+        # Whether every row of A is in B (rows only grow between rounds).
+        def pgs_rows_covered(a: darray[sview]&, b: darray[sview]&) -> bool:
+            can Abort.Panic:
+                row: mutable usize = 0
+                while row + 2 < a.count:
+                    found: mutable bool = false
+                    other: mutable usize = 0
+                    while other + 2 < b.count and not found:
+                        found <- true if a[row] == b[other] and a[row + 1] == b[other + 1] and a[row + 2] == b[other + 2]
+                        other <- other + pgs_row()
+                    false return if not found
+                    row <- row + pgs_row()
+                return true
+
+    public:
+        def param_growth_rows(file: Ast::File&, table: SymbolTable&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                rows: mutable darray[sview] = []
+                pgs_collect(file.top_decls, true, rows, table, rows)
+                for round in 0..<64 |rows, file, table|:
+                    next: mutable darray[sview] = []
+                    pgs_collect(file.top_decls, false, rows, table, next)
+                    same: bool = pgs_rows_covered(next, rows) and pgs_rows_covered(rows, next)
+                    rows <- next
+                    return rows if same
+                empty: darray[sview] = []
+                return empty
+
+        # Whether (callee, position) is summarised; its grown fields go to FIELDS.
+        def param_growth_fields(table: SymbolTable&, callee: sview, position: usize, fields: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return pgs_callee_fields(callee, position, table.param_growth_rows, fields)
