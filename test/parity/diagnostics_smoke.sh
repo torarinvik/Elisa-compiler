@@ -928,6 +928,14 @@ for cnn_line in 5 9 13 18 24 30; do
 done
 run_case contract_not_first_nested neg "$cnn_neg" "must be the first statements"
 
+# A struct that reaches its grown container only through a `&` field owns no region of its
+# own, so stage0 cannot thread `@__rg_p` into the grower (stage1 used to miscompile: SIGBUS).
+echo "-- region_param_ref_field --"
+run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_field.pos.elisa" "L14 cannot infer region parameter \"__rg_p\" for call to \"add\""
+run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_field.pos.elisa" "L15 cannot infer region parameter \"__rg_p\" for call to \"add\""
+run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_field.pos.elisa" "L17 cannot infer region parameter \"__rg_p\" for call to \"add\""
+run_case region_param_ref_field neg "$REPO_ROOT/test/repro/region_param_ref_field.neg.elisa" "cannot infer region parameter"
+
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then

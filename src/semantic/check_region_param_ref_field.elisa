@@ -1,0 +1,197 @@
+# Region-parameter inference failure for a struct that reaches its grown container only
+# THROUGH A REFERENCE FIELD (stage0 inferRegionParamsForGrownContainerParams +
+# attachStructLocalArgRegion). A callee `def add(p: P&)` that grows `p.names.bytes` gets an
+# inferred `@__rg_p`. At a call, stage0 binds that region from the argument local only when
+# the local's struct owns a region-less container field itself (structHasRegionlessContainer-
+# Field, which descends through BY-VALUE struct fields and never through a `&` field). A local
+# `p: P` whose only route to a container is `names: mutable Store&` therefore has no region to
+# thread, and stage0 reports "cannot infer region parameter". Stage1 used to accept it and
+# allocate the growth into a per-call arena (SIGBUS at run time).
+#
+# Decidable subset, chosen so it never fires where stage0 binds: the argument is a bare (or
+# `&`-taken) local declared in the caller with a non-ref struct type that owns no container
+# field; the caller is not inside an `in` block (perm/global ambient binds) and the callee takes
+# no Arena& (self-threading). Everything else declines to stay silent.
+extend Semantic:
+    private:
+        def rpf_is_grow_method(method: sview) -> bool:
+            return method == "push" or method == "push_back" or method == "insert" or method == "append" or method == "extend" or method == "resize" or method == "reserve"
+
+        # Root identifier of a field chain `root.f1...fn` (n >= 1), else "".
+        def rpf_field_chain_root(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, field_line):
+                        root: sview = ident_name_of(object)
+                        root return if root != ""
+                        return rpf_field_chain_root(object)
+                    Expr.Paren(inner, paren_line):
+                        return rpf_field_chain_root(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # Whether EXPRESSION contains `param.<chain>.grow(...)`.
+        def rpf_grows_through(expression: Ast::Expr, param: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        return rpf_grows_through(inner, param)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Field(receiver, method, field_line):
+                                true return if rpf_is_grow_method(method) and rpf_field_chain_root(receiver) == param
+                            _:
+                                pass
+                        return any argument in arguments where rpf_grows_through(argument, param)
+                    _:
+                        return false
+
+        # Whether PARAM is grown through a field chain anywhere in STATEMENTS; an `in` block
+        # makes the whole function decline (stage0 treats perm/global growth as needing no region).
+        def rpf_grows_stmts(statements: darray[Ast::Stmt], param: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if rpf_grows_through(expression, param)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if block_kind != "in" and rpf_grows_stmts(block_body, param)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if rpf_grows_stmts(then_body, param)
+                            true return if rpf_grows_stmts(else_body, param)
+                        _:
+                            pass
+                return false
+
+        def rpf_has_in_block(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if block_kind == "in" or rpf_has_in_block(block_body)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if rpf_has_in_block(then_body) or rpf_has_in_block(else_body)
+                        _:
+                            pass
+                return false
+
+        # Whether struct NAME owns a container field directly or through by-value struct fields
+        # (structHasRegionlessContainerField). Unknown names and deep nesting answer TRUE, which
+        # makes the checker decline.
+        def rpf_struct_owns_container(file: Ast::File&, name: sview, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if depth > 8
+                for declaration in file.top_decls |name, depth, file|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            if struct_name == name:
+                                for member in members |depth, file|:
+                                    field_type: Ast::Expr = member.type_expression
+                                    if not type_marker_present_here(field_type, TokenKind.Ampersand):
+                                        head: sview = rpu_struct_head(field_type)
+                                        true return if head == "darray" or head == "dict" or head == "set"
+                                        true return if head != "" and rpf_is_struct(file, head) and rpf_struct_owns_container(file, head, depth + 1)
+                                return false
+                        _:
+                            pass
+                return true
+
+        def rpf_is_struct(file: Ast::File&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in file.top_decls |name|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            true return if struct_name == name
+                        _:
+                            pass
+                return false
+
+        # Declared type head of LOCAL in STATEMENTS when it is a non-ref declaration, else "".
+        # A second declaration of the same name (shadowing) declines.
+        def rpf_local_struct(statements: darray[Ast::Stmt], local: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable sview = sview("", 0, 0)
+                seen: mutable u32 = 0
+                for statement in statements |found, seen, local|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if name == local:
+                                seen <- seen + 1
+                                found <- rpu_struct_head(type_expression) if not type_marker_present_here(type_expression, TokenKind.Ampersand)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            inner: sview = rpf_local_struct(block_body, local)
+                            seen <- seen + 1 if inner != ""
+                            found <- inner if inner != ""
+                        _:
+                            pass
+                return sview("", 0, 0) if seen != 1 else found
+
+        def rpf_check_calls(file: Ast::File&, statements: darray[Ast::Stmt], body: darray[Ast::Stmt], params: darray[Ast::ParamDecl]&, ref_names: darray[sview]&, ref_places: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(call_expression, stmt_line):
+                            match call_expression:
+                                Expr.Call(callee, arguments, argument_names, call_line):
+                                    callee_name: sview = ident_name_of(callee)
+                                    if callee_name != "" and not any argument_name in argument_names where argument_name != "":
+                                        table <- rpf_check_one_call(file, callee_name, arguments, call_line, body, params, ref_names, ref_places, table)
+                                _:
+                                    pass
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            table <- rpf_check_calls(file, block_body, body, params, ref_names, ref_places, table) if block_kind != "in"
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- rpf_check_calls(file, then_body, body, params, ref_names, ref_places, table)
+                            table <- rpf_check_calls(file, else_body, body, params, ref_names, ref_places, table)
+                        _:
+                            pass
+
+        def rpf_check_one_call(file: Ast::File&, callee_name: sview, arguments: darray[Ast::Expr]&, call_line: Ast::Pos, body: darray[Ast::Stmt], params: darray[Ast::ParamDecl]&, ref_names: darray[sview]&, ref_places: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                matches: mutable u32 = 0
+                for declaration in file.top_decls |callee_name, matches|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, function_body, effects, decorators, line):
+                            matches <- matches + 1 if function_name == callee_name
+                        _:
+                            pass
+                # Overloads / redeclarations decline.
+                return if matches != 1
+                for declaration in file.top_decls |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, function_body, effects, decorators, line):
+                            if function_name == callee_name and parameters.count == arguments.count:
+                                arena_managed: bool = any parameter in parameters where rpu_struct_head(parameter.type_expression) == "Arena"
+                                if not arena_managed and not rpf_has_in_block(function_body):
+                                    index: mutable usize = 0
+                                    while index < parameters.count |index, table| -> table:
+                                        parameter_type: Ast::Expr = parameters[index].type_expression
+                                        parameter_name: sview = parameters[index].name
+                                        head: sview = rpu_struct_head(parameter_type)
+                                        ref_struct: bool = type_marker_present_here(parameter_type, TokenKind.Ampersand) and head != "" and rpf_is_struct(file, head)
+                                        if ref_struct and rpf_grows_stmts(function_body, parameter_name):
+                                            # A ref local `q: P& = &p` (declared once, never reassigned) stands for its
+                                            # root; a field-place initializer resolves to "" and declines.
+                                            resolved: (address: bool, place: Ast::Expr) = exclusivity_resolve_ref_local(exclusivity_strip_address(arguments[index]), ref_names, ref_places)
+                                            local: sview = ident_name_of(resolved.place)
+                                            is_param: bool = any caller_param in params where caller_param.name == local
+                                            if local != "" and not is_param:
+                                                local_head: sview = rpf_local_struct(body, local)
+                                                owned: bool = local_head == "" or not rpf_is_struct(file, local_head) or rpf_struct_owns_container(file, local_head, 0)
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamUninferable, name: callee_name, pos: call_line, line: call_line.line, expected: "", actual: parameter_name}) if not owned
+                                        index <- index + 1
+                        _:
+                            pass
+
+    public:
+        def check_region_param_ref_field(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in file.top_decls |table| -> table:
+                    match declaration:
+                        Decl.Func(check_name, check_params, check_return, check_body, check_effects, check_decorators, check_line):
+                            ref_names: mutable darray[sview] = []
+                            ref_places: mutable darray[Ast::Expr] = []
+                            exclusivity_collect_ref_locals(check_params, check_body, ref_names, ref_places)
+                            table <- rpf_check_calls(file, check_body, check_body, check_params, ref_names, ref_places, table)
+                        _:
+                            pass
