@@ -1,0 +1,354 @@
+# Which parameters a user function's borrowed result points into (stage0
+# storageViewReturnOriginsFor). A call `v = f(&h)` whose callee returns a view of its
+# parameter's storage depends on what the argument names: growing `h.buf` afterwards
+# relocates the buffer `v` reads, and returning `f(&local)` returns a view of a frame-owned
+# buffer. Without this, every user call cut the dependency (MEASURED 2026-10-02: l2, m4,
+# m5, pr1, pr2, pr5, l3, g1 ran on freed storage under stage1; stage0 rejects all eight).
+#
+# Rows are flat groups of VRO_ROW sviews: (function, arity, position, mode, field).
+#   mode "into"   -- the result points INTO the parameter's own storage (`p.as_sview()`,
+#                    `bytes_view(p.buf)`, `&p[i]`, `p[a:b]`);
+#   mode "carry"  -- the result is a copy of a view the parameter holds (`return p`,
+#                    `return p.v`, `return ps[0]`);
+#   mode "thread" -- a `Thread[...]` handle: the spawned work holds every argument;
+#   mode "known"  -- the function was summarised (a marker; it may have no origins);
+#   mode "unknown"-- some returned value is not traceable: callers keep today's behaviour.
+# `field` is the first field the result goes through (`p.buf` -> "buf"), else "".
+# Only functions whose result can carry a borrow are summarised (a view, a
+# generic type parameter or a thread handle); every other call is unchanged. Functions
+# sharing a name and arity are UNIONED (name-only resolution), and any "unknown" row
+# among them makes the call unknown.
+extend Semantic:
+    private:
+        def vro_row() -> usize:
+            return 5
+
+        # Small integers as static sviews, so the rows stay a plain darray[sview] that the
+        # storage walk already threads everywhere. Positions past the table are untracked.
+        def vro_tag(value: usize) -> sview:
+            can Abort.Panic:
+                tags: darray[sview] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
+                return tags[value] if value < tags.count else ""
+
+        def vro_borrow_return(type_expression: Ast::Expr, generics: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return name == "sview" or name == "cstr" or any generic in generics where generic == name
+                    Expr.Index(head, _, _):
+                        head_name: sview = ident_name_of(head)
+                        return head_name == "view" or head_name == "readonly" or head_name == "Thread"
+                    Expr.IndexN(head, _, _):
+                        head_name: sview = ident_name_of(head)
+                        return head_name == "view" or head_name == "readonly" or head_name == "Thread"
+                    # A `T&` / `lmut` return is a stable reference to a place, not a view of its
+                    # buffer: growing through it is not a use-after-grow of the reference (the
+                    # ref-returning call rules own it). Only VIEW results are summarised.
+                    Expr.Unary(operator, operand, _):
+                        return operator == TokenKind.Mutable and vro_borrow_return(operand, generics)
+                    Expr.Paren(inner, _):
+                        return vro_borrow_return(inner, generics)
+                    _:
+                        return false
+
+        def vro_thread_return(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, _, _) | Expr.IndexN(head, _, _):
+                        return ident_name_of(head) == "Thread"
+                    Expr.Paren(inner, _):
+                        return vro_thread_return(inner)
+                    _:
+                        return false
+
+        def vro_view_builtin(name: sview) -> bool:
+            return name in {"bytes_view", "bytes_view_range", "bytes_view_range_ref", "sview", "string_view_slice", "string_view_prefix", "string_view_suffix", "darray_view", "arena_da_view", "readonly", "arena_da_view_slice", "arena_da_view_prefix", "arena_da_view_suffix"}
+
+        # Every binding in the body: `name: T = value` and `name = value` / `name <- value`.
+        # A name bound more than once is untraceable (its value depends on flow).
+        def vro_collect_bindings(statements: darray[Ast::Stmt]&, names: mutable darray[sview]&, values: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, values|:
+                    match statement:
+                        Stmt.VarDecl(name, _, value, _):
+                            names.push(name)
+                            values.push(value)
+                        Stmt.Assign(target, _, value, _):
+                            match target:
+                                Expr.Ident(target_name, _):
+                                    names.push(target_name)
+                                    values.push(value)
+                                _:
+                                    pass
+                        Stmt.Block(_, _, _, body, _):
+                            vro_collect_bindings(body, names, values)
+                        Stmt.If(_, then_body, else_body, _):
+                            vro_collect_bindings(then_body, names, values)
+                            vro_collect_bindings(else_body, names, values)
+                        Stmt.While(_, body, _):
+                            vro_collect_bindings(body, names, values)
+                        Stmt.For(_, variables, _, body, _):
+                            for variable in variables |names, values|:
+                                # A loop variable is bound by the loop, never traceable: bind it
+                                # twice so it reads as untraceable.
+                                names.push(variable)
+                                values.push(Ast::Expr.Absent)
+                                names.push(variable)
+                                values.push(Ast::Expr.Absent)
+                            vro_collect_bindings(body, names, values)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms |names, values|:
+                                vro_collect_bindings(arm.body, names, values)
+                        _:
+                            pass
+
+        def vro_push(position: usize, into: bool, field: sview, out_positions: mutable darray[usize]&, out_into: mutable darray[bool]&, out_fields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out_positions.push(position)
+                out_into.push(into)
+                out_fields.push(field)
+
+        # Appends the parameter origins of EXPRESSION; false when some part is untraceable.
+        # FIELD is the innermost field seen so far walking outward, i.e. the first field after
+        # the root once the walk reaches the parameter.
+        def vro_origins(expression: Ast::Expr, params: darray[sview]&, names: darray[sview]&, values: darray[Ast::Expr]&, into: bool, field: sview, hops: usize, out_positions: mutable darray[usize]&, out_into: mutable darray[bool]&, out_fields: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if hops > 8
+                match expression:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return vro_origins(inner, params, names, values, into, field, hops, out_positions, out_into, out_fields)
+                    Expr.Unary(operator, operand, _):
+                        false return if operator != TokenKind.Ampersand and operator != TokenKind.Lmut
+                        return vro_origins(operand, params, names, values, true, field, hops, out_positions, out_into, out_fields)
+                    Expr.StringLit(_, _) | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
+                        return true
+                    Expr.Ident(name, _):
+                        bindings: mutable usize = 0
+                        bound_at: mutable usize = 0
+                        for index in 0..<names.count |bindings, bound_at, names, name|:
+                            if names[index] == name:
+                                bindings <- bindings + 1
+                                bound_at <- index
+                        if bindings == 1:
+                            return vro_origins(values[bound_at], params, names, values, into, field, hops + 1, out_positions, out_into, out_fields)
+                        false return if bindings > 1
+                        for position in 0..<params.count |out_positions, out_into, out_fields, params, name, into, field|:
+                            if params[position] == name:
+                                vro_push(position, into, field, out_positions, out_into, out_fields)
+                                return true
+                        return false
+                    Expr.Field(object, object_field, _):
+                        return vro_origins(object, params, names, values, into, object_field, hops, out_positions, out_into, out_fields)
+                    Expr.Index(object, _, _):
+                        return vro_origins(object, params, names, values, into, field, hops, out_positions, out_into, out_fields)
+                    Expr.Slice(object, _, _, _):
+                        return vro_origins(object, params, names, values, true, field, hops, out_positions, out_into, out_fields)
+                    Expr.If(_, then_value, else_value, _):
+                        return vro_origins(then_value, params, names, values, into, field, hops, out_positions, out_into, out_fields) and vro_origins(else_value, params, names, values, into, field, hops, out_positions, out_into, out_fields)
+                    Expr.Call(callee, arguments, _, _):
+                        match callee:
+                            Expr.Ident(called, _):
+                                if vro_view_builtin(called) and arguments.count > 0:
+                                    return vro_origins(arguments[0], params, names, values, true, field, hops, out_positions, out_into, out_fields)
+                                return false
+                            Expr.Field(receiver, method, _):
+                                if arguments.count == 0 and (method == "as_sview" or method == "as_cstr" or method == "view"):
+                                    return vro_origins(receiver, params, names, values, true, field, hops, out_positions, out_into, out_fields)
+                                return false
+                            _:
+                                return false
+                    _:
+                        return false
+
+        # Every returned value: `return EXPR` anywhere, plus the trailing expression statement.
+        def vro_returns(statements: darray[Ast::Stmt]&, is_tail: bool, out: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while statement_index < statements.count |statement_index: usize = 0, out|:
+                    last: bool = is_tail and statement_index + 1 == statements.count
+                    statement: Ast::Stmt = statements[statement_index]
+                    statement_index <- statement_index + 1
+                    match statement:
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                out.push(returned)
+                        Stmt.Expr(expression, _):
+                            out.push(expression) if last
+                        Stmt.Block(_, _, _, body, _):
+                            vro_returns(body, last, out)
+                        Stmt.If(_, then_body, else_body, _):
+                            vro_returns(then_body, last, out)
+                            vro_returns(else_body, last, out)
+                        Stmt.While(_, body, _):
+                            vro_returns(body, false, out)
+                        Stmt.For(_, _, _, body, _):
+                            vro_returns(body, false, out)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms |out, last|:
+                                vro_returns(arm.body, last, out)
+                        _:
+                            pass
+
+        def vro_function(name: sview, params: darray[Ast::ParamDecl]&, return_type: Ast::Expr, body: darray[Ast::Stmt]&, generics: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not vro_borrow_return(return_type, generics)
+                arity: sview = vro_tag(params.count)
+                return if arity == ""
+                if vro_thread_return(return_type):
+                    out.extend([name, arity, "0", "thread", ""])
+                    return
+                param_names: mutable darray[sview] = []
+                for param in params |param_names|:
+                    param_names.push(param.name)
+                names: mutable darray[sview] = []
+                values: mutable darray[Ast::Expr] = []
+                vro_collect_bindings(body, names, values)
+                returned: mutable darray[Ast::Expr] = []
+                vro_returns(body, true, returned)
+                positions: mutable darray[usize] = []
+                into: mutable darray[bool] = []
+                fields: mutable darray[sview] = []
+                known: mutable bool = true
+                for value in returned |known, positions, into, fields, param_names, names, values|:
+                    known <- false if not vro_origins(value, param_names, names, values, false, "", 0, positions, into, fields)
+                if not known:
+                    out.extend([name, arity, "0", "unknown", ""])
+                    return
+                out.extend([name, arity, "0", "known", ""])
+                for index in 0..<positions.count |out, positions, into, fields, name, arity|:
+                    is_into: bool = into[index]
+                    out.extend([name, arity, vro_tag(positions[index]), "into" if is_into else "carry", fields[index]])
+
+        def vro_generics_of(line: u32, generic_lines: darray[u32]&, generic_names: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in 0..<generic_names.count |out, generic_lines, generic_names, line|:
+                    out.push(generic_names[index]) if index < generic_lines.count and generic_lines[index] == line
+
+        def vro_collect(declarations: darray[Ast::Decl]&, generic_lines: darray[u32]&, generic_names: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out, generic_lines, generic_names|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, _, _, pos):
+                            if return_type is declared_return:
+                                generics: mutable darray[sview] = []
+                                vro_generics_of(pos.line, generic_lines, generic_names, generics)
+                                vro_function(name, params, declared_return, body, generics, out)
+                        Decl.Module(_, body, _):
+                            vro_collect(body, generic_lines, generic_names, out)
+                        Decl.Scoped(body, _):
+                            vro_collect(body, generic_lines, generic_names, out)
+                        _:
+                            pass
+
+        # Whether rows name a summarised function NAME of ARITY, and none of them is unknown.
+        # 0 = not summarised, 1 = summarised and traceable, 2 = summarised but unknown.
+        def vro_status(rows: darray[sview]&, name: sview, arity: usize) -> u8:
+            can Abort.Panic:
+                arity_tag: sview = vro_tag(arity)
+                0 return if arity_tag == "" or name == ""
+                status: mutable u8 = 0
+                while row + 4 < rows.count |row: usize = 0, status, rows, name, arity_tag|:
+                    if rows[row] == name and rows[row + 1] == arity_tag:
+                        status <- 2 if rows[row + 3] == "unknown" else (1 if status == 0 else status)
+                    row <- row + vro_row()
+                return status
+
+    public:
+        def view_return_origin_rows(file: Ast::File&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                rows: mutable darray[sview] = []
+                vro_collect(file.top_decls, file.generic_param_lines, file.generic_param_names, rows)
+                return rows
+
+        # A summarised call's status, resolving `recv.m(args)` (receiver form, arity args+1)
+        # before the static form `T.m(args)`.
+        def vro_call_status(callee: Ast::Expr, argument_count: usize, rows: darray[sview]&) -> u8:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(name, _):
+                        return vro_status(rows, name, argument_count)
+                    Expr.Field(_, method, _):
+                        receiver_status: u8 = vro_status(rows, method, argument_count + 1)
+                        receiver_status return if receiver_status != 0
+                        return vro_status(rows, method, argument_count)
+                    _:
+                        return 0
+
+        # The argument expressions a traceable summarised call's result carries (CARRIED true:
+        # "carry" rows) or borrows the storage of (CARRIED false: "into" rows). Empty when the
+        # call is not summarised or is unknown; "thread" rows are left to the storage checker.
+        def vro_origin_arguments(callee: Ast::Expr, arguments: darray[Ast::Expr]&, rows: darray[sview]&, carried: bool) -> darray[Ast::Expr]:
+            can Memory.Allocate, Abort.Panic:
+                out: mutable darray[Ast::Expr] = []
+                name: mutable sview = ""
+                receiver: mutable Ast::Expr = Ast::Expr.Absent
+                shift: mutable usize = 0
+                match callee:
+                    Expr.Ident(callee_name, _):
+                        name <- callee_name
+                    Expr.Field(object, method, _):
+                        name <- method
+                        if vro_status(rows, method, arguments.count + 1) != 0:
+                            receiver <- object
+                            shift <- 1
+                    _:
+                        pass
+                arity: usize = arguments.count + shift
+                out return if vro_status(rows, name, arity) != 1
+                arity_tag: sview = vro_tag(arity)
+                wanted: sview = "carry" if carried else "into"
+                while row + 4 < rows.count |row: usize = 0, out|:
+                    if rows[row] == name and rows[row + 1] == arity_tag and rows[row + 3] == wanted:
+                        position: mutable usize = 16
+                        for candidate in 0..<16 |position|:
+                            position <- candidate if vro_tag(candidate) == rows[row + 2]
+                        if position < arity:
+                            if shift == 1 and position == 0:
+                                out.push(receiver)
+                            else:
+                                out.push(arguments[position - shift])
+                    row <- row + vro_row()
+                return out
+
+        # The field each vro_origin_arguments entry goes through ("" for the whole argument),
+        # in the same order.
+        def vro_origin_fields(callee: Ast::Expr, arguments: darray[Ast::Expr]&, rows: darray[sview]&, carried: bool) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                out: mutable darray[sview] = []
+                name: mutable sview = ""
+                receiver: mutable Ast::Expr = Ast::Expr.Absent
+                shift: mutable usize = 0
+                match callee:
+                    Expr.Ident(callee_name, _):
+                        name <- callee_name
+                    Expr.Field(object, method, _):
+                        name <- method
+                        if vro_status(rows, method, arguments.count + 1) != 0:
+                            receiver <- object
+                            shift <- 1
+                    _:
+                        pass
+                arity: usize = arguments.count + shift
+                out return if vro_status(rows, name, arity) != 1
+                arity_tag: sview = vro_tag(arity)
+                wanted: sview = "carry" if carried else "into"
+                while row + 4 < rows.count |row: usize = 0, out|:
+                    if rows[row] == name and rows[row + 1] == arity_tag and rows[row + 3] == wanted:
+                        position: mutable usize = 16
+                        for candidate in 0..<16 |position|:
+                            position <- candidate if vro_tag(candidate) == rows[row + 2]
+                        if position < arity:
+                            out.push(rows[row + 4])
+                    row <- row + vro_row()
+                return out
+
+        # Strip parentheses and `&` / `lmut` borrows: `&buf` names `buf`.
+        def vro_strip_borrow(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, _):
+                        return vro_strip_borrow(inner)
+                    Expr.Unary(operator, operand, _):
+                        expression return if operator != TokenKind.Ampersand and operator != TokenKind.Lmut
+                        return vro_strip_borrow(operand)
+                    _:
+                        return expression
