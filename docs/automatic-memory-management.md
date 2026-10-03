@@ -72,6 +72,64 @@ Each fix restores the invariant at one decision point:
 `-O2` and compares the exit code with stage0's. The pre-fix binary fails 9 of
 the gate's checks.
 
+## Module globals: generational re-homing
+
+A function with no caller-threaded arena allocates in a scratch arena that is
+freed on every exit. If its body stores into a heap-holding module global
+(`g <- v`, `g.f <- v`, `g.xs.push(v)`, `fill(&g)`), the global would point into
+that scratch. Commit 50acc4f7 restored the invariant by moving such bodies up
+the ladder to a never-freed static region. That was sound, but it leaked
+everything those bodies allocated: about 1.5 MB per Mocap Studio rebuild, and
+more per frame during mesh playback.
+
+The replacement (`codegen_global_rehome.elisa`) gives each touched global its
+own storage rung:
+
+| Storage | Freed | Decided by |
+| --- | --- | --- |
+| Global generation `g.region.{0,1}` | when `g` is re-homed a second time | `global_rehome_collect_*` |
+
+The function keeps its ordinary scratch. Just before the scratch is freed, on
+every return path and on fall-off, it calls `g.rehome(scratch)` for each global
+it touches. Each call does four things:
+
+1. `arena_adopt(scratch, spare)` moves the previous generation into the scratch,
+   so that generation is freed with the scratch.
+2. It deep-clones `g` into `spare`. String views are copied too, which cuts
+   every alias into the scratch, into caller regions and into other globals.
+3. It stores the clone back into `g`.
+4. It flips the generation bit.
+
+Each global therefore holds at most two copies of its value, no matter how
+often it is overwritten.
+
+**Contract.** A value read out of a global stays valid until that global has
+been re-homed twice. In practice that means until two later mutating calls have
+returned.
+
+**Fallback.** If a touched global's type cannot be cloned exactly (dict or set
+tables, refs, `cstr`, payload enums), the function keeps the static region.
+It still reads correctly; it only keeps the old leak.
+
+**Shadowing.** Parameters shadow globals of the same name. Without that rule,
+`LongClip::local(clip: Clip&)` looked like a store to `Studio.clip` and paid a
+clone on every call.
+
+**Rejected alternatives:**
+
+- A per-global region that is freed on overwrite. It needs escape tracking to
+  know which of the body's allocations the new value uses, and a partial store
+  never overwrites the root.
+- Reference-counted regions. They need counts maintained on every copy, which
+  this model deliberately avoids.
+
+**Cost.** One clone of each touched global per call of a mutating function.
+
+**Tests.** `test/parity/global_store_auto_region_smoke.sh` checks values.
+`test/parity/global_rehome_bounded_smoke.sh` checks that 1000 overwrites of
+128 KiB stay under 32 MiB of peak RSS: the result is 3 MB, against 262 MB with
+the static region.
+
 ## Why the current structure will not scale
 
 Today, each optimization carries its own escape proof. That includes the
