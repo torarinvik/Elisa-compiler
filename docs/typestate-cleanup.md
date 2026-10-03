@@ -107,6 +107,23 @@ no resolved family/edge authority. The metadata executable checks distinct IDs
 for two same-spelled module families, edge-to-family IDs, and the detached control.
 This is declaration resolution, not state-qualified alias lookup or ownership.
 
+The resolver now records `BindingDeclaredType` rows for function parameters and
+annotated locals: lexical `BindingId`, declared structural `type_id`, module, and
+source position. The initializer is resolved before the new local binds, and
+branch-scope reference resolution retains existing distinct binding IDs. A
+self-hosted probe checks inner shadowing, restoration of the outer owner, same
+spelling in a second function, and distinct state-qualified/ref type shapes.
+These rows are not yet ownership authority: inferred bindings, nominal alias
+resolution, and storage/capability qualifiers (including `lmut`, which the type
+interner currently erases) must be modeled before consuming transitions use them.
+
+This probe exposed a separate self-hosting diagnostic defect: raw-reference
+classification consulted an outer structural type row through an intentionally
+unknown loop/pattern binder. It now honors the scoped-binder sentinel, matching
+the inference walker. Paired controls accept the inner `sview` loop item and still
+reject the restored outer `u8&` as a string argument after the loop. This is a
+scope-classification fix, not proof of complete loop-element ownership typing.
+
 The remaining transition implementation must track values by existing lexical
 `BindingId` and resolve qualified/imported type uses and aliases to the family
 declaration ID. Do not extend
@@ -179,6 +196,10 @@ protocol-state proof alone does not prove filesystem durability or OS behavior.
   execution and retained semantic rejection; not a transition-acceptance gate.
 - `test/parity/protocol_graph_validation_smoke.sh`: paired declaration-level
   graph rejection controls, independent of the unsupported-transition guard.
+- `test/parity/typestate_binding_identity_smoke.sh`: lexical binding/type-record
+  controls; not a state-transition or full ownership-soundness gate.
+- `test/parity/binding_loop_string_shadow_smoke.sh`: paired raw-reference/string
+  boundary controls across loop shadowing and restoration.
 - Stage1: a fresh seed from this Stage0 worktree, never a stale product bypass.
 - `test/parity/typestate_foundation_smoke.sh`: paired semantic positives and
   negatives, complete LLVM emission, and named-state executables at O0/O2.
