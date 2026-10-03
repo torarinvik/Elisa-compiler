@@ -15,7 +15,7 @@ document distinguishes the target design from capabilities actually verified.
   predicate or invalidate the refinement.
 
 Initially these modes must be exclusive for a state family. A transition graph
-authorizes an operation; it is not an implementation of resource acquisition,
+authorizes a state edge, independently of function names; it is not an implementation of resource acquisition,
 release, publication, or any other effect. The legacy generated tag-writing
 functions must not become the authority for the new protocol mode.
 
@@ -44,25 +44,48 @@ a general state-set analysis over resolved places and aliases.
 ### 1. Explicit state-family metadata
 
 Introduce resolved state-family IDs, protocol/derived mode, declared states,
-construction authority, operation-specific transitions, and terminal states in
+construction authority, function-independent transition edges, and terminal states in
 both compilers. Replace protocol sentinel annotations with structured metadata;
 retain a compatibility adapter for legacy syntax until its users migrate.
 
-Required negative controls: duplicate states/operations, unknown endpoints,
+Required negative controls: duplicate states/edges, unknown endpoints,
 foreign-family states with the same spelling, ambiguous module lookup, and
 mixing protocol authority with derived predicates.
 
 ### 2. Classic construction and consuming transitions
 
-Support predicate-free `struct File[state Open | Closed]:` with an explicit legal
-transition declaration. Final constructor/transition-body syntax is not shipped
-by the foundation fixes above. Construction authority must be enforced before
-removing the existing missing-derive diagnostic.
+Support predicate-free state families with a function-independent graph:
+
+```elisa
+affine struct File[state Closed | Open]:
+    handle: i64
+    transitions:
+        Closed -> Open
+        Open -> Closed
+```
+
+Stage0 now implements this first subset. The first declared state is the initial
+construction state. Construction and `transition[Open](move file)` are restricted
+to the existing owning-module privacy domain (including child modules). Root-level
+declarations share a namespace; libraries requiring encapsulation must use a module.
+No functions are synthesized or named by the graph. Preservation needs no self-edge.
+Any independently implemented function within the authority domain can use an edge.
+Consuming transitions require linear/affine ownership and an explicitly moved local
+or parameter. A copied plain struct may declare a graph but cannot use the intrinsic.
+The payload is transferred unchanged; external effects remain separate obligations.
+
+Stage0 rejects target-state construction, direct and nested inline `zeroed`, missing
+edges, missing moves, unknown targets, old-owner reuse, and post-move borrowed aliases
+in targeted tests. LLVM lowering checks identical payload field types before
+reconstructing the destination aggregate; unsupported representations fail closed.
+Stage1 still rejects predicate-free named families. This is not a parity release;
+Stage1 must acquire equivalent structured metadata and enforcement before enabling it.
+Broader alias, control-flow, cross-module, and generic negative controls remain gates.
 
 Start with owned, consuming transitions. Accept the declared source state only;
 consume the old value; establish the target on every successful exit. Reject
 arbitrary target-state literals, annotation laundering, unauthorized transition
-functions, old-value reuse, surviving aliases, and graph edges without checked
+authority, old-value reuse, surviving aliases, and graph edges without checked
 implementations. State declaration must not permit forging native resources.
 
 ### 3. Place-based control flow and exclusive borrows
@@ -115,6 +138,8 @@ protocol-state proof alone does not prove filesystem durability or OS behavior.
 ## Current regression gates
 
 - Stage0: `go test ./src/parser ./src/semantic -count=1` from `compiler/`.
+- `test/parity/protocol_graph_stage0_smoke.sh`: Stage0-only graph round trip,
+  independent operation names, tag-free layout, and execution at O0/O2.
 - Stage1: a fresh seed from this Stage0 worktree, never a stale product bypass.
 - `test/parity/typestate_foundation_smoke.sh`: paired semantic positives and
   negatives, complete LLVM emission, and named-state executables at O0/O2.
