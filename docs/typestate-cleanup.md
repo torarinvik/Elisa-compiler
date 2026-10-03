@@ -183,6 +183,18 @@ aliases, qualified construction types, outer borrow wrappers, and negative cases
 Files with no resolved state families return unknown immediately, avoiding a second
 nominal/import traversal of every ordinary binding in self-hosted compiler builds.
 
+Explicit move operands now have `ResolvedBindingMove` source records produced by
+the lexical resolver. Whole-local identifiers, including parenthesized identifiers,
+retain their resolved `BindingId`, move span, and operand span. Shadowed names and
+same-spelled parameters in different functions cannot collapse to one owner.
+Projections, complex expressions, unresolved names, and depth exhaustion retain an
+unresolved record with no binding authority rather than guessing a root. Borrowed
+parameters can have resolved move records without becoming legal consuming inputs.
+These records are source occurrences, not an execution trace: branch/loop joins,
+implicit consumption, partial places, borrow invalidation, and legal-move decisions
+still require ownership flow analysis. The existing name-based affine checker is
+not replaced or weakened by this metadata channel.
+
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
 unknown loop/pattern binder. It now honors the scoped-binder sentinel, matching
