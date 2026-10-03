@@ -148,10 +148,19 @@ modules resolve relative to the import's declaration scope before absolute root
 fallback, and remaining path segments stay under that selected module. Executable
 controls cover inherited imports, local overrides, separate sibling imports,
 unrelated and prefix-colliding modules, duplicate aliases, nested paths, and
-relative target precedence. Selective-import lookup, chained module-alias targets,
-and generic substitution still need implementation; this channel does not yet
-authorize moves. Older file-wide import lists are deliberately not ownership
-evidence.
+relative target precedence. Selective `using Module::Type` and `from Module import
+Type` records now preserve lexical scope and individual token offsets. Capability
+lookup pairs member/source records by scope, line, and offset, resolves the source
+module in the import's scope, and ranks imports with lexical declarations. Equal
+rank conflicts, duplicate target declarations, and missing source metadata remain
+unknown; repeated imports of the same declaration do not invent ambiguity.
+Controls cover multiple members and sources on one line, inherited imports,
+nearer local declarations, sibling isolation, conflicting sources, and relative
+module precedence. A sparse import-only table prevents per-binding scans of the
+complete fields/effects/generics annotation stream. Wildcard imports, chained
+module-alias targets, and generic substitution still need implementation; this
+channel does not yet authorize moves. Older file-wide import lists are deliberately
+not ownership evidence.
 
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
