@@ -82,6 +82,16 @@ Stage1 still rejects predicate-free named families. This is not a parity release
 Stage1 must acquire equivalent structured metadata and enforcement before enabling it.
 Broader alias, control-flow, cross-module, and generic negative controls remain gates.
 
+Stage1's parser now preserves structured `StateFamily` and `StateTransitionEdge`
+rows in `Ast::File`, keyed by owning module, declaration name, and declaration
+line. The semantic loop-view copy preserves both tables. Its transition block
+parser creates no operation declarations. An executable self-hosted parser probe
+checks state order, affinity, both edges, unchanged declaration count, metadata
+preservation, and two same-named families in distinct modules. This is parser
+infrastructure only: the missing-derive guard and unsupported-intrinsic errors
+remain until Stage1 ownership, construction authority, graph checks, provenance,
+and backend lowering are implemented together.
+
 Start with owned, consuming transitions. Accept the declared source state only;
 consume the old value; establish the target on every successful exit. Reject
 arbitrary target-state literals, annotation laundering, unauthorized transition
@@ -140,6 +150,8 @@ protocol-state proof alone does not prove filesystem durability or OS behavior.
 - Stage0: `go test ./src/parser ./src/semantic -count=1` from `compiler/`.
 - `test/parity/protocol_graph_stage0_smoke.sh`: Stage0-only graph round trip,
   independent operation names, tag-free layout, and execution at O0/O2.
+- `test/parity/protocol_graph_metadata_smoke.sh`: self-hosted Stage1 metadata
+  execution and retained semantic rejection; not a transition-acceptance gate.
 - Stage1: a fresh seed from this Stage0 worktree, never a stale product bypass.
 - `test/parity/typestate_foundation_smoke.sh`: paired semantic positives and
   negatives, complete LLVM emission, and named-state executables at O0/O2.
