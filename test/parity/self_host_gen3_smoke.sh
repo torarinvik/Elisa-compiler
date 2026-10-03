@@ -83,6 +83,10 @@ BASELINE_GEN3_RC="${BASELINE_GEN3_RC:-0}"
 # bootstrap work as a regression. Keep the bound finite, but make the default
 # large enough for a normal host rather than a tiny fixture probe.
 DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=600
+# The Linux gate hosts are slower per core for this input: on a 4 vCPU x86_64 container the
+# -O0 gen2 needs well over 600 s for stage B alone (the whole check took 2600 s with a 3600 s
+# bound and passed every stage), so 600 s reported a healthy bootstrap as "closure BROKE".
+if [[ "$(uname -s)" == "Linux" ]]; then DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=3600; fi
 DEFAULT_SELF_HOST_PROBE_POLL_SECONDS=0.05
 SELF_HOST_PROBE_TIMEOUT_SECONDS="${SELF_HOST_PROBE_TIMEOUT_SECONDS:-$DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS}"
 SELF_HOST_PROBE_POLL_SECONDS="${SELF_HOST_PROBE_POLL_SECONDS:-$DEFAULT_SELF_HOST_PROBE_POLL_SECONDS}"
