@@ -416,10 +416,18 @@ consuming-transition guard remains enabled until those obligations are met.
 
 Passing native controls under `ownership_control_flow_smoke.sh` cover repeated moves,
 independent branch joins, returning branches, lexical shadowing and dead paths.
-The pending `darray_extend_reassignment_smoke.sh` separately exercises the same-place fluent
+`darray_extend_reassignment_smoke.sh` separately exercises the same-place fluent
 append lowering required to collect observations, including empty inputs and
-self-extension; a different target must decline. These gates must pass before
-the broader append behavior is described as verified. That gate currently declines
-in its positive control; the exact failing call still needs isolation. The
-ownership-flow fixture itself compiles and runs using the new same-place append
-lowering, but does not establish general append-call or self-extension parity.
+self-extension at O0/O2; a different target declines with the driver's documented
+backend-decline exit code 2 and no emitted artifact. The initial gate wrongly
+expected exit code 1 for that intentional rejection. Tracing confirmed both
+positive builds/runs succeeded; the earlier positive-failure attribution was
+incorrect. This establishes the tested append forms, not general call parity.
+
+The local append control now pushes past the literal's initial capacity and
+self-appends 308 elements, checking all 616 resulting entries at O0/O2. The
+constructor isolation probe also passes. An independent OPEN regression,
+`darray_rows_binding_collision_open.elisa`, changes an included stdlib function's
+return-type diagnostic merely by naming a main-local array `rows`; the renamed
+control passes. This spelling-sensitive type channel must be repaired before
+it can contribute ownership/typestate authority.
