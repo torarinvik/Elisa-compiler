@@ -358,10 +358,13 @@ These record operations are not yet connected to the AST control-flow walker.
 They do not establish borrow invalidation, affine type eligibility, state edges,
 or legal native effects, and do not enable Stage1 consuming transitions.
 
-`ownership_binding_identity.elisa` dogfoods the actual identity helpers. Its
-producer proves 21/21 obligations but independent replay currently admits only
-20/21: `serial_zero_is_valid`, which instantiates the summary with a nested
-BindingId/DeclId record, remains OPEN. `check_ownership_binding_identity.py`
-tracks that exact gap and explicitly reports `admitted: false`; it is not a
-green admission gate. Fix the kernel replay gap before citing this client law
-as proved. The separate Boolean domain admission gate remains fully replayed.
+`ownership_binding_identity.elisa` dogfoods the actual identity helpers and now
+passes 21/21 obligations with 21/21 independent replay. The earlier 20/21 gap
+was a missing constructor case in replay's exact-expression comparator, not a
+false law or a required extra assumption. Replay now checks nominal type,
+field order/names/count and nested initializers exactly. The source law was not
+weakened. `check_ownership_binding_identity.py` is an admission gate with repeated
+reports, freshness/source hashes, zero replay gaps, and three false identity
+claims rejected. `ownership_identity_replay_probe.elisa` also checks the scalar
+comparison/summary control (6/6 replay), isolating the former record-specific
+failure. This establishes identity laws, not the control-flow ownership walker.
