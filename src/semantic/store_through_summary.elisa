@@ -1,0 +1,318 @@
+# Which arguments a call may store THROUGH a `mutable T&` parameter. `ea(out, r)` with
+# `out.push(r)` stores the second argument into the first one's pointee, so a caller that
+# passes its own reference parameter as `out` and `&local` as `r` leaves the caller's caller
+# holding a pointer into a dead frame. The callee's own checks accept the store (both are
+# its parameters), so the CALLER checks it: stage0's queueCallArgumentStoreChecks with the
+# callArgNeverReaches summary.
+#
+# Rows are flat triples (function, target position, source position): the source argument's
+# contents may reach the target parameter's pointee. Only a "writable" target is summarised:
+# a `mutable T&` parameter whose pointee type can hold a reference. Within one function the
+# flow is a flow-INSENSITIVE union of names -- every assignment, declaration, method call and
+# unknown call unifies the names it mentions, a call to a summarised function unifies just
+# the argument pairs its rows name -- so the summary over-approximates and never misses a
+# store this walk can see. Same-named functions are not summarised (name-only resolution),
+# and a call to one is not checked.
+#
+# The summary is the LEAST fixpoint over all functions: every function starts with no rows
+# and rounds add rows until none is added. Rows only grow and are bounded, so it terminates;
+# mutual recursion (`eb -> ea -> eb`) converges to the same rows in any declaration order.
+extend Semantic:
+    private:
+        struct StoreThroughSummary:
+            # Unique-declared function names (overloads are excluded).
+            declared: mutable darray[sview]
+            # One row per writable parameter: (function, position).
+            writable_function: mutable darray[sview]
+            writable_position: mutable darray[usize]
+            # One row per (function, target, source) that may store through the target.
+            pair_function: mutable darray[sview]
+            pair_target: mutable darray[usize]
+            pair_source: mutable darray[usize]
+
+        def sts_empty() -> StoreThroughSummary:
+            can Memory.Allocate, Abort.Panic:
+                return StoreThroughSummary{declared: [], writable_function: [], writable_position: [], pair_function: [], pair_target: [], pair_source: []}
+
+        def sts_is_writable(summary: StoreThroughSummary&, function_name: sview, position: usize) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                row: mutable usize = 0
+                while row < summary.writable_function.count |row|:
+                    return true if summary.writable_function[row] == function_name and summary.writable_position[row] == position
+                    row <- row + 1
+                return false
+
+        def sts_has_writable(summary: StoreThroughSummary&, function_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return any writable_name in summary.writable_function where writable_name == function_name
+
+        def sts_has_pair(summary: StoreThroughSummary&, function_name: sview, target: usize, source: usize) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                row: mutable usize = 0
+                while row < summary.pair_function.count |row|:
+                    return true if summary.pair_function[row] == function_name and summary.pair_target[row] == target and summary.pair_source[row] == source
+                    row <- row + 1
+                return false
+
+        # Every name an expression mentions, at any depth (`f(a.b[i], &c)` -> f, a, i, c).
+        def sts_collect_names(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        out.push(name) if name != ""
+                    Expr.Field(object, _, _):
+                        sts_collect_names(object, out)
+                    Expr.Index(object, index, _):
+                        sts_collect_names(object, out)
+                        sts_collect_names(index, out)
+                    Expr.IndexN(object, arguments, _):
+                        sts_collect_names(object, out)
+                        for argument in arguments |out|:
+                            sts_collect_names(argument, out)
+                    Expr.Slice(object, low, high, _):
+                        sts_collect_names(object, out)
+                        sts_collect_names(low, out)
+                        sts_collect_names(high, out)
+                    Expr.Call(callee, arguments, _, _):
+                        sts_collect_names(callee, out)
+                        for argument in arguments |out|:
+                            sts_collect_names(argument, out)
+                    Expr.Binary(left, _, right, _):
+                        sts_collect_names(left, out)
+                        sts_collect_names(right, out)
+                    Expr.Unary(_, operand, _):
+                        sts_collect_names(operand, out)
+                    Expr.Move(operand, _):
+                        sts_collect_names(operand, out)
+                    Expr.Paren(inner, _):
+                        sts_collect_names(inner, out)
+                    Expr.Array(elements, _):
+                        for element in elements |out|:
+                            sts_collect_names(element, out)
+                    Expr.Tuple(elements, _):
+                        for element in elements |out|:
+                            sts_collect_names(element, out)
+                    Expr.SetLit(elements, _):
+                        for element in elements |out|:
+                            sts_collect_names(element, out)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |out|:
+                            sts_collect_names(field.value, out)
+                    Expr.RecordUpdate(base, fields, _):
+                        sts_collect_names(base, out)
+                        for field in fields |out|:
+                            sts_collect_names(field.value, out)
+                    Expr.If(condition, then_value, else_value, _):
+                        sts_collect_names(condition, out)
+                        sts_collect_names(then_value, out)
+                        sts_collect_names(else_value, out)
+                    _:
+                        pass
+
+        def sts_class_of(names: mutable darray[sview]&, classes: mutable darray[usize]&, name: sview) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                row: mutable usize = 0
+                while row < names.count |row|:
+                    return classes[row] if names[row] == name
+                    row <- row + 1
+                names.push(name)
+                classes.push(names.count)
+                return names.count
+
+        def sts_unify(names: mutable darray[sview]&, classes: mutable darray[usize]&, first: sview, second: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                kept: usize = sts_class_of(names, classes, first)
+                merged: usize = sts_class_of(names, classes, second)
+                return if kept == merged
+                row: mutable usize = 0
+                while row < classes.count |row, classes|:
+                    classes[row] <- kept if classes[row] == merged
+                    row <- row + 1
+
+        def sts_unify_all(names: mutable darray[sview]&, classes: mutable darray[usize]&, mentioned: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if mentioned.count < 2
+                for other in mentioned |names, classes|:
+                    sts_unify(names, classes, mentioned[0], other)
+
+        # Calls anywhere inside EXPRESSION: a summarised callee unifies its stored argument
+        # pairs, a method call or any other call unifies everything it was handed.
+        def sts_unify_calls(expression: Ast::Expr, summary: StoreThroughSummary&, names: mutable darray[sview]&, classes: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        for argument in arguments |names, classes|:
+                            sts_unify_calls(argument, summary, names, classes)
+                        match callee:
+                            Expr.Ident(callee_name, _):
+                                if any declared_name in summary.declared where declared_name == callee_name:
+                                    row: mutable usize = 0
+                                    while row < summary.pair_function.count |row, names, classes|:
+                                        if summary.pair_function[row] == callee_name and summary.pair_target[row] < arguments.count and summary.pair_source[row] < arguments.count:
+                                            pair_names: mutable darray[sview] = []
+                                            sts_collect_names(arguments[summary.pair_target[row]], pair_names)
+                                            sts_collect_names(arguments[summary.pair_source[row]], pair_names)
+                                            sts_unify_all(names, classes, pair_names)
+                                        row <- row + 1
+                                    return
+                            _:
+                                pass
+                        call_names: mutable darray[sview] = []
+                        match callee:
+                            Expr.Field(receiver, _, _):
+                                sts_collect_names(receiver, call_names)
+                            _:
+                                pass
+                        for argument in arguments |call_names|:
+                            sts_collect_names(argument, call_names)
+                        sts_unify_all(names, classes, call_names)
+                    Expr.Field(object, _, _):
+                        sts_unify_calls(object, summary, names, classes)
+                    Expr.Index(object, index, _):
+                        sts_unify_calls(object, summary, names, classes)
+                        sts_unify_calls(index, summary, names, classes)
+                    Expr.Binary(left, _, right, _):
+                        sts_unify_calls(left, summary, names, classes)
+                        sts_unify_calls(right, summary, names, classes)
+                    Expr.Unary(_, operand, _):
+                        sts_unify_calls(operand, summary, names, classes)
+                    Expr.Move(operand, _):
+                        sts_unify_calls(operand, summary, names, classes)
+                    Expr.Paren(inner, _):
+                        sts_unify_calls(inner, summary, names, classes)
+                    Expr.If(condition, then_value, else_value, _):
+                        sts_unify_calls(condition, summary, names, classes)
+                        sts_unify_calls(then_value, summary, names, classes)
+                        sts_unify_calls(else_value, summary, names, classes)
+                    _:
+                        # Anything this walk does not open (a lambda, a block or match value)
+                        # may store anything it mentions anywhere.
+                        hidden_names: mutable darray[sview] = []
+                        sts_collect_names(expression, hidden_names)
+                        sts_unify_all(names, classes, hidden_names)
+
+        def sts_unify_bound(name: sview, value: Ast::Expr, summary: StoreThroughSummary&, names: mutable darray[sview]&, classes: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bound_names: mutable darray[sview] = []
+                bound_names.push(name) if name != ""
+                sts_collect_names(value, bound_names)
+                sts_unify_all(names, classes, bound_names)
+                sts_unify_calls(value, summary, names, classes)
+
+        def sts_statements(statements: darray[Ast::Stmt], summary: StoreThroughSummary&, names: mutable darray[sview]&, classes: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, classes|:
+                    match statement:
+                        Stmt.VarDecl(declared_name, _, declared_value, _):
+                            sts_unify_bound(declared_name, declared_value, summary, names, classes)
+                        Stmt.Assign(assign_target, _, assign_value, _):
+                            assign_names: mutable darray[sview] = []
+                            sts_collect_names(assign_target, assign_names)
+                            sts_collect_names(assign_value, assign_names)
+                            sts_unify_all(names, classes, assign_names)
+                            sts_unify_calls(assign_target, summary, names, classes)
+                            sts_unify_calls(assign_value, summary, names, classes)
+                        Stmt.Expr(statement_value, _):
+                            sts_unify_calls(statement_value, summary, names, classes)
+                        Stmt.Return(returned, _):
+                            if returned is returned_value:
+                                sts_unify_calls(returned_value, summary, names, classes)
+                        Stmt.If(condition, then_body, else_body, _):
+                            sts_unify_calls(condition, summary, names, classes)
+                            sts_statements(then_body, summary, names, classes)
+                            sts_statements(else_body, summary, names, classes)
+                        Stmt.While(condition, loop_body, _):
+                            sts_unify_calls(condition, summary, names, classes)
+                            sts_statements(loop_body, summary, names, classes)
+                        Stmt.For(_, loop_variables, iterable, loop_body, _):
+                            for loop_variable in loop_variables |names, classes|:
+                                sts_unify_bound(loop_variable, iterable, summary, names, classes)
+                            sts_unify_calls(iterable, summary, names, classes)
+                            sts_statements(loop_body, summary, names, classes)
+                        Stmt.Block(_, _, _, block_body, _):
+                            sts_statements(block_body, summary, names, classes)
+                        Stmt.Match(scrutinee, arms, _):
+                            # Arm binders are not read here: they join the scrutinee through
+                            # any later statement that mentions both, and a binder stored into a
+                            # parameter is unified with that parameter by the store itself.
+                            sts_unify_calls(scrutinee, summary, names, classes)
+                            for arm in arms |names, classes|:
+                                sts_statements(arm.body, summary, names, classes)
+                        _:
+                            pass
+
+        def sts_collect_declared(declarations: darray[Ast::Decl], seen: mutable darray[sview]&, functions: mutable darray[Ast::Decl]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |seen, functions|:
+                    match declaration:
+                        Decl.Func(function_name, _, _, _, _, _, _):
+                            seen.push(function_name)
+                            functions.push(declaration)
+                        Decl.Module(_, module_body, _):
+                            sts_collect_declared(module_body, seen, functions)
+                        Decl.Scoped(scoped_body, _):
+                            sts_collect_declared(scoped_body, seen, functions)
+                        _:
+                            pass
+
+        # The rows one function adds under SUMMARY; true when any row is new.
+        def sts_summarise_function(function_name: sview, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt], summary: mutable StoreThroughSummary&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                classes: mutable darray[usize] = []
+                sts_statements(body, summary, names, classes)
+                added: mutable bool = false
+                target: mutable usize = 0
+                while target < parameters.count |target, names, classes, added, summary|:
+                    if sts_is_writable(summary, function_name, target):
+                        target_class: usize = sts_class_of(names, classes, parameters[target].name)
+                        source: mutable usize = 0
+                        while source < parameters.count |source, names, classes, added, summary|:
+                            if source != target and sts_class_of(names, classes, parameters[source].name) == target_class and not sts_has_pair(summary, function_name, target, source):
+                                summary.pair_function.push(function_name)
+                                summary.pair_target.push(target)
+                                summary.pair_source.push(source)
+                                added <- true
+                            source <- source + 1
+                    target <- target + 1
+                return added
+
+    public:
+        def build_store_through_summary(declarations: darray[Ast::Decl], table: mutable SymbolTable&) -> StoreThroughSummary:
+            can Memory.Allocate, Abort.Panic:
+                summary: mutable StoreThroughSummary = sts_empty()
+                seen: mutable darray[sview] = []
+                functions: mutable darray[Ast::Decl] = []
+                sts_collect_declared(declarations, seen, functions)
+                summarised: mutable darray[Ast::Decl] = []
+                for function in functions |summary, seen, summarised, table|:
+                    match function:
+                        Decl.Func(function_name, function_parameters, _, _, _, _, _):
+                            if borrow_bound_once(seen, function_name):
+                                summary.declared.push(function_name)
+                                position: mutable usize = 0
+                                writable_found: mutable bool = false
+                                for parameter in function_parameters |position, writable_found, summary, table|:
+                                    if param_is_mutable_ref(parameter):
+                                        visited_types: mutable darray[u32] = []
+                                        pointee: u32 = bam_strip_ref(annotation_type_id(parameter.type_expression, table), table)
+                                        if bam_type_contains_reference(pointee, visited_types, table):
+                                            summary.writable_function.push(function_name)
+                                            summary.writable_position.push(position)
+                                            writable_found <- true
+                                    position <- position + 1
+                                summarised.push(function) if writable_found and function_parameters.count > 1
+                        _:
+                            pass
+                # Only functions with a writable parameter carry rows; every other declared
+                # function is summarised as storing nothing through a writable parameter.
+                more_rows: mutable bool = summarised.count > 0
+                while more_rows |more_rows, summary|:
+                    more_rows <- false
+                    for function in summarised |more_rows, summary|:
+                        match function:
+                            Decl.Func(function_name, function_parameters, _, function_body, _, _, _):
+                                more_rows <- true if sts_summarise_function(function_name, function_parameters, function_body, summary)
+                            _:
+                                pass
+                return summary
