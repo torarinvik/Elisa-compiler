@@ -107,21 +107,34 @@ extend Semantic:
                         return false
 
         # The storage a view-producing ARGUMENT points into, as an `&PLACE[..]` borrow:
-        # `x.as_sview()` / `x.as_cstr()` / `x.view()` -> (true, x[..]), `x[a:b]` -> (true, x[a:b]).
-        # Anything else is returned unchanged.
-        def exclusivity_view_borrow(argument: Ast::Expr) -> (address: bool, place: Ast::Expr):
+        # `x.as_sview()` / `x.as_cstr()` / `x.view()` -> (true, x[..]), `x[a:b]` -> (true, x[a:b]),
+        # when `x` is a container local or parameter (a row of the ref-local tables whose place is
+        # Absent:
+        # a darray/dstr/set/dict that owns the buffer the view points into; slicing an sview views
+        # ITS bytes instead). Anything else is returned unchanged.
+        def exclusivity_view_borrow(argument: Ast::Expr, ref_names: darray[sview]&, ref_places: darray[Ast::Expr]&) -> (address: bool, place: Ast::Expr):
             can Memory.Allocate, Abort.Panic:
                 match argument:
                     Expr.Paren(inner, _):
-                        return exclusivity_view_borrow(inner)
+                        return exclusivity_view_borrow(inner, ref_names, ref_places)
                     Expr.Call(Expr.Field(receiver, method, method_pos), call_arguments, _, _):
-                        if call_arguments.count == 0 and (method == "as_sview" or method == "as_cstr" or method == "view"):
+                        if call_arguments.count == 0 and (method == "as_sview" or method == "as_cstr" or method == "view") and exclusivity_is_container_name(exclusivity_ident_name(receiver), ref_names, ref_places):
                             return (true, Ast::Expr.Slice(receiver, Ast::Expr.Absent, Ast::Expr.Absent, method_pos))
                         return (false, argument)
-                    Expr.Slice(_, _, _, _):
-                        return (true, argument)
+                    Expr.Slice(slice_object, _, _, _):
+                        return (true, argument) if exclusivity_is_container_name(exclusivity_ident_name(slice_object), ref_names, ref_places)
+                        return (false, argument)
                     _:
                         return (false, argument)
+
+        def exclusivity_is_container_name(name: sview, ref_names: darray[sview]&, ref_places: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if name == ""
+                index: mutable usize = 0
+                while index < ref_names.count |index|:
+                    return true if ref_names[index] == name and (ref_places[index] is Expr.Absent)
+                    index <- index + 1
+                return false
 
         # Whether the referent of TYPE_EXPRESSION is a generic container instantiation
         # (`darray[T]`, `dict[K, V]`, ...). The backend never stamps `noalias` on those, and a
@@ -310,7 +323,11 @@ extend Semantic:
                     ref_names.push(name)
                     ref_places.push(initial.place)
                     return
-                viewed: (address: bool, place: Ast::Expr) = exclusivity_view_borrow(value)
+                if chv_type_is_owned_container(type_expression) and not type_marker_present_here(type_expression, TokenKind.Ampersand):
+                    ref_names.push(name)
+                    ref_places.push(Ast::Expr.Absent)
+                    return
+                viewed: (address: bool, place: Ast::Expr) = exclusivity_view_borrow(value, ref_names, ref_places)
                 if viewed.address:
                     ref_names.push(name)
                     ref_places.push(viewed.place)
@@ -318,6 +335,7 @@ extend Semantic:
                 return if not type_marker_present_here(type_expression, TokenKind.Ampersand)
                 source: usize = exclusivity_ref_slot(ref_names, exclusivity_ident_name(value))
                 return if source == ref_names.count
+                return if ref_places[source] is Expr.Absent
                 chained: Ast::Expr = ref_places[source]
                 ref_names.push(name)
                 ref_places.push(chained)
@@ -376,6 +394,11 @@ extend Semantic:
                     exclusivity_note_binder(parameter.name, binders, repeated)
                 candidate_names: mutable darray[sview] = []
                 candidate_places: mutable darray[Ast::Expr] = []
+                # A by-value container parameter owns the buffer its views point into.
+                for parameter in parameters |candidate_names, candidate_places|:
+                    if chv_type_is_owned_container(parameter.type_expression) and not type_marker_present_here(parameter.type_expression, TokenKind.Ampersand):
+                        candidate_names.push(parameter.name)
+                        candidate_places.push(Ast::Expr.Absent)
                 exclusivity_scan_ref_statements(body, binders, repeated, assigned, candidate_names, candidate_places)
                 index: mutable usize = 0
                 while index < candidate_names.count |index|:
@@ -391,6 +414,8 @@ extend Semantic:
                 return stripped if stripped.address
                 slot: usize = exclusivity_ref_slot(ref_names, exclusivity_ident_name(stripped.place))
                 return stripped if slot == ref_names.count
+                # A container row (place Absent) only marks a buffer-owning name.
+                return stripped if ref_places[slot] is Expr.Absent
                 return (true, ref_places[slot])
 
         def exclusivity_check_call(callee_name: sview, arguments: darray[Ast::Expr], argument_names: darray[sview], function_names: darray[sview]&, starts: darray[usize]&, counts: darray[usize]&, params: darray[Ast::ParamDecl]&, ref_names: darray[sview]&, ref_places: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
@@ -412,7 +437,7 @@ extend Semantic:
                     slot: usize = exclusivity_argument_slot(argument_names, argument_index, params, param_start, param_count)
                     stripped: mutable (address: bool, place: Ast::Expr) = exclusivity_resolve_ref_local(exclusivity_strip_address(argument), ref_names, ref_places)
                     if not stripped.address and slot < param_count and exclusivity_param_is_view(params[param_start + slot]):
-                        stripped <- exclusivity_view_borrow(argument)
+                        stripped <- exclusivity_view_borrow(argument, ref_names, ref_places)
                     first_step: usize = kinds.count
                     roots.push(exclusivity_place(stripped.place, kinds, names, values))
                     addressed.push(stripped.address)
@@ -464,7 +489,8 @@ extend Semantic:
                         return if not exclusivity_param_is_ref(params[starts[function_index]])
                         # A resolved ref local already names its referent; anything else is
                         # borrowed in place.
-                        receiver_is_ref_local: bool = exclusivity_ref_slot(ref_names, exclusivity_ident_name(object)) < ref_names.count
+                        receiver_slot: usize = exclusivity_ref_slot(ref_names, exclusivity_ident_name(object))
+                        receiver_is_ref_local: bool = receiver_slot < ref_names.count and not (ref_places[receiver_slot] is Expr.Absent)
                         receiver: Ast::Expr = object if receiver_is_ref_local else Ast::Expr.Unary(TokenKind.Ampersand, object, field_position)
                         with_receiver: mutable darray[Ast::Expr] = [receiver]
                         for argument in arguments |with_receiver|:
