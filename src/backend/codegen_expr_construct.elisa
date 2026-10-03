@@ -89,6 +89,47 @@ extend Backend:
                 _:
                     return 0
 
+        # The standalone component runtime intentionally does not include the native
+        # prelude's StringView declaration. Preserve its source-level field spelling while
+        # constructing the same builtin `{ptr, i64}` value as `sview` directly.
+        def emit_stringview_record_value(fields: darray[Ast::FieldInit], expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if expected.kind != TypeKind.SView and expected.kind != TypeKind.Unmodeled
+            sview_type: ValueType = ValueType{kind: TypeKind.SView, bits: 0}
+            sview_llvm: LLVMTypeRef = llvm_type_of(sview_type, structs, ctx)
+            sview_value: mutable LLVMValueRef = LLVMConstNull(sview_llvm)
+            supplied: mutable darray[bool] = [false, false]
+            data_type: ValueType = intern_ref_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs)
+            length_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+            order: mutable u32 = 0
+            declined: mutable bool = false
+            for field in fields |supplied, order, data_type, length_type, sview_value, local_scope, fns, structs, generics, runtime, m, ctx, builder, declined|:
+                position: mutable i64 = -1
+                if field.name == "":
+                    position <- order.i64()
+                elif field.name == "data":
+                    position <- 0
+                elif field.name == "len":
+                    position <- 1
+                order <- order + 1
+                if position < 0 or position >= 2:
+                    declined <- true
+                elif supplied[position.usize()]:
+                    declined <- true
+                elif position == 0:
+                    if emit_expression_coerced(field.value, data_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_value:
+                        supplied[0] <- true
+                        sview_value <- LLVMBuildInsertValue(builder, sview_value, field_value, 0, "stringview.data")
+                    else:
+                        declined <- true
+                else:
+                    if emit_expression_coerced(field.value, length_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_value:
+                        supplied[1] <- true
+                        sview_value <- LLVMBuildInsertValue(builder, sview_value, field_value, 1, "stringview.len")
+                    else:
+                        declined <- true
+            null return if declined
+            return sview_value
+
         def emit_expression_record_and_construct(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             match expression:
                 Expr.RecordUpdate(ru_base, ru_fields, ru_line):
@@ -118,6 +159,9 @@ extend Backend:
                     pass
             match expression:
                 Expr.Construct(construct_type, construct_fields, construct_line):
+                    if construct_type is Expr.Ident(construct_name, construct_name_line):
+                        if construct_name == "StringView":
+                            return emit_stringview_record_value(construct_fields, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     built_type: mutable ValueType = annotation_value_type(construct_type, structs)
                     # Arena has a dedicated ABI type, but its field registry is
                     # the runtime's declared struct (as for arena field reads).
@@ -131,6 +175,48 @@ extend Backend:
                     # use the same anonymous `{ptr, i64}` LLVM type as every `sview` signature;
                     # returning `%StringView` where the function returns `{ptr, i64}` is invalid.
                     built_type <- ValueType{kind: TypeKind.SView, bits: 0} if structs.names[struct_slot] == "StringView"
+
+                    # LLVM's anonymous sview value and the named StringView struct are
+                    # layout-compatible but not interchangeable as pointer-to-aggregate types.
+                    # Build the ABI value directly instead of using the generic struct spill.
+                    if structs.names[struct_slot] == "StringView":
+                        null return if structs.field_count[struct_slot] != 2
+                        sview_llvm: LLVMTypeRef = llvm_type_of(built_type, structs, ctx)
+                        sview_value: mutable LLVMValueRef = LLVMConstNull(sview_llvm)
+                        sview_supplied: mutable darray[bool] = []
+                        for _ in 0..<structs.field_count[struct_slot] |sview_supplied|:
+                            sview_supplied.push(false)
+                        sview_order: mutable u32 = 0
+                        sview_declined: mutable bool = false
+                        for sview_field in construct_fields |sview_supplied, sview_order, struct_slot, structs, sview_llvm, sview_value, local_scope, fns, generics, runtime, m, ctx, builder, sview_declined|:
+                            sview_position: mutable i64 = field_index_of(structs, struct_slot, sview_field.name)
+                            sview_position <- sview_order.i64() if sview_field.name == ""
+                            sview_order <- sview_order + 1
+                            if sview_position < 0 or sview_position >= structs.field_count[struct_slot].i64():
+                                sview_declined <- true
+                            else:
+                                sview_slot: usize = structs.field_start[struct_slot] + sview_position.usize()
+                                sview_field_type: ValueType = structs.field_types[sview_slot]
+                                sview_supplied[sview_position.usize()] <- true
+                                if emit_expression_coerced(sview_field.value, sview_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_field_value:
+                                    sview_value <- LLVMBuildInsertValue(builder, sview_value, sview_field_value, sview_position.u32(), "sview.construct.field")
+                                else:
+                                    sview_declined <- true
+                        null return if sview_declined
+                        for sview_default_position in 0..<sview_supplied.count |sview_supplied, sview_llvm, sview_value, local_scope, fns, structs, generics, runtime, m, ctx, builder, sview_declined|:
+                            if not sview_supplied[sview_default_position]:
+                                sview_default_slot: usize = structs.field_start[struct_slot] + sview_default_position
+                                sview_default_row: i64 = field_default_row(structs, structs.names[struct_slot], structs.field_names[sview_default_slot])
+                                if sview_default_row >= 0:
+                                    sview_default_type: ValueType = structs.field_types[sview_default_slot]
+                                    sview_default_expr: Expr = structs.field_default_values[sview_default_row.usize()]
+                                    if not is_zeroed_literal(sview_default_expr):
+                                        if emit_expression(sview_default_expr, sview_default_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_default_value:
+                                            sview_value <- LLVMBuildInsertValue(builder, sview_value, sview_default_value, sview_default_position.u32(), "sview.construct.default")
+                                        else:
+                                            sview_declined <- true
+                        null return if sview_declined
+                        return sview_value
 
                     struct_llvm: LLVMTypeRef = llvm_type_of(built_type, structs, ctx)
                     temporary: LLVMValueRef = build_entry_alloca(builder, struct_llvm, "construct")
