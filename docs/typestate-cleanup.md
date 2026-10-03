@@ -195,6 +195,24 @@ implicit consumption, partial places, borrow invalidation, and legal-move decisi
 still require ownership flow analysis. The existing name-based affine checker is
 not replaced or weakened by this metadata channel.
 
+`ownership_flow_domain.elisa` defines the Boolean components for possibility-set
+joins (OR), knownness joins (AND), and the liveness portion of move eligibility
+(`known and may_live and not may_consumed`). Its complete truth tables execute
+inside the binding regression. Borrow exclusivity, affinity, matching BindingIds,
+state legality, and reachability are separate caller obligations; this module is
+not yet integrated into a control-flow ownership checker or transition admission.
+
+`test/proofs/ownership_flow_domain.elisa` imports that exact implementation rather
+than a copied model. Its `elisa-proof` baseline remains **OPEN: 24/32 obligations**,
+with 24/24 independently replayed certificates and no trusted assumptions. The
+implementation bodies and five client properties verify; eight client declarations
+(including associativity, idempotence and commutativity) remain unverified. Four
+false claims reject. `check_ownership_flow.py` checks repeatability, source/product
+hashes, replay coverage and the explicit OPEN status; a successful baseline check
+is not proof admission. Prover logical-Boolean-equation support raised coverage
+from 19 to 24 obligations without changing budgets or weakening these claims.
+Complete these laws and the consumed-input client before claiming the domain proved.
+
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
 unknown loop/pattern binder. It now honors the scoped-binder sentinel, matching
