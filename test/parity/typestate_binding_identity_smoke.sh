@@ -19,4 +19,4 @@ else
     echo "binding identity probe failed control $status" >&2
     exit "$status"
 fi
-echo 'Stage1 binding/alias capabilities OK: retained annotations, type-alias chains, scoped module/selective/wildcard imports, same-line pairing, lexical precedence, inherited wildcard conflicts, sibling isolation, sparse import metadata, cyclic/ambiguous aliases remain unknown'
+echo 'Stage1 binding identities/capabilities OK: canonical family/state identities through aliases/imports, retained annotations, scoped imports, lexical precedence, inherited wildcard conflicts, sibling isolation, sparse metadata, invalid/cyclic/ambiguous cases remain unknown'

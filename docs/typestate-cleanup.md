@@ -167,6 +167,22 @@ Chained module-alias targets and generic substitution still need implementation;
 channel does not yet authorize moves. Older file-wide import lists are deliberately
 not ownership evidence.
 
+Each declared binding now also carries `BindingStateIdentity`: a canonical family
+`DeclId`, state ordinal in that family's declaration, and protocol/derived mode.
+The full semantic-check and reference-resolution paths populate resolved family
+metadata before binding resolution, not only declaration-only symbol collection.
+Single named-state applications resolve through qualified/imported type heads and
+non-generic alias chains in each alias's declaration scope. Explicit reference and
+`lmut` wrappers preserve state identity without changing their borrow capabilities.
+Unknown states, duplicate occurrences of the queried state, cycles, unqualified
+bare families, unrelated containers, and unsupported generic/union applications
+remain unknown. These records identify annotations; they do not certify graph
+validity, establish runtime state, or authorize consuming transitions. Executable
+controls distinguish state ordinals, same-spelled families across modules, imported
+aliases, qualified construction types, outer borrow wrappers, and negative cases.
+Files with no resolved state families return unknown immediately, avoiding a second
+nominal/import traversal of every ordinary binding in self-hosted compiler builds.
+
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
 unknown loop/pattern binder. It now honors the scoped-binder sentinel, matching
