@@ -151,14 +151,19 @@ unrelated and prefix-colliding modules, duplicate aliases, nested paths, and
 relative target precedence. Selective `using Module::Type` and `from Module import
 Type` records now preserve lexical scope and individual token offsets. Capability
 lookup pairs member/source records by scope, line, and offset, resolves the source
-module in the import's scope, and ranks imports with lexical declarations. Equal
-rank conflicts, duplicate target declarations, and missing source metadata remain
+module in the import's scope. Non-root lexical declarations take precedence;
+visible imports form a combined lookup tier before root fallback. Conflicts,
+duplicate target declarations, and missing source metadata remain
 unknown; repeated imports of the same declaration do not invent ambiguity.
 Controls cover multiple members and sources on one line, inherited imports,
 nearer local declarations, sibling isolation, conflicting sources, and relative
 module precedence. A sparse import-only table prevents per-binding scans of the
-complete fields/effects/generics annotation stream. Wildcard imports, chained
-module-alias targets, and generic substitution still need implementation; this
+complete fields/effects/generics annotation stream. Wildcard imports now use an
+explicit scoped marker, distinct from module aliases. Resolved wildcard modules
+without the requested member contribute nothing. Controls cover multiple wildcard
+sources, inherited imports and conflicts, sibling/prefix isolation, lexical
+precedence, repeated imports, and the absence of unqualified leakage from aliases.
+Chained module-alias targets and generic substitution still need implementation; this
 channel does not yet authorize moves. Older file-wide import lists are deliberately
 not ownership evidence.
 
