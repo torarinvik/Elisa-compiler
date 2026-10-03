@@ -431,3 +431,15 @@ constructor isolation probe also passes. An independent OPEN regression,
 return-type diagnostic merely by naming a main-local array `rows`; the renamed
 control passes. This spelling-sensitive type channel must be repaired before
 it can contribute ownership/typestate authority.
+
+The smaller `structural_binding_function_isolation_probe.elisa` reproduces the
+error without runtime imports: functions take same-spelled `rows` parameters
+with different element types, and a later local uses the scalar element type.
+Stage0 accepts its object emission; the fresh seeded Stage1 CLI incorrectly
+reports the first function returning `i64` instead of `IsolationRow`.
+The Stage1-compiled `structural_binding_phase_probe.elisa` checks the same embedded
+AST via resolution and the full semantic API and passes. That discrepancy means
+the bootstrap/frontend/driver path still needs isolation; a missing scope reset
+is not yet established as the cause. `structural_binding_isolation_smoke.sh` is
+an intentionally failing admission gate until both actual CLI cases pass. It
+must not be made green by suppressing return-type diagnostics.
