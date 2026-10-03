@@ -554,6 +554,242 @@ extend Backend:
             return false
 
 
+        # Append `extra` trivially-copyable elements in ONE step: grow once, `memmove` the
+        # bytes, bump the count. `xs.extend(src)` used to lower to a per-element push loop --
+        # a capacity check, a byte load and a count store per element. Besides being slow,
+        # a function of N consecutive extends (every text emitter: `emit_tokens_push_sview`
+        # inlined 225 times into one JS-facade writer) chained the promoted count through N
+        # loops, and IndVarSimplify re-derived that chain once per loop: 40 s of a 150 s
+        # self-host `-O2` pipeline went to ONE such function.
+        #
+        # The final capacity is the one the push loop would have reached -- the same
+        # 8-then-double sequence, saturating to `needed` when doubling overflows -- so the
+        # header a program can observe is unchanged; only the intermediate reallocations go.
+        #
+        # `source` is either the element pointer itself or, when `source_is_darray_slot`, a
+        # darray header whose items pointer is loaded AFTER the growth: `xs.extend(xs)`
+        # must read the reallocated backing, exactly as the per-element loop did.
+        def emit_darray_append_copy(array_slot: LLVMValueRef, array_type: ValueType, extra: LLVMValueRef, source: LLVMValueRef, source_is_darray_slot: bool, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            element_type: ValueType = darray_element_of(array_type, structs)
+            false return if element_type.kind == TypeKind.Unmodeled
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+            stride: LLVMValueRef = element_stride(element_type, structs, ctx)
+            extra_i64: LLVMValueRef = darray_size_value_i64(extra, ctx, builder, "append.extra")
+
+            items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 0, "append.items.ptr")
+            count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 1, "append.count.ptr")
+            capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 2, "append.cap.ptr")
+            count: LLVMValueRef = darray_load_size_i64(count_pointer, ctx, builder, "append.count")
+            capacity: LLVMValueRef = darray_load_size_i64(capacity_pointer, ctx, builder, "append.cap")
+            if emit_checked_reserve_binary(count, extra_i64, false, m, ctx, builder) is append_needed:
+                needed: LLVMValueRef = append_needed
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                grow_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.grow")
+                step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.cap.step")
+                sized_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.cap.sized")
+                copy_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.copy")
+                # 35 = UGE: capacities are unsigned.
+                enough: LLVMValueRef = LLVMBuildICmp(builder, 35, capacity, needed, "append.cap.ok")
+                _ = LLVMBuildCondBr(builder, enough, copy_block, grow_block)
+
+                # The push loop's capacity sequence, without the pushes: 0 -> 8, otherwise
+                # double (or jump straight to `needed` once doubling overflows), until it fits.
+                LLVMPositionBuilderAtEnd(builder, grow_block)
+                capacity_slot: LLVMValueRef = build_entry_alloca(builder, int64_type, "append.cap.next")
+                _ = LLVMBuildStore(builder, capacity, capacity_slot)
+                _ = LLVMBuildBr(builder, step_block)
+                LLVMPositionBuilderAtEnd(builder, step_block)
+                current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_slot, "append.cap.cur")
+                if emit_overflow_binary(current, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder) is doubled_result:
+                    doubled: LLVMValueRef = LLVMBuildSelect(builder, doubled_result.overflow, needed, doubled_result.value, "append.cap.double.safe")
+                    # 32 = EQ. Keep the 8 in lockstep with emit_darray_push / ARENA_DA_INIT_CAP.
+                    is_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, current, LLVMConstInt(int64_type, 0, 0), "append.cap.zero")
+                    next_capacity: LLVMValueRef = LLVMBuildSelect(builder, is_empty, LLVMConstInt(int64_type, 8, 0), doubled, "append.cap.base")
+                    _ = LLVMBuildStore(builder, next_capacity, capacity_slot)
+                    # 36 = ULT: still short of `needed` -> another doubling.
+                    short: LLVMValueRef = LLVMBuildICmp(builder, 36, next_capacity, needed, "append.cap.short")
+                    _ = LLVMBuildCondBr(builder, short, step_block, sized_block)
+                else:
+                    return false
+                LLVMPositionBuilderAtEnd(builder, sized_block)
+                new_capacity: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_slot, "append.cap.new")
+                if emit_checked_reserve_binary(capacity, stride, true, m, ctx, builder) is append_old_bytes:
+                    if emit_checked_reserve_binary(new_capacity, stride, true, m, ctx, builder) is append_new_bytes:
+                        old_items: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, items_pointer, "append.items")
+                        is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, old_items, LLVMConstNull(pointer_type), "append.items.null")
+                        alloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.alloc")
+                        realloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.realloc")
+                        grown_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.grown")
+                        _ = LLVMBuildCondBr(builder, is_null, alloc_block, realloc_block)
+
+                        LLVMPositionBuilderAtEnd(builder, alloc_block)
+                        alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, runtime_size_argument(append_new_bytes, ctx, builder)]
+                        alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+                        allocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "append.alloc")
+                        _ = LLVMBuildStore(builder, allocated, items_pointer)
+                        _ = LLVMBuildBr(builder, grown_block)
+
+                        LLVMPositionBuilderAtEnd(builder, realloc_block)
+                        realloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, old_items, runtime_size_argument(append_old_bytes, ctx, builder), runtime_size_argument(append_new_bytes, ctx, builder)]
+                        realloc_pointer: void& = (&realloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+                        reallocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_realloc_type, runtime.arena_realloc, realloc_pointer, 4, "append.realloc")
+                        _ = LLVMBuildStore(builder, reallocated, items_pointer)
+                        _ = LLVMBuildBr(builder, grown_block)
+
+                        LLVMPositionBuilderAtEnd(builder, grown_block)
+                        darray_store_size(builder, new_capacity, capacity_pointer, ctx)
+                        _ = LLVMBuildBr(builder, copy_block)
+                    else:
+                        return false
+                else:
+                    return false
+
+                LLVMPositionBuilderAtEnd(builder, copy_block)
+                source_items: mutable LLVMValueRef = source
+                if source_is_darray_slot:
+                    source_items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, source, 0, "append.src.items.ptr")
+                    source_items <- LLVMBuildLoad2(builder, pointer_type, source_items_pointer, "append.src.items")
+                items: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, items_pointer, "append.items.cur")
+                indices: mutable darray[LLVMValueRef] = [count]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                destination: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items, indices_pointer, 1, "append.dst")
+                # Cannot wrap: `needed * stride` was checked when the capacity was sized, and
+                # `extra <= needed`. With no growth, `extra * stride` fits the existing backing.
+                byte_count: LLVMValueRef = LLVMBuildMul(builder, extra_i64, stride, "append.bytes")
+                _ = LLVMBuildMemMove(builder, destination, 1, source_items, 1, runtime_size_argument(byte_count, ctx, builder))
+                darray_store_size(builder, needed, count_pointer, ctx)
+                return true
+            return false
+
+
+        # Is `name` exactly one top-level function of `arity` parameters, the first an sview?
+        # Guards the byte-copy idiom below: it relies on the std meaning of `sview_len` /
+        # `sview_at`, so a program with its own overloads of either keeps the plain loop.
+        def sole_sview_helper(fns: FnTable&, name: sview, arity: usize) -> bool can[Abort.Panic]:
+            found: mutable i64 = -1
+            cursor: mutable i64 = first_function_named(fns, name)
+            while cursor >= 0 |fns, name, found, cursor|:
+                false return if found >= 0
+                found <- cursor
+                cursor <- next_function_named(fns, name, cursor)
+            false return if found < 0
+            row: usize = found.usize()
+            false return if fns.owners[row] != "" or fns.param_count[row] != arity
+            return fns.param_types[fns.param_start[row]].kind == TypeKind.SView
+
+
+        # `for i in 0..<sview_len(s): out.push(sview_at(s, i))` -- the compiler's own idiom for
+        # appending a string's bytes (dozens of helpers, `emit_tokens_push_sview` among them,
+        # which is inlined thousands of times). It is `out.extend(s)`: `sview_len` clamps a
+        # negative length to 0 and every index the range yields is in bounds, so each
+        # `sview_at` is the plain byte. Lowered as the bulk append -- one growth check and a
+        # memmove instead of a capacity check, call and store per byte. As a loop, one
+        # function made of ~225 such appends cost LLVM a minute of SCEV work at -O2.
+        #
+        # Only the exact shape is taken: one binder, `0..<sview_len(S)` with S a name or a
+        # string literal, and a body that is that single push of `sview_at(S, i)` with the
+        # same S into a darray[u8]. Nothing is emitted unless the whole shape matches.
+        # Returns 1 = emitted, 0 = not this shape, -1 = matched but could not be emitted.
+        def try_emit_sview_byte_copy_loop(for_variables: darray[sview]&, for_iterable: Expr, for_body: darray[Stmt]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            0 return if for_variables.count != 1 or for_body.count != 1
+            loop_name: sview = for_variables[0]
+            # The range: `0..<sview_len(S)`.
+            source: mutable Expr = Expr.Absent
+            if for_iterable is Expr.Binary(range_low, range_operator, range_high, range_line):
+                0 return if range_operator != TokenKind.RangeLt
+                if range_low is Expr.IntLit(low_value, low_line):
+                    0 return if low_value != 0
+                else:
+                    return 0
+                if range_high is Expr.Call(len_callee, len_arguments, len_names, len_line):
+                    0 return if len_arguments.count != 1
+                    if len_callee is Expr.Ident(len_name, len_name_line):
+                        0 return if len_name != "sview_len"
+                    else:
+                        return 0
+                    source <- len_arguments[0]
+                else:
+                    return 0
+            else:
+                return 0
+            source_name: mutable sview = ""
+            source_is_literal: mutable bool = false
+            source_literal_text: mutable sview = ""
+            match source:
+                Expr.Ident(source_ident, source_ident_line):
+                    source_name <- source_ident
+                Expr.StringLit(source_text, source_text_line):
+                    source_is_literal <- true
+                    source_literal_text <- source_text
+                _:
+                    return 0
+            0 return if source_name == loop_name
+            # The body: `OUT.push(sview_at(S, i))`.
+            target: mutable Expr = Expr.Absent
+            if for_body[0] is Stmt.Expr(body_expression, body_line):
+                if body_expression is Expr.Call(push_callee, push_arguments, push_names, push_line):
+                    0 return if push_arguments.count != 1
+                    if push_callee is Expr.Field(push_object, push_method, push_method_line):
+                        0 return if push_method != "push"
+                        target <- push_object
+                    else:
+                        return 0
+                    if push_arguments[0] is Expr.Call(at_callee, at_arguments, at_names, at_line):
+                        0 return if at_arguments.count != 2
+                        if at_callee is Expr.Ident(at_name, at_name_line):
+                            0 return if at_name != "sview_at"
+                        else:
+                            return 0
+                        if at_arguments[1] is Expr.Ident(index_name, index_line):
+                            0 return if index_name != loop_name
+                        else:
+                            return 0
+                        match at_arguments[0]:
+                            Expr.Ident(at_source_ident, at_source_line):
+                                0 return if source_is_literal or at_source_ident != source_name
+                            Expr.StringLit(at_source_text, at_source_text_line):
+                                0 return if not source_is_literal or at_source_text != source_literal_text
+                            _:
+                                return 0
+                    else:
+                        return 0
+                else:
+                    return 0
+            else:
+                return 0
+            # The push target must be a byte darray, and the loop binder must not BE it.
+            if target is Expr.Ident(target_name, target_line):
+                0 return if target_name == loop_name
+            target_type: ValueType = darray_type_behind_expr(target, local_scope, structs)
+            0 return if target_type.kind != TypeKind.DArray
+            target_element: ValueType = darray_element_of(target_type, structs)
+            0 return if target_element.kind != TypeKind.Unsigned or target_element.bits != 8
+            0 return if expression_type(source, local_scope, fns, structs, generics).kind != TypeKind.SView and not source_is_literal
+            0 return if not sole_sview_helper(fns, "sview_len", 1) or not sole_sview_helper(fns, "sview_at", 2)
+            # Matched. From here on IR is emitted, so a failure is a decline, not a fallback.
+            if darray_address_of_expr(target, local_scope, fns, structs, generics, runtime, m, ctx, builder) is target_slot:
+                growth_runtime: Runtime = growth_runtime_for(target, local_scope, runtime)
+                if emit_expression(source, ValueType{kind: TypeKind.SView, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is source_value:
+                    source_length: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 1, "bytecopy.len")
+                    source_data: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 0, "bytecopy.data")
+                    # 40 = SLT: a negative length is the empty range `sview_len` makes of it.
+                    negative: LLVMValueRef = LLVMBuildICmp(builder, 40, source_length, LLVMConstInt(LLVMTypeOf(source_length), 0, 0), "bytecopy.neg")
+                    count: LLVMValueRef = LLVMBuildSelect(builder, negative, LLVMConstInt(LLVMTypeOf(source_length), 0, 0), source_length, "bytecopy.count")
+                    1 return if emit_darray_append_copy(target_slot, target_type, count, source_data, false, structs, growth_runtime, m, ctx, builder)
+            return -1
+
+
+        # Element kinds whose darray/view storage is exactly their bytes, so `extend` may copy
+        # them with one memmove instead of reading and re-storing each element. Bool is left
+        # out: an `i1` element round-trips through a load/store normalisation a raw byte copy
+        # would skip.
+        def append_copy_element_ok(source_element: ValueType, target_element: ValueType) -> bool:
+            false return if source_element.kind != target_element.kind or source_element.bits != target_element.bits
+            return is_integer_type(target_element) or target_element.kind == TypeKind.Float
+
+
         # `_ = xs.reserve(n)` — reserve returns `mutable darray&` (for chaining), so it is
         # DISCARDED via `_ =` rather than appearing as a bare statement (unlike void `push`).
         # Both discard sites (`_` VarDecl and `_` Assign) route through emit_expression, which
