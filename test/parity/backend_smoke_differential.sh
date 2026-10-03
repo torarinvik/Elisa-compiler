@@ -490,3 +490,8 @@ diff_case u8_zext     'def main() -> i64:\n    a: u8 = 200\n    return a.i64()\n
 diff_case i8_sext     'def main() -> i64:\n    a: i8 = -56\n    return a.i64() + 100\n'
 diff_case u32_cmp     'def main() -> i64:\n    a: u32 = 4000000000\n    return 42 if a > 100 else 7\n'
 diff_case match_chain 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        1: 200\n        -1: 300\n        _: 400\n\ndef main() -> i64:\n    return classify(-1) - classify(0)\n'
+
+# Region-block view stores: the ACCEPTED shapes (an inner-target store,
+# an outer-source view rebinding) must still run right.
+diff_case region_view_store_in_auto_inner 'def main() -> i32:\n    can Memory.Allocate:\n        total: mutable i64 = 0\n        in auto:\n            xs: mutable darray[i64] = [1, 2, 3]\n            v: mutable view[i64] = xs[0:0]\n            v <- xs[1:3]\n            total <- v[0] + v[1]\n        return (total - 5).i32()\n'
+diff_case region_view_store_tuple_outer 'def pick(xs: darray[i64]&) -> (known: bool, v: view[i64]):\n    return (true, xs[0:2])\n\ndef main() -> i32:\n    can Memory.Allocate:\n        base: mutable darray[i64] = [4, 7, 9]\n        v: mutable view[i64] = base[0:0]\n        region scratch(4096):\n            xs: mutable darray[i64] = [1, 2, 3]\n            w: view[i64] = pick(&xs).v\n            v <- pick(&base).v if w[1] == 2 else base[0:1]\n        return v[1].i32() - 7\n'
