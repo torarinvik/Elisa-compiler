@@ -7,7 +7,7 @@
 #
 # Installs: LLVM 21 (apt.llvm.org: llvm-21-dev clang-21 lld-21 libpolly-21-dev), the z3 5.1.0
 # RELEASE binary (apt's 4.8.12 makes contract-bearing compiles ~25x slower), Go 1.27.1, and
-# the clang shim at /root/elisa/bin/clang (= tools/linux_shim/clang: dead_strip -> --gc-sections, drop
+# the clang shim at /root/elisa/bin/clang (= tools/remote/clang_shim: dead_strip -> --gc-sections, drop
 # -stack_size, -lLLVM -> -lLLVM-21, -no-pie + --unresolved-symbols=ignore-all on links).
 # Work dir: /root/elisa. The box is SHARED (another session uses clang-19 from apt): nothing
 # here touches /usr/local/bin, the default clang, update-alternatives or any global PATH.
@@ -17,7 +17,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${1:-}" != --local ]]; then
   source "$HERE/hosts.sh"; host_ssh_args "${1:?host alias}"
   ssh "${SSH_ARGS[@]}" "mkdir -p /root/elisa && cat > /root/elisa/setup_host.sh" < "$HERE/setup_host.sh"
-  ssh "${SSH_ARGS[@]}" "cat > /root/elisa/clang_shim" < "$HERE/../linux_shim/clang"
+  ssh "${SSH_ARGS[@]}" "cat > /root/elisa/clang_shim" < "$HERE/clang_shim"
   exec ssh "${SSH_ARGS[@]}" "bash /root/elisa/setup_host.sh --local"
 fi
 GO_VER=1.27.1; Z3_VER=5.1.0; LLVM=21

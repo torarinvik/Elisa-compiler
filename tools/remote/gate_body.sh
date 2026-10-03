@@ -44,7 +44,9 @@ t=$(stamp)
     export REPO_ROOT="$SEED" ELISA_CORE="$S0" ELISACORE_BIN="$S0BIN" \
       ELISA_STAGE1_BIN="$SEED/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$SEED/build/runtime/elisacore_runtime.o" \
       ELISA_STAGE1_SEED_OPT_LEVEL="$OPT" ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR="$W/locks/seed-global-$KEY" \
-      TMPDIR="$SEED/build/tmp"
+      TMPDIR="$SEED/build/tmp" ELISA_STAGE1_SEED_MAX_RSS_KB="${ELISA_STAGE1_SEED_MAX_RSS_KB:-33554432}"
+    # stage0 on Linux peaks above the Mac-sized 4 GB seed guard (stopped at 4.0 GB on
+    # vast4); these hosts have >200 GB, so the guard is 32 GB here.
     mkdir -p bin build/runtime build/tmp
     bash scripts/elisac_stage1.sh --seed && [[ -x bin/elisac-stage1 && -f build/runtime/elisacore_runtime.o ]] && touch .seeded
   fi
@@ -70,7 +72,7 @@ run_gate() {
     export REPO_ROOT="$d" ELISA_CORE="$S0" ELISACORE_BIN="$S0BIN" ELISA_S0_REAL="$S0BIN"
     [[ -x "$d/tools/s0cache" ]] && export ELISACORE_BIN="$d/tools/s0cache"
     export ELISA_STAGE1_BIN="$d/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$d/build/runtime/elisacore_runtime.o"
-    export TMPDIR="$d/build/tmp" HOME="$d/home"
+    export TMPDIR="$d/build/tmp" HOME="$d/home" ELISA_STAGE1_MAX_RSS_KB="${ELISA_STAGE1_MAX_RSS_KB:-33554432}"
     export ELISA_JOBS=$per ELISA_GATE_JOBS=$per ELISA_HEAVY_JOBS=$per ELISA_INTERNAL_JOBS=$per \
       ELISA_DIAG_JOBS=$per ELISA_ACCEPT_JOBS=$per ELISA_CORPUS_JOBS=$per ELISA_LOCAL_JOBS=$per
     bash "test/parity/$g.sh"
@@ -96,7 +98,7 @@ for g in "${GATES[@]}"; do
   skips=0; real=()
   for f in "${fails[@]}"; do
     row=$(sed -E 's/^\s*FAIL:? ([^: ]+).*/\1/' <<<"$f")
-    if awk -v g="$g" -v r="$row" '$1==g && $2==r {found=1} END {exit !found}' "$W/tools/host_invalid.txt"; then
+    if awk -v g="$g" -v r="$row" '$1==g && $2==r {found=1} END {exit !found}' "$RUNDIR/host_invalid.txt"; then
       skips=$((skips+1))
     else real+=("$f"); fi
   done
