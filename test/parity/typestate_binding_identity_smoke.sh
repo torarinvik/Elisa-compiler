@@ -19,4 +19,4 @@ else
     echo "binding identity probe failed control $status" >&2
     exit "$status"
 fi
-echo 'Stage1 binding/alias capabilities OK: chains, absolute/relative qualified lookup, nearest-module precedence, prefix boundaries, cyclic/ambiguous aliases remain unknown'
+echo 'Stage1 binding/alias capabilities OK: retained annotations, type-alias chains, absolute/relative paths, scoped module imports, nearest-scope precedence, sibling isolation, cyclic/ambiguous aliases remain unknown'

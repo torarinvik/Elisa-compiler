@@ -134,16 +134,24 @@ alias-to-alias target. This prevents irreversible capability/state information
 loss. The binding capability channel now follows lexical and qualified
 alias chains in the alias declaration's module and retains the terminal nominal
 `DeclId`. References and `lmut` remain borrowed through the chain. Cycles,
-equal-rank ambiguity, missing targets, depth exhaustion, imported-only lookup,
+equal-rank ambiguity, missing targets, depth exhaustion, selective-import lookup,
 and generic-alias applications return `known: false`, never owned authority.
 The executable probe checks separate module families, qualified uses, a cycle,
 and duplicate same-scope aliases. Qualified lookup also searches enclosing module
 ancestors, preferring the nearest matching module/member and enforcing separator
 boundaries. It reuses the existing module-path matchers rather than allocating a
 joined qualifier. Controls distinguish root, parent, and inner sibling aliases
-and an `OuterKit` prefix collision. Imported-only lookup, module-alias expansion,
+and an `OuterKit` prefix collision. Qualified module aliases now select the nearest
+lexically visible `using ... as ...` declaration. Target metadata must agree on
+scope, line, and byte offset; duplicate aliases or targets remain unknown. Target
+modules resolve relative to the import's declaration scope before absolute root
+fallback, and remaining path segments stay under that selected module. Executable
+controls cover inherited imports, local overrides, separate sibling imports,
+unrelated and prefix-colliding modules, duplicate aliases, nested paths, and
+relative target precedence. Selective-import lookup, chained module-alias targets,
 and generic substitution still need implementation; this channel does not yet
-authorize moves.
+authorize moves. Older file-wide import lists are deliberately not ownership
+evidence.
 
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
