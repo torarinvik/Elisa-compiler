@@ -113,9 +113,14 @@ source position. The initializer is resolved before the new local binds, and
 branch-scope reference resolution retains existing distinct binding IDs. A
 self-hosted probe checks inner shadowing, restoration of the outer owner, same
 spelling in a second function, and distinct state-qualified/ref type shapes.
-These rows are not yet ownership authority: inferred bindings, nominal alias
-resolution, and storage/capability qualifiers (including `lmut`, which the type
-interner currently erases) must be modeled before consuming transitions use them.
+Each row also retains explicit borrow access, writable-borrow access, `lmut`, and
+binding mutability independently of the structural type ID. Capability inspection
+peels only outer wrappers: references inside container element types do not make
+the container itself borrowed. The probe checks readonly/writable references,
+`lmut` versus an owned value with the same erased type ID, a mutable owned value,
+and a container of references. These are declared syntax facts, not yet ownership
+authority: inferred bindings and nominal alias capabilities remain required
+before consuming transitions use them.
 
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
