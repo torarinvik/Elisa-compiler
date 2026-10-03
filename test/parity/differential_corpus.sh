@@ -72,10 +72,19 @@ fi
 # stall can hold a fresh process in dyld past ten seconds, and a 124 on ONE side of the
 # comparison fabricates a MISMATCH (observed: 3 mismatches in one run, 8 in the next, for
 # an identical product). A genuine runaway expires both times and still fails.
+# ELISA_CORPUS_TIMEOUT_SCALE multiplies every budget below (integer, default 1). The budgets
+# were tuned on the reference macOS host; on a 4 vCPU Linux container stage0 alone needs
+# ~100 s for the easm_* programs, so whether they land in "declined" or "skipped (stage0
+# could not arbitrate)" depended on how loaded the host was. Scale, don't loosen per program.
+CORPUS_TIMEOUT_SCALE="${ELISA_CORPUS_TIMEOUT_SCALE:-1}"
+[[ "$CORPUS_TIMEOUT_SCALE" =~ ^[1-9][0-9]*$ ]] || { echo "ELISA_CORPUS_TIMEOUT_SCALE must be a positive integer" >&2; exit 2; }
+RUN_TIMEOUT=$((10 * CORPUS_TIMEOUT_SCALE))
+RUN_RETRY_TIMEOUT=$((30 * CORPUS_TIMEOUT_SCALE))
+LONG_TIMEOUT="${ELISA_CORPUS_LONG_TIMEOUT:-$((180 * CORPUS_TIMEOUT_SCALE))}"
 RUN() {
-    timeout 10 "$@" >/dev/null 2>&1 </dev/null
+    timeout "$RUN_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null
     local status=$?
-    if [ "$status" -eq 124 ]; then timeout 30 "$@" >/dev/null 2>&1 </dev/null; status=$?; fi
+    if [ "$status" -eq 124 ]; then timeout "$RUN_RETRY_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null; status=$?; fi
     return $status
 }
 # Last resort for a program that expired BOTH budgets while the other compiler answered: on a
@@ -84,9 +93,9 @@ RUN() {
 # — a fabricated MISMATCH (8 of them in one loaded run, none on a quiet host). A real runaway
 # expires this budget too and is still reported.
 RUN_LONG() {
-    timeout "${ELISA_CORPUS_LONG_TIMEOUT:-180}" "$@" >/dev/null 2>&1 </dev/null
+    timeout "$LONG_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null
 }
-COMPILE_TIMEOUT=60
+COMPILE_TIMEOUT=$((60 * CORPUS_TIMEOUT_SCALE))
 # …and the same rule for COMPILING. A compile that expires is not a DECLINE — the classifier
 # below reads a nonzero exit as "stage1 dropped a function", so on a loaded host a slow
 # compile was filed as a language gap (5 spurious declines against a baseline of 0 in one
@@ -95,7 +104,7 @@ COMPILE() {
     timeout "$COMPILE_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null
     local status=$?
     if [ "$status" -eq 124 ]; then
-        timeout "${ELISA_CORPUS_LONG_TIMEOUT:-180}" "$@" >/dev/null 2>&1 </dev/null; status=$?
+        timeout "$LONG_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null; status=$?
     fi
     return $status
 }

@@ -164,6 +164,7 @@ terminate_guarded_pid() {
   wait "$pid" 2>/dev/null || true
 }
 
+source "$ROOT/scripts/process_rss.sh"
 source "$ROOT/scripts/elisac_stage1_seed.sh"
 
 if [[ "${1:-}" == "--seed" ]]; then
@@ -199,16 +200,21 @@ run_stage1_driver_guarded() {
   # every one of the ~4900 wrapper invocations a full gate makes (~4 minutes of
   # sleeping per gate). A runaway compile still meets the full-interval poll
   # within a few iterations, so the guard's protection is unchanged.
-  local driver_poll_now=0.002
+  # Polls are fork-free on Linux (scripts/process_rss.sh): the backoff is integer
+  # microseconds, the RSS comes from /proc, the sleep is a builtin timed read.
+  local driver_poll_us=2000 driver_poll_cap_us
+  process_seconds_to_us "$driver_rss_poll_seconds"
+  driver_poll_cap_us="$PROCESS_US"
   # stdin is closed rather than fed: the stdin wire protocol is still the driver's other
   # front door, and leaving a terminal attached would make it wait for one.
   "$BIN" "${driver_args[@]+${driver_args[@]}}" </dev/null &
   driver_pid=$!
   while kill -0 "$driver_pid" 2>/dev/null; do
-    # The compiler can finish between kill(0) and ps(1). Do not let that ordinary
+    # The compiler can finish between kill(0) and the RSS read. Do not let that ordinary
     # observation race trip `set -euo pipefail`: the wait below owns the child's
     # authoritative exit status.
-    driver_rss="$(ps -o rss= -p "$driver_pid" 2>/dev/null | awk '{print $1}')" || driver_rss=""
+    process_observe "$driver_pid"
+    driver_rss="$PROCESS_RSS_KB"
     if [[ -n "$driver_rss" && "$driver_rss" -gt "$driver_peak" ]]; then
       driver_peak="$driver_rss"
     fi
@@ -217,8 +223,10 @@ run_stage1_driver_guarded() {
       terminate_guarded_pid "$driver_pid"
       return 125
     fi
-    sleep "$driver_poll_now"
-    driver_poll_now="$(awk -v now="$driver_poll_now" -v cap="$driver_rss_poll_seconds" 'BEGIN { doubled = now * 2; print (doubled > cap) ? cap : doubled }')"
+    process_us_to_seconds "$driver_poll_us"
+    process_sleep "$PROCESS_SECONDS"
+    driver_poll_us=$(( driver_poll_us * 2 ))
+    (( driver_poll_us > driver_poll_cap_us )) && driver_poll_us="$driver_poll_cap_us"
   done
   wait "$driver_pid" || driver_rc=$?
   return "$driver_rc"
