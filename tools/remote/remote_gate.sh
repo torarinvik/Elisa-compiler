@@ -84,7 +84,7 @@ rssh "mkdir -p $R $W/bin && cat > $R/gate_body.sh" < "$HERE/gate_body.sh"
 rssh "cat > $R/host_invalid.txt" < "$HERE/host_invalid.txt"
 rssh "cat > $R/clang_shim && chmod 755 $R/clang_shim && cp $R/clang_shim $W/bin/.clang.$RUN && mv -f $W/bin/.clang.$RUN $W/bin/clang && for n in clang++ cc; do [ -e $W/bin/\$n ] || ln -s clang $W/bin/\$n; done" < "$HERE/clang_shim"
 echo "ship: $(( $(date +%s) - t0 ))s"
-rssh "cd $R && nohup setsid bash $R/gate_body.sh $s1 $s0 $OPT $JOBS ${GATES[*]} > out 2>&1 < /dev/null &"
+rssh "cd $R && nohup setsid -f bash $R/gate_body.sh $s1 $s0 $OPT $JOBS ${GATES[*]} > out 2>&1 < /dev/null"
 # Block (no polling) until the detached run exits; a dropped connection loses nothing:
 # re-attach with --attach $RUN.
 # (gate_body writes the pid file itself; wait for it rather than race it.)

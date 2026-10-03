@@ -52,5 +52,5 @@ exec nice -n 15 python3 $W/fuzz/tools/fuzz.py --s0 $W/src/s0-$s0/compiler/bin/el
   $SEED/test/fixtures $SEED/test/repro $OUT/seeds
 EOF
 # run.sh records its own pid; nothing may follow the & on this line or ssh keeps the channel open.
-rssh "cd $OUT && nohup setsid bash run.sh > fuzz.log 2>&1 < /dev/null &"
+rssh "cd $OUT && nohup setsid -f bash run.sh > fuzz.log 2>&1 < /dev/null"
 echo "fuzz: $HOST:$OUT  (status: $0 --host $HOST --status $NAME)"
