@@ -121,12 +121,11 @@ def run(cmd, timeout, env=None, cwd=None):
 
 
 def first_error(text):
-    for l in text.splitlines():
-        if "warning:" in l:
-            continue
-        if "error" in l.lower() or "panic" in l.lower() or "declined" in l:
-            return l.strip()
-    return ""
+    lines = [l.strip() for l in text.splitlines() if l.strip() and "warning:" not in l]
+    for l in lines:
+        if ".elisa:" in l or "error" in l.lower() or "panic" in l.lower() or "declined" in l:
+            return l
+    return lines[0] if lines else ""
 
 
 def norm(msg):
@@ -165,8 +164,14 @@ def evaluate(cfg, path, wd):
     r["exec"] = {}
     if r["s1"] == "accept":
         for opt in ("-O0", "-O2"):
-            exe = os.path.join(wd, "p" + opt)
-            rc, out = run([cfg["s1"], "-emit", "exe", opt, "-o", exe, path], cfg["ctimeout"], cwd=wd)
+            # Not `-emit exe`: stage1's link step writes its callback-fallback .c with macOS
+            # open() flags (1537 = O_WRONLY|O_CREAT|O_TRUNC on Darwin, no O_CREAT on Linux), so
+            # it exits 8 on Linux. Emit the object and link it the same way ourselves.
+            exe = os.path.join(wd, "p" + opt); o = exe + ".o"
+            rc, out = run([cfg["s1"], "-emit", "obj", opt, "-o", o, path], cfg["ctimeout"], cwd=wd)
+            if rc == 0:
+                rc, out = run([cfg["cc"], "-fno-builtin", "-Wl,-dead_strip", "-o", exe, o, cfg["runtime"],
+                               cfg["fallback"]], cfg["ctimeout"], cwd=wd)
             if rc != 0 or not os.path.exists(exe):
                 r["exec"][opt] = "build_fail"
                 continue
@@ -288,7 +293,9 @@ def main():
     os.makedirs(os.path.join(a.out, "findings"), exist_ok=True)
     cfg = {"s0": a.s0, "s1": a.s1, "guard": os.path.abspath(a.guard), "out": os.path.abspath(a.out),
            "seeds": a.seeds, "seed_root": os.path.commonpath([os.path.abspath(s) for s in a.seeds]),
-           "ctimeout": a.ctimeout, "rtimeout": a.rtimeout, "pause_lock": a.pause_lock}
+           "ctimeout": a.ctimeout, "rtimeout": a.rtimeout, "pause_lock": a.pause_lock,
+           "cc": os.environ.get("ELISA_CLANG", "clang"), "runtime": os.environ["ELISA_RUNTIME_OBJ"],
+           "fallback": os.path.join(os.path.dirname(os.path.abspath(__file__)), "callback_fallback.c")}
     n = len(load_seeds(a.seeds))
     print("fuzz: %d seeds, %d jobs, out=%s" % (n, a.jobs, a.out), flush=True)
     if n == 0:
