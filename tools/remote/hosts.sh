@@ -19,5 +19,11 @@ host_aliases() { awk '!/^#/ && NF>=3 {print $1}' "$HOSTS_FILE" 2>/dev/null; }
 # ssh to the current SSH_ARGS host with the provider's login banner stripped from stderr.
 # (fd swap, not process substitution: macOS bash 3.2 fails to parse `2> >(...)` inside $(...).)
 rssh() {
-  { ssh "${SSH_ARGS[@]}" "$@" 2>&1 1>&3 3>&- | grep -v -E 'Welcome to vast.ai|^Have fun!|^AI agents: READ /etc/vast-agents-guide' >&2; return "${PIPESTATUS[0]}"; } 3>&1
+  # The grep stage must never fail the pipeline (callers run under set -e -o pipefail and a
+  # banner-free stderr makes grep exit 1); the ssh status is returned explicitly.
+  local st f="${TMPDIR:-/tmp}/rssh.$$.$RANDOM$RANDOM"
+  { { s0=0; ssh "${SSH_ARGS[@]}" "$@" 2>&1 1>&3 3>&- || s0=$?; echo "$s0" > "$f"; } |
+      { grep -v -E 'Welcome to vast.ai|^Have fun!|^AI agents: READ /etc/vast-agents-guide' >&2 || true; }; } 3>&1
+  st=$(cat "$f" 2>/dev/null || echo 255); rm -f "$f"
+  return "$st"
 }
