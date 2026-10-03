@@ -942,6 +942,16 @@ run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_fiel
 run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_field.pos.elisa" "L17 cannot infer region parameter \"__rg_p\" for call to \"add\""
 run_case region_param_ref_field neg "$REPO_ROOT/test/repro/region_param_ref_field.neg.elisa" "cannot infer region parameter"
 
+echo "-- global_storage_return --"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L16 value backed by global \"store\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L19 value backed by global \"gitems\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L22 value backed by global \"nested\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L25 value backed by global \"gitems\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L29 value backed by global \"gitems\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L34 value backed by global \"store\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L37 value backed by global \"name\" cannot be returned by value with a region-less type"
+run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L40 value backed by global \"store\" cannot be returned by value with a region-less type"
+run_case global_storage_return neg "$FIXTURES/global_storage_return.neg.elisa" "cannot be returned by value with a region-less type"
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
 if [[ "$failed" -gt 0 ]]; then

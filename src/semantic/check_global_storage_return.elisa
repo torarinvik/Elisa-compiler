@@ -1,0 +1,218 @@
+# A GLOBAL's owning container returned BY VALUE (stage0 checkGlobalStorageReturnEscape):
+#
+#     global store: mutable Box
+#     def items_of() -> darray[i64]:
+#         return store.items        # the copy shares store.items' buffer
+#
+# A darray/dstr/dict/set copy is a shallow header copy, so the caller's value points at the
+# global's buffer; the global's next growth reallocates and frees it under the caller (verified
+# by running: the copy read the global's later write, 9). This is the global-rooted analogue of
+# the parameter rule (a parameter's storage cannot be returned with a region-less type).
+#
+# Decidable subset, mirroring stage0:
+# - the function's declared return type is a bare owned container (darray/dstr/dict/set) or a
+#   struct that (transitively) holds one; a `@r`, reference or view return is not this rule;
+# - the returned value (a `return`, or the trailing expression) is a place rooted at a
+#   `global` through parens, fields and indexes (a slice is a view, not a copy), or a local
+#   initialised / `<-`-assigned from such a place (flow-insensitive: never cleared);
+# - a parameter or local of the global's name shadows it.
+extend Semantic:
+    private:
+        def gsr_owned_type(type_expression: Ast::Expr, container_structs: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return gsr_owned_type(operand, container_structs) if operator == TokenKind.Mutable
+                        return false
+                    Expr.Paren(inner, paren_pos):
+                        return gsr_owned_type(inner, container_structs)
+                    Expr.Ident(name, ident_pos):
+                        return name == "dstr" or any container_struct in container_structs where container_struct == name
+                    Expr.Index(object, element, index_pos):
+                        head: sview = ident_name_of(object)
+                        return head == "darray" or head == "set" or head == "dict"
+                    Expr.IndexN(object_n, arguments_n, index_n_pos):
+                        head_n: sview = ident_name_of(object_n)
+                        return head_n == "darray" or head_n == "set" or head_n == "dict"
+                    _:
+                        return false
+
+
+        # collect_container_structs closed over struct members: a struct holding a container
+        # struct by value shares that struct's buffers too.
+        def gsr_container_structs(declarations: darray[Ast::Decl]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                collect_container_structs(declarations, out)
+                changed: mutable bool = true
+                while changed |changed, out|:
+                    changed <- false
+                    before: usize = out.count
+                    gsr_close_structs(declarations, out)
+                    changed <- out.count != before
+
+
+        def gsr_close_structs(declarations: darray[Ast::Decl]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                            continue if any known in out where known == struct_name
+                            out.push(struct_name) if any member in members where gsr_owned_type(member.type_expression, out)
+                        Decl.Module(module_name, module_body, module_pos):
+                            gsr_close_structs(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_pos):
+                            gsr_close_structs(scoped_body, out)
+                        _:
+                            pass
+
+
+        def gsr_collect_globals(declarations: darray[Ast::Decl]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Const(name, type_expression, value, is_mutable, const_pos):
+                            out.push(name) if is_mutable
+                        Decl.Module(module_name, module_body, module_pos):
+                            gsr_collect_globals(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_pos):
+                            gsr_collect_globals(scoped_body, out)
+                        _:
+                            pass
+
+
+        # Every name a function body binds (locals and for binders), anywhere.
+        def gsr_collect_locals(statements: darray[Ast::Stmt]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, decl_pos):
+                            out.push(name)
+                        Stmt.Block(kind, clause, binding, body, block_pos):
+                            out.push(binding) if binding != ""
+                            gsr_collect_locals(body, out)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            gsr_collect_locals(then_body, out)
+                            gsr_collect_locals(else_body, out)
+                        Stmt.While(condition, while_body, while_pos):
+                            gsr_collect_locals(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            out.push(bind) if bind != ""
+                            for variable in variables |out|:
+                                out.push(variable)
+                            gsr_collect_locals(for_body, out)
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            for arm in arms |out|:
+                                gsr_collect_locals(arm.body, out)
+                        _:
+                            pass
+
+
+        # The global a by-value expression shares storage with, or "".
+        def gsr_root(value: Ast::Expr, globals: darray[sview]&, shadowed: darray[sview]&, alias_names: darray[sview]&, alias_roots: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return gsr_root(inner, globals, shadowed, alias_names, alias_roots)
+                    Expr.Field(object, field_name, field_pos):
+                        return gsr_place_root(object, globals, shadowed)
+                    Expr.Index(object, index, index_pos):
+                        return gsr_place_root(object, globals, shadowed)
+                    Expr.Ident(name, ident_pos):
+                        for alias_index in 0..<alias_names.count:
+                            return alias_roots[alias_index] if alias_names[alias_index] == name
+                        return gsr_place_root(value, globals, shadowed)
+                    _:
+                        return sview("", 0, 0)
+
+
+        def gsr_place_root(place: Ast::Expr, globals: darray[sview]&, shadowed: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Paren(inner, paren_pos):
+                        return gsr_place_root(inner, globals, shadowed)
+                    Expr.Field(object, field_name, field_pos):
+                        return gsr_place_root(object, globals, shadowed)
+                    Expr.Index(object, index, index_pos):
+                        return gsr_place_root(object, globals, shadowed)
+                    Expr.Ident(name, ident_pos):
+                        return sview("", 0, 0) if any local in shadowed where local == name
+                        return name if any global_name in globals where global_name == name
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # Locals that share a global's storage: `x: darray[T] = g` / `x <- g`, to a fixpoint.
+        def gsr_collect_aliases(statements: darray[Ast::Stmt]&, globals: darray[sview]&, shadowed: darray[sview]&, container_structs: darray[sview]&, alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |alias_names, alias_roots|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, decl_pos):
+                            if gsr_owned_type(type_expression, container_structs) and not (any known in alias_names where known == name):
+                                root: sview = gsr_root(value, globals, shadowed, alias_names, alias_roots)
+                                if root != "":
+                                    alias_names.push(name)
+                                    alias_roots.push(root)
+                        Stmt.Assign(target, operator, value, assign_pos):
+                            target_name: sview = ident_name_of(target)
+                            if target_name != "" and (operator == TokenKind.LArrow or operator == TokenKind.Assign) and not (any known in alias_names where known == target_name):
+                                assigned_root: sview = gsr_root(value, globals, shadowed, alias_names, alias_roots)
+                                if assigned_root != "" and (any local in shadowed where local == target_name):
+                                    alias_names.push(target_name)
+                                    alias_roots.push(assigned_root)
+                        Stmt.Block(kind, clause, binding, body, block_pos):
+                            gsr_collect_aliases(body, globals, shadowed, container_structs, alias_names, alias_roots)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            gsr_collect_aliases(then_body, globals, shadowed, container_structs, alias_names, alias_roots)
+                            gsr_collect_aliases(else_body, globals, shadowed, container_structs, alias_names, alias_roots)
+                        Stmt.While(condition, while_body, while_pos):
+                            gsr_collect_aliases(while_body, globals, shadowed, container_structs, alias_names, alias_roots)
+                        Stmt.For(bind, variables, iterable, for_body, for_pos):
+                            gsr_collect_aliases(for_body, globals, shadowed, container_structs, alias_names, alias_roots)
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            for arm in arms |alias_names, alias_roots|:
+                                gsr_collect_aliases(arm.body, globals, shadowed, container_structs, alias_names, alias_roots)
+                        _:
+                            pass
+
+
+        def gsr_walk(declarations: darray[Ast::Decl]&, globals: darray[sview]&, container_structs: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, func_pos):
+                            if return_type is declared_return:
+                                if gsr_owned_type(declared_return, container_structs):
+                                    shadowed: mutable darray[sview] = []
+                                    for parameter in parameters |shadowed|:
+                                        shadowed.push(parameter.name)
+                                    gsr_collect_locals(body, shadowed)
+                                    alias_names: mutable darray[sview] = []
+                                    alias_roots: mutable darray[sview] = []
+                                    while true |alias_names, alias_roots|:
+                                        before: usize = alias_names.count
+                                        gsr_collect_aliases(body, globals, shadowed, container_structs, alias_names, alias_roots)
+                                        break if alias_names.count == before
+                                    returned_values: mutable darray[Ast::Expr] = []
+                                    lvre_returns(body, true, returned_values)
+                                    for returned in returned_values |table|:
+                                        root: sview = gsr_root(returned, globals, shadowed, alias_names, alias_roots)
+                                        continue if root == ""
+                                        position: Ast::Pos = Ast::expr_pos(returned)
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.GlobalStorageReturnEscape, name: root, line: position.line, pos: position, expected: "", actual: ""})
+                        Decl.Module(module_name, module_body, module_pos):
+                            table <- gsr_walk(module_body, globals, container_structs, table)
+                        Decl.Scoped(scoped_body, scoped_pos):
+                            table <- gsr_walk(scoped_body, globals, container_structs, table)
+                        _:
+                            pass
+
+    public:
+        def check_global_storage_return(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                globals: mutable darray[sview] = []
+                gsr_collect_globals(file.top_decls, globals)
+                return if globals.count == 0
+                container_structs: mutable darray[sview] = []
+                gsr_container_structs(file.top_decls, container_structs)
+                table <- gsr_walk(file.top_decls, globals, container_structs, table)
