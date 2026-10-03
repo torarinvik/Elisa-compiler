@@ -51,6 +51,8 @@
 #   same_name_nested_region_*    `region scratch:` inside `region scratch:` (run-proven stale
 #                                read); sibling regions may still share a name
 # Fuzz round 1, holes BOTH compilers accepted (fuzz_*; stage0 fixed first, same wording):
+#   fuzz_esc_return_*            a returned view of a struct local's darray field (F1; stage0 adopts
+#                                its caller's arena there, stage1's view ABI cannot)
 #   fuzz_setter_store_*          `set(h, b.as_sview())`, set storing into h.s (F2)
 #   fuzz_callarg_mutref_*        `use(&buf, buf.as_sview())`: the callee grows buf, reads s (F3)
 #   fuzz_aff_closure_*           a closure moving a captured affine value is one-shot (F12)
