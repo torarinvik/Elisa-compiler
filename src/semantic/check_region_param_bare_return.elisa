@@ -1,0 +1,120 @@
+# Returning a parameter tied to an explicit region parameter from a function whose return
+# type carries no `@r` (stage0 analyzeRegionParamInference): `def f[@r](n: usize& @r) -> usize:
+# return n` gets "value tied to region parameter "r" cannot be returned with a region-less
+# type ...". Stage1 accepted every non-reference return type and, for reference returns,
+# reported RegionTiedReturn with a different sentence and no column.
+#
+# Decidable subset (stage0 probed shape by shape; everything else declines):
+# - the returned expression is the parameter's bare name, possibly parenthesised
+#   (`return n.m`, `return n + 1`, a copy into a local are all accepted by stage0);
+# - the parameter has an explicit tie row and the function declares that `[@r]`;
+# - the function has no `__region_return` tie at all;
+# - returns are found through if/else and while bodies; a for, match or named block anywhere
+#   in the body, or a local of the same name, declines the whole function (a binder could
+#   shadow the parameter).
+extend Semantic:
+    private:
+        def rpbr_bare_ident(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_pos):
+                        return name
+                    Expr.Paren(inner, paren_pos):
+                        return rpbr_bare_ident(inner)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # True when nothing in BODY may rebind NAME: no same-named local, no for/match/block.
+        def rpbr_unshadowed(statements: darray[Ast::Stmt]&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.VarDecl(declared, declared_type, declared_value, declared_pos):
+                            return false if declared == name
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            return false if not rpbr_unshadowed(then_body, name) or not rpbr_unshadowed(else_body, name)
+                        Stmt.While(condition, while_body, while_pos):
+                            return false if not rpbr_unshadowed(while_body, name)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
+                            return false
+                        Stmt.Match(scrutinee, arms, match_pos):
+                            return false
+                        Stmt.Block(kind, clause, binding, block_body, block_pos):
+                            return false
+                        _:
+                            pass
+                return true
+
+
+        # The explicit region NAME is tied to in a function at LINE that declares no return tie,
+        # or "" when the rule does not apply.
+        def rpbr_tied_region(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                region: mutable sview = sview("", 0, 0)
+                for annotation in annotations |region, name, line|:
+                    continue if annotation.line != line
+                    return sview("", 0, 0) if annotation.name == "__region_return"
+                    region <- annotation.region if annotation.name == name and region == ""
+                return sview("", 0, 0) if region == ""
+                return region if any annotation in annotations where annotation.name == "__region_param" and annotation.line == line and annotation.region == region
+                return sview("", 0, 0)
+
+
+        def rpbr_check_returns(statements: darray[Ast::Stmt]&, tied_names: darray[sview]&, tied_regions: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, return_pos):
+                            if value is returned:
+                                name: sview = rpbr_bare_ident(returned)
+                                for index in 0..<tied_names.count |table, name, returned, tied_names, tied_regions|:
+                                    continue if name == "" or tied_names[index] != name
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamInferenceFailure, name: "", pos: Ast::expr_pos(returned), line: return_pos.line, expected: name, actual: tied_regions[index], state_code: 2})
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            table <- rpbr_check_returns(then_body, tied_names, tied_regions, table)
+                            table <- rpbr_check_returns(else_body, tied_names, tied_regions, table)
+                        Stmt.While(condition, while_body, while_pos):
+                            table <- rpbr_check_returns(while_body, tied_names, tied_regions, table)
+                        _:
+                            pass
+
+
+        def rpbr_walk(declarations: darray[Ast::Decl]&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            tied_names: mutable darray[sview] = []
+                            tied_regions: mutable darray[sview] = []
+                            for parameter in parameters |tied_names, tied_regions, annotations, body, line|:
+                                region: sview = rpbr_tied_region(annotations, parameter.name, line.line)
+                                continue if region == "" or not rpbr_unshadowed(body, parameter.name)
+                                tied_names.push(parameter.name)
+                                tied_regions.push(region)
+                            table <- rpbr_check_returns(body, tied_names, tied_regions, table) if tied_names.count > 0
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- rpbr_walk(module_body, annotations, table)
+                        _:
+                            pass
+
+    public:
+        # Runs after check_region_tied_return: a reference-returning function used to get
+        # RegionTiedReturn for the same return; stage0 prints only this sentence there.
+        def check_region_param_bare_return(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                before: usize = table.diagnostics.count
+                table <- rpbr_walk(file.top_decls, file.local_region_annotations, table)
+                return if table.diagnostics.count == before
+                count: usize = table.diagnostics.count
+                write: mutable usize = 0
+                for read in 0..<count |write, table, before, count|:
+                    existing: Diagnostic = table.diagnostics[read]
+                    superseded: mutable bool = false
+                    if read < before and existing.kind == DiagnosticKind.RegionTiedReturn:
+                        for later in before..<count |superseded, table, existing|:
+                            superseded <- true if table.diagnostics[later].line == existing.line and table.diagnostics[later].expected == existing.name
+                    continue if superseded
+                    table.diagnostics[write] <- existing if write != read
+                    write <- write + 1
+                table.diagnostics <- table.diagnostics.truncate(write)
