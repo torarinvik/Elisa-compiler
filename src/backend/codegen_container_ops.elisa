@@ -375,52 +375,15 @@ extend Backend:
             enough: LLVMValueRef = LLVMBuildICmp(builder, 35, capacity, needed, "push.cap.ok")
             _ = LLVMBuildCondBr(builder, enough, store_block, grow_block)
 
+            # The growth itself is the module's one out-of-line `__elisa_darray_grow` (see
+            # darray_grow_callee); it stores the new items pointer and capacity.
             LLVMPositionBuilderAtEnd(builder, grow_block)
-            doubled: mutable LLVMValueRef = LLVMConstInt(int64_type, 0, 0)
-            if emit_overflow_binary(capacity, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder) is doubled_result:
-                doubled <- LLVMBuildSelect(builder, doubled_result.overflow, needed, doubled_result.value, "push.cap.double.safe")
+            if darray_grow_callee(false, structs, runtime, ctx, builder) is grow_function:
+                grow_arguments: mutable darray[LLVMValueRef] = [array_slot, needed, stride, runtime.arena]
+                grow_pointer: void& = (&grow_arguments[0]).cast[void&] can Unsafe.PointerCast
+                _ = LLVMBuildCall2(builder, LLVMGlobalGetValueType(grow_function), grow_function, grow_pointer, 4, "")
             else:
                 return false
-            # 32 = EQ.
-            is_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, capacity, LLVMConstInt(int64_type, 0, 0), "push.cap.zero")
-            # Keep stage1's builtin push lowering in lockstep with
-            # elisacore_std.collections' ARENA_DA_INIT_CAP. This is part of
-            # the ABI-visible runtime policy, not an independent heuristic.
-            base: LLVMValueRef = LLVMBuildSelect(builder, is_empty, LLVMConstInt(int64_type, 8, 0), doubled, "push.cap.base")
-            # 36 = ULT.
-            too_small: LLVMValueRef = LLVMBuildICmp(builder, 36, base, needed, "push.cap.lt")
-            new_capacity: LLVMValueRef = LLVMBuildSelect(builder, too_small, needed, base, "push.cap.new")
-            if emit_checked_reserve_binary(capacity, stride, true, m, ctx, builder) is push_old_bytes:
-                if emit_checked_reserve_binary(new_capacity, stride, true, m, ctx, builder) is push_new_bytes:
-                    old_bytes: LLVMValueRef = push_old_bytes
-                    new_bytes: LLVMValueRef = push_new_bytes
-                    old_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "push.items")
-                    is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, old_items, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), "push.items.null")
-                    alloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.alloc")
-                    realloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.realloc")
-                    grown_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.grown")
-                    _ = LLVMBuildCondBr(builder, is_null, alloc_block, realloc_block)
-
-                    LLVMPositionBuilderAtEnd(builder, alloc_block)
-                    alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, runtime_size_argument(new_bytes, ctx, builder)]
-                    alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
-                    allocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "push.alloc")
-                    _ = LLVMBuildStore(builder, allocated, items_pointer)
-                    _ = LLVMBuildBr(builder, grown_block)
-
-                    LLVMPositionBuilderAtEnd(builder, realloc_block)
-                    realloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, old_items, runtime_size_argument(old_bytes, ctx, builder), runtime_size_argument(new_bytes, ctx, builder)]
-                    realloc_pointer: void& = (&realloc_arguments[0]).cast[void&] can Unsafe.PointerCast
-                    reallocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_realloc_type, runtime.arena_realloc, realloc_pointer, 4, "push.realloc")
-                    _ = LLVMBuildStore(builder, reallocated, items_pointer)
-                    _ = LLVMBuildBr(builder, grown_block)
-
-                    LLVMPositionBuilderAtEnd(builder, grown_block)
-                else:
-                    return false
-            else:
-                return false
-            darray_store_size(builder, new_capacity, capacity_pointer, ctx)
             _ = LLVMBuildBr(builder, store_block)
 
             LLVMPositionBuilderAtEnd(builder, store_block)
@@ -554,6 +517,118 @@ extend Backend:
             return false
 
 
+        # The COLD half of darray growth -- capacity policy, checked byte sizes, alloc or
+        # realloc, the new items pointer and capacity stored back -- as ONE private
+        # `noinline cold` function per module, called from each growth site:
+        #   __elisa_darray_grow(header, needed, stride, arena)     push's policy
+        #   __elisa_darray_grow_to(header, needed, stride, arena)  extend's doubling loop
+        # Inline, this was ~35 instructions, three overflow multiplies and two trap blocks at
+        # EVERY push site (8.4k of them in elisa-proof), a large share of the IR every LLVM
+        # pass and the code generator then chewed through. A push's hot path (count check,
+        # store, count bump) stays inline; growth is already a reallocation, so one call more
+        # is noise. Same arithmetic, same traps, same allocator calls as the inline form.
+        def darray_grow_callee(append_policy: bool, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            m: LLVMModuleRef = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)))
+            helper_name: cstr = "__elisa_darray_grow_to" if append_policy else "__elisa_darray_grow"
+            if LLVMGetNamedFunction(m, helper_name) is existing_helper:
+                return existing_helper
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            parameter_types: mutable darray[LLVMTypeRef] = [pointer_type, int64_type, int64_type, pointer_type]
+            parameter_pointer: void& = (&parameter_types[0]).cast[void&] can Unsafe.PointerCast
+            helper_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), parameter_pointer, 4, 0)
+            helper: LLVMValueRef = LLVMAddFunction(m, helper_name, helper_type)
+            # 8 = InternalLinkage.
+            LLVMSetLinkage(helper, 8)
+            add_parameter_attribute(helper, 4294967295, "noinline", ctx)
+            add_parameter_attribute(helper, 4294967295, "cold", ctx)
+            helper_builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+            LLVMPositionBuilderAtEnd(helper_builder, LLVMAppendBasicBlockInContext(ctx, helper, "entry"))
+            grown: bool = emit_darray_grow_body(LLVMGetParam(helper, 0), LLVMGetParam(helper, 1), LLVMGetParam(helper, 2), LLVMGetParam(helper, 3), append_policy, structs, runtime, m, ctx, helper_builder)
+            if grown:
+                _ = LLVMBuildRetVoid(helper_builder)
+            LLVMDisposeBuilder(helper_builder)
+            if not grown:
+                LLVMDeleteFunction(helper)
+                return null
+            return helper
+
+
+        # Grow `header_slot`'s backing so it holds at least `needed` elements of `stride`
+        # bytes, allocating from `arena`. Push's policy: 0 -> 8, otherwise double (or
+        # `needed` when doubling overflows), never below `needed`. Extend's policy repeats
+        # the doubling until it fits -- the capacity the per-element push loop reaches.
+        def emit_darray_grow_body(header_slot: LLVMValueRef, needed: LLVMValueRef, stride: LLVMValueRef, arena: LLVMValueRef, append_policy: bool, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+            items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, header_slot, 0, "grow.items.ptr")
+            capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, header_slot, 2, "grow.cap.ptr")
+            capacity: LLVMValueRef = darray_load_size_i64(capacity_pointer, ctx, builder, "grow.cap")
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            new_capacity: mutable LLVMValueRef = capacity
+            if append_policy:
+                capacity_slot: LLVMValueRef = build_entry_alloca(builder, int64_type, "grow.cap.next")
+                _ = LLVMBuildStore(builder, capacity, capacity_slot)
+                step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "grow.cap.step")
+                sized_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "grow.cap.sized")
+                _ = LLVMBuildBr(builder, step_block)
+                LLVMPositionBuilderAtEnd(builder, step_block)
+                current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_slot, "grow.cap.cur")
+                if emit_overflow_binary(current, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder) is step_doubled:
+                    step_safe: LLVMValueRef = LLVMBuildSelect(builder, step_doubled.overflow, needed, step_doubled.value, "grow.cap.double.safe")
+                    # 32 = EQ. Keep the 8 in lockstep with ARENA_DA_INIT_CAP.
+                    step_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, current, LLVMConstInt(int64_type, 0, 0), "grow.cap.zero")
+                    step_next: LLVMValueRef = LLVMBuildSelect(builder, step_empty, LLVMConstInt(int64_type, 8, 0), step_safe, "grow.cap.base")
+                    _ = LLVMBuildStore(builder, step_next, capacity_slot)
+                    # 36 = ULT: still short of `needed` -> another doubling.
+                    _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 36, step_next, needed, "grow.cap.short"), step_block, sized_block)
+                else:
+                    return false
+                LLVMPositionBuilderAtEnd(builder, sized_block)
+                new_capacity <- LLVMBuildLoad2(builder, int64_type, capacity_slot, "grow.cap.new")
+            else:
+                if emit_overflow_binary(capacity, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder) is doubled_result:
+                    doubled: LLVMValueRef = LLVMBuildSelect(builder, doubled_result.overflow, needed, doubled_result.value, "push.cap.double.safe")
+                    # 32 = EQ. Keep in lockstep with elisacore_std.collections' ARENA_DA_INIT_CAP:
+                    # part of the ABI-visible runtime policy, not an independent heuristic.
+                    is_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, capacity, LLVMConstInt(int64_type, 0, 0), "push.cap.zero")
+                    base: LLVMValueRef = LLVMBuildSelect(builder, is_empty, LLVMConstInt(int64_type, 8, 0), doubled, "push.cap.base")
+                    # 36 = ULT.
+                    too_small: LLVMValueRef = LLVMBuildICmp(builder, 36, base, needed, "push.cap.lt")
+                    new_capacity <- LLVMBuildSelect(builder, too_small, needed, base, "push.cap.new")
+                else:
+                    return false
+            if emit_checked_reserve_binary(capacity, stride, true, m, ctx, builder) is old_bytes:
+                if emit_checked_reserve_binary(new_capacity, stride, true, m, ctx, builder) is new_bytes:
+                    old_items: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, items_pointer, "grow.items")
+                    is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, old_items, LLVMConstNull(pointer_type), "grow.items.null")
+                    alloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "grow.alloc")
+                    realloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "grow.realloc")
+                    grown_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "grow.done")
+                    _ = LLVMBuildCondBr(builder, is_null, alloc_block, realloc_block)
+
+                    LLVMPositionBuilderAtEnd(builder, alloc_block)
+                    alloc_arguments: mutable darray[LLVMValueRef] = [arena, runtime_size_argument(new_bytes, ctx, builder)]
+                    alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+                    allocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "grow.alloc")
+                    _ = LLVMBuildStore(builder, allocated, items_pointer)
+                    _ = LLVMBuildBr(builder, grown_block)
+
+                    LLVMPositionBuilderAtEnd(builder, realloc_block)
+                    realloc_arguments: mutable darray[LLVMValueRef] = [arena, old_items, runtime_size_argument(old_bytes, ctx, builder), runtime_size_argument(new_bytes, ctx, builder)]
+                    realloc_pointer: void& = (&realloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+                    reallocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_realloc_type, runtime.arena_realloc, realloc_pointer, 4, "grow.realloc")
+                    _ = LLVMBuildStore(builder, reallocated, items_pointer)
+                    _ = LLVMBuildBr(builder, grown_block)
+
+                    LLVMPositionBuilderAtEnd(builder, grown_block)
+                    darray_store_size(builder, new_capacity, capacity_pointer, ctx)
+                    return true
+                return false
+            return false
+
+
         # Append `extra` trivially-copyable elements in ONE step: grow once, `memmove` the
         # bytes, bump the count. `xs.extend(src)` used to lower to a per-element push loop --
         # a capacity check, a byte load and a count store per element. Besides being slow,
@@ -587,64 +662,21 @@ extend Backend:
                 needed: LLVMValueRef = append_needed
                 function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                 grow_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.grow")
-                step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.cap.step")
-                sized_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.cap.sized")
                 copy_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.copy")
                 # 35 = UGE: capacities are unsigned.
                 enough: LLVMValueRef = LLVMBuildICmp(builder, 35, capacity, needed, "append.cap.ok")
                 _ = LLVMBuildCondBr(builder, enough, copy_block, grow_block)
 
-                # The push loop's capacity sequence, without the pushes: 0 -> 8, otherwise
-                # double (or jump straight to `needed` once doubling overflows), until it fits.
+                # The push loop's capacity sequence, without the pushes, in the module's one
+                # out-of-line `__elisa_darray_grow_to` (see darray_grow_callee).
                 LLVMPositionBuilderAtEnd(builder, grow_block)
-                capacity_slot: LLVMValueRef = build_entry_alloca(builder, int64_type, "append.cap.next")
-                _ = LLVMBuildStore(builder, capacity, capacity_slot)
-                _ = LLVMBuildBr(builder, step_block)
-                LLVMPositionBuilderAtEnd(builder, step_block)
-                current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_slot, "append.cap.cur")
-                if emit_overflow_binary(current, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder) is doubled_result:
-                    doubled: LLVMValueRef = LLVMBuildSelect(builder, doubled_result.overflow, needed, doubled_result.value, "append.cap.double.safe")
-                    # 32 = EQ. Keep the 8 in lockstep with emit_darray_push / ARENA_DA_INIT_CAP.
-                    is_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, current, LLVMConstInt(int64_type, 0, 0), "append.cap.zero")
-                    next_capacity: LLVMValueRef = LLVMBuildSelect(builder, is_empty, LLVMConstInt(int64_type, 8, 0), doubled, "append.cap.base")
-                    _ = LLVMBuildStore(builder, next_capacity, capacity_slot)
-                    # 36 = ULT: still short of `needed` -> another doubling.
-                    short: LLVMValueRef = LLVMBuildICmp(builder, 36, next_capacity, needed, "append.cap.short")
-                    _ = LLVMBuildCondBr(builder, short, step_block, sized_block)
+                if darray_grow_callee(true, structs, runtime, ctx, builder) is grow_to_function:
+                    grow_to_arguments: mutable darray[LLVMValueRef] = [array_slot, needed, stride, runtime.arena]
+                    grow_to_pointer: void& = (&grow_to_arguments[0]).cast[void&] can Unsafe.PointerCast
+                    _ = LLVMBuildCall2(builder, LLVMGlobalGetValueType(grow_to_function), grow_to_function, grow_to_pointer, 4, "")
                 else:
                     return false
-                LLVMPositionBuilderAtEnd(builder, sized_block)
-                new_capacity: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_slot, "append.cap.new")
-                if emit_checked_reserve_binary(capacity, stride, true, m, ctx, builder) is append_old_bytes:
-                    if emit_checked_reserve_binary(new_capacity, stride, true, m, ctx, builder) is append_new_bytes:
-                        old_items: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, items_pointer, "append.items")
-                        is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, old_items, LLVMConstNull(pointer_type), "append.items.null")
-                        alloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.alloc")
-                        realloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.realloc")
-                        grown_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "append.grown")
-                        _ = LLVMBuildCondBr(builder, is_null, alloc_block, realloc_block)
-
-                        LLVMPositionBuilderAtEnd(builder, alloc_block)
-                        alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, runtime_size_argument(append_new_bytes, ctx, builder)]
-                        alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
-                        allocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "append.alloc")
-                        _ = LLVMBuildStore(builder, allocated, items_pointer)
-                        _ = LLVMBuildBr(builder, grown_block)
-
-                        LLVMPositionBuilderAtEnd(builder, realloc_block)
-                        realloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, old_items, runtime_size_argument(append_old_bytes, ctx, builder), runtime_size_argument(append_new_bytes, ctx, builder)]
-                        realloc_pointer: void& = (&realloc_arguments[0]).cast[void&] can Unsafe.PointerCast
-                        reallocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_realloc_type, runtime.arena_realloc, realloc_pointer, 4, "append.realloc")
-                        _ = LLVMBuildStore(builder, reallocated, items_pointer)
-                        _ = LLVMBuildBr(builder, grown_block)
-
-                        LLVMPositionBuilderAtEnd(builder, grown_block)
-                        darray_store_size(builder, new_capacity, capacity_pointer, ctx)
-                        _ = LLVMBuildBr(builder, copy_block)
-                    else:
-                        return false
-                else:
-                    return false
+                _ = LLVMBuildBr(builder, copy_block)
 
                 LLVMPositionBuilderAtEnd(builder, copy_block)
                 source_items: mutable LLVMValueRef = source
