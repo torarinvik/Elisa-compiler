@@ -1,0 +1,149 @@
+extend Semantic:
+    private:
+        # Named types whose values can NEVER carry a borrow, transitively: every field (and every
+        # enum payload field) is a builtin scalar, another such type, or a `darray[...]` of one.
+        # A least fixpoint over the file's struct/enum declarations, so a self-recursive or
+        # generic type, an sview/cstr/slice/ref field at any depth, or a name declared twice with
+        # one view-carrying declaration all stay OUT (conservative). Used to tell an owned
+        # by-value return (`args: darray[ValueType] = infer(scope)`) from one that may hold a
+        # view of its arguments.
+        def storage_owned_type_names(file: Ast::File&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                fields: mutable darray[Ast::Expr] = []
+                starts: mutable darray[usize] = []
+                generic: mutable darray[bool] = []
+                storage_owned_collect(file.top_decls, file.generic_param_lines, names, fields, starts, generic)
+                owned: mutable darray[sview] = []
+                changed: mutable bool = true
+                while changed |changed, owned, names, fields, starts, generic|:
+                    changed <- false
+                    for index in 0..<names.count |changed, owned, names, fields, starts, generic|:
+                        continue if hce_contains(&owned, names[index])
+                        same_ok: bool =
+                            for other in 0..<names.count |same_ok: bool = true, owned, names, fields, starts, generic| -> same_ok:
+                                if names[other] == names[index]:
+                                    same_ok <- false if generic[other] or not storage_owned_fields_free(fields, starts[other], starts[other + 1], &owned)
+                        if same_ok:
+                            owned.push(names[index])
+                            changed <- true
+                return owned
+
+        def storage_owned_collect(declarations: darray[Ast::Decl]&, generic_lines: darray[u32]&, names: mutable darray[sview]&, fields: mutable darray[Ast::Expr]&, starts: mutable darray[usize]&, generic: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                starts.push(0) if starts.count == 0
+                for declaration in declarations |generic_lines, names, fields, starts, generic|:
+                    match declaration:
+                        Decl.Struct(name, members, _, _, _, _, pos):
+                            names.push(name)
+                            generic.push(any line in generic_lines where line == pos.line)
+                            for member in members |fields|:
+                                fields.push(member.type_expression)
+                            starts.push(fields.count)
+                        Decl.Enum(name, variants, is_const, _, pos):
+                            names.push(name)
+                            generic.push(any line in generic_lines where line == pos.line)
+                            if not is_const:
+                                for variant in variants |fields|:
+                                    for field_type in variant.fields |fields|:
+                                        fields.push(field_type)
+                            starts.push(fields.count)
+                        Decl.Module(_, body, _):
+                            storage_owned_collect(body, generic_lines, names, fields, starts, generic)
+                        Decl.Scoped(body, _):
+                            storage_owned_collect(body, generic_lines, names, fields, starts, generic)
+                        _:
+                            pass
+
+        def storage_owned_fields_free(fields: darray[Ast::Expr]&, first: usize, last: usize, owned: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for index in first..<last |fields, owned|:
+                    false return if not storage_owned_type_free(fields[index], owned)
+                return true
+
+        # Whether a TYPE expression is borrow-free under OWNED: a builtin scalar, an owned named
+        # type, or `darray[T]` of one (an optional `mutable` binding qualifier is ignored).
+        def storage_owned_type_free(type_expression: Ast::Expr, owned: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(TokenKind.Mutable, operand, _) | Expr.Paren(operand, _):
+                        return storage_owned_type_free(operand, owned)
+                    Expr.Ident(name, _):
+                        return storage_view_type_is_scalar_copy(type_expression) or hce_contains(owned, name)
+                    Expr.Index(head, argument, _):
+                        return ident_name_of(head) == "darray" and storage_owned_type_free(argument, owned)
+                    _:
+                        return false
+
+        # Append one `[owned-fn]` row (vro row width, so view-summary lookups skip it) per
+        # function whose result is a FRESH borrow-free value: a declared return type that is
+        # borrow-free under storage_owned_type_names, no `-> T @r` return-region tie, not generic.
+        # A by-value return cannot be a parameter's storage without such a tie (a region-less
+        # return of `p.items` is rejected), so the caller's local owns it. Every declaration of
+        # the name (overloads, externs) must qualify. A GLOBAL's field returned by value DOES
+        # share the global's buffer, so a body mentioning a global -- or, to a fixpoint, another
+        # candidate that does (`return g()`) -- is excluded.
+        def storage_owned_fn_rows(file: Ast::File&, rows: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                owned: darray[sview] = storage_owned_type_names(file)
+                good: mutable darray[sview] = []
+                bad: mutable darray[sview] = []
+                bodies: mutable darray[darray[Ast::Stmt]] = []
+                tainted: mutable darray[sview] = []
+                storage_owned_fn_collect(file.top_decls, file.generic_param_lines, file.local_region_annotations, &owned, good, bad, bodies, tainted)
+                none: darray[sview] = []
+                changed: mutable bool = tainted.count > 0
+                while changed |changed, good, bad, bodies, tainted, none|:
+                    changed <- false
+                    for index in 0..<good.count |changed, good, bad, bodies, tainted, none|:
+                        continue if hce_contains(&tainted, good[index])
+                        if lvre_stmts_mention(&bodies[index], &tainted, &none) != "":
+                            tainted.push(good[index])
+                            bad.push(good[index])
+                            changed <- true
+                for name in good |rows, bad|:
+                    continue if hce_contains(&bad, name)
+                    rows.push("[owned-fn]")
+                    rows.push(name)
+                    rows.push("")
+                    rows.push("")
+                    rows.push("")
+
+        def storage_owned_fn_collect(declarations: darray[Ast::Decl]&, generic_lines: darray[u32]&, annotations: darray[Ast::LocalRegionAnnotation]&, owned: darray[sview]&, good: mutable darray[sview]&, bad: mutable darray[sview]&, bodies: mutable darray[darray[Ast::Stmt]]&, globals: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |generic_lines, annotations, owned, good, bad, bodies, globals|:
+                    match declaration:
+                        Decl.Func(name, _, return_type, body, _, _, pos):
+                            fresh: mutable bool = false
+                            if return_type is declared:
+                                fresh <- storage_owned_type_free(declared, owned) and function_return_region(annotations, pos.line) == "" and not (any line in generic_lines where line == pos.line)
+                            if fresh:
+                                good.push(name)
+                                bodies.push(body)
+                            else:
+                                bad.push(name)
+                        Decl.Extern(name, _, _, _, _, _, _, _):
+                            bad.push(name)
+                        Decl.Const(name, _, _, _, _):
+                            globals.push(name)
+                        Decl.Module(_, body, _):
+                            storage_owned_fn_collect(body, generic_lines, annotations, owned, good, bad, bodies, globals)
+                        Decl.Scoped(body, _):
+                            storage_owned_fn_collect(body, generic_lines, annotations, owned, good, bad, bodies, globals)
+                        _:
+                            pass
+
+        # `x: T = f(...)` where f is an `[owned-fn]`: the local owns a fresh value.
+        def storage_view_owned_call(value: Ast::Expr, view_fns: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return storage_view_owned_call(inner, view_fns)
+                    Expr.Call(Expr.Ident(called, _), _, _, _):
+                        row: mutable usize = 0
+                        while row + 4 < view_fns.count |row, view_fns, called|:
+                            true return if view_fns[row] == "[owned-fn]" and view_fns[row + 1] == called
+                            row <- row + 5
+                        return false
+                    _:
+                        return false
