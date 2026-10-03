@@ -203,18 +203,23 @@ state legality, and reachability are separate caller obligations; this module is
 not yet integrated into a control-flow ownership checker or transition admission.
 
 `test/proofs/ownership_flow_domain.elisa` imports that exact implementation rather
-than a copied model. Its `elisa-proof` baseline remains **OPEN: 25/32 obligations**,
-with 25/25 independently replayed certificates and no trusted assumptions. The
-implementation bodies and six client properties verify; seven client declarations
-(including associativity, idempotence and commutativity) remain unverified. Four
-false claims reject. `check_ownership_flow.py` checks repeatability, source/product
-hashes, replay coverage and the explicit OPEN status; a successful baseline check
-is not proof admission. Prover logical-Boolean-equation support raised coverage
-from 19 to 24 obligations; guarded logical constant reduction then closes the
-consumed-input client (25 obligations) without weakening these claims. The kernel
-checks formation before constant absorption, so malformed or unwitnessed leaves
-cannot disappear merely because a neighboring operand determines the result.
-Complete the remaining algebraic laws before claiming the domain proved.
+than a copied model. The Boolean-domain proof is now **admitted: 32/32 obligations**,
+with 32/32 independently replayed certificates, zero semantic errors, and no trusted
+assumptions. All three implementation bodies and thirteen client laws verify,
+including associativity, commutativity, idempotence, identity, and consumed/unknown
+input denial. Seven false claims reject at their postconditions. The admission gate
+checks repeated reports, source/product hashes, all function-summary statuses and
+complete replay. This admission applies only to this Boolean domain, not binding
+resolution, ownership flow, borrow invalidation or transition code generation.
+
+Coverage progressed through 19, 24 and 25 obligations before bounded same-operator
+join normalization and void-return summary rewriting closed the remaining seven.
+The original postconditions remain unchanged; proof bodies explicitly evaluate
+the pure calls needed for their verified summary facts. Search and kernel replay
+independently compare flattened witnessed atom sets, rejecting mixed operators,
+numeric literal leaves, missing witnesses and fuel exhaustion. Formation precedes
+constant absorption, so malformed operands cannot be erased by a neighboring
+constant. No proof-analysis budget was increased or foreign axiom added.
 
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
