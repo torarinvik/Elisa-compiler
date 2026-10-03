@@ -1,0 +1,210 @@
+# Whole-binding liveness over resolved source AST. Unsupported semantics are
+# explicit coverage gaps, never authority to move. Construction/state/borrows,
+# implicit call consumption, places, loops and handlers require further passes.
+extend Semantic:
+    private:
+        def ownership_fact_slot(facts: darray[OwnershipBindingFact]&, id: BindingId) -> int can[Abort.Panic]:
+            for index in 0..<facts.count:
+                return index.int() if ownership_binding_ids_equal(facts[index].binding_id, id)
+            return -1
+
+        def ownership_flow_unknown(flow: mutable OwnershipFrontier&) -> void can[Abort.Panic]:
+            flow.coverage_complete <- false
+            for index in 0..<flow.facts.count |flow|:
+                fact: OwnershipBindingFact = flow.facts[index]
+                flow.facts[index] <- OwnershipBindingFact{binding_id: fact.binding_id, reachable: flow.reachable, known: false, may_live: flow.reachable, may_consumed: flow.reachable}
+
+        def ownership_flow_step(flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> bool can[Abort.Panic]:
+            return false if not flow.reachable
+            if depth >= 128 or work.fuel == 0:
+                ownership_flow_unknown(flow)
+                return false
+            work.fuel <- work.fuel - 1
+            return true
+
+        def ownership_flow_clone(flow: OwnershipFrontier&) -> OwnershipFrontier can[Memory.Allocate, Abort.Panic]:
+            return OwnershipFrontier{facts: [fact for fact in flow.facts], reachable: flow.reachable, coverage_complete: flow.coverage_complete}
+
+        def ownership_literal_bool(expression: Ast::Expr, depth: usize = 0) -> (known: bool, value: bool) can[Abort.Panic]:
+            return (false, false) if depth >= 128
+            match expression:
+                Expr.BoolLit(value, _):
+                    return (true, value)
+                Expr.Paren(inner, _):
+                    return ownership_literal_bool(inner, depth + 1)
+                _:
+                    return (false, false)
+
+        # Only entry bindings survive a lexical branch. Each predecessor's
+        # reachability is attached before using the independently proved join.
+        def ownership_flow_join(flow: mutable OwnershipFrontier&, left: OwnershipFrontier&, right: OwnershipFrontier&) -> void can[Abort.Panic]:
+            for index in 0..<flow.facts.count |flow|:
+                original: OwnershipBindingFact = flow.facts[index]
+                lslot: int = ownership_fact_slot(&left.facts, original.binding_id)
+                rslot: int = ownership_fact_slot(&right.facts, original.binding_id)
+                if lslot < 0 or rslot < 0:
+                    ownership_flow_unknown(flow)
+                    return
+                l: OwnershipBindingFact = left.facts[lslot.usize()]
+                r: OwnershipBindingFact = right.facts[rslot.usize()]
+                flow.facts[index] <- ownership_binding_join(original.binding_id,
+                    OwnershipBindingFact{binding_id: l.binding_id, reachable: left.reachable, known: l.known, may_live: l.may_live, may_consumed: l.may_consumed},
+                    OwnershipBindingFact{binding_id: r.binding_id, reachable: right.reachable, known: r.known, may_live: r.may_live, may_consumed: r.may_consumed})
+            flow.reachable <- left.reachable or right.reachable
+            flow.coverage_complete <- flow.coverage_complete and left.coverage_complete and right.coverage_complete
+
+        def ownership_flow_occurrence(position: Ast::Pos, is_move: bool, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&) -> void can[Memory.Allocate, Abort.Panic]:
+            resolved, id = ownership_binding_at_position(table, owner, position)
+            if not resolved:
+                ownership_flow_unknown(flow) if is_move
+                return
+            slot: int = ownership_fact_slot(&flow.facts, id)
+            if slot < 0:
+                work.occurrences.push(OwnershipOccurrence{binding_id: id, pos: position, is_move: is_move, known: false, liveness_available: false})
+                ownership_flow_unknown(flow)
+                return
+            fact: OwnershipBindingFact = flow.facts[slot.usize()]
+            work.occurrences.push(OwnershipOccurrence{binding_id: id, pos: position, is_move: is_move, known: fact.known, liveness_available: ownership_binding_can_consume(fact)})
+            if is_move:
+                accepted, consumed = ownership_binding_consume(fact)
+                flow.facts[slot.usize()] <- consumed
+
+        def ownership_flow_expression(expression: Ast::Expr, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> void can[Memory.Allocate, Abort.Panic]:
+            return if not ownership_flow_step(flow, work, depth)
+            match expression:
+                Expr.Ident(_, position):
+                    ownership_flow_occurrence(position, false, owner, table, flow, work)
+                Expr.Paren(inner, _):
+                    ownership_flow_expression(inner, owner, table, flow, work, depth + 1)
+                Expr.Unary(operator, inner, _):
+                    ownership_flow_expression(inner, owner, table, flow, work, depth + 1)
+                    ownership_flow_unknown(flow) if operator != TokenKind.Not
+                Expr.Move(operand, _):
+                    current: mutable Ast::Expr = operand
+                    for unwrap in 0..<128 |current, flow, work|:
+                        match current:
+                            Expr.Paren(inner, _):
+                                current <- inner
+                            Expr.Ident(_, position):
+                                ownership_flow_occurrence(position, true, owner, table, flow, work)
+                                return
+                            _:
+                                ownership_flow_unknown(flow)
+                                return
+                    ownership_flow_unknown(flow)
+                Expr.Binary(left, operator, right, _):
+                    ownership_flow_expression(left, owner, table, flow, work, depth + 1)
+                    if operator == TokenKind.And or operator == TokenKind.Or:
+                        literal = ownership_literal_bool(left)
+                        if literal.known:
+                            ownership_flow_expression(right, owner, table, flow, work, depth + 1) if (operator == TokenKind.And and literal.value) or (operator == TokenKind.Or and not literal.value)
+                            return
+                        evaluated: mutable OwnershipFrontier = ownership_flow_clone(flow)
+                        skipped: OwnershipFrontier = ownership_flow_clone(flow)
+                        ownership_flow_expression(right, owner, table, &evaluated, work, depth + 1)
+                        ownership_flow_join(flow, &evaluated, &skipped)
+                    else:
+                        ownership_flow_expression(right, owner, table, flow, work, depth + 1)
+                        # Overloaded operators may have implicit consumption.
+                        ownership_flow_unknown(flow)
+                Expr.If(condition, then_value, else_value, _):
+                    ownership_flow_expression(condition, owner, table, flow, work, depth + 1)
+                    yes: mutable OwnershipFrontier = ownership_flow_clone(flow)
+                    no: mutable OwnershipFrontier = ownership_flow_clone(flow)
+                    literal = ownership_literal_bool(condition)
+                    yes.reachable <- yes.reachable and literal.value if literal.known
+                    no.reachable <- no.reachable and not literal.value if literal.known
+                    ownership_flow_expression(then_value, owner, table, &yes, work, depth + 1)
+                    ownership_flow_expression(else_value, owner, table, &no, work, depth + 1)
+                    ownership_flow_join(flow, &yes, &no)
+                Expr.Tuple(elements, _) | Expr.Array(elements, _):
+                    for element in elements |flow, work|:
+                        ownership_flow_expression(element, owner, table, flow, work, depth + 1)
+                Expr.Call(callee, arguments, _, _):
+                    ownership_flow_expression(callee, owner, table, flow, work, depth + 1)
+                    for argument in arguments |flow, work|:
+                        ownership_flow_expression(argument, owner, table, flow, work, depth + 1)
+                    # Call signatures/effects may consume or invalidate owners.
+                    ownership_flow_unknown(flow)
+                Expr.Construct(_, fields, _):
+                    for field in fields |flow, work|:
+                        ownership_flow_expression(field.value, owner, table, flow, work, depth + 1)
+                Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _) | Expr.CharLit(_, _) | Expr.StringLit(_, _) | Expr.Absent:
+                    pass
+                _:
+                    ownership_flow_unknown(flow)
+
+        def ownership_flow_statements(statements: darray[Ast::Stmt]&, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> void can[Memory.Allocate, Abort.Panic]:
+            for statement in statements |flow, work|:
+                return if not ownership_flow_step(flow, work, depth)
+                match statement:
+                    Stmt.Expr(expression, _):
+                        ownership_flow_expression(expression, owner, table, flow, work, depth + 1)
+                    Stmt.VarDecl(name, _, value, position):
+                        ownership_flow_expression(value, owner, table, flow, work, depth + 1)
+                        binder: mutable Ast::Pos = source_binder_position(table, name, position.line, 0, "__pattern_binder")
+                        binder <- position if binder.line == 0
+                        found, id = ownership_binding_at_position(table, owner, binder)
+                        if found:
+                            initialized: bool = match value:
+                                Expr.Absent: false
+                                _: true
+                            flow.facts.push(OwnershipBindingFact{binding_id: id, reachable: flow.reachable, known: flow.coverage_complete, may_live: initialized, may_consumed: false})
+                        else:
+                            ownership_flow_unknown(flow)
+                    Stmt.Assign(Expr.Ident("_", _), _, value, _):
+                        ownership_flow_expression(value, owner, table, flow, work, depth + 1)
+                    Stmt.If(condition, then_body, else_body, _):
+                        ownership_flow_expression(condition, owner, table, flow, work, depth + 1)
+                        yes: mutable OwnershipFrontier = ownership_flow_clone(flow)
+                        no: mutable OwnershipFrontier = ownership_flow_clone(flow)
+                        literal = ownership_literal_bool(condition)
+                        yes.reachable <- yes.reachable and literal.value if literal.known
+                        no.reachable <- no.reachable and not literal.value if literal.known
+                        ownership_flow_statements(&then_body, owner, table, &yes, work, depth + 1)
+                        ownership_flow_statements(&else_body, owner, table, &no, work, depth + 1)
+                        ownership_flow_join(flow, &yes, &no)
+                    Stmt.Return(value, _):
+                        if value is returned:
+                            ownership_flow_expression(returned, owner, table, flow, work, depth + 1)
+                        flow.reachable <- false
+                    Stmt.Block(kind, _, binding, body, _):
+                        if binding == "" and (kind == "can" or kind == "trusted"):
+                            ownership_flow_statements(&body, owner, table, flow, work, depth + 1)
+                        else:
+                            ownership_flow_unknown(flow)
+                    Stmt.Contract(_, _, _):
+                        pass
+                    _:
+                        ownership_flow_unknown(flow)
+
+        def record_protocol_ownership_declarations(declarations: darray[Ast::Decl]&, table: lmut SymbolTable) -> void can[Memory.Allocate, Abort.Panic]:
+            for declaration in declarations |table|:
+                match declaration:
+                    Decl.Func(name, params, _, body, _, _, position):
+                        owner: DeclId = function_declaration_id(table, name, position.offset)
+                        flow: mutable OwnershipFrontier = OwnershipFrontier{facts: [], reachable: true, coverage_complete: true}
+                        work: mutable OwnershipFlowWork = OwnershipFlowWork{occurrences: [], fuel: 8192}
+                        for param in params |flow|:
+                            found, id = ownership_binding_at_position(table, owner, param.name_pos)
+                            if found:
+                                flow.facts.push(OwnershipBindingFact{binding_id: id, reachable: true, known: flow.coverage_complete, may_live: true, may_consumed: false})
+                            else:
+                                ownership_flow_unknown(&flow)
+                        ownership_flow_statements(&body, owner, table, &flow, &work, 0)
+                        for index in 0..<flow.facts.count |flow|:
+                            fact: OwnershipBindingFact = flow.facts[index]
+                            flow.facts[index] <- OwnershipBindingFact{binding_id: fact.binding_id, reachable: flow.reachable, known: fact.known, may_live: fact.may_live, may_consumed: fact.may_consumed}
+                        facts_start: usize = table.ownership_exit_facts.count
+                        table.ownership_occurrences <- table.ownership_occurrences.extend(work.occurrences)
+                        table.ownership_exit_facts <- table.ownership_exit_facts.extend(flow.facts)
+                        table.ownership_function_flows <- table.ownership_function_flows.push(OwnershipFunctionFlow{owner: owner, coverage_complete: flow.coverage_complete, fallthrough_reachable: flow.reachable, facts_start: facts_start, facts_count: flow.facts.count})
+                    Decl.Module(_, body, _) | Decl.Scoped(body, _):
+                        table <- record_protocol_ownership_declarations(&body, table)
+                    _:
+                        pass
+
+        def record_protocol_ownership(file: Ast::File&, table: lmut SymbolTable) -> void can[Memory.Allocate, Abort.Panic]:
+            # Keep the general compiler/self-host path allocation-free here.
+            return if not any family in file.state_families where not family.has_derive
+            table <- record_protocol_ownership_declarations(&file.top_decls, table)

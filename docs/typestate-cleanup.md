@@ -354,7 +354,8 @@ at O0/O2: shadow/function isolation, consumed/live branch join, dead branch
 exclusion, all-dead joins, repeated consumption, and all sixteen consume inputs.
 It also compares all 256 pairs of frontier facts against an independent
 branch-based calculation. The fresh Stage1 product executes this probe too.
-These record operations are not yet connected to the AST control-flow walker.
+These record operations now have an initial observational AST control-flow
+integration (see below); they do not authorize consuming transitions.
 They do not establish borrow invalidation, affine type eligibility, state edges,
 or legal native effects, and do not enable Stage1 consuming transitions.
 
@@ -396,3 +397,29 @@ formation checks run before Boolean absorption. Native controls reject wrong
 polarity, missing premises/witnesses, malformed siblings and exhausted fuel;
 record controls preserve caller names even when they overlap callee parameters.
 These are source-linked identity laws, not proof of the ownership walker.
+
+## Observational ownership control flow
+
+The full semantic-check path records whole-binding liveness for files containing
+classic named-state families. Occurrences use exact resolved binding IDs and
+source spans; branch frontiers are independent copies and joins retain only
+entry bindings. Return paths and literal Boolean short-circuit paths retain
+reachability. Exit facts live in a flat table pool with per-function slices.
+The walker is bounded by depth and work fuel; exhaustion loses knowledge.
+
+This is not an enforcement pass. Loops, match/pattern bindings, general writes,
+places, captures, call effects and implicit consumption remain coverage gaps.
+Unknown operations taint liveness rather than granting permission. Complete
+walker coverage alone does not establish borrow safety, state-transition
+authority, construction authority or native-effect correctness. Stage1's classic
+consuming-transition guard remains enabled until those obligations are met.
+
+Passing native controls under `ownership_control_flow_smoke.sh` cover repeated moves,
+independent branch joins, returning branches, lexical shadowing and dead paths.
+The pending `darray_extend_reassignment_smoke.sh` separately exercises the same-place fluent
+append lowering required to collect observations, including empty inputs and
+self-extension; a different target must decline. These gates must pass before
+the broader append behavior is described as verified. That gate currently declines
+in its positive control; the exact failing call still needs isolation. The
+ownership-flow fixture itself compiles and runs using the new same-place append
+lowering, but does not establish general append-call or self-extension parity.
