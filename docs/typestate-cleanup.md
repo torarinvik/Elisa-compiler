@@ -337,3 +337,31 @@ Boolean input combinations against a branch-based reference calculation.
 domain obligations and a separate 16/16 reachability report (shared imported
 helper obligations overlap), with the seven existing false claims rejected.
 The earlier 32/32 figures below describe the preceding admission milestone.
+
+## BindingId-indexed fact operations
+
+`binding_identity_types.elisa` now holds the single canonical DeclId/BindingId
+definitions and `OwnershipBindingFact`; the semantic facade and standalone
+native controls import those same types, not a test substitute.
+`ownership_binding_flow.elisa` joins only matching IDs, fails closed on invalid
+declaration IDs and cross-binding joins, excludes unreachable predecessor facts,
+and consumes a live known owner once. Failed consumption leaves facts unchanged.
+Serial zero remains valid, matching the actual resolver allocator. The two
+Boolean identity helpers expose their actual field predicates as postconditions.
+
+`test/parity/ownership_binding_flow_stage0_smoke.sh` checks actual fact operations
+at O0/O2: shadow/function isolation, consumed/live branch join, dead branch
+exclusion, all-dead joins, repeated consumption, and all sixteen consume inputs.
+It also compares all 256 pairs of frontier facts against an independent
+branch-based calculation. The fresh Stage1 product executes this probe too.
+These record operations are not yet connected to the AST control-flow walker.
+They do not establish borrow invalidation, affine type eligibility, state edges,
+or legal native effects, and do not enable Stage1 consuming transitions.
+
+`ownership_binding_identity.elisa` dogfoods the actual identity helpers. Its
+producer proves 21/21 obligations but independent replay currently admits only
+20/21: `serial_zero_is_valid`, which instantiates the summary with a nested
+BindingId/DeclId record, remains OPEN. `check_ownership_binding_identity.py`
+tracks that exact gap and explicitly reports `admitted: false`; it is not a
+green admission gate. Fix the kernel replay gap before citing this client law
+as proved. The separate Boolean domain admission gate remains fully replayed.
