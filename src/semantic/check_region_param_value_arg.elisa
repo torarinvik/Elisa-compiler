@@ -1,0 +1,256 @@
+# A plain VALUE passed for an explicitly region-tied ref parameter (stage0 argument check +
+# analyzeRegionParamInference). For `def get[@r](s: mutable S& @r)`, the call `get(q)` with a
+# by-value `q: S` gets "argument 1 to "get" expects mutable S& @r, got S", and, when nothing
+# in the caller binds `r`, "cannot infer region parameter "r"". Stage1 accepted both and
+# passed the value's address into a region-tied slot.
+#
+# Decidable subset (stage0's rule was probed shape by shape; everything else declines):
+# - callee is unique by name (top level, or `M::f` in one module), takes no Arena, and has an
+#   explicit `[@r]` tied to a ref parameter, no `__region_return`;
+# - the call is a top-level statement of the caller body, unnamed arguments only;
+# - the argument is a caller-local (declared once, at top level, before the call) or a caller
+#   by-value parameter, or a field chain over one, whose spelled type equals the parameter's
+#   referent and is a primitive or a struct owning no container (an owning local is the case
+#   stage0 binds a region from and accepts);
+# - the caller has no region parameter of its own, and no region block / `in` block / Arena
+#   local anywhere in the file binds a region of that name (those bind `r`; the mismatch line
+#   still fires in stage0 but this subset stays silent rather than half-report).
+extend Semantic:
+    private:
+        struct RgvKey:
+            qual: sview = ""
+            name: sview = ""
+            is_ref: bool = false
+            is_mutable: bool = false
+            ok: bool = false
+
+        # Spelled base of a type: `[mutable] [M::]Name[&]`; anything else is not ok.
+        # An unqualified name that is a struct of CONTEXT module takes that qualifier.
+        def rgv_key(file: Ast::File&, expression: Ast::Expr, context: sview) -> RgvKey:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_pos):
+                        qualified: bool = context != "" and rgv_find_struct(file, context, name).found
+                        return RgvKey{qual: context if qualified else "", name: name, ok: true}
+                    Expr.Scope(base, name, scope_pos):
+                        qualifier: sview = ident_name_of(base) if base is Ast::Expr.Ident(_, _) else ""
+                        return RgvKey{qual: qualifier, name: name, ok: qualifier != ""}
+                    Expr.Paren(inner, paren_pos):
+                        return rgv_key(file, inner, context)
+                    Expr.Unary(operator, operand, unary_pos):
+                        inner: RgvKey = rgv_key(file, operand, context)
+                        if operator == TokenKind.Ampersand and not inner.is_ref:
+                            return RgvKey{qual: inner.qual, name: inner.name, is_ref: true, is_mutable: inner.is_mutable, ok: inner.ok}
+                        if operator == TokenKind.Mutable:
+                            return RgvKey{qual: inner.qual, name: inner.name, is_ref: inner.is_ref, is_mutable: true, ok: inner.ok}
+                        return RgvKey{}
+                    _:
+                        return RgvKey{}
+
+        def rgv_is_primitive(name: sview) -> bool:
+            return name in {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize", "bool", "f32", "f64"}
+
+        struct RgvStruct:
+            found: mutable bool = false
+            count: mutable u32 = 0
+            members: mutable darray[Ast::StructMember] = []
+
+        # The struct QUAL::NAME ("" = top level); `count` != 1 means ambiguous.
+        def rgv_find_struct(file: Ast::File&, qual: sview, name: sview) -> RgvStruct:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable RgvStruct = RgvStruct{}
+                for declaration in file.top_decls |result, qual, name|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                            if qual == "" and struct_name == name:
+                                result.count <- result.count + 1
+                                result.members <- members
+                        Decl.Module(module_name, module_body, module_pos):
+                            if qual != "" and module_name == qual:
+                                for inner in module_body |result, name|:
+                                    match inner:
+                                        Decl.Struct(inner_name, inner_members, inner_affinity, inner_states, inner_derive, inner_invariants, inner_pos):
+                                            if inner_name == name:
+                                                result.count <- result.count + 1
+                                                result.members <- inner_members
+                                        _:
+                                            pass
+                        _:
+                            pass
+                result.found <- result.count == 1
+                return result
+
+        # Whether a by-value value of KEY owns no container (directly or through by-value
+        # struct fields). Unknown spellings answer false, which declines.
+        def rgv_plain_value(file: Ast::File&, key: RgvKey, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not key.ok or key.is_ref or depth > 8
+                true return if key.qual == "" and rgv_is_primitive(key.name)
+                found: RgvStruct = rgv_find_struct(file, key.qual, key.name)
+                false return if not found.found
+                for member in found.members |file, key, depth|:
+                    member_key: RgvKey = rgv_key(file, member.type_expression, key.qual)
+                    false return if not rgv_plain_value(file, member_key, depth + 1)
+                return true
+
+        # Type of field FIELD of value type KEY; not ok when unknown or a ref field.
+        def rgv_field_key(file: Ast::File&, key: RgvKey, field: sview) -> RgvKey:
+            can Memory.Allocate, Abort.Panic:
+                found: RgvStruct = rgv_find_struct(file, key.qual, key.name)
+                return RgvKey{} if not found.found or key.is_ref
+                for member in found.members |file, key, field|:
+                    if member.name == field:
+                        member_key: RgvKey = rgv_key(file, member.type_expression, key.qual)
+                        return RgvKey{} if member_key.is_ref
+                        return RgvKey{qual: member_key.qual, name: member_key.name, ok: member_key.ok}
+                return RgvKey{}
+
+        # Value type of ARGUMENT in the caller at top-level statement INDEX; not ok = decline.
+        def rgv_arg_key(file: Ast::File&, argument: Ast::Expr, body: darray[Ast::Stmt]&, before: usize, params: darray[Ast::ParamDecl]&) -> RgvKey:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, paren_pos):
+                        return rgv_arg_key(file, inner, body, before, params)
+                    Expr.Field(object, field, field_pos):
+                        root: RgvKey = rgv_arg_key(file, object, body, before, params)
+                        return RgvKey{} if not root.ok or not rgv_plain_value(file, root, 0)
+                        return rgv_field_key(file, root, field)
+                    Expr.Ident(name, ident_pos):
+                        declared: mutable u32 = 0
+                        found: mutable RgvKey = RgvKey{}
+                        for parameter in params |declared, found, name, file|:
+                            if parameter.name == name:
+                                declared <- declared + 1
+                                found <- rgv_key(file, parameter.type_expression, "")
+                        index: mutable usize = 0
+                        for statement in body |declared, found, index, name, before, file|:
+                            match statement:
+                                Stmt.VarDecl(local_name, type_expression, value, local_pos):
+                                    if local_name == name:
+                                        declared <- declared + 1
+                                        found <- rgv_key(file, type_expression, "") if index < before
+                                        found <- RgvKey{} if index >= before
+                                _:
+                                    pass
+                            index <- index + 1
+                        return RgvKey{} if declared != 1 or found.is_ref
+                        return found
+                    _:
+                        return RgvKey{}
+
+        struct RgvCallee:
+            found: mutable bool = false
+            count: mutable u32 = 0
+            params: mutable darray[Ast::ParamDecl] = []
+            line: mutable u32 = 0
+            qual: sview = ""
+
+        def rgv_find_func(file: Ast::File&, qual: sview, name: sview) -> RgvCallee:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable RgvCallee = RgvCallee{qual: qual}
+                for declaration in file.top_decls |result, qual, name|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, function_body, effects, decorators, function_pos):
+                            if function_name == name:
+                                result.count <- result.count + 1
+                                result.params <- parameters
+                                result.line <- function_pos.line
+                        Decl.Module(module_name, module_body, module_pos):
+                            for inner in module_body |result, qual, name, module_name|:
+                                match inner:
+                                    Decl.Func(inner_name, inner_params, inner_return, inner_body, inner_effects, inner_decorators, inner_pos):
+                                        if inner_name == name:
+                                            result.count <- result.count + 1
+                                            if module_name == qual:
+                                                result.params <- inner_params
+                                                result.line <- inner_pos.line
+                                    _:
+                                        pass
+                        _:
+                            pass
+                # Unique ACROSS the file, so an unqualified call can never mean a module twin.
+                result.found <- result.count == 1 and result.line != 0
+                return result
+
+        def rgv_check_call(file: Ast::File&, callee: Ast::Expr, arguments: darray[Ast::Expr]&, call_pos: Ast::Pos, body: darray[Ast::Stmt]&, before: usize, params: darray[Ast::ParamDecl]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                qual: mutable sview = sview("", 0, 0)
+                name: mutable sview = ident_name_of(callee)
+                match callee:
+                    Expr.Scope(base, scoped_name, scope_pos):
+                        qual <- ident_name_of(base) if base is Ast::Expr.Ident(_, _) else ""
+                        name <- scoped_name if qual != "" else ""
+                    _:
+                        pass
+                return if name == ""
+                target: RgvCallee = rgv_find_func(file, qual, name)
+                return if not target.found or target.params.count != arguments.count
+                return if any parameter in target.params where rpu_struct_head(parameter.type_expression) == "Arena"
+                return if any row in file.local_region_annotations where row.name == "__region_return" and row.line == target.line
+                index: mutable usize = 0
+                while index < target.params.count |index, table| -> table:
+                    parameter: Ast::ParamDecl = target.params[index]
+                    region: mutable sview = sview("", 0, 0)
+                    ties: mutable u32 = 0
+                    for row in file.local_region_annotations |region, ties, parameter, target|:
+                        if row.name == parameter.name and row.line == target.line:
+                            ties <- ties + 1
+                            region <- row.region
+                    explicit: bool = ties == 1 and any row in file.local_region_annotations where row.name == "__region_param" and row.line == target.line and row.region == region
+                    # Any other binder of that region name in the file may bind it at this call.
+                    ambient: bool = any row in file.local_region_annotations where (row.name == "__region_local" or row.name == "__region_arena_local") and row.region == region
+                    want: RgvKey = rgv_key(file, parameter.type_expression, qual)
+                    if explicit and not ambient and want.ok and want.is_ref:
+                        got: RgvKey = rgv_arg_key(file, arguments[index], body, before, params)
+                        same: bool = got.ok and not got.is_ref and got.qual == want.qual and got.name == want.name
+                        if same and rgv_plain_value(file, got, 0):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamArgumentMismatch, name: name, pos: Ast::expr_pos(arguments[index]), line: Ast::expr_pos(arguments[index]).line, expected: want.name, actual: region, detail: want.qual, detail2: qual, expected_count: (index + 1).u32(), state_code: 2 if want.is_mutable else 3})
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamUninferable, name: name, pos: call_pos, line: call_pos.line, expected: "", actual: region, detail2: qual, state_code: 2})
+                    index <- index + 1
+
+        def rgv_has_scoped_block(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Block(block_kind, clause, binding, block_body, block_pos):
+                            true return if block_kind == "in" or block_kind == "region" or rgv_has_scoped_block(block_body)
+                        Stmt.If(condition, then_body, else_body, if_pos):
+                            true return if rgv_has_scoped_block(then_body) or rgv_has_scoped_block(else_body)
+                        _:
+                            pass
+                return false
+
+        def rgv_check_func(file: Ast::File&, params: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt], function_line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if any row in file.local_region_annotations where row.name == "__region_param" and row.line == function_line
+                return if rgv_has_scoped_block(body)
+                index: mutable usize = 0
+                while index < body.count |index, table| -> table:
+                    match body[index]:
+                        Stmt.Expr(expression, stmt_pos):
+                            match expression:
+                                Expr.Call(callee, arguments, argument_names, call_pos):
+                                    if not any argument_name in argument_names where argument_name != "":
+                                        table <- rgv_check_call(file, callee, arguments, call_pos, body, index, params, table)
+                                _:
+                                    pass
+                        _:
+                            pass
+                    index <- index + 1
+
+    public:
+        def check_region_param_value_arg(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in file.top_decls |table| -> table:
+                    match declaration:
+                        Decl.Func(check_name, check_params, check_return, check_body, check_effects, check_decorators, check_pos):
+                            table <- rgv_check_func(file, check_params, check_body, check_pos.line, table)
+                        Decl.Module(module_name, module_body, module_pos):
+                            for inner in module_body |table| -> table:
+                                match inner:
+                                    Decl.Func(inner_name, inner_params, inner_return, inner_body, inner_effects, inner_decorators, inner_pos):
+                                        table <- rgv_check_func(file, inner_params, inner_body, inner_pos.line, table)
+                                    _:
+                                        pass
+                        _:
+                            pass
