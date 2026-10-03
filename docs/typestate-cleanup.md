@@ -92,6 +92,21 @@ infrastructure only: the missing-derive guard and unsupported-intrinsic errors
 remain until Stage1 ownership, construction authority, graph checks, provenance,
 and backend lowering are implemented together.
 
+Stage1 now also has a structured graph-validation pass, invoked on the semantic
+loop view. It checks nonempty families, duplicate states, unknown edge endpoints,
+duplicate edges, derived/protocol mixing, and edges without a named family. The
+paired graph-validation gate requires the intended diagnostic and semantic exit
+status; the old missing-derive rejection alone does not count as validation.
+
+The remaining transition implementation must resolve these metadata rows to the
+existing `DeclId` and track values by existing lexical `BindingId`. Do not extend
+the legacy function-name/sentinel protocol checker: its bare-name tracking is not
+adequate for shadowing, independent operation names, or module-separated families.
+State-qualified types need structural type identity through calls, returns,
+containers, and references, followed by owner consumption and borrow/provenance
+transfer. Constructor authority, nested zero initialization, record updates,
+casts, and reference projections need negative controls before relaxing the guard.
+
 Start with owned, consuming transitions. Accept the declared source state only;
 consume the old value; establish the target on every successful exit. Reject
 arbitrary target-state literals, annotation laundering, unauthorized transition
@@ -152,6 +167,8 @@ protocol-state proof alone does not prove filesystem durability or OS behavior.
   independent operation names, tag-free layout, and execution at O0/O2.
 - `test/parity/protocol_graph_metadata_smoke.sh`: self-hosted Stage1 metadata
   execution and retained semantic rejection; not a transition-acceptance gate.
+- `test/parity/protocol_graph_validation_smoke.sh`: paired declaration-level
+  graph rejection controls, independent of the unsupported-transition guard.
 - Stage1: a fresh seed from this Stage0 worktree, never a stale product bypass.
 - `test/parity/typestate_foundation_smoke.sh`: paired semantic positives and
   negatives, complete LLVM emission, and named-state executables at O0/O2.
