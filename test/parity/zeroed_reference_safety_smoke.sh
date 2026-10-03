@@ -456,7 +456,18 @@ for repro in \
     zeroed_value_sview_local_assignment.elisa \
     zeroed_value_reference_rebind_assignment.elisa \
     zeroed_value_sview_write_through_assignment.elisa \
-    zeroed_value_conditional_field_assignment.elisa; do
+    zeroed_value_conditional_field_assignment.elisa \
+    zeroed_value_array_element.elisa \
+    zeroed_value_reference_array_element.elisa \
+    zeroed_value_indexed_place_assignment.elisa \
+    zeroed_value_reference_indexed_place_assignment.elisa \
+    zeroed_value_inferred_generic_field_literal.elisa \
+    zeroed_value_inferred_generic_reference_field_literal.elisa \
+    zeroed_value_record_update_field.elisa \
+    zeroed_value_record_update_reference_field.elisa \
+    zeroed_value_function_value_argument.elisa \
+    zeroed_value_function_param_argument.elisa \
+    zeroed_value_using_alias_argument.elisa; do
     for compiler in "${COMPILERS[@]}"; do
         for level in 0 2; do
             output="$WORK/$(basename -- "$compiler")-${repro%.elisa}-O$level.ll"
@@ -485,7 +496,8 @@ for level in 0 2; do
         zeroed_value_extern_optional_ok.elisa \
         zeroed_value_scalar_ok.elisa \
         zeroed_value_trusted_reference_ok.elisa \
-        zeroed_value_assignment_ok.elisa; do
+        zeroed_value_assignment_ok.elisa \
+        zeroed_value_element_ok.elisa; do
         run_positive "$STAGE1" stage1 "$level" "$ROOT/test/repro/$repro"
         if [[ -x "$STAGE0" ]]; then
             run_positive "$STAGE0" stage0 "$level" "$ROOT/test/repro/$repro"
