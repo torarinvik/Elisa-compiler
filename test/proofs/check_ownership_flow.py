@@ -15,7 +15,8 @@ if any(path.stat().st_mtime_ns > BIN.stat().st_mtime_ns for path in (PROVER / "s
     raise SystemExit("proof executable is older than prover source; rebuild it")
 inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa",
           HERE / "ownership_flow_domain.elisa", HERE / "ownership_flow_domain_rejected.elisa",
-          HERE / "ownership_reachable_join.elisa"]
+          HERE / "ownership_reachable_join.elisa", HERE / "ownership_loop_head.elisa",
+          HERE / "ownership_loop_head_rejected.elisa"]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):
@@ -56,9 +57,24 @@ assert code == 0 and reachable["status"] == "proved"
 assert reachable["summary"]["proven"] == reachable["summary"]["obligations"] == 16
 assert reachable == run("ownership_reachable_join.elisa")[1]
 assert not reachable["findings"]
+code, loop = run("ownership_loop_head.elisa")
+assert code == 0 and loop["status"] == loop["verification_state"] == "proved"
+assert loop["summary"]["proven"] == loop["summary"]["obligations"] == 20
+assert loop == run("ownership_loop_head.elisa")[1]
+assert not loop["findings"]
+assert {"entry_path_remains_possible", "consumed_back_edge_is_retained", "dead_back_edge_preserves_entry",
+        "dead_back_edge_preserves_knowledge", "unknown_back_edge_loses_knowledge"} <= {row["name"] for row in loop["declaration_details"] if row.get("verified")}
+code, loop_rejected = run("ownership_loop_head_rejected.elisa")
+loop_false_names = {"dead_back_edge_can_flip_entry", "unknown_back_edge_grants_knowledge"}
+assert code == 1 and loop_rejected["status"] == "failed"
+assert {finding["name"] for finding in loop_rejected["findings"]} == loop_false_names
+assert all(finding["kind"] == "ensure-unproven" for finding in loop_rejected["findings"])
+assert not loop_false_names & {row["name"] for row in loop_rejected["declaration_details"] if row.get("verified")}
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
                   "reachable_join_report_proved": 16,
+                  "loop_head_report_replayed": 20,
+                  "loop_false_claims_rejected": sorted(loop_false_names),
                   "open_declarations": [], "false_claims_rejected": sorted(false_names),
                   "sources_sha256": hashes}, sort_keys=True))

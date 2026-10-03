@@ -407,7 +407,7 @@ entry bindings. Return paths and literal Boolean short-circuit paths retain
 reachability. Exit facts live in a flat table pool with per-function slices.
 The walker is bounded by depth and work fuel; exhaustion loses knowledge.
 
-This is not an enforcement pass. Loops, match/pattern bindings, general writes,
+This is not an enforcement pass. `for` loops, match/pattern bindings, general writes,
 places, captures, call effects and implicit consumption remain coverage gaps.
 Unknown operations taint liveness rather than granting permission. Complete
 walker coverage alone does not establish borrow safety, state-transition
@@ -450,6 +450,32 @@ exit and masks unknown binders via the existing condition/pattern helpers.
 branch-shadow restoration, and continued rejection of a scalar array element
 returned as a struct. All these controls now pass on a fresh seeded Stage1;
 return diagnostics have not been suppressed.
+
+### Bounded `while` fixed points
+
+Whole-binding liveness now joins the loop entry with the body's back edge until
+the head stabilizes. The entry path is retained at the head, including the
+zero-iteration possibility for a symbolic condition. Returning bodies contribute
+no back edge. Literal-false bodies are skipped; a fully covered literal-true
+loop has no fallthrough. Unsupported `break`/`continue` or effects preserve a
+conservative reachable, unknown exit instead of claiming non-fallthrough.
+Speculative iteration occurrences are truncated; only the stable traversal is
+retained, so one source occurrence does not become an execution trace.
+
+The walker uses its shared work/depth limits and a 64-iteration cap. Exhaustion
+loses knowledge and never grants consumption. Temporary frontier arrays do not
+escape into the long-lived table: only POD fact entries are copied into existing
+pools. Native controls cover repeated loop moves, returning bodies, literal
+false/true paths and unsupported break. `for`, labeled jumps, full borrow/place
+analysis and transition enforcement remain unfinished.
+
+Five imported loop-head algebra laws independently replay (20/20 obligations
+including helper obligations); two opposite claims reject. These prove the join
+properties used by the algorithm, not its entire AST transfer or termination.
+The proof assistant needed matching producer and independent-kernel reduction
+of mixed logical operators with Boolean constants. It validates the complete
+bounded primitive tree before absorption and rejects missing witnesses, malformed
+literals/children, cycles and exhausted fuel in 40 native kernel controls.
 
 `ownership_binding_scope_isolation.elisa` generalizes the identity separation laws
 to arbitrary owners and serials. Its 21/21 obligations independently replay with

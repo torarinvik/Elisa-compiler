@@ -10,7 +10,7 @@ cleanup() {
     rmdir "$WORK"
 }
 trap cleanup EXIT
-for fixture in ownership_control_flow_probe ownership_dead_paths_probe; do
+for fixture in ownership_control_flow_probe ownership_dead_paths_probe ownership_while_paths_probe; do
 elisa_run_timeout 180 env -u ELISACORE_BIN -u ELISA_CORE ELISA_STAGE1_BIN="$STAGE1" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit exe -O0 -permissive \
     -o "$WORK/probe" "$ROOT/test/repro/$fixture.elisa" >"$WORK/build.log" 2>&1 || {
@@ -19,4 +19,4 @@ elisa_run_timeout 180 env -u ELISACORE_BIN -u ELISA_CORE ELISA_STAGE1_BIN="$STAG
 }
 elisa_run_timeout 15 "$WORK/probe"
 done
-echo 'Ownership CFG observations pass: repeat moves, branch inputs/joins, return and literal/short-circuit dead paths, lexical shadows, unsupported loops fail closed'
+echo 'Ownership CFG observations pass: repeat moves, branches, shadows, dead paths, bounded while fixed points; unsupported break fails closed'
