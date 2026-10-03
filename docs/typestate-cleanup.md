@@ -382,10 +382,17 @@ is provided. The binding identity native probe compares indexed/fallback lookup
 and includes ambiguous/misaligned/cyclic controls (87–92).
 
 The identity admission suite has expanded from 21/21 to 23/23 replay with the
-missing-declaration-is-invalid law. `ownership_binding_separation.elisa` contains
-two explicitly OPEN client laws for arbitrary distinct serials/functions: the
-producer does not yet transport their disequality through the Boolean summary
-conjunction. A renamed-parameter counterpart also remains OPEN, so changing
-caller/callee parameter spellings does not resolve the failure. They are not part
-of the admitted suite. Fix that producer gap and
-require independent replay before citing those general laws as proved.
+missing-declaration-is-invalid law. `ownership_binding_separation.elisa` now also
+passes 23/23 producer obligations and independent replay, including arbitrary
+distinct serials/functions and the renamed-parameter counterpart. These reports
+share imported helper obligations and must not be summed as distinct theorems.
+The admission checker requires five false identity claims to reject.
+
+Closing the separation laws required two proof-assistant fixes: bounded truth
+transport from exact witnessed comparison premises through logical connectives,
+and simultaneous substitution that does not re-substitute caller names inside
+an already-inserted constructor/record-update argument. Whole-expression
+formation checks run before Boolean absorption. Native controls reject wrong
+polarity, missing premises/witnesses, malformed siblings and exhausted fuel;
+record controls preserve caller names even when they overlap callee parameters.
+These are source-linked identity laws, not proof of the ownership walker.
