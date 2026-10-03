@@ -29,6 +29,9 @@ DEFAULT_SELF_HOST_GEN2_POLL_SECONDS=0.05
 SELF_HOST_GEN2_MAX_RSS_KB="${ELISA_SELF_HOST_GEN2_MAX_RSS_KB:-$DEFAULT_SELF_HOST_GEN2_MAX_RSS_KB}"
 SELF_HOST_GEN2_POLL_SECONDS="${ELISA_SELF_HOST_GEN2_POLL_SECONDS:-$DEFAULT_SELF_HOST_GEN2_POLL_SECONDS}"
 
+# Fork-free RSS polls on Linux (see the file).
+source "$ROOT/scripts/process_rss.sh"
+
 terminate_guarded_pid() {
   local pid="$1" ticks=0
   kill -TERM "$pid" 2>/dev/null || true
@@ -47,7 +50,8 @@ run_guarded_stage1() {
   bash "$ROOT/scripts/elisac_stage1.sh" -o "$OUT_DIR/elisac_stage1_gen2.o" "$ROOT/src/driver/elisac.elisa" &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    rss="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1}')" || rss=""
+    process_observe "$pid"
+    rss="$PROCESS_RSS_KB"
     if [[ -n "$rss" && "$rss" -gt "$peak" ]]; then
       peak="$rss"
     fi
@@ -56,7 +60,7 @@ run_guarded_stage1() {
       terminate_guarded_pid "$pid"
       return 125
     fi
-    sleep "$SELF_HOST_GEN2_POLL_SECONDS"
+    process_sleep "$SELF_HOST_GEN2_POLL_SECONDS"
   done
   wait "$pid"
 }

@@ -137,14 +137,16 @@ seed_build() {
     # can therefore leave this loop spinning forever instead of reaching the
     # explicit `wait` below. Treat an absent or zombie process as terminal;
     # `wait` still collects the authoritative exit status.
-    seed_process_stat="$(ps -o stat= -p "$seed_pid" 2>/dev/null)" || seed_process_stat=""
+    # The child may exit between kill(0) and the observation. With `set -euo pipefail`, a
+    # failing ps(1) used to abort the seed shell before `wait` could collect the child's
+    # successful status, making a completed seed look failed; process_observe (fork-free
+    # on Linux, see scripts/process_rss.sh) reports a vanished child as empty instead.
+    process_observe "$seed_pid"
+    seed_process_stat="$PROCESS_STATE"
     if [[ -z "$seed_process_stat" || "$seed_process_stat" == Z* ]]; then
       break
     fi
-    # The child may exit between kill(0) and ps(1). With `set -euo pipefail`, the
-    # resulting non-zero ps status used to abort the seed shell before `wait` could
-    # collect the child's successful status, making a completed seed look failed.
-    seed_rss_kb="$(ps -o rss= -p "$seed_pid" 2>/dev/null | awk '{print $1}')" || seed_rss_kb=""
+    seed_rss_kb="$PROCESS_RSS_KB"
     if [[ -n "$seed_rss_kb" && "$seed_rss_kb" -gt "$seed_peak_rss_kb" ]]; then
       seed_peak_rss_kb="$seed_rss_kb"
     fi
@@ -153,7 +155,7 @@ seed_build() {
       terminate_guarded_pid "$seed_pid"
       exit 125
     fi
-    sleep "$seed_rss_poll_seconds"
+    process_sleep "$seed_rss_poll_seconds"
   done
   # Collect the child status explicitly instead of letting `set -e` terminate the
   # wrapper before it can explain why the seed failed. A host kill (for example,
