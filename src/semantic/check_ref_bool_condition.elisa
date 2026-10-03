@@ -1,0 +1,198 @@
+# A `bool&` / `mutable bool&` reference used bare as a condition. stage0 requires the
+# condition to BE bool and does not read through the reference:
+#   if flag:           -> "if condition must be bool, got mutable bool&"   (span: `flag`)
+#   return x if flag   -> same message, spanning the guarded statement's keyword
+#   while flag:        -> "while condition must be bool, got mutable bool&" (span: `while`)
+#   a if flag else b   -> "ternary condition must be bool, got mutable bool&" (span: `if`)
+#   not flag           -> "not operator requires bool operand"               (span: `not`)
+# while `flag and y`, `flag == true` and `y: bool = flag` are accepted (stage0 89a8c752,
+# measured 2026-10-03). Before this check stage1 accepted every form and its backend then
+# declined the function (elisa-proof proof_goal_cached). The generic NonBoolCondition walls
+# cannot see it: the type environment records a parameter's BARE type name ("bool").
+# Tracked names: parameters and locals declared with a bool-reference type; a later
+# declaration of the same name with another type stops tracking it (shadowing is legal).
+
+extend Semantic:
+    private:
+        def check_ref_bool_condition(declarations: darray[Ast::Decl]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(_, parameters, _, body, _, _, _):
+                            names: mutable darray[sview] = []
+                            spellings: mutable darray[sview] = []
+                            for parameter in parameters |names, spellings|:
+                                spelling: sview = rbc_type_spelling(parameter.type_expression, parameter.is_mutable)
+                                if spelling != "":
+                                    names.push(parameter.name)
+                                    spellings.push(spelling)
+                            table <- rbc_stmts(&body, names, spellings, table) if names.count > 0 or rbc_body_declares_ref(&body)
+                        Decl.Module(_, body, _):
+                            table <- check_ref_bool_condition(&body, table)
+                        Decl.Scoped(body, _):
+                            table <- check_ref_bool_condition(&body, table)
+                        _:
+                            pass
+
+        # "mutable bool&" / "bool&" for a bool-reference type, else "".
+        def rbc_type_spelling(type_expression: Ast::Expr, binding_mutable: bool) -> sview:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Paren(inner, _):
+                        return rbc_type_spelling(inner, binding_mutable)
+                    Expr.Unary(TokenKind.Mutable, operand, _):
+                        return rbc_type_spelling(operand, true)
+                    Expr.Unary(TokenKind.Ampersand, operand, _):
+                        match operand:
+                            Expr.Unary(TokenKind.Mutable, inner, _):
+                                return "mutable bool&" if ident_name_of(inner) == "bool" else ""
+                            _:
+                                pass
+                        operand_name: sview = ident_name_of(operand)
+                        return "" if operand_name != "bool"
+                        return "mutable bool&" if binding_mutable else "bool&"
+                    _:
+                        return ""
+
+        def rbc_body_declares_ref(statements: darray[Ast::Stmt]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.VarDecl(_, type_expression, _, _):
+                            true return if rbc_type_spelling(type_expression, false) != ""
+                        Stmt.If(_, then_body, else_body, _):
+                            true return if rbc_body_declares_ref(&then_body) or rbc_body_declares_ref(&else_body)
+                        Stmt.While(_, body, _) | Stmt.For(_, _, _, body, _) | Stmt.Block(_, _, _, body, _):
+                            true return if rbc_body_declares_ref(&body)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms:
+                                true return if rbc_body_declares_ref(&arm.body)
+                        _:
+                            pass
+                return false
+
+        # The tracked spelling of a bare (possibly parenthesised) identifier condition, or "".
+        def rbc_condition_spelling(condition: Ast::Expr, names: darray[sview]&, spellings: darray[sview]&) -> sview:
+            can Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        return rbc_condition_spelling(inner, names, spellings)
+                    Expr.Ident(name, _):
+                        return rbc_lookup(name, names, spellings)
+                    _:
+                        return ""
+
+        # The newest tracking entry for NAME ("" = untracked or shadowed).
+        def rbc_lookup(name: sview, names: darray[sview]&, spellings: darray[sview]&) -> sview:
+            can Abort.Panic:
+                index: mutable usize = names.count
+                while index > 0 |index, names, spellings|:
+                    index <- index - 1
+                    spellings[index] return if names[index] == name
+                return ""
+
+        def rbc_stmts(statements: darray[Ast::Stmt]&, names: mutable darray[sview]&, spellings: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, spellings, table|:
+                    table <- rbc_stmt(statement, names, spellings, table)
+
+        def rbc_stmt(statement: Ast::Stmt, names: mutable darray[sview]&, spellings: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, _) | Stmt.Contract(_, expression, _):
+                        table <- rbc_expr(expression, names, spellings, table)
+                    Stmt.Return(value, _):
+                        if value is returned:
+                            table <- rbc_expr(returned, names, spellings, table)
+                    Stmt.VarDecl(name, type_expression, value, _):
+                        table <- rbc_expr(value, names, spellings, table)
+                        # Shadowing: the newest entry wins in rbc_condition_spelling, and ""
+                        # marks a same-named non-reference local as untracked.
+                        spelling: sview = rbc_type_spelling(type_expression, false)
+                        if spelling != "" or rbc_lookup(name, names, spellings) != "":
+                            names.push(name)
+                            spellings.push(spelling)
+                    Stmt.Assign(target, _, value, _):
+                        table <- rbc_expr(target, names, spellings, table)
+                        table <- rbc_expr(value, names, spellings, table)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        spelling: sview = rbc_condition_spelling(condition, names, spellings)
+                        if spelling != "":
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolCondition, name: "if", pos: rbc_if_span(condition, then_body, else_body, pos), line: pos.line, expected: "bool", actual: spelling})
+                        else:
+                            table <- rbc_expr(condition, names, spellings, table)
+                        table <- rbc_stmts(&then_body, names, spellings, table)
+                        table <- rbc_stmts(&else_body, names, spellings, table)
+                    Stmt.While(condition, body, pos):
+                        spelling: sview = rbc_condition_spelling(condition, names, spellings)
+                        if spelling != "":
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolCondition, name: "while", pos: pos, line: pos.line, expected: "bool", actual: spelling})
+                        else:
+                            table <- rbc_expr(condition, names, spellings, table)
+                        table <- rbc_stmts(&body, names, spellings, table)
+                    Stmt.For(_, _, iterable, body, _):
+                        table <- rbc_expr(iterable, names, spellings, table)
+                        table <- rbc_stmts(&body, names, spellings, table)
+                    Stmt.Block(_, _, _, body, _):
+                        table <- rbc_stmts(&body, names, spellings, table)
+                    Stmt.Match(scrutinee, arms, _):
+                        table <- rbc_expr(scrutinee, names, spellings, table)
+                        for arm in arms |names, spellings, table|:
+                            table <- rbc_stmts(&arm.body, names, spellings, table)
+                    _:
+                        pass
+
+        # A block `if flag:` spans the condition identifier; the postfix guard
+        # `return x if flag` (whose guarded statement precedes the condition in the source)
+        # spans that statement's `return` keyword, as stage0 does.
+        def rbc_if_span(condition: Ast::Expr, then_body: darray[Ast::Stmt], else_body: darray[Ast::Stmt], pos: Ast::Pos) -> Ast::Pos:
+            can Abort.Panic:
+                condition_pos: Ast::Pos = ident_extent_or_line(condition, pos.line)
+                if then_body.count == 1 and else_body.count == 0:
+                    match then_body[0]:
+                        Stmt.Return(_, return_pos):
+                            if return_pos.offset < condition_pos.offset:
+                                return Ast::Pos{line: return_pos.line, column: return_pos.column, offset: return_pos.offset, end_line: return_pos.line, end_column: return_pos.column + 6, end_offset: return_pos.offset + 6}
+                        _:
+                            pass
+                return condition_pos
+
+        def rbc_exprs(expressions: darray[Ast::Expr]&, names: mutable darray[sview]&, spellings: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for expression in expressions |names, spellings, table|:
+                    table <- rbc_expr(expression, names, spellings, table)
+
+        def rbc_expr(expression: Ast::Expr, names: mutable darray[sview]&, spellings: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.If(condition, then_expression, else_expression, pos):
+                        spelling: sview = rbc_condition_spelling(condition, names, spellings)
+                        if spelling != "":
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolCondition, name: "ternary", pos: pos, line: pos.line, expected: "bool", actual: spelling})
+                        else:
+                            table <- rbc_expr(condition, names, spellings, table)
+                        table <- rbc_expr(then_expression, names, spellings, table)
+                        table <- rbc_expr(else_expression, names, spellings, table)
+                    Expr.Unary(operator, operand, pos):
+                        if operator == TokenKind.Not and rbc_condition_spelling(operand, names, spellings) != "":
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolOperand, name: "not", pos: pos, line: pos.line, expected: "bool", actual: "bool"})
+                        else:
+                            table <- rbc_expr(operand, names, spellings, table)
+                    Expr.Call(callee, arguments, _, _):
+                        table <- rbc_expr(callee, names, spellings, table)
+                        table <- rbc_exprs(&arguments, names, spellings, table)
+                    Expr.Field(object, _, _) | Expr.Paren(object, _) | Expr.Move(object, _):
+                        table <- rbc_expr(object, names, spellings, table)
+                    Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                        table <- rbc_expr(object, names, spellings, table)
+                        table <- rbc_expr(index, names, spellings, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        table <- rbc_exprs(&elements, names, spellings, table)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |names, spellings, table|:
+                            table <- rbc_expr(field.value, names, spellings, table)
+                    Expr.Block(statements, value, _, _):
+                        table <- rbc_stmts(&statements, names, spellings, table)
+                        table <- rbc_expr(value, names, spellings, table)
+                    _:
+                        pass
