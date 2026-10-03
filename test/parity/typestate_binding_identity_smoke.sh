@@ -19,4 +19,4 @@ else
     echo "binding identity probe failed control $status" >&2
     exit "$status"
 fi
-echo 'Stage1 binding identity/capabilities OK: shadowing, modules, state/ref types, lmut borrowing, writable borrows, mutable owners, nested-container separation'
+echo 'Stage1 binding/alias metadata OK: lexical identity, capabilities, full state/ref/lmut alias targets, module-separated alias IDs'

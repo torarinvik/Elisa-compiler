@@ -122,6 +122,14 @@ and a container of references. These are declared syntax facts, not yet ownershi
 authority: inferred bindings and nominal alias capabilities remain required
 before consuming transitions use them.
 
+Symbol collection also preserves complete `TypeAliasDeclaration` targets under
+canonical `DeclId`, owning module, and source position. The older bare-target
+tooling columns remain unchanged. The binding probe checks reference and `lmut`
+state-qualified targets in same-spelled aliases from different modules and an
+alias-to-alias target. This prevents irreversible capability/state information
+loss; transitive target resolution, cycle/ambiguity rejection, and integration
+with binding capabilities are still required before an alias can authorize a move.
+
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
 unknown loop/pattern binder. It now honors the scoped-binder sentinel, matching
