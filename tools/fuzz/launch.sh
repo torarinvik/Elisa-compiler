@@ -44,11 +44,13 @@ rssh "cd $OUT && cat > run.sh" <<EOF
 export PATH=$W/bin:/usr/lib/llvm-21/bin:/usr/bin:/bin HOME=$W/home
 export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 ELISA_CLANG=$W/bin/clang ELISA_REAL_CLANG=/usr/lib/llvm-21/bin/clang
 export LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config ELISA_RUNTIME_OBJ=$SEED/build/runtime/elisacore_runtime.o
+echo \$\$ > $OUT/pid
 export TMPDIR=$OUT/tmp; mkdir -p \$TMPDIR
 ulimit -s unlimited
 exec nice -n 15 python3 $W/fuzz/tools/fuzz.py --s0 $W/src/s0-$s0/compiler/bin/elisac \\
   --s1 $SEED/bin/elisac-stage1 --guard $W/fuzz/tools/guard.so --out $OUT --jobs $JOBS --pause-lock $W/locks/active.lock \\
   $SEED/test/fixtures $SEED/test/repro $OUT/seeds
 EOF
-rssh "cd $OUT && nohup setsid bash run.sh > fuzz.log 2>&1 < /dev/null & echo \$! > $OUT/pid; sleep 3; cat $OUT/fuzz.log"
+# run.sh records its own pid; nothing may follow the & on this line or ssh keeps the channel open.
+rssh "cd $OUT && nohup setsid bash run.sh > fuzz.log 2>&1 < /dev/null &"
 echo "fuzz: $HOST:$OUT  (status: $0 --host $HOST --status $NAME)"
