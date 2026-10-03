@@ -323,3 +323,17 @@ New features require paired accepted/rejected programs and executable checks
 where layout or lowering changes. A timeout or backend decline does not count
 as a successful semantic rejection. Deprecation and dogfooding remain gated on
 the guarantees above; neither is completed by the current foundation patch.
+# Reachability-aware ownership joins
+
+The Boolean domain now provides `join_reachable_possible` and
+`join_reachable_known`. Dead predecessors contribute neither possible ownership
+nor missing knowledge; two dead predecessors produce unknown/no possible owner.
+Callers must still establish matching BindingIds and actual CFG reachability.
+These helpers are not yet an ownership walker or transition admission.
+
+`test/repro/ownership_reachable_join_probe.elisa` exhaustively checks all sixteen
+Boolean input combinations against a branch-based reference calculation.
+`test/proofs/check_ownership_flow.py` now requires 36/36 independently replayed
+domain obligations and a separate 16/16 reachability report (shared imported
+helper obligations overlap), with the seven existing false claims rejected.
+The earlier 32/32 figures below describe the preceding admission milestone.
