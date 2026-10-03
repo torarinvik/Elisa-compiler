@@ -112,6 +112,13 @@ seed_build() {
     echo "seed requires stage0 elisac at ELISACORE_BIN=$STAGE0_BIN" >&2
     exit 2
   fi
+  # stage0 discharges the compiler's own contracts with an external z3. Without one on PATH
+  # it does not say so: it reports the std's min/max/clamp ensures as unprovable and fails
+  # minutes into the seed. Refuse up front with the actual cause.
+  if ! command -v z3 >/dev/null 2>&1; then
+    echo "seed: no z3 on PATH; stage0 needs an SMT solver to prove the compiler's contracts (install z3 >= 5, e.g. \`pip install z3-solver\`)" >&2
+    exit 2
+  fi
   echo "seed: building product with stage0 $STAGE0_BIN" >&2
   # The compiler itself is a large input. A duplicated seed can consume the whole
   # workstation before either invocation reports an error, so bound one seed by default.
