@@ -20,7 +20,9 @@ LIBDIR="$("$LLVM_CONFIG" --libdir)"
 [[ -f "$RUNTIME_OBJ" ]] || { echo "missing runtime object $RUNTIME_OBJ (run scripts/build_runtime_object.sh)" >&2; exit 2; }
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN"
-export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin:/usr/local/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
+# ELISA_TOOL_SHIM_DIR (Linux gate hosts): the clang shim that maps Apple link flags must win
+# over a system /usr/bin/clang.
+export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin:/usr/local/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 DEFAULT_SELF_HOST_GEN2_MAX_RSS_KB=8388608
 DEFAULT_SELF_HOST_GEN2_POLL_SECONDS=0.05
