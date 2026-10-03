@@ -1,0 +1,287 @@
+# Stage1 backend — emit one object with N forked LLVM code generators.
+# Part of `module Backend` (see codegen.elisa).
+#
+# Unoptimised codegen of the compiler's own ~110k-line module spends most of its wall
+# clock in LLVM's single-threaded SelectionDAG/AsmPrinter. When ELISA_STAGE1_JOBS asks
+# for N > 1 workers, the finished, verified module is partitioned by function: defined
+# functions are split into N contiguous runs of roughly equal instruction count, and the
+# process forks once per run. Each child keeps the bodies of its own run, turns every
+# other definition into a declaration, and writes `<out>.part<k>.o`; the parent then
+# merges the parts with a relocatable link (`ld -r`) into the requested object.
+#
+# Linkage is rewritten identically in every partition so cross-partition references
+# resolve: a function or mutable/external global with internal or private linkage
+# becomes a HIDDEN external symbol renamed under the `elisa.part.` prefix (so it cannot
+# collide with a symbol of the runtime or another unit), defined only by its owner.
+# Mutable and external globals are owned by partition 0; read-only private constants
+# stay private and are simply duplicated. linkonce/weak definitions are left in every
+# partition. A global alias stays in the partition that defines its aliasee; elsewhere
+# its uses are redirected to the aliasee's declaration and the alias becomes private.
+#
+# The partitioning is a pure function of the module, so the merged object is
+# deterministic: two builds from the same compiler and source are byte-identical, which
+# is what the gen2/gen3 fixpoint compares. Unset or 1 keeps the single-object path.
+
+extern fork() -> i32
+extern waitpid(pid: i32, status: mutable i32&, options: i32) -> i32
+extern _exit(status: i32) -> void
+extern LLVMGetFirstGlobal(m: LLVMModuleRef) -> LLVMValueRef?
+extern LLVMGetNextGlobal(global_value: LLVMValueRef) -> LLVMValueRef?
+extern LLVMGetFirstGlobalAlias(m: LLVMModuleRef) -> LLVMValueRef?
+extern LLVMGetNextGlobalAlias(alias: LLVMValueRef) -> LLVMValueRef?
+extern LLVMAliasGetAliasee(alias: LLVMValueRef) -> LLVMValueRef
+extern LLVMIsDeclaration(global_value: LLVMValueRef) -> i32
+extern LLVMIsGlobalConstant(global_value: LLVMValueRef) -> i32
+extern LLVMSetVisibility(global_value: LLVMValueRef, visibility: u32) -> void
+extern LLVMHasPersonalityFn(fn: LLVMValueRef) -> i32
+@link_name("LLVMSetPersonalityFn")
+extern elisa_part_clear_personality(fn: LLVMValueRef, personality: LLVMValueRef?) -> void
+@link_name("LLVMSetInitializer")
+extern elisa_part_clear_initializer(global_value: LLVMValueRef, value: LLVMValueRef?) -> void
+
+extend Backend:
+    private:
+        const PART_LINKAGE_EXTERNAL: u32 = 0
+        const PART_LINKAGE_INTERNAL: u32 = 8
+        const PART_LINKAGE_PRIVATE: u32 = 9
+        const PART_VISIBILITY_HIDDEN: u32 = 1
+
+        def part_linkage_is_local(linkage: u32) -> bool:
+            linkage == PART_LINKAGE_INTERNAL or linkage == PART_LINKAGE_PRIVATE
+
+        def part_linkage_is_partitioned(linkage: u32) -> bool:
+            linkage == PART_LINKAGE_EXTERNAL or part_linkage_is_local(linkage)
+
+        def part_function_weight(f: LLVMValueRef) -> i64:
+            weight: mutable i64 = 0
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(f)
+            while block_opt is block |weight, block_opt|:
+                inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while inst_opt is inst |weight, inst_opt|:
+                    weight <- weight + 1
+                    inst_opt <- LLVMGetNextInstruction(inst)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            weight
+
+        # A defined function this pass distributes; everything else stays as it is.
+        def part_function_owned(f: LLVMValueRef) -> bool:
+            false return if LLVMIsDeclaration(f) != 0
+            part_linkage_is_partitioned(LLVMGetLinkage(f))
+
+        # A defined global with exactly one owner: mutable, or visible outside the unit.
+        def part_global_owned(g: LLVMValueRef) -> bool:
+            false return if LLVMIsDeclaration(g) != 0
+            linkage: u32 = LLVMGetLinkage(g)
+            false return if not part_linkage_is_partitioned(linkage)
+            true return if linkage == PART_LINKAGE_EXTERNAL
+            LLVMIsGlobalConstant(g) == 0
+
+        # A local symbol becomes a hidden external one under a collision-free name.
+        def part_externalize(value: LLVMValueRef, ordinal: i64) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            linkage: u32 = LLVMGetLinkage(value)
+            return if not part_linkage_is_local(linkage)
+            name_length: mutable usize = 0
+            name_bytes: u8& = LLVMGetValueName2(value, &name_length)
+            renamed: mutable darray[u8] = []
+            emit_tokens_push_sview_backend(renamed, "elisa.part.")
+            if name_length == 0:
+                emit_tokens_push_sview_backend(renamed, "anon.")
+                part_push_decimal(renamed, ordinal)
+            else:
+                for name_index in 0..<name_length |renamed, name_bytes|:
+                    byte_ref: u8& = name_bytes + name_index
+                    renamed.push(byte_ref)
+            renamed_length: usize = renamed.count
+            renamed.push(0)
+            LLVMSetValueName2(value, (&renamed[0]).cast[cstr], renamed_length)
+            LLVMSetLinkage(value, PART_LINKAGE_EXTERNAL)
+            LLVMSetVisibility(value, PART_VISIBILITY_HIDDEN)
+
+        def part_push_decimal(buffer: mutable darray[u8]&, value: i64) -> void can[Abort.Panic, Memory.Allocate]:
+            digits: mutable darray[u8] = []
+            remaining: mutable i64 = value
+            digits.push(48) if remaining == 0
+            while remaining > 0 |remaining, digits|:
+                digits.push((48 + remaining % 10).u8())
+                remaining <- remaining / 10
+            index: mutable usize = digits.count
+            while index > 0 |index, buffer, digits|:
+                index <- index - 1
+                buffer.push(digits[index])
+
+        def emit_tokens_push_sview_backend(buffer: mutable darray[u8]&, text: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            for text_index in 0..<sview_len(text) |buffer, text|:
+                buffer.push(sview_at(text, text_index))
+
+        # Turn a definition into a declaration: drop every value use, then the
+        # instructions, then the blocks.
+        def part_strip_body(f: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(f)
+            while block_opt is block |block_opt|:
+                inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while inst_opt is inst |inst_opt|:
+                    inst_type: LLVMTypeRef = LLVMTypeOf(inst)
+                    inst_kind: u32 = LLVMGetTypeKind(inst_type)
+                    if inst_kind != 0 and inst_kind != 16:
+                        LLVMReplaceAllUsesWith(inst, LLVMGetUndef(inst_type))
+                    inst_opt <- LLVMGetNextInstruction(inst)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            first_block: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(f)
+            while first_block is doomed |first_block|:
+                first_inst: mutable LLVMValueRef? = LLVMGetFirstInstruction(doomed)
+                while first_inst is doomed_inst |first_inst, doomed|:
+                    LLVMInstructionEraseFromParent(doomed_inst)
+                    first_inst <- LLVMGetFirstInstruction(doomed)
+                LLVMDeleteBasicBlock(doomed)
+                first_block <- LLVMGetFirstBasicBlock(f)
+            LLVMSetSubprogram(f, null)
+            elisa_part_clear_personality(f, null) if LLVMHasPersonalityFn(f) != 0
+
+        # Owner of every function, in module order (-1: not partitioned).
+        def part_function_owners(m: LLVMModuleRef, jobs: i64) -> darray[i64] can[Abort.Panic, Memory.Allocate]:
+            weights: mutable darray[i64] = []
+            total: mutable i64 = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |weights, total, function_opt|:
+                weight: i64 = part_function_weight(function) + 1 if part_function_owned(function) else -1
+                weights.push(weight)
+                total <- total + weight if weight > 0
+                function_opt <- LLVMGetNextFunction(function)
+            owners: mutable darray[i64] = []
+            prefix: mutable i64 = 0
+            for weight in weights |owners, prefix, total, jobs|:
+                if weight < 0:
+                    owners.push(-1)
+                else:
+                    owner: mutable i64 = (prefix * jobs) / total if total > 0 else 0
+                    owner <- jobs - 1 if owner >= jobs
+                    owners.push(owner)
+                    prefix <- prefix + weight
+            owners
+
+        # Rewrite the module into partition `part` of `jobs` (runs in the forked child).
+        def part_restrict_module(m: LLVMModuleRef, owners: darray[i64]&, part: i64) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            ordinal: mutable i64 = 0
+            global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
+            while global_opt is global_value |ordinal, global_opt, part|:
+                if part_global_owned(global_value):
+                    part_externalize(global_value, ordinal)
+                    if part != 0:
+                        elisa_part_clear_initializer(global_value, null)
+                        LLVMSetLinkage(global_value, PART_LINKAGE_EXTERNAL)
+                ordinal <- ordinal + 1
+                global_opt <- LLVMGetNextGlobal(global_value)
+            function_index: mutable usize = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |ordinal, function_index, function_opt, owners, part|:
+                owner: i64 = owners[function_index]
+                if owner >= 0:
+                    part_externalize(function, ordinal)
+                    part_strip_body(function) if owner != part
+                ordinal <- ordinal + 1
+                function_index <- function_index + 1
+                function_opt <- LLVMGetNextFunction(function)
+            alias_opt: mutable LLVMValueRef? = LLVMGetFirstGlobalAlias(m)
+            while alias_opt is alias |alias_opt|:
+                aliasee: LLVMValueRef = LLVMAliasGetAliasee(alias)
+                if LLVMIsDeclaration(aliasee) != 0:
+                    LLVMReplaceAllUsesWith(alias, aliasee)
+                    LLVMSetLinkage(alias, PART_LINKAGE_PRIVATE)
+                alias_opt <- LLVMGetNextGlobalAlias(alias)
+
+        def part_path(out_path: cstr, part: i64) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            path: mutable darray[u8] = []
+            part_push_cstr(path, out_path)
+            emit_tokens_push_sview_backend(path, ".part")
+            part_push_decimal(path, part)
+            emit_tokens_push_sview_backend(path, ".o")
+            path.push(0)
+            path
+
+        # Append the bytes of a NUL-terminated string (without the terminator).
+        def part_push_cstr(buffer: mutable darray[u8]&, text: cstr) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            bytes: u8& = text.cast[u8&]
+            index: mutable usize = 0
+            while true |index, bytes, buffer|:
+                byte_ref: u8& = bytes + index
+                byte_value: u8 = byte_ref
+                break if byte_value == 0
+                buffer.push(byte_value)
+                index <- index + 1
+
+        def part_shell_quote(buffer: mutable darray[u8]&, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            buffer.push(39)
+            for path_byte in path |buffer|:
+                continue if path_byte == 0
+                if path_byte == 39:
+                    emit_tokens_push_sview_backend(buffer, "'\\''")
+                else:
+                    buffer.push(path_byte)
+            buffer.push(39)
+
+    public:
+        # ELISA_STAGE1_JOBS, clamped to 1..64; 1 when unset or malformed.
+        def parallel_emit_jobs() -> i64 can[Abort.Panic, Unsafe.PointerCast]:
+            if getenv("ELISA_STAGE1_JOBS") is jobs_text:
+                jobs_bytes: u8& = jobs_text.cast[u8&]
+                jobs: mutable i64 = 0
+                index: mutable usize = 0
+                while true |jobs, index, jobs_bytes|:
+                    byte_ref: u8& = jobs_bytes + index
+                    digit: u8 = byte_ref
+                    break if digit < 48 or digit > 57
+                    jobs <- jobs * 10 + (digit - 48).i64()
+                    break if jobs > 64
+                    index <- index + 1
+                return 64 if jobs > 64
+                return 1 if jobs < 1
+                return jobs
+            1
+
+        # Emit `m` to `path` with `jobs` forked code generators; serial when jobs <= 1.
+        # The module is unchanged in the parent.
+        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, jobs: i64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+            return emit_object(machine, m, path) if jobs <= 1
+            owners: darray[i64] = part_function_owners(m, jobs)
+            children: mutable darray[i32] = []
+            for part in 0..<jobs.usize() |children, owners, machine, m, path|:
+                child: i32 = fork()
+                if child == 0:
+                    part_restrict_module(m, owners, part.i64())
+                    child_path: darray[u8] = part_path(path, part.i64())
+                    ok: bool = emit_object(machine, m, (&child_path[0]).cast[cstr])
+                    _exit(0 if ok else 1)
+                children.push(child)
+            all_ok: mutable bool = true
+            for child in children |all_ok|:
+                if child < 0:
+                    all_ok <- false
+                else:
+                    status: mutable i32 = 0
+                    waited: i32 = waitpid(child, &status, 0)
+                    all_ok <- false if waited != child or status != 0
+            command: mutable darray[u8] = []
+            if getenv("ELISA_LD") is linker_text:
+                part_push_cstr(command, linker_text.cast[cstr])
+            else:
+                emit_tokens_push_sview_backend(command, "ld")
+            emit_tokens_push_sview_backend(command, " -r -o ")
+            out_storage: mutable darray[u8] = []
+            part_push_cstr(out_storage, path)
+            part_shell_quote(command, out_storage)
+            for part in 0..<jobs.usize() |command, path|:
+                command.push(32)
+                part_file: darray[u8] = part_path(path, part.i64())
+                part_shell_quote(command, part_file)
+            command.push(0)
+            if all_ok:
+                all_ok <- system_backend((&command[0]).cast[cstr]) == 0
+            for part in 0..<jobs.usize() |path|:
+                part_file: darray[u8] = part_path(path, part.i64())
+                _ = unlink_backend((&part_file[0]).cast[cstr])
+            all_ok
+
+@link_name("system")
+extern system_backend(command: cstr) -> i32
+@link_name("unlink")
+extern unlink_backend(path: cstr) -> i32
