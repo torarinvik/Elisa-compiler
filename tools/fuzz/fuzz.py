@@ -20,7 +20,7 @@ in place and hides stale reads unless something is allocated after the owner).
   fuzz.py --s0 ELISAC --s1 ELISAC_STAGE1 --guard guard.so --out DIR [--jobs N] [--iters N] SEEDDIR...
 Environment for stage1 (ELISA_RUNTIME_OBJ, ELISA_CLANG, PATH with the clang shim) is inherited.
 """
-import argparse, hashlib, json, multiprocessing as mp, os, random, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, fcntl, hashlib, json, multiprocessing as mp, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 
 GROW_OPS = ["{x}.push({n})", "{x}.push({n})\n{ind}{x}.push({n})", "{x}.clear()", "{x} <- [{n}, {n}]",
             "{x}.extend([{n}, {n}, {n}])"]
@@ -215,6 +215,26 @@ def signature(cls, r, an):
     return hashlib.sha1(key.encode()).hexdigest()[:12], key
 
 
+def wait_for_idle_gates(lock):
+    """Gates have priority: while any remote_gate run holds the host's active.lock (shared),
+    an exclusive non-blocking probe fails and this worker sleeps before its next program."""
+    if not lock:
+        return
+    while True:
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return
+        except OSError:
+            time.sleep(15)
+        finally:
+            os.close(fd)
+
+
 def worker(args):
     cfg, wid, iters, seed_base = args
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -225,6 +245,7 @@ def worker(args):
     res = open(os.path.join(out, "results.jsonl"), "a")
     n = 0
     while iters <= 0 or n < iters:
+        wait_for_idle_gates(cfg.get("pause_lock"))
         n += 1
         sp, src = rng.choice(seeds)
         ops = []
@@ -258,6 +279,7 @@ def main():
     ap.add_argument("--s0", required=True); ap.add_argument("--s1", required=True)
     ap.add_argument("--guard", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--jobs", type=int, default=8); ap.add_argument("--iters", type=int, default=0)
+    ap.add_argument("--pause-lock", default="", help="pause while another process holds this lock")
     ap.add_argument("--rng", type=int, default=int(time.time()))
     ap.add_argument("--ctimeout", type=int, default=60); ap.add_argument("--rtimeout", type=int, default=5)
     ap.add_argument("seeds", nargs="+")
@@ -266,7 +288,7 @@ def main():
     os.makedirs(os.path.join(a.out, "findings"), exist_ok=True)
     cfg = {"s0": a.s0, "s1": a.s1, "guard": os.path.abspath(a.guard), "out": os.path.abspath(a.out),
            "seeds": a.seeds, "seed_root": os.path.commonpath([os.path.abspath(s) for s in a.seeds]),
-           "ctimeout": a.ctimeout, "rtimeout": a.rtimeout}
+           "ctimeout": a.ctimeout, "rtimeout": a.rtimeout, "pause_lock": a.pause_lock}
     n = len(load_seeds(a.seeds))
     print("fuzz: %d seeds, %d jobs, out=%s" % (n, a.jobs, a.out), flush=True)
     if n == 0:

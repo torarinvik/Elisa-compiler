@@ -12,10 +12,12 @@ export XDG_CACHE_HOME="$W/cache" ELISA_S0_CACHE_DIR="$W/cache/s0cache"
 export LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config ELISA_LLVM_BIN_DIR=/usr/lib/llvm-21/bin
 export ELISA_CLANG="$W/bin/clang" ELISA_REAL_CLANG=/usr/lib/llvm-21/bin/clang
 export LLC=/usr/lib/llvm-21/bin/llc LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc ELISA_LLVM_OPT=/usr/lib/llvm-21/bin/opt
-export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1
+export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 ELISA_TOOL_SHIM_DIR="$W/bin"
 ulimit -s unlimited
 mkdir -p "$HOME" "$W/cache" "$W/locks" "$W/seed"
 echo $$ > "$RUNDIR/pid"
+# Held (shared) for the whole run: the fuzzer pauses while any run holds it.
+exec 7>"$W/locks/active.lock"; flock -s 7
 finish() { echo "$1" > "$RUNDIR/rc"; exit "$1"; }
 stamp() { date +%s; }
 [[ "$(z3 --version 2>/dev/null)" == *"version 5."* ]] || { echo "z3 >= 5 missing from $W/bin (run setup_host.sh)"; finish 2; }
@@ -57,16 +59,26 @@ fi
 echo "seed $KEY: $(( $(stamp) - t ))s"
 
 # --- gates, in parallel ------------------------------------------------------------------
-# Core budget from live load at dispatch (the box is shared): free cores, split per gate.
-cores=$(nproc); load=$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1)
-budget=$JOBS; [[ "$budget" -gt 0 ]] 2>/dev/null || budget=$(( cores - load ))
-(( budget < 8 )) && budget=8
-per=$(( budget / ${#GATES[@]} )); (( per < 4 )) && per=4
-echo "dispatch: ${#GATES[@]} gates, load=$load/$cores, $per jobs each"
+# CPU CAP. vast4's 80 "cores" sit under a 38.4-CPU cgroup-v1 quota
+# (/sys/fs/cgroup/cpu/cpu.cfs_quota_us) shared by every session; nice does not help under a
+# quota, so the cap is a hard job count: JOBS = this host's share (hosts.local column 4).
+# The gate phase of every run on the host is serialized on one lock, so concurrent runs from
+# several agents queue instead of each taking the whole share.
+budget=$JOBS; [[ "$budget" -gt 0 ]] 2>/dev/null || budget=8
+n=${#GATES[@]}; per=$(( budget / n )); (( per < 2 )) && per=2
+slots=$(( budget / per )); (( slots < 1 )) && slots=1
+t=$(stamp)
+exec 8>"$W/locks/gate-phase.lock"; flock 8
+echo "dispatch: $n gates, cap=$budget: $slots at a time x $per jobs (queued $(( $(stamp) - t ))s)"
 run_gate() {
   local g="$1" d="$RUNDIR/$1" s; s=$(stamp)
   cp -a "$SEED" "$d" && rm -f "$d/.seeded"
   mkdir -p "$d/build/tmp" "$d/home"
+  # Older revs reset PATH in self_host_gen2.sh to /usr/bin first, so a
+  # shared host's system clang (no Apple-flag mapping) linked gen2 and failed on -dead_strip.
+  # Same one-line PATH fix the newer script carries; harness only, not compiler source.
+  grep -q ELISA_TOOL_SHIM_DIR "$d/scripts/self_host_gen2.sh" 2>/dev/null ||
+    sed -i 's|^export PATH="/usr/bin:/bin:|export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:|' "$d/scripts/self_host_gen2.sh"
   (
     cd "$d"
     export REPO_ROOT="$d" ELISA_CORE="$S0" ELISACORE_BIN="$S0BIN" ELISA_S0_REAL="$S0BIN"
@@ -81,11 +93,14 @@ run_gate() {
   echo "  done $g rc=$(cat "$RUNDIR/$g.rc") $(cat "$RUNDIR/$g.secs")s"
 }
 pids=()
+running=0
 for g in "${GATES[@]}"; do
   if [[ ! -f "$SEED/test/parity/$g.sh" ]]; then echo "missing test/parity/$g.sh" > "$RUNDIR/$g.log"; echo 127 > "$RUNDIR/$g.rc"; echo 0 > "$RUNDIR/$g.secs"; continue; fi
-  run_gate "$g" & pids+=($!)
+  if (( running >= slots )); then wait -n; running=$((running - 1)); fi
+  run_gate "$g" & running=$((running + 1))
 done
-for p in "${pids[@]}"; do wait "$p"; done
+wait
+exec 8>&-
 
 # --- summary -----------------------------------------------------------------------------
 # host_invalid.txt: "<gate> <row>" lines; a FAIL row naming such a row becomes SKIP-HOST and

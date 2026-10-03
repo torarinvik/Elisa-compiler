@@ -9,7 +9,7 @@
 #   --s0-repo PATH   stage0 repo (default: "$HOME/Documents/Coding Projects/Go projects/Elisa-core")
 #   --s0-rev REV     stage0 revision (default: main of --s0-repo)
 #   --opt -O0..-O3   seed opt level (default -O3, the repo default)
-#   --jobs N         total core budget (default: sized from the host's live load at dispatch)
+#   --jobs N         total job cap (default: the host's cpu-cap column in hosts.local)
 #
 # Aliases: gen3=self_host_gen3_smoke diag=diagnostics_smoke internal=semantic_internal_diff
 #          escape=adversarial_escape_smoke backend=backend_native_smoke; any other name is a
@@ -42,6 +42,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$HOST" ]] || { echo "remote_gate: --host required (aliases: $(host_aliases | tr '\n' ' '))" >&2; exit 2; }
 host_ssh_args "$HOST"
+[[ "$JOBS" -gt 0 ]] 2>/dev/null || JOBS=$HOST_CPU_CAP
 W=/root/elisa
 if [[ -n "$ATTACH" ]]; then
   rssh "tail -n +1 --pid=\$(cat $W/runs/$ATTACH/pid) -f $W/runs/$ATTACH/out" || true

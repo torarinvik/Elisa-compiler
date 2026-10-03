@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Launch the differential fuzzer DETACHED on a gate host, at nice 15 (gates have priority).
+# Launch the differential fuzzer DETACHED on a gate host, at nice 15. On a cgroup-quota box
+# nice does not protect the gates, so the fuzzer is small (4 jobs, inside our cpu-cap) and every
+# worker PAUSES while any remote_gate run holds /root/elisa/locks/active.lock.
 #
-#   tools/fuzz/launch.sh --host vast4 [--s1 REV] [--s0 REV] [--opt -O3] [--jobs 30]
+#   tools/fuzz/launch.sh --host vast4 [--s1 REV] [--s0 REV] [--opt -O3] [--jobs 4]
 #                        [--extra-seeds REV:PATH]...   # e.g. FETCH_HEAD:test/fuzz_findings
 #   tools/fuzz/launch.sh --host vast4 --status NAME    # triage summary
 #   tools/fuzz/launch.sh --host vast4 --stop NAME
@@ -12,7 +14,7 @@
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../remote/hosts.sh"
-HOST=""; S1=HEAD; S0_REPO="$HOME/Documents/Coding Projects/Go projects/Elisa-core"; S0=main; OPT=-O3; JOBS=30
+HOST=""; S1=HEAD; S0_REPO="$HOME/Documents/Coding Projects/Go projects/Elisa-core"; S0=main; OPT=-O3; JOBS=4
 EXTRA=(); STATUS=""; STOP=""; S1_REPO="$(cd "$HERE/../.." && pwd)"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,7 +24,7 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac
 done
-host_ssh_args "${HOST:?--host required}"; rssh() { ssh "${SSH_ARGS[@]}" "$@"; }
+host_ssh_args "${HOST:?--host required}"
 W=/root/elisa
 if [[ -n "$STATUS" ]]; then exec ssh "${SSH_ARGS[@]}" "python3 $W/fuzz/tools/triage.py $W/fuzz/$STATUS"; fi
 if [[ -n "$STOP" ]]; then exec ssh "${SSH_ARGS[@]}" "kill -- -\$(cat $W/fuzz/$STOP/pid) && echo stopped $STOP"; fi
@@ -45,7 +47,7 @@ export LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config ELISA_RUNTIME_OBJ=$SEED/buil
 export TMPDIR=$OUT/tmp; mkdir -p \$TMPDIR
 ulimit -s unlimited
 exec nice -n 15 python3 $W/fuzz/tools/fuzz.py --s0 $W/src/s0-$s0/compiler/bin/elisac \\
-  --s1 $SEED/bin/elisac-stage1 --guard $W/fuzz/tools/guard.so --out $OUT --jobs $JOBS \\
+  --s1 $SEED/bin/elisac-stage1 --guard $W/fuzz/tools/guard.so --out $OUT --jobs $JOBS --pause-lock $W/locks/active.lock \\
   $SEED/test/fixtures $SEED/test/repro $OUT/seeds
 EOF
 rssh "cd $OUT && nohup setsid bash run.sh > fuzz.log 2>&1 < /dev/null & echo \$! > $OUT/pid; sleep 3; cat $OUT/fuzz.log"
