@@ -14,7 +14,12 @@
 # pair is provably disjoint: two different field names, or two different integer-literal
 # indices. A non-literal index may overlap (`swap(&v[i], &v[j])` is rejected: i == j is
 # allowed at runtime). A `can Unsafe.Alias:` / `trusted Unsafe.Alias:` block (or a broad
-# `Unsafe` grant) opts its body out, as stage0's strict mode allows. Only calls that resolve by name to exactly one declared function are
+# `Unsafe` grant) opts its body out, as stage0's strict mode allows.
+# A VIEW argument (`buf.as_sview()`, `buf.as_cstr()`, `buf.view()`, `buf[a:b]`, or a local bound
+# to one) bound to a by-value view parameter (sview, cstr, view[T]) borrows the viewed storage
+# like `&buf[..]`: `use(&buf, buf.as_sview())` lets the callee grow buf and then read a dangling
+# view (fuzz F3). It is checked as `&PLACE[..]`, so the container equal-place exemption never
+# applies to it. Only calls that resolve by name to exactly one declared function are
 # checked; methods, externs and overloaded names are left alone rather than guessed at.
 extend Semantic:
     private:
@@ -81,6 +86,42 @@ extend Semantic:
         def exclusivity_param_is_ref(parameter: Ast::ParamDecl) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+
+        # Whether PARAMETER is a by-value view: `sview`, `cstr` or `view[T]` (any mutability).
+        def exclusivity_param_is_view(parameter: Ast::ParamDecl) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return exclusivity_type_is_view(parameter.type_expression)
+
+        def exclusivity_type_is_view(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(type_name, _):
+                        return type_name == "sview" or type_name == "cstr"
+                    Expr.Index(Expr.Ident(head_name, _), _, _):
+                        return head_name == "view"
+                    Expr.Unary(operator, operand, _):
+                        return operator != TokenKind.Ampersand and exclusivity_type_is_view(operand)
+                    Expr.Paren(inner, _):
+                        return exclusivity_type_is_view(inner)
+                    _:
+                        return false
+
+        # The storage a view-producing ARGUMENT points into, as an `&PLACE[..]` borrow:
+        # `x.as_sview()` / `x.as_cstr()` / `x.view()` -> (true, x[..]), `x[a:b]` -> (true, x[a:b]).
+        # Anything else is returned unchanged.
+        def exclusivity_view_borrow(argument: Ast::Expr) -> (address: bool, place: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, _):
+                        return exclusivity_view_borrow(inner)
+                    Expr.Call(Expr.Field(receiver, method, method_pos), call_arguments, _, _):
+                        if call_arguments.count == 0 and (method == "as_sview" or method == "as_cstr" or method == "view"):
+                            return (true, Ast::Expr.Slice(receiver, Ast::Expr.Absent, Ast::Expr.Absent, method_pos))
+                        return (false, argument)
+                    Expr.Slice(_, _, _, _):
+                        return (true, argument)
+                    _:
+                        return (false, argument)
 
         # Whether the referent of TYPE_EXPRESSION is a generic container instantiation
         # (`darray[T]`, `dict[K, V]`, ...). The backend never stamps `noalias` on those, and a
@@ -269,6 +310,11 @@ extend Semantic:
                     ref_names.push(name)
                     ref_places.push(initial.place)
                     return
+                viewed: (address: bool, place: Ast::Expr) = exclusivity_view_borrow(value)
+                if viewed.address:
+                    ref_names.push(name)
+                    ref_places.push(viewed.place)
+                    return
                 return if not type_marker_present_here(type_expression, TokenKind.Ampersand)
                 source: usize = exclusivity_ref_slot(ref_names, exclusivity_ident_name(value))
                 return if source == ref_names.count
@@ -363,11 +409,14 @@ extend Semantic:
                 values: mutable darray[i64] = []
                 argument_index: mutable usize = 0
                 for argument in arguments |argument_index, roots, addressed, slots, step_starts, step_counts, kinds, names, values|:
-                    stripped: (address: bool, place: Ast::Expr) = exclusivity_resolve_ref_local(exclusivity_strip_address(argument), ref_names, ref_places)
+                    slot: usize = exclusivity_argument_slot(argument_names, argument_index, params, param_start, param_count)
+                    stripped: mutable (address: bool, place: Ast::Expr) = exclusivity_resolve_ref_local(exclusivity_strip_address(argument), ref_names, ref_places)
+                    if not stripped.address and slot < param_count and exclusivity_param_is_view(params[param_start + slot]):
+                        stripped <- exclusivity_view_borrow(argument)
                     first_step: usize = kinds.count
                     roots.push(exclusivity_place(stripped.place, kinds, names, values))
                     addressed.push(stripped.address)
-                    slots.push(exclusivity_argument_slot(argument_names, argument_index, params, param_start, param_count))
+                    slots.push(slot)
                     step_starts.push(first_step)
                     step_counts.push(kinds.count - first_step)
                     argument_index <- argument_index + 1
@@ -381,7 +430,9 @@ extend Semantic:
                             earlier_param: Ast::ParamDecl = params[param_start + slots[earlier]]
                             later_mutable: bool = param_is_mutable_ref(later_param)
                             earlier_mutable: bool = param_is_mutable_ref(earlier_param)
-                            conflicting_params: bool = (later_mutable and exclusivity_param_is_ref(earlier_param)) or (earlier_mutable and exclusivity_param_is_ref(later_param))
+                            later_borrows: bool = exclusivity_param_is_ref(later_param) or exclusivity_param_is_view(later_param)
+                            earlier_borrows: bool = exclusivity_param_is_ref(earlier_param) or exclusivity_param_is_view(earlier_param)
+                            conflicting_params: bool = (later_mutable and earlier_borrows) or (earlier_mutable and later_borrows)
                             # A bare place names the reference it holds, so only an EQUAL path is
                             # the same referent; `&PLACE` paths conflict on any prefix overlap.
                             path_conflict: bool = exclusivity_paths_overlap(kinds, names, values, step_starts[earlier], step_counts[earlier], step_starts[later], step_counts[later]) and (addressed[later] or step_counts[later] == step_counts[earlier])
