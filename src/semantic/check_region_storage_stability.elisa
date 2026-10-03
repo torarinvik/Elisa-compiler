@@ -66,6 +66,13 @@ extend Semantic:
                     Expr.Construct(type_expression, fields, line):
                         for field in fields |alias_names, alias_sources, alias_is_view, view_fns, out|:
                             storage_view_append_value_sources(field.value, alias_names, alias_sources, alias_is_view, view_fns, out)
+                    # A tuple literal holding a view keeps that view's backing alive under the
+                    # tuple's name: `t = (1, buf[0:1])` then `buf <- [..]` leaves `t.f`
+                    # dangling (fuzz F5), exactly as a struct field does. (An ARRAY literal
+                    # copies its elements into a fresh buffer, so it is not included.)
+                    Expr.Tuple(elements, line):
+                        for element in elements |alias_names, alias_sources, alias_is_view, view_fns, out|:
+                            storage_view_append_value_sources(element, alias_names, alias_sources, alias_is_view, view_fns, out)
                     Expr.RecordUpdate(base, fields, line):
                         storage_view_append_value_sources(base, alias_names, alias_sources, alias_is_view, view_fns, out)
                         for field in fields |alias_names, alias_sources, alias_is_view, view_fns, out|:
@@ -253,10 +260,53 @@ extend Semantic:
                 # (`t: Tok = wrap(buf)`) carries its arguments' borrow (stage0
                 # storageViewDependencyForUserCall on an EnumType that carries borrowed storage).
                 summarised_call: bool = sources.count > 0 and storage_view_is_summarised_call(value, view_fns)
+                # A tuple / struct LITERAL with a field initialised straight from a view
+                # (`(1, buf[0:1])`, `S{f: s.as_sview()}`) holds that view: replacing or growing
+                # `buf` leaves `t.f` dangling (fuzz F5; stage0 tracks it). Only a literal whose
+                # field IS a view-producing expression counts -- no layout guessing for other
+                # struct values, which the comment above warns about.
+                literal_view: bool = storage_view_literal_holds_view(value)
+                storage_view_append_value_sources(value, alias_names, alias_sources, alias_is_view, view_fns, sources) if literal_view and sources.count == 0
                 origin_value: Ast::Expr = storage_view_call_field_value(value, view_fns)
-                for source in sources |alias_names, alias_sources, alias_is_view, name, value, origin_value, summarised_call|:
-                    row_is_view: bool = return_type_is_view(type_expression) or storage_view_type_is_reference(type_expression) or captures_storage or payload_view or summarised_call or (storage_view_expr_carries_borrow(value, alias_names, alias_sources, alias_is_view) and not storage_view_type_is_scalar_copy(type_expression))
+                for source in sources |alias_names, alias_sources, alias_is_view, name, value, origin_value, summarised_call, literal_view|:
+                    row_is_view: bool = return_type_is_view(type_expression) or storage_view_type_is_reference(type_expression) or captures_storage or payload_view or summarised_call or literal_view or (storage_view_expr_carries_borrow(value, alias_names, alias_sources, alias_is_view) and not storage_view_type_is_scalar_copy(type_expression))
                     storage_view_push_origin_rows(origin_value, name, source, row_is_view, alias_names, alias_sources, alias_is_view)
+
+        def storage_view_invalidate_rebound_views(root: sview, alias_names: darray[sview]&, alias_sources: darray[sview]&, alias_is_view: darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if root == ""
+                for index in 0..<alias_sources.count |root, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by|:
+                    source: sview = alias_sources[index]
+                    under_root: bool = source == root or (sview_starts_with(source, root) and sview_len(source) > sview_len(root) and (source[sview_len(root)] == 46.u8() or source[sview_len(root)] == 91.u8()))
+                    if under_root and index < alias_names.count and index < alias_is_view.count and alias_is_view[index] and alias_names[index] != root and not fresh_wrapper_name_exists(invalidated, alias_names[index]):
+                        invalidated.push(alias_names[index])
+                        invalidated_by.push("") if invalidated.count > invalidated_by.count
+
+        def storage_view_literal_holds_view(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return storage_view_literal_holds_view(inner)
+                    Expr.Tuple(elements, _):
+                        return any element in elements where storage_view_is_direct_view(element)
+                    Expr.Construct(_, fields, _):
+                        return any field in fields where storage_view_is_direct_view(field.value)
+                    _:
+                        return false
+
+        def storage_view_is_direct_view(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return storage_view_is_direct_view(inner)
+                    Expr.Slice(_, _, _, _):
+                        return true
+                    Expr.Unary(TokenKind.Ampersand, operand, _):
+                        return operand is Expr.Index(_, _, _)
+                    Expr.Call(Expr.Field(_, method, _), _, _, _):
+                        return method in {"as_sview", "as_view", "as_slice", "as_cstr"}
+                    _:
+                        return false
 
         def storage_view_is_summarised_call(value: Ast::Expr, view_fns: darray[sview]&) -> bool:
             can Memory.Allocate, Abort.Panic:
@@ -2007,6 +2057,23 @@ extend Semantic:
                             invalidate_replaced_container_views(target, operator, value, replace_names, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) if rebound == ""
                             invalidate_replaced_field_views(target, operator, value, field_elems, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) if rebound == ""
                             invalidate_replaced_field_element_views(target, operator, field_views, field_view_heads, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) if rebound == ""
+                            # `rebind n: i64, p = p.lgrow()` lowers to `[n, p] = call`: every bare
+                            # target is REPLACED by the threaded result exactly as `p <- p.lgrow()`
+                            # replaces `p`, so views into the old value die (fuzz F6). The
+                            # replacement helpers key on a bare Ident target; feed them each one.
+                            match target:
+                                Expr.Array(rebind_targets, rebind_line):
+                                    for rebind_target in rebind_targets |replace_names, field_elems, field_views, field_view_heads, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by|:
+                                        invalidate_replaced_container_views(rebind_target, TokenKind.LArrow, value, replace_names, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                                        invalidate_replaced_field_views(rebind_target, TokenKind.LArrow, value, field_elems, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                                        invalidate_replaced_field_element_views(rebind_target, TokenKind.LArrow, field_views, field_view_heads, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                                        # The threaded result mentions the target (`lgrow(p)`), which
+                                        # the helpers above read as "the new value still borrows it"
+                                        # and skip. An lmut call may reallocate every buffer of the old
+                                        # value, so drop each view of it outright.
+                                        storage_view_invalidate_rebound_views(ident_name_of(rebind_target), alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                                _:
+                                    pass
                             # `<-` of a plain value into a whole local (`t <- s`, `vs <- [s]`) re-aliases
                             # it; a field/element store is not a rebind of the root. A
                             # `<-` of a view-producing CALL is left untracked: the walk cannot tell a
