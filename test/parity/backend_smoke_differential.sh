@@ -114,7 +114,10 @@ diff_case errorset_payload_multi_catch 'error Payload:\n    Bad(left: i64, right
 diff_case darray_push  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'
 diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
 diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'
-diff_case darray_ref_elem_arith  'def main() -> i64:\n    x: i64 = 40\n    out: mutable darray[i64&] = []\n    out.push(&x)\n    return out[0] + 2\n'
+# stage0's c-archive unsafe audit labels these reads; grant it so the case is compared, not SKIPped.
+diff_case darray_ref_elem_arith  'def main() -> i64:\n    x: i64 = 40\n    out: mutable darray[i64&] = []\n    out.push(&x)\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        return out[0] + 2\n'
+# Fuzz repro crash_ref_darray_index_arith: an empty darray[i64&] read traps in both (rc 133).
+diff_case darray_ref_elem_oob  'def main() -> i64:\n    out: mutable darray[i64&] = []\n    s: i64 = 3\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        return out[0] + s - s\n'
 # A `T&` struct field read twice in value position (fuzz: 21+ hits; was invalid IR).
 diff_case struct_ref_field_arith  'struct HB:\n    items: mutable darray[i64]\n\nstruct Cr:\n    f: i64&\n\ndef main() -> i64:\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        h: mutable HB = HB{items: [41, 41]}\n        c: Cr = Cr{f: &h.items[0]}\n        first: i64 = c.f\n        return first + c.f\n'
 diff_case array_literal 'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'
