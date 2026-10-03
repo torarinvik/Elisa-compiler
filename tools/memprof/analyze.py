@@ -11,6 +11,7 @@ ap.add_argument('binary'); ap.add_argument('profile')
 ap.add_argument('--live', action='store_true')
 ap.add_argument('--depth', type=int, default=6)
 ap.add_argument('--top', type=int, default=40)
+ap.add_argument('--inlines', action='store_true', help='attribute to the innermost inlined function')
 ap.add_argument('--skip', default=r'^(arena_|darray_|elisa_|Elisacore|collection_|new_region|sview_|__|backtrace)')
 a = ap.parse_args()
 
@@ -64,11 +65,13 @@ for s in sample_meta: addrs.update(s[3][:40])
 addrs = sorted(addrs)
 sym = {}
 if addrs:
-    out = subprocess.run(['llvm-symbolizer', '--obj=' + a.binary, '--functions=linkage', '--no-inlines', '-C'],
+    out = subprocess.run(['llvm-symbolizer', '--obj=' + a.binary, '--functions=linkage', '--inlines' if a.inlines else '--no-inlines', '-C'],
                          input='\n'.join('0x' + x for x in addrs), capture_output=True, text=True).stdout
     blocks = out.strip('\n').split('\n\n')
     for x, b in zip(addrs, blocks):
-        sym[x] = b.split('\n')[0]
+        lines = b.split('\n')
+        # with --inlines a block is (function, location) pairs, innermost first
+        sym[x] = lines[0] + ((' @' + lines[1].rsplit('/', 1)[-1]) if a.inlines and len(lines) > 1 else '')
 
 skip = re.compile(a.skip)
 incl = collections.Counter(); selfc = collections.Counter(); stacks = collections.Counter()
