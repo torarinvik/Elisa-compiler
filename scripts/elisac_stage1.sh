@@ -241,5 +241,78 @@ resolve_python_tools
 [[ -n "${PYTHON_CONFIG:-}" ]] && export PYTHON_CONFIG || true
 
 driver_args=("$@")
+
+# Opt-in content-addressed object cache (ELISA_STAGE1_CACHE=1, directory
+# ELISA_STAGE1_CACHE_DIR, default ~/.cache/elisac-stage1). Only a plain object compile
+# (`-o OUT` with no `-emit` other than obj) is cached. The key covers everything the
+# object is a function of: the product binary, the argument vector with OUT
+# normalised, every ELISA_* variable, every file of the source's include graph
+# (`-emit deps`), and the standard library tree the driver may pull in implicitly.
+# A hit copies the cached object to OUT (warnings of the original compile are not
+# replayed); a miss compiles and then stores it.
+stage1_cache_key=""
+stage1_cache_out=""
+stage1_cache_prepare() {
+  [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
+  local index=0 count=${#driver_args[@]} arg emit="obj" source=""
+  local -a normalized=() deps_args=()
+  while (( index < count )); do
+    arg="${driver_args[index]}"
+    case "$arg" in
+      -o)
+        stage1_cache_out="${driver_args[index + 1]:-}"
+        normalized+=("-o" "@OUT@")
+        index=$((index + 2))
+        continue
+        ;;
+      -emit)
+        emit="${driver_args[index + 1]:-}"
+        ;;
+      *.elisa|*.elisai)
+        source="$arg"
+        ;;
+    esac
+    normalized+=("$arg")
+    deps_args+=("$arg")
+    index=$((index + 1))
+  done
+  [[ "$emit" == obj && -n "$stage1_cache_out" && -n "$source" ]] || return 1
+  local deps_file
+  deps_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps.XXXXXX")"
+  if ! "$BIN" -emit deps -o "$deps_file" "$source" </dev/null >/dev/null 2>&1; then
+    rm -f "$deps_file"
+    return 1
+  fi
+  stage1_cache_key="$(
+    {
+      printf 'elisac-stage1-object-cache v1\n'
+      shasum -a 256 "$BIN" | cut -d' ' -f1
+      printf '%s\0' "${normalized[@]}"
+      printf '\n'
+      env | LC_ALL=C grep '^ELISA_' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
+      tr '\n' '\0' <"$deps_file" | xargs -0 shasum -a 256
+      (cd "$ROOT" && find elisacore_std -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256)
+    } | shasum -a 256 | cut -d' ' -f1
+  )"
+  rm -f "$deps_file"
+  [[ -n "$stage1_cache_key" ]]
+}
+if stage1_cache_prepare; then
+  stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
+  stage1_cache_entry="$stage1_cache_dir/$stage1_cache_key.o"
+  if [[ -f "$stage1_cache_entry" ]]; then
+    mkdir -p "$(dirname -- "$stage1_cache_out")"
+    cp "$stage1_cache_entry" "$stage1_cache_out.tmp.$$" && mv -f "$stage1_cache_out.tmp.$$" "$stage1_cache_out"
+    exit 0
+  fi
+  stage1_cache_rc=0
+  run_stage1_driver_guarded || stage1_cache_rc=$?
+  if [[ "$stage1_cache_rc" -eq 0 && -f "$stage1_cache_out" ]]; then
+    mkdir -p "$stage1_cache_dir"
+    cp "$stage1_cache_out" "$stage1_cache_entry.tmp.$$" && mv -f "$stage1_cache_entry.tmp.$$" "$stage1_cache_entry" || rm -f "$stage1_cache_entry.tmp.$$"
+  fi
+  exit "$stage1_cache_rc"
+fi
+
 run_stage1_driver_guarded
 exit $?
