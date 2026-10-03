@@ -944,6 +944,14 @@ run_case region_param_ref_field neg "$REPO_ROOT/test/repro/region_param_ref_fiel
 
 echo
 echo "diagnostics smoke: $((total - failed))/$total fixtures PASS"
+echo "-- reference_authority_cast --"
+# Mirrors stage0 testdata/reference_authority_cast (its .neg = our .pos): hard errors in every mode.
+run_case reference_authority_forge pos "$FIXTURES/reference_authority_forge.pos.elisa" "forging a reference from an integer"
+run_case reference_authority_upgrade_reborrow pos "$FIXTURES/reference_authority_upgrade_reborrow.pos.elisa" "upgrading a read-only reference to a mutable one"
+run_case reference_authority_upgrade_value pos "$FIXTURES/reference_authority_upgrade_value.pos.elisa" "upgrading a read-only reference to a mutable one"
+run_case reference_authority_cast neg "$FIXTURES/reference_authority_cast.neg.elisa" "forging a reference from an integer"
+run_case reference_authority_cast neg "$FIXTURES/reference_authority_cast.neg.elisa" "upgrading a read-only reference to a mutable one"
+
 if [[ "$failed" -gt 0 ]]; then
     echo "diagnostics smoke FAIL: $failed fixture(s) failed" >&2
     exit 1
