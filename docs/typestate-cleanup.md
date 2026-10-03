@@ -426,20 +426,33 @@ incorrect. This establishes the tested append forms, not general call parity.
 
 The local append control now pushes past the literal's initial capacity and
 self-appends 308 elements, checking all 616 resulting entries at O0/O2. The
-constructor isolation probe also passes. An independent OPEN regression,
-`darray_rows_binding_collision_open.elisa`, changes an included stdlib function's
-return-type diagnostic merely by naming a main-local array `rows`; the renamed
-control passes. This spelling-sensitive type channel must be repaired before
-it can contribute ownership/typestate authority.
+constructor isolation probe also passes. The regression
+`darray_rows_binding_collision_probe.elisa` formerly changed an included stdlib
+function's return diagnostic merely by naming a main-local array `rows`. Both
+that spelling and the renamed control now compile and run at O0/O2 after the
+nominal checker scope fix. This targeted diagnostic repair does not turn the
+legacy spelling-based channel into ownership/typestate authority.
 
 The smaller `structural_binding_function_isolation_probe.elisa` reproduces the
 error without runtime imports: functions take same-spelled `rows` parameters
 with different element types, and a later local uses the scalar element type.
 Stage0 accepts its object emission; the fresh seeded Stage1 CLI incorrectly
 reports the first function returning `i64` instead of `IsolationRow`.
-The Stage1-compiled `structural_binding_phase_probe.elisa` checks the same embedded
-AST via resolution and the full semantic API and passes. That discrepancy means
-the bootstrap/frontend/driver path still needs isolation; a missing scope reset
-is not yet established as the cause. `structural_binding_isolation_smoke.sh` is
-an intentionally failing admission gate until both actual CLI cases pass. It
-must not be made green by suppressing return-type diagnostics.
+The first `structural_binding_phase_probe.elisa` checked only `TypeMismatch`,
+but the bad finding is `NamedTypeMismatch`. Its apparent full-check success was
+a deficient test, not evidence of a bootstrap discrepancy. The corrected probe
+checks all error-severity findings and the located diagnostic API too.
+The nominal-struct wall reused the last function's structural local-type frame
+while resetting only its flat spelling frame. The current fix seeds both frames
+per function, records structural local annotations, closes both frames on scope
+exit and masks unknown binders via the existing condition/pattern helpers.
+`structural_binding_isolation_smoke.sh` requires actual CLI acceptance at O0/O2,
+branch-shadow restoration, and continued rejection of a scalar array element
+returned as a struct. All these controls now pass on a fresh seeded Stage1;
+return diagnostics have not been suppressed.
+
+`ownership_binding_scope_isolation.elisa` generalizes the identity separation laws
+to arbitrary owners and serials. Its 21/21 obligations independently replay with
+no trusted assumptions, and two opposite alias claims reject. The identity proof
+gate hashes these inputs and checks repeated reports. These are canonical-ID
+laws, not a proof of the legacy spelling-based nominal checker.
