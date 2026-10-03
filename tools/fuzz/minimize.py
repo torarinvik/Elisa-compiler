@@ -16,7 +16,9 @@ def main():
     ap.add_argument("--guard", required=True); ap.add_argument("finding")
     a = ap.parse_args()
     info = json.load(open(os.path.join(a.finding, "info.json")))
-    cfg = {"s0": a.s0, "s1": a.s1, "guard": os.path.abspath(a.guard), "ctimeout": 60, "rtimeout": 5}
+    cfg = {"s0": a.s0, "s1": a.s1, "guard": os.path.abspath(a.guard), "ctimeout": 60, "rtimeout": 5,
+           "cc": os.environ.get("ELISA_CLANG", "clang"), "runtime": os.environ["ELISA_RUNTIME_OBJ"],
+           "fallback": os.path.join(os.path.dirname(os.path.abspath(__file__)), "callback_fallback.c")}
     wd = tempfile.mkdtemp(prefix="min.")
 
     def same(lines):

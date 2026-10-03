@@ -34,7 +34,7 @@ SEED="$W/seed/$s1-$s0$OPT"
 rssh "test -f $SEED/.seeded" || { echo "no seeded tree $SEED: run tools/remote/remote_gate.sh for $s1 first" >&2; exit 2; }
 NAME="$(date +%Y%m%d-%H%M)-$s1"; OUT="$W/fuzz/$NAME"
 rssh "mkdir -p $W/fuzz/tools $OUT/seeds"
-for f in fuzz.py minimize.py triage.py guard.c; do rssh "cat > $W/fuzz/tools/$f" < "$HERE/$f"; done
+for f in fuzz.py minimize.py triage.py guard.c callback_fallback.c; do rssh "cat > $W/fuzz/tools/$f" < "$HERE/$f"; done
 for e in ${EXTRA[@]+"${EXTRA[@]}"}; do
   rev="${e%%:*}"; path="${e#*:}"
   git -C "$S1_REPO" archive "$rev" "$path" | rssh "mkdir -p $OUT/seeds/extra && tar -x -C $OUT/seeds/extra"
