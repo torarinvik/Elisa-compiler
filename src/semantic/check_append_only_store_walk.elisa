@@ -1,0 +1,318 @@
+# The body walk of check_append_only_store (rules in check_append_only_store.elisa).
+#
+# Every expression is walked with a SLOT saying what the position may hold:
+#   0  nothing store-shaped (a store here is a copy, an iteration, a `move` ...)
+#   1  a store PLACE by reference: an argument of the store module's own function, the
+#      operand of `&`, a ref-typed binding, the object of a field access
+#   2  a FRESH store value: a binding, a struct-literal field, a return
+# A store place in slot 0/2 is a copy; a fresh store in slot 0/1 is a dropped or copied one.
+extend Semantic:
+    private:
+        struct AoScope:
+            module_name: sview
+            store_index: i64
+            # 0 any function, 1 make_room, 2 append — of the store's own module.
+            kind: u8
+            locals: mutable darray[sview]
+            # Index into AppendOnlyFacts.stores (an index, not an sview: a name read back out
+            # of this function-local scope would borrow it).
+            local_types: mutable darray[usize]
+
+        # Every store lookup that reads the scope answers an INDEX into facts.stores: a name
+        # handed back through `env` would make every reported diagnostic borrow this
+        # function-local scope.
+        def ao_local_store(env: AoScope&, name: sview) -> i64:
+            can Abort.Panic:
+                probe: mutable usize = env.locals.count
+                while probe > 0 |probe|:
+                    probe <- probe - 1
+                    env.local_types[probe].i64() return if env.locals[probe] == name
+                return -1
+
+        def ao_store_name(facts: AppendOnlyFacts&, index: i64) -> sview:
+            return facts.stores[index.usize()] if index >= 0 else ""
+
+        def ao_store_slot(facts: AppendOnlyFacts&, store: sview) -> usize:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                while probe < facts.stores.count |probe|:
+                    probe return if facts.stores[probe] == store
+                    probe <- probe + 1
+                return 0
+
+        # The store a place expression denotes (a store-typed local/param, or a store-typed
+        # struct field), or "".
+        def ao_place_store(facts: AppendOnlyFacts&, env: AoScope&, expression: Ast::Expr) -> i64:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return ao_local_store(env, name)
+                    Expr.Field(_, field, _):
+                        field_type: sview = ao_store_field_type(facts, field)
+                        return -1 if field_type == "" else ao_store_slot(facts, field_type).i64()
+                    Expr.Paren(inner, _):
+                        return ao_place_store(facts, env, inner)
+                    _:
+                        return -1
+
+        def ao_callee_name(callee: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match callee:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Scope(_, name, _):
+                        return name
+                    _:
+                        return ""
+
+        # The module a callee names: the enclosing module for a bare name, the scope base for
+        # `M::f`.
+        def ao_callee_module(env: AoScope&, callee: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match callee:
+                    Expr.Ident(_, _):
+                        return env.module_name
+                    Expr.Scope(base, _, _):
+                        return sview_basename(ident_name_of(base), 58.u8())
+                    _:
+                        return ""
+
+        def ao_returns_store(facts: AppendOnlyFacts&, callee: Ast::Expr) -> bool:
+            can Abort.Panic:
+                name: sview = ao_callee_name(callee)
+                return name != "" and any returning in facts.returning_functions where returning == name
+
+        def ao_is_buffer(facts: AppendOnlyFacts&, env: AoScope&, field: sview) -> bool:
+            return ao_is_buffer_field(facts, env.store_index, field)
+
+        def ao_is_current(facts: AppendOnlyFacts&, env: AoScope&, expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Field(_, field, _):
+                        return env.store_index >= 0 and facts.current_fields[env.store_index.usize()] == field
+                    _:
+                        return false
+
+        def ao_is_retired(facts: AppendOnlyFacts&, env: AoScope&, expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Field(_, field, _):
+                        return env.store_index >= 0 and facts.retired_fields[env.store_index.usize()] == field
+                    _:
+                        return false
+
+        def ao_field_object(expression: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match expression:
+                    Expr.Field(object, _, _):
+                        return object
+                    _:
+                        return expression
+
+
+        def ao_pattern(facts: AppendOnlyFacts&, pattern: Ast::Pattern, position: Ast::Pos, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Struct(path, fields):
+                        segment: sview = sview_basename(path, 58.u8())
+                        if any store in facts.stores where store == segment:
+                            table <- ao_report(table, segment, position, "may not be destructured by a pattern")
+                        for field in fields |table|:
+                            table <- ao_pattern(facts, field, position, table)
+                    Pattern.Variant(_, fields):
+                        for field in fields |table|:
+                            table <- ao_pattern(facts, field, position, table)
+                    Pattern.Field(_, inner):
+                        for field in inner |table|:
+                            table <- ao_pattern(facts, field, position, table)
+                    Pattern.Tuple(elements):
+                        for element in elements |table|:
+                            table <- ao_pattern(facts, element, position, table)
+                    Pattern.Or(options):
+                        for option in options |table|:
+                            table <- ao_pattern(facts, option, position, table)
+                    _:
+                        pass
+
+        def ao_exprs(facts: AppendOnlyFacts&, env: mutable AoScope&, expressions: darray[Ast::Expr]&, slot: u8, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for expression in expressions |table, env|:
+                    table <- ao_expr(facts, env, expression, slot, table)
+
+        def ao_arms(facts: AppendOnlyFacts&, env: mutable AoScope&, arms: darray[Ast::MatchArm]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |table, env|:
+                    table <- ao_pattern(facts, arm.pattern, arm.pos, table)
+                    table <- ao_expr(facts, env, arm.guard, 0, table)
+                    table <- ao_stmts(facts, env, arm.body, table)
+
+        def ao_call(facts: AppendOnlyFacts&, env: mutable AoScope&, callee: Ast::Expr, arguments: darray[Ast::Expr]&, position: Ast::Pos, slot: u8, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if ao_returns_store(facts, callee) and slot != 2 and slot != 3:
+                    table <- ao_report(table, ao_callee_name(callee), position, "a fresh store must be bound, stored in a struct literal, or returned")
+                match callee:
+                    Expr.Field(receiver, method, method_pos):
+                        receiver_store: i64 = ao_place_store(facts, env, receiver)
+                        if receiver_store >= 0:
+                            table <- ao_report(table, ao_store_name(facts, receiver_store), method_pos, "has no methods; pass it to its own module's functions")
+                            table <- ao_expr(facts, env, ao_field_object(receiver), 1, table)
+                        elif env.kind == 2 and method == "push" and ao_is_current(facts, env, receiver):
+                            table <- ao_expr(facts, env, ao_field_object(receiver), 1, table)
+                        else:
+                            table <- ao_expr(facts, env, receiver, 1, table)
+                        table <- ao_exprs(facts, env, arguments, 0, table)
+                    _:
+                        name: sview = ao_callee_name(callee)
+                        if env.kind == 2 and name == "bytes_view_range" and arguments.count == 3 and ao_is_current(facts, env, arguments[0]):
+                            table <- ao_expr(facts, env, ao_field_object(arguments[0]), 1, table)
+                            table <- ao_expr(facts, env, arguments[1], 0, table)
+                            table <- ao_expr(facts, env, arguments[2], 0, table)
+                            return
+                        table <- ao_expr(facts, env, callee, 0, table) if name == ""
+                        own: bool = name != "" and ao_is_module_function(facts, ao_callee_module(env, callee), name)
+                        table <- ao_exprs(facts, env, arguments, 1 if own else 0, table)
+
+        def ao_expr(facts: AppendOnlyFacts&, env: mutable AoScope&, expression: Ast::Expr, slot: u8, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                place_store: i64 = ao_place_store(facts, env, expression)
+                if place_store >= 0:
+                    table <- ao_report(table, ao_store_name(facts, place_store), Ast::expr_pos(expression), "may only be passed by reference to its own module's functions") if slot != 1
+                    # A store-typed field walks its object; a store-typed local is the whole place
+                    # (ao_field_object would hand it back unchanged and recurse forever).
+                    table <- ao_expr(facts, env, ao_field_object(expression), 1, table) if not ao_is_plain_ident(expression)
+                    return
+                match expression:
+                    Expr.Field(object, field, position):
+                        if ao_is_buffer(facts, env, field):
+                            detail: sview = "only make_room and append may touch the buffer fields" if env.kind == 0 else ("make_room may only retire the buffer: retired.push(current), then current <- [], then optionally current.reserve(n)" if env.kind == 1 else "buffer fields may only be read for .count/.capacity, pushed by append, or retired by make_room")
+                            table <- ao_report(table, ao_store_name(facts, env.store_index), position, detail)
+                            table <- ao_expr(facts, env, object, 1, table)
+                        elif (field == "count" or field == "capacity") and env.kind != 0 and (ao_is_current(facts, env, object) or ao_is_retired(facts, env, object)):
+                            table <- ao_expr(facts, env, ao_field_object(object), 1, table)
+                        else:
+                            table <- ao_expr(facts, env, object, 1, table)
+                    Expr.Call(callee, arguments, _, position):
+                        table <- ao_call(facts, env, callee, arguments, position, slot, table)
+                    Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                        table <- ao_exprs(facts, env, arguments, 0, table)
+                    Expr.Unary(operator, operand, _):
+                        table <- ao_expr(facts, env, operand, 1 if operator == TokenKind.Ampersand else 0, table)
+                    Expr.Paren(inner, _):
+                        table <- ao_expr(facts, env, inner, slot, table)
+                    Expr.Binary(left, _, right, _):
+                        table <- ao_expr(facts, env, left, 0, table)
+                        table <- ao_expr(facts, env, right, 0, table)
+                    Expr.Index(object, index, _):
+                        table <- ao_expr(facts, env, object, 0, table)
+                        table <- ao_expr(facts, env, index, 0, table)
+                    Expr.Slice(object, low, high, _):
+                        table <- ao_expr(facts, env, object, 0, table)
+                        table <- ao_expr(facts, env, low, 0, table)
+                        table <- ao_expr(facts, env, high, 0, table)
+                    Expr.IndexN(object, arguments, _):
+                        table <- ao_expr(facts, env, object, 0, table)
+                        table <- ao_exprs(facts, env, arguments, 0, table)
+                    Expr.Move(operand, _):
+                        table <- ao_expr(facts, env, operand, 0, table)
+                    Expr.RegionNew(operand, _, _):
+                        table <- ao_expr(facts, env, operand, 0, table)
+                    Expr.Array(elements, _):
+                        table <- ao_exprs(facts, env, elements, 0, table)
+                    Expr.Tuple(elements, _):
+                        table <- ao_exprs(facts, env, elements, 0, table)
+                    Expr.SetLit(elements, _):
+                        table <- ao_exprs(facts, env, elements, 0, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table, env|:
+                            table <- ao_expr(facts, env, entry.key, 0, table)
+                            table <- ao_expr(facts, env, entry.value, 0, table)
+                    Expr.Construct(type_expression, fields, position):
+                        head: sview = ao_type_head(facts, type_expression)
+                        for field in fields |table, env|:
+                            if head != "" and not ao_is_empty_array(field.value):
+                                table <- ao_report(table, head, position, "a store literal takes only empty buffers")
+                            table <- ao_expr(facts, env, field.value, 2, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- ao_expr(facts, env, base, 0, table)
+                        for field in fields |table, env|:
+                            table <- ao_expr(facts, env, field.value, 2, table)
+                    Expr.If(condition, then_expression, else_expression, _):
+                        table <- ao_expr(facts, env, condition, 0, table)
+                        table <- ao_expr(facts, env, then_expression, slot, table)
+                        table <- ao_expr(facts, env, else_expression, slot, table)
+                    Expr.Match(scrutinee, arms, _):
+                        table <- ao_expr(facts, env, scrutinee, 0, table)
+                        table <- ao_arms(facts, env, arms, table)
+                    Expr.Catch(guarded, arms, _):
+                        table <- ao_expr(facts, env, guarded, 0, table)
+                        table <- ao_arms(facts, env, arms, table)
+                    Expr.Comprehension(_, iterable, condition, body, _):
+                        table <- ao_expr(facts, env, iterable, 0, table)
+                        table <- ao_expr(facts, env, condition, 0, table)
+                        table <- ao_expr(facts, env, body, 0, table)
+                    Expr.Refinement(base, predicate, _):
+                        table <- ao_expr(facts, env, base, 0, table)
+                        table <- ao_expr(facts, env, predicate, 0, table)
+                    Expr.GetElse(guarded, recovery, _):
+                        table <- ao_expr(facts, env, guarded, 0, table)
+                        table <- ao_stmts(facts, env, recovery, table)
+                    Expr.Lambda(_, body, _):
+                        table <- ao_stmts(facts, env, body, table)
+                    Expr.Block(statements, value, _, _):
+                        table <- ao_stmts(facts, env, statements, table)
+                        table <- ao_expr(facts, env, value, slot, table)
+                    _:
+                        pass
+
+        def ao_is_empty_array(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Array(elements, _):
+                        return elements.count == 0
+                    Expr.Paren(inner, _):
+                        return ao_is_empty_array(inner)
+                    _:
+                        return false
+
+        # A binding whose declared type heads at a store makes the name a store place.
+        def ao_bind(facts: AppendOnlyFacts&, env: mutable AoScope&, name: sview, type_expression: Ast::Expr, value: Ast::Expr, position: Ast::Pos, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if ao_type_nests_store(facts, type_expression, true):
+                    table <- ao_report(table, name, position, "may not be nested inside another type")
+                head: mutable sview = ao_type_head(facts, type_expression)
+                is_ref: bool = head != "" and ao_type_is_ref(type_expression)
+                borrowed: i64 = ao_address_of_store(facts, env, value)
+                if head == "":
+                    head <- ao_returned_store(facts, value)
+                    head <- ao_store_name(facts, borrowed) if head == ""
+                table <- ao_expr(facts, env, value, 1 if is_ref or borrowed >= 0 else 2, table)
+                if head != "":
+                    env.locals.push(name)
+                    env.local_types.push(ao_store_slot(facts, head))
+
+        # `&place` of a store place: the store, else "".
+        def ao_address_of_store(facts: AppendOnlyFacts&, env: AoScope&, value: Ast::Expr) -> i64:
+            can Abort.Panic:
+                match value:
+                    Expr.Unary(operator, operand, _):
+                        return ao_place_store(facts, env, operand) if operator == TokenKind.Ampersand else -1
+                    Expr.Paren(inner, _):
+                        return ao_address_of_store(facts, env, inner)
+                    _:
+                        return -1
+
+        # The store a fresh-store call returns, else "".
+        def ao_returned_store(facts: AppendOnlyFacts&, value: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match value:
+                    Expr.Call(callee, _, _, _):
+                        name: sview = ao_callee_name(callee)
+                        probe: mutable usize = 0
+                        while probe < facts.returning_functions.count |probe|:
+                            facts.returning_types[probe] return if facts.returning_functions[probe] == name and name != ""
+                            probe <- probe + 1
+                        return ""
+                    Expr.Paren(inner, _):
+                        return ao_returned_store(facts, inner)
+                    _:
+                        return ""

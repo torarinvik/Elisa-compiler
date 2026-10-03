@@ -1,0 +1,174 @@
+# Statements, the `make_room` retire sequence and the declaration walk of
+# check_append_only_store (rules in check_append_only_store.elisa).
+extend Semantic:
+    private:
+        def ao_stmts(facts: AppendOnlyFacts&, env: mutable AoScope&, statements: darray[Ast::Stmt]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, env|:
+                    table <- ao_stmt(facts, env, statement, table)
+
+        def ao_stmt(facts: AppendOnlyFacts&, env: mutable AoScope&, statement: Ast::Stmt, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, _):
+                        table <- ao_expr(facts, env, expression, 0, table)
+                    Stmt.VarDecl(name, type_expression, value, position):
+                        table <- ao_bind(facts, env, name, type_expression, value, position, table)
+                    Stmt.Assign(target, operator, value, position):
+                        name: sview = ident_name_of(target)
+                        if operator == TokenKind.Assign and name != "" and ao_is_plain_ident(target):
+                            table <- ao_bind(facts, env, name, Ast::Expr.Absent, value, position, table)
+                            return
+                        target_store: i64 = ao_place_store(facts, env, target)
+                        if target_store >= 0:
+                            table <- ao_report(table, ao_store_name(facts, target_store), position, "cannot be reassigned")
+                            table <- ao_expr(facts, env, ao_field_object(target), 1, table)
+                            table <- ao_expr(facts, env, value, 2, table)
+                            return
+                        table <- ao_expr(facts, env, target, 1, table)
+                        table <- ao_expr(facts, env, value, 0, table)
+                    Stmt.If(condition, then_body, else_body, _):
+                        table <- ao_expr(facts, env, condition, 0, table)
+                        table <- ao_stmts(facts, env, then_body, table)
+                        table <- ao_stmts(facts, env, else_body, table)
+                    Stmt.While(condition, body, _):
+                        table <- ao_expr(facts, env, condition, 0, table)
+                        table <- ao_stmts(facts, env, body, table)
+                    Stmt.For(_, _, iterable, body, _):
+                        table <- ao_expr(facts, env, iterable, 0, table)
+                        table <- ao_stmts(facts, env, body, table)
+                    Stmt.Return(value, _):
+                        table <- ao_expr(facts, env, returned, 2, table) if value is returned
+                    Stmt.Match(scrutinee, arms, _):
+                        table <- ao_expr(facts, env, scrutinee, 0, table)
+                        table <- ao_arms(facts, env, arms, table)
+                    Stmt.Block(_, _, _, body, _):
+                        table <- ao_stmts(facts, env, body, table)
+                    Stmt.Contract(_, expression, _):
+                        table <- ao_expr(facts, env, expression, 0, table)
+                    _:
+                        pass
+
+        def ao_is_plain_ident(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(_, _):
+                        return true
+                    _:
+                        return false
+
+        def ao_same_object(left: Ast::Expr, right: Ast::Expr) -> bool:
+            can Abort.Panic:
+                name: sview = ident_name_of(ao_field_object(left))
+                return name != "" and name == ident_name_of(ao_field_object(right))
+
+        # 1 = `X.retired.push(X.current)`, 2 = `X.current <- []`, 3 = `X.current.reserve(n)`,
+        # 0 = anything else.
+        def ao_retire_step(facts: AppendOnlyFacts&, env: AoScope&, statement: Ast::Stmt) -> u8:
+            can Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, _):
+                        match expression:
+                            Expr.Call(callee, arguments, _, _):
+                                match callee:
+                                    Expr.Field(receiver, method, _):
+                                        if method == "push" and arguments.count == 1 and ao_is_retired(facts, env, receiver) and ao_is_current(facts, env, arguments[0]) and ao_same_object(receiver, arguments[0]):
+                                            return 1
+                                        return 3 if method == "reserve" and arguments.count == 1 and ao_is_current(facts, env, receiver) else 0
+                                    _:
+                                        return 0
+                            _:
+                                return 0
+                    Stmt.Assign(target, operator, value, _):
+                        return 2 if operator == TokenKind.LArrow and ao_is_current(facts, env, target) and ao_is_empty_array(value) else 0
+                    _:
+                        return 0
+
+        # Walks the argument of a `current.reserve(n)` step in place (a by-value copy of the
+        # argument would be function-local storage reaching the table).
+        def ao_reserve_check(facts: AppendOnlyFacts&, env: mutable AoScope&, statement: Ast::Stmt, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, _):
+                        match expression:
+                            Expr.Call(_, arguments, _, _):
+                                table <- ao_expr(facts, env, arguments[0], 0, table) if arguments.count > 0
+                            _:
+                                table <- ao_expr(facts, env, expression, 0, table)
+                    _:
+                        pass
+
+        def ao_stmt_pos(statement: Ast::Stmt) -> Ast::Pos:
+            can Abort.Panic:
+                match statement:
+                    Stmt.Expr(_, position):
+                        return position
+                    Stmt.Assign(_, _, _, position):
+                        return position
+                    _:
+                        return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+
+        # True when make_room's top level ends mid-sequence (pushed but not cleared).
+        def ao_make_room_open(facts: AppendOnlyFacts&, env: AoScope&, statements: darray[Ast::Stmt]&) -> bool:
+            can Abort.Panic:
+                retire_phase: mutable u8 = 0
+                for statement in statements |retire_phase|:
+                    retire_kind: u8 = ao_retire_step(facts, env, statement)
+                    retire_phase <- 1 if retire_kind == 1 else (2 if retire_kind == 2 else 0)
+                return retire_phase == 1
+
+        # make_room's top level: ordinary statements (which may only READ the buffers'
+        # count/capacity), and the retire sequence push -> `<- []` -> optional reserve.
+        def ao_make_room(facts: AppendOnlyFacts&, env: mutable AoScope&, statements: darray[Ast::Stmt]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                retire_phase: mutable u8 = 0
+                for statement in statements |table, env, retire_phase|:
+                    retire_kind: u8 = ao_retire_step(facts, env, statement)
+                    if retire_kind == 1:
+                        table <- ao_report(table, ao_store_name(facts, env.store_index), ao_stmt_pos(statement), "make_room may only retire the buffer: retired.push(current), then current <- [], then optionally current.reserve(n)") if retire_phase == 1
+                        retire_phase <- 1
+                    elif retire_kind == 2:
+                        table <- ao_report(table, ao_store_name(facts, env.store_index), ao_stmt_pos(statement), "make_room may only retire the buffer: retired.push(current), then current <- [], then optionally current.reserve(n)") if retire_phase != 1
+                        retire_phase <- 2
+                    elif retire_kind == 3:
+                        table <- ao_report(table, ao_store_name(facts, env.store_index), ao_stmt_pos(statement), "make_room may only retire the buffer: retired.push(current), then current <- [], then optionally current.reserve(n)") if retire_phase != 2
+                        table <- ao_reserve_check(facts, env, statement, table)
+                        retire_phase <- 0
+                    else:
+                        table <- ao_report(table, ao_store_name(facts, env.store_index), ao_stmt_pos(statement), "make_room may only retire the buffer: retired.push(current), then current <- [], then optionally current.reserve(n)") if retire_phase == 1
+                        retire_phase <- 0
+                        table <- ao_stmt(facts, env, statement, table)
+
+        def ao_check_declarations(declarations: darray[Ast::Decl]&, module_name: sview, facts: AppendOnlyFacts&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, _, _, position):
+                            store_index: i64 = ao_store_of_module(facts, module_name)
+                            kind: mutable u8 = 0
+                            if store_index >= 0:
+                                kind <- 1 if name == "make_room" else (2 if name == "append" else 0)
+                            env: mutable AoScope = AoScope{module_name: module_name, store_index: store_index, kind: kind, locals: [], local_types: []}
+                            for parameter in parameters |table, env|:
+                                table <- ao_report(table, parameter.name, position, "may not be nested inside another type") if ao_type_nests_store(facts, parameter.type_expression, true)
+                                head: sview = ao_type_head(facts, parameter.type_expression)
+                                if head != "":
+                                    table <- ao_report(table, head, position, "parameters must be references") if not ao_type_is_ref(parameter.type_expression)
+                                    env.locals.push(parameter.name)
+                                    env.local_types.push(ao_store_slot(facts, head))
+                            if return_type is returned:
+                                table <- ao_report(table, name, position, "may not be nested inside another type") if ao_type_nests_store(facts, returned, true)
+                            if kind == 1:
+                                table <- ao_make_room(facts, env, body, table)
+                                table <- ao_report(table, ao_store_name(facts, store_index), position, "make_room may only retire the buffer: retired.push(current), then current <- [], then optionally current.reserve(n)") if ao_make_room_open(facts, env, body)
+                            else:
+                                table <- ao_stmts(facts, env, body, table)
+                        Decl.Struct(_, members, _, _, _, _, position):
+                            for member in members |table|:
+                                table <- ao_report(table, member.name, position, "may not be nested inside another type") if ao_type_nests_store(facts, member.type_expression, true)
+                        Decl.Module(name, body, _):
+                            table <- ao_check_declarations(body, name, facts, table)
+                        Decl.Scoped(body, _):
+                            table <- ao_check_declarations(body, module_name, facts, table)
+                        _:
+                            pass

@@ -1,0 +1,219 @@
+# `@append_only` store structs: an ENFORCED, not trusted, append-only byte store.
+#
+# A view into a darray dangles the moment the darray reallocates. An append-only store lets
+# long-lived views point into a growing pool by never growing a buffer under a view: when the
+# current buffer is full it is RETIRED (pushed onto a list that is never shrunk) and a fresh
+# one is started. That is only sound when nothing else can reach the buffers, so the
+# annotation turns the shape into rules (stage0 analyzer_append_only_store.go is the twin):
+#
+#   declaration  the struct sits in a module and has exactly two private fields, a
+#                `darray[T]` buffer and a `darray[darray[T]]` retired list.
+#   in-module    only `make_room` and `append` may mention the buffer fields; a store literal
+#                takes empty buffers only; no struct pattern may open a store.
+#   make_room    may read `.count`/`.capacity` and do exactly one thing to the buffers:
+#                `retired.push(current)`, then `current <- []`, then `current.reserve(n)`.
+#                No clear, pop, truncate, other assignment or method — it never frees.
+#   append       may read `.count`/`.capacity`, `current.push(x)` and
+#                `bytes_view_range(current, a, b)`; nothing else.
+#   everywhere   a store value (a field, parameter or local whose type head is the store) may
+#                only be passed to a function of the store's own module (whose store
+#                parameters must be references), have its address taken, or bind a
+#                reference. Reassignment, copies, `move`, method calls, iteration, and
+#                nesting the type in another type (`darray[S]`, `S?`) are rejected.
+#
+# Copies of a struct that CONTAINS a store would duplicate the store header, and two headers
+# append into the same spare capacity. A store and every struct holding one are therefore
+# affine (symbols_append_only_affinity.elisa): by-value copies, assignment and record updates
+# are rejected by the affine move-site checks, while `&` borrows stay legal.
+extend Semantic:
+    private:
+        struct AppendOnlyFacts:
+            stores: mutable darray[sview]
+            store_modules: mutable darray[sview]
+            current_fields: mutable darray[sview]
+            retired_fields: mutable darray[sview]
+            module_functions: mutable darray[sview]
+            module_function_modules: mutable darray[sview]
+            returning_functions: mutable darray[sview]
+            returning_types: mutable darray[sview]
+            store_fields: mutable darray[sview]
+            store_field_types: mutable darray[sview]
+
+        def ao_report(table: lmut SymbolTable, store: sview, position: Ast::Pos, detail: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AppendOnlyStore, name: store, line: position.line, pos: position, expected: "", actual: store, detail: detail})
+
+        def ao_last_segment(path: sview) -> sview:
+            return sview_basename(path, 58.u8())
+
+        # The store a type expression names at its head (through `mutable`, `&`, parens and
+        # refinements), or "".
+        def ao_type_head(facts: AppendOnlyFacts&, type_expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return name if (any store in facts.stores where store == name) else ""
+                    Expr.Scope(_, name, _):
+                        return name if (any store in facts.stores where store == name) else ""
+                    Expr.Field(_, name, _):
+                        return name if (any store in facts.stores where store == name) else ""
+                    Expr.Unary(_, operand, _):
+                        return ao_type_head(facts, operand)
+                    Expr.Paren(inner, _):
+                        return ao_type_head(facts, inner)
+                    Expr.Refinement(base, _, _):
+                        return ao_type_head(facts, base)
+                    _:
+                        return ""
+
+        def ao_type_is_ref(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        true return if operator == TokenKind.Ampersand
+                        return ao_type_is_ref(operand)
+                    Expr.Paren(inner, _):
+                        return ao_type_is_ref(inner)
+                    _:
+                        return false
+
+        # A store named ANYWHERE below the head of a type (`darray[S]`, `S?`, `(S, u8)`).
+        def ao_type_nests_store(facts: AppendOnlyFacts&, type_expression: Ast::Expr, at_head: bool) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return not at_head and any store in facts.stores where store == name
+                    Expr.Scope(_, name, _):
+                        return not at_head and any store in facts.stores where store == name
+                    Expr.Unary(_, operand, _):
+                        return ao_type_nests_store(facts, operand, at_head)
+                    Expr.Paren(inner, _):
+                        return ao_type_nests_store(facts, inner, at_head)
+                    Expr.Refinement(base, _, _):
+                        return ao_type_nests_store(facts, base, at_head)
+                    Expr.Index(object, index, _):
+                        return ao_type_nests_store(facts, object, false) or ao_type_nests_store(facts, index, false)
+                    Expr.IndexN(object, arguments, _):
+                        true return if ao_type_nests_store(facts, object, false)
+                        return any argument in arguments where ao_type_nests_store(facts, argument, false)
+                    Expr.Tuple(elements, _):
+                        return any element in elements where ao_type_nests_store(facts, element, false)
+                    Expr.Call(callee, arguments, _, _):
+                        true return if ao_type_nests_store(facts, callee, false)
+                        return any argument in arguments where ao_type_nests_store(facts, argument, false)
+                    _:
+                        return false
+
+        # `darray[...]` nesting depth of a field type, through `mutable`; -1 for anything else.
+        def ao_darray_depth(type_expression: Ast::Expr) -> i32:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        return -1 if operator == TokenKind.Ampersand else ao_darray_depth(operand)
+                    Expr.Index(object, index, _):
+                        return -1 if ident_name_of(object) != "darray"
+                        inner: i32 = ao_darray_depth(index)
+                        return 1 if inner < 0 else inner + 1
+                    _:
+                        return -1
+
+        def ao_is_store_annotated(file: Ast::File&, name: sview) -> bool:
+            return any annotation in file.enum_annotations where annotation.owner == name and annotation.name == "append_only"
+
+        def ao_collect_stores(file: Ast::File&, declarations: darray[Ast::Decl], module_name: sview, facts: mutable AppendOnlyFacts&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |facts, table|:
+                    match declaration:
+                        Decl.Struct(name, members, _, _, _, _, position):
+                            if ao_is_store_annotated(file, name):
+                                if module_name == "":
+                                    table <- ao_report(table, name, position, "must be declared inside a module")
+                                current: mutable sview = ""
+                                retired: mutable sview = ""
+                                shape_ok: mutable bool = members.count == 2
+                                for member in members |current, retired, shape_ok|:
+                                    depth: i32 = ao_darray_depth(member.type_expression)
+                                    shape_ok <- false if not member.is_private
+                                    if depth == 1 and current == "":
+                                        current <- member.name
+                                    elif depth == 2 and retired == "":
+                                        retired <- member.name
+                                    else:
+                                        shape_ok <- false
+                                if not shape_ok or current == "" or retired == "":
+                                    table <- ao_report(table, name, position, "must have exactly two private fields: a darray buffer and a darray of retired buffers")
+                                facts.stores.push(name)
+                                facts.store_modules.push(module_name)
+                                facts.current_fields.push(current)
+                                facts.retired_fields.push(retired)
+                        Decl.Module(name, body, _):
+                            table <- ao_collect_stores(file, body, name, facts, table)
+                        Decl.Scoped(body, _):
+                            table <- ao_collect_stores(file, body, module_name, facts, table)
+                        _:
+                            pass
+
+        # Second pass, once every store is known: module functions, store-returning
+        # functions and every struct field whose type head is a store.
+        def ao_collect_uses(declarations: darray[Ast::Decl], module_name: sview, facts: mutable AppendOnlyFacts&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |facts|:
+                    match declaration:
+                        Decl.Func(name, _, return_type, _, _, _, _):
+                            if any store_module in facts.store_modules where store_module == module_name and module_name != "":
+                                facts.module_functions.push(name)
+                                facts.module_function_modules.push(module_name)
+                            if return_type is returned:
+                                returned_store: sview = ao_type_head(facts, returned)
+                                if returned_store != "" and not ao_type_is_ref(returned):
+                                    facts.returning_functions.push(name)
+                                    facts.returning_types.push(returned_store)
+                        Decl.Struct(_, members, _, _, _, _, _):
+                            for member in members |facts|:
+                                head: sview = ao_type_head(facts, member.type_expression)
+                                if head != "":
+                                    facts.store_fields.push(member.name)
+                                    facts.store_field_types.push(head)
+                        Decl.Module(name, body, _):
+                            ao_collect_uses(body, name, facts)
+                        Decl.Scoped(body, _):
+                            ao_collect_uses(body, module_name, facts)
+                        _:
+                            pass
+
+        def ao_store_of_module(facts: AppendOnlyFacts&, module_name: sview) -> i64:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                while probe < facts.stores.count |probe|:
+                    probe.i64() return if facts.store_modules[probe] == module_name and module_name != ""
+                    probe <- probe + 1
+                return -1
+
+        def ao_is_module_function(facts: AppendOnlyFacts&, module_name: sview, name: sview) -> bool:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                while probe < facts.module_functions.count |probe|:
+                    true return if facts.module_functions[probe] == name and facts.module_function_modules[probe] == module_name
+                    probe <- probe + 1
+                return false
+
+        def ao_store_field_type(facts: AppendOnlyFacts&, field: sview) -> sview:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                while probe < facts.store_fields.count |probe|:
+                    facts.store_field_types[probe] return if facts.store_fields[probe] == field
+                    probe <- probe + 1
+                return ""
+
+        def ao_is_buffer_field(facts: AppendOnlyFacts&, store_index: i64, field: sview) -> bool:
+            return store_index >= 0 and (facts.current_fields[store_index.usize()] == field or facts.retired_fields[store_index.usize()] == field)
+
+    public:
+        def check_append_only_store(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not any annotation in file.enum_annotations where annotation.name == "append_only"
+                facts: mutable AppendOnlyFacts = AppendOnlyFacts{stores: [], store_modules: [], current_fields: [], retired_fields: [], module_functions: [], module_function_modules: [], returning_functions: [], returning_types: [], store_fields: [], store_field_types: []}
+                table <- ao_collect_stores(file, file.top_decls, "", facts, table)
+                return if facts.stores.count == 0
+                ao_collect_uses(file.top_decls, "", facts)
+                table <- ao_check_declarations(file.top_decls, "", facts, table)
