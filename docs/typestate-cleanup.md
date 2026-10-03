@@ -84,7 +84,8 @@ Broader alias, control-flow, cross-module, and generic negative controls remain 
 
 Stage1's parser now preserves structured `StateFamily` and `StateTransitionEdge`
 rows in `Ast::File`, keyed by owning module, declaration name, and declaration
-line. The semantic loop-view copy preserves both tables. Its transition block
+position. Edges retain the owning declaration's byte offset as well as its line;
+line numbers alone are not canonical identity. The semantic loop-view copy preserves both tables. Its transition block
 parser creates no operation declarations. An executable self-hosted parser probe
 checks state order, affinity, both edges, unchanged declaration count, metadata
 preservation, and two same-named families in distinct modules. This is parser
@@ -98,8 +99,17 @@ duplicate edges, derived/protocol mixing, and edges without a named family. The
 paired graph-validation gate requires the intended diagnostic and semantic exit
 status; the old missing-derive rejection alone does not count as validation.
 
-The remaining transition implementation must resolve these metadata rows to the
-existing `DeclId` and track values by existing lexical `BindingId`. Do not extend
+Symbol collection now resolves state-family metadata to existing `DeclId` rows,
+requiring a unique struct with matching module, name, line, and byte offset.
+Resolved edges carry that same declaration ID and their immutable source-row
+index. Detached metadata without its declaration produces an explicit error and
+no resolved family/edge authority. The metadata executable checks distinct IDs
+for two same-spelled module families, edge-to-family IDs, and the detached control.
+This is declaration resolution, not state-qualified alias lookup or ownership.
+
+The remaining transition implementation must track values by existing lexical
+`BindingId` and resolve qualified/imported type uses and aliases to the family
+declaration ID. Do not extend
 the legacy function-name/sentinel protocol checker: its bare-name tracking is not
 adequate for shadowing, independent operation names, or module-separated families.
 State-qualified types need structural type identity through calls, returns,

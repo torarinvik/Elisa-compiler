@@ -22,4 +22,4 @@ status=$?
 set -e
 [[ "$status" -eq 1 ]] || { cat "$WORK/reject.log" >&2; echo "expected semantic rejection, got $status" >&2; exit 1; }
 rg -q 'missing a derive state: block' "$WORK/reject.log"
-echo 'Stage1 protocol metadata OK: states/edges, module identity, semantic-view preservation, fail-closed guard'
+echo 'Stage1 protocol metadata OK: states/edges, resolved declaration IDs, detached-metadata rejection, semantic-view preservation, fail-closed guard'
