@@ -9,6 +9,77 @@ extend Backend:
         const SVIEW_EQUALITY_LENGTH_FIELD: u32 = 1
         const SVIEW_EQUALITY_ARGUMENT_COUNT: u32 = 2
 
+        # The callee every `sview == sview` / string-literal match arm uses: a module-private
+        # `__elisa_sview_eq` with ctx_string_views_eq's signature and answer -- unequal or
+        # negative lengths are unequal, empty or same-pointer views are equal, otherwise
+        # `memcmp(...) == 0` -- built once per module.
+        #
+        # The runtime's ctx_string_views_eq is an EXTERNAL declaration in every program (it
+        # binds to elisacore_runtime.o), so each comparison was an opaque call LLVM could
+        # neither inline nor specialise: in the compiler's own -O2 profile that call and its
+        # memcmp were ~18% of a self-compile, mostly `owner == "literal"` tests. Defined in
+        # the module, the optimiser inlines it and expands the constant-length memcmp of a
+        # literal compare into a couple of loads. At -O0 it is still one call.
+        #
+        # Falls back to the runtime entry point when `memcmp` names something that is not
+        # an external declaration (a program's own internal function of that name).
+        def sview_equality_callee(runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            m: LLVMModuleRef = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)))
+            if LLVMGetNamedFunction(m, "__elisa_sview_eq") is existing_helper:
+                return existing_helper
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            size_type: LLVMTypeRef = runtime_size_llvm_type(ctx)
+            memcmp_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, size_type]
+            memcmp_params_pointer: void& = (&memcmp_params[0]).cast[void&] can Unsafe.PointerCast
+            memcmp_type: LLVMTypeRef = LLVMFunctionType(LLVMInt32TypeInContext(ctx), memcmp_params_pointer, 3, 0)
+            memcmp_fn: mutable LLVMValueRef = runtime.sview_eq
+            if LLVMGetNamedFunction(m, "memcmp") is existing_memcmp:
+                # 0 = ExternalLinkage: only a declaration (or a public definition, which the
+                # linker would bind every libc memcmp call to anyway) is the C function.
+                runtime.sview_eq return if LLVMGetLinkage(existing_memcmp) != 0
+                memcmp_fn <- existing_memcmp
+            else:
+                memcmp_fn <- LLVMAddFunction(m, "memcmp", memcmp_type)
+            helper: LLVMValueRef = LLVMAddFunction(m, "__elisa_sview_eq", runtime.sview_eq_type)
+            # 8 = InternalLinkage: one private copy per object, never an exported symbol.
+            LLVMSetLinkage(helper, 8)
+            result_type: LLVMTypeRef = size_type
+            unequal_value: LLVMValueRef = LLVMConstInt(result_type, 0, 0)
+            equal_value: LLVMValueRef = LLVMConstInt(result_type, 1, 0)
+            zero_length: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
+            helper_builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+            entry_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "entry")
+            sign_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "same.len")
+            nonempty_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "nonempty")
+            bytes_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "bytes")
+            equal_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "equal")
+            unequal_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "unequal")
+            LLVMPositionBuilderAtEnd(helper_builder, entry_block)
+            left: LLVMValueRef = LLVMGetParam(helper, 0)
+            right: LLVMValueRef = LLVMGetParam(helper, 1)
+            left_data: LLVMValueRef = LLVMBuildExtractValue(helper_builder, left, 0, "left.data")
+            right_data: LLVMValueRef = LLVMBuildExtractValue(helper_builder, right, 0, "right.data")
+            left_length: LLVMValueRef = LLVMBuildExtractValue(helper_builder, left, SVIEW_EQUALITY_LENGTH_FIELD, "left.len")
+            right_length: LLVMValueRef = LLVMBuildExtractValue(helper_builder, right, SVIEW_EQUALITY_LENGTH_FIELD, "right.len")
+            # 32 = EQ, 40 = SLT.
+            _ = LLVMBuildCondBr(helper_builder, LLVMBuildICmp(helper_builder, 32, left_length, right_length, "same.len"), sign_block, unequal_block)
+            LLVMPositionBuilderAtEnd(helper_builder, sign_block)
+            _ = LLVMBuildCondBr(helper_builder, LLVMBuildICmp(helper_builder, 40, left_length, zero_length, "negative"), unequal_block, nonempty_block)
+            LLVMPositionBuilderAtEnd(helper_builder, nonempty_block)
+            empty_or_same: LLVMValueRef = LLVMBuildOr(helper_builder, LLVMBuildICmp(helper_builder, 32, left_length, zero_length, "empty"), LLVMBuildICmp(helper_builder, 32, left_data, right_data, "same.data"), "trivially.equal")
+            _ = LLVMBuildCondBr(helper_builder, empty_or_same, equal_block, bytes_block)
+            LLVMPositionBuilderAtEnd(helper_builder, bytes_block)
+            memcmp_args: mutable darray[LLVMValueRef] = [left_data, right_data, runtime_size_argument(left_length, ctx, helper_builder)]
+            memcmp_args_pointer: void& = (&memcmp_args[0]).cast[void&] can Unsafe.PointerCast
+            difference: LLVMValueRef = LLVMBuildCall2(helper_builder, memcmp_type, memcmp_fn, memcmp_args_pointer, 3, "difference")
+            _ = LLVMBuildCondBr(helper_builder, LLVMBuildICmp(helper_builder, 32, difference, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "bytes.equal"), equal_block, unequal_block)
+            LLVMPositionBuilderAtEnd(helper_builder, equal_block)
+            _ = LLVMBuildRet(helper_builder, equal_value)
+            LLVMPositionBuilderAtEnd(helper_builder, unequal_block)
+            _ = LLVMBuildRet(helper_builder, unequal_value)
+            LLVMDisposeBuilder(helper_builder)
+            return helper
+
         # Operands are already evaluated. Unequal lengths need no runtime call.
         # A real cstr may be compared with an sview; materialize its length before
         # calling the by-value sview ABI. Opaque handles and all other mismatches
@@ -38,7 +109,7 @@ extend Backend:
             LLVMPositionBuilderAtEnd(builder, compare_block)
             arguments: mutable darray[LLVMValueRef] = [left_value, right_value]
             arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
-            code: LLVMValueRef = LLVMBuildIntCast2(builder, LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, arguments_pointer, SVIEW_EQUALITY_ARGUMENT_COUNT, "sview.eq"), LLVMInt64TypeInContext(ctx), 1, "string.eq.code")
+            code: LLVMValueRef = LLVMBuildIntCast2(builder, LLVMBuildCall2(builder, runtime.sview_eq_type, sview_equality_callee(runtime, ctx, builder), arguments_pointer, SVIEW_EQUALITY_ARGUMENT_COUNT, "sview.eq"), LLVMInt64TypeInContext(ctx), 1, "string.eq.code")
             _ = LLVMBuildStore(builder, code, result_slot)
             _ = LLVMBuildBr(builder, done_block)
             LLVMPositionBuilderAtEnd(builder, done_block)
