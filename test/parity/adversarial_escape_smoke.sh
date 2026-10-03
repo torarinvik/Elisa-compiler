@@ -50,6 +50,11 @@
 #                                submit, or anywhere in the nursery body before the join
 #   same_name_nested_region_*    `region scratch:` inside `region scratch:` (run-proven stale
 #                                read); sibling regions may still share a name
+# Fuzz round 1, holes BOTH compilers accepted (fuzz_*; stage0 fixed first, same wording):
+#   fuzz_setter_store_*          `set(h, b.as_sview())`, set storing into h.s (F2)
+#   fuzz_callarg_mutref_*        `use(&buf, buf.as_sview())`: the callee grows buf, reads s (F3)
+#   fuzz_aff_closure_*           a closure moving a captured affine value is one-shot (F12)
+#   fuzz_drain/move_with_live_*  a ref/view into xs read after `move xs` / a drain (F16)
 # Each .neg must be REJECTED by the semantic layer (not a backend decline); each .pos twin
 # (same shape, no escape) must still compile to a non-empty object.
 set -u

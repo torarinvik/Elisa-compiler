@@ -1,0 +1,193 @@
+# One-shot closures in the affine-use walk (fuzz finding F12; stage0
+# analyzer_one_shot_closure.go). A lambda whose body moves a captured affine local
+# (`fn() => take(move h)`) can run that move only once, so:
+#
+#   - creating it consumes the capture: h is unusable afterwards;
+#   - it must be bound directly to a local (`g = fn() => ...` / `g: fn() -> T = fn() => ...`);
+#   - that local may only be CALLED, at most once on any path: the call consumes it, with the
+#     walk's ordinary branch and loop rules;
+#   - any other use of it (copy, argument, store, return, capture) is rejected.
+#
+# A one-shot local is recorded in the walk's names/flags rows as three rows: the captured
+# name (affine, so its own lookup is unchanged), the closure name (affine), then a
+# "[once]" marker. Shadowing a name pushes newer rows, so only the latest binding counts.
+extend Semantic:
+    private:
+        # The affine outer locals the statements of a lambda body move (not shadowed by one of
+        # its parameters), in first-move order.
+        def one_shot_moved_captures(body: darray[Ast::Stmt], lambda_params: darray[sview]&, names: darray[sview]&, flags: darray[bool]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |out|:
+                    match statement:
+                        Stmt.Expr(statement_value, _):
+                            one_shot_moved_in_expression(statement_value, lambda_params, names, flags, out)
+                        Stmt.VarDecl(_, _, declared_value, _):
+                            one_shot_moved_in_expression(declared_value, lambda_params, names, flags, out)
+                        Stmt.Assign(_, _, assigned_value, _):
+                            one_shot_moved_in_expression(assigned_value, lambda_params, names, flags, out)
+                        Stmt.Return(returned, _):
+                            one_shot_moved_in_expression(returned_value, lambda_params, names, flags, out) if returned is returned_value
+                        Stmt.If(condition, then_body, else_body, _):
+                            one_shot_moved_in_expression(condition, lambda_params, names, flags, out)
+                            one_shot_moved_captures(then_body, lambda_params, names, flags, out)
+                            one_shot_moved_captures(else_body, lambda_params, names, flags, out)
+                        Stmt.While(condition, loop_body, _):
+                            one_shot_moved_in_expression(condition, lambda_params, names, flags, out)
+                            one_shot_moved_captures(loop_body, lambda_params, names, flags, out)
+                        Stmt.For(_, _, iterable, loop_body, _):
+                            one_shot_moved_in_expression(iterable, lambda_params, names, flags, out)
+                            one_shot_moved_captures(loop_body, lambda_params, names, flags, out)
+                        Stmt.Block(_, _, _, block_body, _):
+                            one_shot_moved_captures(block_body, lambda_params, names, flags, out)
+                        Stmt.Match(scrutinee, arms, _):
+                            one_shot_moved_in_expression(scrutinee, lambda_params, names, flags, out)
+                            for arm in arms |out|:
+                                one_shot_moved_captures(arm.body, lambda_params, names, flags, out)
+                        _:
+                            pass
+
+        def one_shot_moved_in_expression(expression: Ast::Expr, lambda_params: darray[sview]&, names: darray[sview]&, flags: darray[bool]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Move(operand, _):
+                        root: sview = affine_root(operand)
+                        if root != "" and affine_local(names, flags, root) and not (any lambda_param in lambda_params where lambda_param == root) and not affine_consumed(out, root):
+                            out.push(root)
+                    Expr.Call(callee, arguments, _, _):
+                        one_shot_moved_in_expression(callee, lambda_params, names, flags, out)
+                        for argument in arguments |out|:
+                            one_shot_moved_in_expression(argument, lambda_params, names, flags, out)
+                    Expr.Field(object, _, _):
+                        one_shot_moved_in_expression(object, lambda_params, names, flags, out)
+                    Expr.Index(object, index, _):
+                        one_shot_moved_in_expression(object, lambda_params, names, flags, out)
+                        one_shot_moved_in_expression(index, lambda_params, names, flags, out)
+                    Expr.Binary(left, _, right, _):
+                        one_shot_moved_in_expression(left, lambda_params, names, flags, out)
+                        one_shot_moved_in_expression(right, lambda_params, names, flags, out)
+                    Expr.Unary(_, operand, _) | Expr.Paren(operand, _):
+                        one_shot_moved_in_expression(operand, lambda_params, names, flags, out)
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        for field in fields |out|:
+                            one_shot_moved_in_expression(field.value, lambda_params, names, flags, out)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements |out|:
+                            one_shot_moved_in_expression(element, lambda_params, names, flags, out)
+                    Expr.If(condition, then_value, else_value, _):
+                        one_shot_moved_in_expression(condition, lambda_params, names, flags, out)
+                        one_shot_moved_in_expression(then_value, lambda_params, names, flags, out)
+                        one_shot_moved_in_expression(else_value, lambda_params, names, flags, out)
+                    Expr.Block(block_statements, block_value, _, _):
+                        one_shot_moved_captures(block_statements, lambda_params, names, flags, out)
+                        one_shot_moved_in_expression(block_value, lambda_params, names, flags, out)
+                    _:
+                        pass
+
+        # The capture a one-shot closure named NAME moves, or "" when NAME's latest binding is
+        # not a one-shot closure.
+        def one_shot_capture_of(names: darray[sview]&, name: sview) -> sview:
+            can Abort.Panic:
+                index: mutable usize = names.count
+                while index > 0 |index|:
+                    index <- index - 1
+                    if names[index] == name:
+                        return "" if index == 0 or index + 1 >= names.count
+                        return "" if names[index + 1] != "[once]"
+                        return names[index - 1]
+                return ""
+
+        def one_shot_report(kind_code: sview, name: sview, captured: sview, pos: Ast::Pos, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OneShotClosure, name: name, pos: pos, line: pos.line, expected: kind_code, actual: captured})
+
+        # A lambda VALUE (not bound by a declaration): its moved captures are consumed here and,
+        # since nothing tracks how often it runs, it is rejected. Every one-shot local it names
+        # is captured, which is a copy the new closure could call any number of times.
+        def one_shot_walk_lambda(lambda_params: darray[sview]&, body: darray[Ast::Stmt], pos: Ast::Pos, bound: bool, names: darray[sview]&, flags: darray[bool]&, consumed: mutable darray[sview]&, moved: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                one_shot_moved_captures(body, lambda_params, names, flags, moved)
+                for moved_name in moved |consumed, table| -> table:
+                    table <- report_affine_consumed(moved_name, pos.line, consumed, table)
+                    consumed.push(moved_name) if not affine_consumed(consumed, moved_name)
+                table <- one_shot_report("unbound", "", moved[0], pos, table) if moved.count > 0 and not bound
+                mentioned: mutable darray[sview] = []
+                for statement in body |mentioned|:
+                    sts_collect_statement_names(statement, mentioned)
+                reported: mutable darray[sview] = []
+                for mentioned_name in mentioned |reported, table| -> table:
+                    captured: sview = one_shot_capture_of(names, mentioned_name)
+                    if captured != "" and not (any lambda_param in lambda_params where lambda_param == mentioned_name) and not affine_consumed(reported, mentioned_name):
+                        reported.push(mentioned_name)
+                        table <- one_shot_report("use", mentioned_name, captured, pos, table)
+
+        # Names a statement mentions anywhere (a conservative capture set).
+        def sts_collect_statement_names(statement: Ast::Stmt, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(statement_value, _):
+                        sts_collect_names(statement_value, out)
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        sts_collect_names(declared_value, out)
+                    Stmt.Assign(target, _, assigned_value, _):
+                        sts_collect_names(target, out)
+                        sts_collect_names(assigned_value, out)
+                    Stmt.Return(returned, _):
+                        sts_collect_names(returned_value, out) if returned is returned_value
+                    Stmt.If(condition, then_body, else_body, _):
+                        sts_collect_names(condition, out)
+                        for nested in then_body |out|:
+                            sts_collect_statement_names(nested, out)
+                        for nested in else_body |out|:
+                            sts_collect_statement_names(nested, out)
+                    Stmt.While(condition, loop_body, _):
+                        sts_collect_names(condition, out)
+                        for nested in loop_body |out|:
+                            sts_collect_statement_names(nested, out)
+                    Stmt.For(_, _, iterable, loop_body, _):
+                        sts_collect_names(iterable, out)
+                        for nested in loop_body |out|:
+                            sts_collect_statement_names(nested, out)
+                    Stmt.Block(_, _, _, block_body, _):
+                        for nested in block_body |out|:
+                            sts_collect_statement_names(nested, out)
+                    Stmt.Match(scrutinee, arms, _):
+                        sts_collect_names(scrutinee, out)
+                        for arm in arms |out|:
+                            for nested in arm.body |out|:
+                                sts_collect_statement_names(nested, out)
+                    _:
+                        pass
+
+        # `g = fn() => ...` / `g: T = fn() => ...`: the lambda VALUE of a declaration, walked here
+        # instead of by walk_affine_expression (which rejects an unbound one-shot lambda). The
+        # first moved capture lands in CAPTURED ("" when the lambda moves none).
+        def one_shot_value_is_lambda(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return one_shot_value_is_lambda(inner)
+                    Expr.Lambda(_, _, _):
+                        return true
+                    _:
+                        return false
+
+        def one_shot_walk_bound(value: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, consumed: mutable darray[sview]&, moved: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        table <- one_shot_walk_bound(inner, names, flags, consumed, moved, table)
+                    Expr.Lambda(lambda_params, lambda_body, lambda_pos):
+                        table <- one_shot_walk_lambda(lambda_params, lambda_body, lambda_pos, true, names, flags, consumed, moved, table)
+                    _:
+                        pass
+
+        # Rows marking NAME (just declared) as a one-shot closure moving CAPTURED.
+        def one_shot_register(name: sview, moved: darray[sview]&, names: mutable darray[sview]&, flags: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if moved.count == 0
+                names.push(moved[0])
+                flags.push(true)
+                names.push(name)
+                flags.push(true)
+                names.push("[once]")
+                flags.push(false)
