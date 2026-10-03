@@ -108,8 +108,12 @@ for two same-spelled module families, edge-to-family IDs, and the detached contr
 This is declaration resolution, not state-qualified alias lookup or ownership.
 
 The resolver now records `BindingDeclaredType` rows for function parameters and
-annotated locals: lexical `BindingId`, declared structural `type_id`, module, and
-source position. The initializer is resolved before the new local binds, and
+annotated locals: lexical `BindingId`, declared structural `type_id`, complete
+annotation AST, module, and source position. Keeping the original annotation
+preserves state arguments, `lmut`, and qualified alias spellings even when
+structural interning erases qualifiers. The probe checks those retained forms;
+they are not themselves resolved state identities or transition authority.
+The initializer is resolved before the new local binds, and
 branch-scope reference resolution retains existing distinct binding IDs. A
 self-hosted probe checks inner shadowing, restoration of the outer owner, same
 spelling in a second function, and distinct state-qualified/ref type shapes.
