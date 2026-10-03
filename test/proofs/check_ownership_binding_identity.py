@@ -30,11 +30,11 @@ def run(name):
 
 code, report = run("ownership_binding_identity.elisa")
 assert code == 0 and report["status"] == report["verification_state"] == "proved"
-assert report["summary"]["proven"] == report["summary"]["obligations"] == 21
+assert report["summary"]["proven"] == report["summary"]["obligations"] == 23
 assert not report["findings"]
 assert report == run("ownership_binding_identity.elisa")[1]
 verified = {d["name"] for d in report["declaration_details"] if d.get("verified")}
-assert {"binding_identity_reflexive", "serial_zero_is_valid"} <= verified
+assert {"binding_identity_reflexive", "serial_zero_is_valid", "missing_declaration_is_invalid"} <= verified
 code, isolated = run("ownership_identity_replay_probe.elisa")
 assert code == 0 and isolated["status"] == "proved"
 assert isolated["summary"]["proven"] == isolated["summary"]["obligations"] == 6
@@ -46,5 +46,5 @@ assert all(f["kind"] == "ensure-unproven" for f in rejected["findings"])
 assert not false_names & {d["name"] for d in rejected["declaration_details"] if d.get("verified")}
 assert hashes == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
 print(json.dumps({"admitted": True, "scope": "BindingId identity laws only, not ownership flow",
-                  "producer_proven": 21, "independently_replayed": 21,
+                  "producer_proven": 23, "independently_replayed": 23,
                   "false_claims_rejected": sorted(false_names), "sources_sha256": hashes}))

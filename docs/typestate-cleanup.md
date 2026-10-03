@@ -368,3 +368,24 @@ reports, freshness/source hashes, zero replay gaps, and three false identity
 claims rejected. `ownership_identity_replay_probe.elisa` also checks the scalar
 comparison/summary control (6/6 replay), isolating the former record-specific
 failure. This establishes identity laws, not the control-flow ownership walker.
+
+## Exact occurrence lookup for the ownership walker
+
+`ownership_binding_at_position` resolves an occurrence by enclosing declaration
+ID and exact byte span. Ordinary tables use the existing owner-linked reference
+index, so a lookup visits that function's references rather than the whole file.
+An explicitly invalidated index uses the canonical scan. Line-only positions,
+misaligned arrays, conflicting BindingIds at a span, malformed links, and index
+cycles return unknown; the walker must never turn unknown into move permission.
+Repeated rows may agree only on the identical BindingId. No spelling fallback
+is provided. The binding identity native probe compares indexed/fallback lookup
+and includes ambiguous/misaligned/cyclic controls (87–92).
+
+The identity admission suite has expanded from 21/21 to 23/23 replay with the
+missing-declaration-is-invalid law. `ownership_binding_separation.elisa` contains
+two explicitly OPEN client laws for arbitrary distinct serials/functions: the
+producer does not yet transport their disequality through the Boolean summary
+conjunction. A renamed-parameter counterpart also remains OPEN, so changing
+caller/callee parameter spellings does not resolve the failure. They are not part
+of the admitted suite. Fix that producer gap and
+require independent replay before citing those general laws as proved.
