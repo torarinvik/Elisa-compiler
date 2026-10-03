@@ -27,16 +27,16 @@ def run(name):
     return process.returncode, report
 
 code, positive = run("ownership_flow_domain.elisa")
-assert code == 1 and positive["summary"]["proven"] == 24 and positive["summary"]["obligations"] == 32
+assert code == 1 and positive["summary"]["proven"] == 25 and positive["summary"]["obligations"] == 32
 assert positive == run("ownership_flow_domain.elisa")[1], "proof reports changed across repeats"
 open_names = {"possible_commutative", "possible_idempotent", "possible_associative",
               "possible_empty_identity", "known_commutative", "known_idempotent",
-              "known_associative", "consumed_blocks_move"}
+              "known_associative"}
 assert {finding["name"] for finding in positive["findings"]} == open_names
 verified = {row["name"] for row in positive["declaration_details"] if row.get("verified")}
 assert {"join_possible", "join_known", "can_move", "possible_preserves_consumed",
         "unknown_stays_unknown", "unknown_blocks_move", "unreachable_blocks_move",
-        "live_owner_can_move"} <= verified
+        "live_owner_can_move", "consumed_blocks_move"} <= verified
 assert not open_names & verified
 code, negative = run("ownership_flow_domain_rejected.elisa")
 assert code == 1 and negative["status"] == "failed"
@@ -46,6 +46,6 @@ assert {finding["name"] for finding in negative["findings"]} == false_names
 assert not false_names & {row["name"] for row in negative["declaration_details"] if row.get("verified")}
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": False, "scope": "ownership-domain OPEN proof baseline",
-                  "proved": 24, "obligations": 32, "replayed": 24,
+                  "proved": 25, "obligations": 32, "replayed": 25,
                   "open_declarations": sorted(open_names), "false_claims_rejected": sorted(false_names),
                   "sources_sha256": hashes}, sort_keys=True))

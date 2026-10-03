@@ -203,15 +203,18 @@ state legality, and reachability are separate caller obligations; this module is
 not yet integrated into a control-flow ownership checker or transition admission.
 
 `test/proofs/ownership_flow_domain.elisa` imports that exact implementation rather
-than a copied model. Its `elisa-proof` baseline remains **OPEN: 24/32 obligations**,
-with 24/24 independently replayed certificates and no trusted assumptions. The
-implementation bodies and five client properties verify; eight client declarations
+than a copied model. Its `elisa-proof` baseline remains **OPEN: 25/32 obligations**,
+with 25/25 independently replayed certificates and no trusted assumptions. The
+implementation bodies and six client properties verify; seven client declarations
 (including associativity, idempotence and commutativity) remain unverified. Four
 false claims reject. `check_ownership_flow.py` checks repeatability, source/product
 hashes, replay coverage and the explicit OPEN status; a successful baseline check
 is not proof admission. Prover logical-Boolean-equation support raised coverage
-from 19 to 24 obligations without changing budgets or weakening these claims.
-Complete these laws and the consumed-input client before claiming the domain proved.
+from 19 to 24 obligations; guarded logical constant reduction then closes the
+consumed-input client (25 obligations) without weakening these claims. The kernel
+checks formation before constant absorption, so malformed or unwitnessed leaves
+cannot disappear merely because a neighboring operand determines the result.
+Complete the remaining algebraic laws before claiming the domain proved.
 
 This probe exposed a separate self-hosting diagnostic defect: raw-reference
 classification consulted an outer structural type row through an intentionally
