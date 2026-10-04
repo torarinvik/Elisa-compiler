@@ -318,6 +318,23 @@ const enum Step of i64:
 def main() -> i64:
     return Step.A.i64() * 100 + Step.B.i64() * 10 + Step.C.i64()
 """)
+    # difffuzz 2026-10-04: stage1 read the member value only when it was a bare IntLit, so
+    # `B = -3` (a Unary) and `D = 1 << 4` (a Binary) silently took the running ordinal.
+    # stage0 const-evaluates: A=0 B=-3 C=-2 D=16 E=17 F=5 G=6.
+    yield ("const_enum_folded_values", """
+const enum K of i64:
+    A
+    B = -3
+    C
+    D = 1 << 4
+    E
+    F = (2 + 3) * 2 - 5
+    G
+
+def main() -> i64:
+    s: i64 = K.A.i64() * 7 + K.B.i64() * 11 + K.C.i64() * 13 + K.D.i64() + K.E.i64() * 3
+    return s + K.F.i64() * 5 + K.G.i64() * 2 + 50
+""")
     yield ("const_enum_in_when_columns", """
 const enum Code of i64:
     Lo = 1
