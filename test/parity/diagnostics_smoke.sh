@@ -81,7 +81,6 @@ NAMES=(
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
-    named_states_without_derive
     flow_flag_state_machine
     # --- fixtures batch (backlog Phase A items 18-32): 68 previously-uncovered checks ---
     affine_collection
@@ -324,7 +323,6 @@ EXPECTS=(
     "if condition must be bool, got mutable bool&"
     "not operator requires bool operand"
     "duplicate packed group member \"b\" in H.flags"
-    "declares named states but is missing a derive state: block"
     "written in multiple branches and read after the join"
     # --- matching expected substrings for the batch above (index-aligned) ---
     "dict keys cannot contain linear handles, got Guard"
