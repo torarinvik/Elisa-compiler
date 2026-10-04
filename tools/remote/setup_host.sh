@@ -20,13 +20,20 @@ if [[ "${1:-}" != --local ]]; then
   ssh "${SSH_ARGS[@]}" "cat > /root/elisa/clang_shim" < "$HERE/clang_shim"
   exec ssh "${SSH_ARGS[@]}" "bash /root/elisa/setup_host.sh --local"
 fi
-GO_VER=1.27.1; Z3_VER=5.1.0; LLVM=21
+GO_VER=1.27.1; Z3_VER=5.1.0; LLVM="${ELISA_REMOTE_LLVM:-21}"
+# ELISA_REMOTE_ROOT relocates the work dir on a box where /root/elisa is not ours;
+# ELISA_REMOTE_LLVM=20 reuses an LLVM the box already has instead of apt-installing 21.
+W="${ELISA_REMOTE_ROOT:-/root/elisa}"
 export DEBIAN_FRONTEND=noninteractive
 log() { echo "[setup $(date +%T)] $*"; }
 need_apt=0
+if [[ -x /usr/lib/llvm-$LLVM/bin/llvm-config && -x /usr/lib/llvm-$LLVM/bin/clang && -n "${ELISA_REMOTE_ROOT:-}" ]]; then
+  : # relocated root on a shared box: reuse the LLVM it already has, never apt-install
+else
 for p in llvm-$LLVM-dev clang-$LLVM lld-$LLVM libpolly-$LLVM-dev gdb file unzip; do
   dpkg -s "$p" >/dev/null 2>&1 || need_apt=1
 done
+fi
 if [[ $need_apt == 1 ]]; then
   log "apt base"
   apt-get update -qq
@@ -38,24 +45,24 @@ if [[ $need_apt == 1 ]]; then
   apt-get install -y -qq llvm-$LLVM-dev clang-$LLVM lld-$LLVM libpolly-$LLVM-dev >/dev/null
 fi
 L=/usr/lib/llvm-$LLVM/lib
-[[ -e $L/libLLVM.so ]] || ln -sf "$(ls $L/libLLVM-$LLVM.so $L/libLLVM.so.* 2>/dev/null | head -1)" $L/libLLVM.so
-[[ -e $L/libLLVM-C.so ]] || ln -sf $L/libLLVM.so $L/libLLVM-C.so
-B=/root/elisa/bin; mkdir -p $B
+[[ -e $L/libLLVM.so || -n "${ELISA_REMOTE_ROOT:-}" ]] || ln -sf "$(ls $L/libLLVM-$LLVM.so $L/libLLVM.so.* 2>/dev/null | head -1)" $L/libLLVM.so
+[[ -e $L/libLLVM-C.so || -n "${ELISA_REMOTE_ROOT:-}" ]] || ln -sf $L/libLLVM.so $L/libLLVM-C.so
+B=$W/bin; mkdir -p $B $W/tmp
 ln -sf /usr/lib/llvm-$LLVM/bin/llvm-config $B/llvm-config
 if ! $B/z3 --version 2>/dev/null | grep -q "$Z3_VER"; then
   log "z3 $Z3_VER release binary"
-  wget -qO /tmp/z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-$Z3_VER/z3-$Z3_VER-x64-glibc-2.39.zip"
-  rm -rf /tmp/z3x && unzip -q /tmp/z3.zip -d /tmp/z3x
-  install -m755 "$(find /tmp/z3x -path '*/bin/z3' -type f | head -1)" $B/z3
+  wget -qO $W/tmp/z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-$Z3_VER/z3-$Z3_VER-x64-glibc-2.39.zip"
+  rm -rf $W/tmp/z3x && unzip -q $W/tmp/z3.zip -d $W/tmp/z3x
+  install -m755 "$(find $W/tmp/z3x -path '*/bin/z3' -type f | head -1)" $B/z3
 fi
-if ! /root/elisa/go/bin/go version 2>/dev/null | grep -q "go$GO_VER"; then
+if ! $W/go/bin/go version 2>/dev/null | grep -q "go$GO_VER"; then
   log "Go $GO_VER"
-  wget -qO /tmp/go.tgz "https://go.dev/dl/go$GO_VER.linux-amd64.tar.gz"
-  rm -rf /root/elisa/go && tar -C /root/elisa -xzf /tmp/go.tgz
+  wget -qO $W/tmp/go.tgz "https://go.dev/dl/go$GO_VER.linux-amd64.tar.gz"
+  rm -rf $W/go && tar -C $W -xzf $W/tmp/go.tgz
 fi
-if [[ -f /root/elisa/clang_shim ]]; then
-  install -m755 /root/elisa/clang_shim $B/clang
+if [[ -f $W/clang_shim ]]; then
+  install -m755 $W/clang_shim $B/clang
   for n in clang++ cc; do ln -sf clang $B/$n; done
 fi
-log "versions:"; $B/z3 --version; /root/elisa/go/bin/go version; $B/llvm-config --version
+log "versions:"; $B/z3 --version; $W/go/bin/go version; $B/llvm-config --version
  nproc; cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo "cpu.max: absent (no CPU cap)"
