@@ -381,9 +381,16 @@ later-iteration copies with stale state, break-before-write and scalar-reference
 alias counterclaims reject semantically without artifacts. The existing source,
 result-context, coupled-predicate and typestate-foundation gates also pass.
 
-**Stage0 loop parity remains open.** Its current analyzer rejects the known-empty,
-false-condition and proven-nonempty cases in this new positive fixture by
-over-widening, and emits LLVM for the invalid later-iteration copy. The separately
+**Stage0 loop parity remains open.** Literal-false `while` and constant-empty
+ascending default-step ranges now preserve the entry tracked typestate while
+still checking the body. Explicit `break`/`continue` snapshots now carry current
+tracked value types as well as affine state in while, range-for and iterable-for
+loops; a body that exits through a jump can no longer discard a state-changing
+write. Focused controls reject six direct mutation/jump combinations and two
+mixed branch/jump paths with the actual return-type mismatch, while unchanged
+and unreachable jump controls accept. These are exit-state fixes, not cyclic
+body validation. The analyzer still over-widens proven-nonempty ranges and emits
+LLVM for the invalid later-iteration copy. The separately
 named `derived_source_loop_stage0_audit.sh` is deliberately red (current exit 1,
 reporting compiler exit 0 with an artifact). It is not folded into the green
 Stage1 gate. Next priority is a binding-keyed, cyclic tracked-state transfer in
@@ -414,6 +421,13 @@ membership, reachable knownness and idempotence laws import the actual Boolean
 domain used by the compiler. Dropped zero-iteration entries, unknown back edges
 hidden by known entries, and discarded later states are rejected counterclaims.
 These do not prove the AST fixed-point algorithm or range/alias classifier.
+
+`derived_source_loop_exit.elisa` adds 24 independently replayed obligations for
+entry/body/jump membership and knowledge joins; dropping a reachable break state
+or hiding an unknown continue state are rejected counterclaims. The admission
+gate checks deterministic full reports, zero semantic errors, no trusted
+assumptions, complete certificate replay and unchanged input hashes. These laws
+model exit edges and do not prove the Go jump snapshot/traversal implementation.
 The proof assistant now admits validated opposite-connective subtrees as opaque
 signed islands and reduces their constant identities. Matching preserves exact
 subtree/polarity identity without distribution, arithmetic evaluation, synthetic
