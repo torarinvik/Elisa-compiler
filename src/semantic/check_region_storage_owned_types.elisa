@@ -1,5 +1,10 @@
 extend Semantic:
     private:
+        struct StorageOwnedCandidate:
+            name: sview
+            parameters: darray[Ast::ParamDecl]
+            fresh: bool
+
         # Named types whose values can NEVER carry a borrow, transitively: every field (and every
         # enum payload field) is a builtin scalar, another such type, or a `darray[...]` of one.
         # A least fixpoint over the file's struct/enum declarations, so a self-recursive or
@@ -83,7 +88,7 @@ extend Semantic:
         # the name (overloads, externs) must qualify. A GLOBAL's field returned by value DOES
         # share the global's buffer, so a body mentioning a global -- or, to a fixpoint, another
         # candidate that does (`return g()`) -- is excluded.
-        def storage_owned_fn_rows(file: Ast::File&, rows: mutable darray[sview]&) -> void:
+        def storage_owned_fn_rows(file: Ast::File&, rows: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 owned: darray[sview] = storage_owned_type_names(file)
                 good: mutable darray[sview] = []
@@ -102,6 +107,19 @@ extend Semantic:
                             tainted.push(good[index])
                             bad.push(good[index])
                             changed <- true
+                table.storage_owned_candidates <- table.storage_owned_candidates.truncate(0)
+                # Only global functions participate in the bounded overload fallback.
+                # Module/local/value calls remain on the conservative legacy path.
+                for declaration in file.top_decls |table, owned, tainted, file|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, _, _, _, pos):
+                            fresh: mutable bool = false
+                            if return_type is declared:
+                                fresh <- storage_owned_type_free(declared, &owned) and function_return_region(file.local_region_annotations, pos.line) == "" and not (any line in file.generic_param_lines where line == pos.line) and not hce_contains(&tainted, name)
+                            table.storage_owned_candidates <- table.storage_owned_candidates.push(StorageOwnedCandidate{name: name, parameters: parameters, fresh: fresh})
+                        _:
+                            pass
+                table <- storage_owned_block_nested(file.top_decls, false, table)
                 for name in good |rows, bad|:
                     continue if hce_contains(&bad, name)
                     rows.push("[owned-fn]")
@@ -109,6 +127,22 @@ extend Semantic:
                     rows.push("")
                     rows.push("")
                     rows.push("")
+
+        # Unmodelled declarations must block the fallback, never disappear from
+        # its candidate set. A zero-parameter sentinel also blocks arity changes.
+        def storage_owned_block_nested(declarations: darray[Ast::Decl]&, nested: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table, nested|:
+                    match declaration:
+                        Decl.Func(name, _, _, _, _, _, _):
+                            if nested:
+                                table.storage_owned_candidates <- table.storage_owned_candidates.push(StorageOwnedCandidate{name: name, parameters: [], fresh: false})
+                        Decl.Extern(name, _, _, _, _, _, _, _):
+                            table.storage_owned_candidates <- table.storage_owned_candidates.push(StorageOwnedCandidate{name: name, parameters: [], fresh: false})
+                        Decl.Module(_, body, _) | Decl.Scoped(body, _):
+                            table <- storage_owned_block_nested(body, true, table)
+                        _:
+                            pass
 
         def storage_owned_fn_collect(declarations: darray[Ast::Decl]&, generic_lines: darray[u32]&, annotations: darray[Ast::LocalRegionAnnotation]&, owned: darray[sview]&, flat: darray[sview]&, good: mutable darray[sview]&, bad: mutable darray[sview]&, bodies: mutable darray[darray[Ast::Stmt]]&, globals: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -150,6 +184,84 @@ extend Semantic:
                             true return if view_fns[row] == "[owned-fn]" and view_fns[row + 1] == called
                             row <- row + 5
                         return false
+                    _:
+                        return false
+
+        # Recover the exact lexical type of a borrowed identifier. No file-wide
+        # spelling lookup is allowed: shadowed bindings have independent IDs.
+        def storage_owned_argument_type(argument: Ast::Expr, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, _) | Expr.Unary(TokenKind.Ampersand, inner, _):
+                        return storage_owned_argument_type(inner, table)
+                    Expr.Ident(_, pos):
+                        return 0 if pos.end_offset <= pos.offset
+                        for index in 0..<table.ref_pos.count:
+                            return 0 if index >= table.ref_binding_ids.count
+                            continue if table.ref_pos[index].offset != pos.offset or table.ref_pos[index].end_offset != pos.end_offset
+                            for declared in table.binding_declared_types:
+                                continue if declared.binding_id.owner.value != table.ref_binding_ids[index].owner.value or declared.binding_id.serial != table.ref_binding_ids[index].serial
+                                return 0 if declared.module_owner != ""
+                                type_id: mutable u32 = declared.type_id
+                                while type_id != 0 and interned_kind(type_id, table) == SemTypeKind.Ref and interned_elem_count(type_id, table) == 1 |type_id|:
+                                    type_id <- interned_elem(type_id, 0, table)
+                                return type_id
+                        return 0
+                    _:
+                        return 0
+
+        # A known builtin container cannot bind a nominal struct parameter.
+        # Aliases, unknown types and same-shaped candidates are NOT excluded.
+        def storage_owned_argument_incompatible(argument: Ast::Expr, parameter: Ast::Expr, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                actual: u32 = storage_owned_argument_type(argument, table)
+                return false if actual == 0 or interned_kind(actual, table) != SemTypeKind.Container
+                return false if interned_name(actual, table) != "darray" and interned_name(actual, table) != "array"
+                formal: Ast::Expr = zeroed_strip_binding_modifiers(parameter)
+                referent: Ast::Expr = rvc_ref_pointee(formal)
+                head: mutable Ast::Expr = formal if rvc_is_absent(referent) else referent
+                match head:
+                    Expr.Index(base, _, _) | Expr.IndexN(base, _, _):
+                        head <- base
+                    _:
+                        pass
+                # Builtin array declarations also have Struct symbol rows. They
+                # are the compatible container itself, not a distinct nominal.
+                return false if ident_name_of(head) == "darray" or ident_name_of(head) == "array"
+                nominal: u32 = binding_nominal_declaration(head, "", table)
+                return nominal != SYMBOL_INDEX_ROW_NONE and table.symbols[nominal.usize()].kind == SymbolKind.Struct
+
+        def storage_view_owned_overload_call(value: Ast::Expr, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return storage_view_owned_overload_call(inner, table)
+                    Expr.Call(Expr.Ident(called, callee_pos), arguments, argument_names, _):
+                        return false if arguments.count == 0 or any label in argument_names where label != ""
+                        # Most calls already use the cheap legacy summary. Avoid
+                        # whole lexical-reference scans unless an owned overload
+                        # could actually benefit from disambiguation.
+                        possible: mutable bool = false
+                        matches: mutable usize = 0
+                        for candidate in table.storage_owned_candidates |possible, matches|:
+                            if candidate.name == called:
+                                matches <- matches + 1
+                                possible <- true if candidate.fresh
+                        return false if not possible or matches < 2
+                        return false if storage_owned_argument_type(arguments[0], table) == 0
+                        # A function-valued local/parameter shadows file functions.
+                        return false if any pos in table.ref_pos where pos.offset == callee_pos.offset and pos.end_offset == callee_pos.end_offset
+                        found: mutable bool = false
+                        for candidate in table.storage_owned_candidates |found|:
+                            continue if candidate.name != called
+                            return false if candidate.parameters.count != arguments.count
+                            incompatible: mutable bool = false
+                            for index in 0..<arguments.count |incompatible|:
+                                incompatible <- true if storage_owned_argument_incompatible(arguments[index], candidate.parameters[index].type_expression, table)
+                            continue if incompatible
+                            return false if not candidate.fresh
+                            found <- true
+                        return found
                     _:
                         return false
 
