@@ -1,6 +1,6 @@
 # Whole-binding liveness over resolved source AST. Unsupported semantics are
 # explicit coverage gaps, never authority to move. Construction/state/borrows,
-# implicit call consumption, places, for loops, jumps and handlers need more passes.
+# implicit call consumption, places, custom iterators, jumps and handlers need more passes.
 extend Semantic:
     private:
         def ownership_fact_slot(facts: darray[OwnershipBindingFact]&, id: BindingId) -> int can[Abort.Panic]:
@@ -33,9 +33,10 @@ extend Semantic:
                 return false if not ownership_binding_ids_equal(l.binding_id, r.binding_id) or l.reachable != r.reachable or l.known != r.known or l.may_live != r.may_live or l.may_consumed != r.may_consumed
             return true
 
-        # Copy POD facts into an existing pool, never escape a temporary array.
+        # Copy the matching lexical prefix, discarding inner binders without
+        # letting a temporary fact array escape into the retained pool.
         def ownership_frontier_copy(destination: mutable OwnershipFrontier&, source: OwnershipFrontier&) -> void can[Abort.Panic]:
-            if destination.facts.count != source.facts.count:
+            if destination.facts.count > source.facts.count:
                 ownership_flow_unknown(destination)
                 return
             for index in 0..<destination.facts.count |destination|:
@@ -155,7 +156,51 @@ extend Semantic:
                 _:
                     ownership_flow_unknown(flow)
 
-        def ownership_flow_while(condition: Ast::Expr, body: darray[Ast::Stmt]&, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> void can[Memory.Allocate, Abort.Panic]:
+        def ownership_declared_type_at(expression: Ast::Expr, owner: DeclId, table: SymbolTable&, depth: usize = 0) -> u32 can[Abort.Panic]:
+            return 0 if depth >= 128
+            match expression:
+                Expr.Paren(inner, _):
+                    return ownership_declared_type_at(inner, owner, table, depth + 1)
+                Expr.Ident(_, position):
+                    found, id = ownership_binding_at_position(table, owner, position)
+                    return 0 if not found
+                    result: mutable u32 = 0
+                    seen: mutable bool = false
+                    for declaration in table.binding_declared_types |result, seen|:
+                        if ownership_binding_ids_equal(declaration.binding_id, id):
+                            return 0 if seen
+                            result <- declaration.type_id
+                            seen <- true
+                    return result
+                _:
+                    return 0
+
+        def ownership_unwrap_type(type_id: u32, table: SymbolTable&) -> u32 can[Abort.Panic]:
+            current: mutable u32 = type_id
+            for depth in 0..<128 |current|:
+                return current if interned_kind(current, table) != SemTypeKind.Ref
+                return 0 if interned_elem_count(current, table) != 1
+                current <- interned_elem(current, 0, table)
+            return 0
+
+        def ownership_integer_operand(expression: Ast::Expr, owner: DeclId, table: SymbolTable&) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.IntLit(_, _):
+                    return true
+                _:
+                    return interned_kind(ownership_unwrap_type(ownership_declared_type_at(expression, owner, table), table), table) == SemTypeKind.Int
+
+        def ownership_for_bindings(variables: darray[sview]&, position: Ast::Pos, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<variables.count |flow|:
+                binder: Ast::Pos = source_binder_position(table, variables[index], position.line, index, "__for_binder")
+                found, id = ownership_binding_at_position(table, owner, binder)
+                if found:
+                    # Fresh per iteration. Liveness is not inferred element ownership.
+                    flow.facts.push(OwnershipBindingFact{binding_id: id, reachable: flow.reachable, known: flow.coverage_complete, may_live: true, may_consumed: false})
+                else:
+                    ownership_flow_unknown(flow)
+
+        def ownership_flow_loop(condition: Ast::Expr, body: darray[Ast::Stmt]&, variables: darray[sview]&, position: Ast::Pos, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> void can[Memory.Allocate, Abort.Panic]:
             entry: OwnershipFrontier = ownership_flow_clone(flow)
             head: mutable OwnershipFrontier = ownership_flow_clone(flow)
             occurrence_mark: usize = work.occurrences.count
@@ -167,6 +212,7 @@ extend Semantic:
                 ownership_flow_expression(condition, owner, table, &tested, work, depth + 1)
                 back: mutable OwnershipFrontier = ownership_flow_clone(&tested)
                 back.reachable <- back.reachable and literal.value if literal.known
+                ownership_for_bindings(variables, position, owner, table, &back) if back.reachable
                 ownership_flow_statements(body, owner, table, &back, work, depth + 1)
                 next: mutable OwnershipFrontier = ownership_flow_clone(&entry)
                 ownership_flow_join(&next, &entry, &back)
@@ -183,6 +229,31 @@ extend Semantic:
             ownership_frontier_copy(flow, &head)
             flow.reachable <- entry.reachable
             ownership_flow_unknown(flow)
+
+        def ownership_flow_for(variables: darray[sview]&, iterable: Ast::Expr, body: darray[Ast::Stmt]&, position: Ast::Pos, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> void can[Memory.Allocate, Abort.Panic]:
+            if not for_loop_has_plain_binder(position.offset, table):
+                ownership_flow_unknown(flow)
+                return
+            if iterable is Expr.Binary(left, operator, right, _):
+                if (operator == TokenKind.RangeLt or operator == TokenKind.RangeLe) and ownership_integer_operand(left, owner, table) and ownership_integer_operand(right, owner, table):
+                    ownership_flow_expression(left, owner, table, flow, work, depth + 1)
+                    ownership_flow_expression(right, owner, table, flow, work, depth + 1)
+                    if left is Expr.IntLit(start, _) and right is Expr.IntLit(stop, _):
+                        return if start > stop or (operator == TokenKind.RangeLt and start == stop)
+                        if (operator == TokenKind.RangeLe and start == stop) or (operator == TokenKind.RangeLt and start < stop and start + 1 == stop):
+                            once: mutable OwnershipFrontier = ownership_flow_clone(flow)
+                            ownership_for_bindings(variables, position, owner, table, &once)
+                            ownership_flow_statements(body, owner, table, &once, work, depth + 1)
+                            ownership_frontier_copy(flow, &once)
+                            return
+                    ownership_flow_loop((Expr.Absent), body, variables, position, owner, table, flow, work, depth + 1)
+                    return
+            iterable_id: u32 = ownership_unwrap_type(ownership_declared_type_at(iterable, owner, table), table)
+            if interned_kind(iterable_id, table) != SemTypeKind.Container or (interned_name(iterable_id, table) != "darray" and interned_name(iterable_id, table) != "array"):
+                ownership_flow_unknown(flow)
+                return
+            ownership_flow_expression(iterable, owner, table, flow, work, depth + 1)
+            ownership_flow_loop((Expr.Absent), body, variables, position, owner, table, flow, work, depth + 1)
 
         def ownership_flow_statements(statements: darray[Ast::Stmt]&, owner: DeclId, table: SymbolTable&, flow: mutable OwnershipFrontier&, work: mutable OwnershipFlowWork&, depth: usize) -> void can[Memory.Allocate, Abort.Panic]:
             for statement in statements |flow, work|:
@@ -219,7 +290,10 @@ extend Semantic:
                             ownership_flow_expression(returned, owner, table, flow, work, depth + 1)
                         flow.reachable <- false
                     Stmt.While(condition, body, _):
-                        ownership_flow_while(condition, &body, owner, table, flow, work, depth + 1)
+                        variables: darray[sview] = []
+                        ownership_flow_loop(condition, &body, &variables, Ast::pos_at_line(0), owner, table, flow, work, depth + 1)
+                    Stmt.For(_, variables, iterable, body, position):
+                        ownership_flow_for(&variables, iterable, &body, position, owner, table, flow, work, depth + 1)
                     Stmt.Block(kind, _, binding, body, _):
                         if binding == "" and (kind == "can" or kind == "trusted"):
                             ownership_flow_statements(&body, owner, table, flow, work, depth + 1)

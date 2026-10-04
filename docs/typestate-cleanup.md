@@ -466,7 +466,7 @@ The walker uses its shared work/depth limits and a 64-iteration cap. Exhaustion
 loses knowledge and never grants consumption. Temporary frontier arrays do not
 escape into the long-lived table: only POD fact entries are copied into existing
 pools. Native controls cover repeated loop moves, returning bodies, literal
-false/true paths and unsupported break. `for`, labeled jumps, full borrow/place
+false/true paths and unsupported break. Custom iteration, labeled jumps, full borrow/place
 analysis and transition enforcement remain unfinished.
 
 Five imported loop-head algebra laws independently replay (20/20 obligations
@@ -476,6 +476,26 @@ The proof assistant needed matching producer and independent-kernel reduction
 of mixed logical operators with Boolean constants. It validates the complete
 bounded primitive tree before absorption and rejects missing witnesses, malformed
 literals/children, cycles and exhausted fuel in 40 native kernel controls.
+
+### Built-in `for` liveness observations
+
+Plain binders over canonically typed `array`/`darray` bindings and integer ranges
+reuse the bounded loop-head join. The iterable/bounds are observed once; each
+iteration starts with fresh binder facts. Only the matching entry fact prefix
+survives the loop, so shadowing loop binders cannot replace outer owners.
+Literal empty ranges skip the body; singleton ranges transfer it once. Other
+ranges retain the conservative zero-iteration path, even when literals imply
+multiple iterations. Custom iterators, filters and pattern binders remain
+unknown. This is liveness metadata, not element ownership or permission to
+perform a classic transition.
+
+The shared source-binder lookup now counts all plain `for` variables in source
+order and checks the requested name, matching the resolver's global ordinal.
+Previously a differently named second variable fell back to a line-only span.
+Native controls exercise empty/singleton/repeating ranges, returning bodies,
+outer-owner shadowing and paired binders. Two composed join/consume laws replay
+14/14 obligations including helpers; the opposite repeated-consume claim rejects.
+They establish the Boolean composition, not a proof of the AST walker.
 
 `ownership_binding_scope_isolation.elisa` generalizes the identity separation laws
 to arbitrary owners and serials. Its 21/21 obligations independently replay with
