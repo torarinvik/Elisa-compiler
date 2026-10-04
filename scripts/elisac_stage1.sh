@@ -168,7 +168,9 @@ source "$ROOT/scripts/process_rss.sh"
 source "$ROOT/scripts/elisac_stage1_seed.sh"
 
 if [[ "${1:-}" == "--seed" ]]; then
+  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0_BIN"
   seed_build
+  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record "$ROOT" "$BIN"
   exit 0
 fi
 
@@ -176,6 +178,8 @@ if [[ ! -x "$BIN" ]]; then
   echo "stage1 product binary missing: $BIN (run: $0 --seed once)" >&2
   exit 2
 fi
+
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN"
 
 # A product binary generated from older compiler sources is not a compatible cache.
 # In particular, parser/lowering changes can make the stale product misread a newer
