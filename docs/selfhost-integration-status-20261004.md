@@ -62,11 +62,17 @@ The quantified-range contract gate passes. The final native suite passes
 563/563 checks. Bootstrap passes stage A (5/5 blocker controls), stage B
 (gen2 compiled the complete compiler), and stage C (gen3.o equals gen4.o
 byte-for-byte). All local branch tips are ancestors of the integration tip.
-The qualified tree can now replace primary main and redundant local worktrees.
+Primary main was fast-forwarded to the qualified tree. All redundant local
+worktrees and branches were removed; only the primary main checkout remains.
+Detached tip 2dc1b770 was patch-equivalent (git cherry reported only minus),
+and all other removed tips were incorporated by ancestry. Local non-source
+files were archived before removal; generated worktree products are rebuildable.
 
 Recovery: primary .git/selfhost-integration-recovery-20261004.bundle was
 verified. Primary .git/cleanup-recovery-20261004.qwXoEe stores inventory and
 tar backups of local Finder metadata, .zp probes, an old seed log, and a
 broken temporary symlink. Refresh the bundle with final integration history
 before deletion. A second verified bundle, selfhost-integration-final-20261004.bundle,
-preserves the backend repairs. Remote branches remain untouched.
+preserves the backend repairs. The verified qualified bundle
+selfhost-integration-qualified-20261004.bundle includes the passing-gate
+documentation and every pre-deletion ref. Remote branches remain untouched.
