@@ -328,6 +328,38 @@ tracking, general inference and coverage/overlap remain open. A valid symbolic
 update currently needs further proof-aware compiler support, rather than being
 admitted merely because a predicate was undecidable.
 
+The source-state audit confirms a concrete remaining hole:
+`derived_update_unchanged_wrong_state.neg.elisa` relabels Alive as Dead through a
+tag-only update. Stage0 rejects; Stage1 emits LLVM. The deliberately red
+`derived_source_state_smoke.sh` requires semantic rejection without an artifact.
+Its positive control, `derived_update_changed_before_copy.pos.elisa`, changes
+health to zero before copying and correctly returns Dead; it compiles in both
+compilers and executes in Stage1 at O0/O2 with input-copy preservation. Comparing
+the destination with the source binding's original Alive annotation would
+incorrectly reject this valid program and is not an acceptable fix.
+
+The next enforcement pass must maintain current state facts keyed by exact
+BindingId and canonical family ID, not spelling or original annotation. Parameter
+annotations seed entry facts only. Proven construction and writes establish new
+snapshot facts; reassignment, aliases, opaque writes and mutable-effect calls
+invalidate affected evidence unless their checked contracts establish a result.
+Branches join every reachable predecessor's conservative state set, excluding
+dead paths. Loops need bounded fixed points and explicit unknown coverage on
+exhaustion. Preservation requires an exact source occurrence, current evidence,
+the correct family and all possible source states satisfying the requested result.
+Declared type metadata alone is never current-state permission. Bindings introduced
+by patterns, loops and shadowing must remain distinct; lexical exits discard only
+their own facts. Immutable/borrowed payload and effect guarantees must be checked
+before retaining evidence across calls.
+
+`derived_source_snapshot.elisa` is an **unproved regression**, excluded from the
+admission gate. Combining a verified family/state-comparison result with Boolean
+known/current guards currently leaves the primary ensure unproved and dependent
+summaries unverified. Supporting typed comparison atoms in logical equivalence
+requires producer and independent kernel validation; it must not admit opaque
+or overloaded comparisons. The source-state runtime hole remains open regardless
+of whether this policy model becomes provable.
+
 `derived_dependency_join.elisa` is now admitted: bounded signed-atom normalization
 in the proof producer and independent kernel proves the non-constant De Morgan
 equivalence without distribution, arena rewriting or synthetic premises. All
