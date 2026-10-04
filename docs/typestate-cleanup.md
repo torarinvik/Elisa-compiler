@@ -407,7 +407,7 @@ entry bindings. Return paths and literal Boolean short-circuit paths retain
 reachability. Exit facts live in a flat table pool with per-function slices.
 The walker is bounded by depth and work fuel; exhaustion loses knowledge.
 
-This is not an enforcement pass. `for` loops, match/pattern bindings, general writes,
+This is not an enforcement pass. Custom iterators, match/pattern bindings, general writes,
 places, captures, call effects and implicit consumption remain coverage gaps.
 Unknown operations taint liveness rather than granting permission. Complete
 walker coverage alone does not establish borrow safety, state-transition
@@ -496,6 +496,31 @@ Native controls exercise empty/singleton/repeating ranges, returning bodies,
 outer-owner shadowing and paired binders. Two composed join/consume laws replay
 14/14 obligations including helpers; the opposite repeated-consume claim rejects.
 They establish the Boolean composition, not a proof of the AST walker.
+
+### Canonical consuming-transition prerequisites
+
+`protocol_binding_owned_type` looks up exactly one declared binding row by
+`BindingId`. It requires resolved ownership capabilities (including alias-hidden
+borrows), a known protocol state in the same canonical family, and an explicitly
+affine/linear family. Binding mutability alone does not establish borrow or
+ownership authority. These are necessary type conditions, not a move verdict:
+provenance, liveness, module authority, native effects and successful transition
+implementation remain separate obligations.
+
+`protocol_state_edge_allowed` queries the function-independent relation using a
+canonical family declaration and state ordinals. It rejects detached/mismatched
+families, derived families, empty/duplicate states, out-of-range ordinals,
+malformed/missing/duplicate edge-resolution rows, unknown edge states and duplicate
+edges. Same-state preservation needs no explicit edge, but still requires valid
+family/edge metadata. Equal names in different modules never share edges.
+
+Native controls cover all pairs of two opposite module-local graphs, owned and
+borrowed alias shapes, mutable owning values, nonaffine/linear families and
+malformed metadata. Eleven eligibility laws plus their imported predicate replay
+24/24 obligations, including general borrowed/cross-family exclusions independent
+of other flags; opposite borrowed-alias and cross-family claims reject.
+Neither query relaxes the classic transition guard. The proofs establish the
+Boolean prerequisite predicate, not the resolver or graph-query implementation.
 
 `ownership_binding_scope_isolation.elisa` generalizes the identity separation laws
 to arbitrary owners and serials. Its 21/21 obligations independently replay with
