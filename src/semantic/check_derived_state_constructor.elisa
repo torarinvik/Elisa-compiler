@@ -5,8 +5,8 @@ extend Semantic:
         def derived_type_owner_state(type_expression: Ast::Expr, owner: mutable sview&, state: mutable sview&) -> void:
             can Abort.Panic:
                 match type_expression:
-                    Expr.Index(Expr.Ident(type_owner, owner_line), Expr.Ident(type_state, state_line), index_line):
-                        owner <- type_owner
+                    Expr.Index(type_base, Expr.Ident(type_state, state_line), index_line):
+                        owner <- bare_type_name(type_base)
                         state <- type_state
                     Expr.Unary(operator, operand, unary_line):
                         derived_type_owner_state(operand, owner, state) if operator in {TokenKind.Mutable, TokenKind.Ampersand, TokenKind.Lmut}
@@ -56,100 +56,270 @@ extend Semantic:
             can Abort.Panic:
                 match expression:
                     Expr.Field(Expr.Ident(name, ident_line), field, field_line):
-                        return field
+                        return field if name == "self" else ""
                     Expr.Paren(inner, line):
                         return derived_self_field(inner)
                     _:
                         return ""
 
 
-        def constructor_field_int(fields: darray[Ast::FieldInit]&, wanted: sview, known: mutable bool&) -> i64:
+        # Evaluate the replacement snapshot, never re-read the mutable base value.
+        # One shared budget covers both predicate operands and initializer arithmetic.
+        def derived_snapshot_int(expression: Ast::Expr, fields: darray[Ast::FieldInit]&, known: mutable bool&, fuel: mutable u32&, depth: u32, allow_fields: bool) -> i64:
             can Abort.Panic:
-                for field in fields:
-                    matched: bool = field.name == wanted
-                    value: i64 = derived_literal_int(field.value, known) if matched else 0
-                    value return if matched
                 known <- false
-                return 0
+                return 0 if fuel == 0 or depth >= 128
+                fuel <- fuel - 1
+                match expression:
+                    Expr.IntLit(value, _):
+                        known <- true
+                        return value
+                    Expr.BoolLit(value, _):
+                        known <- true
+                        return 1 if value else 0
+                    Expr.Paren(inner, _):
+                        return derived_snapshot_int(inner, fields, known, fuel, depth + 1, allow_fields)
+                    Expr.Unary(TokenKind.Minus, inner, _):
+                        operand_known: mutable bool = false
+                        operand: i64 = derived_snapshot_int(inner, fields, operand_known, fuel, depth + 1, allow_fields)
+                        result: (known: bool, value: i64) = linear_sub_safe(0, operand) if operand_known else (false, 0)
+                        known <- result.known
+                        return result.value
+                    Expr.Field(_, _, _):
+                        wanted: sview = derived_self_field(expression)
+                        return 0 if not allow_fields or wanted == ""
+                        matches: mutable usize = 0
+                        result: mutable i64 = 0
+                        result_known: mutable bool = false
+                        for field in fields |matches, result, result_known, fuel|:
+                            return 0 if fuel == 0
+                            fuel <- fuel - 1
+                            if field.name == wanted:
+                                matches <- matches + 1
+                                result <- derived_snapshot_int(field.value, fields, result_known, fuel, depth + 1, false)
+                        known <- matches == 1 and result_known
+                        return result
+                    Expr.Binary(left, operator, right, _):
+                        left_known: mutable bool = false
+                        right_known: mutable bool = false
+                        left_value: i64 = derived_snapshot_int(left, fields, left_known, fuel, depth + 1, allow_fields)
+                        right_value: i64 = derived_snapshot_int(right, fields, right_known, fuel, depth + 1, allow_fields)
+                        return 0 if not left_known or not right_known
+                        result: (known: bool, value: i64) = linear_add_safe(left_value, right_value) if operator == TokenKind.Plus else linear_sub_safe(left_value, right_value) if operator == TokenKind.Minus else linear_mul_safe(left_value, right_value) if operator == TokenKind.Star else (false, 0)
+                        known <- result.known
+                        return result.value
+                    _:
+                        return 0
 
+        def derived_snapshot_predicate(condition: Ast::Expr, fields: darray[Ast::FieldInit]&, known: mutable bool&, fuel: mutable u32&, depth: u32) -> bool:
+            can Abort.Panic:
+                known <- false
+                return false if fuel == 0 or depth >= 128
+                fuel <- fuel - 1
+                match condition:
+                    Expr.BoolLit(value, _):
+                        known <- true
+                        return value
+                    Expr.Paren(inner, _):
+                        return derived_snapshot_predicate(inner, fields, known, fuel, depth + 1)
+                    Expr.Unary(TokenKind.Not, inner, _):
+                        value: bool = derived_snapshot_predicate(inner, fields, known, fuel, depth + 1)
+                        return not value if known == true else false
+                    Expr.Binary(left, operator, right, _):
+                        left_known: mutable bool = false
+                        right_known: mutable bool = false
+                        if operator == TokenKind.And or operator == TokenKind.Or:
+                            left_value: bool = derived_snapshot_predicate(left, fields, left_known, fuel, depth + 1)
+                            right_value: bool = derived_snapshot_predicate(right, fields, right_known, fuel, depth + 1)
+                            known <- left_known and right_known
+                            return false if known == false
+                            return left_value and right_value if operator == TokenKind.And else left_value or right_value
+                        return false if operator not in {TokenKind.EqEq, TokenKind.BangEq, TokenKind.Lt, TokenKind.Gt, TokenKind.LtEq, TokenKind.GtEq}
+                        left_value: i64 = derived_snapshot_int(left, fields, left_known, fuel, depth + 1, true)
+                        right_value: i64 = derived_snapshot_int(right, fields, right_known, fuel, depth + 1, true)
+                        known <- left_known and right_known
+                        return false if known == false
+                        return when operator:
+                            TokenKind.EqEq -> left_value == right_value
+                            TokenKind.BangEq -> left_value != right_value
+                            TokenKind.Lt -> left_value < right_value
+                            TokenKind.Gt -> left_value > right_value
+                            TokenKind.LtEq -> left_value <= right_value
+                            TokenKind.GtEq -> left_value >= right_value
+                            _ -> false
+                    _:
+                        return false
 
         def derived_rule_holds(condition: Ast::Expr, fields: darray[Ast::FieldInit]&, known: mutable bool&) -> bool:
             can Abort.Panic:
-                match condition:
-                    Expr.Binary(left, operator, right, line):
-                        field_name: sview = derived_self_field(left)
-                        rhs_known: mutable bool = false
-                        rhs: i64 = derived_literal_int(right, rhs_known)
-                        field_known: mutable bool = false
-                        field_value: i64 = constructor_field_int(fields, field_name, field_known) if field_name != "" else 0
-                        known <- rhs_known and field_known
-                        false return if not rhs_known or not field_known
-                        return when operator:
-                            TokenKind.EqEq -> field_value == rhs
-                            TokenKind.BangEq -> field_value != rhs
-                            TokenKind.Lt -> field_value < rhs
-                            TokenKind.Gt -> field_value > rhs
-                            TokenKind.LtEq -> field_value <= rhs
-                            TokenKind.GtEq -> field_value >= rhs
-                            _ -> false
+                fuel: mutable u32 = 8192
+                return derived_snapshot_predicate(condition, fields, known, fuel, 0)
+
+
+        def check_named_state_constructor_argument(expression: Ast::Expr, scope: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(base, argument, _):
+                        row: u32 = binding_nominal_declaration(base, scope, table)
+                        return if row == SYMBOL_INDEX_ROW_NONE
+                        symbol: Symbol = table.symbols[row.usize()]
+                        return if symbol.kind != SymbolKind.Struct
+                        match argument:
+                            Expr.Ident(state, pos):
+                                for resolved in table.resolved_state_families |table|:
+                                    continue if resolved.declaration_id.value != symbol.id.value or resolved.source_index.usize() >= table.state_family_declarations.count
+                                    family: Ast::StateFamily = table.state_family_declarations[resolved.source_index.usize()]
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NamedStateArgumentUnknown, name: symbol.name, pos: pos, line: pos.line, expected: state, actual: ""}) if not (any declared in family.states where declared == state)
+                            _:
+                                pass
                     _:
-                        known <- false
-                        return false
+                        pass
 
-
-        def check_derived_constructor_expression(expression: Ast::Expr, rules: darray[Ast::DerivedStateRule]&, table: lmut SymbolTable) -> void:
+        def check_derived_constructor_expression(expression: Ast::Expr, rules: darray[Ast::DerivedStateRule]&, scope: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Construct(type_expression, fields, line):
+                        table <- check_named_state_constructor_argument(type_expression, scope, table)
                         owner: mutable sview = ""
                         state: mutable sview = ""
                         derived_type_owner_state(type_expression, owner, state)
-                        for rule in rules |table|:
-                            if rule.owner == owner and rule.state == state:
+                        visited: mutable darray[u32] = []
+                        rebind identity: BindingStateIdentity, table = resolve_binding_state_identity(type_expression, scope, visited, table)
+                        for resolved in table.resolved_derived_state_rules |table|:
+                            continue if not identity.known or identity.protocol or resolved.declaration_id.value != identity.family_id.value or resolved.source_index.usize() >= rules.count
+                            rule: Ast::DerivedStateRule = rules[resolved.source_index.usize()]
+                            if rule.state == state:
                                 known: mutable bool = false
                                 holds: bool = derived_rule_holds(rule.condition, fields, known)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateConstructorMismatch, name: owner, line: line.line, expected: state, actual: ""}) if known and not holds
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateConstructorMismatch, name: rule.owner, line: line.line, expected: state, actual: ""}) if known and not holds
                         for field in fields |table|:
-                            table <- check_derived_constructor_expression(field.value, rules, table)
+                            table <- check_derived_constructor_expression(field.value, rules, scope, table)
                     Expr.Call(callee, arguments, argument_names, line):
                         for argument in arguments |table|:
-                            table <- check_derived_constructor_expression(argument, rules, table)
+                            table <- check_derived_constructor_expression(argument, rules, scope, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- check_derived_constructor_expression(left, rules, table)
-                        table <- check_derived_constructor_expression(right, rules, table)
+                        table <- check_derived_constructor_expression(left, rules, scope, table)
+                        table <- check_derived_constructor_expression(right, rules, scope, table)
                     Expr.Paren(inner, line) | Expr.Unary(_, inner, line):
-                        table <- check_derived_constructor_expression(inner, rules, table)
+                        table <- check_derived_constructor_expression(inner, rules, scope, table)
                     _:
                         pass
 
 
-        def check_derived_constructor_statements(statements: darray[Ast::Stmt], rules: darray[Ast::DerivedStateRule]&, table: lmut SymbolTable) -> void:
+        def derived_snapshot_dependencies(condition: Ast::Expr, fields: darray[Ast::FieldInit]&, fuel: mutable u32&, depth: u32) -> (known: bool, changed: bool):
+            can Abort.Panic:
+                return (false, true) if fuel == 0 or depth >= 128
+                fuel <- fuel - 1
+                match condition:
+                    Expr.IntLit(_, _) | Expr.BoolLit(_, _):
+                        return (true, false)
+                    Expr.Field(_, _, _):
+                        wanted: sview = derived_self_field(condition)
+                        return (false, true) if wanted == ""
+                        for field in fields |fuel|:
+                            return (false, true) if fuel == 0
+                            fuel <- fuel - 1
+                            return (true, true) if field.name == wanted
+                        return (true, false)
+                    Expr.Paren(inner, _):
+                        return derived_snapshot_dependencies(inner, fields, fuel, depth + 1)
+                    Expr.Unary(operator, inner, _):
+                        return (false, true) if operator != TokenKind.Minus and operator != TokenKind.Not
+                        return derived_snapshot_dependencies(inner, fields, fuel, depth + 1)
+                    Expr.Binary(left, operator, right, _):
+                        return (false, true) if operator not in {TokenKind.Plus, TokenKind.Minus, TokenKind.Star, TokenKind.And, TokenKind.Or, TokenKind.EqEq, TokenKind.BangEq, TokenKind.Lt, TokenKind.Gt, TokenKind.LtEq, TokenKind.GtEq}
+                        first: (known: bool, changed: bool) = derived_snapshot_dependencies(left, fields, fuel, depth + 1)
+                        second: (known: bool, changed: bool) = derived_snapshot_dependencies(right, fields, fuel, depth + 1)
+                        return (first.known and second.known, first.changed or second.changed)
+                    _:
+                        return (false, true)
+
+        # A partial replacement map can refute a result predicate only when the
+        # evaluator decides it. Missing captured fields remain unknown; no base reads.
+        def check_derived_contextual_result(expression: Ast::Expr, expected: Ast::Expr, rules: darray[Ast::DerivedStateRule]&, scope: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.RecordUpdate(_, fields, pos) | Expr.Construct(_, fields, pos):
+                        visited: mutable darray[u32] = []
+                        rebind identity: BindingStateIdentity, table = resolve_binding_state_identity(expected, scope, visited, table)
+                        return if not identity.known or identity.protocol
+                        state: mutable sview = ""
+                        for resolved in table.resolved_state_families |state|:
+                            continue if resolved.declaration_id.value != identity.family_id.value or resolved.source_index.usize() >= table.state_family_declarations.count
+                            family: Ast::StateFamily = table.state_family_declarations[resolved.source_index.usize()]
+                            state <- family.states[identity.state_index.usize()] if identity.state_index.usize() < family.states.count
+                        return if state == ""
+                        for resolved in table.resolved_derived_state_rules |table|:
+                            continue if resolved.declaration_id.value != identity.family_id.value or resolved.source_index.usize() >= rules.count
+                            rule: Ast::DerivedStateRule = rules[resolved.source_index.usize()]
+                            continue if rule.state != state
+                            known: mutable bool = false
+                            holds: bool = derived_rule_holds(rule.condition, fields, known)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateResultMismatch, name: rule.owner, pos: pos, line: pos.line, expected: state, actual: ""}) if known and not holds
+                            if not known:
+                                is_update: bool = expression is Expr.RecordUpdate(_, _, _)
+                                fuel: mutable u32 = 8192
+                                dependencies: (known: bool, changed: bool) = derived_snapshot_dependencies(rule.condition, fields, fuel, 0)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateEvidenceUnproven, name: rule.owner, pos: pos, line: pos.line, expected: state, actual: ""}) if not is_update or not dependencies.known or dependencies.changed
+                    Expr.Paren(inner, _):
+                        table <- check_derived_contextual_result(inner, expected, rules, scope, table)
+                    Expr.If(_, then_value, else_value, _):
+                        table <- check_derived_contextual_result(then_value, expected, rules, scope, table)
+                        table <- check_derived_contextual_result(else_value, expected, rules, scope, table)
+                    _:
+                        pass
+
+        def check_derived_constructor_statements(statements: darray[Ast::Stmt], rules: darray[Ast::DerivedStateRule]&, scope: sview, return_type: Ast::Expr?, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
-                        Stmt.VarDecl(name, type_expression, value, line) | Stmt.Assign(type_expression, _, value, line):
-                            table <- check_derived_constructor_expression(value, rules, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- check_derived_contextual_result(value, type_expression, rules, scope, table)
+                            # A destination annotation cannot override contradictory fields.
+                            # Reuse the explicit-constructor check for a bare constructor
+                            # only when its owner matches the destination state family.
+                            owner: mutable sview = ""
+                            state: mutable sview = ""
+                            derived_type_owner_state(type_expression, owner, state)
+                            match value:
+                                Expr.Construct(Expr.Ident(value_owner, owner_line), fields, construct_line):
+                                    if owner == value_owner and state != "":
+                                        contextual: Ast::Expr = Expr.Construct(type_expression, fields, construct_line)
+                                        table <- check_derived_constructor_expression(contextual, rules, scope, table)
+                                    else:
+                                        table <- check_derived_constructor_expression(value, rules, scope, table)
+                                _:
+                                    table <- check_derived_constructor_expression(value, rules, scope, table)
+                        Stmt.Assign(type_expression, _, value, line):
+                            table <- check_derived_constructor_expression(value, rules, scope, table)
                         Stmt.Expr(expression, line):
-                            table <- check_derived_constructor_expression(expression, rules, table)
+                            table <- check_derived_constructor_expression(expression, rules, scope, table)
                         Stmt.Return(value, line):
-                            table <- check_derived_constructor_expression(returned, rules, table) if value is returned
+                            if value is returned:
+                                table <- check_derived_constructor_expression(returned, rules, scope, table)
+                                table <- check_derived_contextual_result(returned, expected, rules, scope, table) if return_type is expected
+                        Stmt.Match(_, arms, _):
+                            for arm in arms |table|:
+                                table <- check_derived_constructor_statements(arm.body, rules, scope, return_type, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_derived_constructor_statements(then_body, rules, table)
-                            table <- check_derived_constructor_statements(else_body, rules, table)
+                            table <- check_derived_constructor_statements(then_body, rules, scope, return_type, table)
+                            table <- check_derived_constructor_statements(else_body, rules, scope, return_type, table)
                         Stmt.Block(_, _, _, body, line) | Stmt.While(_, body, line) | Stmt.For(_, _, _, body, line):
-                            table <- check_derived_constructor_statements(body, rules, table)
+                            table <- check_derived_constructor_statements(body, rules, scope, return_type, table)
                         _:
                             pass
 
 
-        def check_derived_constructor_declarations(declarations: darray[Ast::Decl], rules: darray[Ast::DerivedStateRule]&, table: lmut SymbolTable) -> void:
+        def check_derived_constructor_declarations(declarations: darray[Ast::Decl], rules: darray[Ast::DerivedStateRule]&, scope: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            table <- check_derived_constructor_statements(body, rules, table)
-                        Decl.Module(name, body, line) | Decl.Scoped(body, line):
-                            table <- check_derived_constructor_declarations(body, rules, table)
+                            table <- check_derived_constructor_statements(body, rules, scope, return_type, table)
+                        Decl.Module(name, body, line):
+                            table <- check_derived_constructor_declarations(body, rules, name, table)
+                        Decl.Scoped(body, line):
+                            table <- check_derived_constructor_declarations(body, rules, scope, table)
                         _:
                             pass
 
@@ -174,4 +344,4 @@ extend Semantic:
                 # `self.field`; a bare-ident condition (`hp > 0`) is rejected.
                 for rule in file.derived_state_rules |table|:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateRuleNotFieldBased, name: rule.state, pos: rule.pos, line: rule.pos.line, expected: "", actual: ""}) if derived_rule_is_bare_ident(rule.condition)
-                table <- check_derived_constructor_declarations(file.top_decls, file.derived_state_rules, table)
+                table <- check_derived_constructor_declarations(file.top_decls, file.derived_state_rules, "", table)
