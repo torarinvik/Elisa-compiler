@@ -17,4 +17,10 @@ for optimization in 0 2; do
     elisa_run_timeout 30 "${ELISA_CLANG:-clang}" -Wl,-dead_strip -o "$WORK/protocol" "$WORK/protocol.a"
     elisa_run_timeout 10 "$WORK/protocol"
 done
+FIXTURE="$ROOT/test/repro/protocol_graph_descendant_codegen_probe.elisa"
+for optimization in 0 2; do
+    elisa_run_timeout 30 "$STAGE0" -emit c-archive "-O$optimization" -o "$WORK/descendant.a" "$FIXTURE"
+    elisa_run_timeout 30 "${ELISA_CLANG:-clang}" -Wl,-dead_strip -o "$WORK/descendant" "$WORK/descendant.a"
+    elisa_run_timeout 10 "$WORK/descendant"
+done
 echo 'Stage0 protocol graph OK: independent operations, payload round trip, tag-free layout at O0/O2'

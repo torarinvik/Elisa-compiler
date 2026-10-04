@@ -82,6 +82,23 @@ Stage1 still rejects predicate-free named families. This is not a parity release
 Stage1 must acquire equivalent structured metadata and enforcement before enabling it.
 Broader alias, control-flow, cross-module, and generic negative controls remain gates.
 
+The descendant-module controls exposed a Stage0 identity bug: parsed named-state
+generic parameters retained the leaf `StateOwner` while a consuming transition
+constructed a qualified family name. A legal descendant transition therefore
+reported identical printed return types as incompatible. Semantic struct creation
+now qualifies its copied state-parameter metadata, and field analysis uses that
+semantic copy; the source AST remains unchanged. Go regressions establish distinct
+state types/canonical type IDs for equal spellings in separate modules, all-source
+union checks, borrowed alias rejection, descendant authority and ordinary user
+functions named `transition`. The descendant construction/transition/payload
+round trip also executes at O0/O2 under the Stage0 gate.
+
+`protocol_family_identity.elisa` separately formalizes a resolved family/state
+key: four separation/reflexivity laws plus the key predicate replay 10/10
+obligations; the claim that one state ordinal merges separate families rejects.
+These are model laws conditional on canonical family IDs, not proof of Go's
+qualification algorithm. Compiler regressions provide that source-level evidence.
+
 Stage1's parser now preserves structured `StateFamily` and `StateTransitionEdge`
 rows in `Ast::File`, keyed by owning module, declaration name, and declaration
 position. Edges retain the owning declaration's byte offset as well as its line;

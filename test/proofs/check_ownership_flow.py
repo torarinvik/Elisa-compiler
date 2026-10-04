@@ -19,7 +19,8 @@ inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa"
           HERE / "ownership_loop_head_rejected.elisa", HERE / "ownership_for_head.elisa",
           HERE / "ownership_for_head_rejected.elisa", ROOT / "src/semantic/protocol_owner_domain.elisa",
           HERE / "protocol_owner_eligibility.elisa", HERE / "protocol_owner_eligibility_rejected.elisa",
-          HERE / "protocol_module_authority.elisa", HERE / "protocol_module_authority_rejected.elisa"]
+          HERE / "protocol_module_authority.elisa", HERE / "protocol_module_authority_rejected.elisa",
+          HERE / "protocol_family_identity.elisa", HERE / "protocol_family_identity_rejected.elisa"]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):
@@ -105,6 +106,16 @@ assert code == 1 and authority_rejected["status"] == "failed"
 authority_false_names = {"peer_module_has_authority", "root_owns_every_module", "one_legal_state_is_enough"}
 assert {finding["name"] for finding in authority_rejected["findings"]} == authority_false_names
 assert all(finding["kind"] == "ensure-unproven" for finding in authority_rejected["findings"])
+code, family_identity = run("protocol_family_identity.elisa")
+assert code == 0 and family_identity["status"] == family_identity["verification_state"] == "proved"
+assert family_identity["summary"]["proven"] == family_identity["summary"]["obligations"] == 10
+assert family_identity == run("protocol_family_identity.elisa")[1]
+assert not family_identity["findings"]
+assert all(row.get("verified") for row in family_identity["declaration_details"] if row["kind"] == "function")
+code, family_rejected = run("protocol_family_identity_rejected.elisa")
+assert code == 1 and family_rejected["status"] == "failed"
+assert {finding["name"] for finding in family_rejected["findings"]} == {"same_state_ordinal_merges_families"}
+assert all(finding["kind"] == "ensure-unproven" for finding in family_rejected["findings"])
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
@@ -115,6 +126,8 @@ print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain 
                   "protocol_owner_false_claims_rejected": sorted(protocol_false_names),
                   "protocol_authority_report_replayed": 26,
                   "protocol_authority_false_claims_rejected": sorted(authority_false_names),
+                  "protocol_family_identity_report_replayed": 10,
+                  "protocol_family_false_claims_rejected": ["same_state_ordinal_merges_families"],
                   "loop_false_claims_rejected": sorted(loop_false_names),
                   "open_declarations": [], "false_claims_rejected": sorted(false_names),
                   "sources_sha256": hashes}, sort_keys=True))
