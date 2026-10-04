@@ -18,7 +18,8 @@ inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa"
           HERE / "ownership_reachable_join.elisa", HERE / "ownership_loop_head.elisa",
           HERE / "ownership_loop_head_rejected.elisa", HERE / "ownership_for_head.elisa",
           HERE / "ownership_for_head_rejected.elisa", ROOT / "src/semantic/protocol_owner_domain.elisa",
-          HERE / "protocol_owner_eligibility.elisa", HERE / "protocol_owner_eligibility_rejected.elisa"]
+          HERE / "protocol_owner_eligibility.elisa", HERE / "protocol_owner_eligibility_rejected.elisa",
+          HERE / "protocol_module_authority.elisa", HERE / "protocol_module_authority_rejected.elisa"]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):
@@ -84,7 +85,7 @@ assert {finding["name"] for finding in for_rejected["findings"]} == {"repeated_c
 assert all(finding["kind"] == "ensure-unproven" for finding in for_rejected["findings"])
 code, protocol_owner = run("protocol_owner_eligibility.elisa")
 assert code == 0 and protocol_owner["status"] == protocol_owner["verification_state"] == "proved"
-assert protocol_owner["summary"]["proven"] == protocol_owner["summary"]["obligations"] == 24
+assert protocol_owner["summary"]["proven"] == protocol_owner["summary"]["obligations"] == 28
 assert protocol_owner == run("protocol_owner_eligibility.elisa")[1]
 assert not protocol_owner["findings"]
 assert all(row.get("verified") for row in protocol_owner["declaration_details"] if row["kind"] == "function")
@@ -93,14 +94,27 @@ assert code == 1 and protocol_rejected["status"] == "failed"
 protocol_false_names = {"borrowed_alias_grants_ownership", "different_family_grants_ownership"}
 assert {finding["name"] for finding in protocol_rejected["findings"]} == protocol_false_names
 assert all(finding["kind"] == "ensure-unproven" for finding in protocol_rejected["findings"])
+code, authority = run("protocol_module_authority.elisa")
+assert code == 0 and authority["status"] == authority["verification_state"] == "proved"
+assert authority["summary"]["proven"] == authority["summary"]["obligations"] == 26
+assert authority == run("protocol_module_authority.elisa")[1]
+assert not authority["findings"]
+assert all(row.get("verified") for row in authority["declaration_details"] if row["kind"] == "function")
+code, authority_rejected = run("protocol_module_authority_rejected.elisa")
+assert code == 1 and authority_rejected["status"] == "failed"
+authority_false_names = {"peer_module_has_authority", "root_owns_every_module", "one_legal_state_is_enough"}
+assert {finding["name"] for finding in authority_rejected["findings"]} == authority_false_names
+assert all(finding["kind"] == "ensure-unproven" for finding in authority_rejected["findings"])
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
                   "reachable_join_report_proved": 16,
                   "loop_head_report_replayed": 20, "for_head_report_replayed": 14,
                   "for_false_claims_rejected": ["repeated_consume_grants_move"],
-                  "protocol_owner_report_replayed": 24,
+                  "protocol_owner_report_replayed": 28,
                   "protocol_owner_false_claims_rejected": sorted(protocol_false_names),
+                  "protocol_authority_report_replayed": 26,
+                  "protocol_authority_false_claims_rejected": sorted(authority_false_names),
                   "loop_false_claims_rejected": sorted(loop_false_names),
                   "open_declarations": [], "false_claims_rejected": sorted(false_names),
                   "sources_sha256": hashes}, sort_keys=True))

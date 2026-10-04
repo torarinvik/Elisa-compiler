@@ -517,10 +517,35 @@ family/edge metadata. Equal names in different modules never share edges.
 Native controls cover all pairs of two opposite module-local graphs, owned and
 borrowed alias shapes, mutable owning values, nonaffine/linear families and
 malformed metadata. Eleven eligibility laws plus their imported predicate replay
-24/24 obligations, including general borrowed/cross-family exclusions independent
+28/28 obligations (including imported helper obligations), with general borrowed/cross-family exclusions independent
 of other flags; opposite borrowed-alias and cross-family claims reject.
 Neither query relaxes the classic transition guard. The proofs establish the
 Boolean prerequisite predicate, not the resolver or graph-query implementation.
+
+### Module authority and every-incoming-state edge checks
+
+`protocol_function_has_authority` resolves the actual calling function by its
+canonical `DeclId`. It accepts the family owner's module and its `::`-delimited
+descendants, matching Stage0's privacy rule. Parent modules do not gain authority
+over a child's family; prefix collisions and peers do not gain authority. A
+root-owned family is available only at root, not in every module. Operation names
+are irrelevant. Invalid/nonfunction caller IDs and detached family rows reject.
+This function-level query does not cover global/module-scope construction.
+
+`protocol_all_state_edges_allowed` checks every ordinal in a conservative source
+set against the same resolved family graph. Empty source sets mean unknown and
+reject; one illegal or out-of-range source blocks the check, irrespective of
+order. Repeated legal states do not widen the accepted graph. This helper does
+not establish that its supplied states describe the actual runtime value; the
+flow/provenance pass must provide that evidence before transition admission.
+
+Native controls cover nested/deep modules, ancestors, peers, similar prefixes,
+root authority, invalid declaration IDs, and all-source graph checks. Ten module
+and all-path laws independently replay 26/26 obligations including helper laws;
+opposite peer/root/one-legal-state claims reject. Writable capability bits also
+block owned-type eligibility even if malformed metadata omits its borrow bit.
+Classic consuming execution remains guarded until transfer/provenance and
+native-effect obligations are implemented.
 
 `ownership_binding_scope_isolation.elisa` generalizes the identity separation laws
 to arbitrary owners and serials. Its 21/21 obligations independently replay with
