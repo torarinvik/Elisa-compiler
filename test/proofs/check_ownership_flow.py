@@ -27,7 +27,8 @@ inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa"
           HERE / "derived_snapshot_knowledge.elisa", HERE / "derived_snapshot_knowledge_rejected.elisa",
           HERE / "derived_result_refutation.elisa", HERE / "derived_result_refutation_rejected.elisa",
           HERE / "derived_dependency_join.elisa", HERE / "derived_dependency_join_rejected.elisa",
-          HERE / "derived_source_snapshot.elisa", HERE / "derived_source_snapshot_rejected.elisa"]
+          HERE / "derived_source_snapshot.elisa", HERE / "derived_source_snapshot_rejected.elisa",
+          HERE / "derived_source_join.elisa", HERE / "derived_source_join_rejected.elisa"]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):
@@ -194,6 +195,16 @@ code, source_rejected = run("derived_source_snapshot_rejected.elisa")
 assert code == 1 and source_rejected["status"] == "failed"
 assert {finding["name"] for finding in source_rejected["findings"]} == {"declaration_is_current_state", "unchanged_field_change_can_relabel_state"}
 assert all(finding["kind"] == "ensure-unproven" for finding in source_rejected["findings"])
+code, source_join = run("derived_source_join.elisa")
+assert code == 0 and source_join["status"] == source_join["verification_state"] == "proved"
+assert source_join["summary"]["proven"] == source_join["summary"]["obligations"] == 22
+assert source_join == run("derived_source_join.elisa")[1]
+assert not source_join["findings"]
+assert all(row.get("verified") for row in source_join["declaration_details"] if row["kind"] == "function")
+code, source_join_rejected = run("derived_source_join_rejected.elisa")
+assert code == 1 and source_join_rejected["status"] == "failed"
+assert {finding["name"] for finding in source_join_rejected["findings"]} == {"dead_sources_grant_knowledge", "live_source_can_be_dropped"}
+assert all(finding["kind"] == "ensure-unproven" for finding in source_join_rejected["findings"])
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
@@ -208,6 +219,7 @@ print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain 
                   "protocol_family_false_claims_rejected": ["same_state_ordinal_merges_families"],
                   "derived_dependency_join_report_replayed": 26,
                   "derived_source_snapshot_report_replayed": 20,
+                  "derived_source_join_report_replayed": 22,
                   "derived_result_refutation_report_replayed": 12,
                   "derived_snapshot_knowledge_report_replayed": 12,
                   "qualified_type_application_report_replayed": 10,
