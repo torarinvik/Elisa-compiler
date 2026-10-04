@@ -21,7 +21,7 @@ for compiler in "${compilers[@]}"; do
             set -e
             [[ "$status" == 42 ]] || { echo "$repro returned $status at O$level ($compiler)" >&2; exit 1; }
             "$compiler" -emit llvm "-O$level" -o "$WORK/valid.ll" "$ROOT/test/repro/$repro.elisa"
-            "${ELISA_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/valid.ll"
+            "${ELISA_OPT:-${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}}" -passes=verify -disable-output "$WORK/valid.ll"
         done
         for negative in enum_module_alias_wrong_owner enum_module_nested_wrong_owner enum_module_alias_chained_wrong_owner enum_module_ancestor_wrong_owner enum_module_ancestor_const_wrong_owner enum_module_ancestor_const_wrong_width enum_module_ancestor_const_invalid_literal enum_module_ancestor_const_negative_literal enum_module_ancestor_const_invalid_cast enum_module_wrong_payload_pattern enum_module_wrong_payload_pattern_expr enum_module_wrong_nested_payload_pattern enum_module_wrong_payload_is_pattern; do
             for mode in llvm obj; do
