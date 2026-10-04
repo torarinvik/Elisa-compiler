@@ -329,15 +329,27 @@ with opposite predicates and rejects a contradictory literal in its own family.
 The flow checker and record-update checks still need canonical enforcement before
 the demonstrated record-update holes can be closed safely. Alias-carried states,
 broader contextual construction and unknown predicates also remain open.
-`derived_constructor_qualified.repro.elisa` records another open Stage1 issue:
-valid `Owner::File[Valid]{...}` construction reports `Valid` as an undefined
-identifier. Its rejection is not a safety gate or evidence of qualified parity.
+Stage1 qualified nominal bracket applications now use canonical lookup rather
+than treating the state argument as a value identifier. The lookup helper takes
+a read-only table; shadowed heads, dotted paths and unresolved/ambiguous nominal
+paths do not suppress value-index resolution. The previous valid
+`Owner::File[Valid]{...}` undefined-state reproducer now emits LLVM and executes
+at O0/O2. `qualified_typestate_constructor_smoke.sh` also rejects contradictory
+qualified construction and checks that missing/shadowed paths and local array
+indexing still diagnose missing value identifiers. Unknown identifier state
+arguments on canonical named-family constructors receive a specific semantic
+diagnostic, rather than relying on a backend decline. This does not yet provide
+qualified generic-function specialization or unknown-predicate enforcement.
 
 `derived_rule_selection.elisa` supplies 12 independently replayed selection-policy
 obligations, including unknown-family, protocol-family, different-family and
 different-state exclusion. Opposite same-spelling/unresolved-authority claims
 reject. These model laws assume canonical resolution and do not prove the parser,
 constructor traversal or predicate evaluator.
+
+`qualified_type_application.elisa` adds 10 independently replayed guard-policy
+obligations with shadowed/missing-path counterclaims rejected. These are model
+laws, not a proof of nominal lookup, scope traversal or LLVM lowering.
 
 ### 5. Fallible operations and terminal obligations
 
