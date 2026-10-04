@@ -6,6 +6,8 @@
 
 seed_build() {
   local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source
+  local seed_hook_mode
+  local -a seed_link_flags
   # A newly-created Git worktree has no ignored build directory yet. Create the
   # local output roots before taking the per-worktree lock; otherwise `mkdir`
   # cannot create the nested lock path and every first seed fails as if a stale
@@ -190,14 +192,31 @@ seed_build() {
     echo "seed requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
     exit 2
   }
-  # The compiler source includes the complete standard runtime.  Its optional
-  # native-callback and varargs entry points are deliberately unreachable from
-  # the compiler itself and are provided only when linking an executable/runtime
-  # consumer.  Dead-strip those sections here, matching the other self-host
-  # product links, instead of requiring unrelated host runtime symbols.
-  # The weak profiler-hook fallbacks, from the one shared source (see the script).
-  bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
-  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
+  # The compiler source includes the complete standard runtime. Optional native
+  # callback and varargs entry points are unreachable from the compiler itself.
+  # Darwin removes them with dead_strip; Linux uses weak host-callback fallbacks
+  # because GNU --gc-sections does not discard every reference from this object.
+  case "$(uname -s)" in
+    Linux)
+      seed_link_flags=(-no-pie -Wl,--gc-sections)
+      seed_hook_mode=--host-callbacks
+      ;;
+    Darwin)
+      seed_link_flags=(-Wl,-dead_strip -Wl,-stack_size,0x20000000)
+      seed_hook_mode=""
+      ;;
+    *)
+      echo "seed: unsupported host for native product linking: $(uname -s) (supported: Linux, Darwin)" >&2
+      exit 2
+  esac
+  # Use the shared weak fallback source so seed, runtime, and test products keep
+  # one definition of the optional profiler/native callback ABI.
+  if [[ -n "$seed_hook_mode" ]]; then
+    bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$seed_hook_mode" >"$seed_profile_hook_source"
+  else
+    bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
+  fi
+  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir"
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$seed_object_output"
   ELISA_SEED_OUTPUT=""
