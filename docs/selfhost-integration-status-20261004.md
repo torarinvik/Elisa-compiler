@@ -21,7 +21,7 @@ adversarial escape (146 cases).
 Integration repairs: immutable submit identity no longer appears in threaded
 loop captures; type-position T&[N] is no longer parsed as bitwise ampersand;
 zeroed-value container controls link the runtime object. The complete zeroed
-gate must finish after the last harness repair.
+safety gate now passes, including Stage0/Stage1 O0/O2 controls.
 
 Driver acceptance: bare passes at 5 disagreements (limit 6); with-std fails at
 8 (limit 0). Do not loosen this ratchet to conceal integration gaps.
@@ -41,8 +41,8 @@ exemption in check_pointer_erasure_cast; runtime inclusion must not exempt
 user code. Fix without disabling safety or relying on spelling-only trust.
 Other disagreements need individual diagnosis, not blanket exclusions.
 
-Still required: driver parity repair, complete zeroed safety verification,
-backend differential coverage, and self_host_gen3 byte-identical fixpoint.
+Still required: driver parity repair, backend differential coverage, and
+self_host_gen3 byte-identical fixpoint.
 Only then advance primary main and remove other local branches/worktrees.
 
 Recovery: primary .git/selfhost-integration-recovery-20261004.bundle was
