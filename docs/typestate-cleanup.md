@@ -315,6 +315,26 @@ both `derived_record_update_forged.neg.elisa` and
 `derived_record_update_single_unknown.neg.elisa`. Closing these demonstrated
 holes is required before claiming derived-state parity.
 
+Stage1's predicate evaluator now reads one explicit field snapshot and supports
+comparisons with fields on either side, checked addition/subtraction/multiplication,
+parentheses, Boolean conjunction/disjunction and negation. Only `self.field`
+selects snapshot fields; foreign receivers do not. Missing or duplicate fields,
+unsupported operators, overflow, depth 128 and exhausted shared work fuel 8192
+produce unknown evidence. Field-initializer arithmetic cannot recursively read
+the new snapshot. Both Boolean operands must be understood: a constant branch
+does not erase an unsupported atom. Field ordering does not alter classification.
+This enables coupled-field constructor checks, but is not itself record-update
+admission, coverage/overlap enforcement or proof-aware symbolic inference.
+
+`derived_coupled_constructor_smoke.sh` executes paired coupled-field Boolean
+predicates at O0/O2 and rejects a contradictory constructor without an artifact.
+`derived_snapshot_predicate_probe.elisa` exercises the actual evaluator's known
+and unknown results, duplicate/missing/foreign fields, overflow, unsupported
+division, ordering and budgets. `derived_snapshot_knowledge.elisa` contributes
+12 independently replayed knowledge-policy model obligations, with unknown-atom
+and exhausted-budget counterclaims rejected; it does not prove the AST evaluator
+or checked arithmetic implementation.
+
 Stage1 now preserves each derived rule's declaring module and exact struct source
 position, and resolves it to the canonical family declaration ID. Resolution
 requires exactly one matching derived family; detached, ambiguous or mismatched

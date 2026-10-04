@@ -11,7 +11,7 @@ cleanup() {
 }
 trap cleanup EXIT
 if [[ $# -eq 0 ]]; then
-    set -- ownership_control_flow_probe ownership_dead_paths_probe ownership_while_paths_probe ownership_for_paths_probe protocol_transition_eligibility_probe protocol_module_authority_probe derived_rule_identity_probe
+    set -- ownership_control_flow_probe ownership_dead_paths_probe ownership_while_paths_probe ownership_for_paths_probe protocol_transition_eligibility_probe protocol_module_authority_probe derived_rule_identity_probe derived_snapshot_predicate_probe
 fi
 for fixture in "$@"; do
 elisa_run_timeout 180 env -u ELISACORE_BIN -u ELISA_CORE ELISA_STAGE1_BIN="$STAGE1" \
