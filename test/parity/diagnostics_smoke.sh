@@ -75,6 +75,8 @@ NAMES=(
     storage_dependency_loop_held_view
     storage_dependency_owned_return
     loop_literal_array_binder_arg
+    submit_unnamed_view_growth
+    submit_local_mutable_ref
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
@@ -313,6 +315,8 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "storage dependency facts were invalidated by darray push"
     "argument 1 to \"f\" expects sview, got static u8&"
+    "storage dependency facts were invalidated by darray push"
+    "is not structurally shareable across threads"
     "duplicate packed group member \"b\" in H.flags"
     "declares named states but is missing a derive state: block"
     "written in multiple branches and read after the join"
