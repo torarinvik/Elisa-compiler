@@ -30,7 +30,8 @@ BAD_ZEROED_GENERIC_CALL="$ROOT/test/repro/struct_field_refinement_zeroed_generic
 BAD_ZEROED_RETURN="$ROOT/test/repro/struct_field_refinement_zeroed_return.elisa"
 GOOD="$ROOT/test/repro/struct_field_refinement_refined_param.elisa"
 GOOD_RETURN="$ROOT/test/repro/struct_field_refinement_valid_return.elisa"
-GOOD_RETURN="$ROOT/test/repro/struct_field_refinement_valid_return.elisa"
+GOOD_RETURN_SCOPE="$ROOT/test/repro/field_return_scope_shadow.pos.elisa"
+BAD_RETURN_SCOPE_RESTORE="$ROOT/test/repro/field_return_scope_restore.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-field-refinement-shadow.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -48,15 +49,31 @@ ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
         cat "$WORK/good-stage1.log" >&2
         exit 1
     }
-"$STAGE0" -emit obj -O0 -o "$WORK/good-return-stage0.o" "$GOOD_RETURN" >"$WORK/good-return-stage0.log" 2>&1 || {
-    cat "$WORK/good-return-stage0.log" >&2
+"$STAGE0" -emit obj -O0 -o "$WORK/good-return-scope-stage0.o" "$GOOD_RETURN_SCOPE" >"$WORK/good-return-scope-stage0.log" 2>&1 || {
+    cat "$WORK/good-return-scope-stage0.log" >&2
     exit 1
 }
 ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
-    bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -o "$WORK/good-return-stage1.o" "$GOOD_RETURN" >"$WORK/good-return-stage1.log" 2>&1 || {
-        cat "$WORK/good-return-stage1.log" >&2
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -o "$WORK/good-return-scope-stage1.o" "$GOOD_RETURN_SCOPE" >"$WORK/good-return-scope-stage1.log" 2>&1 || {
+        cat "$WORK/good-return-scope-stage1.log" >&2
         exit 1
     }
+if grep -Fq 'refinement on the return of' "$WORK/good-return-scope-stage1.log"; then
+    printf 'Stage1 reported a refinement-return failure for a Stage0-valid shadowed receiver\n' >&2
+    cat "$WORK/good-return-scope-stage1.log" >&2
+    exit 1
+fi
+
+ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -o "$WORK/bad-return-scope-restore.o" "$BAD_RETURN_SCOPE_RESTORE" >"$WORK/bad-return-scope-restore.log" 2>&1 || {
+        cat "$WORK/bad-return-scope-restore.log" >&2
+        exit 1
+    }
+if [[ ! -e "$WORK/bad-return-scope-restore.o" ]] || ! grep -Fq 'refinement on the return of "restore_after_shadow_scope" could not be proven statically' "$WORK/bad-return-scope-restore.log"; then
+    printf 'Stage1 did not restore and diagnose the unrefined by-value parameter after its shadow scope closed\n' >&2
+    cat "$WORK/bad-return-scope-restore.log" >&2
+    exit 1
+fi
 
 "$STAGE0" -emit obj -O0 -o "$WORK/good-return-stage0.o" "$GOOD_RETURN" >"$WORK/good-return-stage0.log" 2>&1 || {
     cat "$WORK/good-return-stage0.log" >&2
@@ -110,4 +127,4 @@ reject_stage1 "$BAD_ZEROED_NAMED_CALL" "bad-zeroed-named-call"
 reject_stage1 "$BAD_ZEROED_GENERIC_CALL" "bad-zeroed-generic-call"
 reject_stage1 "$BAD_ZEROED_RETURN" "bad-zeroed-return"
 
-echo "struct-field refinement shadow smoke OK: unproven construction including same-name refined-parameter shadows, stores, record updates, zeroed values, refined calls and returns, compound mutations, and stale interval facts are rejected; proven values and refined parameters are accepted"
+echo "struct-field refinement shadow smoke OK: unproven constructions and stale facts are rejected; refined returns from block, assignment, loop, and match shadows remain accepted"
