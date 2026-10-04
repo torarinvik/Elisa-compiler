@@ -1,0 +1,196 @@
+# Stage1 backend — LOOP PRE-RESERVE: a counted loop that pushes into an outer local darray
+# a known number of times per iteration reserves the whole fill once, before the loop.
+# Part of `module Backend` (see codegen.elisa).
+#
+# stage0 does the same at analysis time (semantic/analyzer_auto_reserve.go: a synthesized
+# `ys.reserve(bound)` before `for i in 0..<n:` / `for x in src:` fills). stage1 had only the
+# narrow memory-speed buffer shape, so an ordinary fill grew 8 -> 16 -> 32 ..., one arena
+# call and one copy per doubling: `for i in 0..<16: xs.push(...)` cost an arena_alloc AND an
+# arena_realloc on every call of its function.
+#
+# Capacity is a hint, never semantics, so the proof only has to bound MEMORY, not prove
+# correctness: the reserve is exactly what the loop will push when the body runs straight
+# through. To keep it from over-reserving, the body may not break, continue or return, may
+# not contain a nested loop, match, value block or lambda (any of which could hide a jump),
+# and only UNCONDITIONAL top-level pushes count (a push under an `if` is simply not counted,
+# so the reserve is a lower bound). The receiver must be a plain local darray, not the loop
+# source, not redeclared or reassigned in the body. The bound is a literal, a scalar local, or
+# `src.count`/`src.len` of a local -- re-reading it cannot have a side effect -- clamped at 0
+# and capped (PRERESERVE_CAP elements), so a loop that panics early cannot have reserved an
+# unbounded block. Growth goes to the receiver's declaration arena, exactly as its pushes do.
+extend Backend:
+    private:
+        const PRERESERVE_CAP: u64 = 16777216
+        const PRERESERVE_MAX_PUSHES: i64 = 64
+
+        def prereserve_expr_plain(expression: Expr) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.Absent:
+                    return true
+                Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _):
+                    return true
+                Expr.ShorthandMember(_, _):
+                    return true
+                Expr.Call(callee, arguments, _, _):
+                    false return if not prereserve_expr_plain(callee)
+                    for argument in arguments:
+                        false return if not prereserve_expr_plain(argument)
+                    return true
+                Expr.Field(object, _, _):
+                    return prereserve_expr_plain(object)
+                Expr.Scope(base, _, _):
+                    return prereserve_expr_plain(base)
+                Expr.Index(object, index, _):
+                    return prereserve_expr_plain(object) and prereserve_expr_plain(index)
+                Expr.Slice(object, low, high, _):
+                    return prereserve_expr_plain(object) and prereserve_expr_plain(low) and prereserve_expr_plain(high)
+                Expr.IndexN(object, arguments, _):
+                    false return if not prereserve_expr_plain(object)
+                    for argument in arguments:
+                        false return if not prereserve_expr_plain(argument)
+                    return true
+                Expr.Binary(left, _, right, _):
+                    return prereserve_expr_plain(left) and prereserve_expr_plain(right)
+                Expr.Unary(_, operand, _):
+                    return prereserve_expr_plain(operand)
+                Expr.Move(operand, _):
+                    return prereserve_expr_plain(operand)
+                Expr.Paren(inner, _):
+                    return prereserve_expr_plain(inner)
+                Expr.Array(elements, _):
+                    for element in elements:
+                        false return if not prereserve_expr_plain(element)
+                    return true
+                Expr.Tuple(tuple_elements, _):
+                    for tuple_element in tuple_elements:
+                        false return if not prereserve_expr_plain(tuple_element)
+                    return true
+                Expr.Construct(type_expression, fields, _):
+                    false return if not prereserve_expr_plain(type_expression)
+                    for field in fields:
+                        false return if not prereserve_expr_plain(field.value)
+                    return true
+                Expr.If(condition, yes, no, _):
+                    return prereserve_expr_plain(condition) and prereserve_expr_plain(yes) and prereserve_expr_plain(no)
+                _:
+                    return false
+
+        # The loop body runs straight through: no jump, nested loop, match, prefix block or
+        # value block, and `name` is neither redeclared nor reassigned.
+        def prereserve_body_ok(body: darray[Stmt]&, name: sview) -> bool can[Abort.Panic]:
+            for statement in body:
+                match statement:
+                    Stmt.VarDecl(declared, _, value, _):
+                        false return if declared == name or not prereserve_expr_plain(value)
+                    Stmt.Assign(target, _, value, _):
+                        false return if not prereserve_expr_plain(target) or not prereserve_expr_plain(value)
+                        if target is Expr.Ident(assigned, _):
+                            false return if assigned == name
+                    Stmt.Expr(expression, _):
+                        if expression is Expr.Block(nested, value, _, _):
+                            false return if not (value is Expr.Invalid) or not prereserve_body_ok(nested, name)
+                        else:
+                            false return if not prereserve_expr_plain(expression)
+                    Stmt.If(condition, yes, no, _):
+                        false return if not prereserve_expr_plain(condition) or not prereserve_body_ok(yes, name) or not prereserve_body_ok(no, name)
+                    _:
+                        return false
+            return true
+
+        # Unconditional top-level `name.push(x)` statements (looking through capture headers).
+        def prereserve_push_count(body: darray[Stmt]&, name: sview) -> i64 can[Abort.Panic]:
+            count: mutable i64 = 0
+            for statement in body |count|:
+                if statement is Stmt.Expr(expression, _):
+                    if expression is Expr.Call(callee, arguments, _, _):
+                        if callee is Expr.Field(object, method, _):
+                            if object is Expr.Ident(receiver, _):
+                                count <- count + 1 if receiver == name and method == "push" and arguments.count == 1
+                    elif expression is Expr.Block(nested, value, _, _):
+                        count <- count + prereserve_push_count(nested, name) if value is Expr.Invalid
+            return count
+
+        def prereserve_push_receivers(body: darray[Stmt]&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in body |names|:
+                if statement is Stmt.Expr(expression, _):
+                    if expression is Expr.Call(callee, arguments, _, _):
+                        if callee is Expr.Field(object, method, _):
+                            if object is Expr.Ident(receiver, _):
+                                if method == "push" and arguments.count == 1:
+                                    seen: mutable bool = false
+                                    for known in names |seen, receiver|:
+                                        seen <- true if known == receiver
+                                    names.push(receiver) if not seen
+                    elif expression is Expr.Block(nested, value, _, _):
+                        prereserve_push_receivers(nested, names) if value is Expr.Invalid
+
+        def prereserve_scalar_type(kind: ValueType) -> bool:
+            return (kind.kind == TypeKind.Signed or kind.kind == TypeKind.Unsigned) and kind.bits > 0 and kind.bits <= 64
+
+        # The loop's trip count as a side-effect-free expression, or null.
+        def prereserve_loop_bound(iterable: Expr, local_scope: mutable Scope&) -> Expr? can[Abort.Panic]:
+            if iterable is Expr.Binary(low, operator, high, _):
+                null return if operator != TokenKind.RangeLt
+                if low is Expr.IntLit(start, _):
+                    null return if start != 0
+                else:
+                    return null
+                match high:
+                    Expr.IntLit(limit, _):
+                        return high if limit > 0
+                        return null
+                    Expr.Ident(limit_name, _):
+                        return high if prereserve_scalar_type(lookup_type(local_scope, limit_name))
+                        return null
+                    Expr.Field(object, field, _):
+                        if object is Expr.Ident(owner, _):
+                            owner_type: ValueType = lookup_type(local_scope, owner)
+                            return high if field == "count" and owner_type.kind == TypeKind.DArray
+                        return null
+                    _:
+                        return null
+            if iterable is Expr.Ident(source, pos):
+                return Expr.Field(iterable, "count", pos) if lookup_type(local_scope, source).kind == TypeKind.DArray
+            return null
+
+        def emit_loop_prereserve(variables: darray[sview]&, iterable: Expr, body: darray[Stmt]&, line: Ast::Pos, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not structs.memory_speed_enabled or not structs.memory_reserve_enabled
+            if prereserve_loop_bound(iterable, local_scope) is bound:
+                receivers: mutable darray[sview] = []
+                prereserve_push_receivers(body, receivers)
+                for receiver in receivers |variables, iterable, body, line, bound, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    skip: mutable bool = false
+                    for variable in variables |skip, receiver|:
+                        skip <- true if variable == receiver
+                    if iterable is Expr.Ident(source, _):
+                        skip <- true if source == receiver
+                    receiver_type: ValueType = lookup_type(local_scope, receiver)
+                    skip <- true if receiver_type.kind != TypeKind.DArray
+                    pushes: i64 = prereserve_push_count(body, receiver)
+                    skip <- true if pushes <= 0 or pushes > PRERESERVE_MAX_PUSHES
+                    skip <- true if not skip and not prereserve_body_ok(body, receiver)
+                    # An integer literal has no type of its own until a context gives it one.
+                    bound_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64} if bound is Expr.IntLit(_, _) else expression_type(bound, local_scope, fns, structs, generics)
+                    skip <- true if not prereserve_scalar_type(bound_type)
+                    if not skip:
+                        receiver_expression: Expr = Expr.Ident(receiver, line)
+                        if darray_address_of_expr(receiver_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slot:
+                            if emit_expression(bound, bound_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is raw_bound:
+                                i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                zero: LLVMValueRef = LLVMConstInt(i64_type, 0, 0)
+                                wide: mutable LLVMValueRef = raw_bound
+                                if bound_type.bits < 64:
+                                    wide <- LLVMBuildSExt(builder, raw_bound, i64_type, "prereserve.bound.wide") if bound_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, raw_bound, i64_type, "prereserve.bound.wide")
+                                # A negative signed bound runs the loop zero times: reserve nothing.
+                                positive: LLVMValueRef = LLVMBuildICmp(builder, 38, wide, zero, "prereserve.positive") if bound_type.kind == TypeKind.Signed else LLVMBuildICmp(builder, 33, wide, zero, "prereserve.nonzero")
+                                cap: LLVMValueRef = LLVMConstInt(i64_type, PRERESERVE_CAP, 0)
+                                # 36 = ULT: min(bound, cap) without overflow.
+                                capped: LLVMValueRef = LLVMBuildSelect(builder, LLVMBuildICmp(builder, 36, wide, cap, "prereserve.under.cap"), wide, cap, "prereserve.capped")
+                                trips: LLVMValueRef = LLVMBuildSelect(builder, positive, capped, zero, "prereserve.trips")
+                                extra: LLVMValueRef = LLVMBuildMul(builder, trips, LLVMConstInt(i64_type, pushes.u64(), 0), "prereserve.extra")
+                                header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                current: LLVMValueRef = darray_load_size_i64(LLVMBuildStructGEP2(builder, header, slot, 1, "prereserve.count.ptr"), ctx, builder, "prereserve.count")
+                                needed: LLVMValueRef = LLVMBuildAdd(builder, current, extra, "prereserve.needed")
+                                growth_runtime: Runtime = growth_runtime_for(receiver_expression, local_scope, runtime)
+                                if emit_darray_reserve(slot, receiver_type, needed, structs, growth_runtime, m, ctx, builder):
+                                    scratch_memory_report("buffer", receiver, line.line, "reserve once before a counted fill")
