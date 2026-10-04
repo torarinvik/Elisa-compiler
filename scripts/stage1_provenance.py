@@ -40,8 +40,9 @@ def source_revision(root):
         capture_output=True,
         text=True,
     )
+    # Informational only: a tree shipped without .git (remote gates) still has a provenance.
     if result.returncode != 0:
-        raise RuntimeError(f"cannot read Stage1 source revision from {root}")
+        return "unknown"
     return result.stdout.strip()
 
 
@@ -83,7 +84,10 @@ def check(root, binary):
     except (OSError, json.JSONDecodeError, RuntimeError) as error:
         print(f"stage1 provenance cannot be verified: {error}", file=sys.stderr)
         return 2
-    changed = [key for key, value in current.items() if recorded.get(key) != value]
+    # Freshness is decided by CONTENT. The git revision is recorded for humans but not compared:
+    # committing after a seed changes HEAD without changing a single input byte.
+    changed = [key for key, value in current.items()
+               if key != "source_revision" and recorded.get(key) != value]
     if changed:
         print("stage1 product is stale: provenance mismatch in " + ", ".join(changed), file=sys.stderr)
         return 2
