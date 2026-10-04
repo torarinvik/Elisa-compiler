@@ -23,23 +23,32 @@ loop captures; type-position T&[N] is no longer parsed as bitwise ampersand;
 zeroed-value container controls link the runtime object. The complete zeroed
 safety gate now passes, including Stage0/Stage1 O0/O2 controls.
 
-Driver acceptance: bare passes at 5 disagreements (limit 6); with-std fails at
-8 (limit 0). Do not loosen this ratchet to conceal integration gaps.
-Disagreements needing resolution:
+The first repaired driver sweep passes bare at 2 disagreements (limit 6),
+with no accept gaps. With-std is down from 8 disagreements to 1 (limit 0):
+storage_dependency_owned_return_global.neg. The subsequent owned-overload
+repair passes focused O0/O2 checks in bare and runtime-inclusive modes;
+the complete sweep is being rerun. No ratchet has been loosened.
 
-- global_storage_return.neg: Stage0 rejects, Stage1 accepts.
-- local_view_escape_view_call.pos: Stage0 accepts, Stage1 rejects.
-- named_states_without_derive.pos: Stage0 accepts, Stage1 rejects.
-- new_region_owner_resolved.neg: Stage0 rejects, Stage1 accepts.
-- reference_authority_forge.pos: Stage0 rejects, Stage1 accepts.
-- reference_authority_upgrade_reborrow.pos: Stage0 rejects, Stage1 accepts.
-- reference_authority_upgrade_value.pos: Stage0 rejects, Stage1 accepts.
-- storage_dependency_owned_return_global.neg: Stage0 accepts, Stage1 rejects.
+Repairs and fixture diagnosis:
 
-The authority accept gaps come from the compilation-unit-wide runtime_std
-exemption in check_pointer_erasure_cast; runtime inclusion must not exempt
-user code. Fix without disabling safety or relying on spelling-only trust.
-Other disagreements need individual diagnosis, not blanket exclusions.
+- Runtime inclusion no longer exempts nongeneric user code from reference
+  forging or authority-upgrade checks. Audited runtime casts have local grants.
+- Inline grants use exact expression spans; a granted argument cannot authorize
+  its ungranted sibling. The authority gate passes both compilers in bare and
+  runtime-inclusive modes, also testing function/global collisions in both orders.
+- Classic named states do not require derived predicates; protocol graph checks
+  remain enabled. The obsolete rejection and diagnostic expectation were removed.
+- The global-storage control no longer accidentally collides with atomic `store`.
+  The real function/global value-namespace collision is now rejected separately.
+- Region-selector controls return scalars independently of local scratch values,
+  separating legal owner resolution from return-provenance analysis.
+- The local-view escape case is explicitly marked deliberate-decline: Stage1
+  rejects a dangling view that Stage0's hidden arena happens to keep alive.
+- Fresh array returns use a bounded overload fallback rather than trusting a
+  spelling shared with atomic `load`. Unknown, nested, extern, arity-mismatched,
+  shadowed and borrow-carrying candidates remain conservative. Builtin array
+  symbol rows must not be mistaken for distinct nominal structs. The storage
+  gate preserves rejection of global-buffer and view-payload dependencies.
 
 Still required: driver parity repair, backend differential coverage, and
 self_host_gen3 byte-identical fixpoint.
