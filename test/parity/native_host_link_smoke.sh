@@ -4,7 +4,16 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/native-host-link.XXXXXX")"
-trap 'rm -rf -- "$WORK"' EXIT
+finish() {
+    local status=$?
+    if [[ "$status" -eq 0 ]]; then
+        rm -rf -- "$WORK"
+    else
+        echo "native host linking failed (status=$status); logs retained at $WORK" >&2
+    fi
+    exit "$status"
+}
+trap finish EXIT
 mkdir "$WORK/path with spaces"
 cp "$ROOT/test/repro/native_host_link.elisa" "$WORK/path with spaces/source.elisa"
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
@@ -19,7 +28,7 @@ if grep -Eq 'unable to disambiguate|linker command failed|unknown argument' "$WO
     echo 'native host linking emitted a linker failure' >&2
     exit 1
 fi
-# A real override must be invoked in both modes, including a space in its path.
+# A real override must be invoked in every mode, including a space in its path.
 export ELISA_NATIVE_LINK_REAL_CLANG="${ELISA_CLANG:-$(command -v clang)}"
 export ELISA_NATIVE_LINK_MARKER="$WORK/selected-driver.marker"
 cp "$ROOT/test/repro/native_host_link_driver.sh" "$WORK/path with spaces/selected clang"
@@ -33,7 +42,12 @@ test "$status" -eq 23
 ELISA_CLANG="$WORK/path with spaces/selected clang" "$BIN" -emit interpret "$WORK/path with spaces/source.elisa" >"$WORK/selected-interpret.out" 2>"$WORK/selected-interpret.err"
 test -s "$ELISA_NATIVE_LINK_MARKER"
 grep -Eq '\[ result[[:space:]]*\][[:space:]]*23' "$WORK/selected-interpret.out"
-# Neither mode may silently fall back to PATH when the caller selected a linker.
+cp "$ROOT/test/repro/native_host_link_tests.elisa" "$WORK/path with spaces/tests.elisa"
+: > "$ELISA_NATIVE_LINK_MARKER"
+ELISA_CLANG="$WORK/path with spaces/selected clang" "$BIN" -emit test "$WORK/path with spaces/tests.elisa" >"$WORK/selected-test.out" 2>"$WORK/selected-test.err"
+test -s "$ELISA_NATIVE_LINK_MARKER"
+grep -Eq '\[ SUMMARY[[:space:]]*\] 1 test\(s\) selected; passed=1 skipped=0 failed=0' "$WORK/selected-test.out"
+# No mode may silently fall back to PATH when the caller selected a linker.
 if ELISA_CLANG="$WORK/missing clang" "$BIN" -emit exe -o "$WORK/must-not-exist" "$WORK/path with spaces/source.elisa" >"$WORK/missing-exe.out" 2>&1; then
     echo 'executable mode ignored the selected missing linker' >&2
     exit 1
@@ -43,4 +57,8 @@ if ELISA_CLANG="$WORK/missing clang" "$BIN" -emit interpret "$WORK/path with spa
     echo 'interpreter mode ignored the selected missing linker' >&2
     exit 1
 fi
-echo 'native host linking: executable and interpreter return 23 with space-containing paths'
+if ELISA_CLANG="$WORK/missing clang" "$BIN" -emit test "$WORK/path with spaces/tests.elisa" >"$WORK/missing-test.out" 2>&1; then
+    echo 'test mode ignored the selected missing linker' >&2
+    exit 1
+fi
+echo 'native host linking: exe, interpret, and test honor the selected linker with space-containing paths'

@@ -28,7 +28,10 @@ export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 same=0
 differ=0
@@ -72,11 +75,11 @@ compare_modulo_backtrace() {
     strip() { sed -E 's/^ +[0-9]+ +[^ ]+ +0x[0-9a-f]+ .*/    <frame>/'; }
     s0="$("$ELISACORE_BIN" -emit test "$@" "$src" </dev/null 2>/dev/null | strip)"; rc0=$?
     s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test "$@" "$src" 2>/dev/null | strip)"; rc1=$?
-    if [ "$s0" = "$s1" ]; then
+    if [ "$s0" = "$s1" ] && [ "$rc0" = "$rc1" ]; then
         same=$((same + 1))
     else
         differ=$((differ + 1))
-        echo "DIFF: $label"
+        echo "DIFF: $label (stage0 rc=$rc0, stage1 rc=$rc1)"
         diff <(printf '%s\n' "$s0") <(printf '%s\n' "$s1") | head -10
     fi
 }

@@ -179,7 +179,8 @@ if [[ ! -x "$BIN" ]]; then
   exit 2
 fi
 
-bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN"
+# Provenance is a driver diagnostic, not part of the emitted program/report.
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" >&2
 
 # A product binary generated from older compiler sources is not a compatible cache.
 # In particular, parser/lowering changes can make the stale product misread a newer
