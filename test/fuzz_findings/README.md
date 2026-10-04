@@ -59,3 +59,22 @@ Every repro below is now rejected by stage1 with stage0's diagnostic. Each one i
 
 Check: across all diagnostic fixtures, counts match stock stage1 apart from the new fuzz files,
 and stage1 still compiles itself.
+
+# Generative runtime differential, round 2 (2026-10-04, tools/fuzz/difffuzz.py)
+
+Valid programs from `tools/fuzz/gen_progs.py`, built by stage0 and by stage1 at -O0 and -O2
+and RUN; output and exit code compared. ~9,000 programs on a Linux host.
+
+Fixed on branch claude/difffuzz-20261004 (fixtures live with the fix):
+- const enum member values other than a bare literal (`B = -3`, `D = 1 << 4`) took the running
+  ordinal in stage1 -- every early MISMATCH. Fixture: adversarial `const_enum_folded_values`.
+- `rows[i].f <- v` on an immutable field was checked only in the last function of a file
+  (stale structural local-type channel). Fixture: diagnostics `field_immutable_assign_indexed`.
+- darray `.count` and a `count` query were signed i64 in stage1, usize in stage0 (docs/18), so
+  `xs.count - 3 <= 0` compared differently. Fixture: adversarial `usize_count_compares_unsigned`.
+
+Open (repros here):
+| Repro | stage0 | stage1 | class |
+|---|---|---|---|
+| fn_value_effect_row_ignored(_arg) | reject (effect row) | accept, runs | PERMISSIVE: no effect rows on fn values |
+| query_same_line_binder_head_collision | 21 | declines | loud decline, known limit of the line-keyed __query table |
