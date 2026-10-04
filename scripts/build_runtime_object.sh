@@ -51,11 +51,25 @@ runtime_input_digest() {
       -exec "${HASH_COMMAND[@]}" {} + || return
     # The PRODUCT is an input: a reseed changes the compiler that builds the object.
     "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$PRODUCT" "$ELISA_CLANG_TOOL" || return
+    # So is the optimisation level: an -O0 and an -O2 object are different products.
+    printf 'opt-level %s\n' "$RUNTIME_OPT_LEVEL"
   } | LC_ALL=C sort | "${HASH_COMMAND[@]}" | awk '{print $1}'
 }
 runtime_object_digest() {
   "${HASH_COMMAND[@]}" < "$1" | awk '{print $1}'
 }
+# Built OPTIMISED. Every program calls into this object on its hottest paths -- AST store row
+# access (ctx_aos_store_record) on every packed-node match, arena growth, string compares --
+# and at -O0 those helpers were spill-everything code: ~35% of the elisa-proof checker's
+# samples. ELISACORE_FORCE_CONTRACTS keeps the runtime's own checks (contracts are erased
+# above -O0 otherwise), so only the code quality changes. The backend keeps this unit's
+# entry points external at every level (bundled_runtime_build), so -O2 cannot delete them.
+# ELISA_RUNTIME_OPT_LEVEL=-O0 restores the unoptimised object.
+RUNTIME_OPT_LEVEL="${ELISA_RUNTIME_OPT_LEVEL:--O2}"
+case "$RUNTIME_OPT_LEVEL" in
+  -O0|-O1|-O2|-O3) ;;
+  *) echo "ELISA_RUNTIME_OPT_LEVEL must be -O0, -O1, -O2 or -O3 (got $RUNTIME_OPT_LEVEL)" >&2; exit 2 ;;
+esac
 INPUT_DIGEST="$(runtime_input_digest)"
 STAMP="$OUT.inputs.sha256"
 if [[ -s "$OUT" && -f "$STAMP" && "${ELISA_RUNTIME_FORCE:-0}" != 1 ]]; then
@@ -78,7 +92,7 @@ trap cleanup_runtime_build EXIT
 # This entrypoint intentionally compiles the trusted bundled runtime as a standalone unit.
 # The product driver normally infers runtime status from flattened compiler sources, but
 # direct product invocations do not always preserve include-origin markers.
-ELISA_STAGE1_RUNTIME_STD=1 "$PRODUCT" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
+ELISA_STAGE1_RUNTIME_STD=1 ELISACORE_FORCE_CONTRACTS=1 "$PRODUCT" -emit obj "$RUNTIME_OPT_LEVEL" -o "$RUNTIME_TMP" "$SRC"
 # --host-callbacks: the object must link STANDALONE (`clang prog.o elisacore_runtime.o`),
 # not only through the driver, which adds its own weak callback shims and -dead_strip.
 bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" --host-callbacks >"$HOOK_SOURCE"
