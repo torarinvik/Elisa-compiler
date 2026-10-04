@@ -1281,13 +1281,63 @@ extend Semantic:
                     found <- invalidated_alias_in_expression(argument, invalidated) if found == ""
                 return found
 
-        def diagnose_invalidated_alias(expression: Ast::Expr, invalidated: darray[sview]&, invalidated_by: darray[sview]&, line: u32, table: lmut SymbolTable) -> void:
+        def diagnose_invalidated_alias(expression: Ast::Expr, alias_names: darray[sview]&, alias_sources: darray[sview]&, invalidated: darray[sview]&, invalidated_by: darray[sview]&, line: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 alias: sview = invalidated_alias_in_expression(expression, invalidated)
                 by: sview =
                     for candidate_index in 0..<invalidated.count |by: sview = ""| -> by:
                         by <- invalidated_by[candidate_index] if invalidated[candidate_index] == alias and candidate_index < invalidated_by.count
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StorageDependencyInvalidated, name: alias, pos: ident_extent_or_line(expression, line), line: line, expected: by, actual: ""}) if alias != ""
+                moved: bool = by != "" and storage_view_container_moved(by, alias_names, alias_sources)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StorageDependencyInvalidated, name: alias, pos: ident_extent_or_line(expression, line), line: line, expected: by, actual: "move" if moved else ""}) if alias != ""
+
+        # `move xs` (a consuming call argument, a value, or a `for e in move xs` drain) hands
+        # xs's buffer and elements to a new owner: every view or interior reference taken into
+        # xs before it is stale from then on, exactly as after a relocating push (stage0
+        # invalidateStorageViewsForMovedContainer; fuzz F16). A `"[moved]"` marker row records
+        # the move so the diagnostic says "move of xs".
+        def storage_view_container_moved(name: sview, alias_names: darray[sview]&, alias_sources: darray[sview]&) -> bool:
+            can Abort.Panic:
+                for index in 0..<alias_names.count:
+                    true return if alias_names[index] == "[moved]" and index < alias_sources.count and alias_sources[index] == name
+                return false
+
+        def storage_view_collect_moves(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Move(Expr.Ident(moved_name, _), _):
+                        out.push(moved_name) if not fresh_wrapper_name_exists(out, moved_name)
+                    Expr.Move(inner, _) | Expr.Paren(inner, _):
+                        storage_view_collect_moves(inner, out)
+                    Expr.Call(callee, arguments, _, _):
+                        storage_view_collect_moves(callee, out)
+                        for argument in arguments |out|:
+                            storage_view_collect_moves(argument, out)
+                    Expr.Field(object, _, _):
+                        storage_view_collect_moves(object, out)
+                    Expr.Binary(left, _, right, _):
+                        storage_view_collect_moves(left, out)
+                        storage_view_collect_moves(right, out)
+                    Expr.Unary(_, operand, _):
+                        storage_view_collect_moves(operand, out)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements |out|:
+                            storage_view_collect_moves(element, out)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |out|:
+                            storage_view_collect_moves(field.value, out)
+                    _:
+                        pass
+
+        def invalidate_moved_containers(expression: Ast::Expr, field_elems: darray[sview]&, function_line: u32, line: u32, annotations: darray[Ast::LocalRegionAnnotation]&, stable_regions: darray[sview]&, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview]&, invalidated_by: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                moved: mutable darray[sview] = []
+                storage_view_collect_moves(expression, moved)
+                for moved_name in moved |alias_names, alias_sources, alias_is_view, invalidated, invalidated_by|:
+                    invalidate_growth_aliases(moved_name, "", field_elems, function_line, line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
+                    if not storage_view_container_moved(moved_name, alias_names, alias_sources):
+                        alias_names.push("[moved]")
+                        alias_sources.push(moved_name)
+                        alias_is_view.push(false)
 
         # A plain darray and a darray in malloc/chained/scratch storage can move its backing
         # buffer when it grows. Only reserve_commit and fixed are single-block backings whose
@@ -2044,18 +2094,20 @@ extend Semantic:
                                 storage_view_collect_submits(body, submitted, submitted_lines)
                                 for submit_index in 0..<submitted.count |table, submitted, submitted_lines|:
                                     stale: sview = invalidated_alias_in_expression(submitted[submit_index], invalidated)
-                                    table <- diagnose_invalidated_alias(submitted[submit_index], invalidated, invalidated_by, submitted_lines[submit_index], table) if stale != "" and not storage_view_already_reported(stale, submitted_lines[submit_index], table)
+                                    table <- diagnose_invalidated_alias(submitted[submit_index], alias_names, alias_sources, invalidated, invalidated_by, submitted_lines[submit_index], table) if stale != "" and not storage_view_already_reported(stale, submitted_lines[submit_index], table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(value, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
                             invalidate_growth_aliases(growth_call_target(value), growth_call_target_field(value), field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             invalidate_callee_relocations(value, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            invalidate_moved_containers(value, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             storage_view_forget_invalidated(name, invalidated, invalidated_by)
                             storage_view_record_typed_alias(name, type_expression, value, alias_names, alias_sources, alias_is_view, view_fns)
                             storage_view_inherit_held(name, value, alias_names, alias_sources, alias_is_view)
                         Stmt.Expr(expression, line):
-                            table <- diagnose_invalidated_alias(expression, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(expression, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
                             invalidate_growth_aliases(growth_call_target(expression), growth_call_target_field(expression), field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             invalidate_callee_relocations(expression, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
+                            invalidate_moved_containers(expression, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             storage_view_record_container_store(expression, alias_names, alias_sources, alias_is_view, view_fns)
                             match expression:
                                 Expr.Block(statements, value, captures, block_line):
@@ -2072,8 +2124,9 @@ extend Semantic:
                             # cstr`) always rebinds it: there is no referent to write through, so a
                             # stale old value is not used (`name <- fill(storage)` after growth).
                             value_rebound: sview = storage_view_value_rebind_target(target, operator, value_names)
-                            table <- diagnose_invalidated_alias(target, invalidated, invalidated_by, line.line, table) if rebound == "" and value_rebound == ""
-                            table <- diagnose_invalidated_alias(value, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(target, alias_names, alias_sources, invalidated, invalidated_by, line.line, table) if rebound == "" and value_rebound == ""
+                            table <- diagnose_invalidated_alias(value, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
+                            invalidate_moved_containers(value, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             storage_view_forget_invalidated(rebound, invalidated, invalidated_by) if rebound != ""
                             storage_view_forget_invalidated(value_rebound, invalidated, invalidated_by) if value_rebound != "" and rebound == ""
                             invalidate_replaced_container_views(target, operator, value, replace_names, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) if rebound == ""
@@ -2114,14 +2167,14 @@ extend Semantic:
                                     _:
                                         storage_view_record_place_store(target, value, alias_names, alias_sources, alias_is_view, view_fns)
                         Stmt.Return(value, line):
-                            table <- diagnose_invalidated_alias(returned, invalidated, invalidated_by, line.line, table) if value is returned
+                            table <- diagnose_invalidated_alias(returned, alias_names, alias_sources, invalidated, invalidated_by, line.line, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- diagnose_invalidated_alias(condition, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(condition, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
                             storage_view_bind_payload_condition(condition, alias_names, alias_sources, alias_is_view, table)
                             table <- walk_region_storage_branch(then_body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                             table <- walk_region_storage_branch(else_body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)
                         Stmt.While(condition, while_body, line):
-                            table <- diagnose_invalidated_alias(condition, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(condition, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
                             storage_view_snapshot(invalidated, invalidated_by, loop_entry, loop_entry_by)
                             loop_exit: mutable darray[sview] = []
                             loop_exit_by: mutable darray[sview] = []
@@ -2131,7 +2184,8 @@ extend Semantic:
                             table <- storage_view_rewalk_loop_body(while_body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, aliases_before, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                             storage_view_restore_invalidated(loop_exit, loop_exit_by, invalidated, invalidated_by)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- diagnose_invalidated_alias(iterable, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(iterable, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
+                            invalidate_moved_containers(iterable, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by)
                             storage_view_snapshot(invalidated, invalidated_by, loop_entry, loop_entry_by)
                             loop_exit: mutable darray[sview] = []
                             loop_exit_by: mutable darray[sview] = []
@@ -2141,7 +2195,7 @@ extend Semantic:
                             table <- storage_view_rewalk_loop_body(for_body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, aliases_before, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table)
                             storage_view_restore_invalidated(loop_exit, loop_exit_by, invalidated, invalidated_by)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- diagnose_invalidated_alias(scrutinee, invalidated, invalidated_by, line.line, table)
+                            table <- diagnose_invalidated_alias(scrutinee, alias_names, alias_sources, invalidated, invalidated_by, line.line, table)
                             for arm in arms |table, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by| -> table:
                                 storage_view_bind_payload_pattern(arm.pattern, storage_view_place_root(scrutinee), alias_names, alias_sources, alias_is_view, table)
                                 table <- walk_region_storage_branch(arm.body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table)

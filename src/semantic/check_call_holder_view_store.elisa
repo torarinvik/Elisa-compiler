@@ -1,0 +1,333 @@
+# A call that stores a VIEW of this function's own container storage into a holder the
+# caller passed by reference (fuzz finding F2, stage0 checkCallArgumentHolderStoreEscape):
+#
+#     def set(h: mutable Hs&, s: sview) -> void:
+#         h.s <- s
+#     def fill(h: mutable Hs&) -> void:
+#         b: mutable darray[u8] = [65.u8()]
+#         set(h, b.as_sview())          # h.s now views b's bytes, freed when fill returns
+#
+# The direct store `h.s <- b.as_sview()` is the `in auto:` store escape; the callee's own
+# checks accept the store (both are its parameters), so the CALLER checks it, using the
+# store-through summary machinery (store_through_summary.elisa) with a different notion of a
+# writable target: a `mutable S&` parameter whose struct S holds a view field (sview, cstr,
+# view[T]), directly or through a nested struct field. Container holders (`mutable
+# darray[sview]&`) are the region container rule's, not this one's.
+#
+# The stored argument must be a view of OWNED storage: `x.as_sview()` / `x.as_cstr()` /
+# `x.view()` / `x[a:b]` whose root `x` is a local declared with a non-reference type outside
+# any region block, or a local bound once to such a view. The target argument's root must be
+# a reference parameter of the calling function (storage that outlives it). Only calls to a
+# uniquely declared free function are checked; methods and overloads are left alone.
+extend Semantic:
+    private:
+        # Whether TYPE_EXPRESSION names a struct in HOLDERS: `S`, `mutable S`, `S&`, `Mod::S`.
+        def chv_type_names_holder(type_expression: Ast::Expr, holders: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(type_name, _):
+                        return any holder in holders where holder == type_name
+                    Expr.Scope(_, scoped_name, _):
+                        return any holder in holders where holder == scoped_name
+                    Expr.Unary(_, operand, _):
+                        return chv_type_names_holder(operand, holders)
+                    Expr.Paren(inner, _):
+                        return chv_type_names_holder(inner, holders)
+                    _:
+                        return false
+
+        def chv_collect_structs(declarations: darray[Ast::Decl], names: mutable darray[sview]&, members: mutable darray[darray[Ast::StructMember]]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, members|:
+                    match declaration:
+                        Decl.Struct(struct_name, struct_members, _, _, _, _, _):
+                            names.push(struct_name)
+                            members.push(struct_members)
+                        Decl.Module(_, module_body, _):
+                            chv_collect_structs(module_body, names, members)
+                        Decl.Scoped(scoped_body, _):
+                            chv_collect_structs(scoped_body, names, members)
+                        _:
+                            pass
+
+        # Structs holding a view field, directly or through a field of another such struct.
+        def chv_view_holders(declarations: darray[Ast::Decl]) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                members: mutable darray[darray[Ast::StructMember]] = []
+                chv_collect_structs(declarations, names, members)
+                holders: mutable darray[sview] = []
+                more: mutable bool = true
+                while more |more, holders|:
+                    more <- false
+                    for index in 0..<names.count |more, holders|:
+                        if not (any holder in holders where holder == names[index]):
+                            holds: bool = any member in members[index] where exclusivity_type_is_view(member.type_expression) or chv_type_names_holder(member.type_expression, holders)
+                            if holds:
+                                holders.push(names[index])
+                                more <- true
+                return holders
+
+        # The store-through summary restricted to view-holder targets.
+        def chv_build_summary(declarations: darray[Ast::Decl], holders: darray[sview]&) -> StoreThroughSummary:
+            can Memory.Allocate, Abort.Panic:
+                summary: mutable StoreThroughSummary = sts_empty()
+                seen: mutable darray[sview] = []
+                functions: mutable darray[Ast::Decl] = []
+                sts_collect_declared(declarations, seen, functions)
+                summarised: mutable darray[Ast::Decl] = []
+                for function in functions |summary, seen, summarised|:
+                    match function:
+                        Decl.Func(function_name, function_parameters, _, _, _, _, _):
+                            if borrow_bound_once(seen, function_name):
+                                summary.declared.push(function_name)
+                                position: mutable usize = 0
+                                writable_found: mutable bool = false
+                                for parameter in function_parameters |position, writable_found, summary|:
+                                    if param_is_mutable_ref(parameter) and chv_type_names_holder(parameter.type_expression, holders):
+                                        summary.writable_function.push(function_name)
+                                        summary.writable_position.push(position)
+                                        writable_found <- true
+                                    position <- position + 1
+                                summarised.push(function) if writable_found and function_parameters.count > 1
+                        _:
+                            pass
+                more_rows: mutable bool = summarised.count > 0
+                while more_rows |more_rows, summary|:
+                    more_rows <- false
+                    for function in summarised |more_rows, summary|:
+                        match function:
+                            Decl.Func(function_name, function_parameters, _, function_body, _, _, _):
+                                more_rows <- true if sts_summarise_function(function_name, function_parameters, function_body, summary)
+                            _:
+                                pass
+                return summary
+
+        # Every binder of a function body (VarDecl names and `r = ...` definitions), with
+        # repeats, plus the locals declared with a non-reference type outside region blocks.
+        def chv_scan_locals(statements: darray[Ast::Stmt], in_region: bool, binders: mutable darray[sview]&, owned: mutable darray[sview]&, view_names: mutable darray[sview]&, view_values: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |binders, owned, view_names, view_values|:
+                    match statement:
+                        Stmt.VarDecl(declared_name, type_expression, declared_value, _):
+                            binders.push(declared_name)
+                            typed_owned: bool = chv_type_is_owned_container(type_expression) and not type_marker_present_here(type_expression, TokenKind.Ampersand)
+                            literal_owned: bool = (type_expression is Expr.Absent) and (declared_value is Expr.Array(_, _))
+                            owned.push(declared_name) if not in_region and (typed_owned or literal_owned)
+                            view_names.push(declared_name)
+                            view_values.push(declared_value)
+                        Stmt.Assign(Expr.Ident(assigned_name, _), _, _, _):
+                            binders.push(assigned_name)
+                        Stmt.If(_, then_body, else_body, _):
+                            chv_scan_locals(then_body, in_region, binders, owned, view_names, view_values)
+                            chv_scan_locals(else_body, in_region, binders, owned, view_names, view_values)
+                        Stmt.While(_, loop_body, _):
+                            chv_scan_locals(loop_body, in_region, binders, owned, view_names, view_values)
+                        Stmt.For(_, loop_variables, _, loop_body, _):
+                            for loop_variable in loop_variables |binders|:
+                                binders.push(loop_variable)
+                            chv_scan_locals(loop_body, in_region, binders, owned, view_names, view_values)
+                        Stmt.Block(kind, _, binding, block_body, _):
+                            binders.push(binding) if binding != ""
+                            chv_scan_locals(block_body, in_region or kind == "region" or kind == "in", binders, owned, view_names, view_values)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms |binders, owned, view_names, view_values|:
+                                pattern_names: mutable darray[sview] = []
+                                collect_pattern_binding_names(arm.pattern, pattern_names)
+                                for pattern_name in pattern_names |binders|:
+                                    binders.push(pattern_name)
+                                chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)
+                        Stmt.Expr(Expr.Block(block_statements, _, _, _), _):
+                            chv_scan_locals(block_statements, in_region, binders, owned, view_names, view_values)
+                        _:
+                            pass
+
+        # `darray[T]`, `dict[K, V]`, `set[T]` or `dstr`, under any `mutable`.
+        def chv_type_is_owned_container(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(type_name, _):
+                        return type_name == "dstr"
+                    Expr.Index(Expr.Ident(head_name, _), _, _):
+                        return head_name == "darray" or head_name == "set"
+                    Expr.IndexN(Expr.Ident(head_name, _), _, _):
+                        return head_name == "dict"
+                    Expr.Unary(operator, operand, _):
+                        return operator != TokenKind.Ampersand and chv_type_is_owned_container(operand)
+                    Expr.Paren(inner, _):
+                        return chv_type_is_owned_container(inner)
+                    _:
+                        return false
+
+        # The local a view-producing argument views: `x.as_sview()` / `x.as_cstr()` / `x.view()` /
+        # `x[a:b]` with `x` a bare name; "" otherwise.
+        def chv_view_call_local(argument: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, _):
+                        return chv_view_call_local(inner)
+                    Expr.Call(Expr.Field(receiver, method, _), call_arguments, _, _):
+                        return chv_viewed_local(receiver) if call_arguments.count == 0 and (method == "as_sview" or method == "as_cstr" or method == "view")
+                        return ""
+                    Expr.Slice(slice_object, _, _, _):
+                        return chv_viewed_local(slice_object)
+                    _:
+                        return ""
+
+        # The viewed container when PLACE is a bare local name or a slice of one.
+        def chv_viewed_local(place: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Ident(root_name, _):
+                        return root_name
+                    Expr.Slice(object, _, _, _):
+                        return chv_viewed_local(object)
+                    Expr.Paren(inner, _):
+                        return chv_viewed_local(inner)
+                    _:
+                        return ""
+
+        def chv_place_root(place: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Ident(root_name, _):
+                        return root_name
+                    Expr.Field(object, _, _):
+                        return chv_place_root(object)
+                    Expr.Index(object, _, _):
+                        return chv_place_root(object)
+                    Expr.Slice(object, _, _, _):
+                        return chv_place_root(object)
+                    Expr.Paren(inner, _):
+                        return chv_place_root(inner)
+                    _:
+                        return ""
+
+        # Whether ARGUMENT is a view of owned local storage: a direct view of an owned place, or
+        # a name bound exactly once to one (followed through `w = v` chains).
+        def chv_is_owned_view(argument: Ast::Expr, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if depth > 8
+                root: sview = chv_view_call_local(argument)
+                if root != "":
+                    return borrow_bound_once(binders, root) and lvre_has(owned, root)
+                match argument:
+                    Expr.Paren(inner, _):
+                        return chv_is_owned_view(inner, binders, owned, view_names, view_values, depth + 1)
+                    Expr.Ident(bound_name, _):
+                        return false if not borrow_bound_once(binders, bound_name)
+                        for index in 0..<view_names.count:
+                            return chv_is_owned_view(view_values[index], binders, owned, view_names, view_values, depth + 1) if view_names[index] == bound_name
+                        return false
+                    _:
+                        return false
+
+        def chv_check_call(call: Ast::Expr, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match call:
+                    Expr.Call(Expr.Ident(callee_name, _), call_arguments, _, _):
+                        return if not sts_has_writable(summary, callee_name)
+                        target: mutable usize = 0
+                        while target < call_arguments.count |target, table| -> table:
+                            if sts_is_writable(summary, callee_name, target):
+                                target_root: sview = chv_place_root(exclusivity_strip_address(call_arguments[target]).place)
+                                if target_root != "" and (any outer in ref_params where outer == target_root):
+                                    source: mutable usize = 0
+                                    while source < call_arguments.count |source, table| -> table:
+                                        if source != target and sts_has_pair(summary, callee_name, target, source) and chv_is_owned_view(call_arguments[source], binders, owned, view_names, view_values, 0):
+                                            at: Ast::Pos = Ast::expr_pos(call_arguments[source])
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", pos: at, line: at.line, expected: "", actual: "", state_code: (target + 1).u32()})
+                                        source <- source + 1
+                            target <- target + 1
+                    _:
+                        pass
+
+        def chv_walk_expression(expression: Ast::Expr, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        table <- chv_check_call(expression, ref_params, binders, owned, view_names, view_values, summary, table)
+                        table <- chv_walk_expression(callee, ref_params, binders, owned, view_names, view_values, summary, table)
+                        for argument in arguments |table| -> table:
+                            table <- chv_walk_expression(argument, ref_params, binders, owned, view_names, view_values, summary, table)
+                    Expr.Binary(left, _, right, _):
+                        table <- chv_walk_expression(left, ref_params, binders, owned, view_names, view_values, summary, table)
+                        table <- chv_walk_expression(right, ref_params, binders, owned, view_names, view_values, summary, table)
+                    Expr.Unary(_, operand, _):
+                        table <- chv_walk_expression(operand, ref_params, binders, owned, view_names, view_values, summary, table)
+                    Expr.Paren(inner, _):
+                        table <- chv_walk_expression(inner, ref_params, binders, owned, view_names, view_values, summary, table)
+                    Expr.Field(object, _, _):
+                        table <- chv_walk_expression(object, ref_params, binders, owned, view_names, view_values, summary, table)
+                    Expr.If(condition, then_value, else_value, _):
+                        table <- chv_walk_expression(condition, ref_params, binders, owned, view_names, view_values, summary, table)
+                        table <- chv_walk_expression(then_value, ref_params, binders, owned, view_names, view_values, summary, table)
+                        table <- chv_walk_expression(else_value, ref_params, binders, owned, view_names, view_values, summary, table)
+                    Expr.Block(block_statements, block_value, _, _):
+                        table <- chv_walk_statements(block_statements, ref_params, binders, owned, view_names, view_values, summary, table)
+                        table <- chv_walk_expression(block_value, ref_params, binders, owned, view_names, view_values, summary, table)
+                    _:
+                        pass
+
+        def chv_walk_statements(statements: darray[Ast::Stmt], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(statement_value, _):
+                            table <- chv_walk_expression(statement_value, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.VarDecl(_, _, declared_value, _):
+                            table <- chv_walk_expression(declared_value, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.Assign(_, _, assigned_value, _):
+                            table <- chv_walk_expression(assigned_value, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.Return(returned, _):
+                            table <- chv_walk_expression(returned_value, ref_params, binders, owned, view_names, view_values, summary, table) if returned is returned_value
+                        Stmt.If(condition, then_body, else_body, _):
+                            table <- chv_walk_expression(condition, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_statements(then_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_statements(else_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.While(condition, loop_body, _):
+                            table <- chv_walk_expression(condition, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_statements(loop_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.For(_, _, iterable, loop_body, _):
+                            table <- chv_walk_expression(iterable, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_statements(loop_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.Block(_, _, _, block_body, _):
+                            table <- chv_walk_statements(block_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                        Stmt.Match(scrutinee, arms, _):
+                            table <- chv_walk_expression(scrutinee, ref_params, binders, owned, view_names, view_values, summary, table)
+                            for arm in arms |table| -> table:
+                                table <- chv_walk_statements(arm.body, ref_params, binders, owned, view_names, view_values, summary, table)
+                        _:
+                            pass
+
+        def chv_walk_declarations(declarations: darray[Ast::Decl], summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(_, parameters, _, body, _, _, _):
+                            ref_params: mutable darray[sview] = []
+                            binders: mutable darray[sview] = []
+                            for parameter in parameters |ref_params, binders|:
+                                binders.push(parameter.name)
+                                ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                            if ref_params.count > 0:
+                                owned: mutable darray[sview] = []
+                                view_names: mutable darray[sview] = []
+                                view_values: mutable darray[Ast::Expr] = []
+                                chv_scan_locals(body, false, binders, owned, view_names, view_values)
+                                table <- chv_walk_statements(body, ref_params, binders, owned, view_names, view_values, summary, table) if owned.count > 0
+                        Decl.Module(_, module_body, _):
+                            table <- chv_walk_declarations(module_body, summary, table)
+                        Decl.Scoped(scoped_body, _):
+                            table <- chv_walk_declarations(scoped_body, summary, table)
+                        _:
+                            pass
+
+    public:
+        def check_call_holder_view_store(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                holders: darray[sview] = chv_view_holders(file.top_decls)
+                return if holders.count == 0
+                summary: StoreThroughSummary = chv_build_summary(file.top_decls, holders)
+                return if summary.writable_function.count == 0
+                table <- chv_walk_declarations(file.top_decls, summary, table)
