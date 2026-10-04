@@ -30,7 +30,8 @@ inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa"
           HERE / "derived_source_snapshot.elisa", HERE / "derived_source_snapshot_rejected.elisa",
           HERE / "derived_source_join.elisa", HERE / "derived_source_join_rejected.elisa",
           HERE / "derived_source_loop_head.elisa", HERE / "derived_source_loop_head_rejected.elisa",
-          HERE / "derived_source_loop_exit.elisa", HERE / "derived_source_loop_exit_rejected.elisa"]
+          HERE / "derived_source_loop_exit.elisa", HERE / "derived_source_loop_exit_rejected.elisa",
+          HERE / "derived_source_for_entry.elisa", HERE / "derived_source_for_entry_rejected.elisa"]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):
@@ -227,6 +228,16 @@ code, source_exit_rejected = run("derived_source_loop_exit_rejected.elisa")
 assert code == 1 and source_exit_rejected["status"] == "failed"
 assert {finding["name"] for finding in source_exit_rejected["findings"]} == {"break_state_can_be_discarded", "unknown_continue_preserves_knowledge"}
 assert all(finding["kind"] == "ensure-unproven" for finding in source_exit_rejected["findings"])
+code, source_for = run("derived_source_for_entry.elisa")
+assert code == 0 and source_for["status"] == source_for["verification_state"] == "proved"
+assert source_for["summary"]["proven"] == source_for["summary"]["obligations"] == 24
+assert source_for == run("derived_source_for_entry.elisa")[1]
+assert not source_for["findings"]
+assert all(row.get("verified") for row in source_for["declaration_details"] if row["kind"] == "function")
+code, source_for_rejected = run("derived_source_for_entry_rejected.elisa")
+assert code == 1 and source_for_rejected["status"] == "failed"
+assert {finding["name"] for finding in source_for_rejected["findings"]} == {"proven_nonempty_retains_zero_entry", "unknown_count_can_drop_entry"}
+assert all(finding["kind"] == "ensure-unproven" for finding in source_for_rejected["findings"])
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
@@ -244,6 +255,7 @@ print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain 
                   "derived_source_join_report_replayed": 22,
                   "derived_source_loop_head_report_replayed": 26,
                   "derived_source_loop_exit_report_replayed": 24,
+                  "derived_source_for_entry_report_replayed": 24,
                   "derived_result_refutation_report_replayed": 12,
                   "derived_snapshot_knowledge_report_replayed": 12,
                   "qualified_type_application_report_replayed": 10,

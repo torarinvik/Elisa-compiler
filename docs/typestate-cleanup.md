@@ -381,24 +381,47 @@ later-iteration copies with stale state, break-before-write and scalar-reference
 alias counterclaims reject semantically without artifacts. The existing source,
 result-context, coupled-predicate and typestate-foundation gates also pass.
 
-**Stage0 loop parity remains open.** Literal-false `while` and constant-empty
+**Stage0 loop transfer now passes the focused native corpus.** Literal-false `while` and constant-empty
 ascending default-step ranges now preserve the entry tracked typestate while
 still checking the body. Explicit `break`/`continue` snapshots now carry current
 tracked value types as well as affine state in while, range-for and iterable-for
 loops; a body that exits through a jump can no longer discard a state-changing
 write. Focused controls reject six direct mutation/jump combinations and two
 mixed branch/jump paths with the actual return-type mismatch, while unchanged
-and unreachable jump controls accept. These are exit-state fixes, not cyclic
-body validation. The analyzer still over-widens proven-nonempty ranges and emits
-LLVM for the invalid later-iteration copy. The separately
-named `derived_source_loop_stage0_audit.sh` is deliberately red (current exit 1,
-reporting compiler exit 0 with an artifact). It is not folded into the green
-Stage1 gate. Next priority is a binding-keyed, cyclic tracked-state transfer in
-Stage0, including empty/nonempty range classification and later-iteration body
-checks without speculative diagnostics or leaking other analyzer side effects.
-This requires auditing `analyzer_flow.go`, `analyzer_flow_loop_stmts.go`, branch
-snapshots and tracked-type propagation, not merely widening a declaration before
-the first body check.
+and unreachable jump controls accept. A separate bounded, binding-keyed transfer
+now stabilizes while/range loop heads without replaying borrow/effect analysis,
+optimization recording or SMT hypotheses. It checks the stabilized body, retains
+zero-iteration predecessors for unknown counts, transfers proven-nonempty ranges
+at least once, and excludes break edges from the back edge. First-iteration
+variable facts cannot classify a range or justify literal reclassification.
+Fixed-width integer range arithmetic uses mathematical evaluation with a
+representation check at every node, including u64's high half and overflowing
+inclusive ends; unknown/target-dependent representations stay conservative.
+Fuel (8192), depth (128) and iteration (64) exhaustion and unsupported coverage
+reject and do not install partial narrow facts. Clone memos are shared across
+bindings within a frontier. Existing checked call poststates are replayed through
+the pure type transform; other effects and possible scalar-reference aliases
+widen. Generated constant-true capture wrappers no longer add impossible skip
+paths to specialized-type/function-value/range joins.
+
+`derived_source_loop_stage0_smoke.sh` executes the shared positive program at
+O0/O2 through Stage0's C archive/link path and requires semantic exit 1 with no
+artifact for zero-entry, stale later-iteration and break-before-write controls.
+`derived_source_loop_stage0_audit.sh` is now green and requires the current-state
+diagnostic, not an unrelated failure. These focused controls are not full loop,
+diagnostic, ownership or compiler parity.
+
+**Predicate knowledge remains a critical Stage0 gap.** The new
+`derived_source_single_state_unknown.neg.elisa` counterexample currently emits
+LLVM in Stage0 while fresh Stage1 rejects unknown predicate evidence. A single
+case's full possible-state set is not a knowledge certificate. The separately
+named `derived_source_single_state_stage0_audit.sh` is deliberately red. Next
+priority is explicit knowledge in the Stage0 frontier and source/exit contexts,
+including symbolic updates, unknown effects and one-case/non-exhaustive families;
+do not hide this by treating a full state set as known or enabling classic Stage1
+transitions. Pure-root derived families are covered by this transfer; top-level
+iterable loops, nested-only state-bearing roots, pattern/guard refinements,
+general effect summaries and full predicate coverage/overlap still need work.
 
 **Remaining enforcement/inference work:** match joins retain the entry path until
 exhaustiveness is certified. Checked call/effect/alias summaries, pattern/loop binder seeding,
@@ -428,6 +451,11 @@ or hiding an unknown continue state are rejected counterclaims. The admission
 gate checks deterministic full reports, zero semantic errors, no trusted
 assumptions, complete certificate replay and unchanged input hashes. These laws
 model exit edges and do not prove the Go jump snapshot/traversal implementation.
+
+`derived_source_for_entry.elisa` adds 24 replayed obligations for zero-entry
+admission, known-nonempty exclusion, singleton transfer and retained break states.
+Opposite zero-entry claims reject. These laws do not prove the range arithmetic
+recognizer, first-iteration transfer, or the new Go fixed-point implementation.
 The proof assistant now admits validated opposite-connective subtrees as opaque
 signed islands and reduces their constant identities. Matching preserves exact
 subtree/polarity identity without distribution, arithmetic evaluation, synthetic
