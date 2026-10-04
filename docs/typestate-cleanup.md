@@ -315,6 +315,16 @@ both `derived_record_update_forged.neg.elisa` and
 `derived_record_update_single_unknown.neg.elisa`. Closing these demonstrated
 holes is required before claiming derived-state parity.
 
+Stage1 now preserves each derived rule's declaring module and exact struct source
+position, and resolves it to the canonical family declaration ID. Resolution
+requires exactly one matching derived family; detached, ambiguous or mismatched
+rules retain an unresolved sentinel rather than falling back to a bare name.
+`derived_rule_identity_probe.elisa` exercises root and nested same-named families,
+opposite predicates, missing declarations, incorrect source positions and module
+substitution. This is identity infrastructure, not predicate enforcement: the
+legacy constructor/flow checks still need to consume these canonical rows before
+the demonstrated record-update holes can be closed safely.
+
 ### 5. Fallible operations and terminal obligations
 
 Each outcome needs a checked state contract: success, failure, early return, and
