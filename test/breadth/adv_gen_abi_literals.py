@@ -145,6 +145,19 @@ def main() -> i64:
     xs: darray[i64] = [1, 2, 3, 4, 5]
     return (count x in xs where x > 2) * 10 + (sum y in xs where y > 2)
 """)
+    # difffuzz 2026-10-04: `.count` and a `count` query are usize (docs/18), so a difference
+    # below zero wraps and compares HUGE in stage0 -- even against an i64 operand (`- v`).
+    # stage1 typed both as signed i64: 19 instead of 28.
+    yield ("usize_count_compares_unsigned", """
+def main() -> i64:
+    xs: darray[i64] = [12, 7]
+    v: i64 = 3
+    a: i64 = 1 if xs.count - 3 <= 0 else 0
+    b: i64 = 1 if (count y in xs where y > 0) - v <= 0 else 0
+    c: i64 = 1 if xs.count / 2 - 2 > 0 else 0
+    d: i64 = 1 if xs.count < 1 - 2 else 0
+    return a + b * 2 + c * 4 + d * 8 + 16
+""")
     yield ("query_any_all", """
 def main() -> i64:
     xs: darray[i64] = [1, 2, 3]
@@ -317,6 +330,23 @@ const enum Step of i64:
 
 def main() -> i64:
     return Step.A.i64() * 100 + Step.B.i64() * 10 + Step.C.i64()
+""")
+    # difffuzz 2026-10-04: stage1 read the member value only when it was a bare IntLit, so
+    # `B = -3` (a Unary) and `D = 1 << 4` (a Binary) silently took the running ordinal.
+    # stage0 const-evaluates: A=0 B=-3 C=-2 D=16 E=17 F=5 G=6.
+    yield ("const_enum_folded_values", """
+const enum K of i64:
+    A
+    B = -3
+    C
+    D = 1 << 4
+    E
+    F = (2 + 3) * 2 - 5
+    G
+
+def main() -> i64:
+    s: i64 = K.A.i64() * 7 + K.B.i64() * 11 + K.C.i64() * 13 + K.D.i64() + K.E.i64() * 3
+    return s + K.F.i64() * 5 + K.G.i64() * 2 + 50
 """)
     yield ("const_enum_in_when_columns", """
 const enum Code of i64:
