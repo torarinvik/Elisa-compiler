@@ -328,12 +328,13 @@ tracking, general inference and coverage/overlap remain open. A valid symbolic
 update currently needs further proof-aware compiler support, rather than being
 admitted merely because a predicate was undecidable.
 
-`derived_dependency_join.elisa` is an **unproved regression**, excluded from the
-admission gate. Its non-constant De Morgan equivalence exposes a proof-assistant
-logical-normalization gap: the primary ensure is unproved and dependent function
-summaries are unverified. Producer and independent kernel support must be added
-before admitting this law; the existing 16-obligation update-policy model still
-replays and is not a proof of the dependency AST walker.
+`derived_dependency_join.elisa` is now admitted: bounded signed-atom normalization
+in the proof producer and independent kernel proves the non-constant De Morgan
+equivalence without distribution, arena rewriting or synthetic premises. All
+26 obligations replay (16 imported policy obligations plus 10 join obligations);
+one-known/one-unchanged counterclaims reject. Complete primitive-tree validation,
+atom witnesses, fuel/depth/atom bounds and polarity are retained. These policy
+model laws are not a proof of the dependency AST walker or source-state validity.
 
 Returns and annotated locals resolve their expected canonical derived family and
 state (including alias-carried states). Direct record updates and constructors,

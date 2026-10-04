@@ -25,7 +25,8 @@ inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa"
           HERE / "derived_rule_selection.elisa", HERE / "derived_rule_selection_rejected.elisa",
           HERE / "qualified_type_application.elisa", HERE / "qualified_type_application_rejected.elisa",
           HERE / "derived_snapshot_knowledge.elisa", HERE / "derived_snapshot_knowledge_rejected.elisa",
-          HERE / "derived_result_refutation.elisa", HERE / "derived_result_refutation_rejected.elisa"]
+          HERE / "derived_result_refutation.elisa", HERE / "derived_result_refutation_rejected.elisa",
+          HERE / "derived_dependency_join.elisa", HERE / "derived_dependency_join_rejected.elisa"]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):
@@ -172,6 +173,16 @@ code, refutation_rejected = run("derived_result_refutation_rejected.elisa")
 assert code == 1 and refutation_rejected["status"] == "failed"
 assert {finding["name"] for finding in refutation_rejected["findings"]} == {"undecided_means_contradiction", "true_predicate_is_contradiction"}
 assert all(finding["kind"] == "ensure-unproven" for finding in refutation_rejected["findings"])
+code, dependency = run("derived_dependency_join.elisa")
+assert code == 0 and dependency["status"] == dependency["verification_state"] == "proved"
+assert dependency["summary"]["proven"] == dependency["summary"]["obligations"] == 26
+assert dependency == run("derived_dependency_join.elisa")[1]
+assert not dependency["findings"]
+assert all(row.get("verified") for row in dependency["declaration_details"] if row["kind"] == "function")
+code, dependency_rejected = run("derived_dependency_join_rejected.elisa")
+assert code == 1 and dependency_rejected["status"] == "failed"
+assert {finding["name"] for finding in dependency_rejected["findings"]} == {"one_known_operand_is_enough", "one_unchanged_operand_is_enough"}
+assert all(finding["kind"] == "ensure-unproven" for finding in dependency_rejected["findings"])
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
@@ -184,6 +195,7 @@ print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain 
                   "protocol_authority_false_claims_rejected": sorted(authority_false_names),
                   "protocol_family_identity_report_replayed": 10,
                   "protocol_family_false_claims_rejected": ["same_state_ordinal_merges_families"],
+                  "derived_dependency_join_report_replayed": 26,
                   "derived_result_refutation_report_replayed": 12,
                   "derived_snapshot_knowledge_report_replayed": 12,
                   "qualified_type_application_report_replayed": 10,
