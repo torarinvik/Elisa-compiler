@@ -78,6 +78,7 @@ NAMES=(
     submit_unnamed_view_growth
     submit_local_mutable_ref
     storage_dependency_owned_return_global
+    storage_dependency_owned_return_qualified
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
@@ -319,6 +320,7 @@ EXPECTS=(
     "argument 1 to \"f\" expects sview, got static u8&"
     "storage dependency facts were invalidated by darray push"
     "is not structurally shareable across threads"
+    "storage dependency facts were invalidated by darray push"
     "storage dependency facts were invalidated by darray push"
     "if condition must be bool, got mutable bool&"
     "not operator requires bool operand"
