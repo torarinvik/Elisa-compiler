@@ -81,6 +81,7 @@ NAMES=(
     storage_dependency_owned_return_qualified
     store_ref_local_global
     storage_growth_through_ref_self
+    local_field_view_bound_return
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
@@ -326,6 +327,7 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "storing a reference to function-local storage into longer-lived storage"
     "storage dependency facts were invalidated by darray push"
+    "via return"
     "if condition must be bool, got mutable bool&"
     "not operator requires bool operand"
     "duplicate packed group member \"b\" in H.flags"

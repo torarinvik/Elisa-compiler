@@ -5,7 +5,7 @@ Repros are in `repros/`. stage0's verdict counts as a rejection if it rejects un
 ## S1: confirmed by execution
 | ID | Repro | stage0 | stage1 | Owner |
 |---|---|---|---|---|
-| F1 | esc_return_struct_field_view (+ esc_return_local_view_control) | accept | accept | both-escape agent |
+| F1 | esc_return_struct_field_view (+ esc_return_local_view_control) | accept | reject (2026-10-04, droots fixpoint) | stage0 still open |
 | F2 | setter_store_through_local_view | accept | accept | both-escape agent |
 | F3 | callarg_mutref_and_view_overlap | accept | accept | both-escape agent |
 | F4 | region_store_field_view_escape | reject | accept | s1-holes agent |
