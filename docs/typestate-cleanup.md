@@ -322,8 +322,22 @@ rules retain an unresolved sentinel rather than falling back to a bare name.
 `derived_rule_identity_probe.elisa` exercises root and nested same-named families,
 opposite predicates, missing declarations, incorrect source positions and module
 substitution. This is identity infrastructure, not predicate enforcement: the
-legacy constructor/flow checks still need to consume these canonical rows before
-the demonstrated record-update holes can be closed safely.
+constructor checker now resolves the explicit state-qualified type in its owning
+module and selects only rules with the same canonical family ID and state. The
+paired `derived_constructor_family_smoke.sh` gate accepts two same-named families
+with opposite predicates and rejects a contradictory literal in its own family.
+The flow checker and record-update checks still need canonical enforcement before
+the demonstrated record-update holes can be closed safely. Alias-carried states,
+broader contextual construction and unknown predicates also remain open.
+`derived_constructor_qualified.repro.elisa` records another open Stage1 issue:
+valid `Owner::File[Valid]{...}` construction reports `Valid` as an undefined
+identifier. Its rejection is not a safety gate or evidence of qualified parity.
+
+`derived_rule_selection.elisa` supplies 12 independently replayed selection-policy
+obligations, including unknown-family, protocol-family, different-family and
+different-state exclusion. Opposite same-spelling/unresolved-authority claims
+reject. These model laws assume canonical resolution and do not prove the parser,
+constructor traversal or predicate evaluator.
 
 ### 5. Fallible operations and terminal obligations
 
