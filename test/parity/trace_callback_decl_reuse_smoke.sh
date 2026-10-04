@@ -25,8 +25,8 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 [[ -x "$CLANG" ]] || { echo "trace_callback_decl_reuse FAIL: no clang" >&2; exit 1; }
 
 case "$(uname -s)" in
-    Linux) LINK_FLAGS=(-no-pie -Wl,--gc-sections); LINK_LIBS=(-lm) ;;
-    Darwin) LINK_FLAGS=(-Wl,-dead_strip); LINK_LIBS=() ;;
+    Linux) LINK_FLAGS=(-no-pie -Wl,--gc-sections -lm) ;;
+    Darwin) LINK_FLAGS=(-Wl,-dead_strip) ;;
     *) echo "trace_callback_decl_reuse FAIL: unsupported host $(uname -s)" >&2; exit 2 ;;
 esac
 
@@ -34,7 +34,7 @@ esac
 
 link_and_run() {
     local label="$1" object="$2"
-    "$CLANG" "${LINK_FLAGS[@]}" -o "$WORK/$label" "$object" "$RUNTIME_OBJ" "$WORK/profile_hooks.o" "${LINK_LIBS[@]}"
+    "$CLANG" -o "$WORK/$label" "$object" "$RUNTIME_OBJ" "$WORK/profile_hooks.o" "${LINK_FLAGS[@]}"
     "$WORK/$label"
 }
 
