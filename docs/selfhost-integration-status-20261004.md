@@ -23,11 +23,12 @@ loop captures; type-position T&[N] is no longer parsed as bitwise ampersand;
 zeroed-value container controls link the runtime object. The complete zeroed
 safety gate now passes, including Stage0/Stage1 O0/O2 controls.
 
-The first repaired driver sweep passes bare at 2 disagreements (limit 6),
-with no accept gaps. With-std is down from 8 disagreements to 1 (limit 0):
-storage_dependency_owned_return_global.neg. The subsequent owned-overload
-repair passes focused O0/O2 checks in bare and runtime-inclusive modes;
-the complete sweep is being rerun. No ratchet has been loosened.
+The complete repaired driver sweep passes bare at 2 disagreements (limit 6),
+with no accept gaps, and with-std at zero disagreements (limit 0). Both results
+were reproduced after the alias-owner repair. No ratchet has been loosened.
+The native backend gate passes 563/563 before the subsequent packed-pattern
+repairs; required Stage0 oracle compilation now fails the gate rather than
+silently skipping cases.
 
 Repairs and fixture diagnosis:
 
@@ -50,8 +51,17 @@ Repairs and fixture diagnosis:
   symbol rows must not be mistaken for distinct nominal structs. The storage
   gate preserves rejection of global-buffer and view-payload dependencies.
 
-Still required: driver parity repair, backend differential coverage, and
-self_host_gen3 byte-identical fixpoint.
+Bootstrap exposed three additional lowering gaps: payloadless packed `or`
+arms, nested value-match bindings, and nested string constraints. The recursive
+matcher now compares string contents and falls through on mismatch instead of
+silently treating the literal as a wildcard; unsupported field types decline.
+Tag-only patterns remain legal, and payload offsets account for common fields.
+The new native packed-pattern gate passes Stage0/Stage1 at O0/O2, including
+matching and mismatching literals, wrong tags, and both empty alternatives.
+The quantified-range contract gate passes. The final native suite and bootstrap
+closure are being rerun. Bootstrap stage A passes all five blocker controls.
+
+Still required: final backend coverage and self_host_gen3 byte-identical fixpoint.
 Only then advance primary main and remove other local branches/worktrees.
 
 Recovery: primary .git/selfhost-integration-recovery-20261004.bundle was
