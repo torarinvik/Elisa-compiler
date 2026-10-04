@@ -87,7 +87,11 @@ def check(root, binary):
     if changed:
         print("stage1 product is stale: provenance mismatch in " + ", ".join(changed), file=sys.stderr)
         return 2
-    print(f"stage1 provenance: current ({current['source_revision']})")
+    # Silent on success: assert_stage1_fresh.sh runs before EVERY wrapper compile, so a line
+    # here lands in the compiler's own output (stdout of `-emit ast`/`fmt`, the first stderr
+    # line a parity gate compares). ELISA_PROVENANCE_VERBOSE=1 prints it.
+    if os.environ.get("ELISA_PROVENANCE_VERBOSE") == "1":
+        print(f"stage1 provenance: current ({current['source_revision']})", file=sys.stderr)
     return 0
 
 
