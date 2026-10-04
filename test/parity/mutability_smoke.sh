@@ -51,4 +51,9 @@ grep -q "readonly ref" <<< "$out" && fail "explicit mutable reference binding wa
 out=$(printf 'def f() -> void:\n    x: mutable i64 = 5\n    p: mutable i64& = &x\n    p <- 7\n' | "$RPT")
 grep -q "cannot mutate through readonly ref\|cannot assign through readonly ref" <<< "$out" && fail "mutable pointee through an immutable slot was rejected: $out"
 
-echo "mutability smoke OK: binding and pointee mutability remain independent, 0 FP"
+# 11. Mutability inside a grouped pointer chain belongs only to that inner
+# reference. It must not make the outer readonly pointer slot writable.
+out=$(printf 'def f(p: (mutable i64&?) &?, q: mutable i64&?) -> void:\n    p <- q\n' | "$RPT")
+grep -q "cannot assign through readonly ref\|cannot mutate through readonly ref" <<< "$out" || fail "inner mutable reference leaked write capability to the readonly outer layer: $out"
+
+echo "mutability smoke OK: binding and per-layer pointee mutability remain independent, 0 FP"

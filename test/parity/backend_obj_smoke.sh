@@ -71,6 +71,11 @@ obj_case() {
 
 obj_case scalar   'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 42
 
+# Internal parser metadata also uses owner/name annotation pairs. Only rows explicitly
+# paired with `__export_global` may materialize LLVM aliases; otherwise a regular global
+# in this object collides with the same generated metadata symbol in the runtime object.
+obj_case lsp_declaration_name_not_exported 'global lsp_alias_probe: i64 = 40\n\ndef main() -> i64:\n    return lsp_alias_probe + 2\n' 42
+
 # Value blocks lower their leading declarations in the current scope and evaluate the
 # trailing expression as the block result.
 obj_case value_block 'def main() -> i64:\n    value: i64 =\n        x: i64 = 40\n        x + 2\n    return value\n' 42

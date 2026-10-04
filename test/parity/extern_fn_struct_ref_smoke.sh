@@ -39,4 +39,20 @@ stage1_result=$?
 set -e
 [[ "$stage0_result" -eq 42 && "$stage1_result" -eq 42 ]]
 
-echo "fn-typed extern struct-ref smoke OK (stage0/stage1)"
+# Stage1's translator-facing ABI also accepts the nullable form emitted for a
+# C function pointer. Exercise the callback from C so a pointer-to-slot mistake
+# cannot pass merely because the first argument is non-null.
+OPTIONAL_SOURCE="$ROOT/test/repro/extern_nullable_fn_param.elisa"
+"$STAGE1" -emit obj -o "$WORK/optional-callback.o" "$OPTIONAL_SOURCE"
+printf '%s\n' \
+    'void invoke_optional_callback(void *item, void (*handler)(void *)) { handler(item); }' \
+    | "$CLANG" -x c -c -o "$WORK/optional-callback-stub.o" -
+"$CLANG" -Wl,-dead_strip -o "$WORK/optional-callback" \
+    "$WORK/optional-callback.o" "$WORK/optional-callback-stub.o" "$RUNTIME_OBJ"
+set +e
+"$WORK/optional-callback"
+optional_callback_result=$?
+set -e
+[[ "$optional_callback_result" -eq 42 ]]
+
+echo "fn-typed extern struct-ref smoke OK (stage0/stage1); nullable C callback ABI OK (stage1)"

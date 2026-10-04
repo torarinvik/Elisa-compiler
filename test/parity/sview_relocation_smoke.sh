@@ -18,6 +18,7 @@ CLOSURE_GOOD="$ROOT/test/parity/fixtures/sview_closure_unrelated_growth_live.eli
 CLOSURE_PARAM_SHADOW_GOOD="$ROOT/test/parity/fixtures/sview_closure_parameter_shadow_live.elisa"
 CLOSURE_LOCAL_SHADOW_GOOD="$ROOT/test/parity/fixtures/sview_closure_local_shadow_live.elisa"
 CLOSURE_SCALAR_GOOD="$ROOT/test/parity/fixtures/sview_closure_scalar_capture_unrelated_growth_live.elisa"
+NULLABLE_POINTER_REF_GOOD="$ROOT/test/parity/fixtures/sview_nullable_pointer_ref_live.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-relocation.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -76,6 +77,11 @@ check_stage1_alias_stale "$CLOSURE_BAD" 'storage dependency facts were invalidat
 check_stage1_alias_stale "$CLOSURE_ASSIGNMENT_BAD" 'storage dependency facts were invalidated by darray push of values' closure-assignment-target-capture
 
 for optimization in 0 2; do
+    pointer_ref_output="$WORK/nullable-pointer-ref-O$optimization.ll"
+    pointer_ref_log="$pointer_ref_output.log"
+    "$STAGE1" -emit llvm "-O$optimization" -o "$pointer_ref_output" "$NULLABLE_POINTER_REF_GOOD" >"$pointer_ref_log" 2>&1 \
+        || fail "Stage1 rejected a live pointer view after forwarding its nullable pointer through a mutable reference at O$optimization: $(tail -n 8 "$pointer_ref_log")"
+
     aggregate_good_output="$WORK/aggregate-unrelated-growth-O$optimization.ll"
     aggregate_good_log="$aggregate_good_output.log"
     "$STAGE1" -emit llvm "-O$optimization" -o "$aggregate_good_output" "$AGGREGATE_GOOD" >"$aggregate_good_log" 2>&1 \

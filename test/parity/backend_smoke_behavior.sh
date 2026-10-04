@@ -142,6 +142,8 @@ run_case match_first      'def classify(n: i64) -> i64:\n    return match n:\n  
 run_case match_default    'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(99)\n'  42
 # A negative literal pattern: the sign must survive parse_int_literal + ConstInt.
 run_case match_negative   'def classify(n: i64) -> i64:\n    return match n:\n        -1: 42\n        _: 7\n\ndef main() -> i64:\n    return classify(-1)\n'  42
+run_case match_i64_min    'def main() -> i64:\n    value: i64 = -9223372036854775808\n    return match value:\n        -9223372036854775808: 42\n        _: 7\n' 42
+run_case match_u64_max    'def main() -> i64:\n    value: u64 = 18446744073709551615\n    return match value:\n        18446744073709551615: 42\n        _: 7\n' 42
 run_case match_as_value   'def main() -> i64:\n    n: i64 = 2\n    v: i64 = match n:\n        1: 10\n        2: 40\n        _: 0\n    return v + 2\n'  42
 
 # Integer WIDTHS and SIGNEDNESS. These are the cases an i64-only backend gets wrong:
@@ -253,7 +255,18 @@ run_case array_write_loop 'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0
 # 256 initial capacity and the grow rule are all stage0's, read out of its own `-emit llvm`
 # output — they are dictated by the shared runtime, not chosen here.
 run_case darray_push      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'  42
+# A user `impl` method named like a stdlib generic must still resolve by its concrete
+# receiver. Generic UFCS inference can reject `Stack`, after which monomorphic impl lookup
+# must continue; otherwise `s.push(1, 2)` is incorrectly declined.
+run_case impl_push_named_like_generic 'struct Stack:\n    total: i64\n\nimpl Stack:\n    def push(self: Stack, a: i64, b: i64) -> i64:\n        return self.total + a + b\n\ndef main() -> i64:\n    s: Stack = Stack{total: 39}\n    return s.push(1, 2)\n' 42
 run_case darray_literal   'def main() -> i64:\n    xs: darray[i64] = [40, 2, 99]\n    return xs[0] + xs[1]\n'  42
+# A struct field can hold a borrowed darray header. Mutating through `h.w` must load the
+# stored header pointer before the darray operation, rather than treating the pointer slot as
+# the header itself.
+run_case darray_ref_field 'struct Holder:\n    w: mutable darray[i64]&\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    h: Holder = Holder{w: &xs}\n    h.w.push(42)\n    return h.w[0]\n' 42
+# A fixed-array spread is a value copy, not a darray-header copy. The backend must
+# materialize the source once and append each fixed slot in order.
+run_case darray_spread_fixed_array 'def main() -> i64:\n    source: i64[2] = [7, 35]\n    xs: darray[i64] = [...source, 0]\n    return xs[0] + xs[1]\n'  42
 run_case darray_count     'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(7)\n    xs.push(7)\n    xs.push(7)\n    return xs.count * 14\n'  42
 run_case darray_loop      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<10:\n        xs.push(i)\n    total: mutable i64 = 0\n    for j in 0..<10:\n        total <- total + xs[j]\n    return total - 3\n'  42
 run_case darray_u8        'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'  42
@@ -375,6 +388,10 @@ run_case ref_addr_field   'struct Box:\n    value: mutable i64\n\ndef get_ref(b:
 run_case ref_optional     'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 42, used: 1}\n    if get_ref(b) is v:\n        return v\n    return 0\n'  42
 # Absent case of a ref-optional: the null branch is taken, so the fallback returns.
 run_case ref_optional_absent 'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 7, used: 0}\n    if get_ref(b) is v:\n        return v\n    return 42\n'  42
+# A reference to an OPTIONAL reference is a different shape from an optional reference:
+# this generic returns the address of its optional local, so assigning the call result must
+# load the nullable pointer stored there (null), not preserve the address of the slot.
+run_case ref_to_niche_optional_value 'def slot[T](value: mutable T&) -> mutable T&:\n    return value\n\ndef main() -> i64:\n    maybe: mutable u8&? = null\n    value: u8&? = slot(maybe)\n    return 0 if value == null else 42\n' 0
 # `opt == null` / `opt != null` — a PRESENCE test on the optional's tag (no binding, unlike
 # `is`). The std dict guards `m.items == null` this way. Both the present and absent branch.
 run_case opt_eq_null 'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef maybe(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    present: mutable Box = Box{value: 10, used: 1}\n    absent: mutable Box = Box{value: 20, used: 0}\n    total: mutable i64 = 0\n    total <- total + 40 if maybe(present) != null else total\n    total <- total + 2 if maybe(absent) == null else total\n    return total\n'  42
@@ -382,6 +399,15 @@ run_case opt_eq_null 'struct Box:\n    value: mutable i64\n    used: mutable u8\
 # (GEP by struct stride). How the std walks `DictBucket[K,T]&` rows. `&arr[0]` supplies the
 # base as a ref; `items[1].value` reads the second element in place.
 run_case ref_index_base 'struct Bucket:\n    value: mutable i64\n\ndef second_value(items: Bucket&) -> i64:\n    return items[1].value\n\ndef main() -> i64:\n    arr: mutable Bucket[3] = [Bucket{value: 10}, Bucket{value: 42}, Bucket{value: 99}]\n    return second_value(&arr[0])\n'  42
+# Compound and plain writes through an arbitrary reference-returning call should share the
+# same rvalue-base address/type handling. The helper name is deliberately not a compiler or
+# translator intrinsic: this guards the general function-call/index composition.
+run_case ref_call_index_compound 'def pointer[T](value: mutable T&) -> mutable T&:\n    return value\n\ndef main() -> i64:\n    value: mutable i64 = 37\n    pointer(&value)[0] += 5\n    return value\n'  42
+run_case ref_call_index_store 'def pointer[T](value: mutable T&) -> mutable T&:\n    return value\n\ndef main() -> i64:\n    value: mutable i64 = 37\n    pointer(&value)[0] <- 42\n    return value\n'  42
+# A pointer-to-pointer keeps the inner optional-reference layer when it is indexed as a
+# generic argument. Exercise both `**p += n` and replacing `*p` with null, the two C shapes
+# that exposed a missing Ref -> Optional result in expression type inference.
+run_case nested_optional_pointer_assignment 'def nonnull[T](value: mutable T&?) -> mutable T& can[Abort.Panic]:\n    can Abort.Panic:\n        if value == null:\n            panic("null pointer")\n        return value\n\ndef nonnull_readonly[T](value: T&?) -> T& can[Abort.Panic]:\n    can Abort.Panic:\n        if value == null:\n            panic("null pointer")\n        return value\n\ndef mutate_inner_pointer(slot: mutable (mutable i32&?) &?) -> i64 can[Abort.Panic]:\n    can Abort.Panic:\n        nonnull(nonnull(slot)[0])[0] += 5\n        return nonnull(nonnull(slot)[0])[0]\n\ndef replace_inner_pointer(slot: mutable (i32&?) &?) -> i64 can[Abort.Panic]:\n    can Abort.Panic:\n        nonnull_readonly(slot)[0] <- zeroed\n        return 42 if nonnull_readonly(slot)[0] == null else 0\n\ndef main() -> i64 can[Abort.Panic]:\n    value: mutable i32 = 37\n    mutable_pointer: mutable i32&? = &value\n    mutable_slot: mutable (mutable i32&?) &? = &mutable_pointer\n    if mutate_inner_pointer(mutable_slot) != 42:\n        return 1\n    readonly_pointer: i32&? = &value\n    readonly_slot: mutable (i32&?) &? = &readonly_pointer\n    return replace_inner_pointer(readonly_slot)\n' 42
 # `void`: a bare `return`, a void call in statement position (its result must be UNNAMED —
 # LLVM rejects a named void instruction), and a void body running off the end.
 run_case void_call        'def noop() -> void:\n    return\n\ndef main() -> i64:\n    noop()\n    return 42\n'  42
