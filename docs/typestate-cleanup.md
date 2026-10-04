@@ -283,6 +283,38 @@ field mutation or opaque effects must not silently preserve a singleton.
 Do not interpret an unknown predicate as true. Do not give protocol transitions
 authority to override derived-state predicates.
 
+Stage0 record updates previously kept the input's derived state even when a
+replacement field made its predicate false. They now classify one simultaneous
+replacement map, preserving the input state only when every predicate is
+unaffected. Unsupported dependency expressions and exhausted traversal limits
+count as possibly changed. Unchanged fields are not re-read from the input AST
+after argument analysis, because those reads could observe a later mutation
+rather than the captured payload. Unknown replacements widen instead of keeping
+a stale singleton. A one-state family's full set is also a singleton, so unknown
+or incomplete predicate evidence now diagnoses instead of being accepted as proof
+in both construction and changed record updates. Known predicate gaps/overlaps
+also diagnose. Constant replacements can establish a different derived state;
+unrelated-field changes preserve the existing state.
+
+LLVM record-update lowering now uses the checked result type. It shares a
+same-family payload reconstruction helper with classic consuming transitions:
+direct aggregate kind, packedness, field count and exact LLVM field types must
+match. No state tag or unchecked reinterpretation is added. The native Stage0
+gate checks layout and copy preservation while changing Alive/Dead states at
+O0/O2; invalid preserved-state and unknown-singleton cases reject without an
+artifact. Full Stage0 semantic and backend suites pass.
+
+`derived_update_policy.elisa` formalizes preservation/narrowing conditions:
+16/16 obligations independently replay; opposite changed/unknown-singleton claims
+reject. These are decision-policy model laws, not a proof of the Go dependency
+walker, evaluator or LLVM emitter. Preserving predicates that depend on both
+changed and captured unchanged fields still needs a stable symbolic snapshot and
+proof-aware inference; this implementation conservatively widens those cases.
+**Stage1 enforcement remains open:** the current Stage1 compiler emits LLVM for
+both `derived_record_update_forged.neg.elisa` and
+`derived_record_update_single_unknown.neg.elisa`. Closing these demonstrated
+holes is required before claiming derived-state parity.
+
 ### 5. Fallible operations and terminal obligations
 
 Each outcome needs a checked state contract: success, failure, early return, and
