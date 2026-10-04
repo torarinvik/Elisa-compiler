@@ -352,9 +352,49 @@ operators and uncertified constructors invalidate evidence conservatively.
 Match guards are included in effect coverage, including effects before a failed
 guard. Statement traversal has shared fuel/depth bounds and reports exhaustion.
 
-**Remaining enforcement/inference work:** loop fixed points currently have
-explicit unknown coverage; match joins retain the entry path until exhaustiveness
-is certified. Checked call/effect/alias summaries, pattern/loop binder seeding,
+Stage1 now computes bounded state-set fixed points for `while` and builtin
+integral range `for` loops: head = entry union reachable back edge. Equality
+compares canonical IDs and semantic state sets, not pool offsets or insertion
+order. Captured values are dropped at joins. Speculation suppresses frontier
+diagnostics; the body is checked once against the stable head, so a first-iteration
+success cannot hide an invalid later iteration. Pool offsets are relocated into
+the retained destination on copies. Failure to converge within 64 transfers,
+shared fuel/depth exhaustion, and unsupported control flow retain explicit
+unknown coverage rather than partial permissions.
+
+Known-false `while` conditions and known-empty literal ranges preserve entry
+facts. Proven nonempty ranges execute a first transfer before joining possible
+remaining iterations; singleton ranges execute exactly once. Numeric range bounds
+must be literal or resolved integral bindings, not custom iteration calls.
+Captured statement loops are traversed through the semantic `Block("loop")`
+wrapper, including header declarations and lexical exits. By-value primitive
+counter writes preserve unrelated self-field facts only after canonical binding
+and non-borrowed capability checks; scalar references may alias predicate fields
+and invalidate instead. Break/continue, custom iterators, stateful element binders
+and uncertified jump paths still require more CFG/effect coverage. Literal-true
+non-fallthrough is inferred only with complete body coverage.
+
+`derived_source_loop_stage1_smoke.sh` passes at O0/O2, covering finite counter
+loops, unknown-count preservation, known-empty/false loops, nonempty state changes,
+and singleton ranges with input-copy preservation. Zero-iteration narrowing,
+later-iteration copies with stale state, break-before-write and scalar-reference
+alias counterclaims reject semantically without artifacts. The existing source,
+result-context, coupled-predicate and typestate-foundation gates also pass.
+
+**Stage0 loop parity remains open.** Its current analyzer rejects the known-empty,
+false-condition and proven-nonempty cases in this new positive fixture by
+over-widening, and emits LLVM for the invalid later-iteration copy. The separately
+named `derived_source_loop_stage0_audit.sh` is deliberately red (current exit 1,
+reporting compiler exit 0 with an artifact). It is not folded into the green
+Stage1 gate. Next priority is a binding-keyed, cyclic tracked-state transfer in
+Stage0, including empty/nonempty range classification and later-iteration body
+checks without speculative diagnostics or leaking other analyzer side effects.
+This requires auditing `analyzer_flow.go`, `analyzer_flow_loop_stmts.go`, branch
+snapshots and tracked-type propagation, not merely widening a declaration before
+the first body check.
+
+**Remaining enforcement/inference work:** match joins retain the entry path until
+exhaustiveness is certified. Checked call/effect/alias summaries, pattern/loop binder seeding,
 whole-binding reassignment and copy transfer, exact captured-value joins, general
 argument/assignment contexts, symbolic predicates, state-union annotation
 resolution and predicate coverage/overlap remain unfinished. Some valid programs
@@ -367,6 +407,19 @@ replayed, deterministic repeated reports and no trust/replay gaps. It imports
 the actual reachable-knownness/possible-state Boolean domain used by this pass;
 dead-source knowledge and dropped-live-state counterclaims reject. These are
 domain laws, not a kernel proof of the AST walker, pool management or resolver.
+
+`derived_source_loop_head.elisa` is admitted with all 26 obligations independently
+replayed, deterministic reports and no trust/replay gaps. Its entry/back-edge
+membership, reachable knownness and idempotence laws import the actual Boolean
+domain used by the compiler. Dropped zero-iteration entries, unknown back edges
+hidden by known entries, and discarded later states are rejected counterclaims.
+These do not prove the AST fixed-point algorithm or range/alias classifier.
+The proof assistant now admits validated opposite-connective subtrees as opaque
+signed islands and reduces their constant identities. Matching preserves exact
+subtree/polarity identity without distribution, arithmetic evaluation, synthetic
+premises or arena rewriting. Eight dedicated obligations and 61 raw-kernel
+controls pass; wrong connective/polarity, missing witnesses, malformed/cyclic
+islands and exhausted bounds remain rejected.
 
 `derived_source_snapshot.elisa` is now admitted with all 20 obligations
 independently replayed, deterministic repeated reports, zero semantic errors,
