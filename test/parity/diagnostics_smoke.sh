@@ -79,6 +79,7 @@ NAMES=(
     submit_local_mutable_ref
     storage_dependency_owned_return_global
     storage_dependency_owned_return_qualified
+    store_ref_local_global
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
@@ -322,6 +323,7 @@ EXPECTS=(
     "is not structurally shareable across threads"
     "storage dependency facts were invalidated by darray push"
     "storage dependency facts were invalidated by darray push"
+    "storing a reference to function-local storage into longer-lived storage"
     "if condition must be bool, got mutable bool&"
     "not operator requires bool operand"
     "duplicate packed group member \"b\" in H.flags"
