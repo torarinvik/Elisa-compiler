@@ -732,6 +732,13 @@ run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the o
 run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "ys" through a call'
 run_case value_block_nested_loop neg "$vn_neg" "value block may not mutate"
 run_case value_block_nested_loop neg "$vn_neg" "names no binding in scope"
+# The rendered TYPE must be the type, not whatever bytes now sit where a dead buffer was
+# (these printed 'got set ele' / 'got ment' while the substring above still matched).
+echo "-- affine_set_key (rendered types) --"
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'set elements cannot contain linear handles, got Handle?'
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'dict keys cannot contain linear handles, got Pair'
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'set elements cannot contain linear handles, got darray[Handle]'
+
 echo "-- call_argument_alias --"
 ca_pos="$FIXTURES/call_argument_alias.pos.elisa"
 ca_neg="$FIXTURES/call_argument_alias.neg.elisa"
