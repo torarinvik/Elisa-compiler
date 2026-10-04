@@ -1,0 +1,265 @@
+# Stage1 backend — reclaiming storage reachable from heap-holding module globals.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+#
+# The problem. A function without a caller-threaded arena allocates in a scratch
+# region that is `arena_free`d on every exit. When the body stores into a module
+# global (`g <- v`, `g.f <- v`, `fill(&g)`, `g.xs.push(v)`) the global can end up
+# pointing into that scratch, so the global dangles after return. 50acc4f7 answered
+# that by allocating such bodies in a never-freed static region: correct, but every
+# call leaks everything the body allocates (about 1.9 MB per Studio rebuild).
+#
+# The design: GENERATIONAL RE-HOMING. Each heap-holding global `g` owns two arenas,
+# `g.region.0` / `g.region.1`, and a generation bit `g.region.gen`. The function keeps
+# its ordinary scratch region. Right before that scratch is freed (every return path
+# and the fall-off), the function calls `g.rehome(scratch)` for each global it touches:
+#
+#   1. spare <- the arena NOT holding the current generation (it holds the previous one)
+#   2. arena_adopt(scratch, spare): the previous generation's blocks move into the
+#      scratch and are freed with it a moment later. Deferring the free to the scratch
+#      unwind keeps this function's own locals that still view that generation valid
+#      until return.
+#   3. g <- deep clone of g, allocated in `spare` (string views copied too)
+#   4. flip the generation bit: `spare` now holds the current generation.
+#
+# So after a re-home the global owns exactly one private generation, plus the previous
+# one kept as a grace period. Memory per global is bounded by two copies of its value,
+# no matter how many times it is overwritten. The clone also cuts every alias into the
+# scratch, into caller regions and into other globals, which is what makes freeing the
+# scratch safe.
+#
+# Why not the alternatives. A per-global region "freed on overwrite" cannot know which
+# allocations of the body belong to the new value without escape tracking, and a
+# partial store (`g.xs.push`) never overwrites the root at all. Reference-counted
+# regions need counts maintained on every copy of a region-backed value, which the
+# arena/AMM model deliberately does not have. Clone-on-exit reuses the existing deep
+# clone (codegen_clone.elisa) and arena_adopt, adds no runtime ABI, and costs one copy
+# of the touched globals per call of a mutating function.
+#
+# The semantic contract (docs/automatic-memory-management.md): a value READ from a global stays valid
+# until that global is re-homed twice. Holding a global's old value across two
+# separate mutating calls is the case the grace generation does not cover.
+#
+# Types the clone cannot reproduce exactly (dict/set tables, raw references, views,
+# cstr, enums with payloads, ...) keep 50acc4f7's static region for the function, so
+# nothing regresses to a dangling read; they only keep the old leak.
+
+extend Backend:
+    private:
+        # Can the re-home clone fully own a value of this type? Mirrors
+        # emit_clone_aggregate_value with `clone_copies_views` set.
+        def global_rehome_clonable(value_type: ValueType, structs: mutable StructTable&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            false return if depth > 32
+            kind: TypeKind = value_type.kind
+            true return if kind == TypeKind.Signed or kind == TypeKind.Unsigned or kind == TypeKind.Float or kind == TypeKind.Bool or kind == TypeKind.SView
+            if kind == TypeKind.DArray:
+                return global_rehome_clonable(darray_element_of(value_type, structs), structs, depth + 1)
+            if kind == TypeKind.Array:
+                return global_rehome_clonable(array_element_of(value_type, structs), structs, depth + 1)
+            if kind == TypeKind.Optional:
+                payload: ValueType = optional_payload_of(value_type, structs)
+                false return if payload.kind == TypeKind.Ref or payload.kind == TypeKind.SView
+                return global_rehome_clonable(payload, structs, depth + 1)
+            if kind == TypeKind.Struct:
+                false return if is_growable_container_struct(value_type, structs)
+                slot: usize = value_type.bits.usize()
+                false return if slot >= structs.field_count.count or structs.field_count[slot] == 0
+                for field_index in 0..<structs.field_count[slot] |structs, slot, depth|:
+                    false return if not global_rehome_clonable(copied_type(structs.field_types[structs.field_start[slot] + field_index]), structs, depth + 1)
+                return true
+            return false
+
+
+        # The heap-holding mutable global a place roots at, or -1.
+        def global_rehome_place_index(place: Expr, structs: mutable StructTable&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            root: sview = auto_region_place_root(place)
+            if root == "":
+                return -1
+            global_index: i64 = auto_region_global_root_index(structs, root)
+            if global_index < 0:
+                return -1
+            if not value_type_owns_region_storage(copied_type(structs.mutable_global_types[global_index.usize()]), structs, 0):
+                return -1
+            return global_index
+
+
+        # Sets the re-home scratch carrier. A separate call (not an inline `<-`) because
+        # flow typing narrows the field to `null` after an inline null reset, and a later
+        # store of the carrier in the same function would then be rejected.
+        def global_rehome_set_scratch(runtime: mutable Runtime&, scratch: LLVMValueRef?) -> void:
+            runtime.rehome_scratch <- scratch
+
+        def global_rehome_note(index: i64, found: mutable darray[i64]&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if index < 0
+            for existing in found |index|:
+                return if existing == index
+            found.push(index)
+
+
+        def global_rehome_collect_place(place: Expr, structs: mutable StructTable&, found: mutable darray[i64]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if place is Expr.Array(rehome_places, rehome_places_line):
+                for rehome_place in rehome_places |structs, found|:
+                    global_rehome_collect_place(rehome_place, structs, found)
+                return
+            global_rehome_note(global_rehome_place_index(place, structs), found)
+
+
+        # Same shape as auto_region_expression_passes_global, collecting the globals.
+        def global_rehome_collect_expression(expression: Expr, structs: mutable StructTable&, found: mutable darray[i64]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if expression is Expr.Call(rehome_callee, rehome_args, rehome_names, rehome_line):
+                if rehome_callee is Expr.Field(rehome_receiver, rehome_method, rehome_method_line):
+                    global_rehome_collect_place(rehome_receiver, structs, found)
+                    global_rehome_collect_expression(rehome_receiver, structs, found)
+                for rehome_arg in rehome_args |structs, found|:
+                    global_rehome_collect_place(rehome_arg, structs, found)
+                    global_rehome_collect_expression(rehome_arg, structs, found)
+                return
+            if expression is Expr.Binary(rehome_left, rehome_operator, rehome_right, rehome_binary_line):
+                global_rehome_collect_expression(rehome_left, structs, found)
+                global_rehome_collect_expression(rehome_right, structs, found)
+                return
+            if expression is Expr.Unary(rehome_unary_operator, rehome_unary_operand, rehome_unary_line):
+                global_rehome_collect_expression(rehome_unary_operand, structs, found)
+                return
+            if expression is Expr.Paren(rehome_paren_operand, rehome_paren_line):
+                global_rehome_collect_expression(rehome_paren_operand, structs, found)
+                return
+            if expression is Expr.Move(rehome_move_operand, rehome_move_line):
+                global_rehome_collect_expression(rehome_move_operand, structs, found)
+
+
+        # Every heap-holding global the body may leave pointing into its scratch region:
+        # exactly the globals that make auto_region_statements_store_global answer true.
+        def global_rehome_collect_statements(statements: darray[Stmt], structs: mutable StructTable&, found: mutable darray[i64]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for rehome_statement in statements |structs, found|:
+                global_rehome_collect_statement(rehome_statement, structs, found)
+
+
+        def global_rehome_collect_statement(statement: Stmt, structs: mutable StructTable&, found: mutable darray[i64]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if statement is Stmt.Assign(rehome_target, rehome_operator, rehome_value, rehome_assign_line):
+                global_rehome_collect_place(rehome_target, structs, found)
+                global_rehome_collect_expression(rehome_value, structs, found)
+                return
+            if statement is Stmt.Expr(rehome_expression, rehome_expression_line):
+                global_rehome_collect_expression(rehome_expression, structs, found)
+                return
+            if statement is Stmt.VarDecl(rehome_var_name, rehome_var_type, rehome_var_value, rehome_var_line):
+                global_rehome_collect_expression(rehome_var_value, structs, found)
+                return
+            if statement is Stmt.Return(rehome_return_value, rehome_return_line):
+                if rehome_return_value is rehome_returned:
+                    global_rehome_collect_expression(rehome_returned, structs, found)
+                return
+            if statement is Stmt.Block(rehome_block_kind, rehome_block_clause, rehome_block_binding, rehome_block_body, rehome_block_line):
+                global_rehome_collect_statements(rehome_block_body, structs, found)
+                return
+            if statement is Stmt.If(rehome_if_condition, rehome_if_then, rehome_if_else, rehome_if_line):
+                global_rehome_collect_expression(rehome_if_condition, structs, found)
+                global_rehome_collect_statements(rehome_if_then, structs, found)
+                global_rehome_collect_statements(rehome_if_else, structs, found)
+                return
+            if statement is Stmt.While(rehome_while_condition, rehome_while_body, rehome_while_line):
+                global_rehome_collect_statements(rehome_while_body, structs, found)
+                return
+            if statement is Stmt.For(rehome_for_bind, rehome_for_variables, rehome_for_iterable, rehome_for_body, rehome_for_line):
+                global_rehome_collect_statements(rehome_for_body, structs, found)
+                return
+            if statement is Stmt.Match(rehome_match_scrutinee, rehome_match_arms, rehome_match_line):
+                for rehome_match_arm in rehome_match_arms |structs, found|:
+                    global_rehome_collect_statements(rehome_match_arm.body, structs, found)
+
+
+        # `<global symbol><suffix>` as a cstr backed by `storage`.
+        def global_rehome_symbol(handle: LLVMValueRef, suffix: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_length: mutable usize = 0
+            name_bytes: u8& = LLVMGetValueName2(handle, &name_length)
+            _ = dbg_push_sview(storage, unsafe_sview_bounded_bytes(name_bytes, name_length))
+            _ = dbg_push_sview(storage, suffix)
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        def global_rehome_slot(handle: LLVMValueRef, suffix: sview, slot_type: LLVMTypeRef, m: LLVMModuleRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            storage: mutable darray[u8] = []
+            symbol: cstr = global_rehome_symbol(handle, suffix, storage)
+            if LLVMGetNamedGlobal(m, symbol) is existing:
+                return existing
+            slot: LLVMValueRef = LLVMAddGlobal(m, slot_type, symbol)
+            LLVMSetInitializer(slot, LLVMConstNull(slot_type))
+            # Internal (8) beside an internal global; otherwise weak (5) so every object
+            # that touches the same external global shares one pair of arenas.
+            LLVMSetLinkage(slot, 8 if LLVMGetLinkage(handle) == 8 else 5)
+            return slot
+
+
+        def global_rehome_fn_type(ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            parameters: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+            parameters_pointer: void& = (&parameters[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMFunctionType(LLVMVoidTypeInContext(ctx), parameters_pointer, 1, 0)
+
+
+        # The `<g>.rehome(scratch)` helper for mutable global `index`, created once per
+        # module. Null when the clone cannot model the global's type.
+        def global_rehome_helper(index: i64, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if index < 0
+            global_type: ValueType = copied_type(structs.mutable_global_types[index.usize()])
+            null return if not global_rehome_clonable(global_type, structs, 0)
+            handle: LLVMValueRef = structs.mutable_global_handles[index.usize()]
+            name_storage: mutable darray[u8] = []
+            helper_name: cstr = global_rehome_symbol(handle, ".rehome", name_storage)
+            if LLVMGetNamedFunction(m, helper_name) is existing_helper:
+                return existing_helper
+            arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+            region_zero: LLVMValueRef = global_rehome_slot(handle, ".region.0", arena_type, m)
+            region_one: LLVMValueRef = global_rehome_slot(handle, ".region.1", arena_type, m)
+            generation_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+            generation: LLVMValueRef = global_rehome_slot(handle, ".region.gen", generation_type, m)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            adopt_parameters: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type]
+            adopt_parameters_pointer: void& = (&adopt_parameters[0]).cast[void&] can Unsafe.PointerCast
+            adopt_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), adopt_parameters_pointer, 2, 0)
+            adopt_fn: mutable LLVMValueRef = LLVMConstNull(pointer_type)
+            if LLVMGetNamedFunction(m, "arena_adopt") is declared_adopt:
+                adopt_fn <- declared_adopt
+            else:
+                adopt_fn <- LLVMAddFunction(m, "arena_adopt", adopt_type)
+            helper: LLVMValueRef = LLVMAddFunction(m, helper_name, global_rehome_fn_type(ctx))
+            LLVMSetLinkage(helper, 8 if LLVMGetLinkage(handle) == 8 else 5)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+            entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, helper, "entry")
+            LLVMPositionBuilderAtEnd(builder, entry)
+            scratch: LLVMValueRef = LLVMGetParam(helper, 0)
+            current_generation: LLVMValueRef = LLVMBuildLoad2(builder, generation_type, generation, "rehome.gen")
+            region_zero_current: LLVMValueRef = LLVMBuildICmp(builder, 32, current_generation, LLVMConstInt(generation_type, 0, 0), "rehome.zero.current")
+            spare: LLVMValueRef = LLVMBuildSelect(builder, region_zero_current, region_one, region_zero, "rehome.spare")
+            adopt_arguments: mutable darray[LLVMValueRef] = [scratch, spare]
+            adopt_arguments_pointer: void& = (&adopt_arguments[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(builder, adopt_type, adopt_fn, adopt_arguments_pointer, 2, "")
+            global_llvm_type: LLVMTypeRef = llvm_type_of(global_type, structs, ctx)
+            current_value: LLVMValueRef = LLVMBuildLoad2(builder, global_llvm_type, handle, "rehome.value")
+            clone_runtime: mutable Runtime = copied_runtime(runtime)
+            clone_runtime.arena <- spare
+            clone_runtime.owns_arena <- false
+            clone_runtime.clone_copies_views <- true
+            clone_runtime.rehome_fns <- []
+            clone_runtime.rehome_scratch <- null
+            cloned: LLVMValueRef? = emit_clone_aggregate_value(current_value, global_type, global_type, structs, clone_runtime, m, ctx, builder)
+            if cloned is cloned_value:
+                _ = LLVMBuildStore(builder, cloned_value, handle)
+                _ = LLVMBuildStore(builder, LLVMBuildXor(builder, current_generation, LLVMConstInt(generation_type, 1, 0), "rehome.flip"), generation)
+                _ = LLVMBuildRetVoid(builder)
+                LLVMDisposeBuilder(builder)
+                return helper
+            # Unreachable when global_rehome_clonable mirrors the clone; the helper is then
+            # never called (the caller falls back to the static region).
+            _ = LLVMBuildRetVoid(builder)
+            LLVMDisposeBuilder(builder)
+            return null
+
+
+        # Re-home every touched global into its own generation before `scratch` is freed.
+        def emit_global_rehomes(scratch: LLVMValueRef, runtime: Runtime&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if runtime.rehome_fn_type is rehome_type:
+                for rehome_fn in runtime.rehome_fns |scratch, rehome_type, builder|:
+                    rehome_arguments: mutable darray[LLVMValueRef] = [scratch]
+                    rehome_arguments_pointer: void& = (&rehome_arguments[0]).cast[void&] can Unsafe.PointerCast
+                    _ = LLVMBuildCall2(builder, rehome_type, rehome_fn, rehome_arguments_pointer, 1, "")
