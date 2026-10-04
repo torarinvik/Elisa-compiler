@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 /* Extension modules do not have an Elisa executable host to provide these optional
  * callbacks.  Preserve the runtime's documented fallback/no-op behavior instead. */
@@ -43,9 +44,24 @@ uint32_t elisa_native_callback_context_result_u32(void *ctx, uint32_t fallback) 
 void elisa_native_callback_context_free(void *ctx) {
     (void)ctx;
 }
-void *va_copy(void *source) {
-    return source;
+#define ELISA_WEAK
+#if (defined(__x86_64__) && !defined(_WIN32)) || (defined(__aarch64__) && !defined(__APPLE__) && !defined(_WIN32))
+#define ELISA_VA_LIST_BY_REF 1
+#endif
+ELISA_WEAK void *va_copy(void *source) {
+#ifdef ELISA_VA_LIST_BY_REF
+  __builtin_va_list *copy = (__builtin_va_list *)malloc(sizeof(__builtin_va_list));
+  if (copy == NULL) abort();
+  __builtin_va_copy(*copy, *(__builtin_va_list *)source);
+  return (void *)copy;
+#else
+  return source;
+#endif
 }
-void va_end(void *argument) {
-    (void)argument;
+ELISA_WEAK void va_end(void *argument) {
+#ifdef ELISA_VA_LIST_BY_REF
+  if (argument != NULL) { __builtin_va_end(*(__builtin_va_list *)argument); free(argument); }
+#else
+  (void)argument;
+#endif
 }
