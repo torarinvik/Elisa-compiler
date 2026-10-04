@@ -41,6 +41,7 @@ NAMES=(
     invalid_bool_cast
     redundant_cast
     field_immutable_assign
+    field_immutable_assign_indexed
     void_condition
     ordering_non_numeric
     darray_element_mismatch
@@ -283,6 +284,7 @@ EXPECTS=(
     "invalid cast from bool to i64"
     "redundant \`.cast[i32]\`: the operand already has type i32; remove the cast"
     "field \"a\" is immutable"
+    "field \"f0\" is immutable"
     "condition must be bool, got void"
     "comparison requires numeric operands"
     "darray literal element expects i64, got static u8"
