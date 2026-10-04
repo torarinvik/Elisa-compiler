@@ -7,9 +7,10 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 S0="${ELISA_STAGE0_BIN:-$ELISACORE_BIN}"
 S1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+bash "$REPO_ROOT/scripts/assert_stage0_fresh.sh" "$S0" || exit $?
 bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$S1" || exit $?
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'status=$?; if [ "$status" -eq 0 ]; then rm -rf "$work"; else echo "const-enum owner equality logs retained at: $work" >&2; fi' EXIT
 
 fail() { echo "const-enum owner equality FAIL: $1" >&2; exit 1; }
 reject_both() {
@@ -17,8 +18,8 @@ reject_both() {
   local s0_rc=0 s1_rc=0
   "$S0" -emit llvm -o /dev/null "$source" >"$work/$case_name.s0" 2>&1 || s0_rc=$?
   env -u ELISA_STAGE1_RUNTIME_STD "$S1" -emit llvm -o /dev/null "$source" >"$work/$case_name.s1" 2>&1 || s1_rc=$?
-  [ "$s0_rc" -ne 0 ] || fail "$case_name accepted by Stage0"
-  [ "$s1_rc" -ne 0 ] || fail "$case_name accepted by Stage1"
+  [ "$s0_rc" -eq 1 ] || fail "$case_name Stage0 expected semantic exit 1, got $s0_rc: $(cat "$work/$case_name.s0")"
+  [ "$s1_rc" -eq 1 ] || fail "$case_name Stage1 expected semantic exit 1, got $s1_rc: $(cat "$work/$case_name.s1")"
   grep -qF "$expected_s0" "$work/$case_name.s0" || fail "$case_name Stage0 diagnostic changed: $(cat "$work/$case_name.s0")"
   grep -qF "$expected_s1" "$work/$case_name.s1" || fail "$case_name Stage1 lacks semantic diagnostic '$expected_s1': $(cat "$work/$case_name.s1")"
   if grep -qF 'backend could not produce a linkable unit' "$work/$case_name.s1"; then
