@@ -12,7 +12,7 @@ cleanup() {
     rmdir -- "$WORK"
 }
 trap cleanup EXIT
-for positive in derived_record_update_codegen_probe derived_result_snapshot_codegen_probe; do
+for positive in derived_record_update_codegen_probe derived_result_snapshot_codegen_probe derived_singleton_update_codegen_probe; do
 for optimization in 0 2; do
     elisa_run_timeout 30 env DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}" \
         "$STAGE1" -emit exe "-O$optimization" -o "$WORK/native" \
@@ -32,4 +32,11 @@ for fixture in derived_record_update_forged derived_update_local derived_update_
     [[ "$status" -eq 1 && ! -e "$WORK/rejected.ll" ]] || { cat "$WORK/rejected.log" >&2; exit 1; }
     rg -q 'does not satisfy derived state (Alive|Within)' "$WORK/rejected.log" || { cat "$WORK/rejected.log" >&2; exit 1; }
 done
+set +e
+elisa_run_timeout 30 "$STAGE1" -emit llvm -o "$WORK/rejected.ll" \
+    "$ROOT/test/repro/derived_record_update_single_unknown.neg.elisa" >"$WORK/rejected.log" 2>&1
+status=$?
+set -e
+[[ "$status" -eq 1 && ! -e "$WORK/rejected.ll" ]] || { cat "$WORK/rejected.log" >&2; exit 1; }
+rg -Fq 'cannot establish derived state Valid' "$WORK/rejected.log"
 echo 'Derived result contexts reject proven contradictions; valid state-changing updates run at O0/O2'

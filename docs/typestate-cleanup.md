@@ -311,9 +311,29 @@ walker, evaluator or LLVM emitter. Preserving predicates that depend on both
 changed and captured unchanged fields still needs a stable symbolic snapshot and
 proof-aware inference; this implementation conservatively widens those cases.
 **Stage1 enforcement remains incomplete:** contextual result checks now reject
-`derived_record_update_forged.neg.elisa` instead of emitting LLVM. The compiler
-still emits LLVM for `derived_record_update_single_unknown.neg.elisa`; closing
-that unknown-evidence hole is required before claiming derived-state parity.
+both `derived_record_update_forged.neg.elisa` and
+`derived_record_update_single_unknown.neg.elisa` instead of emitting LLVM.
+Predicate-changing updates with unknown result evidence and unknown contextual
+construction receive a specific unproven-evidence diagnostic. A bounded structural
+dependency walk distinguishes unrelated-field changes: both operands must have
+known dependencies; changed fields combine by union. Foreign/unsupported terms
+and exhausted limits are possibly changed, not proof of preservation. Native
+singleton controls accept proven replacements and unrelated-field updates at
+O0/O2 while preserving the input copy.
+
+This does not yet prove the unchanged input satisfies the requested canonical
+state, nor consume source-state provenance or proof-backed symbolic constraints.
+Unrelated-field updates still need that independent validation; source-state
+tracking, general inference and coverage/overlap remain open. A valid symbolic
+update currently needs further proof-aware compiler support, rather than being
+admitted merely because a predicate was undecidable.
+
+`derived_dependency_join.elisa` is an **unproved regression**, excluded from the
+admission gate. Its non-constant De Morgan equivalence exposes a proof-assistant
+logical-normalization gap: the primary ensure is unproved and dependent function
+summaries are unverified. Producer and independent kernel support must be added
+before admitting this law; the existing 16-obligation update-policy model still
+replays and is not a proof of the dependency AST walker.
 
 Returns and annotated locals resolve their expected canonical derived family and
 state (including alias-carried states). Direct record updates and constructors,
