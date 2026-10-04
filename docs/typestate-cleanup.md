@@ -310,10 +310,29 @@ reject. These are decision-policy model laws, not a proof of the Go dependency
 walker, evaluator or LLVM emitter. Preserving predicates that depend on both
 changed and captured unchanged fields still needs a stable symbolic snapshot and
 proof-aware inference; this implementation conservatively widens those cases.
-**Stage1 enforcement remains open:** the current Stage1 compiler emits LLVM for
-both `derived_record_update_forged.neg.elisa` and
-`derived_record_update_single_unknown.neg.elisa`. Closing these demonstrated
-holes is required before claiming derived-state parity.
+**Stage1 enforcement remains incomplete:** contextual result checks now reject
+`derived_record_update_forged.neg.elisa` instead of emitting LLVM. The compiler
+still emits LLVM for `derived_record_update_single_unknown.neg.elisa`; closing
+that unknown-evidence hole is required before claiming derived-state parity.
+
+Returns and annotated locals resolve their expected canonical derived family and
+state (including alias-carried states). Direct record updates and constructors,
+parenthesized results and conditional result branches are checked against that
+destination. Return contexts are retained through blocks, loops, branches and
+match arms. A predicate decided false from supplied replacement fields refutes
+the promised result; missing captured fields are unknown and never re-read from
+the mutable input. This is refutation, not permission to narrow on unknown
+evidence. Inferred locals, assignments, argument contexts, result unions,
+coverage/overlap and proof-aware unknown-state handling remain required work.
+
+`derived_result_context_smoke.sh` executes valid Alive/Dead changes and coupled
+two-field updates (both field orders), alias/conditional returns, unrelated-field
+preservation and input-copy preservation at O0/O2. Seven negative fixtures reject
+with semantic status 1 and no artifact: direct, local, alias, bare-constructor,
+conditional, match-arm and coupled-field result contradictions. The
+`derived_result_refutation.elisa` policy model adds 12 independently replayed
+obligations and rejects unknown-as-contradiction and true-as-contradiction claims.
+These model laws do not prove contextual traversal or state-set inference.
 
 Stage1's predicate evaluator now reads one explicit field snapshot and supports
 comparisons with fields on either side, checked addition/subtraction/multiplication,
