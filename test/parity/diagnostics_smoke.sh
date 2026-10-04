@@ -78,6 +78,10 @@ NAMES=(
     submit_unnamed_view_growth
     submit_local_mutable_ref
     storage_dependency_owned_return_global
+    storage_dependency_owned_return_qualified
+    store_ref_local_global
+    storage_growth_through_ref_self
+    local_field_view_bound_return
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
@@ -320,6 +324,10 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "is not structurally shareable across threads"
     "storage dependency facts were invalidated by darray push"
+    "storage dependency facts were invalidated by darray push"
+    "storing a reference to function-local storage into longer-lived storage"
+    "storage dependency facts were invalidated by darray push"
+    "via return"
     "if condition must be bool, got mutable bool&"
     "not operator requires bool operand"
     "duplicate packed group member \"b\" in H.flags"
@@ -726,6 +734,13 @@ run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the o
 run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "ys" through a call'
 run_case value_block_nested_loop neg "$vn_neg" "value block may not mutate"
 run_case value_block_nested_loop neg "$vn_neg" "names no binding in scope"
+# The rendered TYPE must be the type, not whatever bytes now sit where a dead buffer was
+# (these printed 'got set ele' / 'got ment' while the substring above still matched).
+echo "-- affine_set_key (rendered types) --"
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'set elements cannot contain linear handles, got Handle?'
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'dict keys cannot contain linear handles, got Pair'
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'set elements cannot contain linear handles, got darray[Handle]'
+
 echo "-- call_argument_alias --"
 ca_pos="$FIXTURES/call_argument_alias.pos.elisa"
 ca_neg="$FIXTURES/call_argument_alias.neg.elisa"

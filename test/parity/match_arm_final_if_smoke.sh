@@ -9,7 +9,7 @@ mkdir -p "$OUT"
 
 # Keep the regression runnable after the stage0 binary rename. An explicit override
 # still wins for CI and differential testing; otherwise use the installed product.
-STAGE0="${ELISA_STAGE0_BIN:-$HOME/.elisac/elisac-stage0}"
+STAGE0="${ELISA_STAGE0_BIN:-${ELISACORE_BIN:-$HOME/.elisac/elisac-stage0}}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/scripts/elisac_stage1.sh}"
 
 "$STAGE0" -emit obj -O0 -o "$OUT/stage0.o" "$SOURCE"

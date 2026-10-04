@@ -4,14 +4,14 @@
 # Writes out (the live log the Mac tails), rc, and <gate>.log per gate.
 set -uo pipefail
 s1="$1"; s0="$2"; OPT="$3"; JOBS="$4"; shift 4; GATES=("$@")
-W=/root/elisa; RUNDIR="$PWD"
+W="${ELISA_REMOTE_ROOT:-/root/elisa}"; LV="${ELISA_REMOTE_LLVM:-21}"; RUNDIR="$PWD"
 # Our toolchain only; the box is shared (another session's clang-19 stays the default).
-export PATH="$W/bin:$W/go/bin:/usr/lib/llvm-21/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$W/bin:$W/go/bin:/usr/lib/llvm-$LV/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="$W/home" GOCACHE="$W/cache/go-build" GOPATH="$W/cache/gopath" GOFLAGS=-mod=mod
 export XDG_CACHE_HOME="$W/cache" ELISA_S0_CACHE_DIR="$W/cache/s0cache"
-export LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config ELISA_LLVM_BIN_DIR=/usr/lib/llvm-21/bin
-export ELISA_CLANG="$W/bin/clang" ELISA_REAL_CLANG=/usr/lib/llvm-21/bin/clang
-export LLC=/usr/lib/llvm-21/bin/llc LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc ELISA_LLVM_OPT=/usr/lib/llvm-21/bin/opt
+export LLVM_CONFIG=/usr/lib/llvm-$LV/bin/llvm-config ELISA_LLVM_BIN_DIR=/usr/lib/llvm-$LV/bin
+export ELISA_CLANG="$W/bin/clang" ELISA_REAL_CLANG=/usr/lib/llvm-$LV/bin/clang
+export LLC=/usr/lib/llvm-$LV/bin/llc LLVM_MC=/usr/lib/llvm-$LV/bin/llvm-mc ELISA_LLVM_OPT=/usr/lib/llvm-$LV/bin/opt
 export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 ELISA_TOOL_SHIM_DIR="$W/bin"
 ulimit -s unlimited
 mkdir -p "$HOME" "$W/cache" "$W/locks" "$W/seed"
@@ -28,8 +28,8 @@ t=$(stamp)
 (
   flock 9
   if [[ ! -x "$S0BIN" ]]; then
-    cd "$S0/compiler" && CGO_CFLAGS="-I/usr/lib/llvm-21/include" \
-      CGO_LDFLAGS="-L/usr/lib/llvm-21/lib -Wl,-rpath,/usr/lib/llvm-21/lib" \
+    cd "$S0/compiler" && CGO_CFLAGS="-I/usr/lib/llvm-$LV/include" \
+      CGO_LDFLAGS="-L/usr/lib/llvm-$LV/lib -Wl,-rpath,/usr/lib/llvm-$LV/lib" \
       go build -o bin/elisac.part ./src && mv bin/elisac.part bin/elisac
   fi
 ) 9>"$W/locks/s0-$s0.lock" > "$RUNDIR/stage0_build.log" 2>&1

@@ -24,7 +24,7 @@ def main() -> i64:
 SRC
 
 "$STAGE1" -emit obj -O0 -o "$WORK/probe.o" "$WORK/probe.elisa" >/dev/null
-nm -g "$WORK/probe.o" | awk '$NF == "_ctx_exported_probe" { found = 1 } END { exit !found }' || {
+nm -g "$WORK/probe.o" | awk '$NF == "_ctx_exported_probe" || $NF == "ctx_exported_probe" { found = 1 } END { exit !found }' || {
     echo "export-global metadata link FAIL: explicit public alias was not emitted" >&2
     exit 1
 }

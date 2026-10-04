@@ -17,8 +17,8 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 "$STAGE0" -emit llvm -O0 -o "$WORK/stage0.ll" "$FIXTURE"
 "$STAGE1" -emit llvm -O0 -o "$WORK/stage1.ll" "$FIXTURE"
 ! rg -q '!elisa\.declined' "$WORK/stage1.ll"
-/opt/homebrew/opt/llvm/bin/opt -passes=verify -disable-output "$WORK/stage0.ll"
-/opt/homebrew/opt/llvm/bin/opt -passes=verify -disable-output "$WORK/stage1.ll"
+"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage0.ll"
+"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage1.ll"
 set +e
 "$LLI" "$WORK/stage0.ll"
 stage0_rc=$?

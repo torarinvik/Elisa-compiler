@@ -25,7 +25,7 @@ cc -fno-builtin "$WORK/stage0.o" "$RUNTIME_OBJ" \
 ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" "$STAGE1" -emit exe -O0 -o "$WORK/stage1" "$FIXTURE" >/dev/null 2>&1
 ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" "$STAGE1" -emit llvm -O0 -o "$WORK/stage1.ll" "$FIXTURE" >/dev/null 2>&1
 ! rg -q '!elisa\.declined' "$WORK/stage1.ll"
-/opt/homebrew/opt/llvm/bin/opt -passes=verify -disable-output "$WORK/stage1.ll"
+"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage1.ll"
 
 set +e
 "$WORK/stage0"

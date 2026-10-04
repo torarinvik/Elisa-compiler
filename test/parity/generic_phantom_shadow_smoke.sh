@@ -16,6 +16,6 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0.o" "$WORK/probe.elisa" >/dev/null 2>&1
 "$STAGE1" -emit llvm -O0 -o "$WORK/stage1.ll" "$WORK/probe.elisa" >/dev/null 2>&1
 ! rg -q '!elisa\.declined' "$WORK/stage1.ll"
-/opt/homebrew/opt/llvm/bin/opt -passes=verify -disable-output "$WORK/stage1.ll"
+"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage1.ll"
 
 echo "generic phantom shadow smoke OK: both stages compile struct S with the runtime generic types"
