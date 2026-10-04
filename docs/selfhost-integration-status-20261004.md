@@ -1,7 +1,7 @@
 # Self-hosted compiler consolidation status — 2026-10-04
 
-Integration branch: `codex/selfhost-main-integration`. Primary main remains at
-`dfaeb45c` until combined acceptance and bootstrap closure pass.
+Integration was prepared on `codex/selfhost-main-integration` and qualified
+for promotion to primary main after acceptance, native behavior and closure.
 
 All local branch tips and unique detached tip `bb9f1b63` are incorporated into
 the integration history. Uncommitted transpiler gains were preserved as
@@ -58,15 +58,15 @@ silently treating the literal as a wildcard; unsupported field types decline.
 Tag-only patterns remain legal, and payload offsets account for common fields.
 The new native packed-pattern gate passes Stage0/Stage1 at O0/O2, including
 matching and mismatching literals, wrong tags, and both empty alternatives.
-The quantified-range contract gate passes. The final native suite and bootstrap
-closure are being rerun. Bootstrap stage A passes all five blocker controls.
-
-Still required: final backend coverage and self_host_gen3 byte-identical fixpoint.
-Only then advance primary main and remove other local branches/worktrees.
+The quantified-range contract gate passes. The final native suite passes
+563/563 checks. Bootstrap passes stage A (5/5 blocker controls), stage B
+(gen2 compiled the complete compiler), and stage C (gen3.o equals gen4.o
+byte-for-byte). All local branch tips are ancestors of the integration tip.
+The qualified tree can now replace primary main and redundant local worktrees.
 
 Recovery: primary .git/selfhost-integration-recovery-20261004.bundle was
 verified. Primary .git/cleanup-recovery-20261004.qwXoEe stores inventory and
 tar backups of local Finder metadata, .zp probes, an old seed log, and a
 broken temporary symlink. Refresh the bundle with final integration history
-before deletion. No branches or worktrees have been deleted yet; remote
-branches must remain untouched.
+before deletion. A second verified bundle, selfhost-integration-final-20261004.bundle,
+preserves the backend repairs. Remote branches remain untouched.
