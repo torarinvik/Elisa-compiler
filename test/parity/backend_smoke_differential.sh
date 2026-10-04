@@ -64,8 +64,10 @@ diff_case() {
     # struct cases were silently NEVER compared. A skip that hides a missing comparison is
     # worse than no test.
     printf '%b' "$src" > "$BUILD/diff_$name.elisa"
-    if ! "$ELISACORE_BIN" -emit c-archive -o "$BUILD/diff_${name}_s0.a" "$BUILD/diff_$name.elisa" 2>/dev/null; then
-        echo "  SKIP diff_$name: stage0 rejects this program (not a backend divergence)"; total=$((total - 1)); return
+    if ! "$ELISACORE_BIN" -emit c-archive -o "$BUILD/diff_${name}_s0.a" "$BUILD/diff_$name.elisa" 2>"$BUILD/diff_${name}_s0.err"; then
+        echo "  FAIL diff_$name: stage0 rejected the required oracle program"
+        cat "$BUILD/diff_${name}_s0.err" >&2
+        return
     fi
     clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.a" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
     RUN "$BUILD/diff_${name}_s0"; local got0=$?
@@ -111,9 +113,9 @@ diff_case errorset_payload_union_catch 'error Payload:\n    Bad(code: i64)\n\nde
 diff_case errorset_payload_call_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    return catch bad():\n        ok:\n            ok\n        Payload.Bad(code):\n            code\n'
 diff_case errorset_payload_stmt_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    catch bad():\n        ok:\n            return ok\n        Payload.Bad(code):\n            return code\n'
 diff_case errorset_payload_multi_catch 'error Payload:\n    Bad(left: i64, right: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(7, 5)\n\ndef main() -> i64:\n    return catch bad():\n        ok:\n            ok\n        Payload.Bad(left, right):\n            left + right\n'
-diff_case darray_push  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'
-diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
-diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'
+diff_case darray_push  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return (xs[0] can Unsafe.UncheckedIndex) + (xs[1] can Unsafe.UncheckedIndex)\n'
+diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + (xs[j] can Unsafe.UncheckedIndex)\n    return total - 458\n'
+diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return (xs[0] can Unsafe.UncheckedIndex).i64() - (xs[1] can Unsafe.UncheckedIndex).i64() - 58\n'
 # stage0's c-archive unsafe audit labels these reads; grant it so the case is compared, not SKIPped.
 diff_case darray_ref_elem_arith  'def main() -> i64:\n    x: i64 = 40\n    out: mutable darray[i64&] = []\n    out.push(&x)\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        return out[0] + 2\n'
 # Fuzz repro crash_ref_darray_index_arith: an empty darray[i64&] read traps in both (rc 133).
@@ -212,9 +214,9 @@ diff_case cstr_reassign 'def main() -> i64:\n    s: mutable cstr = "a"\n    s <-
 # `def fill(out: mutable darray[i64]&)` as `define void @fill(ptr, ptr)`, grows via
 # `arena_alloc(ptr %1, ...)`, and the call site passes the caller's arena. The backing
 # belongs to the CALLER, so a callee-local region would free it at return.
-diff_case region_fill_via_ref 'def fill(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    fill(xs)\n    return xs[0]\n'
+diff_case region_fill_via_ref 'def fill(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    fill(xs)\n    return (xs[0] can Unsafe.UncheckedIndex)\n'
 # 500 pushes force REALLOCATION inside the callee, through the caller's arena.
-diff_case region_fill_grows 'def fill(out: mutable darray[i64]&, n: i64) -> void:\n    for i in 0..<n:\n        out.push(1)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    fill(xs, 500)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
+diff_case region_fill_grows 'def fill(out: mutable darray[i64]&, n: i64) -> void:\n    for i in 0..<n:\n        out.push(1)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    fill(xs, 500)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + (xs[j] can Unsafe.UncheckedIndex)\n    return total - 458\n'
 # Reading through a borrowed darray: the param slot holds a POINTER to the caller's header,
 # so count/index need one extra load that a local darray does not.
 diff_case region_count_via_ref 'def size(xs: darray[i64]&) -> i64:\n    return xs.count.i64()\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(1)\n    ys.push(2)\n    return size(ys) + 40\n'
@@ -228,7 +230,7 @@ diff_case region_count_via_ref 'def size(xs: darray[i64]&) -> i64:\n    return x
 # `get` is an ungated contextual keyword there (task_66494fc2).
 diff_case region_index_via_ref 'def first(xs: darray[i64]&) -> i64:\n    return xs[0] can Unsafe.UncheckedIndex\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(42)\n    return first(ys)\n'
 # Two levels: main's arena is threaded through outer into inner.
-diff_case region_two_levels 'def inner(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef outer(out: mutable darray[i64]&) -> void:\n    inner(out)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    outer(xs)\n    return xs[0]\n'
+diff_case region_two_levels 'def inner(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef outer(out: mutable darray[i64]&) -> void:\n    inner(out)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    outer(xs)\n    return (xs[0] can Unsafe.UncheckedIndex)\n'
 # A threaded callee may construct an aggregate temporary before adopting it into the
 # caller-owned container. Both the outer header AND the nested row backing must use the
 # caller region; a callee scratch arena leaves `rows[0]` valid-looking but dangling.
@@ -243,12 +245,12 @@ diff_case region_ref_adopts_nested_temporary 'def build_row[@r](out: mutable dar
 # and the program exited 139 (SIGSEGV) where stage0 returns 42 -- the callee's region was
 # freed at return and the caller read the freed backing. It was declined (95915b5) until the
 # mechanism existed; now it is a real differential.
-diff_case region_return_owned 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(42)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build()\n    return ys[0]\n'
+diff_case region_return_owned 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(42)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build()\n    return (ys[0] can Unsafe.UncheckedIndex)\n'
 # The returned container must survive REALLOCATION inside the callee too.
-diff_case region_return_grown 'def build(n: i64) -> darray[i64]:\n    xs: mutable darray[i64] = []\n    for i in 0..<n:\n        xs.push(1)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build(500)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + ys[j]\n    return total - 458\n'
+diff_case region_return_grown 'def build(n: i64) -> darray[i64]:\n    xs: mutable darray[i64] = []\n    for i in 0..<n:\n        xs.push(1)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build(500)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + (ys[j] can Unsafe.UncheckedIndex)\n    return total - 458\n'
 # A returned container passed straight into a function that GROWS it: the same region has to
 # reach both, or the push reallocates backing the caller still points at.
-diff_case region_return_then_fill 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    return xs\n\ndef fill(out: mutable darray[i64]&) -> void:\n    out.push(2)\n\ndef main() -> i64:\n    ys: mutable darray[i64] = build()\n    fill(ys)\n    return ys[0] + ys[1]\n'
+diff_case region_return_then_fill 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    return xs\n\ndef fill(out: mutable darray[i64]&) -> void:\n    out.push(2)\n\ndef main() -> i64:\n    ys: mutable darray[i64] = build()\n    fill(ys)\n    return (ys[0] can Unsafe.UncheckedIndex) + (ys[1] can Unsafe.UncheckedIndex)\n'
 # `region NAME:` — a NAMED, SCOPED region. stage0 emits `%r = alloca %Arena`, allocates the
 # block's containers from it (`arena_alloc(ptr %r, ...)`), and arena_free's it at scope exit.
 # This is the form the language actually offers: `Arena` as a user-facing type is REJECTED
@@ -327,8 +329,8 @@ diff_case extern_strlen_empty 'extern strlen(s: cstr) -> usize\n\ndef main() -> 
 diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\ndef main() -> i64:\n    return strncmp("abc", "abc", 3).i64() + 42\n'
 # Mutable globals must be real writable storage in both backends, while plain `global`
 # declarations used by the runtime remain folded/linked according to stage0's existing ABI.
-diff_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    seed <- 42\n    return seed\n'
-diff_case global_mutable_array 'global mutable xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    xs[1] <- 42\n    return xs[1]\n'
+diff_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    can Unsafe.MutableGlobal:\n        seed <- 42\n        return seed\n'
+diff_case global_mutable_array 'global mutable xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    can Unsafe.MutableGlobal, Unsafe.UncheckedIndex:\n        xs[1] <- 42\n        return xs[1]\n'
 # NAMED-FIELD construction: `Shape.Circle(r: 42)`, which stage0 accepts alongside the
 # positional form. The label is checked against the payload field's DECLARED name -- a label
 # naming something else is a different program. This is the last of the four prerequisites
@@ -457,11 +459,11 @@ diff_case call_result_field 'struct P:\n    x: i64\n    y: i64\n\ndef mk() -> P:
 # datalayout resolves it), not a hardcoded scalar width -- which is what let struct elements
 # stop declining at intern time. push stores the struct by value; `a[i].x` addresses the
 # element in place.
-diff_case darray_of_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    a.push(P{x: 42})\n    return a[0].x\n'
+diff_case darray_of_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    a.push(P{x: 42})\n    return (a[0] can Unsafe.UncheckedIndex).x\n'
 # 100 struct pushes force REALLOCATION with the struct stride, then a per-element field sum.
-diff_case darray_struct_grow 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    for i in 0..<100:\n        a.push(P{x: i, y: 1})\n    total: mutable i64 = 0\n    for j in 0..<100:\n        total <- total + a[j].x + a[j].y\n    return total - 5008\n'
+diff_case darray_struct_grow 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    for i in 0..<100:\n        a.push(P{x: i, y: 1})\n    total: mutable i64 = 0\n    for j in 0..<100:\n        total <- total + (a[j] can Unsafe.UncheckedIndex).x + (a[j] can Unsafe.UncheckedIndex).y\n    return total - 5008\n'
 # A struct COMPREHENSION -- presize-and-fill with a struct element stride.
-diff_case comprehension_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: darray[P] = [P{x: i} for i in 0..<10]\n    return a[3].x + 39\n'
+diff_case comprehension_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: darray[P] = [P{x: i} for i in 0..<10]\n    return (a[3] can Unsafe.UncheckedIndex).x + 39\n'
 # CONTAINER IN A STRUCT: a darray FIELD (`struct Bag: items: darray[i64]`). push, count,
 # and indexed reads all go through the receiver as a struct field -- the darray-op receiver
 # resolvers were extended from Ident-only to an Expr form (Ident or struct field), the
@@ -499,6 +501,6 @@ diff_case match_chain 'def classify(n: i64) -> i64:\n    return match n:\n      
 
 # Region-block view stores and call-site store-through summaries: the ACCEPTED shapes
 # (outer-source view rebinding, a store-free mutual-recursion cycle) must still run right.
-diff_case region_view_store_in_auto_inner 'def main() -> i32:\n    can Memory.Allocate:\n        total: mutable i64 = 0\n        in auto:\n            xs: mutable darray[i64] = [1, 2, 3]\n            v: mutable view[i64] = xs[0:0]\n            v <- xs[1:3]\n            total <- v[0] + v[1]\n        return (total - 5).i32()\n'
-diff_case region_view_store_tuple_outer 'def pick(xs: darray[i64]&) -> (known: bool, v: view[i64]):\n    return (true, xs[0:2])\n\ndef main() -> i32:\n    can Memory.Allocate:\n        base: mutable darray[i64] = [4, 7, 9]\n        v: mutable view[i64] = base[0:0]\n        region scratch(4096):\n            xs: mutable darray[i64] = [1, 2, 3]\n            w: view[i64] = pick(&xs).v\n            v <- pick(&base).v if w[1] == 2 else base[0:1]\n        return v[1].i32() - 7\n'
-diff_case call_store_through_cycle_pos 'def eb(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        return ea(out, r, n - 1)\n    return 0\n\ndef ea(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        return r + eb(out, r, n - 1)\n    return out.count.i64()\n\ndef fill(out: mutable darray[i64&]&) -> i64:\n    x: i64 = 7\n    return eb(out, &x, 3)\n\ndef main() -> i64:\n    out: mutable darray[i64&] = []\n    return fill(&out) - 7\n'
+diff_case region_view_store_in_auto_inner 'def main() -> i32:\n    can Memory.Allocate:\n        total: mutable i64 = 0\n        in auto:\n            xs: mutable darray[i64] = [1, 2, 3]\n            v: mutable view[i64] = xs[0:0]\n            v <- xs[1:3]\n            total <- (v[0] can Unsafe.UncheckedIndex) + (v[1] can Unsafe.UncheckedIndex)\n        return (total - 5).i32()\n'
+diff_case region_view_store_tuple_outer 'def pick(xs: darray[i64]&) -> (known: bool, v: view[i64]):\n    return (true, xs[0:2])\n\ndef main() -> i32:\n    can Memory.Allocate:\n        base: mutable darray[i64] = [4, 7, 9]\n        v: mutable view[i64] = base[0:0]\n        region scratch(4096):\n            xs: mutable darray[i64] = [1, 2, 3]\n            w: view[i64] = pick(&xs).v\n            v <- pick(&base).v if (w[1] can Unsafe.UncheckedIndex) == 2 else base[0:1]\n        return (v[1] can Unsafe.UncheckedIndex).i32() - 7\n'
+diff_case call_store_through_cycle_pos 'def eb(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        return ea(out, r, n - 1)\n    return 0\n\ndef ea(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        return r + eb(out, r, n - 1) can Unsafe.PointerArithmetic\n    return out.count.i64()\n\ndef fill(out: mutable darray[i64&]&) -> i64:\n    x: i64 = 7\n    return eb(out, &x, 3)\n\ndef main() -> i64:\n    out: mutable darray[i64&] = []\n    return fill(&out) - 7\n'
