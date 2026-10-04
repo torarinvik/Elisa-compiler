@@ -366,7 +366,9 @@ run_positive() {
     local name="$(basename -- "$source" .elisa)"
     local object="$WORK/$tag-$name-O$level.o" binary="$WORK/$tag-$name-O$level"
     "$compiler" -emit obj "-O$level" -o "$object" "$source"
-    "$CLANG" -o "$binary" "$object"
+    # Container controls exercise arena cleanup; link the same runtime as
+    # real programs and discard runtime functions unused by this fixture.
+    "$CLANG" -Wl,-dead_strip -o "$binary" "$object" "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
     set +e
     "$binary"
     local result=$?
