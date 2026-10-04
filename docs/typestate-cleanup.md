@@ -352,13 +352,18 @@ by patterns, loops and shadowing must remain distinct; lexical exits discard onl
 their own facts. Immutable/borrowed payload and effect guarantees must be checked
 before retaining evidence across calls.
 
-`derived_source_snapshot.elisa` is an **unproved regression**, excluded from the
-admission gate. Combining a verified family/state-comparison result with Boolean
-known/current guards currently leaves the primary ensure unproved and dependent
-summaries unverified. Supporting typed comparison atoms in logical equivalence
-requires producer and independent kernel validation; it must not admit opaque
-or overloaded comparisons. The source-state runtime hole remains open regardless
-of whether this policy model becomes provable.
+`derived_source_snapshot.elisa` is now admitted with all 20 obligations
+independently replayed, deterministic repeated reports, zero semantic errors,
+zero replay gaps and no trusted assumptions. Annotation-as-current-evidence and
+unchanged-field relabelling counterclaims reject. Producer and kernel now accept
+primitive comparisons as opaque Boolean atoms only with stable witnessed
+identifier/scope/literal operands and no overriding untrusted-operator marker.
+They preserve exact operands, operator and negation polarity; they do not
+evaluate arithmetic or complement ordering operators. Calls, fields, arithmetic
+operands, malformed arena nodes and missing witnesses remain excluded from this
+normalization. Six dedicated positive obligations and 55 raw kernel controls
+pass. **This proves the policy model, not compiler enforcement:** the source-state
+runtime hole and the required binding-specific frontier remain open.
 
 `derived_dependency_join.elisa` is now admitted: bounded signed-atom normalization
 in the proof producer and independent kernel proves the non-constant De Morgan
