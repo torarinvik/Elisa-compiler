@@ -1,0 +1,386 @@
+# Current derived-state evidence. Flat pools retain snapshots for one function;
+# facts contain only canonical IDs and pool offsets, never temporary arrays.
+extend Semantic:
+    private:
+        struct DerivedSourceFact:
+            binding_id: BindingId
+            family_id: DeclId
+            known: bool
+            states_start: usize = 0
+            states_count: usize = 0
+            fields_start: usize = 0
+            fields_count: usize = 0
+            fields_current: bool = false
+
+        struct DerivedSourceFrontier:
+            facts: mutable darray[DerivedSourceFact]
+            states: mutable darray[u32]
+            fields: mutable darray[Ast::FieldInit]
+            reachable: mutable bool
+
+        def derived_source_slot(flow: DerivedSourceFrontier&, id: BindingId) -> int can[Abort.Panic]:
+            found: mutable int = -1
+            for index in 0..<flow.facts.count |found|:
+                if ownership_binding_ids_equal(flow.facts[index].binding_id, id):
+                    return -1 if found >= 0
+                    found <- index.int()
+            return found
+
+        def derived_source_states_valid(flow: DerivedSourceFrontier&, fact: DerivedSourceFact) -> bool:
+            return fact.states_start <= flow.states.count and fact.states_count <= flow.states.count - fact.states_start
+
+        def derived_source_contains(flow: DerivedSourceFrontier&, fact: DerivedSourceFact, wanted: u32) -> bool can[Abort.Panic]:
+            return false if not derived_source_states_valid(flow, fact)
+            for offset in 0..<fact.states_count:
+                return true if flow.states[fact.states_start + offset] == wanted
+            return false
+
+        def derived_source_unknown(fact: DerivedSourceFact) -> DerivedSourceFact:
+            return DerivedSourceFact{binding_id: fact.binding_id, family_id: fact.family_id, known: false}
+
+        def derived_source_invalidate(flow: mutable DerivedSourceFrontier&) -> void can[Abort.Panic]:
+            for index in 0..<flow.facts.count |flow|:
+                flow.facts[index] <- derived_source_unknown(flow.facts[index])
+
+        def derived_source_clone(flow: DerivedSourceFrontier&) -> DerivedSourceFrontier can[Memory.Allocate, Abort.Panic]:
+            return DerivedSourceFrontier{facts: [fact for fact in flow.facts],
+                states: [state for state in flow.states], fields: [field for field in flow.fields],
+                reachable: flow.reachable}
+
+        # Only lexical entry binding IDs survive. Unknown/live predecessors
+        # cannot be dropped; dead predecessors neither grant nor destroy facts.
+        def derived_source_join(flow: mutable DerivedSourceFrontier&, left: DerivedSourceFrontier&, right: DerivedSourceFrontier&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<flow.facts.count |flow|:
+                old: DerivedSourceFact = flow.facts[index]
+                lslot: int = derived_source_slot(left, old.binding_id)
+                rslot: int = derived_source_slot(right, old.binding_id)
+                if lslot < 0 or rslot < 0:
+                    flow.facts[index] <- derived_source_unknown(old)
+                    continue
+                l: DerivedSourceFact = left.facts[lslot.usize()]
+                r: DerivedSourceFact = right.facts[rslot.usize()]
+                known: bool = OwnershipFlow::join_reachable_known(left.reachable, l.known, right.reachable, r.known) and l.family_id.value == old.family_id.value and r.family_id.value == old.family_id.value and derived_source_states_valid(left, l) and derived_source_states_valid(right, r)
+                start: usize = flow.states.count
+                if known:
+                    for offset in 0..<l.states_count |flow|:
+                        break if flow.states.count >= 8192
+                        flow.states.push(left.states[l.states_start + offset]) if left.reachable
+                    for offset in 0..<r.states_count |flow|:
+                        break if flow.states.count >= 8192
+                        candidate: u32 = right.states[r.states_start + offset]
+                        merged: DerivedSourceFact = DerivedSourceFact{binding_id: old.binding_id, family_id: old.family_id, known: true, states_start: start, states_count: flow.states.count - start}
+                        flow.states.push(candidate) if right.reachable and not derived_source_contains(flow, merged, candidate)
+                complete: bool = known and flow.states.count < 8192
+                # Captured fields require a separate equality certificate at a
+                # join. Dropping them does not drop the conservative state union.
+                flow.facts[index] <- DerivedSourceFact{binding_id: old.binding_id, family_id: old.family_id, known: complete, states_start: start, states_count: flow.states.count - start}
+            flow.reachable <- left.reachable or right.reachable
+
+        def derived_source_binding(expression: Ast::Expr, owner: DeclId, table: SymbolTable&, flow: DerivedSourceFrontier&, depth: usize = 0) -> int can[Abort.Panic]:
+            return -1 if depth >= 128
+            match expression:
+                Expr.Paren(inner, _):
+                    return derived_source_binding(inner, owner, table, flow, depth + 1)
+                Expr.Ident(_, pos):
+                    known, id = ownership_binding_at_position(table, owner, pos)
+                    return derived_source_slot(flow, id) if known else -1
+                _:
+                    return -1
+
+        # Build one simultaneous snapshot. Unknown replacements remove old
+        # values. All retained expressions are boundedly evaluated literals.
+        def derived_source_reclassify[@r](flow: mutable DerivedSourceFrontier& @r, previous: DerivedSourceFact, replacements: darray[Ast::FieldInit]&, rules: darray[Ast::DerivedStateRule]&, table: SymbolTable&) -> DerivedSourceFact can[Memory.Allocate, Abort.Panic]:
+            return derived_source_unknown(previous) if previous.fields_start > flow.fields.count or previous.fields_count > flow.fields.count - previous.fields_start
+            snapshot: mutable darray[Ast::FieldInit] = []
+            if previous.fields_current:
+                for offset in 0..<previous.fields_count |snapshot|:
+                    old: Ast::FieldInit = flow.fields[previous.fields_start + offset]
+                    replaced: mutable bool = false
+                    for replacement in replacements |replaced|:
+                        replaced <- true if replacement.name == old.name
+                    snapshot.push(old) if not replaced
+            for replacement in replacements |snapshot|:
+                known: mutable bool = false
+                empty: darray[Ast::FieldInit] = []
+                fuel: mutable u32 = 8192
+                value: i64 = derived_snapshot_int(replacement.value, &empty, known, fuel, 0, false)
+                snapshot.push(Ast::FieldInit{name: replacement.name, value: Expr.IntLit(value, expr_pos(replacement.value))}) if known
+            states: mutable darray[u32] = []
+            complete: mutable bool = true
+            found_family: mutable bool = false
+            for resolved in table.resolved_state_families |states, complete, found_family|:
+                continue if resolved.declaration_id.value != previous.family_id.value or resolved.source_index.usize() >= table.state_family_declarations.count
+                return derived_source_unknown(previous) if found_family
+                found_family <- true
+                family: Ast::StateFamily = table.state_family_declarations[resolved.source_index.usize()]
+                return derived_source_unknown(previous) if not family.has_derive or family.states.count > 256
+                for index in 0..<family.states.count |states, complete|:
+                    found_rule: mutable bool = false
+                    for resolved_rule in table.resolved_derived_state_rules |states, complete, found_rule|:
+                        continue if resolved_rule.declaration_id.value != previous.family_id.value or resolved_rule.source_index.usize() >= rules.count
+                        rule: Ast::DerivedStateRule = rules[resolved_rule.source_index.usize()]
+                        continue if rule.state != family.states[index]
+                        return derived_source_unknown(previous) if found_rule
+                        found_rule <- true
+                        known: mutable bool = false
+                        holds: bool = derived_rule_holds(rule.condition, &snapshot, known)
+                        if known:
+                            states.push(index.u32()) if holds
+                        else:
+                            fuel: mutable u32 = 8192
+                            dependency = derived_snapshot_dependencies(rule.condition, replacements, fuel, 0)
+                            if previous.known and dependency.known and not dependency.changed:
+                                states.push(index.u32()) if derived_source_contains(flow, previous, index.u32())
+                            else:
+                                complete <- false
+                    complete <- false if not found_rule
+            return derived_source_unknown(previous) if flow.states.count + states.count >= 8192 or flow.fields.count + snapshot.count >= 8192
+            state_start: usize = flow.states.count
+            field_start: usize = flow.fields.count
+            for state in states |flow|:
+                flow.states.push(state)
+            for field in snapshot |flow|:
+                flow.fields.push(field)
+            return DerivedSourceFact{binding_id: previous.binding_id, family_id: previous.family_id, known: found_family and complete and states.count > 0, states_start: state_start, states_count: states.count, fields_start: field_start, fields_count: snapshot.count, fields_current: true}
+
+        # Calls and escaping/unknown expressions may mutate aliases. Until a
+        # checked effect summary is available they invalidate, never reseed.
+        def derived_source_primitive(expression: Ast::Expr, owner: DeclId, table: SymbolTable&, depth: usize = 0) -> bool can[Abort.Panic]:
+            return false if depth >= 128
+            match expression:
+                Expr.IntLit(_, _) | Expr.BoolLit(_, _) | Expr.FloatLit(_, _) | Expr.CharLit(_, _):
+                    return true
+                Expr.Paren(inner, _):
+                    return derived_source_primitive(inner, owner, table, depth + 1)
+                Expr.Ident(_, _):
+                    kind: SemTypeKind = interned_kind(ownership_unwrap_type(ownership_declared_type_at(expression, owner, table), table), table)
+                    return kind in {SemTypeKind.Int, SemTypeKind.Bool, SemTypeKind.Float, SemTypeKind.Char}
+                _:
+                    return false
+
+        def derived_source_effects[@r](expression: Ast::Expr, owner: DeclId, table: SymbolTable&, flow: mutable DerivedSourceFrontier& @r, depth: usize = 0) -> void can[Memory.Allocate, Abort.Panic]:
+            if depth >= 128:
+                derived_source_invalidate(flow)
+                return
+            match expression:
+                Expr.IntLit(_, _) | Expr.BoolLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.Ident(_, _) | Expr.Scope(_, _, _) | Expr.Absent:
+                    pass
+                Expr.Paren(inner, _) | Expr.Field(inner, _, _):
+                    derived_source_effects(inner, owner, table, flow, depth + 1)
+                Expr.Unary(operator, inner, _):
+                    derived_source_effects(inner, owner, table, flow, depth + 1)
+                    derived_source_invalidate(flow) if (operator != TokenKind.Not and operator != TokenKind.Minus) or not derived_source_primitive(inner, owner, table)
+                Expr.Binary(left, operator, right, _):
+                    derived_source_effects(left, owner, table, flow, depth + 1)
+                    derived_source_effects(right, owner, table, flow, depth + 1)
+                    # An overloaded operator may call user code. Syntactic
+                    # arithmetic alone is not an effect-freedom witness.
+                    derived_source_invalidate(flow) if operator not in {TokenKind.Plus, TokenKind.Minus, TokenKind.Star, TokenKind.Slash, TokenKind.Percent, TokenKind.And, TokenKind.Or, TokenKind.EqEq, TokenKind.BangEq, TokenKind.Lt, TokenKind.LtEq, TokenKind.Gt, TokenKind.GtEq} or not derived_source_primitive(left, owner, table) or not derived_source_primitive(right, owner, table)
+                Expr.If(condition, yes, no, _):
+                    derived_source_effects(condition, owner, table, flow, depth + 1)
+                    left: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                    right: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                    literal = ownership_literal_bool(condition)
+                    left.reachable <- false if literal.known and not literal.value
+                    right.reachable <- false if literal.known and literal.value
+                    derived_source_effects(yes, owner, table, &left, depth + 1) if left.reachable
+                    derived_source_effects(no, owner, table, &right, depth + 1) if right.reachable
+                    derived_source_join(flow, &left, &right)
+                Expr.RecordUpdate(base, fields, _):
+                    for field in fields |flow|:
+                        derived_source_effects(field.value, owner, table, flow, depth + 1)
+                    derived_source_effects(base, owner, table, flow, depth + 1)
+                Expr.Construct(_, _, _):
+                    # Default initializers are not yet an effect certificate.
+                    derived_source_invalidate(flow)
+                _:
+                    derived_source_invalidate(flow)
+
+        def derived_source_check_result(expression: Ast::Expr, expected: Ast::Expr, scope: sview, owner: DeclId, rules: darray[Ast::DerivedStateRule]&, flow: DerivedSourceFrontier&, table: lmut SymbolTable, depth: usize = 0) -> void can[Memory.Allocate, Abort.Panic]:
+            return if depth >= 128 or not flow.reachable
+            match expression:
+                Expr.Paren(inner, _):
+                    table <- derived_source_check_result(inner, expected, scope, owner, rules, flow, table, depth + 1)
+                Expr.If(_, yes, no, _):
+                    table <- derived_source_check_result(yes, expected, scope, owner, rules, flow, table, depth + 1)
+                    table <- derived_source_check_result(no, expected, scope, owner, rules, flow, table, depth + 1)
+                Expr.RecordUpdate(base, fields, pos):
+                    visited: mutable darray[u32] = []
+                    rebind identity: BindingStateIdentity, table = resolve_binding_state_identity(expected, scope, visited, table)
+                    return if not identity.known or identity.protocol
+                    slot: int = derived_source_binding(base, owner, table, flow)
+                    for resolved in table.resolved_derived_state_rules |table|:
+                        continue if resolved.declaration_id.value != identity.family_id.value or resolved.source_index.usize() >= rules.count
+                        rule: Ast::DerivedStateRule = rules[resolved.source_index.usize()]
+                        state: mutable sview = ""
+                        for family in table.resolved_state_families |state|:
+                            continue if family.declaration_id.value != identity.family_id.value or family.source_index.usize() >= table.state_family_declarations.count
+                            names: darray[sview] = table.state_family_declarations[family.source_index.usize()].states
+                            state <- names[identity.state_index.usize()] if identity.state_index.usize() < names.count
+                        continue if rule.state != state
+                        decided: mutable bool = false
+                        ignored: bool = derived_rule_holds(rule.condition, &fields, decided)
+                        fuel: mutable u32 = 8192
+                        dependency = derived_snapshot_dependencies(rule.condition, &fields, fuel, 0)
+                        # The existing contextual pass handles decided/changed
+                        # replacements; this closes its preservation-only gap.
+                        continue if decided or not dependency.known or dependency.changed
+                        matches: mutable bool = false
+                        if slot >= 0:
+                            source: DerivedSourceFact = flow.facts[slot.usize()]
+                            matches <- source.known and source.family_id.value == identity.family_id.value and source.states_count > 0 and derived_source_states_valid(flow, source)
+                            if matches:
+                                for offset in 0..<source.states_count |matches|:
+                                    matches <- false if flow.states[source.states_start + offset] != identity.state_index
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateEvidenceUnproven, name: rule.owner, pos: pos, line: pos.line, expected: state, actual: "current source snapshot"}) if not matches
+                _:
+                    pass
+
+        def derived_source_walk[@r](statements: darray[Ast::Stmt]&, expected: Ast::Expr?, scope: sview, owner: DeclId, rules: darray[Ast::DerivedStateRule]&, flow: mutable DerivedSourceFrontier& @r, fuel: mutable usize&, table: lmut SymbolTable, depth: usize = 0) -> void can[Memory.Allocate, Abort.Panic]:
+            if depth >= 128 or fuel == 0:
+                derived_source_invalidate(flow)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateEvidenceUnproven, name: "<source frontier>", line: 0, expected: "bounded current-state coverage", actual: "analysis budget exhausted"})
+                return
+            for statement in statements |flow, fuel, table|:
+                return if not flow.reachable
+                if fuel == 0:
+                    derived_source_invalidate(flow)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DerivedStateEvidenceUnproven, name: "<source frontier>", line: 0, expected: "bounded current-state coverage", actual: "analysis budget exhausted"})
+                    return
+                fuel <- fuel - 1
+                match statement:
+                    Stmt.Return(value, _):
+                        if value is returned:
+                            derived_source_effects(returned, owner, table, flow)
+                            table <- derived_source_check_result(returned, result_type, scope, owner, rules, flow, table) if expected is result_type
+                        flow.reachable <- false
+                    Stmt.VarDecl(name, annotation, value, pos):
+                        derived_source_effects(value, owner, table, flow)
+                        table <- derived_source_check_result(value, annotation, scope, owner, rules, flow, table)
+                        binder: mutable Ast::Pos = source_binder_position(table, name, pos.line, 0, "__pattern_binder")
+                        binder <- pos if binder.line == 0
+                        resolved, id = ownership_binding_at_position(table, owner, binder)
+                        for declared in table.binding_declared_types |flow|:
+                            continue if not resolved or not ownership_binding_ids_equal(declared.binding_id, id) or not declared.state_identity.known or declared.state_identity.protocol
+                            fact: mutable DerivedSourceFact = DerivedSourceFact{binding_id: id, family_id: declared.state_identity.family_id, known: false}
+                            match value:
+                                Expr.Construct(constructor, fields, _):
+                                    nominal: mutable u32 = binding_nominal_declaration(constructor, scope, table)
+                                    match constructor:
+                                        Expr.Index(base, _, _):
+                                            nominal <- binding_nominal_declaration(base, scope, table)
+                                        _:
+                                            pass
+                                    fact <- derived_source_reclassify(flow, fact, &fields, rules, table) if nominal != SYMBOL_INDEX_ROW_NONE and nominal.usize() < table.symbols.count and table.symbols[nominal.usize()].id.value == fact.family_id.value
+                                Expr.RecordUpdate(base, fields, _):
+                                    slot: int = derived_source_binding(base, owner, table, flow)
+                                    if slot >= 0 and flow.facts[slot.usize()].family_id.value == fact.family_id.value:
+                                        source: DerivedSourceFact = flow.facts[slot.usize()]
+                                        fact <- derived_source_reclassify(flow, DerivedSourceFact{binding_id: id, family_id: source.family_id, known: source.known, states_start: source.states_start, states_count: source.states_count, fields_start: source.fields_start, fields_count: source.fields_count, fields_current: source.fields_current}, &fields, rules, table)
+                                _:
+                                    pass
+                            flow.facts.push(fact)
+                    Stmt.Assign(target, operator, value, pos):
+                        derived_source_effects(value, owner, table, flow)
+                        match target:
+                            Expr.Field(base, field, _):
+                                slot: int = derived_source_binding(base, owner, table, flow)
+                                if slot >= 0 and operator == TokenKind.LArrow:
+                                    # Writes through a reference can affect other
+                                    # tracked owners; no alias independence claim.
+                                    source: DerivedSourceFact = flow.facts[slot.usize()]
+                                    borrowed: mutable bool = false
+                                    for declared in table.binding_declared_types |borrowed|:
+                                        borrowed <- true if ownership_binding_ids_equal(declared.binding_id, source.binding_id) and (declared.explicit_borrow or not declared.capabilities.known or declared.capabilities.borrowed)
+                                    if borrowed:
+                                        derived_source_invalidate(flow)
+                                    else:
+                                        replacements: darray[Ast::FieldInit] = [Ast::FieldInit{name: field, value: value}]
+                                        classified: DerivedSourceFact = derived_source_reclassify(flow, source, &replacements, rules, table)
+                                        flow.facts[slot.usize()] <- classified
+                                else:
+                                    derived_source_invalidate(flow)
+                            _:
+                                derived_source_invalidate(flow)
+                    Stmt.Expr(expression, _):
+                        derived_source_effects(expression, owner, table, flow)
+                    Stmt.If(condition, yes, no, _):
+                        derived_source_effects(condition, owner, table, flow)
+                        left: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                        right: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                        literal = ownership_literal_bool(condition)
+                        left.reachable <- false if literal.known and not literal.value
+                        right.reachable <- false if literal.known and literal.value
+                        table <- derived_source_walk(&yes, expected, scope, owner, rules, &left, fuel, table, depth + 1)
+                        table <- derived_source_walk(&no, expected, scope, owner, rules, &right, fuel, table, depth + 1)
+                        derived_source_join(flow, &left, &right)
+                    Stmt.Block(kind, _, binding, body, _):
+                        count: usize = flow.facts.count
+                        derived_source_invalidate(flow) if binding != "" or (kind != "can" and kind != "trusted")
+                        table <- derived_source_walk(&body, expected, scope, owner, rules, flow, fuel, table, depth + 1)
+                        flow.facts <- flow.facts.truncate(count)
+                    Stmt.While(_, body, _) | Stmt.For(_, _, _, body, _):
+                        # Explicit unknown loop coverage until the state-set
+                        # fixed-point transfer is implemented. Never use a
+                        # one-pass body to establish a zero-iteration result.
+                        derived_source_invalidate(flow)
+                        loop: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                        table <- derived_source_walk(&body, expected, scope, owner, rules, &loop, fuel, table, depth + 1)
+                        derived_source_invalidate(flow)
+                    Stmt.Match(value, arms, _):
+                        derived_source_effects(value, owner, table, flow)
+                        # A failed guard may run before a later arm. Account
+                        # for its possible effects before cloning any branch.
+                        for arm in arms |flow|:
+                            derived_source_effects(arm.guard, owner, table, flow)
+                        joined: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                        joined.reachable <- false
+                        for arm in arms |joined, fuel, table|:
+                            branch: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                            literal_guard = ownership_literal_bool(arm.guard)
+                            branch.reachable <- false if literal_guard.known and not literal_guard.value
+                            table <- derived_source_walk(&arm.body, expected, scope, owner, rules, &branch, fuel, table, depth + 1)
+                            next: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                            derived_source_join(&next, &joined, &branch)
+                            joined <- next
+                        # Exhaustiveness is not yet a frontier certificate.
+                        entry: mutable DerivedSourceFrontier = derived_source_clone(flow)
+                        derived_source_join(flow, &entry, &joined)
+                    Stmt.Contract(_, _, _):
+                        pass
+                    _:
+                        derived_source_invalidate(flow)
+
+        def derived_source_declarations(declarations: darray[Ast::Decl]&, rules: darray[Ast::DerivedStateRule]&, scope: sview, table: lmut SymbolTable) -> void can[Memory.Allocate, Abort.Panic]:
+            for declaration in declarations |table|:
+                match declaration:
+                    Decl.Func(name, params, expected, body, _, _, pos):
+                        owner: DeclId = function_declaration_id(table, name, pos.offset)
+                        flow: mutable DerivedSourceFrontier = DerivedSourceFrontier{facts: [], states: [], fields: [], reachable: true}
+                        for param in params |flow|:
+                            resolved, id = ownership_binding_at_position(table, owner, param.name_pos)
+                            for declared in table.binding_declared_types |flow|:
+                                identity: BindingStateIdentity = declared.state_identity
+                                continue if not resolved or not ownership_binding_ids_equal(declared.binding_id, id) or not identity.known or identity.protocol
+                                start: usize = flow.states.count
+                                flow.states.push(identity.state_index)
+                                flow.facts.push(DerivedSourceFact{binding_id: id, family_id: identity.family_id, known: true, states_start: start, states_count: 1})
+                        fuel: mutable usize = 8192
+                        relevant: mutable bool = flow.facts.count > 0
+                        for declared in table.binding_declared_types |relevant|:
+                            relevant <- true if declared.binding_id.owner.value == owner.value and declared.state_identity.known and not declared.state_identity.protocol
+                        if expected is result_type:
+                            visited: mutable darray[u32] = []
+                            rebind result_identity: BindingStateIdentity, table = resolve_binding_state_identity(result_type, scope, visited, table)
+                            relevant <- true if result_identity.known and not result_identity.protocol
+                        table <- derived_source_walk(&body, expected, scope, owner, rules, &flow, fuel, table) if relevant
+                    Decl.Module(name, body, _):
+                        table <- derived_source_declarations(&body, rules, name, table)
+                    Decl.Scoped(body, _):
+                        table <- derived_source_declarations(&body, rules, scope, table)
+                    _:
+                        pass
+
+    public:
+        def check_derived_source_frontier(file: Ast::File&, table: lmut SymbolTable) -> void can[Memory.Allocate, Abort.Panic]:
+            table <- derived_source_declarations(&file.top_decls, &file.derived_state_rules, "", table) if file.derived_state_rules.count > 0

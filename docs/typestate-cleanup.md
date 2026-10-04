@@ -321,36 +321,52 @@ and exhausted limits are possibly changed, not proof of preservation. Native
 singleton controls accept proven replacements and unrelated-field updates at
 O0/O2 while preserving the input copy.
 
-This does not yet prove the unchanged input satisfies the requested canonical
-state, nor consume source-state provenance or proof-backed symbolic constraints.
-Unrelated-field updates still need that independent validation; source-state
-tracking, general inference and coverage/overlap remain open. A valid symbolic
-update currently needs further proof-aware compiler support, rather than being
-admitted merely because a predicate was undecidable.
+The preservation-only contextual-result gap is now closed by
+`check_derived_source_frontier.elisa`. Facts are keyed by exact BindingId and
+canonical family ID. Parameter annotations seed entry facts only; local
+annotations never assert the initializer's current state. Proven canonical
+construction and bounded literal field writes establish snapshots. Every
+possible source state must equal the requested canonical result state before an
+unrelated-field update can preserve it. Unknown evidence grants no permission.
+The previous name-based derived call checker is not reused as this authority.
 
-The source-state audit confirms a concrete remaining hole:
-`derived_update_unchanged_wrong_state.neg.elisa` relabels Alive as Dead through a
-tag-only update. Stage0 rejects; Stage1 emits LLVM. The deliberately red
-`derived_source_state_smoke.sh` requires semantic rejection without an artifact.
-Its positive control, `derived_update_changed_before_copy.pos.elisa`, changes
-health to zero before copying and correctly returns Dead; it compiles in both
-compilers and executes in Stage1 at O0/O2 with input-copy preservation. Comparing
-the destination with the source binding's original Alive annotation would
-incorrectly reject this valid program and is not an acceptable fix.
+`derived_source_state_smoke.sh` now passes, rather than being deliberately red.
+Both compilers reject wrong-state relabelling, a mixed Alive/Dead branch union,
+unknown field writes, and cross-family updates despite identical owner/state
+spellings, with semantic exit 1 and no artifact. Four positive programs execute
+in Stage1 at O0/O2: ordinary and conditional preservation, a literal write before
+copying, two reachable writes establishing Dead, and an early-return predecessor
+that must not poison the continuing state. These preserve the caller's input
+copy. Comparing against the original Alive annotation would still be an invalid
+substitute for current facts.
 
-The next enforcement pass must maintain current state facts keyed by exact
-BindingId and canonical family ID, not spelling or original annotation. Parameter
-annotations seed entry facts only. Proven construction and writes establish new
-snapshot facts; reassignment, aliases, opaque writes and mutable-effect calls
-invalidate affected evidence unless their checked contracts establish a result.
-Branches join every reachable predecessor's conservative state set, excluding
-dead paths. Loops need bounded fixed points and explicit unknown coverage on
-exhaustion. Preservation requires an exact source occurrence, current evidence,
-the correct family and all possible source states satisfying the requested result.
-Declared type metadata alone is never current-state permission. Bindings introduced
-by patterns, loops and shadowing must remain distinct; lexical exits discard only
-their own facts. Immutable/borrowed payload and effect guarantees must be checked
-before retaining evidence across calls.
+Snapshot/state storage uses retained flat pools (8192 entries each); facts carry
+validated offsets, not temporary nested arrays. Snapshot evaluation has depth
+128/fuel 8192 bounds; reclassification currently supports up to 256 named states.
+Invalid ranges, unsupported values and exhausted storage become unknown, not
+partial permission. Branch joins use the admitted reachable-knownness law and
+union states across every reachable predecessor; lexical exits discard only
+their own binding IDs. Captured field values are dropped at joins until an exact
+equality certificate is available. Calls, borrowed/uncertain writes, unverified
+operators and uncertified constructors invalidate evidence conservatively.
+Match guards are included in effect coverage, including effects before a failed
+guard. Statement traversal has shared fuel/depth bounds and reports exhaustion.
+
+**Remaining enforcement/inference work:** loop fixed points currently have
+explicit unknown coverage; match joins retain the entry path until exhaustiveness
+is certified. Checked call/effect/alias summaries, pattern/loop binder seeding,
+whole-binding reassignment and copy transfer, exact captured-value joins, general
+argument/assignment contexts, symbolic predicates, state-union annotation
+resolution and predicate coverage/overlap remain unfinished. Some valid programs
+therefore reject conservatively. This incremental return/local preservation
+check does not replace the legacy name-based call/balance checks or establish
+complete typestate support. Predicate-free Stage1 families remain disabled.
+
+`derived_source_join.elisa` is admitted with all 22 obligations independently
+replayed, deterministic repeated reports and no trust/replay gaps. It imports
+the actual reachable-knownness/possible-state Boolean domain used by this pass;
+dead-source knowledge and dropped-live-state counterclaims reject. These are
+domain laws, not a kernel proof of the AST walker, pool management or resolver.
 
 `derived_source_snapshot.elisa` is now admitted with all 20 obligations
 independently replayed, deterministic repeated reports, zero semantic errors,
@@ -362,8 +378,9 @@ They preserve exact operands, operator and negation polarity; they do not
 evaluate arithmetic or complement ordering operators. Calls, fields, arithmetic
 operands, malformed arena nodes and missing witnesses remain excluded from this
 normalization. Six dedicated positive obligations and 55 raw kernel controls
-pass. **This proves the policy model, not compiler enforcement:** the source-state
-runtime hole and the required binding-specific frontier remain open.
+pass. **This proves the policy model, not the AST algorithm:** the native gates
+now cover the preservation gap, but general current-state inference and loop,
+effect and symbolic coverage remain incomplete.
 
 `derived_dependency_join.elisa` is now admitted: bounded signed-atom normalization
 in the proof producer and independent kernel proves the non-constant De Morgan
