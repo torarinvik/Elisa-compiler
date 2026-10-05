@@ -8,6 +8,7 @@ WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/fixtures/edir/host_clock.elisa"
 CONSOLE_FIXTURE="$ROOT/test/fixtures/edir/host_console_output.elisa"
 CONSOLE_INPUT_FIXTURE="$ROOT/test/fixtures/edir/host_console_input.elisa"
+VIRTUAL_FILE_FIXTURE="$ROOT/test/fixtures/edir/host_virtual_file_read.elisa"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -25,7 +26,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 4
+PROGRAM_VERSION = 5
 INSTRUCTION_COUNT = 4
 FUNCTION_COUNT = 2
 LOCAL_COUNT = 1
@@ -78,7 +79,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 4
+PROGRAM_VERSION = 5
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -124,7 +125,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 4
+PROGRAM_VERSION = 5
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -160,4 +161,50 @@ assert struct.unpack_from("<I", data, function_count_offset)[0] == FUNCTION_COUN
 PY
 done
 
-echo "emit_edir_host_effect_smoke OK: namespaced clock/random/console input/output calls lower at O0 and O2 with source identity"
+for optimization in 0 2; do
+  artifact="$WORK/host-virtual-file-read-O$optimization.edir"
+  ELISA_EDIR_SOURCE_ROOT="$ROOT" ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir "-O$optimization" -o "$artifact" "$VIRTUAL_FILE_FIXTURE"
+  python3 - "$artifact" "$VIRTUAL_FILE_FIXTURE" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+SCHEMA = 4
+PROGRAM_VERSION = 5
+INSTRUCTION_COUNT = 2
+FUNCTION_COUNT = 1
+LOCAL_COUNT = 0
+HAS_RETURN = 1
+SOURCE_FILE_COUNT = 1
+OPCODE_VIRTUAL_FILE_READ_BYTE = 24
+OPCODE_RETURN = 19
+RESOURCE_HANDLE = 7
+NO_OPERAND = 0
+PROGRAM_HEADER_BYTES = 29
+SOURCE_FILE_FIXED_BYTES = 36
+SOURCE_FILE_PATH_LENGTH_OFFSET = 32
+INSTRUCTION_BYTES = 62
+INSTRUCTION_SOURCE_OFFSET = 18
+HAS_RETURN_OFFSET = 24
+
+artifact_path, source_path = map(Path, sys.argv[1:])
+data = artifact_path.read_bytes()
+source = source_path.read_bytes()
+source_path_length = struct.unpack_from("<I", data, PROGRAM_HEADER_BYTES + SOURCE_FILE_PATH_LENGTH_OFFSET)[0]
+header_bytes = PROGRAM_HEADER_BYTES + SOURCE_FILE_FIXED_BYTES + source_path_length
+schema, program_version, instruction_count, local_count = struct.unpack_from("<IIQQ", data)
+assert (schema, program_version, instruction_count, local_count, data[HAS_RETURN_OFFSET]) == (SCHEMA, PROGRAM_VERSION, INSTRUCTION_COUNT, LOCAL_COUNT, HAS_RETURN)
+assert struct.unpack_from("<I", data, PROGRAM_HEADER_BYTES)[0] == SOURCE_FILE_COUNT
+read = struct.unpack_from("<Hqq", data, header_bytes)
+returned = struct.unpack_from("<Hqq", data, header_bytes + INSTRUCTION_BYTES)
+assert read == (OPCODE_VIRTUAL_FILE_READ_BYTE, RESOURCE_HANDLE, NO_OPERAND), read
+assert returned == (OPCODE_RETURN, NO_OPERAND, NO_OPERAND), returned
+read_source = struct.unpack_from("<QQQIIIII", data, header_bytes + INSTRUCTION_SOURCE_OFFSET)
+start_byte, end_byte = read_source[1], read_source[2]
+assert source[start_byte:end_byte].decode() == "DebuggerHostEffects::virtual_file_read_byte"
+function_count_offset = header_bytes + instruction_count * INSTRUCTION_BYTES
+assert struct.unpack_from("<I", data, function_count_offset)[0] == FUNCTION_COUNT
+PY
+done
+
+echo "emit_edir_host_effect_smoke OK: namespaced clock/random/console/virtual-file calls lower at O0 and O2 with source identity"
