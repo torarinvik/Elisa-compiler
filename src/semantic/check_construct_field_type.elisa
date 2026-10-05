@@ -146,14 +146,72 @@ extend Semantic:
                     spellings[index] return if elements[index] == element
                 return "darray"
 
-        # The declared TypeId of positional parameter `position` of `function_name`, with a
-        # reference wrapper peeled (`darray[i8]&` -> `darray[i8]`); 0 when unknown.
-        def darray_param_type_id_at(table: SymbolTable&, function_name: sview, position: usize) -> u32:
+        # Resolve a direct function call to one canonical declaration. Bare names are scoped
+        # to the current module; qualified names must match a declared module path exactly.
+        # Anything ambiguous, aliased-but-unresolved, or non-function remains unknown.
+        def darray_call_declaration_id(callee: Ast::Expr, bound_names: darray[sview]&, table: SymbolTable&) -> DeclId:
+            can Memory.Allocate, Abort.Panic:
+                function_name: mutable sview = ""
+                module_name: mutable sview = ""
+                qualified_names: mutable darray[sview] = []
+                qualified: mutable bool = false
+                match callee:
+                    Expr.Ident(name, _):
+                        return DeclId{value: SYMBOL_INDEX_ROW_NONE} if any bound_name in bound_names where bound_name == name
+                        return DeclId{value: SYMBOL_INDEX_ROW_NONE} if any imported_name in table.imported_members where imported_name == name
+                        imported_member_row: mutable u32 = member_chain_head(table, name)
+                        while imported_member_row != SYMBOL_INDEX_ROW_NONE |imported_member_row, table, name|:
+                            member_index: usize = imported_member_row.usize()
+                            if table.module_member_name[member_index] == name and (any imported_module in table.imported_modules where imported_module == table.module_member_owner[member_index]):
+                                return DeclId{value: SYMBOL_INDEX_ROW_NONE}
+                            imported_member_row <- table.member_name_next[member_index]
+                        function_name <- name
+                        module_name <- table.current_module
+                    Expr.Scope(scope_base, name, _):
+                        dotted: mutable darray[bool] = []
+                        return DeclId{value: SYMBOL_INDEX_ROW_NONE} if not type_path_collect(scope_base, qualified_names, dotted)
+                        return DeclId{value: SYMBOL_INDEX_ROW_NONE} if qualified_names.count == 0 or (any separator_is_dot in dotted where separator_is_dot)
+                        return DeclId{value: SYMBOL_INDEX_ROW_NONE} if any bound_name in bound_names where bound_name == qualified_names[0]
+                        qualified <- true
+                        function_name <- name
+                    _:
+                        return DeclId{value: SYMBOL_INDEX_ROW_NONE}
+
+                found: mutable DeclId = DeclId{value: SYMBOL_INDEX_ROW_NONE}
+                candidate_count: mutable usize = 0
+                function_row: mutable u32 = symbol_chain_head(table, function_name)
+                while function_row != SYMBOL_INDEX_ROW_NONE |found, candidate_count, function_row, table, function_name, module_name, qualified_names, qualified|:
+                    symbol: Symbol& = &table.symbols[function_row.usize()]
+                    if symbol.kind == SymbolKind.Func and symbol.name == function_name:
+                        owner_matches: bool = module_symbol_matches(symbol.module_owner, "", qualified_names, 0, qualified_names.count) or (table.current_module != "" and module_symbol_matches_relative(symbol.module_owner, table.current_module, qualified_names, qualified_names.count)) if qualified else symbol.module_owner == module_name
+                        if owner_matches:
+                            found <- symbol.id
+                            candidate_count <- candidate_count + 1
+                    function_row <- table.symbol_name_next[function_row.usize()]
+                return DeclId{value: SYMBOL_INDEX_ROW_NONE} if candidate_count != 1
+                return found
+
+        # Resolve a formal index within this exact function declaration. The declaration ID
+        # prevents signatures in other modules with the same bare name from contaminating the
+        # lookup; -1 means the argument label is not a formal of this declaration.
+        def darray_param_index_for_call(table: SymbolTable&, function_name: sview, declaration_id: DeclId, parameter_name: sview) -> int:
             can Abort.Panic:
                 seen: mutable usize = 0
                 cur: mutable u32 = function_param_chain_head(table, function_name)
-                while cur != 4294967295:
-                    if table.function_param_owner[cur.usize()] == function_name:
+                while cur != SYMBOL_INDEX_ROW_NONE:
+                    if table.function_param_owner[cur.usize()] == function_name and cur.usize() < table.function_param_declaration_id.count and table.function_param_declaration_id[cur.usize()].value == declaration_id.value:
+                        return seen.int() if table.function_param_name[cur.usize()] == parameter_name
+                        seen <- seen + 1
+                    cur <- table.function_param_name_next[cur.usize()]
+                return -1
+
+        # The declared TypeId at a formal index of this exact function declaration.
+        def darray_param_type_id_at(table: SymbolTable&, function_name: sview, declaration_id: DeclId, position: usize) -> u32:
+            can Abort.Panic:
+                seen: mutable usize = 0
+                cur: mutable u32 = function_param_chain_head(table, function_name)
+                while cur != SYMBOL_INDEX_ROW_NONE:
+                    if table.function_param_owner[cur.usize()] == function_name and cur.usize() < table.function_param_declaration_id.count and table.function_param_declaration_id[cur.usize()].value == declaration_id.value:
                         if seen == position:
                             type_id: u32 = table.function_param_type_id[cur.usize()] if cur.usize() < table.function_param_type_id.count else 0
                             return darray_referent_type_id(type_id, table)
@@ -161,23 +219,47 @@ extend Semantic:
                     cur <- table.function_param_name_next[cur.usize()]
                 return 0
 
-        # A bare darray local passed where a uniquely-named function's parameter is a
-        # darray (or darray ref) of a DIFFERENT known scalar/string element: the callee reads or
-        # grow one buffer under another element layout. Same wall as the struct-field case.
+        # A direct darray argument may not flow to a formal with a different known scalar or
+        # string element type. Resolve the declaration first, then map each actual argument to
+        # its formal using the source argument label or the next positional slot.
         def check_darray_call_arguments(callee: Ast::Expr, arguments: darray[Ast::Expr], argument_names: darray[sview], table: lmut SymbolTable, var_types: darray[sview]&, var_type_ids: darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                match callee:
-                    Expr.Ident(function_name, _):
-                        return if direct_function_count(table, function_name) != 1
-                        for index in 0..<arguments.count |table|:
-                            continue if index < argument_names.count and argument_names[index] != ""
-                            actual_id: u32 = construct_ident_type_id(arguments[index], var_types, var_type_ids)
-                            continue if actual_id == 0
-                            expected_id: u32 = darray_param_type_id_at(table, function_name, index)
-                            continue if expected_id == 0
+                declaration_id: DeclId = darray_call_declaration_id(callee, var_types, table)
+                return if declaration_id.value == SYMBOL_INDEX_ROW_NONE
+                return if declaration_id.value.usize() >= table.symbols.count
+                function_name: sview = table.symbols[declaration_id.value.usize()].name
+                function_arity_max: u32 = table.symbols[declaration_id.value.usize()].arity_max
+                positional_index: mutable usize = 0
+                seen_named: mutable bool = false
+                formal_count: mutable usize = function_arity_max.usize()
+                if function_arity_max == SYMBOL_INDEX_ROW_NONE:
+                    formal_count <- 0
+                    formal_row: mutable u32 = function_param_chain_head(table, function_name)
+                    while formal_row != SYMBOL_INDEX_ROW_NONE |formal_count, formal_row, table, function_name, declaration_id|:
+                        row: usize = formal_row.usize()
+                        formal_count <- formal_count + 1 if table.function_param_owner[row] == function_name and row < table.function_param_declaration_id.count and table.function_param_declaration_id[row].value == declaration_id.value
+                        formal_row <- table.function_param_name_next[row]
+                filled: mutable darray[bool] = []
+                while filled.count < formal_count |filled, formal_count|:
+                    filled <- filled.push(false)
+                for index in 0..<arguments.count |table, positional_index, seen_named, function_name, declaration_id, argument_names, filled|:
+                    parameter_name: sview = argument_names[index] if index < argument_names.count else ""
+                    parameter_index: mutable int = 0
+                    if parameter_name != "":
+                        seen_named <- true
+                        parameter_index <- darray_param_index_for_call(table, function_name, declaration_id, parameter_name)
+                        return if parameter_index < 0
+                    else:
+                        return if seen_named
+                        parameter_index <- positional_index.int()
+                        positional_index <- positional_index + 1
+                    return if parameter_index.usize() >= filled.count or filled[parameter_index.usize()]
+                    filled[parameter_index.usize()] <- true
+                    actual_id: u32 = construct_ident_type_id(arguments[index], var_types, var_type_ids)
+                    if actual_id != 0:
+                        expected_id: u32 = darray_param_type_id_at(table, function_name, declaration_id, parameter_index.usize())
+                        if expected_id != 0:
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FirmArgTypeMismatch, name: function_name, pos: Ast::expr_pos(arguments[index]), line: Ast::expr_pos(arguments[index]).line, expected: darray_type_spelling(expected_id, table), actual: darray_type_spelling(actual_id, table), expected_count: (index + 1).u32()}) if darray_element_conflict(expected_id, actual_id, table)
-                    _:
-                        pass
 
         # The annotated TypeId of a bare local `name` (innermost wins), 0 when unknown or
         # when the name and id channels are not in step.
@@ -375,7 +457,10 @@ extend Semantic:
                                 var_type_ids.push(annotation_type_id(param.type_expression, table))
                             table <- walk_statements_for_construct_field_type(body, table, var_types, type_names, var_type_ids)
                         Decl.Module(module_name, body, line):
+                            outer_module: sview = table.current_module
+                            table.current_module <- module_name
                             table <- check_construct_field_type_declarations(body, table)
+                            table.current_module <- outer_module
                         Decl.Scoped(body, line):
                             table <- check_construct_field_type_declarations(body, table)
                         _:
