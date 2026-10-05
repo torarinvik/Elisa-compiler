@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A long valid alias chain is a positive control for cycle detection: it must not
-# recurse through the chain, reject a valid type, or become cubic by rescanning the
-# full chain from each RHS.
+# recurse through the chain, reject a valid type, or rescan the chain for every
+# repeated annotation use.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
@@ -28,6 +28,11 @@ while [ "$index" -ge 0 ]; do
   index=$((index - 1))
 done
 printf '\ndef long_valid_alias_chain(value: Chain0000) -> bool:\n    return true\n' >>"$source"
+index=0
+while [ "$index" -lt 512 ]; do
+  printf 'const RepeatedUse%04d: Chain0000 = 0\n' "$index" >>"$source"
+  index=$((index + 1))
+done
 
 rc=0
 "$S0" -emit llvm -o /dev/null "$source" >"$work/long.s0" 2>&1 || rc=$?
@@ -38,4 +43,4 @@ env -u ELISA_STAGE1_RUNTIME_STD "$S1" -emit llvm -o /dev/null "$source" >"$work/
 if grep -qF 'backend could not produce a linkable unit' "$work/long.s1" || grep -qF 'backend emitted no functions' "$work/long.s1"; then
   fail "Stage1 reached backend decline: $(tail -12 "$work/long.s1")"
 fi
-echo 'alias chain depth OK: 1024-link acyclic alias accepted by Stage0 and Stage1'
+echo 'alias chain depth OK: 1024-link acyclic chain and 512 repeated uses accepted by Stage0 and Stage1'
