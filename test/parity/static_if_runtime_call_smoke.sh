@@ -19,10 +19,18 @@ for row in "stage0:$S0" "stage1:$S1"; do
         fail "$stage rejected runtime calls in a Linux static-if branch: $(cat "$WORK/$stage-positive.err")"
     fi
     grep -Fq 'target triple = "x86_64-unknown-linux-gnu"' "$WORK/$stage-positive.ll" || fail "$stage output did not retain the requested Linux target"
+    if ! ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 "$compiler" -emit llvm -target-triple "$linux_triple" -o "$WORK/$stage-nested-positive.ll" "$ROOT/test/repro/static_if_nested_runtime_elif_module.elisa" >"$WORK/$stage-nested-positive.out" 2>"$WORK/$stage-nested-positive.err"; then
+        fail "$stage rejected nested static-if runtime calls in module/elif branches: $(cat "$WORK/$stage-nested-positive.err")"
+    fi
+    grep -Fq 'target triple = "x86_64-unknown-linux-gnu"' "$WORK/$stage-nested-positive.ll" || fail "$stage nested output did not retain the requested Linux target"
     rc=0
     "$compiler" -emit llvm -o "$WORK/$stage-negative.ll" "$ROOT/test/repro/static_block_runtime_call_rejected.elisa" >"$WORK/$stage-negative.out" 2>"$WORK/$stage-negative.err" || rc=$?
     [[ "$rc" -eq 1 ]] || fail "$stage bare static block expected semantic exit 1, got $rc"
     grep -Fq 'static expression statement must evaluate at compile time' "$WORK/$stage-negative.err" || fail "$stage did not preserve bare-static runtime-call refusal"
+    rc=0
+    ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 "$compiler" -emit llvm -target-triple "$linux_triple" -o "$WORK/$stage-nested-negative.ll" "$ROOT/test/repro/static_if_nested_bare_static_rejected.elisa" >"$WORK/$stage-nested-negative.out" 2>"$WORK/$stage-nested-negative.err" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "$stage nested bare static block expected semantic exit 1, got $rc"
+    grep -Fq 'static expression statement must evaluate at compile time' "$WORK/$stage-nested-negative.err" || fail "$stage did not refuse nested bare-static runtime call"
 done
 
-echo 'static-if runtime calls OK: target-selected Linux branch accepted; bare static block remains refused by Stage0 and Stage1'
+echo 'static-if runtime calls OK: nested/module/elif runtime branches accepted; top-level and nested bare static blocks refused by Stage0 and Stage1'
