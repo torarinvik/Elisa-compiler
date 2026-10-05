@@ -40,9 +40,15 @@ def source_revision(root):
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"cannot read Stage1 source revision from {root}")
-    return result.stdout.strip()
+    if result.returncode == 0:
+        return result.stdout.strip()
+    snapshot = root / "SNAPSHOT"
+    if snapshot.is_file():
+        for line in snapshot.read_text().splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == "source_revision" and value.strip():
+                return value.strip()
+    raise RuntimeError(f"cannot read Stage1 source revision from {root}")
 
 
 def snapshot(root, binary):

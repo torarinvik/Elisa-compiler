@@ -27,6 +27,7 @@ MODE="snapshot"
 
 mkdir -p "$PREFIX"
 REVISION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+SOURCE_REVISION="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 
 if [[ "$MODE" == "link" ]]; then
     cat > "$PREFIX/elisac-stage1" <<WRAPPER
@@ -43,6 +44,7 @@ fi
 
 [[ -x "$ROOT/bin/elisac-stage1" ]] || { echo "no product at $ROOT/bin/elisac-stage1 -- run scripts/elisac_stage1.sh --seed first" >&2; exit 2; }
 [[ -f "$ROOT/build/runtime/elisacore_runtime.o" ]] || { echo "no runtime object at $ROOT/build/runtime/elisacore_runtime.o" >&2; exit 2; }
+[[ -f "$ROOT/bin/elisac-stage1.provenance.json" ]] || { echo "no product provenance at $ROOT/bin/elisac-stage1.provenance.json -- run scripts/elisac_stage1.sh --seed first" >&2; exit 2; }
 
 STAGING="$PREFIX/.stage1.incoming.$$"
 rm -rf "$STAGING"
@@ -55,9 +57,11 @@ cp -R "$ROOT/elisacore_std" "$STAGING/elisacore_std"
 cp -R "$ROOT/scripts" "$STAGING/scripts"
 cp "$ROOT/build/runtime/elisacore_runtime.o" "$STAGING/build/runtime/elisacore_runtime.o"
 cp "$ROOT/bin/elisac-stage1" "$STAGING/bin/elisac-stage1"
+cp "$ROOT/bin/elisac-stage1.provenance.json" "$STAGING/bin/elisac-stage1.provenance.json"
 touch "$STAGING/bin/elisac-stage1"
 cat > "$STAGING/SNAPSHOT" <<META
 revision: ${REVISION}
+source_revision: ${SOURCE_REVISION}
 taken:    $(date -u +%Y-%m-%dT%H:%M:%SZ)
 from:     ${ROOT}
 META
