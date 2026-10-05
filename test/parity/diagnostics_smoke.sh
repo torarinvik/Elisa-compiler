@@ -630,7 +630,7 @@ require_removed_semicolon_control() {
         failed=$((failed + 1))
     fi
 }
-require_removed_semicolon_control region_param_container_return_same_line_reassign "$FIXTURES/region_param_container_return_same_line_reassign.pos.elisa"
+require_removed_semicolon_control region_param_container_return_semicolon_refusal "$FIXTURES/region_param_container_return_semicolon_refusal.elisa"
 run_case region_param_container_return_branch_bindings neg "$FIXTURES/region_param_container_return_branch_bindings.neg.elisa" "$region_return_msg"
 
 # Stage0's independent region/type passes are the authority for these source-provenance
