@@ -72,9 +72,13 @@ Fixed on branch claude/difffuzz-20261004 (fixtures live with the fix):
   (stale structural local-type channel). Fixture: diagnostics `field_immutable_assign_indexed`.
 - darray `.count` and a `count` query were signed i64 in stage1, usize in stage0 (docs/18), so
   `xs.count - 3 <= 0` compared differently. Fixture: adversarial `usize_count_compares_unsigned`.
+- a function VALUE carried no effect row in stage1, so a `can[Global]`/`can[Memory]` function
+  bound or passed where a plain `fn(...)` type is expected built and ran (stage0: `variable "g"
+  expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]`). Fixed 2026-10-05
+  (src/semantic/check_fn_value_effect_row.elisa; repros fn_value_effect_row_ignored*.elisa now
+  reject like stage0). Fixtures: diagnostics `fn_value_effect_row`, `fn_value_effect_row_arg`.
 
 Open (repros here):
 | Repro | stage0 | stage1 | class |
 |---|---|---|---|
-| fn_value_effect_row_ignored(_arg) | reject (effect row) | accept, runs | PERMISSIVE: no effect rows on fn values |
 | query_same_line_binder_head_collision | 21 | declines | loud decline, known limit of the line-keyed __query table |
