@@ -27,6 +27,26 @@ for optimization in 0 2; do
     elisa_run_timeout 60 "$CLANG" -fno-builtin -o "$executable" "$object" "$RUNTIME"
     elisa_run_timeout 15 "$executable"
 
+    object="$WORK/descendant-O$optimization.o"
+    executable="$WORK/descendant-O$optimization"
+    elisa_run_timeout 60 "$STAGE1" -emit obj "-O$optimization" -o "$object" \
+        "$ROOT/test/repro/protocol_graph_descendant_codegen_probe.elisa" >"$WORK/descendant-build.log" 2>&1 || {
+        cat "$WORK/descendant-build.log" >&2
+        exit 1
+    }
+    elisa_run_timeout 60 "$CLANG" -fno-builtin -o "$executable" "$object" "$RUNTIME"
+    elisa_run_timeout 15 "$executable"
+
+    object="$WORK/zeroed-controls-O$optimization.o"
+    executable="$WORK/zeroed-controls-O$optimization"
+    elisa_run_timeout 60 "$STAGE1" -emit obj "-O$optimization" -o "$object" \
+        "$ROOT/test/repro/protocol_graph_transition_zeroed_nullable.pos.elisa" >"$WORK/zeroed-controls-build.log" 2>&1 || {
+        cat "$WORK/zeroed-controls-build.log" >&2
+        exit 1
+    }
+    elisa_run_timeout 60 "$CLANG" -fno-builtin -o "$executable" "$object" "$RUNTIME"
+    elisa_run_timeout 15 "$executable"
+
     object="$WORK/owners-O$optimization.o"
     executable="$WORK/owners-O$optimization"
     elisa_run_timeout 60 "$STAGE1" -emit obj "-O$optimization" -o "$object" \
@@ -38,7 +58,7 @@ for optimization in 0 2; do
     elisa_run_timeout 15 "$executable"
 done
 
-for negative in forged_target missing_move old_owner_reuse alias cross_family no_authority; do
+for negative in forged_target missing_move old_owner_reuse alias cross_family no_authority unauthorized_construction zeroed_construction zeroed_generic; do
     source="$ROOT/test/repro/protocol_graph_transition_${negative}.neg.elisa"
     object="$WORK/rejected-$negative.o"
     log="$WORK/rejected-$negative.log"
@@ -48,7 +68,18 @@ for negative in forged_target missing_move old_owner_reuse alias cross_family no
     set -e
     [[ "$status" -eq 1 ]] || { cat "$log" >&2; echo "expected semantic exit 1 for $negative, got $status" >&2; exit 1; }
     [[ ! -e "$object" ]] || { echo "rejected $negative left an object artifact" >&2; exit 1; }
-    rg -Fq 'consuming protocol transition is not valid here' "$log" || { cat "$log" >&2; exit 1; }
+    if [[ "$negative" == unauthorized_construction ]]; then
+        rg -Fq 'protocol type "Lease" may only be constructed in its declaring module "Owner" or a nested module' "$log" || { cat "$log" >&2; exit 1; }
+    elif [[ "$negative" == zeroed_construction ]]; then
+        rg -Fq 'protocol type "Lease" may only be constructed in its declaring module "Owner" or a nested module' "$log" || { cat "$log" >&2; exit 1; }
+        rg -Fq 'protocol type "Marker" may only be constructed in its declaring module "Owner" or a nested module' "$log" || { cat "$log" >&2; exit 1; }
+        count="$(rg -c 'protocol type .* may only be constructed in its declaring module' "$log" || true)"
+        [[ "$count" == 17 ]] || { cat "$log" >&2; echo "expected seventeen typed/nested zeroed construction diagnostics, got $count" >&2; exit 1; }
+    elif [[ "$negative" == zeroed_generic ]]; then
+        rg -Fq 'cannot initialize aggregate "return" from zeroed: field "" requires a valid non-null value' "$log" || { cat "$log" >&2; exit 1; }
+    else
+        rg -Fq 'consuming protocol transition is not valid here' "$log" || { cat "$log" >&2; exit 1; }
+    fi
 done
 
-echo 'protocol graph transition smoke OK: payload-preserving consume and same-spelling module owners at O0/O2; six fail-closed ownership/authority negatives'
+echo 'protocol graph transition smoke OK: payload-preserving consume, nested module authority, and same-spelling owners at O0/O2; six transition negatives, direct and seventeen typed/nested zeroed-position rejections, generic zeroing rejected'
