@@ -55,4 +55,20 @@ for optimization in O0 O2; do
     [[ "$branch_stage1_rc" -eq 0 ]] || { echo "machine transition order smoke FAIL ($optimization): stage1 branch result $branch_stage1_rc, expected 0" >&2; exit 1; }
 done
 
-echo "machine transition smoke OK: payload evaluation and branch-local arrows agree in Stage0/Stage1 at O0/O2"
+# Statement-position catch arms inside machine arms are void control-flow handlers.
+# Stage0's catch-expression arm rule does not describe this statement form, so keep this
+# acceptance check Stage1-owned. The fixture combines void handlers with nested
+# branch-local transitions; the result proves each path updates exactly once.
+VOID_CATCH_SOURCE="$ROOT/test/fixtures/machine_transition/void_catch_in_arm.elisa"
+for optimization in O0 O2; do
+    ELISA_STAGE1_BIN="$STAGE1" \
+      bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/void-catch-stage1-$optimization.o" "$VOID_CATCH_SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/void-catch-stage1-$optimization" "$WORK/void-catch-stage1-$optimization.o" "$RUNTIME"
+
+    set +e
+    "$WORK/void-catch-stage1-$optimization"; void_catch_rc=$?
+    set -e
+    [[ "$void_catch_rc" -eq 0 ]] || { echo "machine transition smoke FAIL ($optimization): void catch branch returned $void_catch_rc, expected 0" >&2; exit 1; }
+done
+
+echo "machine transition smoke OK: Stage0/Stage1 transitions agree; Stage1 void-catch arms pass at O0/O2"

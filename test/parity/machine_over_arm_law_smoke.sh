@@ -139,6 +139,38 @@ EOF
 run_case "catch in an arm (expression and statement form)" legal \
     < "$REPO_ROOT/test/fixtures/machine_transition/catch_in_arm.elisa"
 
+# In a machine arm, statement-position `catch` is control flow and may use void handlers.
+# Keep the nested branch-local transition in this case because it is the concrete shape
+# used by output_transport_posix.elisa. Stage0's catch-expression tail rule does not model
+# this statement form, so this is deliberately a Stage1-owned acceptance case.
+run_case "void statement catch in nested machine branch" stage1-legal <<'EOF'
+error LoadError:
+    Failed
+
+def load() -> i64 error[LoadError]:
+    1
+
+def scan(value: mutable i64) -> i64:
+    machine over value while value < 2:
+        state Run
+        state Done
+        start Run
+        Run, _:
+            if value == 0:
+                catch load():
+                    loaded:
+                        value <- value + loaded
+                    LoadError.Failed:
+                        value <- value + 1
+                -> Run
+            else:
+                value <- value + 1
+                -> Done
+        Done, _:
+            break
+    return value
+EOF
+
 # ------------------------------------------------------ valid branch + shared transition
 
 run_case "block if/else followed by the shared transition" legal <<'EOF'
