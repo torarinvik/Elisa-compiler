@@ -35,4 +35,24 @@ for optimization in O0 O2; do
     [[ "$stage0_rc" -eq 201 ]] || { echo "machine transition order smoke FAIL ($optimization): stage0 returned $stage0_rc, expected 201" >&2; exit 1; }
     [[ "$stage1_rc" -eq 201 ]] || { echo "machine transition order smoke FAIL ($optimization): stage1 returned $stage1_rc, expected 201" >&2; exit 1; }
 done
-echo "machine transition order smoke OK: stage0/stage1 preserve parallel payload evaluation at O0/O2 (201)"
+
+# A branch-local arrow ends its selected path. The shared suffix adds 2 and targets C
+# only on fallthrough; scan(0) instead reaches B, adds 10, and exits with 11.
+BRANCH_SOURCE="$ROOT/test/fixtures/machine_transition/branch_transitions.elisa"
+for optimization in O0 O2; do
+    "$STAGE0" -emit obj "-$optimization" -o "$WORK/branch-stage0-$optimization.o" "$BRANCH_SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/branch-stage0-$optimization" "$WORK/branch-stage0-$optimization.o" "$RUNTIME"
+
+    ELISA_STAGE1_BIN="$STAGE1" \
+      bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/branch-stage1-$optimization.o" "$BRANCH_SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/branch-stage1-$optimization" "$WORK/branch-stage1-$optimization.o" "$RUNTIME"
+
+    set +e
+    "$WORK/branch-stage0-$optimization"; branch_stage0_rc=$?
+    "$WORK/branch-stage1-$optimization"; branch_stage1_rc=$?
+    set -e
+    [[ "$branch_stage0_rc" -eq 0 ]] || { echo "machine transition order smoke FAIL ($optimization): stage0 branch result $branch_stage0_rc, expected 0" >&2; exit 1; }
+    [[ "$branch_stage1_rc" -eq 0 ]] || { echo "machine transition order smoke FAIL ($optimization): stage1 branch result $branch_stage1_rc, expected 0" >&2; exit 1; }
+done
+
+echo "machine transition smoke OK: payload evaluation and branch-local arrows agree in Stage0/Stage1 at O0/O2"
