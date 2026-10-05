@@ -3,11 +3,48 @@
 # declaration ASTs when validating spawn/pool arguments and callback results.
 extend Semantic:
     private:
-        def thread_has_submit_marker(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> bool:
+        def thread_has_submit_marker(annotations: darray[Ast::EnumAnnotation]&, pos: Ast::Pos) -> bool:
             can Abort.Panic:
                 for annotation in annotations:
-                    true return if annotation.name == "__submit" and annotation.line == line
+                    true return if annotation.name == "__submit" and annotation.offset == pos.offset
                 return false
+
+
+        def thread_restore_scope(names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, count: usize) -> void:
+            can Abort.Panic:
+                names <- names.truncate(count)
+                flags <- flags.truncate(count)
+                element_flags <- element_flags.truncate(count)
+
+
+        def thread_push_pattern_binders(pattern: Ast::Pattern, may_reference: bool, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.TypeBind(_, name):
+                        names.push(name)
+                        flags.push(may_reference)
+                        element_flags.push(may_reference)
+                    Pattern.Rest(name):
+                        if name != "":
+                            names.push(name)
+                            flags.push(may_reference)
+                            element_flags.push(may_reference)
+                    Pattern.As(name, inner):
+                        names.push(name)
+                        flags.push(may_reference)
+                        element_flags.push(may_reference)
+                        for item in inner |names, flags, element_flags|:
+                            thread_push_pattern_binders(item, may_reference, names, flags, element_flags)
+                    Pattern.Variant(_, fields) | Pattern.Struct(_, fields) | Pattern.Field(_, fields) | Pattern.Tuple(fields) | Pattern.Or(fields):
+                        for item in fields |names, flags, element_flags|:
+                            thread_push_pattern_binders(item, may_reference, names, flags, element_flags)
+                    _:
+                        pass
+
+
+        def thread_push_arm_binders(arm: Ast::MatchArm, may_reference: bool, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                thread_push_pattern_binders(arm.pattern, may_reference, names, flags, element_flags)
 
         def type_contains_operator(type_expression: Ast::Expr, wanted: TokenKind) -> bool:
             can Abort.Panic:
@@ -30,6 +67,59 @@ extend Semantic:
         def type_is_nonstatic_reference(type_expression: Ast::Expr) -> bool:
             can Abort.Panic:
                 return type_contains_operator(type_expression, TokenKind.Ampersand) and not type_contains_operator(type_expression, TokenKind.Static)
+
+
+        def type_iterable_element_may_reference(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _) if operator == TokenKind.Ampersand or operator == TokenKind.Lmut:
+                        return type_iterable_element_may_reference(operand)
+                    Expr.Index(element_type, _, _) | Expr.Refinement(element_type, _, _):
+                        return type_is_nonstatic_reference(element_type)
+                    Expr.IndexN(element_type, _, _):
+                        return type_is_nonstatic_reference(element_type)
+                    Expr.Paren(inner, _):
+                        return type_iterable_element_may_reference(inner)
+                    _:
+                        return true
+
+
+        def thread_expression_may_reference(expression: Ast::Expr, names: darray[sview]&, flags: darray[bool]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return thread_flag_for_name(names, flags, name)
+                    Expr.Unary(operator, _, _):
+                        return operator == TokenKind.Ampersand or operator == TokenKind.Lmut
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return thread_expression_may_reference(inner, names, flags)
+                    Expr.Binary(_, operator, _, _) if operator == TokenKind.RangeLt or operator == TokenKind.RangeLe:
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            true return if thread_expression_may_reference(element, names, flags)
+                        return false
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _) | Expr.CharLit(_, _) | Expr.StringLit(_, _) | Expr.Absent:
+                        return false
+                    _:
+                        # Calls, indexed values, and unknown collection expressions may
+                        # yield references; retain soundness when source types are absent.
+                        return true
+
+
+        def thread_iterable_binder_may_reference(iterable: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, element_flags: darray[bool]&) -> bool:
+            can Abort.Panic:
+                match iterable:
+                    Expr.Binary(_, operator, _, _) if operator == TokenKind.RangeLt or operator == TokenKind.RangeLe:
+                        return false
+                    Expr.Ident(name, _):
+                        return thread_flag_for_name(names, element_flags, name)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            true return if thread_expression_may_reference(element, names, flags)
+                        return false
+                    _:
+                        return true
 
 
         def thread_flag_for_name(names: darray[sview]&, flags: darray[bool]&, name: sview) -> bool:
@@ -86,60 +176,171 @@ extend Semantic:
                 table <- report_thread_payload(call_name, arguments[arguments.count - 1], line, names, flags, table) if arguments.count > 0
 
 
-        def walk_thread_shareability_expression(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, names: darray[sview]&, flags: darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
+        def walk_thread_shareability_expression(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
                         table <- check_thread_boundary_call(callee, arguments, line.line, names, flags, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(callee, annotations, names, flags, element_flags, callback_names, callback_flags, table)
                         for argument in arguments |table|:
-                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, callback_names, callback_flags, table)
-                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line):
-                        table <- walk_thread_shareability_expression(operand, annotations, names, flags, callback_names, callback_flags, table)
-                    Expr.Binary(left, operator, right, line) | Expr.Refinement(left, right, line):
-                        table <- walk_thread_shareability_expression(left, annotations, names, flags, callback_names, callback_flags, table)
-                        table <- walk_thread_shareability_expression(right, annotations, names, flags, callback_names, callback_flags, table)
-                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                        for argument in arguments |table|:
+                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.Field(object, _, _):
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.Index(object, index, _) | Expr.Binary(object, _, index, _) | Expr.Refinement(object, index, _):
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(index, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.IndexN(object, indices, _):
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        for index in indices |table|:
+                            table <- walk_thread_shareability_expression(index, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.Slice(object, low, high, _):
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(low, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(high, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.Unary(operator, operand, _) | Expr.Move(operand, _) | Expr.RegionNew(operand, _, _) | Expr.Paren(operand, _):
+                        table <- walk_thread_shareability_expression(operand, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
                         for element in elements |table|:
-                            table <- walk_thread_shareability_expression(element, annotations, names, flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(element, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table|:
+                            table <- walk_thread_shareability_expression(entry.key, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(entry.value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |table|:
+                            table <- walk_thread_shareability_expression(field.value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- walk_thread_shareability_expression(base, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        for field in fields |table|:
+                            table <- walk_thread_shareability_expression(field.value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                    Expr.If(condition, then_value, else_value, _):
+                        table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        names_before: usize = names.count
+                        table <- walk_thread_shareability_expression(then_value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        thread_restore_scope(names, flags, element_flags, names_before)
+                        table <- walk_thread_shareability_expression(else_value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        thread_restore_scope(names, flags, element_flags, names_before)
+                    Expr.Match(scrutinee, arms, _):
+                        table <- walk_thread_shareability_expression(scrutinee, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        for arm in arms |table, names, flags, element_flags|:
+                            names_before: usize = names.count
+                            thread_push_arm_binders(arm, thread_expression_may_reference(scrutinee, names, flags), names, flags, element_flags)
+                            table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                    Expr.Catch(guarded, arms, _):
+                        table <- walk_thread_shareability_expression(guarded, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        for arm in arms |table, names, flags, element_flags|:
+                            names_before: usize = names.count
+                            thread_push_arm_binders(arm, true, names, flags, element_flags)
+                            table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                    Expr.Comprehension(variable, iterable, condition, body, _):
+                        table <- walk_thread_shareability_expression(iterable, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        names_before: usize = names.count
+                        comprehension_items_may_reference: bool = thread_iterable_binder_may_reference(iterable, names, flags, element_flags)
+                        names.push(variable)
+                        flags.push(comprehension_items_may_reference)
+                        element_flags.push(comprehension_items_may_reference)
+                        table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        thread_restore_scope(names, flags, element_flags, names_before)
+                    Expr.GetElse(guarded, recovery, _):
+                        table <- walk_thread_shareability_expression(guarded, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        names_before: usize = names.count
+                        table <- walk_thread_shareability_statements(recovery, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        thread_restore_scope(names, flags, element_flags, names_before)
+                    Expr.Lambda(parameters, body, _):
+                        names_before: usize = names.count
+                        for parameter in parameters |names, flags, element_flags|:
+                            names.push(parameter)
+                            flags.push(true)
+                            element_flags.push(true)
+                        table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        thread_restore_scope(names, flags, element_flags, names_before)
                     # `submit f(a, b)` parses as a statement-less value block around the call and
                     # lowers to pool_submit1(pool, f, payload): every argument is a payload.
                     Expr.Block(block_statements, block_value, _, line):
-                        if block_statements.count == 0 and thread_has_submit_marker(annotations, line.line):
+                        if block_statements.count == 0 and thread_has_submit_marker(annotations, line):
                             match block_value:
                                 Expr.Call(_, task_arguments, _, task_pos):
                                     for task_argument in task_arguments |table|:
                                         table <- report_thread_payload("pool_submit1", task_argument, task_pos.line, names, flags, table)
-                                        table <- walk_thread_shareability_expression(task_argument, annotations, names, flags, callback_names, callback_flags, table)
+                                        table <- walk_thread_shareability_expression(task_argument, annotations, names, flags, element_flags, callback_names, callback_flags, table)
                                 _:
                                     pass
                         else:
-                            table <- walk_thread_shareability_statements(block_statements, annotations, names, flags, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_expression(block_value, annotations, names, flags, callback_names, callback_flags, table)
+                            names_before: usize = names.count
+                            table <- walk_thread_shareability_statements(block_statements, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(block_value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                    # `Scope` and `ShorthandMember` nodes contain type/member selectors,
+                    # not evaluated values. Literals and identifiers have no children.
                     _:
                         pass
 
 
-        def walk_thread_shareability_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
+        def walk_thread_shareability_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |names, flags, table|:
+                for statement in statements |names, flags, element_flags, table|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- walk_thread_shareability_expression(value, annotations, names, flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            declared_elements_may_reference: bool = thread_iterable_binder_may_reference(value, names, flags, element_flags) if (type_expression is Expr.Absent) or (type_expression is Expr.Invalid) else type_iterable_element_may_reference(type_expression)
                             names.push(name)
                             flags.push(type_is_nonstatic_reference(type_expression))
-                        Stmt.Assign(target, operator, value, line) | Stmt.Expr(value, line):
-                            table <- walk_thread_shareability_expression(value, annotations, names, flags, callback_names, callback_flags, table)
+                            element_flags.push(declared_elements_may_reference)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- walk_thread_shareability_expression(target, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                        Stmt.Expr(value, line):
+                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, callback_names, callback_flags, table)
                         Stmt.Return(value, line):
-                            table <- walk_thread_shareability_expression(returned, annotations, names, flags, callback_names, callback_flags, table) if value is returned
+                            table <- walk_thread_shareability_expression(returned, annotations, names, flags, element_flags, callback_names, callback_flags, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_statements(then_body, annotations, names, flags, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_statements(else_body, annotations, names, flags, callback_names, callback_flags, table)
-                        Stmt.Block(kind, clause, binding, body, line) | Stmt.While(_, body, line) | Stmt.For(_, _, _, body, line):
-                            table <- walk_thread_shareability_statements(body, annotations, names, flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            names_before: usize = names.count
+                            table <- walk_thread_shareability_statements(then_body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                            table <- walk_thread_shareability_statements(else_body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            names_before: usize = names.count
+                            if binding != "":
+                                names.push(binding)
+                                flags.push(false)
+                                element_flags.push(false)
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                        Stmt.While(condition, body, line):
+                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            names_before: usize = names.count
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
+                        Stmt.For(_, variables, iterable, body, line):
+                            table <- walk_thread_shareability_expression(iterable, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            names_before: usize = names.count
+                            loop_items_may_reference: bool = thread_iterable_binder_may_reference(iterable, names, flags, element_flags)
+                            for variable in variables |names, flags, element_flags|:
+                                names.push(variable)
+                                flags.push(loop_items_may_reference)
+                                element_flags.push(loop_items_may_reference)
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            thread_restore_scope(names, flags, element_flags, names_before)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |names, flags, table|:
-                                table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(scrutinee, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                            for arm in arms |names, flags, element_flags, table|:
+                                names_before: usize = names.count
+                                thread_push_arm_binders(arm, thread_expression_may_reference(scrutinee, names, flags), names, flags, element_flags)
+                                table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                                table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
+                                thread_restore_scope(names, flags, element_flags, names_before)
+                        Stmt.Contract(_, expression, line):
+                            table <- walk_thread_shareability_expression(expression, annotations, names, flags, element_flags, callback_names, callback_flags, table)
                         _:
                             pass
 
@@ -164,10 +365,12 @@ extend Semantic:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
                             names: mutable darray[sview] = []
                             flags: mutable darray[bool] = []
-                            for param in params |names, flags|:
+                            element_flags: mutable darray[bool] = []
+                            for param in params |names, flags, element_flags|:
                                 names.push(param.name)
                                 flags.push(type_is_nonstatic_reference(param.type_expression))
-                            table <- walk_thread_shareability_statements(body, annotations, names, flags, callback_names, callback_flags, table)
+                                element_flags.push(type_iterable_element_may_reference(param.type_expression))
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, callback_names, callback_flags, table)
                         Decl.Module(name, body, line) | Decl.Scoped(body, line):
                             table <- check_thread_shareability_declarations(body, annotations, callback_names, callback_flags, table)
                         _:

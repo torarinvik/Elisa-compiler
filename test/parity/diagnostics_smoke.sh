@@ -78,6 +78,11 @@ NAMES=(
     submit_unnamed_view_growth
     submit_local_mutable_ref
     thread_shareability_ref_call
+    thread_shareability_branch_shadow
+    thread_shareability_loop_shadow
+    thread_shareability_ref_elements
+    thread_shareability_same_line
+    thread_shareability_nested_submit
     storage_dependency_owned_return_global
     ref_bool_condition
     ref_bool_not_operand
@@ -319,6 +324,11 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "argument 1 to \"f\" expects sview, got static u8&"
     "storage dependency facts were invalidated by darray push"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
     "is not structurally shareable across threads"
     "is not structurally shareable across threads"
     "storage dependency facts were invalidated by darray push"
