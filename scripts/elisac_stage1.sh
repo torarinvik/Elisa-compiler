@@ -77,7 +77,9 @@ else
   STAGE0_BIN=""
   # Inside a linked worktree (.claude/worktrees/*) the relative paths below miss; the main
   # checkout is the parent of the shared git dir.
-  main_checkout="$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  # Installed snapshots intentionally omit .git. Treat that as the standalone
+  # compiler root instead of letting set -e abort the product launcher.
+  main_checkout="$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
   main_checkout="${main_checkout%/.git}"
   for stage0_candidate in \
       "${main_checkout:-$ROOT}/../../Go projects/Elisa-core/compiler/bin/elisac" \

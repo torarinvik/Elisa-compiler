@@ -65,3 +65,14 @@ if ! file "$BIN" | grep  'Mach-O\|ELF' >/dev/null; then
 fi
 
 echo "stage1_product_smoke OK: product $BIN compiled fixture → exit 42 (no stage0)"
+
+# The installed snapshot has no .git directory. Exercise its public wrapper so
+# startup cannot accidentally depend on running from the compiler checkout.
+snapshot_prefix="$SCRATCH_DIR/snapshot-prefix"
+snapshot_obj="$SCRATCH_DIR/snapshot-fixture.o"
+ELISAC_PREFIX="$snapshot_prefix" bash "$ROOT/scripts/install_stage1.sh"
+unset ELISACORE_BIN ELISA_STAGE1_BIN ELISA_STAGE1_ROOT ELISA_STAGE1_SELF
+unset ELISA_RUNTIME_OBJ ELISA_LLVM_BIN_DIR ELISA_CLANG
+"$snapshot_prefix/elisac-stage1" -o "$snapshot_obj" "$fixture"
+[[ -s "$snapshot_obj" ]] || { echo "stage1_product_smoke FAIL: installed snapshot did not emit an object" >&2; exit 1; }
+echo "stage1_product_smoke OK: installed snapshot wrapper compiled fixture (no .git)"
