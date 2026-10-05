@@ -35,6 +35,11 @@ alias_s0_count="$(grep -cF 'unknown type "Cycle' "$work/alias_cycle_source_diagn
 alias_s1_count="$(grep -cF 'unknown type "Cycle' "$work/alias_cycle_source_diagnostic.s1" || true)"
 [ "$alias_s0_count" -eq 3 ] || fail "alias-cycle Stage0 expected three source diagnostics, got $alias_s0_count"
 [ "$alias_s1_count" -eq 3 ] || fail "alias-cycle Stage1 expected three source diagnostics, got $alias_s1_count"
+reject_both alias_cycle_module_owner_control 'unknown type "LocalA"'
+module_alias_s0_count="$(grep -cF 'unknown type' "$work/alias_cycle_module_owner_control.s0" || true)"
+module_alias_s1_count="$(grep -cF 'unknown type' "$work/alias_cycle_module_owner_control.s1" || true)"
+[ "$module_alias_s0_count" -eq 3 ] || fail "module alias-cycle Stage0 expected three diagnostics with acyclic North control, got $module_alias_s0_count"
+[ "$module_alias_s1_count" -eq 3 ] || fail "module alias-cycle Stage1 expected three diagnostics with acyclic North control, got $module_alias_s1_count"
 reject_both ambiguous_wildcard_type_import 'unknown identifier "Code"' 'undefined identifier "Code"'
 accept_both single_wildcard_type_import_control
 echo 'source type resolution diagnostics OK: alias cycle and duplicate wildcard import fail semantically; unique import accepted'

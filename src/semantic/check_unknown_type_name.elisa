@@ -18,25 +18,55 @@ extend Semantic:
             return false if any owner in table.struct_field_owner where owner == name
             return interface_is_declared(table.protocol_declarations, name)
 
-        # Follow only uniquely declared, bare aliases within their declaration module.
-        # Cyclic chains are diagnosed at alias RHSs below and at each bound use, matching
-        # Stage0's unknown-type behavior without guessing through duplicate declarations.
-        def alias_target_chain_is_cyclic(current_name: sview, current_module: sview, visited: mutable darray[sview]&, steps: usize, table: SymbolTable&) -> bool:
+        # Resolve the bare-alias graph once per semantic pass. Iterative paths avoid
+        # stack growth on long valid chains; completed nodes memoize whether following
+        # their unique same-module targets reaches a cycle. Duplicate declarations and
+        # non-bare targets intentionally terminate a path instead of guessing.
+        def type_alias_cycle_info(table: SymbolTable&) -> darray[bool]:
             can Memory.Allocate, Abort.Panic:
-                true return if any prior in visited where prior == current_name
-                return false if steps > table.type_alias_name.count
-                selected: mutable usize = table.type_alias_name.count
-                matches: mutable usize = 0
-                for index in 0..<table.type_alias_name.count |selected, matches, current_name, current_module, table|:
-                    alias_module: sview = table.type_alias_module[index] if index < table.type_alias_module.count else ""
-                    if table.type_alias_name[index] == current_name and alias_module == current_module:
-                        selected <- index
-                        matches <- matches + 1.usize()
-                return false if matches != 1 or selected >= table.type_alias_target.count
-                target: sview = table.type_alias_target[selected]
-                return false if target == ""
-                visited.push(current_name)
-                return alias_target_chain_is_cyclic(target, current_module, visited, steps + 1.usize(), table)
+                count: usize = table.type_alias_name.count
+                cycles: mutable darray[bool] = []
+                state: mutable darray[u8] = []
+                for index in 0..<count |cycles, state|:
+                    cycles.push(false)
+                    state.push(0)
+                for root in 0..<count |cycles, state, count, table|:
+                    continue if state[root] == 2
+                    path: mutable darray[usize] = []
+                    current: mutable usize = root
+                    reaches_cycle: mutable bool = false
+                    walking: mutable bool = true
+                    while walking |current, reaches_cycle, walking, path, cycles, state, count, table|:
+                        if current >= count:
+                            walking <- false
+                        elif state[current] == 2:
+                            reaches_cycle <- cycles[current]
+                            walking <- false
+                        elif state[current] == 1:
+                            reaches_cycle <- true
+                            walking <- false
+                        else:
+                            state[current] <- 1
+                            path.push(current)
+                            target: sview = table.type_alias_target[current] if current < table.type_alias_target.count else ""
+                            current_module: sview = table.type_alias_module[current] if current < table.type_alias_module.count else ""
+                            selected: mutable usize = count
+                            matches: mutable usize = 0
+                            if target != "":
+                                for candidate in 0..<count |selected, matches, target, current_module, table|:
+                                    candidate_module: sview = table.type_alias_module[candidate] if candidate < table.type_alias_module.count else ""
+                                    if table.type_alias_name[candidate] == target and candidate_module == current_module:
+                                        selected <- candidate
+                                        matches <- matches + 1.usize()
+                            if matches == 1 and selected < count and selected < table.type_alias_target.count:
+                                current <- selected
+                            else:
+                                walking <- false
+                    for path_index in 0..<path.count |path_index, path, cycles, state, reaches_cycle|:
+                        alias_index: usize = path[path_index]
+                        cycles[alias_index] <- reaches_cycle
+                        state[alias_index] <- 2
+                return cycles
 
 
         def type_alias_name_is_cyclic(name: sview, current_module: sview, table: SymbolTable&) -> bool:
@@ -49,8 +79,38 @@ extend Semantic:
                         selected <- index
                         matches <- matches + 1.usize()
                 return false if matches != 1 or selected >= table.type_alias_target.count
-                visited: mutable darray[sview] = []
-                return alias_target_chain_is_cyclic(name, current_module, visited, 0, table)
+                visited: mutable darray[usize] = []
+                current: mutable usize = selected
+                steps: mutable usize = 0
+                while current < table.type_alias_name.count |current, steps, visited, table, current_module|:
+                    true return if any prior in visited where prior == current
+                    return false if steps > table.type_alias_name.count or current >= table.type_alias_target.count
+                    visited.push(current)
+                    target: sview = table.type_alias_target[current]
+                    return false if target == ""
+                    selected <- table.type_alias_name.count
+                    matches <- 0
+                    for index in 0..<table.type_alias_name.count |selected, matches, target, current_module, table|:
+                        alias_module: sview = table.type_alias_module[index] if index < table.type_alias_module.count else ""
+                        if table.type_alias_name[index] == target and alias_module == current_module:
+                            selected <- index
+                            matches <- matches + 1.usize()
+                    return false if matches != 1 or selected >= table.type_alias_target.count
+                    current <- selected
+                    steps <- steps + 1.usize()
+                return false
+
+        def type_alias_cached_cycle(name: sview, current_module: sview, cycles: darray[bool]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                selected: mutable usize = table.type_alias_name.count
+                matches: mutable usize = 0
+                for index in 0..<table.type_alias_name.count |selected, matches, name, current_module, table|:
+                    alias_module: sview = table.type_alias_module[index] if index < table.type_alias_module.count else ""
+                    if table.type_alias_name[index] == name and alias_module == current_module:
+                        selected <- index
+                        matches <- matches + 1.usize()
+                return false if matches != 1 or selected >= cycles.count
+                return cycles[selected]
 
         # `Self` is a compiler-defined receiver type, but only inside an impl scope. Keeping
         # the context explicit matters: a free `def f(x: Self)` and a struct field `x: Self`
@@ -241,19 +301,18 @@ extend Semantic:
 
         # Check every alias RHS, keeping module scope so same-spelled names in separate
         # declaration owners cannot create a fabricated local cycle.
-        def check_alias_target_declarations(declarations: darray[Ast::Decl], alias_params: darray[sview]&, current_module: sview, table: lmut SymbolTable) -> void:
+        def check_alias_target_declarations(declarations: darray[Ast::Decl], alias_params: darray[sview]&, current_module: sview, alias_cycles: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Alias(alias_name, target, alias_line):
                             target_name: sview = bare_type_name(target)
-                            visited: mutable darray[sview] = []
-                            cyclic: bool = target_name != "" and alias_target_chain_is_cyclic(target_name, current_module, visited, 0, table)
+                            cyclic: bool = target_name != "" and type_alias_cached_cycle(target_name, current_module, alias_cycles, table)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: target_name, pos: ident_extent_or_line(target, expr_line(target)), line: expr_line(target), expected: "", actual: ""}) if alias_target_unresolved(target_name, alias_params, table) or cyclic
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_alias_target_declarations(module_body, alias_params, module_name, table)
+                            table <- check_alias_target_declarations(module_body, alias_params, module_name, alias_cycles, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_alias_target_declarations(scoped_body, alias_params, current_module, table)
+                            table <- check_alias_target_declarations(scoped_body, alias_params, current_module, alias_cycles, table)
                         _:
                             pass
 
@@ -262,9 +321,10 @@ extend Semantic:
         def check_alias_target_type(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 alias_params: mutable darray[sview] = []
+                alias_cycles: mutable darray[bool] = type_alias_cycle_info(table)
                 for annotation in file.enum_annotations |alias_params|:
                     alias_params.push(annotation.name) if annotation.owner == "__alias_param"
-                table <- check_alias_target_declarations(file.top_decls, alias_params, "", table)
+                table <- check_alias_target_declarations(file.top_decls, alias_params, "", alias_cycles, table)
 
     private:
         # Source offsets identify the actual scope even when #line resets line numbers in
