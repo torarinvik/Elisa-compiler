@@ -617,6 +617,22 @@ require_region_control() {
 }
 require_region_control region_param_container_return_inferred_new "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" '`new[auto]` is deprecated'
 
+# Semicolon-separated multistatements are not legal Elisa. Pin that parser rejection instead of
+# treating equal source-line numbers as evidence that the unsafe reassignment is supported syntax.
+require_removed_semicolon_control() {
+    local name="$1" file="$2" out
+    out="$("$RPT" < "$file" 2>&1)"
+    if grep -qF '`;` statement separator has been removed' <<< "$out"; then
+        echo "  PASS $name (unsupported multistatement syntax rejected)"
+    else
+        echo "  FAIL $name: expected removed-semicolon parser diagnostic missing" >&2
+        echo "$out" | sed 's/^/      /' >&2
+        failed=$((failed + 1))
+    fi
+}
+require_removed_semicolon_control region_param_container_return_same_line_reassign "$FIXTURES/region_param_container_return_same_line_reassign.pos.elisa"
+run_case region_param_container_return_branch_bindings neg "$FIXTURES/region_param_container_return_branch_bindings.neg.elisa" "$region_return_msg"
+
 # Stage0's independent region/type passes are the authority for these source-provenance
 # controls. Keep them separate from Stage1's return-escape diagnostic assertions above.
 require_stage0_region_control() {
@@ -636,6 +652,7 @@ require_stage0_region_control() {
     fi
 }
 require_stage0_region_control region_param_container_return_inner_new "$FIXTURES/region_param_container_return_inner_new.pos.elisa" 'cannot return value: region dependency facts include local region "inner"'
+require_stage0_region_control region_param_container_return_inferred_new "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" 'expects darray[i64], got mutable darray[i64]& @__auto'
 require_stage0_region_control region_param_container_return_auto_move "$FIXTURES/region_param_container_return_auto_move.pos.elisa" 'value in region "<inferred>" is stored into longer-lived region "r"'
 require_stage0_region_control region_param_container_return_inner_move "$FIXTURES/region_param_container_return_inner_move.pos.elisa" 'value in region "inner" is stored into longer-lived region "r"'
 require_stage0_region_control region_param_container_return_reference_element "$FIXTURES/region_param_container_return_reference_element.pos.elisa" 'cannot return value: region dependency facts include local region "inner"'
