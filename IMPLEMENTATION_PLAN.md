@@ -1,5 +1,91 @@
 # Elisa — Memory Safety, Correctness, and Language Completion Plan
 
+## Active execution priority — compiler throughput and iteration speed (2026-10-05)
+
+**Mandate:** remove avoidable overhead until Elisa is as efficient as, or demonstrably more efficient than, contemporary compilers on declared comparable workloads. Fast iteration accelerates correctness work. Safety, semantic fidelity, valid LLVM, correct runtime/ABI behavior and exact artifact provenance remain mandatory; skipping checks is not a performance improvement. This program controls the iteration-infrastructure work before the older feature/porting schedules. Confirmed safety defects remain immediate blockers; use the program to shorten their repair cycle rather than postponing them for a performance rewrite. All tasks below are planned unless labeled as measured evidence.
+
+This is the current action list for compiler overhead. The orientation, S-package roadmap and evidence ledger below remain intact; historical Phase T and old throughput numbers are reference, not current completion claims. Coordinate the proof consumer through [the proof plan](../elisa-proof/IMPLEMENTATION_PLAN.md), program P-00–P-07. Update these task statuses with acceptance evidence as work lands rather than growing another duplicate chronology.
+
+### Observed baseline and what remains unmeasured
+
+The 2026-10-05 local audit used compiler revision `4c479ad1` and Stage1 product SHA-256 `47c1644002911a79b2528f1eb2408efc8a8d736cc067cbb4fd164e1759bde16e` on arm64 macOS. Raw evidence is retained in the sibling proof checkout's ignored `build/audit-20261005/`; reviewed benchmark summaries and minimized regressions need durable tracked records before task closure.
+
+- The compiler self-source include closure contained 881 files, 17.89 MB and 247,097 lines. The proof main closure contained 894 files, 15.83 MB and 216,196 lines.
+- Fresh compiler-source AST projection took 7.61 seconds; semantic progress projection took 8.58 seconds. These are cumulative modes in separate runs, not additive phase timings or a precise estimate of semantic-only cost.
+- Stage1 expands includes into one buffer, parses and checks the unit, creates a whole LLVM module, then optimizes/emits it. No persistent dependency-aware frontend/module/function incremental pipeline was found on that path.
+- `scripts/elisac_stage1.sh` offers an **opt-in** `ELISA_STAGE1_CACHE=1` complete-object cache. It hashes the product, normalized arguments, relevant environment, dependency closure and standard-library tree. It applies to supported plain object requests; it does not make native project `build/run/test` incremental module compilation.
+- The proof build has a separate default whole-object cache and actual no-op builds took 0.84–1.00 seconds. Small source edits invalidate whole products. Thus caching exists; the missing capability is proportional work after edits.
+- Compiler seeding still compiles the complete driver with Stage0. Wrapper freshness checks refuse stale products; they do not automatically seed on ordinary invocation. Repeated expensive seeds are an orchestration/workflow cost to measure, not an unavoidable language property.
+- The source-matching strict O2 proof binary crashes on `kernel_comparison_runtime.elisa` and mocap `track.elisa`. Both invalid writes map to `ElisaProof.proof_qualified_body_rewrite`. Source, runtime and codegen causes have not been distinguished. Own a compiler regression if minimization implicates generated region/darray code.
+- No fresh full optimized self-build or full compiler matrix was run in this audit. Earlier hundreds-of-seconds self-build and LLVM-pass measurements are historical, machine/revision-specific evidence; do not present them as today's profile. The old O0-runtime bottleneck is also not a current default: runtime builds now default to O2 with retained entry points.
+
+### Execution queue
+
+C-00/C-01 establish reliability and measurement; C-02/C-03 remove immediate build/harness waste; C-04/C-05 implement real incremental compilation; C-06 attacks measured frontend/backend/runtime residuals; C-07 qualifies against external baselines. Land useful slices continuously. Do not require a wholesale compiler rewrite or defer cheap gains until separate compilation is complete.
+
+| ID | Deliverable | Acceptance gate |
+| --- | --- | --- |
+| C-00 | Investigate the proof-consumer invalid write and current compiler crash/miscompile repros | Stage0/Stage1 and O0/O2 minimized controls distinguish lifetime/source defects from lowering/runtime faults; original proof inputs produce complete reports after the responsible fix. Preserve stage-specific negative controls and existing safety packages |
+| C-01 | Reproducible phase-cost and edit-workload baseline | Named timings/counters for include expansion, lex/parse, resolution, semantic passes, lowering, LLVM optimization, emission, linking, wrapper/cache validation and seed/fixpoint work; versioned workload/host manifests and raw exits/diagnostics |
+| C-02 | One coherent cache/artifact contract for all build entry points | Driver/project build, object/executable paths and downstream proof builds use effective request/dependency identities; cache hits preserve artifacts, observable diagnostics, exit status and manifests; corruption/version/input controls force correct misses |
+| C-03 | Cheap no-op operation and bounded orchestration | No unchanged compile, runtime/hook rebuild, link, snapshot rewrite or unnecessary hash scan; dependency discovery is reused safely; test setup compiles each exact helper once per identity; validated artifacts survive workspace/process restarts |
+| C-04 | Persistent immutable frontend and semantic artifacts | Stable declaration/type/module identity; explicit dependencies and serialized checked summaries; only affected files/declarations/SCCs are reanalyzed after edits; clean versus incremental outcomes agree over an edit-mutation corpus |
+| C-05 | Separate compilation with reusable typed/lowered IR and objects | Versioned module interfaces and ABI; module partitions compatible with generics, generated declarations, effects/regions and runtime linkage; body-only changes do not recompile unaffected consumers; interface changes invalidate the full affected closure |
+| C-06 | Remove profiled algorithmic/allocation/LLVM costs | Current phase/leaf profile selects work; improve lookup indexes, AST/store growth, per-function allocations and emission/pass pipelines with valid IR and runtime equivalence. Show repeatable uninstrumented latency/CPU/RSS gains |
+| C-07 | Competitive performance and maintained regression budgets | Published controlled comparisons, cold/no-op/local-edit/interface-edit/import-edit/self-build workloads, macOS/Linux qualification, correctness results and performance ratchets; no general superiority claim from one favorable microbenchmark |
+
+### C-02/C-03: cache and build-system contract
+
+1. Define one canonical effective compile request after CLI/environment/project configuration resolution. Include product and recipe digests, compiler/frontend/runtime versions as applicable, target triple/CPU/features/data layout, optimization/codegen flags, contract mode, debug/profiling/PGO inputs, include/search paths, generated source, standard library and external artifact dependencies. Separate compile and link identities; link keys include every object/archive, linker identity/options and applicable signing settings.
+2. Dependency discovery must model added/deleted files, missing include candidates, search-path precedence, import ownership, changed manifests, generated declarations and implicit std dependencies. A graph that hashes only yesterday's resolved files is insufficient. Validate reusable graph metadata before trusting it.
+3. Cache diagnostics and status alongside objects, or make explicitly non-equivalent invocation modes ineligible for transparent caching. The current wrapper object hit omits prior warnings; fix that before treating cached/uncached invocations as observably equivalent. Machine-readable output must keep provenance/logging out of payload streams.
+4. Preserve unchanged files and timestamps; use compare-before-write and content-addressed immutable snapshots. Replace global all-source invalidation with actual product/module closures. A no-op build verifies its manifest and outputs cheaply and invokes no compiler/linker when valid.
+5. Use atomic bounded publication, exact payload validation, schema migration, collision tests, interrupted-build recovery, concurrent writer/readers and bounded eviction. Never expose an incomplete executable/object or silently fall back to a different product. A digest is artifact identity, not a correctness proof.
+6. Consolidate caches instead of stacking independent wrappers with conflicting keys. Offer explainable cache miss/invalidation reasons and per-phase hit/miss/work counters. Establish a validated default cache for eligible normal builds after parity/correctness gates; retain an explicit uncached reference mode.
+7. Reuse immutable validated compiler/runtime/helper products across focused tests and worktrees when identities match. A workspace copy or new process is not a reason to rebuild the same seed. Preserve freshness and global high-memory seed coordination. Track cache storage and startup/hash overhead as first-class costs.
+
+### C-04/C-05: incremental architecture and migration
+
+1. Preserve the existing full-unit compiler as the correctness reference while introducing reusable phases. Start with include/source expansion and immutable parsed artifacts, then resolved typed declaration summaries, then per-module lowered IR/objects. Measure each slice before moving the next phase into reuse.
+2. Separate semantic identity from source location and compiler-store handles. Canonical module/declaration/type IDs survive unrelated line edits; diagnostic spans are remapped against current source. Serialized AST/IR cannot retain dangling pointers, region-backed text views or store indices belonging to another process. Version all layouts and resolution semantics.
+3. Record explicit edges for declaration lookup, imported interfaces, constants/defaults, overload/protocol selection, alias/type representations, effects, ownership/region summaries, generic instantiations, static generation, target ABI and runtime definitions. Record failed lookup dependencies too. Compute reverse invalidation and recursive SCCs; unchanged source text is insufficient if its environment changed.
+4. Publish public interfaces separately from implementation bodies. Reuse consumers after a body edit only if the checked interface and exported safety summaries are unchanged and no consumer depends on the body for inlining, constant evaluation, specialization or contract discharge. Revalidate such recorded body dependencies explicitly.
+5. Design separately linkable module boundaries and symbol/ABI ownership before splitting LLVM emission. Resolve duplicate generic specializations, external definitions, runtime entry points, initialization ordering, debug/source maps, and cross-module region/effect evidence. Existing parallel object emission reduces wall time within a build; it is not persistent incremental reuse.
+6. Cache generic instantiations by resolved generic identity, canonical type/value arguments, constraints, semantic environment and relevant body/interface versions. Avoid silently making every generic/header change a whole-project rebuild; correctness determines the actual invalidation closure.
+7. Keep debug/development and release pipelines explicit. A fast development pipeline retains mandatory semantic/safety checks, LLVM verification and contract behavior. Release optimization may use optional LTO; do not force whole-program O2/O3 onto each local edit. Benchmark O0/O1/O2 and selective pass policies before choosing defaults; tests must reject optimization-dependent miscompiles.
+8. Extend compiler self-builds to consume these artifacts. Measure Stage0 seed, Stage1 rebuild and later fixpoint generations separately. Reuse seed/product artifacts only with exact provenance; retain complete self-host/fixpoint qualification for backend and bootstrap changes. Faster focus checks do not establish bootstrap correctness.
+9. Consider a local session after phase ownership/lifetimes are defined, sharing the same compiler code as CLI builds. Retain bounded memory, cancellation, atomic generation publication and restart recovery. This does not authorize or require the historical network `-emit serve` feature.
+
+### C-01/C-06/C-07: measurement and targets
+
+Use a documented reference host on each required platform, fixed LLVM/product/source/runtime identities, controlled background load and power mode. Report cold cache, warm filesystem, valid artifact hit and warm session separately. Measure isolated latency and parallel throughput separately; respect available memory and CPU/cgroup quotas. At least seven paired uninstrumented rounds after warm-up support performance claims; publish median/p95, CPU, peak RSS and variability. Profiles locate work but do not establish uninstrumented speedups.
+
+Create workloads for: tiny CLI compile; medium real program; current compiler self-source; proof main/replay; a small body edit; a comment/line-only edit; interface/type/constant edits; import addition/deletion; target/optimization/contract-mode changes; restart; and deep/malformed/large refusal inputs. Report work performed, not only wall time: files read/parsed, declarations resolved/checked/lowered, instantiations generated, LLVM functions/passes executed, objects emitted and cache invalidation edges.
+
+Initial targets below are engineering goals, not current capabilities or promises on arbitrary hardware. C-01 binds each to versioned fixtures and reference hosts. A miss needs a measured cause and follow-up; do not retire a target by changing the fixture or hiding failed compilation.
+
+| Path | Target |
+| --- | --- |
+| Valid unchanged project build | p95 ≤100 ms in a warm session, ≤250 ms through the CLI; zero parse/check/lower/emit/link work |
+| Single implementation edit in the pinned medium project | p95 ≤1 second for development compile/link; at least 10× less CPU than its clean build; unaffected modules reused |
+| Comment/line-only edit | No semantic/codegen invalidation where tokens/semantics are unchanged; diagnostics/source maps updated correctly |
+| Self-build after one local implementation edit | At least 10× less CPU than a clean same-mode self-build, with exact dependency-aware invalidation; separately report final optimized/fixpoint qualification cost |
+| Cache validation/orchestration | ≤10% of end-to-end small-edit budget; no full std/source-tree content scan on every warm session query |
+| Resident memory | Bounded steady state over repeated builds/edits; no retained dead generations; peak RSS and allocation count ratchets per pinned workload |
+| Cold optimized build | Meet or beat the selected contemporary baseline within the declared common workload class; publish output/runtime correctness and optimization level alongside timing |
+
+Compare against pinned contemporary Clang, Rust and Go workflows on equivalent algorithmic/module/edit scenarios and comparable output/runtime requirements. Language and checking differences must be documented; raw source line counts are not matched work. Include clean build, no-op, local edit, public interface edit, peak RSS and produced-code performance. Use both microbenchmarks and substantial applications; prohibit a system-wide superiority claim from an optimized-away toy or startup-only test.
+
+Profile current whole-unit builds before assigning backend blame. LLVM pass timers, lowering counters, allocation profiles and native samples must distinguish source expansion, semantic rescans, codegen, optimization and machine emission. Investigate repeated linear lookup, placeholder/store allocations, large aggregate copies and pathological pass/function costs only where current evidence supports them. Keep runtime optimization and exported ABI entry points correct; do not repeat the already-fixed O0-runtime assumption.
+
+### Correctness and execution discipline
+
+- Run fast minimized positive/negative controls and affected suites throughout a change. Select tests using actual dependency metadata; reuse test results only for exact code/product/input/runtime/environment identities. Maintain required negative and artifact-admission inventories.
+- Changes to shared resolution/type/ownership/region logic, cached semantic evidence, backend ABI or bootstrap paths trigger the complete affected safety/differential/self-host gates. Full exact-snapshot qualification remains mandatory at integration/release checkpoints. Existing expensive-command bounds and explicit execution policy in §M.5 still apply; this roadmap does not authorize unlimited compute or weaker tests.
+- Clean versus incremental comparisons cover verdicts, diagnostics, rejected-artifact behavior, ABI/symbols, runtime execution and mandatory safety checks. When outputs differ legitimately in debug location/layout, specify that equivalence before measuring; never erase differences after seeing a regression.
+- No disabling contract/safety checks, freshness assertions or LLVM verification to meet latency. No indiscriminate budget increases, blanket always-reseed workflows, stale helper products, polling/fork overhead on every tiny compile, or repeated serialization/parsing between adjacent phases without a measured justification.
+- Preserve dirty work, split scoped changes and document incomplete validation. For each completed C-item, record the exact mutation/workload, baseline/candidate identities, correctness gates, cost reduction, remaining limitations and cache schema compatibility. Release evidence must remain independent of cache-hit counts.
+
 ## Read this first — orientation (2026-09-26)
 
 **Two goals, one analysis.** This plan serves two goals:

@@ -63,7 +63,25 @@ grep -qE "(cannot assign (i64|int) to bool|expects bool, got (i64|int))" <<< "$o
 out=$(printf 'def f() -> void:\n    a: mutable darray[i64] = []\n    b: dict[cstr, i64] = {}\n    a <- b\n' | "$RPT")
 grep -q "expects darray, got dict" <<< "$out" || fail "generic container mismatch not flagged: $out"
 
-# 10. 0 findings across frontend + stdlib (self-contained resolution set).
+# 10. A by-reference darray parameter must be compared by its referent element type.
+# Both outer types lower as references in the function body, but darray[i64]& cannot be
+# passed to a function that reads/writes the same buffer as darray[sview]&.
+MISMATCH_FIXTURE="$REPO_ROOT/test/fixtures/diagnostics/darray_ref_call_element_mismatch.pos.elisa"
+out=$("$RPT" < "$MISMATCH_FIXTURE")
+grep -q 'argument 1 to "take_texts" expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "by-reference darray element mismatch not flagged: $out"
+if "$STAGE1_BIN" -emit obj -O0 -o /dev/null "$MISMATCH_FIXTURE" > /dev/null 2>&1; then
+  fail "stage1 accepted by-reference darray element mismatch"
+fi
+if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$MISMATCH_FIXTURE" 2>&1); then
+  fail "stage0 accepted by-reference darray element mismatch"
+fi
+grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage0_out" || fail "stage0 rejected mismatch for an unexpected reason: $stage0_out"
+
+# Matching by-reference element types remain accepted.
+out=$(printf 'def take_texts(values: darray[sview]&) -> void:\n    pass\ndef good_call(values: darray[sview]&):\n    take_texts(values)\n' | "$RPT")
+grep -q 'expects darray\[sview\]' <<< "$out" && fail "false positive on matching by-reference darray element types: $out"
+
+# 11. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE " expects .*, got | cannot assign .* to " || true)
