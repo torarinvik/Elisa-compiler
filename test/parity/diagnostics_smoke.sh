@@ -77,6 +77,7 @@ NAMES=(
     loop_literal_array_binder_arg
     submit_unnamed_view_growth
     submit_local_mutable_ref
+    thread_shareability_ref_call
     storage_dependency_owned_return_global
     ref_bool_condition
     ref_bool_not_operand
@@ -318,6 +319,7 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "argument 1 to \"f\" expects sview, got static u8&"
     "storage dependency facts were invalidated by darray push"
+    "is not structurally shareable across threads"
     "is not structurally shareable across threads"
     "storage dependency facts were invalidated by darray push"
     "if condition must be bool, got mutable bool&"
