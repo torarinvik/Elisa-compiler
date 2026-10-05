@@ -593,6 +593,52 @@ for escape_shape in darray binding tail tuple struct_field; do
     run_case "view_return_escape_$escape_shape" pos "$FIXTURES/view_return_escape_$escape_shape.pos.elisa" "$region_return_msg"
 done
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "$region_return_msg"
+run_case region_param_container_return pos "$FIXTURES/region_param_container_return.pos.elisa" "$region_return_msg"
+run_case region_param_container_return neg "$FIXTURES/region_param_container_return.neg.elisa" "$region_return_msg"
+run_case region_param_container_return_reference_element pos "$FIXTURES/region_param_container_return_reference_element.pos.elisa" "$region_return_msg"
+run_case region_param_container_return_inferred_new pos "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" "$region_return_msg"
+run_case region_param_container_return_inner_new pos "$FIXTURES/region_param_container_return_inner_new.pos.elisa" "$region_return_msg"
+run_case region_param_container_return_auto_move pos "$FIXTURES/region_param_container_return_auto_move.pos.elisa" "$region_return_msg"
+run_case region_param_container_return_inner_move pos "$FIXTURES/region_param_container_return_inner_move.pos.elisa" "$region_return_msg"
+# The return-escape exception must not bless a local merely because its annotation says @r.
+# These are independent semantic-pass diagnostics from the initializer/assignment provenance.
+require_region_control() {
+    local name="$1" file="$2" expect="$3"
+    local out
+    out="$("$RPT" < "$file" 2>&1)"
+    if grep -qF "$expect" <<< "$out"; then
+        echo "  PASS $name (independent provenance refusal: \"$expect\")"
+    else
+        echo "  FAIL $name: independent provenance refusal missing" >&2
+        echo "    expected substring: $expect" >&2
+        echo "$out" | sed 's/^/      /' >&2
+        failed=$((failed + 1))
+    fi
+}
+require_region_control region_param_container_return_inferred_new "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" '`new[auto]` is deprecated'
+
+# Stage0's independent region/type passes are the authority for these source-provenance
+# controls. Keep them separate from Stage1's return-escape diagnostic assertions above.
+require_stage0_region_control() {
+    local name="$1" file="$2" expect="$3"
+    local log="$REPO_ROOT/build/g75-region-control-$name.$$.log"
+    local object="$REPO_ROOT/build/g75-region-control-$name.$$.o"
+    if "$ELISACORE_BIN" -emit obj -o "$object" "$file" >"$log" 2>&1; then
+        echo "  FAIL $name: Stage0 accepted unsafe caller-region provenance" >&2
+        failed=$((failed + 1))
+    elif grep -qF "$expect" "$log"; then
+        echo "  PASS $name (Stage0 independently refused: \"$expect\")"
+    else
+        echo "  FAIL $name: expected Stage0 provenance refusal missing" >&2
+        echo "    expected substring: $expect" >&2
+        sed 's/^/      /' "$log" >&2
+        failed=$((failed + 1))
+    fi
+}
+require_stage0_region_control region_param_container_return_inner_new "$FIXTURES/region_param_container_return_inner_new.pos.elisa" 'cannot return value: region dependency facts include local region "inner"'
+require_stage0_region_control region_param_container_return_auto_move "$FIXTURES/region_param_container_return_auto_move.pos.elisa" 'value in region "<inferred>" is stored into longer-lived region "r"'
+require_stage0_region_control region_param_container_return_inner_move "$FIXTURES/region_param_container_return_inner_move.pos.elisa" 'value in region "inner" is stored into longer-lived region "r"'
+require_stage0_region_control region_param_container_return_reference_element "$FIXTURES/region_param_container_return_reference_element.pos.elisa" 'cannot return value: region dependency facts include local region "inner"'
 run_case local_view_escape_binding pos "$FIXTURES/local_view_escape_binding.pos.elisa" "view of local \"v\" escapes via return; the array dies at scope exit"
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "escapes via return; the array dies at scope exit"
 run_case local_view_escape_struct_field pos "$FIXTURES/local_view_escape_struct_field.pos.elisa" "view of local \"s\" escapes via return; the array dies at scope exit"
