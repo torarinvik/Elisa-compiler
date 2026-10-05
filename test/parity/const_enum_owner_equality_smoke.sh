@@ -37,7 +37,11 @@ accept_both() {
 
 reject_both const_enum_cross_owner_equal_payload 'cannot compare OwnerA and OwnerB'
 reject_both const_enum_cross_owner_wrong_shorthand 'Foreign'
-reject_both const_enum_module_owner_collisions 'cannot compare North.Code and South.Code' 'cannot compare'
+reject_both const_enum_module_owner_collisions 'cannot compare North.Code and South.Code'
+module_owner_s0_count="$(grep -cF 'cannot compare North.Code and South.Code' "$work/const_enum_module_owner_collisions.s0" || true)"
+module_owner_s1_count="$(grep -cF 'cannot compare North.Code and South.Code' "$work/const_enum_module_owner_collisions.s1" || true)"
+[ "$module_owner_s0_count" -eq 4 ] || fail "expected four qualified Stage0 owner diagnostics, got $module_owner_s0_count"
+[ "$module_owner_s1_count" -eq 4 ] || fail "expected four qualified Stage1 owner diagnostics, got $module_owner_s1_count"
 accept_both const_enum_same_owner_nonunit_equality
 accept_both const_enum_alias_same_owner_equality
 accept_both const_enum_module_owner_positive_controls
