@@ -3,14 +3,21 @@
 # the Mac kills any local process whose command line mentions them).
 RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"
 # The in-repo clang/cc shim FIRST (tools/linux_shim/clang explains the mappings), then the toolchain.
-export ELISA_TOOL_SHIM_DIR="$RDIR/tools/linux_shim"
-export PATH="$ELISA_TOOL_SHIM_DIR:/usr/local/go/bin:/usr/local/bin:/usr/lib/llvm-21/bin:$PATH"
+# ELISA_NO_LINUX_SHIM=1: no shim; scripts/platform.sh derives the Linux flags instead.
+if [ -n "${ELISA_NO_LINUX_SHIM:-}" ]; then
+  export ELISA_TOOL_SHIM_DIR=""
+  export PATH="/usr/local/go/bin:/usr/local/bin:/usr/lib/llvm-21/bin:$PATH"
+else
+  export ELISA_TOOL_SHIM_DIR="$RDIR/tools/linux_shim"
+  export PATH="$ELISA_TOOL_SHIM_DIR:/usr/local/go/bin:/usr/local/bin:/usr/lib/llvm-21/bin:$PATH"
+fi
 ulimit -s unlimited
 RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/Elisa-core}"
 cd "$RDIR"
 export REPO_ROOT="$RDIR" ELISA_CORE="$RCORE" ELISACORE_BIN="$RCORE/compiler/bin/elisac"
 export ELISA_STAGE1_BIN="$RDIR/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$RDIR/build/runtime/elisacore_runtime.o"
-export LLVM_CONFIG="$(readlink -f "$(command -v llvm-config)")" ELISA_CLANG="$ELISA_TOOL_SHIM_DIR/clang"
+export LLVM_CONFIG="$(readlink -f "$(command -v llvm-config)")"
+export ELISA_CLANG="${ELISA_TOOL_SHIM_DIR:-$(llvm-config --bindir)}/clang"
 export ELISA_LLVM_BIN_DIR="$(llvm-config --bindir)" LLC="$(llvm-config --bindir)/llc" LLVM_MC="$(llvm-config --bindir)/llvm-mc"
 # stage0 must be the HOST's build: an rsync that carried the Mac binary once left an arm64
 # Mach-O here (Exec format error). Rebuild when the file is not a native ELF.

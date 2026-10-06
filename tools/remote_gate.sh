@@ -3,6 +3,8 @@
 #
 #   tools/remote_gate.sh "<ssh options and target>" [fast|full|gen3|check1,check2,...]     (default: fast)
 #   e.g. tools/remote_gate.sh "-p 50559 root@203.0.113.7" full
+#   ELISA_NO_LINUX_SHIM=1 keeps tools/linux_shim off the host PATH (scripts/platform.sh
+#   supplies the Linux link flags itself).
 #
 # Syncs this repo (src/ test/ scripts/ elisacore_std/ ...) and the stage0 checkout to the
 # host, reseeds stage1 there (~90 s on 32 cores), runs the chosen list with every
@@ -17,7 +19,24 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/Elisa-core}"
 addr="${SSH_TARGET##* }"; opts="${SSH_TARGET% *}"; [[ "$addr" == "$SSH_TARGET" ]] && opts=""
-rsync -az --exclude 'build/*' --exclude bin -e "ssh $opts" "$ROOT/" "$addr:$RDIR/"
+# The tree WITHOUT .git: in a linked worktree .git is a file naming a Mac path, useless on
+# the host. The host keeps its own .git; the commits it lacks travel as a bundle and HEAD is
+# moved with a mixed reset, so `git status` there shows exactly this tree's uncommitted edits.
+rsync -az --exclude 'build/*' --exclude bin --exclude .git -e "ssh $opts" "$ROOT/" "$addr:$RDIR/"
+head="$(git -C "$ROOT" rev-parse HEAD)"
+rhead="$(ssh $opts "$addr" "git -C $RDIR rev-parse -q --verify HEAD 2>/dev/null" || true)"
+if [[ "$rhead" != "$head" ]]; then
+  bundle="$(mktemp "${TMPDIR:-/tmp}/remote_gate.XXXXXX")"
+  if [[ -n "$rhead" ]] && git -C "$ROOT" cat-file -e "$rhead^{commit}" 2>/dev/null; then
+    git -C "$ROOT" bundle create -q "$bundle" "$rhead..HEAD" 2>/dev/null || git -C "$ROOT" bundle create -q "$bundle" HEAD
+  else
+    git -C "$ROOT" bundle create -q "$bundle" HEAD
+  fi
+  rsync -az -e "ssh $opts" "$bundle" "$addr:$RDIR.bundle" && rm -f "$bundle"
+  ssh $opts "$addr" "cd $RDIR || exit 1; [ -d .git ] || { rm -f .git; git init -q; }
+    git config --global --get-all safe.directory | grep -qx $RDIR || git config --global --add safe.directory $RDIR
+    git fetch -q $RDIR.bundle HEAD && git reset -q $head && rm -f $RDIR.bundle"
+fi
 rsync -az --exclude compiler/bin -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
 case "$PROFILE" in
   fast) LIST="emit_ast_parity_smoke resolve_smoke diagnostics_smoke diagnostics_diff semantic_internal_diff semantic_acceptance_diff global_permissions_smoke" ;;
@@ -31,4 +50,4 @@ case "$PROFILE" in
   *) echo "unknown profile $PROFILE (fast|full|gen3, or check1,check2,...)" >&2; exit 2 ;;
 esac
 # The remote script is passed on stdin with the three values substituted up front.
-{ printf 'RDIR=%q\nRCORE=%q\nLIST=%q\n' "$RDIR" "$RCORE" "$LIST"; cat "$ROOT/tools/remote_gate_body.sh"; } | ssh $opts "$addr" "bash -s"
+{ printf 'RDIR=%q\nRCORE=%q\nLIST=%q\nELISA_NO_LINUX_SHIM=%q\n' "$RDIR" "$RCORE" "$LIST" "${ELISA_NO_LINUX_SHIM:-}"; cat "$ROOT/tools/remote_gate_body.sh"; } | ssh $opts "$addr" "bash -s"
