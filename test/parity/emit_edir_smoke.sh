@@ -9,7 +9,7 @@ WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/fixtures/edir/arithmetic.elisa"
 # EDIR codec/program versions emitted by ElisaEDIR::Schema.
 EDIR_SCHEMA_VERSION=4
-EDIR_PROGRAM_VERSION=6
+EDIR_PROGRAM_VERSION=7
 export EDIR_SCHEMA_VERSION EDIR_PROGRAM_VERSION
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -470,7 +470,7 @@ check_arithmetic_case - 42 40 3 2
 check_arithmetic_case '*' 6 7 11 42
 check_arithmetic_case / 84 2 12 42
 
-# Schema 4 / program version 6 supplies explicit function ranges and direct call targets. This
+# Schema 4 / program version 7 supplies explicit function ranges and direct call targets. This
 # compiler-owned fixture exercises a regular helper call and bounded tail recursion.
 functions_source="$ROOT/test/fixtures/edir/function_calls.elisa"
 functions_artifact="$WORK/function-calls.edir"

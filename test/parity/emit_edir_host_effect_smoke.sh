@@ -26,7 +26,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 6
+PROGRAM_VERSION = 7
 INSTRUCTION_COUNT = 4
 FUNCTION_COUNT = 2
 LOCAL_COUNT = 1
@@ -43,7 +43,7 @@ INSTRUCTION_BYTES = 62
 INSTRUCTION_SOURCE_OFFSET = 18
 HAS_RETURN_OFFSET = 24
 
-artifact_path, source_path = map(Path, sys.argv[1:])
+artifact_path, source_path = map(Path, sys.argv[1:3])
 data = artifact_path.read_bytes()
 source = source_path.read_bytes()
 source_path_length = struct.unpack_from("<I", data, PROGRAM_HEADER_BYTES + SOURCE_FILE_PATH_LENGTH_OFFSET)[0]
@@ -79,7 +79,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 6
+PROGRAM_VERSION = 7
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -96,7 +96,7 @@ INSTRUCTION_BYTES = 62
 INSTRUCTION_SOURCE_OFFSET = 18
 HAS_RETURN_OFFSET = 24
 
-artifact_path, source_path = map(Path, sys.argv[1:])
+artifact_path, source_path = map(Path, sys.argv[1:3])
 data = artifact_path.read_bytes()
 source = source_path.read_bytes()
 source_path_length = struct.unpack_from("<I", data, PROGRAM_HEADER_BYTES + SOURCE_FILE_PATH_LENGTH_OFFSET)[0]
@@ -125,7 +125,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 6
+PROGRAM_VERSION = 7
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -141,7 +141,7 @@ INSTRUCTION_BYTES = 62
 INSTRUCTION_SOURCE_OFFSET = 18
 HAS_RETURN_OFFSET = 24
 
-artifact_path, source_path = map(Path, sys.argv[1:])
+artifact_path, source_path = map(Path, sys.argv[1:3])
 data = artifact_path.read_bytes()
 source = source_path.read_bytes()
 source_path_length = struct.unpack_from("<I", data, PROGRAM_HEADER_BYTES + SOURCE_FILE_PATH_LENGTH_OFFSET)[0]
@@ -161,22 +161,25 @@ assert struct.unpack_from("<I", data, function_count_offset)[0] == FUNCTION_COUN
 PY
 done
 
+for read_operation in read_byte try_read_byte; do
 for optimization in 0 2; do
+  VIRTUAL_FILE_FIXTURE="$ROOT/test/fixtures/edir/host_virtual_file_read.elisa"
+  [[ "$read_operation" == try_read_byte ]] && VIRTUAL_FILE_FIXTURE="$ROOT/test/fixtures/edir/host_virtual_file_try_read_byte.elisa"
   artifact="$WORK/host-virtual-file-read-O$optimization.edir"
   ELISA_EDIR_SOURCE_ROOT="$ROOT" ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir "-O$optimization" -o "$artifact" "$VIRTUAL_FILE_FIXTURE"
-  python3 - "$artifact" "$VIRTUAL_FILE_FIXTURE" <<'PY'
+  python3 - "$artifact" "$VIRTUAL_FILE_FIXTURE" "$read_operation" <<'PY'
 from pathlib import Path
 import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 6
+PROGRAM_VERSION = 7
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
 HAS_RETURN = 1
 SOURCE_FILE_COUNT = 1
-OPCODE_VIRTUAL_FILE_READ_BYTE = 24
+OPCODE_VIRTUAL_FILE_READ_BYTE = 27 if sys.argv[3] == "try_read_byte" else 24
 OPCODE_RETURN = 19
 RESOURCE_HANDLE = 7
 NO_OPERAND = 0
@@ -187,7 +190,7 @@ INSTRUCTION_BYTES = 62
 INSTRUCTION_SOURCE_OFFSET = 18
 HAS_RETURN_OFFSET = 24
 
-artifact_path, source_path = map(Path, sys.argv[1:])
+artifact_path, source_path = map(Path, sys.argv[1:3])
 data = artifact_path.read_bytes()
 source = source_path.read_bytes()
 source_path_length = struct.unpack_from("<I", data, PROGRAM_HEADER_BYTES + SOURCE_FILE_PATH_LENGTH_OFFSET)[0]
@@ -201,14 +204,16 @@ assert read == (OPCODE_VIRTUAL_FILE_READ_BYTE, RESOURCE_HANDLE, NO_OPERAND), rea
 assert returned == (OPCODE_RETURN, NO_OPERAND, NO_OPERAND), returned
 read_source = struct.unpack_from("<QQQIIIII", data, header_bytes + INSTRUCTION_SOURCE_OFFSET)
 start_byte, end_byte = read_source[1], read_source[2]
-assert source[start_byte:end_byte].decode() == "DebuggerHostEffects::virtual_file_read_byte"
+assert source[start_byte:end_byte].decode() == "DebuggerHostEffects::virtual_file_" + sys.argv[3]
 function_count_offset = header_bytes + instruction_count * INSTRUCTION_BYTES
 assert struct.unpack_from("<I", data, function_count_offset)[0] == FUNCTION_COUNT
 PY
 done
 
+done
+
 # Mutating effects carry both immediate operands and retain source identity.
-for operation in write_byte seek; do
+for operation in write_byte seek try_write_byte try_seek; do
   fixture="$ROOT/test/fixtures/edir/host_virtual_file_$operation.elisa"
   for optimization in 0 2; do
     artifact="$WORK/host-virtual-file-$operation-O$optimization.edir"
@@ -221,9 +226,9 @@ artifact, source = map(Path, sys.argv[1:3])
 operation = sys.argv[3]
 data = artifact.read_bytes()
 schema, version, count, locals_count = struct.unpack_from("<IIQQ", data)
-assert (schema, version, count, locals_count) == (4, 6, 2, 0)
+assert (schema, version, count, locals_count) == (4, 7, 2, 0)
 header = 29 + 36 + struct.unpack_from("<I", data, 29 + 32)[0]
-expected = (25, 7, 255) if operation == "write_byte" else (26, 7, 2)
+expected = {"write_byte": (25, 7, 255), "seek": (26, 7, 2), "try_write_byte": (28, 7, 255), "try_seek": (29, 7, 2)}[operation]
 assert struct.unpack_from("<Hqq", data, header) == expected
 assert struct.unpack_from("<Hqq", data, header + 62) == (19, 0, 0)
 span = struct.unpack_from("<QQQIIIII", data, header + 18)
@@ -233,14 +238,14 @@ PYCODE
 done
 
 # Unsupported calls fail closed: the launcher leaves an empty output path.
-for operation in write_byte seek; do
+for operation in write_byte seek try_write_byte try_seek; do
   for scenario in no_value named_value zero_handle negative_handle negative_value variable_value bad_arity; do
     fixture="$WORK/reject-$operation-$scenario.elisa"
     python3 - "$fixture" "$operation" "$scenario" <<'PYCODE'
 from pathlib import Path
 import sys
 path, operation, scenario = sys.argv[1:]
-second = "value" if operation == "write_byte" else "offset"
+second = "value" if operation.endswith("write_byte") else "offset"
 call = {"no_value":"(1)","named_value":f"(handle: 1, {second}: 1)","zero_handle":"(0, 1)","negative_handle":"(-1, 1)","negative_value":"(1, -1)","variable_value":"(1, byte)","bad_arity":"(1, 1, 1)"}[scenario]
 decl = "handle: i64, " + second + ": i64"
 if scenario == "bad_arity": decl += ", extra: i64"
@@ -256,12 +261,22 @@ PYCODE
     test ! -s "$artifact"
   done
 done
-# A byte operand cannot represent a value above 255.
-fixture="$WORK/reject-byte.elisa"
-printf '%s\n' 'module DebuggerHostEffects:' '    extern virtual_file_write_byte(handle: i64, value: i64) -> i64 can[IO]' '' 'def main() -> i64 can[IO]:' '    return DebuggerHostEffects::virtual_file_write_byte(1, 256)' > "$fixture"
-if ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir -O0 -o "$WORK/reject.edir" "$fixture" > "$WORK/reject.log" 2>&1; then
-  echo "unexpectedly accepted byte 256" >&2; exit 1
-fi
-test ! -s "$WORK/reject.edir"
+# Byte 256 and malformed try-read calls also fail at the producer boundary.
+for operation in write_byte try_write_byte; do
+  fixture="$WORK/reject-byte.elisa"
+  printf '%s\n' 'module DebuggerHostEffects:' "    extern virtual_file_$operation(handle: i64, value: i64) -> i64 can[IO]" '' 'def main() -> i64 can[IO]:' "    return DebuggerHostEffects::virtual_file_$operation(1, 256)" > "$fixture"
+  if ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir -O0 -o "$WORK/reject.edir" "$fixture" > "$WORK/reject.log" 2>&1; then
+    echo "unexpectedly accepted $operation byte 256" >&2; exit 1
+  fi
+  test ! -s "$WORK/reject.edir"
+done
+for call in '()' '(0)' '(-1)' '(1, 2)' '(handle: 1)'; do
+  fixture="$WORK/reject-read.elisa"
+  printf '%s\n' 'module DebuggerHostEffects:' '    extern virtual_file_try_read_byte(handle: i64) -> i64 can[IO]' '' 'def main() -> i64 can[IO]:' "    return DebuggerHostEffects::virtual_file_try_read_byte$call" > "$fixture"
+  if ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir -O0 -o "$WORK/reject.edir" "$fixture" > "$WORK/reject.log" 2>&1; then
+    echo "unexpectedly accepted try-read $call" >&2; exit 1
+  fi
+  test ! -s "$WORK/reject.edir"
+done
 
 echo "emit_edir_host_effect_smoke OK: namespaced clock/random/console/virtual-file calls lower at O0 and O2 with source identity"
