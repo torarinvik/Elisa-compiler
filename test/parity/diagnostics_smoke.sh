@@ -282,6 +282,7 @@ NAMES=(
     auto_region_store_escape_nested
     iter_owner_callee
     storage_dependency_field_replacement
+    global_store_local_escape
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -530,6 +531,7 @@ EXPECTS=(
     'value escapes its `in auto:` scope via store into longer-lived storage'
     'by mutable reference while "p.items" is being iterated: the callee may push/clear/replace it through "p"'
     "storage dependency facts were invalidated for interior reference \"r\""
+    'storing a reference to function-local storage into longer-lived storage'
 )
 
 total=0
