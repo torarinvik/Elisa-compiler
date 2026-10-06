@@ -162,6 +162,34 @@ extend Semantic:
                 return ""
 
 
+        def function_parameter_type_id_at_firm(table: SymbolTable&, function_name: sview, position: usize) -> u32:
+            can Abort.Panic:
+                seen: mutable usize = 0
+                cur: mutable u32 = function_param_chain_head(table, function_name)
+                while cur != 4294967295:
+                    if table.function_param_owner[cur.usize()] == function_name:
+                        return table.function_param_type_id[cur.usize()] if seen == position
+                        seen <- seen + 1
+                    cur <- table.function_param_name_next[cur.usize()]
+                return 0
+
+
+        def firm_parameter_type_is_generic(table: SymbolTable&, function_name: sview, parameter_type_id: u32) -> bool:
+            can Abort.Panic:
+                return false if interned_kind(parameter_type_id, table) != SemTypeKind.Named
+                parameter_name: sview = interned_name(parameter_type_id, table)
+                cur: mutable u32 = symbol_chain_head(table, function_name)
+                while cur != 4294967295:
+                    symbol: Symbol = table.symbols[cur.usize()]
+                    if symbol.name == function_name and symbol.kind == SymbolKind.Func:
+                        generic_index: mutable usize = 0
+                        while generic_index < table.generic_param_names.count:
+                            return true if table.generic_param_lines[generic_index] == symbol.line and table.generic_param_names[generic_index] == parameter_name
+                            generic_index <- generic_index + 1
+                    cur <- table.symbol_name_next[cur.usize()]
+                return false
+
+
         # The string spelling helper above intentionally returns an empty name for a
         # shaped annotation such as `cstr[shape]`. Keep a structural path for the safety
         # boundary so this spelling erasure cannot make a raw pointer look admissible.
@@ -175,6 +203,25 @@ extend Semantic:
                         seen <- seen + 1
                     cur <- table.function_param_name_next[cur.usize()]
                 return false
+
+
+        # Structural actual/parameter comparison for the non-nullable call boundary.
+        # A pattern binder can carry an Optional TypeId even when the coarse InferType
+        # cannot name its payload; that value must never be silently admitted by a
+        # non-optional parameter. Optional-to-optional compatibility remains the full
+        # resolver's responsibility.
+        def firm_optional_type_mismatch(argument: Ast::Expr, function_name: sview, position: usize, names: darray[sview]&, types: darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Ident(name, _):
+                        return false if local_type_of(names, types, name) != "__firm_optional_payload__"
+                    _:
+                        return false
+                argument_type_id: u32 = structural_type_id_of(argument, names, types, table)
+                return false if interned_kind(argument_type_id, table) != SemTypeKind.Optional
+                parameter_type_id: u32 = function_parameter_type_id_at_firm(table, function_name, position)
+                return false if parameter_type_id == 0 or interned_kind(parameter_type_id, table) == SemTypeKind.Optional or firm_parameter_type_is_generic(table, function_name, parameter_type_id)
+                return true
 
         # Extern parameters live in the AST side table rather than the symbol table's
         # function-parameter chain.  Keep the same firm-argument check for them: without
@@ -275,6 +322,16 @@ extend Semantic:
                         if sview_starts_with(protocol_type, "__protocol_arg_"):
                             protocol_argument: InferType = infer_expression_type(arguments[argument_index], var_types, type_names, table)
                             table <- check_inferred_protocol_argument(fn_name, protocol_type, arguments[argument_index], protocol_argument, call_pos, table)
+                    # This structural check is deliberately limited to one direct
+                    # declaration: with overloads, the resolver owns candidate selection
+                    # and this walk must not compare against an arbitrary parameter row.
+                    optional_position: int = function_parameter_index(table, fn_name, argument_names[argument_index]) if argument_names[argument_index] != "" else argument_index.int()
+                    optional_mismatch: mutable bool = false
+                    if literal_kind_of(arguments[argument_index]) == "" and optional_position >= 0 and direct_function_count(table, fn_name) == 1:
+                        optional_mismatch <- firm_optional_type_mismatch(arguments[argument_index], fn_name, optional_position.usize(), var_types, type_names, table)
+                    parameter_type_id: u32 = function_parameter_type_id_at_firm(table, fn_name, optional_position.usize()) if optional_mismatch else 0
+                    optional_expected: sview = diagnostic_name_of_row(parameter_type_id, table) if optional_mismatch else ""
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FirmArgTypeMismatch, name: fn_name, pos: Ast::expr_pos(arguments[argument_index]), line: line, expected: optional_expected, actual: "optional", expected_count: (argument_index + 1).u32()}) if optional_mismatch
                     # Named args + literals are owned by other checks; skip them in one guard.
                     if argument_names[argument_index] == "" and literal_kind_of(arguments[argument_index]) == "":
                         direct_param_type: sview = function_parameter_type_at_firm(table, fn_name, argument_index)
@@ -416,11 +473,29 @@ extend Semantic:
                         close_firm_type_scope(block_name_mark, block_state_mark, var_types, type_names, state_names, states)
                     Expr.Match(scrutinee, arms, line):
                         table <- walk_expression_for_firm_arg_type_mismatch(scrutinee, table, var_types, type_names, state_names, states, declarations, extern_params)
+                        match_type_id: u32 = structural_type_id_of(scrutinee, var_types, type_names, table)
                         for arm in arms |table|:
                             arm_name_mark: usize = var_types.count
                             arm_state_mark: usize = state_names.count
+                            arm_type_id_mark: usize = table.local_type_names.count
+                            arm_pattern: Ast::Pattern = arm.pattern
+                            arm_binding_type_id: mutable u32 = match_type_id
+                            arm_is_optional_payload_binding: bool = match arm_pattern:
+                                Pattern.Binding(_): true
+                                _: false
+                            arm_binding_type_id <- interned_elem(match_type_id, 0, table) if arm_is_optional_payload_binding and interned_kind(match_type_id, table) == SemTypeKind.Optional and interned_elem_count(match_type_id, table) == 1
+                            arm_bindings: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm_pattern, arm_bindings)
+                            for arm_binding in arm_bindings |table, arm_pattern, arm_binding_type_id|:
+                                binding_type_id: u32 = pag_pattern_binding_type_id(arm_pattern, arm_binding_type_id, arm_binding, table)
+                                note_local_type_id_direct(arm_binding, binding_type_id, table)
+                                binding_type_name: sview = type_name_of_row(binding_type_id, table) if interned_kind(binding_type_id, table) == SemTypeKind.Named else ""
+                                note_local_type(var_types, type_names, arm_binding, "__firm_optional_payload__") if interned_kind(binding_type_id, table) == SemTypeKind.Optional
+                                note_local_type(var_types, type_names, arm_binding, binding_type_name) if binding_type_name != "" and interned_kind(binding_type_id, table) != SemTypeKind.Optional
                             table <- walk_statements_for_firm_arg_type_mismatch(arm.body, table, var_types, type_names, state_names, states, declarations, extern_params)
                             close_firm_type_scope(arm_name_mark, arm_state_mark, var_types, type_names, state_names, states)
+                            table.local_type_names <- table.local_type_names.truncate(arm_type_id_mark)
+                            table.local_type_ids <- table.local_type_ids.truncate(arm_type_id_mark)
                     # Literals and other expressions don't contain relevant sub-expressions
                     _:
                         pass
@@ -485,12 +560,30 @@ extend Semantic:
                             close_firm_type_scope(block_name_mark, block_state_mark, var_types, type_names, state_names, states)
                         Stmt.Match(scrutinee, arms, line):
                             table <- walk_expression_for_firm_arg_type_mismatch(scrutinee, table, var_types, type_names, state_names, states, declarations, extern_params)
+                            match_type_id: u32 = structural_type_id_of(scrutinee, var_types, type_names, table)
                             for arm in arms |table|:
                                 arm_name_mark: usize = var_types.count
                                 arm_state_mark: usize = state_names.count
+                                arm_type_id_mark: usize = table.local_type_names.count
+                                arm_pattern: Ast::Pattern = arm.pattern
+                                arm_binding_type_id: mutable u32 = match_type_id
+                                arm_is_optional_payload_binding: bool = match arm_pattern:
+                                    Pattern.Binding(_): true
+                                    _: false
+                                arm_binding_type_id <- interned_elem(match_type_id, 0, table) if arm_is_optional_payload_binding and interned_kind(match_type_id, table) == SemTypeKind.Optional and interned_elem_count(match_type_id, table) == 1
+                                arm_bindings: mutable darray[sview] = []
+                                collect_pattern_binding_names(arm_pattern, arm_bindings)
+                                for arm_binding in arm_bindings |table, arm_pattern, arm_binding_type_id|:
+                                    binding_type_id: u32 = pag_pattern_binding_type_id(arm_pattern, arm_binding_type_id, arm_binding, table)
+                                    note_local_type_id_direct(arm_binding, binding_type_id, table)
+                                    binding_type_name: sview = type_name_of_row(binding_type_id, table) if interned_kind(binding_type_id, table) == SemTypeKind.Named else ""
+                                    note_local_type(var_types, type_names, arm_binding, "__firm_optional_payload__") if interned_kind(binding_type_id, table) == SemTypeKind.Optional
+                                    note_local_type(var_types, type_names, arm_binding, binding_type_name) if binding_type_name != "" and interned_kind(binding_type_id, table) != SemTypeKind.Optional
                                 table <- walk_expression_for_firm_arg_type_mismatch(arm.guard, table, var_types, type_names, state_names, states, declarations, extern_params)
                                 table <- walk_statements_for_firm_arg_type_mismatch(arm.body, table, var_types, type_names, state_names, states, declarations, extern_params)
                                 close_firm_type_scope(arm_name_mark, arm_state_mark, var_types, type_names, state_names, states)
+                                table.local_type_names <- table.local_type_names.truncate(arm_type_id_mark)
+                                table.local_type_ids <- table.local_type_ids.truncate(arm_type_id_mark)
                         Stmt.Return(value, line):
                             if value is return_value:
                                 table <- walk_expression_for_firm_arg_type_mismatch(return_value, table, var_types, type_names, state_names, states, declarations, extern_params)
