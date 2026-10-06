@@ -26,7 +26,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 5
+PROGRAM_VERSION = 6
 INSTRUCTION_COUNT = 4
 FUNCTION_COUNT = 2
 LOCAL_COUNT = 1
@@ -79,7 +79,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 5
+PROGRAM_VERSION = 6
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -125,7 +125,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 5
+PROGRAM_VERSION = 6
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -170,7 +170,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 5
+PROGRAM_VERSION = 6
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -206,5 +206,62 @@ function_count_offset = header_bytes + instruction_count * INSTRUCTION_BYTES
 assert struct.unpack_from("<I", data, function_count_offset)[0] == FUNCTION_COUNT
 PY
 done
+
+# Mutating effects carry both immediate operands and retain source identity.
+for operation in write_byte seek; do
+  fixture="$ROOT/test/fixtures/edir/host_virtual_file_$operation.elisa"
+  for optimization in 0 2; do
+    artifact="$WORK/host-virtual-file-$operation-O$optimization.edir"
+    ELISA_EDIR_SOURCE_ROOT="$ROOT" ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir "-O$optimization" -o "$artifact" "$fixture"
+    python3 - "$artifact" "$fixture" "$operation" <<'PYCODE'
+from pathlib import Path
+import struct
+import sys
+artifact, source = map(Path, sys.argv[1:3])
+operation = sys.argv[3]
+data = artifact.read_bytes()
+schema, version, count, locals_count = struct.unpack_from("<IIQQ", data)
+assert (schema, version, count, locals_count) == (4, 6, 2, 0)
+header = 29 + 36 + struct.unpack_from("<I", data, 29 + 32)[0]
+expected = (25, 7, 255) if operation == "write_byte" else (26, 7, 2)
+assert struct.unpack_from("<Hqq", data, header) == expected
+assert struct.unpack_from("<Hqq", data, header + 62) == (19, 0, 0)
+span = struct.unpack_from("<QQQIIIII", data, header + 18)
+assert source.read_bytes()[span[1]:span[2]].decode() == "DebuggerHostEffects::virtual_file_" + operation
+PYCODE
+  done
+done
+
+# Unsupported calls fail closed: the launcher leaves an empty output path.
+for operation in write_byte seek; do
+  for scenario in no_value named_value zero_handle negative_handle negative_value variable_value bad_arity; do
+    fixture="$WORK/reject-$operation-$scenario.elisa"
+    python3 - "$fixture" "$operation" "$scenario" <<'PYCODE'
+from pathlib import Path
+import sys
+path, operation, scenario = sys.argv[1:]
+second = "value" if operation == "write_byte" else "offset"
+call = {"no_value":"(1)","named_value":f"(handle: 1, {second}: 1)","zero_handle":"(0, 1)","negative_handle":"(-1, 1)","negative_value":"(1, -1)","variable_value":"(1, byte)","bad_arity":"(1, 1, 1)"}[scenario]
+decl = "handle: i64, " + second + ": i64"
+if scenario == "bad_arity": decl += ", extra: i64"
+body = f"def main() -> i64 can[IO]:\n    return DebuggerHostEffects::virtual_file_{operation}{call}\n"
+if scenario == "variable_value":
+    body = f"def main() -> i64 can[IO]:\n    return use_byte(1)\n\ndef use_byte(byte: i64) -> i64 can[IO]:\n    return DebuggerHostEffects::virtual_file_{operation}{call}\n"
+Path(path).write_text(f"module DebuggerHostEffects:\n    extern virtual_file_{operation}({decl}) -> i64 can[IO]\n\n" + body)
+PYCODE
+    artifact="$WORK/reject.edir"
+    if ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir -O0 -o "$artifact" "$fixture" > "$WORK/reject.log" 2>&1; then
+      echo "unexpectedly accepted $operation/$scenario" >&2; exit 1
+    fi
+    test ! -s "$artifact"
+  done
+done
+# A byte operand cannot represent a value above 255.
+fixture="$WORK/reject-byte.elisa"
+printf '%s\n' 'module DebuggerHostEffects:' '    extern virtual_file_write_byte(handle: i64, value: i64) -> i64 can[IO]' '' 'def main() -> i64 can[IO]:' '    return DebuggerHostEffects::virtual_file_write_byte(1, 256)' > "$fixture"
+if ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir -O0 -o "$WORK/reject.edir" "$fixture" > "$WORK/reject.log" 2>&1; then
+  echo "unexpectedly accepted byte 256" >&2; exit 1
+fi
+test ! -s "$WORK/reject.edir"
 
 echo "emit_edir_host_effect_smoke OK: namespaced clock/random/console/virtual-file calls lower at O0 and O2 with source identity"

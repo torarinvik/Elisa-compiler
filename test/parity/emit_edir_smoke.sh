@@ -9,7 +9,7 @@ WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/fixtures/edir/arithmetic.elisa"
 # EDIR codec/program versions emitted by ElisaEDIR::Schema.
 EDIR_SCHEMA_VERSION=4
-EDIR_PROGRAM_VERSION=5
+EDIR_PROGRAM_VERSION=6
 export EDIR_SCHEMA_VERSION EDIR_PROGRAM_VERSION
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -18,6 +18,12 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 [[ -f "$RUNTIME" ]] || { echo "emit_edir_smoke FAIL: missing runtime object $RUNTIME" >&2; exit 1; }
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN" ELISA_RUNTIME_OBJ="$RUNTIME"
+NATIVE_CLANG="${ELISA_CLANG:-clang}"
+case "$(uname -s)" in
+  Darwin) NATIVE_LINK_FLAGS=(-Wl,-dead_strip) ;;
+  Linux) NATIVE_LINK_FLAGS=(-no-pie -Wl,--gc-sections) ;;
+  *) echo "emit_edir_smoke FAIL: unsupported native host" >&2; exit 1 ;;
+esac
 
 emit_edir() {
   local source_root="$1" output_path="$2" source_path="$3"
@@ -345,7 +351,7 @@ PY
 counted_loop_object="$WORK/counted-loop-native.o"
 counted_loop_program="$WORK/counted-loop-native"
 bash "$WRAPPER" -o "$counted_loop_object" "$counted_loop_source"
-clang -Wl,-dead_strip -o "$counted_loop_program" "$counted_loop_object" "$RUNTIME"
+"$NATIVE_CLANG" "${NATIVE_LINK_FLAGS[@]}" -o "$counted_loop_program" "$counted_loop_object" "$RUNTIME"
 set +e
 "$counted_loop_program"
 counted_loop_native_status=$?
@@ -383,7 +389,7 @@ grep -q 'counted-loop body must use' "$WORK/unsupported-loop.stderr"
 native_object="$WORK/native.o"
 native_program="$WORK/native-program"
 bash "$WRAPPER" -o "$native_object" "$FIXTURE"
-clang -Wl,-dead_strip -o "$native_program" "$native_object" "$RUNTIME"
+"$NATIVE_CLANG" "${NATIVE_LINK_FLAGS[@]}" -o "$native_program" "$native_object" "$RUNTIME"
 set +e
 "$native_program"
 native_status=$?
@@ -398,7 +404,7 @@ set -e
 local_object="$WORK/local-native.o"
 local_program="$WORK/local-native"
 bash "$WRAPPER" -o "$local_object" "$local_source"
-clang -Wl,-dead_strip -o "$local_program" "$local_object" "$RUNTIME"
+"$NATIVE_CLANG" "${NATIVE_LINK_FLAGS[@]}" -o "$local_program" "$local_object" "$RUNTIME"
 set +e
 "$local_program"
 local_native_status=$?
@@ -449,7 +455,7 @@ assert instructions[2][0:3] == (19, 0, 0)
 assert all(instruction[3] == 1 and instruction[5] > instruction[4] for instruction in instructions)
 PY
   bash "$WRAPPER" -o "$case_object" "$case_source"
-  clang -Wl,-dead_strip -o "$case_program" "$case_object" "$RUNTIME"
+  "$NATIVE_CLANG" "${NATIVE_LINK_FLAGS[@]}" -o "$case_program" "$case_object" "$RUNTIME"
   set +e
   "$case_program"
   local actual=$?
@@ -464,7 +470,7 @@ check_arithmetic_case - 42 40 3 2
 check_arithmetic_case '*' 6 7 11 42
 check_arithmetic_case / 84 2 12 42
 
-# Schema 4 / program version 5 supplies explicit function ranges and direct call targets. This
+# Schema 4 / program version 6 supplies explicit function ranges and direct call targets. This
 # compiler-owned fixture exercises a regular helper call and bounded tail recursion.
 functions_source="$ROOT/test/fixtures/edir/function_calls.elisa"
 functions_artifact="$WORK/function-calls.edir"
