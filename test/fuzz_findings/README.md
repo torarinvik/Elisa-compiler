@@ -5,7 +5,7 @@ Repros are in `repros/`. stage0's verdict counts as a rejection if it rejects un
 ## S1: confirmed by execution
 | ID | Repro | stage0 | stage1 | Owner |
 |---|---|---|---|---|
-| F1 | esc_return_struct_field_view (+ esc_return_local_view_control) | accept | accept | both-escape agent |
+| F1 | esc_return_struct_field_view (+ esc_return_local_view_control) | accept | reject (2026-10-04, droots fixpoint) | stage0 still open |
 | F2 | setter_store_through_local_view | accept | accept | both-escape agent |
 | F3 | callarg_mutref_and_view_overlap | accept | accept | both-escape agent |
 | F4 | region_store_field_view_escape | reject | accept | s1-holes agent |
@@ -59,3 +59,26 @@ Every repro below is now rejected by stage1 with stage0's diagnostic. Each one i
 
 Check: across all diagnostic fixtures, counts match stock stage1 apart from the new fuzz files,
 and stage1 still compiles itself.
+
+# Generative runtime differential, round 2 (2026-10-04, tools/fuzz/difffuzz.py)
+
+Valid programs from `tools/fuzz/gen_progs.py`, built by stage0 and by stage1 at -O0 and -O2
+and RUN; output and exit code compared. ~9,000 programs on a Linux host.
+
+Fixed on branch claude/difffuzz-20261004 (fixtures live with the fix):
+- const enum member values other than a bare literal (`B = -3`, `D = 1 << 4`) took the running
+  ordinal in stage1 -- every early MISMATCH. Fixture: adversarial `const_enum_folded_values`.
+- `rows[i].f <- v` on an immutable field was checked only in the last function of a file
+  (stale structural local-type channel). Fixture: diagnostics `field_immutable_assign_indexed`.
+- darray `.count` and a `count` query were signed i64 in stage1, usize in stage0 (docs/18), so
+  `xs.count - 3 <= 0` compared differently. Fixture: adversarial `usize_count_compares_unsigned`.
+- a function VALUE carried no effect row in stage1, so a `can[Global]`/`can[Memory]` function
+  bound or passed where a plain `fn(...)` type is expected built and ran (stage0: `variable "g"
+  expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]`). Fixed 2026-10-05
+  (src/semantic/check_fn_value_effect_row.elisa; repros fn_value_effect_row_ignored*.elisa now
+  reject like stage0). Fixtures: diagnostics `fn_value_effect_row`, `fn_value_effect_row_arg`.
+
+Open (repros here):
+| Repro | stage0 | stage1 | class |
+|---|---|---|---|
+| query_same_line_binder_head_collision | 21 | declines | loud decline, known limit of the line-keyed __query table |

@@ -116,6 +116,10 @@ run_native_result() {
 
 run_direct_equivalence() {
     local llvm_diff="${ELISA_LLVM_DIFF:-/opt/homebrew/opt/llvm/bin/llvm-diff}"
+    # Off Homebrew, use the LLVM the harness was pointed at (silently skipped before).
+    if [[ ! -x "$llvm_diff" && -z "${ELISA_LLVM_DIFF:-}" && -x "${ELISA_LLVM_BIN_DIR:-}/llvm-diff" ]]; then
+        llvm_diff="$ELISA_LLVM_BIN_DIR/llvm-diff"
+    fi
     local stem
     for stem in helper_equivalence helper_equivalence_manual helper_generic_equivalence helper_generic_equivalence_manual; do
         "$ROOT/scripts/elisac_stage1.sh" -O2 -emit llvm \

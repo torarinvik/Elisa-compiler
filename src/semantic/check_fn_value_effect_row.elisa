@@ -1,0 +1,627 @@
+# Effect rows on FUNCTION VALUES (stage0 FuncType.Permissions / AssignableTo).
+#
+# A function used as a VALUE carries its effect row — the sorted set of permission
+# FAMILIES it declares (`can[Memory.Allocate]` -> Memory) or is inferred to use. stage0
+# infers the row as a fixpoint over the body: every `can E:` block grant, every direct
+# callee's row (externs included, through their declared `can[...]`), and the Global
+# family whenever the body reads or writes a `global`. A `fn(...) -> R [can[...]]` TYPE
+# carries its own row, and the two are compared wherever a function value meets such a
+# type:
+#
+#   g: fn(i64) -> i64 = bump            # variable "g" expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]
+#   g <- bump                           # cannot assign fn(i64) -> i64 can[Global] to fn(i64) -> i64
+#   return bump                         # return type expects fn(i64) -> i64, got ...
+#   Holder{f: bump}                     # struct literal field "f" expects ..., got ...
+#   apply(bump, 3)                      # argument 1 to "apply" expects ..., got ...
+#
+# Measured against stage0 (probes 2026-10-05): a binding, assignment, return and struct
+# literal field require the rows to be EQUAL in both directions (a plain function is NOT
+# accepted where `fn(...) can[Memory]` is expected); a CALL ARGUMENT accepts a narrower
+# row (the value needs a SUBSET of what the parameter permits) and rejects a wider one.
+# `can[Global]`, `can[Global.Write]` and `can[Global.Read]` all spell the one Global
+# family. An operation without a grant (a bare `assert`, an undeclared darray literal,
+# an index) adds nothing; a `can` block adds its clause even when its body never uses it.
+# Method calls (`s.push(..)`) are not followed, matching the probes.
+#
+# stage1 had no effect row on function values at all, so every one of the shapes above
+# built and ran (fuzz_findings/fn_value_effect_row_ignored*.elisa). The checker is purely
+# syntactic: fn TYPES are `Expr.Lambda` nodes in type position whose row is recorded by
+# the parser on `__fn_type_effect` (keyed by the lambda token's offset), and a function
+# value is a bare identifier (or `M::name`) naming exactly one declared function, or a
+# lambda literal (whose row is inferred from its body; stage0 spells it with the
+# EXPECTED signature). Anything else is left to the other checks.
+#
+# The inferred rows live on the table (`fn_value_effect_owner`/`_ref`, one row per
+# (function, ref) pair; `fn_value_effect_done` = functions whose rows are complete), like
+# function_effect_source_*. A site reads its value's row as INDICES into those rows, so
+# no table-owned sview is ever stored into a frame-local list — stage0's region analysis
+# rejects that (a caller-owned darray memo tripped it three different ways).
+extend Semantic:
+    private:
+        # The reserved memo owner under which a lambda literal's row is computed; the rows
+        # are dropped again once the site has read them (see fver_check_site).
+        def fver_lambda_owner() -> sview:
+            return "__fn_value_lambda"
+
+        # ---- family sets ---------------------------------------------------------------
+
+        # Rows hold the effect REF as written (`Memory.Allocate`) and are read as FAMILIES
+        # through effect_ref_family; one row per family (a computed family is a call result,
+        # so storing it would be a region escape — the ref is stored instead).
+        def fver_add_family(out: mutable darray[sview]&, effect_ref: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                family: sview = effect_ref_family(effect_ref)
+                return if family == ""
+                present: bool = any existing in out where effect_ref_family(existing) == family
+                out.push(effect_ref) if not present
+
+        # Sort IN PLACE, lexically by family (stage0's sort.Strings over the family names).
+        def fver_sort_families(families: mutable darray[sview]&) -> void:
+            can Abort.Panic:
+                for outer in 0..<families.count |families|:
+                    position: mutable usize = outer
+                    while position > 0.usize() |position, families|:
+                        break if not effect_ref_less(effect_ref_family(families[position]), effect_ref_family(families[position - 1.usize()]))
+                        swap: sview = families[position - 1.usize()]
+                        families[position - 1.usize()] <- families[position]
+                        families[position] <- swap
+                        position <- position - 1.usize()
+
+        # The memo rows of OWNER (indices into the table's fn_value_effect rows at or past
+        # FIRST), sorted by family.
+        def fver_owner_rows(owner: sview, first: usize, table: SymbolTable&, out: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while row < table.fn_value_effect_owner.count |row: usize = first, out|:
+                    out.push(row) if table.fn_value_effect_owner[row] == owner
+                    row <- row + 1
+                for outer in 0..<out.count |out|:
+                    position: mutable usize = outer
+                    while position > 0.usize() |position, out|:
+                        break if not effect_ref_less(effect_ref_family(table.fn_value_effect_ref[out[position]]), effect_ref_family(table.fn_value_effect_ref[out[position - 1.usize()]]))
+                        swap: usize = out[position - 1.usize()]
+                        out[position - 1.usize()] <- out[position]
+                        out[position] <- swap
+                        position <- position - 1.usize()
+
+        def fver_expected_has(expected: darray[sview]&, family: sview) -> bool:
+            can Abort.Panic:
+                return any existing in expected where effect_ref_family(existing) == family
+
+        def fver_actual_has(actual: darray[usize]&, table: SymbolTable&, family: sview) -> bool:
+            can Abort.Panic:
+                return any row in actual where effect_ref_family(table.fn_value_effect_ref[row]) == family
+
+        # actual ⊆ expected.
+        def fver_actual_within(actual: darray[usize]&, expected: darray[sview]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for row in actual:
+                    false return if not fver_expected_has(expected, effect_ref_family(table.fn_value_effect_ref[row]))
+                return true
+
+        # expected ⊆ actual.
+        def fver_expected_within(expected: darray[sview]&, actual: darray[usize]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for existing in expected:
+                    false return if not fver_actual_has(actual, table, effect_ref_family(existing))
+                return true
+
+        # ---- declaration lookups -------------------------------------------------------
+
+        def fver_count_functions(declarations: darray[Ast::Decl]&, wanted: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                count: mutable u32 = 0
+                for declaration in declarations |count|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            count <- count + 1 if name == wanted
+                        Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, line):
+                            count <- count + 1 if name == wanted and callable
+                        Decl.Module(module_name, module_body, module_line):
+                            count <- count + fver_count_functions(module_body, wanted)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            count <- count + fver_count_functions(scoped_body, wanted)
+                        _:
+                            pass
+                return count
+
+        def fver_count_structs(declarations: darray[Ast::Decl]&, wanted: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                count: mutable u32 = 0
+                for declaration in declarations |count|:
+                    match declaration:
+                        Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, line):
+                            count <- count + 1 if name == wanted
+                        Decl.Module(module_name, module_body, module_line):
+                            count <- count + fver_count_structs(module_body, wanted)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            count <- count + fver_count_structs(scoped_body, wanted)
+                        _:
+                            pass
+                return count
+
+        # ---- the inferred row of a function (table memo) -------------------------------
+
+        # One row for TARGET, deduplicated by family. Every ref stored here is a literal, an
+        # AST node's own text, or a table element bound to a local first (an element passed
+        # beside the `lmut` table would alias it).
+        def fver_add_memo(target: sview, effect_ref: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if target == ""
+                family: sview = effect_ref_family(effect_ref)
+                return if family == ""
+                while row < table.fn_value_effect_owner.count |row: usize = 0|:
+                    return if table.fn_value_effect_owner[row] == target and effect_ref_family(table.fn_value_effect_ref[row]) == family
+                    row <- row + 1
+                table.fn_value_effect_owner <- table.fn_value_effect_owner.push(target)
+                table.fn_value_effect_ref <- table.fn_value_effect_ref.push(effect_ref)
+
+        # `can` block clauses anywhere in STATEMENTS, as TARGET's rows.
+        def fver_block_grants(statements: darray[Ast::Stmt]&, target: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if kind == "can":
+                                while index < clause.count |index: usize = 0, table| -> table:
+                                    table <- fver_add_memo(target, clause[index], table)
+                                    index <- index + 1
+                            table <- fver_block_grants(&body, target, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- fver_block_grants(&then_body, target, table)
+                            table <- fver_block_grants(&else_body, target, table)
+                        Stmt.While(condition, body, line):
+                            table <- fver_block_grants(&body, target, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- fver_block_grants(&body, target, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- fver_block_grants(&arm.body, target, table)
+                        _:
+                            pass
+
+        # TARGET's rows from one BODY: Global when it reads or writes a global, and every
+        # unique direct callee's row. (The declared `can[...]` and the `can` block clauses
+        # are recorded by the caller, which holds them rooted at the AST.)
+        def fver_body_rows(body: darray[Ast::Stmt], locals: darray[sview]&, target: sview, declarations: darray[Ast::Decl]&, globals: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- fver_add_memo(target, "Global", table) if globals.count > 0 and (gp_body_reads(body, globals, locals) or gp_body_writes(body, globals, locals))
+                callees: mutable darray[sview] = []
+                gp_body_calls(body, false, callees)
+                for callee in callees |table| -> table:
+                    shadowed: bool = any local in locals where local == callee
+                    continue if shadowed
+                    table <- fver_function_rows(callee, target, declarations, globals, table)
+
+        # Complete the rows of the function NAME (a free function or callable extern
+        # declared exactly once) and merge them into TARGET's. An ambiguous or unknown name
+        # contributes nothing. A function is marked done BEFORE its body is read, so a
+        # recursive call graph terminates (a cycle member sees the partial row — never a
+        # wider one than stage0's).
+        def fver_function_rows(name: sview, target: sview, declarations: darray[Ast::Decl]&, globals: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == ""
+                finished: bool = any done in table.fn_value_effect_done where done == name
+                if not finished:
+                    return if fver_count_functions(declarations, name) != 1
+                    table <- fver_declared_rows(name, declarations, globals, table)
+                return if target == "" or target == name
+                # The memo grows while it is read (TARGET's rows), so the scan is bounded by
+                # the count at entry.
+                limit: usize = table.fn_value_effect_owner.count
+                while row < limit |row: usize = 0, table| -> table:
+                    if table.fn_value_effect_owner[row] == name:
+                        merged_ref: sview = table.fn_value_effect_ref[row]
+                        table <- fver_add_memo(target, merged_ref, table)
+                    row <- row + 1
+
+        # NAME's own rows from its declaration (the memo stores the DECLARATION's name).
+        def fver_declared_rows(name: sview, declarations: darray[Ast::Decl]&, globals: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if function_name == name:
+                                table.fn_value_effect_done <- table.fn_value_effect_done.push(function_name)
+                                while index < effects.count |index: usize = 0, table| -> table:
+                                    table <- fver_add_memo(function_name, effects[index], table)
+                                    index <- index + 1
+                                table <- fver_block_grants(&body, function_name, table)
+                                locals: mutable darray[sview] = []
+                                for parameter in parameters |locals|:
+                                    locals.push(parameter.name)
+                                collect_local_names(body, locals)
+                                table <- fver_body_rows(body, locals, function_name, declarations, globals, table)
+                        Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, line):
+                            if extern_name == name:
+                                table.fn_value_effect_done <- table.fn_value_effect_done.push(extern_name)
+                                # An extern's `can[...]` lives in the table's declared-effect rows
+                                # (collect_extern_effects); "Permission" is its unknown placeholder.
+                                while row < table.function_effect_owner.count |row: usize = 0, table| -> table:
+                                    if table.function_effect_owner[row] == extern_name:
+                                        extern_ref: sview = table.function_effect_name[row]
+                                        table <- fver_add_memo(extern_name, extern_ref, table) if extern_ref != "Permission"
+                                    row <- row + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- fver_declared_rows(name, module_body, globals, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- fver_declared_rows(name, scoped_body, globals, table)
+                        _:
+                            pass
+
+        # ---- fn TYPES ------------------------------------------------------------------
+
+        # The `Expr.Lambda` a type position denotes, through `mutable` and parentheses.
+        def fver_type_lambda(type_expression: Ast::Expr) -> Ast::Expr?:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Lambda(params, body, pos):
+                        return type_expression
+                    Expr.Unary(operator, operand, pos):
+                        if operator == TokenKind.Mutable:
+                            return fver_type_lambda(operand)
+                        return null
+                    Expr.Paren(inner, pos):
+                        return fver_type_lambda(inner)
+                    _:
+                        return null
+
+        # The declared row of a fn TYPE: the `__fn_type_effect` rows the parser recorded at
+        # the lambda token's offset.
+        def fver_fn_type_families(lambda_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while index < annotations.count |index: usize = 0, out|:
+                    fver_add_family(out, annotations[index].name) if annotations[index].owner == "__fn_type_effect" and annotations[index].offset == lambda_pos.offset and annotations[index].line == lambda_pos.line
+                    index <- index + 1
+
+        def fver_push_expected_row(families: darray[sview]&, out: mutable darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if families.count == 0
+                push_str(out, " can[")
+                for index in 0..<families.count |out|:
+                    push_str(out, ", ") if index > 0
+                    push_sview(out, effect_ref_family(families[index]))
+                push_str(out, "]")
+
+        def fver_push_actual_row(rows: darray[usize]&, table: SymbolTable&, out: mutable darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if rows.count == 0
+                push_str(out, " can[")
+                for index in 0..<rows.count |out|:
+                    push_str(out, ", ") if index > 0
+                    push_sview(out, effect_ref_family(table.fn_value_effect_ref[rows[index]]))
+                push_str(out, "]")
+
+        # Spell a fn TYPE node as stage0 does (`fn(i64, u8&) -> void`), from the parser's
+        # line-keyed side tables; the bare parameter heads stand in when the line holds
+        # more than one fn type and the rows cannot be told apart. False when a parameter
+        # type cannot be rendered.
+        def fver_render_fn_type(lambda_params: darray[sview]&, lambda_pos: Ast::Pos, file: Ast::File&, out: mutable darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                rows: mutable darray[usize] = []
+                while row < file.fn_type_param_lines.count |row: usize = 0, rows|:
+                    rows.push(row) if file.fn_type_param_lines[row] == lambda_pos.line
+                    row <- row + 1
+                push_str(out, "fn(")
+                for index in 0..<lambda_params.count |out|:
+                    push_str(out, ", ") if index > 0
+                    if rows.count == lambda_params.count:
+                        false return if not affine_type_render(file.fn_type_param_exprs[rows[index]], out)
+                    else:
+                        push_sview(out, lambda_params[index])
+                push_str(out, ") -> ")
+                return_rows: mutable usize = 0
+                return_row: mutable usize = 0
+                while row2 < file.fn_type_return_lines.count |row2: usize = 0, return_rows, return_row|:
+                    if file.fn_type_return_lines[row2] == lambda_pos.line:
+                        return_rows <- return_rows + 1
+                        return_row <- row2
+                    row2 <- row2 + 1
+                if return_rows == 1:
+                    false return if not affine_type_render(file.fn_type_return_exprs[return_row], out)
+                else:
+                    head: mutable sview = ""
+                    while index2 < file.enum_annotations.count |index2: usize = 0, head|:
+                        head <- file.enum_annotations[index2].name if head == "" and file.enum_annotations[index2].owner == "__lambda_return" and file.enum_annotations[index2].line == lambda_pos.line
+                        index2 <- index2 + 1
+                    push_sview(out, head) if head != ""
+                    push_str(out, "void") if head == ""
+                return true
+
+        # Spell a declared function's signature (`fn(i64) -> i64`). False when a type cannot
+        # be rendered.
+        def fver_render_function_signature(name: sview, declarations: darray[Ast::Decl]&, out: mutable darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if function_name == name:
+                                push_str(out, "fn(")
+                                for index in 0..<parameters.count |out|:
+                                    push_str(out, ", ") if index > 0
+                                    false return if not affine_type_render(parameters[index].type_expression, out)
+                                push_str(out, ") -> ")
+                                if return_type is declared_return:
+                                    false return if not affine_type_render(declared_return, out)
+                                else:
+                                    push_str(out, "void")
+                                return true
+                        Decl.Module(module_name, module_body, module_line):
+                            true return if fver_render_function_signature(name, module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            true return if fver_render_function_signature(name, scoped_body, out)
+                        _:
+                            pass
+                return false
+
+        # ---- function VALUES -----------------------------------------------------------
+
+        # The declared function a value expression names (`bump`, `M::bump`), or "" — never
+        # a local, a parameter, an extern, or an ambiguous name.
+        def fver_value_function(value: Ast::Expr, locals: darray[sview]&, declarations: darray[Ast::Decl]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                name: sview = match value:
+                    Expr.Ident(ident_name, pos): ident_name
+                    Expr.Scope(base, scoped_name, pos): scoped_name
+                    Expr.Paren(inner, pos): fver_value_function(inner, locals, declarations)
+                    _: sview("", 0, 0)
+                "" return if name == ""
+                shadowed: bool = any local in locals where local == name
+                "" return if shadowed
+                "" return if fver_count_functions(declarations, name) != 1
+                # Only a declared FUNCTION has a signature to spell; an extern value keeps
+                # the status quo.
+                probe: mutable darray[u8] = []
+                "" return if not fver_render_function_signature(name, declarations, &probe)
+                return name
+
+        def fver_value_pos(value: Ast::Expr) -> Ast::Pos:
+            can Abort.Panic:
+                match value:
+                    Expr.Ident(ident_name, pos):
+                        return pos
+                    Expr.Scope(base, scoped_name, pos):
+                        return pos
+                    Expr.Lambda(params, body, pos):
+                        return pos
+                    Expr.Paren(inner, pos):
+                        return fver_value_pos(inner)
+                    _:
+                        return Ast::pos_at_line(0)
+
+        # One site: VALUE meets the fn TYPE `type_lambda`. `form` 1 variable, 2 return,
+        # 3 assignment, 4 struct literal field, 5 call argument (`ordinal` = its index).
+        def fver_check_site(form: u32, site_name: sview, ordinal: u32, report_pos: Ast::Pos, type_lambda: Ast::Expr, value: Ast::Expr, locals: darray[sview]&, declarations: darray[Ast::Decl]&, globals: darray[sview]&, file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match type_lambda:
+                    Expr.Lambda(type_params, type_body, type_pos):
+                        actual_signature: mutable darray[u8] = []
+                        rendered: mutable bool = false
+                        actual_owner: mutable sview = ""
+                        first_row: mutable usize = 0
+                        rows_before: usize = table.fn_value_effect_owner.count
+                        done_before: usize = table.fn_value_effect_done.count
+                        function_name: sview = fver_value_function(value, locals, declarations)
+                        if function_name != "":
+                            table <- fver_function_rows(function_name, "", declarations, globals, table)
+                            rendered <- fver_render_function_signature(function_name, declarations, &actual_signature)
+                            actual_owner <- function_name
+                        else:
+                            match value:
+                                Expr.Lambda(value_params, value_body, value_pos):
+                                    # A lambda literal: its row is its body's, computed under the
+                                    # reserved owner and dropped again below. stage0 spells it with
+                                    # the EXPECTED signature (its parameter types come from the
+                                    # context, not from the literal).
+                                    lambda_locals: mutable darray[sview] = []
+                                    for local in locals |lambda_locals|:
+                                        lambda_locals.push(local)
+                                    for value_param in value_params |lambda_locals|:
+                                        lambda_locals.push(value_param)
+                                    collect_local_names(value_body, lambda_locals)
+                                    table <- fver_block_grants(&value_body, fver_lambda_owner(), table)
+                                    table <- fver_body_rows(value_body, lambda_locals, fver_lambda_owner(), declarations, globals, table)
+                                    rendered <- fver_render_fn_type(type_params, type_pos, file, &actual_signature)
+                                    actual_owner <- fver_lambda_owner()
+                                    first_row <- rows_before
+                                _:
+                                    pass
+                        if rendered:
+                            expected: mutable darray[sview] = []
+                            fver_fn_type_families(type_pos, file.enum_annotations, expected)
+                            fver_sort_families(expected)
+                            actual: mutable darray[usize] = []
+                            fver_owner_rows(actual_owner, first_row, table, actual)
+                            narrower_ok: bool = fver_actual_within(actual, expected, table)
+                            accepted: bool = narrower_ok if form == 5 else (narrower_ok and fver_expected_within(expected, actual, table))
+                            if not accepted:
+                                expected_spelling: mutable darray[u8] = []
+                                if fver_render_fn_type(type_params, type_pos, file, &expected_spelling):
+                                    fver_push_expected_row(expected, &expected_spelling)
+                                    fver_push_actual_row(actual, table, &actual_signature)
+                                    expected_text: sview = Parser::persist_name_bytes(&expected_spelling, 0)
+                                    actual_text: sview = Parser::persist_name_bytes(&actual_signature, 0)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FnValueEffectRow, name: site_name, pos: report_pos, line: report_pos.line, expected: expected_text, actual: actual_text, expected_count: ordinal, state_code: form})
+                        # A lambda's rows (and whatever the walk completed meanwhile) are
+                        # dropped: the reserved owner must not accumulate across literals.
+                        if actual_owner == fver_lambda_owner():
+                            table.fn_value_effect_owner <- table.fn_value_effect_owner.truncate(rows_before)
+                            table.fn_value_effect_ref <- table.fn_value_effect_ref.truncate(rows_before)
+                            table.fn_value_effect_done <- table.fn_value_effect_done.truncate(done_before)
+                    _:
+                        pass
+
+        # ---- the walk ------------------------------------------------------------------
+
+        def fver_struct_field_type(struct_name: sview, field_name: sview, declarations: darray[Ast::Decl]&) -> Ast::Expr?:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, line):
+                            if name == struct_name:
+                                for member in members:
+                                    if member.name == field_name:
+                                        return member.type_expression
+                        Decl.Module(module_name, module_body, module_line):
+                            found: Ast::Expr? = fver_struct_field_type(struct_name, field_name, module_body)
+                            if found is present:
+                                return present
+                        Decl.Scoped(scoped_body, scoped_line):
+                            found: Ast::Expr? = fver_struct_field_type(struct_name, field_name, scoped_body)
+                            if found is present:
+                                return present
+                        _:
+                            pass
+                return null
+
+        # The call-argument sites of one call: ARGUMENTS against the parameters of the
+        # declared function CALLEE (positional arguments only).
+        def fver_check_call_args(callee: sview, arguments: darray[Ast::Expr]&, declarations: darray[Ast::Decl]&, locals: darray[sview]&, all_declarations: darray[Ast::Decl]&, globals: darray[sview]&, file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if function_name == callee:
+                                while index < arguments.count and index < parameters.count |index: usize = 0, table| -> table:
+                                    parameter_lambda: Ast::Expr? = fver_type_lambda(parameters[index].type_expression)
+                                    if parameter_lambda is type_lambda:
+                                        table <- fver_check_site(5, callee, (index + 1.usize()).u32(), fver_value_pos(arguments[index]), type_lambda, arguments[index], locals, all_declarations, globals, file, table)
+                                    index <- index + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- fver_check_call_args(callee, arguments, module_body, locals, all_declarations, globals, file, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- fver_check_call_args(callee, arguments, scoped_body, locals, all_declarations, globals, file, table)
+                        _:
+                            pass
+
+        def fver_check_expression(expression: Ast::Expr, locals: darray[sview]&, declarations: darray[Ast::Decl]&, globals: darray[sview]&, file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        callee_name: sview = called_function_name(expression)
+                        # `argument_names` parallels `arguments` with "" for a positional one.
+                        positional: bool = not (any argument_name in argument_names where argument_name != "")
+                        if callee_name != "" and positional and fver_count_functions(declarations, callee_name) == 1:
+                            table <- fver_check_call_args(callee_name, arguments, declarations, locals, declarations, globals, file, table)
+                        for argument in arguments |table| -> table:
+                            table <- fver_check_expression(argument, locals, declarations, globals, file, table)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        struct_name: sview = ident_name_of(type_expression)
+                        for field in fields |table| -> table:
+                            if struct_name != "" and fver_count_structs(declarations, struct_name) == 1:
+                                field_type: Ast::Expr? = fver_struct_field_type(struct_name, field.name, declarations)
+                                if field_type is declared_type:
+                                    field_lambda: Ast::Expr? = fver_type_lambda(declared_type)
+                                    if field_lambda is type_lambda:
+                                        table <- fver_check_site(4, field.name, 0, fver_value_pos(field.value), type_lambda, field.value, locals, declarations, globals, file, table)
+                            table <- fver_check_expression(field.value, locals, declarations, globals, file, table)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        table <- fver_check_expression(left, locals, declarations, globals, file, table)
+                        table <- fver_check_expression(right, locals, declarations, globals, file, table)
+                    Expr.Unary(operator, operand, unary_pos):
+                        table <- fver_check_expression(operand, locals, declarations, globals, file, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- fver_check_expression(inner, locals, declarations, globals, file, table)
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        table <- fver_check_expression(condition, locals, declarations, globals, file, table)
+                        table <- fver_check_expression(then_expr, locals, declarations, globals, file, table)
+                        table <- fver_check_expression(else_expr, locals, declarations, globals, file, table)
+                    _:
+                        pass
+
+        # Fn-typed LOCALS of the enclosing function (name -> its type's lambda node), so a
+        # later `name <- value` can be judged against the declared row.
+        def fver_collect_fn_locals(statements: darray[Ast::Stmt]&, names: mutable darray[sview]&, types: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, types|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, pos):
+                            declared: Ast::Expr? = fver_type_lambda(type_expression)
+                            if declared is type_lambda:
+                                names.push(name)
+                                types.push(type_lambda)
+                        Stmt.If(condition, then_body, else_body, pos):
+                            fver_collect_fn_locals(&then_body, names, types)
+                            fver_collect_fn_locals(&else_body, names, types)
+                        Stmt.While(condition, body, pos):
+                            fver_collect_fn_locals(&body, names, types)
+                        Stmt.For(bind, variables, iterable, body, pos):
+                            fver_collect_fn_locals(&body, names, types)
+                        Stmt.Block(kind, clause, binding, body, pos):
+                            fver_collect_fn_locals(&body, names, types)
+                        Stmt.Match(scrutinee, arms, pos):
+                            for arm in arms |names, types|:
+                                fver_collect_fn_locals(&arm.body, names, types)
+                        _:
+                            pass
+
+        def fver_check_statements(statements: darray[Ast::Stmt]&, return_lambda: Ast::Expr?, locals: darray[sview]&, fn_local_names: darray[sview]&, fn_local_types: darray[Ast::Expr]&, declarations: darray[Ast::Decl]&, globals: darray[sview]&, file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, pos):
+                            declared: Ast::Expr? = fver_type_lambda(type_expression)
+                            if declared is type_lambda:
+                                table <- fver_check_site(1, name, 0, pos, type_lambda, value, locals, declarations, globals, file, table)
+                            table <- fver_check_expression(value, locals, declarations, globals, file, table)
+                        Stmt.Assign(target, operator, value, pos):
+                            if operator == TokenKind.LArrow:
+                                target_name: sview = ident_name_of(target)
+                                while slot < fn_local_names.count |slot: usize = 0, table| -> table:
+                                    if target_name != "" and fn_local_names[slot] == target_name:
+                                        table <- fver_check_site(3, target_name, 0, fver_value_pos(target), fn_local_types[slot], value, locals, declarations, globals, file, table)
+                                        slot <- fn_local_names.count
+                                    else:
+                                        slot <- slot + 1
+                            table <- fver_check_expression(value, locals, declarations, globals, file, table)
+                        Stmt.Return(value, pos):
+                            if value is returned:
+                                if return_lambda is type_lambda:
+                                    table <- fver_check_site(2, "", 0, pos, type_lambda, returned, locals, declarations, globals, file, table)
+                                table <- fver_check_expression(returned, locals, declarations, globals, file, table)
+                        Stmt.Expr(expression, pos):
+                            table <- fver_check_expression(expression, locals, declarations, globals, file, table)
+                        Stmt.If(condition, then_body, else_body, pos):
+                            table <- fver_check_expression(condition, locals, declarations, globals, file, table)
+                            table <- fver_check_statements(&then_body, return_lambda, locals, fn_local_names, fn_local_types, declarations, globals, file, table)
+                            table <- fver_check_statements(&else_body, return_lambda, locals, fn_local_names, fn_local_types, declarations, globals, file, table)
+                        Stmt.While(condition, body, pos):
+                            table <- fver_check_statements(&body, return_lambda, locals, fn_local_names, fn_local_types, declarations, globals, file, table)
+                        Stmt.For(bind, variables, iterable, body, pos):
+                            table <- fver_check_statements(&body, return_lambda, locals, fn_local_names, fn_local_types, declarations, globals, file, table)
+                        Stmt.Block(kind, clause, binding, body, pos):
+                            table <- fver_check_statements(&body, return_lambda, locals, fn_local_names, fn_local_types, declarations, globals, file, table)
+                        Stmt.Match(scrutinee, arms, pos):
+                            for arm in arms |table| -> table:
+                                table <- fver_check_statements(&arm.body, return_lambda, locals, fn_local_names, fn_local_types, declarations, globals, file, table)
+                        _:
+                            pass
+
+        def fver_check_declarations(declarations: darray[Ast::Decl]&, all_declarations: darray[Ast::Decl]&, globals: darray[sview]&, file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, pos):
+                            locals: mutable darray[sview] = []
+                            for parameter in parameters |locals|:
+                                locals.push(parameter.name)
+                            collect_local_names(body, locals)
+                            fn_local_names: mutable darray[sview] = []
+                            fn_local_types: mutable darray[Ast::Expr] = []
+                            fver_collect_fn_locals(&body, fn_local_names, fn_local_types)
+                            return_lambda: mutable Ast::Expr? = null
+                            if return_type is declared_return:
+                                return_lambda <- fver_type_lambda(declared_return)
+                            table <- fver_check_statements(&body, return_lambda, locals, fn_local_names, fn_local_types, all_declarations, globals, file, table)
+                        Decl.Module(module_name, module_body, module_pos):
+                            table <- fver_check_declarations(&module_body, all_declarations, globals, file, table)
+                        Decl.Scoped(scoped_body, scoped_pos):
+                            table <- fver_check_declarations(&scoped_body, all_declarations, globals, file, table)
+                        _:
+                            pass
+
+    public:
+        def check_fn_value_effect_row(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                globals: mutable darray[sview] = []
+                collect_mutable_globals(file.top_decls, globals)
+                table <- fver_check_declarations(&file.top_decls, &file.top_decls, globals, file, table)

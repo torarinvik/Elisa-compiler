@@ -119,7 +119,13 @@ if [[ "${1:-}" == "--exec-one" ]]; then
   # Live progress. One short printf per check is written atomically, so concurrent workers
   # do not interleave mid-line.
   printf '  %-4s %4ds  %s\n' "$_st" "$_el" "$_name"
-  rm -f "$_log"
+  # ELISA_GATE_LOG_DIR keeps EVERY check's full log (pass or fail). A green row whose log
+  # says SKIP is the silent-skip shape (harness-path-rot note); the census below needs it.
+  if [[ -n "${ELISA_GATE_LOG_DIR:-}" ]]; then
+    mkdir -p "$ELISA_GATE_LOG_DIR" && mv "$_log" "$ELISA_GATE_LOG_DIR/$(printf '%s' "$_name" | tr -c 'A-Za-z0-9_.-' '_').log"
+  else
+    rm -f "$_log"
+  fi
   exit 0
 fi
 
@@ -580,6 +586,16 @@ if [[ $fail -ne 0 ]]; then
   echo "failing check logs: $failure_dir"
 fi
 rm -rf "$resultdir"
+if [[ -n "${ELISA_GATE_LOG_DIR:-}" && -d "$ELISA_GATE_LOG_DIR" ]]; then
+  # Passing checks whose output admits to skipping work: green, but not measured.
+  skipped_logs="$(grep -l -E '(^|[^A-Za-z_])SKIP([^A-Za-z_]|$)' "$ELISA_GATE_LOG_DIR"/*.log 2>/dev/null || true)"
+  if [[ -n "$skipped_logs" ]]; then
+    echo "checks whose log mentions SKIP ($(printf '%s\n' "$skipped_logs" | wc -l | tr -d ' ')), logs in $ELISA_GATE_LOG_DIR:"
+    printf '%s\n' "$skipped_logs" | while IFS= read -r l; do
+      printf '  %s: %s\n' "$(basename "$l" .log)" "$(grep -m1 -E '(^|[^A-Za-z_])SKIP([^A-Za-z_]|$)' "$l" | cut -c1-110)"
+    done
+  fi
+fi
 
 rm -f /tmp/stage1_gate.$$.log
 if [[ -z "${ELISA_GATE_QUIET:-}" ]]; then

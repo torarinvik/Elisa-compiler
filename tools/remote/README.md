@@ -17,7 +17,10 @@ directory, so a lost scratchpad or a dead box costs one command to rebuild.
 | `hosts.sh`, `hosts.local(.sample)` | host registry; `hosts.local` is gitignored because addresses are ephemeral |
 | `hosts_status.sh` | quick health of every host |
 
-The differential fuzzer that uses the same host layout is in `tools/fuzz/`.
+The differential fuzzers that use the same host layout are in `tools/fuzz/`: `fuzz.py`
+mutates fixtures (verdict oracle); `gen_progs.py` + `difffuzz.py` generate VALID programs and
+compare the RUNTIME output of both compilers' products (`diffmin.py` minimizes a finding,
+`cmp.sh` probes one file by hand).
 
 ## Rules the scripts encode
 

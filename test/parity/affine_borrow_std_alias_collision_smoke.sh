@@ -14,5 +14,5 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0.o" "$FIXTURE" >/dev/null 2>&1
 "$STAGE1" -emit llvm -O0 -o "$WORK/stage1.ll" "$FIXTURE" >/dev/null 2>&1
 ! rg -q '!elisa\.declined' "$WORK/stage1.ll"
-/opt/homebrew/opt/llvm/bin/opt -passes=verify -disable-output "$WORK/stage1.ll"
+"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage1.ll"
 echo "affine borrow std alias collision smoke OK: both stages accept and Stage1 emits complete IR"

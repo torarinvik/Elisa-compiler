@@ -41,6 +41,7 @@ NAMES=(
     invalid_bool_cast
     redundant_cast
     field_immutable_assign
+    field_immutable_assign_indexed
     void_condition
     ordering_non_numeric
     darray_element_mismatch
@@ -78,6 +79,10 @@ NAMES=(
     submit_unnamed_view_growth
     submit_local_mutable_ref
     storage_dependency_owned_return_global
+    storage_dependency_owned_return_qualified
+    store_ref_local_global
+    storage_growth_through_ref_self
+    local_field_view_bound_return
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
@@ -276,6 +281,8 @@ NAMES=(
     auto_region_store_escape_nested
     iter_owner_callee
     storage_dependency_field_replacement
+    fn_value_effect_row
+    fn_value_effect_row_arg
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -283,6 +290,7 @@ EXPECTS=(
     "invalid cast from bool to i64"
     "redundant \`.cast[i32]\`: the operand already has type i32; remove the cast"
     "field \"a\" is immutable"
+    "field \"f0\" is immutable"
     "condition must be bool, got void"
     "comparison requires numeric operands"
     "darray literal element expects i64, got static u8"
@@ -320,6 +328,10 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "is not structurally shareable across threads"
     "storage dependency facts were invalidated by darray push"
+    "storage dependency facts were invalidated by darray push"
+    "storing a reference to function-local storage into longer-lived storage"
+    "storage dependency facts were invalidated by darray push"
+    "via return"
     "if condition must be bool, got mutable bool&"
     "not operator requires bool operand"
     "duplicate packed group member \"b\" in H.flags"
@@ -518,6 +530,8 @@ EXPECTS=(
     'value escapes its `in auto:` scope via store into longer-lived storage'
     'by mutable reference while "p.items" is being iterated: the callee may push/clear/replace it through "p"'
     "storage dependency facts were invalidated for interior reference \"r\""
+    "variable \"g\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]"
+    "argument 1 to \"apply\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Memory]"
 )
 
 total=0
@@ -726,6 +740,13 @@ run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the o
 run_case value_block_nested_loop pos "$vn_pos" 'value block may not mutate the outer binding "ys" through a call'
 run_case value_block_nested_loop neg "$vn_neg" "value block may not mutate"
 run_case value_block_nested_loop neg "$vn_neg" "names no binding in scope"
+# The rendered TYPE must be the type, not whatever bytes now sit where a dead buffer was
+# (these printed 'got set ele' / 'got ment' while the substring above still matched).
+echo "-- affine_set_key (rendered types) --"
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'set elements cannot contain linear handles, got Handle?'
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'dict keys cannot contain linear handles, got Pair'
+run_case affine_set_key pos "$FIXTURES/affine_set_key.pos.elisa" 'set elements cannot contain linear handles, got darray[Handle]'
+
 echo "-- call_argument_alias --"
 ca_pos="$FIXTURES/call_argument_alias.pos.elisa"
 ca_neg="$FIXTURES/call_argument_alias.neg.elisa"

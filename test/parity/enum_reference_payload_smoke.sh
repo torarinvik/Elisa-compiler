@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-OPT="${ELISA_OPT:-/opt/homebrew/opt/llvm/bin/opt}"
+OPT="${ELISA_OPT:-${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-enum-ref.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"

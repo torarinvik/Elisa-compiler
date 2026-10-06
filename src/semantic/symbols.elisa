@@ -59,10 +59,32 @@ extend Semantic:
         def empty_symbol_position() -> Ast::Pos:
             return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
 
-        def function_name_position(annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_offset: u32) -> Ast::Pos:
-            for annotation in annotations:
-                return annotation.pos if annotation.owner == name and annotation.name == "__lsp_func_name" and annotation.offset == declaration_offset
-            return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+        # The first `__lsp_func_name` row (in stream order) owned by `name` at
+        # `declaration_offset`. The offset chain runs newest row first, so the LAST match
+        # along it is the earliest row -- the one the former full scan returned.
+        def function_name_position(table: SymbolTable&, name: sview, declaration_offset: u32) -> Ast::Pos:
+            can Abort.Panic:
+                selected: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+                row: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                if table.function_name_annotation_heads.get(declaration_offset.u64()) is head:
+                    row <- head
+                while row != SYMBOL_INDEX_ROW_NONE |row, selected, table, name, declaration_offset|:
+                    annotation: Ast::EnumAnnotation = table.function_name_annotations[row.usize()]
+                    selected <- annotation.pos if annotation.owner == name and annotation.name == "__lsp_func_name" and annotation.offset == declaration_offset
+                    row <- table.function_name_annotation_next[row.usize()]
+                return selected
+
+        # Append a `__lsp_func_name` row to function_name_annotations and its offset chain.
+        def index_function_name_annotation(table: lmut SymbolTable, annotation: Ast::EnumAnnotation) -> void:
+            can Memory.Allocate, Abort.Panic:
+                row: usize = table.function_name_annotations.count
+                key: u64 = annotation.offset.u64()
+                previous: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                if table.function_name_annotation_heads.get(key) is head:
+                    previous <- head
+                table.function_name_annotation_next <- table.function_name_annotation_next.push(previous)
+                table.function_name_annotation_heads <- table.function_name_annotation_heads.put(key, row.u32())
+                table.function_name_annotations <- table.function_name_annotations.push(annotation)
 
         # The generic declaration-position side table is keyed by keyword offset, not by
         # spelling, so repeated names in separate scopes retain their own token spans.
@@ -80,6 +102,8 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 new_symbol_row: usize = table.symbols.count
                 table.symbols <- table.symbols.push(Symbol{id: DeclId{value: new_symbol_row.u32()}, name: name, kind: kind, line: line, name_pos: name_pos, arity_min: arity_min, arity_max: arity_max, return_type: return_type, return_type_id: return_type_id, offset: offset, module_owner: table.current_module})
+                table.enum_symbol_rows <- table.enum_symbol_rows.push(new_symbol_row.u32()) if kind == SymbolKind.Enum
+                table.module_symbol_rows <- table.module_symbol_rows.push(new_symbol_row.u32()) if kind == SymbolKind.Module
                 table <- index_name(table, name)
                 table <- index_symbol(table, name, new_symbol_row)
 
@@ -245,10 +269,10 @@ extend Semantic:
                 # first in stream order; the filtered copy keeps that order without rescanning
                 # every annotation of the unit for each declaration.
                 decl_name_annotations: mutable darray[Ast::EnumAnnotation] = []
-                for annotation in annotations |variadic_annotations, decl_name_annotations|:
+                for annotation in annotations |variadic_annotations, decl_name_annotations, table|:
                     variadic_annotations.push(annotation) if annotation.owner == "__variadic"
                     decl_name_annotations.push(annotation) if annotation.owner == "__lsp_decl_name"
-                    table.function_name_annotations <- table.function_name_annotations.push(annotation) if annotation.name == "__lsp_func_name"
+                    table <- index_function_name_annotation(table, annotation) if annotation.name == "__lsp_func_name"
                 table <- collect_append_only_holders(declarations, annotations, table)
                 table <- collect_range_with_variadics(declarations, table, annotations, variadic_annotations, decl_name_annotations)
 
@@ -273,7 +297,8 @@ extend Semantic:
                             if return_type is structural_return_expr:
                                 return_id <- annotation_type_id(structural_return_expr, table)
                             variadic: bool = function_is_variadic(variadic_annotations, line.line)
-                            table <- table.add_symbol(name, SymbolKind.Func, line.line, required, 4294967295 if variadic else params.count.u32(), return_type_name, return_id, line.offset, function_name_position(table.function_name_annotations, name, line.offset))
+                            function_pos: Ast::Pos = function_name_position(table, name, line.offset)
+                            table <- table.add_symbol(name, SymbolKind.Func, line.line, required, 4294967295 if variadic else params.count.u32(), return_type_name, return_id, line.offset, function_pos)
                             while parameter_index < params.count |parameter_index: usize = 0|:
                                 new_param_row: usize = table.function_param_owner.count
                                 table.function_param_owner <- table.function_param_owner.push(name)
@@ -380,6 +405,7 @@ extend Semantic:
                                     struct_field_row: usize = table.struct_field_owner.count
                                     struct_field_key: u64 = struct_field_pair_hash(name, seen_fields[field_index])
                                     table <- table.index_struct_field(struct_field_key, struct_field_row)
+                                    table <- table.index_struct_field_owner(name, struct_field_row)
                                     table.struct_field_owner <- table.struct_field_owner.push(name)
                                     table.struct_field_module <- table.struct_field_module.push(table.current_module)
                                     table.struct_field_name <- table.struct_field_name.push(seen_fields[field_index])
@@ -419,6 +445,8 @@ extend Semantic:
                             table.immutable_const_names <- table.immutable_const_names.push(name) if not is_mutable
                             match value:
                                 Expr.IntLit(const_value, _):
+                                    const_int_row: usize = table.const_int_names.count
+                                    table <- table.index_const_int_name(name, const_int_row) if not is_mutable
                                     table.const_int_names <- table.const_int_names.push(name) if not is_mutable
                                     table.const_int_values <- table.const_int_values.push(const_value) if not is_mutable
                                 _:

@@ -89,11 +89,18 @@ def check(root, binary):
     except (OSError, json.JSONDecodeError, RuntimeError) as error:
         print(f"stage1 provenance cannot be verified: {error}", file=sys.stderr)
         return 2
-    changed = [key for key, value in current.items() if recorded.get(key) != value]
+    # Freshness is decided by CONTENT. The git revision is recorded for humans but not compared:
+    # committing after a seed changes HEAD without changing a single input byte.
+    changed = [key for key, value in current.items()
+               if key != "source_revision" and recorded.get(key) != value]
     if changed:
         print("stage1 product is stale: provenance mismatch in " + ", ".join(changed), file=sys.stderr)
         return 2
-    print(f"stage1 provenance: current ({current['source_revision']})")
+    # Silent on success: assert_stage1_fresh.sh runs before EVERY wrapper compile, so a line
+    # here lands in the compiler's own output (stdout of `-emit ast`/`fmt`, the first stderr
+    # line a parity gate compares). ELISA_PROVENANCE_VERBOSE=1 prints it.
+    if os.environ.get("ELISA_PROVENANCE_VERBOSE") == "1":
+        print(f"stage1 provenance: current ({current['source_revision']})", file=sys.stderr)
     return 0
 
 

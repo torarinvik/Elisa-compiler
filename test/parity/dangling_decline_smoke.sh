@@ -61,10 +61,11 @@ fi
 # nothing defines: rc 2, not a silent 0.
 decline_case referenced_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef main() -> i64:\n    return total() + 4\n' 2
 
-# The SAME declining function, never called. Its stripped declaration has no users, the
-# linker never looks for it, and the program is fine. This is the narrowing the self-host
-# build depends on: refusing every drop would refuse to compile the compiler.
-decline_case unreferenced_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef main() -> i64:\n    return 7\n' 0
+# The SAME declining function, never called. Until a6913401 (2026-09-23) an unreferenced
+# drop compiled; since then ANY declined body refuses the artifact ("partial backend output
+# is unsafe to emit", no_partial_backend_output_smoke), reachable or not. The three cases
+# below that wanted rc 0 assert the newer policy, rc 2.
+decline_case unreferenced_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef main() -> i64:\n    return 7\n' 2
 
 # At -O2, a declined body referenced only by a private helper chain is still
 # dead when that chain is unreachable from main. The old direct-use check
@@ -74,8 +75,8 @@ total=$((total + 1))
 printf '%b' 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef dormant() -> i64:\n    return total() + 1\n\ndef main() -> i64:\n    return 7\n' > "$WORK/private_unreachable_chain.elisa"
 RUN "$STAGE1" -O2 -o "$WORK/private_unreachable_chain.o" "$WORK/private_unreachable_chain.elisa" >/dev/null 2>&1
 private_chain_rc=$?
-if [ "$private_chain_rc" -ne 0 ]; then
-    echo "  FAIL private_unreachable_decline_chain: rc=$private_chain_rc want=0"
+if [ "$private_chain_rc" -ne 2 ]; then
+    echo "  FAIL private_unreachable_decline_chain: rc=$private_chain_rc want=2 (partial output policy)"
 else
     pass=$((pass + 1))
 fi
@@ -87,7 +88,7 @@ decline_case referenced_private_chain 'def total() -> i64:\n    table: mutable d
 # A LIBRARY — no `main`. Its whole purpose is to be linked against something else, and
 # `native_runtime_support.elisa` legitimately leaves symbols for the runtime object to
 # satisfy. Same referenced decline as the first case; still compiles.
-decline_case library_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef entry() -> i64:\n    return total() + 4\n' 0
+decline_case library_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef entry() -> i64:\n    return total() + 4\n' 2
 
 # An ordinary program declines nothing and is unaffected.
 decline_case clean_program 'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 0
