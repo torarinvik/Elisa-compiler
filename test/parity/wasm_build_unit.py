@@ -453,6 +453,11 @@ class WasmExportScanClientTests(unittest.TestCase):
         with self.assertRaisesRegex(WasmExportScanClientError, "unsupported payload version"):
             _decode_build_payload(self.encode(version=True))
 
+    def test_rejects_raw_invalid_utf8_before_json_field_validation(self) -> None:
+        payload = self.encode().replace(b"answer_impl", b"\xff", 1)
+        with self.assertRaisesRegex(WasmExportScanClientError, "invalid JSON"):
+            _decode_build_payload(payload)
+
     def test_rejects_duplicate_json_keys(self) -> None:
         payload = (
             b'{"version":1,"version":1,"flattened_source":"x",'
