@@ -29,7 +29,9 @@ record() { # name class rc cmd
   cp "$CORPUS/$1.elisa" "$OUT/$1.elisa"
   printf 'name=%s class=%s rc=%s seed=%s stage0=%s stage1=%s\nsource=%s\ncmd=%s\n' "$1" "$2" "$3" "$SEED" "$S0REV" "$S1REV" "$OUT/$1.elisa" "$4" > "$OUT/$1.record"
   cat "$OUT/$1.err" >> "$OUT/$1.record" 2>/dev/null; echo "  $2 $1 (rc=$3)"; }
-first_line() { sed -n 1p "$1" | sed 's/^[^:]*:\([0-9]*\):[^ ]* /\1 /'; }
+# The stage1 wrapper reports its product's provenance on stderr before any finding; that
+# notice is not a diagnostic, so compare the first line after it.
+first_line() { grep -v '^stage1 provenance: ' "$1" | sed -n 1p | sed 's/^[^:]*:\([0-9]*\):[^ ]* /\1 /'; }
 for src in "$CORPUS"/*.elisa; do
   name="$(basename "$src" .elisa)"
   cmd0="timeout 120 '$STAGE0' -emit obj -O0 -o '$OUT/$name.s0.o' '$src'"
