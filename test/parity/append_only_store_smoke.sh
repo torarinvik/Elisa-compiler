@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac-stage0}"
+STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 DIR="$ROOT/test/repro/append_only"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-append-only.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
