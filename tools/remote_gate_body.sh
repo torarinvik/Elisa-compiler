@@ -12,6 +12,8 @@ mkdir -p bin build/runtime
 # Always rebuild: Go's cache makes it seconds, and the seed needs VCS build info matching the synced tree.
 (cd "$RCORE/compiler" && CGO_CFLAGS="-I/usr/lib/llvm-21/include" CGO_LDFLAGS="-L/usr/lib/llvm-21/lib -Wl,-rpath,/usr/lib/llvm-21/lib" go build -o bin/elisac ./src)
 [ -f "$ELISA_RUNTIME_OBJ" ] || bash scripts/build_runtime_object.sh
+# The seed guard defaults to 6 GB; Linux stage0 peaks above it, and the gate host has far more.
+export ELISA_STAGE1_SEED_MAX_RSS_KB="${ELISA_STAGE1_SEED_MAX_RSS_KB:-60000000}"
 rm -rf build/.elisac-stage1-seed.lock
 if ! bash scripts/elisac_stage1.sh --seed >build/remote-seed.log 2>&1; then
   grep -v "warning:" build/remote-seed.log | tail -20; echo "remote gate: seed failed; no checks run"; exit 1
