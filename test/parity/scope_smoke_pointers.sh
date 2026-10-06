@@ -339,6 +339,9 @@ struct Entry:
 
 
 global mutable cache: heap Entry&?[NB] = zeroed
+# The stored entry is itself a global: a reference to a function local would dangle
+# (stage0 rejects that escape), and the extent fold is what is under test here.
+global mutable stored_entry: Entry = Entry{tag: 7}
 
 
 def peek(bucket: usize) -> i64 can[Abort.Panic]:
@@ -350,8 +353,7 @@ def peek(bucket: usize) -> i64 can[Abort.Panic]:
 
 def main() -> i64:
     can Abort.Panic, Unsafe.PointerCast:
-        a: mutable Entry = Entry{tag: 7}
-        cache[0] <- (&a).cast[heap Entry&]
+        cache[0] <- (&stored_entry).cast[heap Entry&]
         return peek(0.usize()) * 6 + peek(1.usize()) + peek(3.usize())
 EOF
 )" 42
