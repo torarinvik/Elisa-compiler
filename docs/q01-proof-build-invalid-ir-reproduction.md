@@ -14,7 +14,7 @@ The proof repository was not modified. Its cloned worktree remained detached at 
 
 ## Minimal source and root cause
 
-The compiler branch already contains a focused source reproducer: `test/fixtures/backend/nested_optional_ast_match.elisa`. Its 23-line program matches a packed AST enum variant nested in an optional payload (`Stmt.Return.value: Expr?`). The old 6b product rejects this fixture with the same invalid-IR diagnostic at O0; Q0.1 passes the Stage1 smoke.
+The compiler branch already contains a focused source reproducer: `test/fixtures/backend/nested_optional_ast_match.elisa`. Its 24-line program matches a packed AST enum variant nested in an optional payload (`Stmt.Return.value: Expr?`). The old 6b product rejects this fixture with the same invalid-IR diagnostic at O0; Q0.1 passes the Stage1 smoke.
 
 The lowering defect is in nested packed-enum subpattern handling. Before Q0.1, the match emitter sent an optional packed-enum value directly to the packed-store handle reader, even though its LLVM representation is a tagged optional aggregate `{ i1, i32 }`. The new `emit_packed_variant_subpattern_test` branches on the presence tag, extracts the payload, and only then passes the packed-enum handle to the nested matcher. This prevents both invalid aggregate-as-integer IR and the corresponding incorrect runtime interpretation. The same change is applied to statement-match and value-match lowering. The evidence is the controlled compiler-version comparison plus the minimized fixture; the old verifier's diagnostic does not expose a function/block name, so no more specific failing IR instruction is claimed.
 
