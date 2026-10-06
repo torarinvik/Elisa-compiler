@@ -7,6 +7,10 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" || exit $?
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/fixtures/edir/arithmetic.elisa"
+# EDIR codec/program versions emitted by ElisaEDIR::Schema.
+EDIR_SCHEMA_VERSION=4
+EDIR_PROGRAM_VERSION=5
+export EDIR_SCHEMA_VERSION EDIR_PROGRAM_VERSION
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -25,6 +29,7 @@ emit_edir "$ROOT" "$artifact" "$FIXTURE"
 
 python3 - "$artifact" "$FIXTURE" <<'PY'
 from pathlib import Path
+import os
 import struct
 import sys
 
@@ -43,10 +48,12 @@ EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCR
 EDIR_OPCODE_CONSTANT = 1
 EDIR_OPCODE_ADD = 2
 EDIR_OPCODE_RETURN = 19
+EDIR_SCHEMA_VERSION = int(os.environ["EDIR_SCHEMA_VERSION"])
+EDIR_PROGRAM_VERSION = int(os.environ["EDIR_PROGRAM_VERSION"])
 assert len(data) == EDIR_HEADER_BYTES + 3 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES, f"unexpected artifact size: {len(data)}"
 schema, version, instruction_count, local_count = struct.unpack_from("<IIQQ", data)
 has_return = data[24]
-assert (schema, version, instruction_count, local_count, has_return) == (3, 1, 3, 0, 1)
+assert (schema, version, instruction_count, local_count, has_return) == (EDIR_SCHEMA_VERSION, EDIR_PROGRAM_VERSION, 3, 0, 1)
 source_file_count = struct.unpack_from("<I", data, 25)[0]
 file_id, logical_path_id, content_digest, line_count, path_length = struct.unpack_from("<QQQQI", data, EDIR_HEADER_PREFIX_BYTES)
 logical_path = data[EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES : EDIR_HEADER_BYTES]
@@ -125,6 +132,7 @@ printf 'def main() -> i64:\n    return 7' >"$no_newline_source"
 emit_edir "$WORK" "$no_newline_artifact" "$no_newline_source"
 python3 - "$no_newline_artifact" "$no_newline_source" <<'PY'
 from pathlib import Path
+import os
 import struct
 import sys
 
@@ -142,6 +150,8 @@ EDIR_MAIN_NAME_BYTES = 4
 EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
 file_id, logical_path_id, content_digest, line_count, _ = struct.unpack_from("<QQQQI", data, EDIR_HEADER_PREFIX_BYTES)
 logical_path = data[EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES : EDIR_HEADER_BYTES]
+EDIR_SCHEMA_VERSION = int(os.environ["EDIR_SCHEMA_VERSION"])
+EDIR_PROGRAM_VERSION = int(os.environ["EDIR_PROGRAM_VERSION"])
 FNV_OFFSET_BASIS = 14695981039346656037
 FNV_PRIME = 1099511628211
 def fnv1a(domain, value):
@@ -149,7 +159,7 @@ def fnv1a(domain, value):
     for byte in domain + value:
         result = ((result ^ byte) * FNV_PRIME) & ((1 << 64) - 1)
     return result or 1
-assert struct.unpack_from("<IIQQBI", data) == (3, 1, 2, 0, 1, 1)
+assert struct.unpack_from("<IIQQBI", data) == (EDIR_SCHEMA_VERSION, EDIR_PROGRAM_VERSION, 2, 0, 1, 1)
 assert file_id == 1 and logical_path.decode("utf-8") == "café:case.elisa"
 assert logical_path_id == fnv1a(b"EDIR logical path:", logical_path)
 assert content_digest == fnv1a(b"EDIR source content:", source)
@@ -167,6 +177,7 @@ EOF
 emit_edir "$WORK" "$local_artifact" "$local_source"
 python3 - "$local_artifact" "$local_source" <<'PY'
 from pathlib import Path
+import os
 import struct
 import sys
 
@@ -182,9 +193,11 @@ EDIR_FUNCTION_COUNT_BYTES = 4
 EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
 EDIR_MAIN_NAME_BYTES = 4
 EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
+EDIR_SCHEMA_VERSION = int(os.environ["EDIR_SCHEMA_VERSION"])
+EDIR_PROGRAM_VERSION = int(os.environ["EDIR_PROGRAM_VERSION"])
 assert len(data) == EDIR_HEADER_BYTES + 5 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
 schema, version, instruction_count, local_count = struct.unpack_from("<IIQQ", data)
-assert (schema, version, instruction_count, local_count, data[24]) == (3, 1, 5, 1, 1)
+assert (schema, version, instruction_count, local_count, data[24]) == (EDIR_SCHEMA_VERSION, EDIR_PROGRAM_VERSION, 5, 1, 1)
 
 def decode_instruction(index):
     offset = EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES
@@ -223,6 +236,7 @@ EOF
 emit_edir "$WORK" "$local_return_artifact" "$local_return_source"
 python3 - "$local_return_artifact" <<'PY'
 from pathlib import Path
+import os
 import struct
 import sys
 
@@ -236,8 +250,10 @@ EDIR_FUNCTION_COUNT_BYTES = 4
 EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
 EDIR_MAIN_NAME_BYTES = 4
 EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
+EDIR_SCHEMA_VERSION = int(os.environ["EDIR_SCHEMA_VERSION"])
+EDIR_PROGRAM_VERSION = int(os.environ["EDIR_PROGRAM_VERSION"])
 assert len(data) == EDIR_HEADER_BYTES + 4 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
-assert struct.unpack_from("<IIQQB", data) == (3, 1, 4, 1, 1)
+assert struct.unpack_from("<IIQQB", data) == (EDIR_SCHEMA_VERSION, EDIR_PROGRAM_VERSION, 4, 1, 1)
 assert [struct.unpack_from("<Hqq", data, EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES) for index in range(4)] == [
     (1, 42, 0), (5, 0, 0), (4, 0, 0), (19, 0, 0)
 ]
@@ -250,6 +266,7 @@ counted_loop_artifact="$WORK/counted-loop.edir"
 emit_edir "$ROOT" "$counted_loop_artifact" "$counted_loop_source"
 python3 - "$counted_loop_artifact" "$counted_loop_source" <<'PY'
 from pathlib import Path
+import os
 import struct
 import sys
 
@@ -272,13 +289,15 @@ CONDITION_LOAD_INSTRUCTION_INDEX = 4
 TOTAL_UPDATE_LOAD_INSTRUCTION_INDEX = 7
 COUNTER_UPDATE_LOAD_INSTRUCTION_INDEX = 10
 LOOP_BACK_EDGE_INSTRUCTION_INDEX = 13
+EDIR_SCHEMA_VERSION = int(os.environ["EDIR_SCHEMA_VERSION"])
+EDIR_PROGRAM_VERSION = int(os.environ["EDIR_PROGRAM_VERSION"])
 COUNTED_LOOP_HEADER_TEXT = b"while counter < 5:"
 COMPARISON_OPERATOR_TEXT = b"<"
 COMPARISON_OPERATOR_LENGTH = len(COMPARISON_OPERATOR_TEXT)
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 assert len(data) == EDIR_HEADER_BYTES + EXPECTED_INSTRUCTION_COUNT * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
-assert struct.unpack_from("<IIQQB", data) == (3, 1, EXPECTED_INSTRUCTION_COUNT, EXPECTED_LOCAL_COUNT, 1)
+assert struct.unpack_from("<IIQQB", data) == (EDIR_SCHEMA_VERSION, EDIR_PROGRAM_VERSION, EXPECTED_INSTRUCTION_COUNT, EXPECTED_LOCAL_COUNT, 1)
 
 def instruction(index):
     return struct.unpack_from("<HqqQQQIIIII", data, EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES)
@@ -445,13 +464,14 @@ check_arithmetic_case - 42 40 3 2
 check_arithmetic_case '*' 6 7 11 42
 check_arithmetic_case / 84 2 12 42
 
-# Schema 3 supplies explicit function ranges and direct call targets. This
+# Schema 4 / program version 5 supplies explicit function ranges and direct call targets. This
 # compiler-owned fixture exercises a regular helper call and bounded tail recursion.
 functions_source="$ROOT/test/fixtures/edir/function_calls.elisa"
 functions_artifact="$WORK/function-calls.edir"
 emit_edir "$ROOT" "$functions_artifact" "$functions_source"
 python3 - "$functions_artifact" "$functions_source" <<'PY'
 from pathlib import Path
+import os
 import struct
 import sys
 
@@ -465,11 +485,12 @@ EDIR_FUNCTION_COUNT_BYTES = 4
 EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
 EDIR_MAX_CALL_DEPTH = 16
 EDIR_OPCODE_CALL = 18
-EDIR_SCHEMA_VERSION = 3
+EDIR_SCHEMA_VERSION = int(os.environ["EDIR_SCHEMA_VERSION"])
+EDIR_PROGRAM_VERSION = int(os.environ["EDIR_PROGRAM_VERSION"])
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 header_bytes = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 schema, version, instruction_count, local_count, has_return = struct.unpack_from("<IIQQB", data)
-assert (schema, version, local_count, has_return) == (EDIR_SCHEMA_VERSION, 1, 1, 1)
+assert (schema, version, local_count, has_return) == (EDIR_SCHEMA_VERSION, EDIR_PROGRAM_VERSION, 1, 1)
 assert source.count(b"\n") + 1 == 11
 function_table_offset = header_bytes + instruction_count * EDIR_INSTRUCTION_BYTES
 function_count, = struct.unpack_from("<I", data, function_table_offset)
