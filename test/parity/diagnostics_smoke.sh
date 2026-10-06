@@ -1032,8 +1032,11 @@ run_case local_borrow_ref_alias_store neg "$lra_neg" "function-local storage"
 # does; matches stage0 line for line (and column for column at the CLI).
 lfb_pos="$FIXTURES/lmut_field_builtin_mutation.pos.elisa"
 lfb_neg="$FIXTURES/lmut_field_builtin_mutation.neg.elisa"
-for lfb_line in 16 18 20 22 23 25 27 29 32; do
-    run_case lmut_field_builtin_mutation pos "$lfb_pos" "L$lfb_line mutation of \`lmut\` value \"p\" must be a reassignment (docs/120 §10): write \`p <- …\` so the dataflow is visible"
+# The diagnostic names the mutated field PLACE (stage0 lmutMutatedPlaceName).
+for lfb_case in 16:p.items 18:p.items 20:p.q.items 22:p.d 23:p.s 25:p.name 27:p.items 29:p.items 32:p.items; do
+    lfb_line="${lfb_case%%:*}"
+    lfb_place="${lfb_case#*:}"
+    run_case lmut_field_builtin_mutation pos "$lfb_pos" "L$lfb_line mutation of \`lmut\` value \"$lfb_place\" must be a reassignment (docs/120 §10): write \`$lfb_place <- …\` so the dataflow is visible"
 done
 run_case lmut_field_builtin_mutation neg "$lfb_neg" "must be a reassignment"
 
