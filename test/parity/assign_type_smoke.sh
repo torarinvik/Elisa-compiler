@@ -81,6 +81,88 @@ grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage0_out" || fail "stag
 out=$(printf 'def take_texts(values: darray[sview]&) -> void:\n    pass\ndef good_call(values: darray[sview]&):\n    take_texts(values)\n' | "$RPT")
 grep -q 'expects darray\[sview\]' <<< "$out" && fail "false positive on matching by-reference darray element types: $out"
 
+# Formal resolution must follow argument labels, not source argument indices. Reordered
+# named arguments that match their formal darray element types are accepted; a swapped pair
+# must report both actual/formal mismatches.
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_reorder.pos.elisa")
+grep -q 'expects darray\[' <<< "$out" && fail "false positive on matching reordered named darray arguments: $out"
+"$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_reorder.pos.elisa" >/dev/null 2>&1 || fail "stage0 rejected matching reordered named darray arguments"
+"$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_reorder.pos.elisa" >/dev/null 2>&1 || fail "stage1 rejected matching reordered named darray arguments"
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_mismatch.neg.elisa")
+grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "named darray mismatch not mapped to its formal: $out"
+grep -q 'expects darray\[i64\], got darray\[sview\]' <<< "$out" || fail "reordered named darray mismatch not mapped to its formal: $out"
+named_mismatch_count=$(grep -c 'expects darray\[' <<< "$out" || true)
+[ "$named_mismatch_count" -eq 2 ] || fail "named argument matching emitted unexpected darray findings: $out"
+if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_mismatch.neg.elisa" 2>&1); then
+  fail "stage0 accepted mismatched named darray arguments"
+fi
+grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage0_out" || fail "stage0 rejected named darray mismatch for another reason: $stage0_out"
+if stage1_out=$("$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_mismatch.neg.elisa" 2>&1); then
+  fail "stage1 accepted mismatched named darray arguments"
+fi
+grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage1_out" || fail "stage1 rejected named darray mismatch for another reason: $stage1_out"
+
+# A local non-function that shadows a top-level callable is not that function's actual
+# callee. The independent callability diagnostic may reject it, but this check must not
+# borrow the global declaration's darray signature and add a misleading type finding.
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_shadowed_callee.invalid.elisa")
+grep -q 'expects darray\[' <<< "$out" && fail "shadowed local callee was checked against a global function signature: $out"
+
+# Module qualification must select the exact declaration even where two modules declare
+# the same bare function name with different darray formals. Both a matching qualified call
+# and a mismatching qualified call appear in this source; only the latter may be diagnosed.
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.neg.elisa")
+grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "qualified North::store mismatch not found: $out"
+grep -q 'expects darray\[i64\], got darray\[sview\]' <<< "$out" || fail "qualified South::store mismatch not found: $out"
+qualified_mismatch_count=$(grep -c 'expects darray\[' <<< "$out" || true)
+[ "$qualified_mismatch_count" -eq 2 ] || fail "qualified resolution or ambiguous bare-name fail-closed control produced unexpected darray findings: $out"
+if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.neg.elisa" 2>&1); then
+  fail "stage0 accepted mismatched same-name qualified module calls"
+fi
+qualified_stage0_count=$(grep -c 'expects darray\[' <<< "$stage0_out" || true)
+[ "$qualified_stage0_count" -eq 2 ] || fail "stage0 qualified module controls produced unexpected errors: $stage0_out"
+if stage1_out=$("$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.neg.elisa" 2>&1); then
+  fail "stage1 accepted mismatched same-name qualified module calls"
+fi
+qualified_stage1_count=$(grep -c 'expects darray\[' <<< "$stage1_out" || true)
+[ "$qualified_stage1_count" -eq 2 ] || fail "stage1 qualified module controls produced unexpected errors: $stage1_out"
+"$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.pos.elisa" >/dev/null 2>&1 || fail "stage0 rejected matching same-name qualified module calls"
+"$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.pos.elisa" >/dev/null 2>&1 || fail "stage1 rejected matching same-name qualified module calls"
+
+# The parser canonicalizes nested module declarations as fully qualified owner paths
+# (Outer::Inner). The collector and call checker must use the same path without rebuilding
+# or truncating it. Matching calls pass; the two payload-layout mismatches are diagnosed.
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_module.neg.elisa")
+grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "nested module darray mismatch not found: $out"
+grep -q 'expects darray\[i64\], got darray\[sview\]' <<< "$out" || fail "nested module darray mismatch not found: $out"
+nested_module_mismatch_count=$(grep -c 'expects darray\[' <<< "$out" || true)
+[ "$nested_module_mismatch_count" -eq 2 ] || fail "nested module controls produced unexpected darray findings: $out"
+for compiler in "$ELISACORE_BIN" "$STAGE1_BIN"; do
+  if nested_out=$("$compiler" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_module.neg.elisa" 2>&1); then
+    fail "$(basename "$compiler") accepted nested-module darray element mismatches"
+  fi
+  nested_compiler_count=$(grep -c 'expects darray\[' <<< "$nested_out" || true)
+  [ "$nested_compiler_count" -eq 2 ] || fail "$(basename "$compiler") nested module controls produced unexpected errors: $nested_out"
+done
+
+# Reference normalization peels nested reference wrappers but still compares the underlying
+# buffer element layout. The positive file has identical nested-ref element types; the
+# negative file differs only in the darray element type.
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_match.pos.elisa")
+grep -q 'expects darray\[' <<< "$out" && fail "false positive on matching nested-reference darray types: $out"
+"$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_match.pos.elisa" >/dev/null 2>&1 || fail "stage0 rejected matching nested-reference darray types"
+"$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_match.pos.elisa" >/dev/null 2>&1 || fail "stage1 rejected matching nested-reference darray types"
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_mismatch.neg.elisa")
+grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "nested-reference element mismatch not found: $out"
+if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_mismatch.neg.elisa" 2>&1); then
+  fail "stage0 accepted nested-reference darray element mismatch"
+fi
+grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage0_out" || fail "stage0 rejected nested-ref mismatch for another reason: $stage0_out"
+if stage1_out=$("$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_mismatch.neg.elisa" 2>&1); then
+  fail "stage1 accepted nested-reference darray element mismatch"
+fi
+grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage1_out" || fail "stage1 rejected nested-ref mismatch for another reason: $stage1_out"
+
 # 11. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
