@@ -21,6 +21,8 @@ import random
 import re
 import subprocess
 import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+import elisa_platform  # host link flags: scripts/platform.sh
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ELISA_CORE = pathlib.Path(
@@ -168,7 +170,7 @@ def ensure_driver(elisac: str, llvm_config: str) -> pathlib.Path:
             with fallback.open("w", encoding="utf-8") as fh:
                 subprocess.run(["bash", str(profiler_script)], stdout=fh, check=True)
             subprocess.check_call(
-                ["clang", "-o", str(DRIVER), str(obj), str(fallback), f"-L{libdir}", "-lLLVM", f"-Wl,-rpath,{libdir}"],
+                ["clang", "-o", str(DRIVER), str(obj), str(fallback), f"-L{libdir}", *elisa_platform.LLVM_LIBS, *elisa_platform.LINK_EXE_FLAGS, f"-Wl,-rpath,{libdir}"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -198,7 +200,7 @@ def main() -> int:
     parser.add_argument("--cases", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0xE451A)
     parser.add_argument("--elisac", default=os.path.expanduser(DEFAULT_ELISAC))
-    parser.add_argument("--llvm-config", default="/opt/homebrew/opt/llvm/bin/llvm-config")
+    parser.add_argument("--llvm-config", default=elisa_platform.LLVM_CONFIG)
     args = parser.parse_args()
     if not os.path.isfile(args.elisac) or not os.access(args.elisac, os.X_OK):
         print(f"easm_relation_property FAILED: elisac not executable: {args.elisac}", file=sys.stderr)

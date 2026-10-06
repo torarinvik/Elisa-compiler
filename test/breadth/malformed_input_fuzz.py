@@ -18,7 +18,7 @@ NOT to crash is otherwise invisible (the object path tolerates it; see llvm_veri
 It found `ret ptr` from an `-> i64` function, from returning a `fn` value that stage0 rejects
 outright.
 """
-import os, random, signal, subprocess, sys
+import os, random, shutil, signal, subprocess, sys
 
 ROOT = os.environ["REPO_ROOT"]
 WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
@@ -73,7 +73,7 @@ REGRESSIONS = [
     ("malformed_extern_pointer_return", "struct SDL_Window:\n    opaque: u8\n\n@link_name(\"sdlWindow\")\nextern sdlWindow: mutable SDL_Window&?\n\nglobal mutable sdlWindow: SDL_Window&? = zeroed\n\nextern SDL_CreateWindow(title: u8&?, w: i32, h: i32, flags: u64) -> &?\n\ndef main() -> i64:\n    return 0\n"),
 ]
 
-OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")), "opt")
+OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG") or shutil.which("llvm-config") or "/opt/homebrew/opt/llvm/bin/llvm-config"), "opt")
 
 def run_bounded(args, timeout, stdout, stderr):
     """Run one compiler/tool process and kill its entire process group on timeout.

@@ -7,6 +7,8 @@ Split out of adversarial_differential.py, which is still the entry point and sti
 scope note about what this corpus structurally cannot cover."""
 
 import itertools, os, subprocess, sys, tempfile, hashlib
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+import elisa_platform  # host link flags: scripts/platform.sh
 
 
 ROOT = os.environ["REPO_ROOT"]
@@ -84,8 +86,8 @@ def _attempt(src_path, work, tag, run_timeout, scale=1):
     # profiler shim is present in every recipe because an inline runtime has no RT object
     # to provide the optional ABI, while the ordinary stage1 object may need it as well.
     for extra in ([RT, PROFILE_HOOKS], [PROFILE_HOOKS],
-                  [RT, PROFILE_HOOKS, "-L/opt/homebrew/opt/llvm/lib", "-lLLVM"]):
-        if run(["clang", "-Wl,-dead_strip", "-o", exe, obj] + extra).returncode == 0:
+                  [RT, PROFILE_HOOKS, f"-L{elisa_platform.LLVM_LIBDIR}", *elisa_platform.LLVM_LIBS]):
+        if run(["clang", *elisa_platform.EXE_LINK, "-o", exe, obj] + extra).returncode == 0:
             break
     else:
         return (LINK_FAILED, None)
