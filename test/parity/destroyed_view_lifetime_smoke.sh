@@ -39,6 +39,10 @@ ARENA_ALIAS_BOTH_IF_ARMS_LIVE="$ROOT/test/parity/fixtures/arena_alias_both_if_ar
 ARENA_ALIAS_EXHAUSTIVE_MATCH_LIVE="$ROOT/test/parity/fixtures/arena_alias_exhaustive_match_rebind_live.elisa"
 ARENA_HELPER_RESET_BAD="$ROOT/test/repro/arena_helper_reset_leak.elisa"
 ARENA_HELPER_RESET_GOOD="$ROOT/test/parity/fixtures/arena_helper_reset_live.elisa"
+ARENA_QUALIFIED_RESET_BAD="$ROOT/test/repro/arena_qualified_reset_wrapper_leak.elisa"
+ARENA_QUALIFIED_OWNER_COLLISION_GOOD="$ROOT/test/parity/fixtures/arena_qualified_nonreset_same_leaf_live.elisa"
+ARENA_QUALIFIED_ALIAS_OWNER_COLLISION_BAD="$ROOT/test/repro/arena_qualified_alias_owner_collision.elisa"
+ARENA_REGION_TIED_AGGREGATE_BAD="$ROOT/test/repro/arena_region_tied_aggregate_return_leak.elisa"
 ARENA_NAMED_RESET_BAD="$ROOT/test/repro/arena_named_reset_leak.elisa"
 ARENA_NAMED_RESET_GOOD="$ROOT/test/parity/fixtures/arena_named_reset_live.elisa"
 ARENA_OPAQUE_RESET_BAD="$ROOT/test/repro/arena_opaque_reset_leak.elisa"
@@ -795,6 +799,72 @@ for optimization in 0 2; do
         cat "$shadow_rebind_good_log.run" >&2
         exit 1
     }
+
+    qualified_reset_output="$WORK/qualified-reset-owner-O$optimization"
+    qualified_reset_log="$qualified_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$qualified_reset_output.ll" "$ARENA_QUALIFIED_RESET_BAD" >"$qualified_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: qualified reset wrapper failed to invalidate its exact module-owned Arena& at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "arena"' "$qualified_reset_log" || {
+        echo "destroyed view lifetime smoke: qualified reset wrapper refusal lost the arena dependency at O$optimization" >&2
+        cat "$qualified_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$qualified_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale value after qualified reset at O$optimization" >&2; exit 1; }
+
+    qualified_owner_collision_output="$WORK/qualified-owner-collision-live-O$optimization"
+    qualified_owner_collision_log="$qualified_owner_collision_output.log"
+    "$STAGE1" -emit exe "-O$optimization" -o "$qualified_owner_collision_output" "$ARENA_QUALIFIED_OWNER_COLLISION_GOOD" >"$qualified_owner_collision_log" 2>&1 || {
+        echo "destroyed view lifetime smoke: a non-resetting qualified owner inherited another module's same-leaf reset summary at O$optimization" >&2
+        cat "$qualified_owner_collision_log" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 10 "$qualified_owner_collision_output" >"$qualified_owner_collision_log.run" 2>&1
+    run_status=$?
+    set -e
+    [[ "$run_status" -eq 0 ]] || {
+        echo "destroyed view lifetime smoke: qualified same-leaf non-reset control returned $run_status at O$optimization" >&2
+        cat "$qualified_owner_collision_log.run" >&2
+        exit 1
+    }
+
+    qualified_alias_owner_collision_output="$WORK/qualified-alias-owner-collision-O$optimization"
+    qualified_alias_owner_collision_log="$qualified_alias_owner_collision_output.log"
+    set +e
+    "$STAGE1" -emit llvm "-O$optimization" -o "$qualified_alias_owner_collision_output.ll" "$ARENA_QUALIFIED_ALIAS_OWNER_COLLISION_BAD" >"$qualified_alias_owner_collision_log" 2>&1
+    qualified_alias_status=$?
+    set -e
+    if [[ "$qualified_alias_status" -ne 1 ]]; then
+        echo "destroyed view lifetime smoke: a module alias borrowed a same-spelled non-resetting owner's summary at O$optimization" >&2
+        cat "$qualified_alias_owner_collision_log" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region "arena"' "$qualified_alias_owner_collision_log" || {
+        echo "destroyed view lifetime smoke: module-alias reset refusal lost the arena dependency at O$optimization" >&2
+        cat "$qualified_alias_owner_collision_log" >&2
+        exit 1
+    }
+    [[ ! -e "$qualified_alias_owner_collision_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a stale value after aliased reset at O$optimization" >&2; exit 1; }
+
+    aggregate_escape_output="$WORK/region-tied-aggregate-escape-O$optimization"
+    aggregate_escape_log="$aggregate_escape_output.log"
+    set +e
+    "$STAGE1" -emit llvm "-O$optimization" -o "$aggregate_escape_output.ll" "$ARENA_REGION_TIED_AGGREGATE_BAD" >"$aggregate_escape_log" 2>&1
+    aggregate_escape_status=$?
+    set -e
+    if [[ "$aggregate_escape_status" -ne 1 ]]; then
+        echo "destroyed view lifetime smoke: accepted a region-tied aggregate returned after freeing its local owner at O$optimization" >&2
+        cat "$aggregate_escape_log" >&2
+        exit 1
+    fi
+    rg -Fq 'value "payload" cannot be used: region dependency facts were invalidated by destroy of region "arena"' "$aggregate_escape_log" || {
+        echo "destroyed view lifetime smoke: aggregate return refusal lost its region dependency at O$optimization" >&2
+        cat "$aggregate_escape_log" >&2
+        exit 1
+    }
+    [[ ! -e "$aggregate_escape_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for an aggregate escaping a freed owner at O$optimization" >&2; exit 1; }
 done
 
 echo "destroyed view lifetime smoke OK: stale uses are rejected; live, last-use, and shadowed-region controls pass at O0/O2"
