@@ -51,7 +51,9 @@ check ref_alias_forwarded_growth "$ROOT/test/fixtures/amm/ref_alias_forwarded_gr
 check ref_alias_chain "$ROOT/test/fixtures/amm/ref_alias_chain.elisa" 164
 # inner[3] + outer[3] + 100*40 = 4 + 5 + 4000 = 4009 = 169 mod 256.
 check ref_alias_two_regions "$ROOT/test/fixtures/amm/ref_alias_two_regions.elisa" 169
-check index_store_escape "$ROOT/test/fixtures/amm/index_store_escape.elisa" 164
+# A local darray stored by bare `<-` into an element of a caller's darray: stage1 used to
+# place it in the caller's arena silently; since ae902b50 it rejects the escape like stage0.
+check index_store_escape "$ROOT/test/fixtures/amm/index_store_escape.elisa" reject
 # A generic effect operation that grows the caller's darray (stage1-only feature).
 check static_effect_growth "$ROOT/test/fixtures/amm/static_effect_growth.elisa" 164
 check named_argument_forwarding "$ROOT/test/fixtures/amm/named_argument_forwarding.elisa" 169
