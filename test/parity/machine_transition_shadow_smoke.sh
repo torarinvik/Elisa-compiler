@@ -8,6 +8,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE="$ROOT/test/fixtures/machine_transition/shadow.elisa"
 INPUT_BIND_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind.elisa"
 INPUT_BIND_FAST_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind_fast.elisa"
+ARM_LOCAL_SOURCE="$ROOT/test/fixtures/machine_transition/arm_local_shadow.elisa"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
@@ -52,5 +53,6 @@ run_case() {
 run_case "$SOURCE" 2 shadow
 run_case "$INPUT_BIND_SOURCE" 1 input-bind
 run_case "$INPUT_BIND_FAST_SOURCE" 1 input-bind-fast
+run_case "$ARM_LOCAL_SOURCE" 53 arm-local
 
-echo "machine transition scope smoke OK: payload stores and input binders preserve arm scope at O0/O2"
+echo "machine transition scope smoke OK: payload stores, arm locals and input binders preserve arm scope at O0/O2"
