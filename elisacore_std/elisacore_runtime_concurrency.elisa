@@ -12,8 +12,8 @@ include "./elisacore_runtime_atomics.elisa"
 # ------------------------------------------------------------
 
 alias Atomic = Atomics.Load, Atomics.Store, Atomics.Exchange, Atomics.CompareExchange, Atomics.Rmw, Atomics.Fence
-alias Threads = Thread.Spawn, Thread.Join, Thread.Detach, Thread.Yield, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.CompareExchange
-alias Pooled = Pool.Create, Pool.Submit, Pool.Await, Pool.WaitAll, Pool.Shutdown, Thread.Spawn, Thread.Join, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.CompareExchange
+alias Threads = Thread.Spawn, Thread.Join, Thread.Detach, Thread.Yield, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.Store, Atomics.CompareExchange
+alias Pooled = Pool.Create, Pool.Submit, Pool.Await, Pool.WaitAll, Pool.Shutdown, Thread.Spawn, Thread.Join, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.Store, Atomics.CompareExchange
 alias Parallel = Thread.Spawn, Thread.Join, Thread.Detach, Thread.Yield, Pool.Create, Pool.Submit, Pool.Await, Pool.WaitAll, Pool.Shutdown, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.Store, Atomics.Exchange, Atomics.CompareExchange, Atomics.Rmw, Atomics.Fence
 
 # ------------------------------------------------------------
@@ -23,6 +23,13 @@ alias Parallel = Thread.Spawn, Thread.Join, Thread.Detach, Thread.Yield, Pool.Cr
 struct Thread[T, S]:
 	handle: mutable uintptr
 	state: mutable void&?
+
+# Result of an ownership-preserving, nonblocking thread completion poll. The
+# Joinable handle remains affine inside this value until its caller moves it to
+# another poll or to join/detach.
+struct ThreadReadiness[T]:
+	thread: mutable Thread[T, Joinable]
+	complete: mutable bool
 
 struct Task[T, S]:
 	handle: mutable uintptr
@@ -51,6 +58,9 @@ struct ConcurrencyWorkStart1:
 	fn_bits: mutable uintptr
 	arg_bits: mutable void&
 	result_bits: mutable void&
+	# Published after result_bits is initialized. The joining handle retains one
+	# reference to this state while `ready` borrows it.
+	completed: mutable AtomicSlot[i64]
 	refs: mutable AtomicSlot[i64]
 
 @intrusive
@@ -850,16 +860,20 @@ def ctx_concurrency_work1_new[A, R, permission P](fn: fn(A) -> R can[P], arg: A)
 		state.fn_bits <- fn.cast[uintptr]
 		state.arg_bits <- arg_box.cast[void&]
 		state.result_bits <- result_storage.cast[void&]
+		state.completed.value <- 0
 		state.refs.value <- 2
 		return state
 
 def ctx_concurrency_work1_entry[A, R, permission P](state_bits: mutable void&) -> void&:
-	can P, Memory.Release, Atomics.Load, Atomics.CompareExchange:
+	can P, Memory.Release, Atomics.Load, Atomics.Store, Atomics.CompareExchange:
 		state: heap ConcurrencyWorkStart1& = state_bits.cast[heap ConcurrencyWorkStart1&]
 		fn: fn(A) -> R can[P] = state.fn_bits.cast[fn(A) -> R can[P]]
 		arg_box: heap ConcurrencyBox[A]& = state.arg_bits.cast[heap ConcurrencyBox[A]&]
 		result: R = fn(arg_box.value)
 		ctx_concurrency_result_write[R](state.result_bits, result)
+		# Release-publish only after the result write. An Acquire load that sees 1
+		# observes the initialized result storage; `ready` never consumes it.
+		store(&state.completed, 1, MemoryOrder.Release) can Atomics.Store
 		ctx_concurrency_work1_release(state.cast[mutable void&])
 		return state.cast[void&]
 
@@ -914,7 +928,7 @@ def ctx_task_group_release_all(group: mutable TaskGroup&):
 				current <- next
 
 def spawn1[A, R, permission P](fn: fn(A) -> R can[P], arg: A) -> Thread[R, Joinable]:
-	can Thread.Spawn, Memory.Allocate, Abort.Panic:
+	can Thread.Spawn, Memory.Allocate, Abort.Panic, Atomics.Store:
 		from_raw: fn(Thread[void&?, Joinable]) -> Thread[R, Joinable] = ctx_thread_from_raw[R, Joinable]
 		state: heap ConcurrencyWorkStart1& = ctx_concurrency_work1_new(fn, arg)
 		raw: Thread[void&?, Joinable] = spawn_raw(
@@ -923,6 +937,18 @@ def spawn1[A, R, permission P](fn: fn(A) -> R can[P], arg: A) -> Thread[R, Joina
 		)
 		raw.state <- state.cast[void&]
 		return from_raw(move raw)
+
+# An ownership-preserving, nonblocking completion query. Consuming the handle
+# avoids aliasing its linear state; the result returns that same handle for a
+# later poll or join. A missing state/handle fails closed as not complete.
+def poll_ready[R](thread: Thread[R, Joinable]) -> ThreadReadiness[R]:
+	can Atomics.Load:
+		is_complete: mutable bool = false
+		if thread.handle != 0 and thread.state != null:
+			state: heap ConcurrencyWorkStart1& = thread.state.cast[heap ConcurrencyWorkStart1&]
+			completed: i64 = load(&state.completed, MemoryOrder.Acquire)
+			is_complete <- completed == 1
+		return ThreadReadiness[R]{thread: move thread, complete: is_complete}
 
 def join[R](thread: Thread[R, Joinable]) -> R:
 	can Thread.Join, Memory.Release, Abort.Panic, Atomics.Load, Atomics.CompareExchange:
@@ -951,7 +977,7 @@ def detach[R](thread: Thread[R, Joinable]):
 # cannot be raced. Prefer `nursery:` / `pool` for anything that should shut down
 # cleanly; reach for spawn_daemon only for genuinely immortal background work.
 def spawn_daemon[A, permission P](fn: fn(A) -> void can[P], arg: A):
-	can P, Thread.Spawn, Thread.Detach, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.CompareExchange:
+	can P, Thread.Spawn, Thread.Detach, Memory.Allocate, Memory.Release, Abort.Panic, Atomics.Load, Atomics.Store, Atomics.CompareExchange:
 		detach(spawn1(fn, arg))
 
 # ------------------------------------------------------------
@@ -971,7 +997,7 @@ def spawn_daemon[A, permission P](fn: fn(A) -> void can[P], arg: A):
 # ------------------------------------------------------------
 
 def task[A, R, permission P](fn: fn(A) -> R can[P], arg: A) -> Thread[R, Joinable]:
-	can Thread.Spawn, Memory.Allocate, Abort.Panic:
+	can Thread.Spawn, Memory.Allocate, Abort.Panic, Atomics.Store:
 		return spawn1(fn, arg)
 
 def future_get[R](handle: Thread[R, Joinable]) -> R:
@@ -979,7 +1005,7 @@ def future_get[R](handle: Thread[R, Joinable]) -> R:
 		return join(move handle)
 
 def pool_submit1[A, R, permission P](pool: mutable ThreadPool&, fn: fn(A) -> R can[P], arg: A) -> Task[R, Pending]:
-	can Pool.Submit, Thread.Spawn, Memory.Allocate, Abort.Panic:
+	can Pool.Submit, Thread.Spawn, Memory.Allocate, Abort.Panic, Atomics.Store:
 		from_raw: fn(Task[void&?, Pending]) -> Task[R, Pending] = ctx_task_from_raw[R, Pending]
 		state: heap ConcurrencyWorkStart1& = ctx_concurrency_work1_new(fn, arg)
 		raw: Task[void&?, Pending] = pool_submit_raw(
