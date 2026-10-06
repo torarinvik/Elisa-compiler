@@ -78,6 +78,12 @@ NAMES=(
     loop_literal_array_binder_arg
     submit_unnamed_view_growth
     submit_local_mutable_ref
+    thread_shareability_ref_call
+    thread_shareability_branch_shadow
+    thread_shareability_loop_shadow
+    thread_shareability_ref_elements
+    thread_shareability_same_line
+    thread_shareability_nested_submit
     storage_dependency_owned_return_global
     storage_dependency_owned_return_qualified
     store_ref_local_global
@@ -283,6 +289,7 @@ NAMES=(
     storage_dependency_field_replacement
     fn_value_effect_row
     fn_value_effect_row_arg
+    global_store_local_escape
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -326,6 +333,12 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "argument 1 to \"f\" expects sview, got static u8&"
     "storage dependency facts were invalidated by darray push"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
+    "is not structurally shareable across threads"
     "is not structurally shareable across threads"
     "storage dependency facts were invalidated by darray push"
     "storage dependency facts were invalidated by darray push"
@@ -532,6 +545,7 @@ EXPECTS=(
     "storage dependency facts were invalidated for interior reference \"r\""
     "variable \"g\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]"
     "argument 1 to \"apply\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Memory]"
+    'storing a reference to function-local storage into longer-lived storage'
 )
 
 total=0

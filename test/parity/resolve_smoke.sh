@@ -392,11 +392,12 @@ echo "resolve smoke OK: loop-capture call initializers resolve without a danglin
 RUNTIME_STRINGS_IFACE="$WORK/runtime_strings.elisai"
 sed -nE 's/^def ([A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\(.*\)( -> .*)?):$/extern \1/p' \
 	"$REPO_ROOT/elisacore_std/elisacore_runtime_strings.elisa" > "$RUNTIME_STRINGS_IFACE"
-# The parser persists synthesized names with the prelude's alloc_perm (bb9f1b63); the prelude
-# declaration is added the same way (only that one: other prelude signatures name types the
-# frontend never declares, which would count as unresolved).
-sed -nE 's/^def ([A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\(.*\)( -> .*)?):$/extern \1/p' \
-	"$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" | grep -E '^extern alloc_perm\(' >> "$RUNTIME_STRINGS_IFACE"
+# The parser keeps synthesized names alive with the runtime prelude's `alloc_perm`
+# (parser_stmt_machine.elisa). Declare only the prelude entry points the frontend calls,
+# generated from their real definitions: the rest of the prelude names runtime-internal
+# types whose bodies are not part of this measurement.
+sed -nE 's/^def (alloc_perm\(.*\)( -> .*)?):$/extern \1/p' \
+	"$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" >> "$RUNTIME_STRINGS_IFACE"
 FRONTEND_FILES=()
 for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa \
          "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \

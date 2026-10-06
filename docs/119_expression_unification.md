@@ -193,6 +193,35 @@ Fields execute in source order. A complex statement receiver, such as
 the collection's existing growth-region and mutability rules, including when
 it grows through a reference parameter. Bulk append requires explicit `extend`.
 
+## Copy-update struct literals
+
+`T{..base, field: value, ...}` builds a new `T`: every field written in the
+literal takes its new value, and every other declared field is read from
+`base`. `T{..base}` is a plain copy. `base` is left unchanged; unlike `with`,
+which updates its receiver in place, this is an ordinary value.
+
+```elisa
+moved: Point = Point{..origin, x: 10}
+inner: Inner = Inner{..outer.inner, tag: 99}
+```
+
+Rules: `..base` is the first entry and appears at most once; the usual
+trailing-comma rules apply; `T` may be module-qualified or generic wherever an
+ordinary struct literal allows it. `base` must be an identifier or a field
+path `a.b.c` (bind any other expression to a local first), so it is evaluated
+once. It must have type `T`. Field defaults (`x: T = v`) never apply when a
+base is present. Unknown and duplicate fields are reported as for any literal.
+
+The form is pure sugar. Stage1's parser expands it while parsing
+(`src/parser/parser_struct_copy_base.elisa`) into the literal a user would
+write by hand: the written fields in source order, then `g: base.g` for each
+remaining field in declaration order. Semantic analysis, the backend, and
+tools that only parse therefore see an ordinary `Expr.Construct`, and
+ownership is exactly that of the hand-written literal. The base is kept in
+`File.struct_copy_bases` so semantic can check its type
+(`src/semantic/check_struct_copy_base.elisa`). Covered by
+`test/parity/struct_copy_base_smoke.sh`.
+
 ## Optional scrutinees in value matches
 
 `match opt:` in value position accepts `null`, binder, and `_` arms, each with an

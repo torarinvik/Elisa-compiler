@@ -35,4 +35,40 @@ for optimization in O0 O2; do
     [[ "$stage0_rc" -eq 201 ]] || { echo "machine transition order smoke FAIL ($optimization): stage0 returned $stage0_rc, expected 201" >&2; exit 1; }
     [[ "$stage1_rc" -eq 201 ]] || { echo "machine transition order smoke FAIL ($optimization): stage1 returned $stage1_rc, expected 201" >&2; exit 1; }
 done
-echo "machine transition order smoke OK: stage0/stage1 preserve parallel payload evaluation at O0/O2 (201)"
+
+# A branch-local arrow ends its selected path. The shared suffix adds 2 and targets C
+# only on fallthrough; scan(0) instead reaches B, adds 10, and exits with 11.
+BRANCH_SOURCE="$ROOT/test/fixtures/machine_transition/branch_transitions.elisa"
+for optimization in O0 O2; do
+    "$STAGE0" -emit obj "-$optimization" -o "$WORK/branch-stage0-$optimization.o" "$BRANCH_SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/branch-stage0-$optimization" "$WORK/branch-stage0-$optimization.o" "$RUNTIME"
+
+    ELISA_STAGE1_BIN="$STAGE1" \
+      bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/branch-stage1-$optimization.o" "$BRANCH_SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/branch-stage1-$optimization" "$WORK/branch-stage1-$optimization.o" "$RUNTIME"
+
+    set +e
+    "$WORK/branch-stage0-$optimization"; branch_stage0_rc=$?
+    "$WORK/branch-stage1-$optimization"; branch_stage1_rc=$?
+    set -e
+    [[ "$branch_stage0_rc" -eq 0 ]] || { echo "machine transition order smoke FAIL ($optimization): stage0 branch result $branch_stage0_rc, expected 0" >&2; exit 1; }
+    [[ "$branch_stage1_rc" -eq 0 ]] || { echo "machine transition order smoke FAIL ($optimization): stage1 branch result $branch_stage1_rc, expected 0" >&2; exit 1; }
+done
+
+# Statement-position catch arms inside machine arms are void control-flow handlers.
+# Stage0's catch-expression arm rule does not describe this statement form, so keep this
+# acceptance check Stage1-owned. The fixture combines void handlers with nested
+# branch-local transitions; the result proves each path updates exactly once.
+VOID_CATCH_SOURCE="$ROOT/test/fixtures/machine_transition/void_catch_in_arm.elisa"
+for optimization in O0 O2; do
+    ELISA_STAGE1_BIN="$STAGE1" \
+      bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/void-catch-stage1-$optimization.o" "$VOID_CATCH_SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/void-catch-stage1-$optimization" "$WORK/void-catch-stage1-$optimization.o" "$RUNTIME"
+
+    set +e
+    "$WORK/void-catch-stage1-$optimization"; void_catch_rc=$?
+    set -e
+    [[ "$void_catch_rc" -eq 0 ]] || { echo "machine transition smoke FAIL ($optimization): void catch branch returned $void_catch_rc, expected 0" >&2; exit 1; }
+done
+
+echo "machine transition smoke OK: Stage0/Stage1 transitions agree; Stage1 void-catch arms pass at O0/O2"

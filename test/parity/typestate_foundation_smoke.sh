@@ -34,6 +34,30 @@ for compiler in "$STAGE0" "$STAGE1"; do
             rg -q 'read_file' "$WORK/reject.log"
         fi
     done
+    elisa_run_timeout 30 "$compiler" -emit llvm -o "$WORK/state-call-positive.ll" \
+        "$ROOT/test/repro/named_protocol_state_call_compatible.pos.elisa" >"$WORK/compile.log" 2>&1 || {
+        cat "$WORK/compile.log" >&2
+        exit 1
+    }
+    ! rg -q '!elisa\.declined' "$WORK/state-call-positive.ll" || {
+        echo "typestate foundation: declined compatible named-state call" >&2
+        exit 1
+    }
+    set +e
+    elisa_run_timeout 30 "$compiler" -emit llvm -o "$WORK/state-call-negative.ll" \
+        "$ROOT/test/repro/named_protocol_state_call_mismatch.neg.elisa" >"$WORK/reject.log" 2>&1
+    state_call_status=$?
+    set -e
+    [[ "$state_call_status" -eq 1 ]] || {
+        echo "typestate foundation: expected wrong named-state call rejection, got $state_call_status" >&2
+        cat "$WORK/reject.log" >&2
+        exit 1
+    }
+    rg -q 'expects (Snapshot\[Observed\], got Snapshot\[Running\]|the subject in typestate Observed)' "$WORK/reject.log" || {
+        echo "typestate foundation: wrong named-state call lacked its semantic diagnostic" >&2
+        cat "$WORK/reject.log" >&2
+        exit 1
+    }
     elisa_run_timeout 30 "$compiler" -emit llvm -o "$WORK/named.ll" \
         "$ROOT/test/repro/named_typestate_codegen_probe.elisa" >"$WORK/compile.log" 2>&1 || {
         cat "$WORK/compile.log" >&2

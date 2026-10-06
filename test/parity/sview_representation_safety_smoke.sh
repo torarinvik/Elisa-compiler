@@ -161,7 +161,9 @@ check_nullable_cstr_contexts_rejected() {
         cat "$log" >&2
         exit 1
     }
-    [[ "$(rg -F -c 'variable "text" expects cstr?, got reference' "$log")" -eq 2 ]] || {
+    # Initialization reports against the variable; the rebind reports as an assignment
+    # (`cannot assign ...`), the wording stage0 uses for the same line.
+    [[ "$(rg -F -c 'variable "text" expects cstr?, got reference' "$log")" -eq 1 ]] && rg -Fq 'cannot assign reference to cstr?' "$log" || {
         echo "sview representation safety smoke: nullable C-string local initialization/rebind checks were incomplete at O$optimization" >&2
         cat "$log" >&2
         exit 1
