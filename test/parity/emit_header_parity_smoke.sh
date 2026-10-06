@@ -16,6 +16,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/emit_parity_lib.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -35,10 +36,10 @@ header_is_empty_skeleton() {
 
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
     name="$(basename "$src" .elisa)"
-    if ! "$ELISACORE_BIN" -emit header -o "$WORK/$name.s0" "$src" </dev/null >/dev/null 2>&1; then
+    if ! s0 -emit header -o "$WORK/$name.s0" "$src" </dev/null >/dev/null 2>&1; then
         # stage0 declines. A declaration-free stage1 skeleton has no ABI surface and is safe;
         # any declaration here would publish an interface that stage0 refused to validate.
-        if bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit header -o "$WORK/$name.s1" "$src" >/dev/null 2>&1; then
+        if s1 -emit header -o "$WORK/$name.s1" "$src" >/dev/null 2>&1; then
             if header_is_empty_skeleton "$WORK/$name.s1"; then
                 permissive=$((permissive + 1))
                 echo "SAFE SUPERSET: $name — stage1 emitted an empty header skeleton"
@@ -50,7 +51,7 @@ for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elis
         skipped=$((skipped + 1))
         continue
     fi
-    if ! bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit header -o "$WORK/$name.s1" "$src" >/dev/null 2>&1; then
+    if ! s1 -emit header -o "$WORK/$name.s1" "$src" >/dev/null 2>&1; then
         differ=$((differ + 1))
         echo "FAILED: $name — stage0 emitted a header, stage1 did not"
         continue
