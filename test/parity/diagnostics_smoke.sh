@@ -283,6 +283,7 @@ NAMES=(
     iter_owner_callee
     storage_dependency_field_replacement
     global_store_local_escape
+    lmut_field_bare_call
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -532,6 +533,7 @@ EXPECTS=(
     'by mutable reference while "p.items" is being iterated: the callee may push/clear/replace it through "p"'
     "storage dependency facts were invalidated for interior reference \"r\""
     'storing a reference to function-local storage into longer-lived storage'
+    'mutation of `lmut` value "report.cache" must be a reassignment'
 )
 
 total=0
