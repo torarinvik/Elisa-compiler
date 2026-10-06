@@ -284,6 +284,7 @@ NAMES=(
     storage_dependency_field_replacement
     global_store_local_escape
     lmut_field_bare_call
+    storage_owned_return_module_scope
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -534,6 +535,7 @@ EXPECTS=(
     "storage dependency facts were invalidated for interior reference \"r\""
     'storing a reference to function-local storage into longer-lived storage'
     'mutation of `lmut` value "report.cache" must be a reassignment'
+    'view "source" cannot be used: storage dependency facts were invalidated by darray push of doc'
 )
 
 total=0
