@@ -1,0 +1,350 @@
+# Check direct call boundaries for explicitly known states of named protocol
+# families. Unknown, aliased-through-mutation, overloaded, or qualified calls
+# are left to the existing conservative checks; this pass never guesses a state.
+extend Semantic:
+    private:
+        def protocol_call_local_index(names: darray[sview]&, name: sview) -> i64:
+            can Abort.Panic:
+                index: mutable usize = names.count
+                while index > 0 |index, names, name|:
+                    index <- index - 1
+                    return index.i64() if names[index] == name
+                return -1
+
+        def protocol_call_local_name(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Move(inner, _) | Expr.Paren(inner, _):
+                        return protocol_call_local_name(inner)
+                    _:
+                        return ""
+
+        def protocol_call_state_name(table: SymbolTable&, family_id: DeclId, state_index: u32) -> sview:
+            can Abort.Panic:
+                for resolved in table.resolved_state_families:
+                    continue if resolved.declaration_id.value != family_id.value
+                    return "" if resolved.source_index.usize() >= table.state_family_declarations.count
+                    family: Ast::StateFamily = table.state_family_declarations[resolved.source_index.usize()]
+                    return "" if state_index.usize() >= family.states.count
+                    return family.states[state_index.usize()]
+                return ""
+
+        def collect_protocol_call_parameters(declarations: darray[Ast::Decl], module_name: sview, table: lmut SymbolTable, function_names: mutable darray[sview]&, parameter_positions: mutable darray[usize]&, parameter_names: mutable darray[sview]&, parameter_families: mutable darray[DeclId]&, parameter_states: mutable darray[u32]&, parameter_known: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            for position in 0..<parameters.count |table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known|:
+                                parameter: Ast::ParamDecl = parameters[position]
+                                visited: mutable darray[u32] = []
+                                rebind identity: BindingStateIdentity, table = resolve_binding_state_identity(parameter.type_expression, module_name, visited, table)
+                                function_names.push(function_name)
+                                parameter_positions.push(position)
+                                parameter_names.push(parameter.name)
+                                parameter_families.push(identity.family_id)
+                                parameter_states.push(identity.state_index)
+                                parameter_known.push(identity.known and identity.protocol)
+                        Decl.Module(child_module, body, module_line):
+                            table <- collect_protocol_call_parameters(body, child_module, table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        Decl.Scoped(body, scoped_line):
+                            table <- collect_protocol_call_parameters(body, module_name, table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        _:
+                            pass
+
+        def protocol_call_parameter_row(function_name: sview, argument_position: usize, argument_name: sview, function_names: darray[sview]&, parameter_positions: darray[usize]&, parameter_names: darray[sview]&) -> i64:
+            can Abort.Panic:
+                for row in 0..<function_names.count:
+                    continue if function_names[row] != function_name
+                    if argument_name != "":
+                        return row.i64() if parameter_names[row] == argument_name
+                    else:
+                        return row.i64() if parameter_positions[row] == argument_position
+                return -1
+
+        def protocol_call_add_unknown_pattern_binders(pattern: Ast::Pattern, local_names: mutable darray[sview]&, local_families: mutable darray[DeclId]&, local_states: mutable darray[u32]&, local_known: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.Rest(name):
+                        if name != "":
+                            local_names.push(name)
+                            local_families.push(DeclId{value: 4294967295})
+                            local_states.push(4294967295)
+                            local_known.push(false)
+                    Pattern.TypeBind(type_name, binder):
+                        if binder != "":
+                            local_names.push(binder)
+                            local_families.push(DeclId{value: 4294967295})
+                            local_states.push(4294967295)
+                            local_known.push(false)
+                    Pattern.As(name, inner):
+                        if name != "":
+                            local_names.push(name)
+                            local_families.push(DeclId{value: 4294967295})
+                            local_states.push(4294967295)
+                            local_known.push(false)
+                        for subpattern in inner |local_names, local_families, local_states, local_known|:
+                            protocol_call_add_unknown_pattern_binders(subpattern, local_names, local_families, local_states, local_known)
+                    Pattern.Variant(path, fields) | Pattern.Struct(path, fields) | Pattern.Field(selector, fields):
+                        for subpattern in fields |local_names, local_families, local_states, local_known|:
+                            protocol_call_add_unknown_pattern_binders(subpattern, local_names, local_families, local_states, local_known)
+                    Pattern.Tuple(elements) | Pattern.Or(elements):
+                        for subpattern in elements |local_names, local_families, local_states, local_known|:
+                            protocol_call_add_unknown_pattern_binders(subpattern, local_names, local_families, local_states, local_known)
+                    Pattern.Other(_):
+                        # Opaque syntax may bind names we cannot enumerate. Shadow
+                        # every known outer state for this arm rather than guessing.
+                        outer_count: usize = local_names.count
+                        for index in 0..<outer_count |local_names, local_families, local_states, local_known|:
+                            local_names.push(local_names[index])
+                            local_families.push(DeclId{value: 4294967295})
+                            local_states.push(4294967295)
+                            local_known.push(false)
+                    _:
+                        pass
+
+        def check_protocol_call_state_arguments(callee: Ast::Expr, arguments: darray[Ast::Expr]&, argument_names: darray[sview]&, call_pos: Ast::Pos, local_names: darray[sview]&, local_families: darray[DeclId]&, local_states: darray[u32]&, local_known: mutable darray[bool]&, function_names: darray[sview]&, parameter_positions: darray[usize]&, parameter_names: darray[sview]&, parameter_families: darray[DeclId]&, parameter_states: darray[u32]&, parameter_known: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                function_name: sview = ident_name_of(callee)
+                return if function_name == "" or direct_function_count(table, function_name) != 1
+                for position in 0..<arguments.count |table, local_known|:
+                    argument_name: sview = protocol_call_local_name(arguments[position])
+                    local_index: i64 = protocol_call_local_index(local_names, argument_name) if argument_name != "" else -1
+                    named_argument: sview = argument_names[position] if position < argument_names.count else ""
+                    parameter_row: i64 = protocol_call_parameter_row(function_name, position, named_argument, function_names, parameter_positions, parameter_names)
+                    if local_index >= 0 and parameter_row >= 0:
+                        local_slot: usize = local_index.usize()
+                        parameter_slot: usize = parameter_row.usize()
+                        same_family: bool = local_families[local_slot].value == parameter_families[parameter_slot].value
+                        mismatch: bool = local_known[local_slot] and parameter_known[parameter_slot] and same_family and local_states[local_slot] != parameter_states[parameter_slot]
+                        expected_state: sview = protocol_call_state_name(table, parameter_families[parameter_slot], parameter_states[parameter_slot]) if mismatch else ""
+                        actual_state: sview = protocol_call_state_name(table, local_families[local_slot], local_states[local_slot]) if mismatch else ""
+                        if mismatch and expected_state != "" and actual_state != "":
+                            argument_position_span: Ast::Pos = Ast::expr_pos(arguments[position])
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypestateArgMismatch, name: function_name, pos: argument_position_span, line: call_pos.line, expected: expected_state, actual: actual_state})
+                    # Named protocol states are static type arguments, not runtime
+                    # mutable tags. A call cannot change this binding's state; moves
+                    # and later uses are checked by affine-flow analysis.
+
+        def walk_protocol_state_call_expression(expression: Ast::Expr, module_name: sview, local_names: mutable darray[sview]&, local_families: mutable darray[DeclId]&, local_states: mutable darray[u32]&, local_known: mutable darray[bool]&, function_names: darray[sview]&, parameter_positions: darray[usize]&, parameter_names: darray[sview]&, parameter_families: darray[DeclId]&, parameter_states: darray[u32]&, parameter_known: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        table <- walk_protocol_state_call_expression(callee, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        for argument in arguments |table|:
+                            table <- walk_protocol_state_call_expression(argument, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- check_protocol_call_state_arguments(callee, arguments, argument_names, call_pos, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_pos):
+                        table <- walk_protocol_state_call_expression(effect_type, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        for argument in arguments |table|:
+                            table <- walk_protocol_state_call_expression(argument, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Binary(left, operator, right, line):
+                        table <- walk_protocol_state_call_expression(left, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(right, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Unary(operator, operand, line) | Expr.Paren(operand, line) | Expr.Move(operand, line):
+                        table <- walk_protocol_state_call_expression(operand, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Field(object, field, line) | Expr.Scope(object, field, line):
+                        table <- walk_protocol_state_call_expression(object, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Index(object, index, line):
+                        table <- walk_protocol_state_call_expression(object, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(index, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.IndexN(object, indices, line):
+                        table <- walk_protocol_state_call_expression(object, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        for index in indices |table|:
+                            table <- walk_protocol_state_call_expression(index, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Slice(object, low, high, line):
+                        table <- walk_protocol_state_call_expression(object, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(low, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(high, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.RegionNew(operand, region, line):
+                        table <- walk_protocol_state_call_expression(operand, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |table|:
+                            table <- walk_protocol_state_call_expression(element, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |table|:
+                            table <- walk_protocol_state_call_expression(entry.key, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            table <- walk_protocol_state_call_expression(entry.value, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Construct(type_expression, fields, line):
+                        table <- walk_protocol_state_call_expression(type_expression, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        for field in fields |table|:
+                            table <- walk_protocol_state_call_expression(field.value, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.RecordUpdate(base, fields, line):
+                        table <- walk_protocol_state_call_expression(base, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        for field in fields |table|:
+                            table <- walk_protocol_state_call_expression(field.value, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.If(condition, then_expression, else_expression, line):
+                        table <- walk_protocol_state_call_expression(condition, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(then_expression, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(else_expression, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Refinement(base, predicate, line):
+                        table <- walk_protocol_state_call_expression(base, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(predicate, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        table <- walk_protocol_state_call_expression(scrutinee, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        for arm in arms |table, local_names, local_families, local_states, local_known|:
+                            arm_mark: usize = local_names.count
+                            protocol_call_add_unknown_pattern_binders(arm.pattern, local_names, local_families, local_states, local_known)
+                            table <- walk_protocol_state_call_expression(arm.guard, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            table <- walk_protocol_state_call_statements(arm.body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                            local_names.truncate(arm_mark)
+                            local_families.truncate(arm_mark)
+                            local_states.truncate(arm_mark)
+                            local_known.truncate(arm_mark)
+                    Expr.Comprehension(variable, iterable, condition, body, line):
+                        table <- walk_protocol_state_call_expression(iterable, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        comprehension_mark: usize = local_names.count
+                        local_names.push(variable)
+                        local_families.push(DeclId{value: 4294967295})
+                        local_states.push(4294967295)
+                        local_known.push(false)
+                        table <- walk_protocol_state_call_expression(condition, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_expression(body, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        local_names.truncate(comprehension_mark)
+                        local_families.truncate(comprehension_mark)
+                        local_states.truncate(comprehension_mark)
+                        local_known.truncate(comprehension_mark)
+                    Expr.Lambda(parameters, body, line):
+                        lambda_mark: usize = local_names.count
+                        for parameter in parameters |local_names, local_families, local_states, local_known|:
+                            local_names.push(parameter)
+                            local_families.push(DeclId{value: 4294967295})
+                            local_states.push(4294967295)
+                            local_known.push(false)
+                        table <- walk_protocol_state_call_statements(body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        local_names.truncate(lambda_mark)
+                        local_families.truncate(lambda_mark)
+                        local_states.truncate(lambda_mark)
+                        local_known.truncate(lambda_mark)
+                    Expr.Block(statements, value, captures, line):
+                        block_mark: usize = local_names.count
+                        table <- walk_protocol_state_call_statements(statements, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        table <- walk_protocol_state_call_expression(value, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        local_names.truncate(block_mark)
+                        local_families.truncate(block_mark)
+                        local_states.truncate(block_mark)
+                        local_known.truncate(block_mark)
+                    Expr.GetElse(guarded, recovery, line):
+                        table <- walk_protocol_state_call_expression(guarded, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        table <- walk_protocol_state_call_statements(recovery, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                    _:
+                        pass
+
+        def add_protocol_state_local(name: sview, type_expression: Ast::Expr, module_name: sview, table: lmut SymbolTable, local_names: mutable darray[sview]&, local_families: mutable darray[DeclId]&, local_states: mutable darray[u32]&, local_known: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                visited: mutable darray[u32] = []
+                rebind identity: BindingStateIdentity, table = resolve_binding_state_identity(type_expression, module_name, visited, table)
+                local_names.push(name)
+                local_families.push(identity.family_id)
+                local_states.push(identity.state_index)
+                local_known.push(identity.known and identity.protocol)
+
+        def walk_protocol_state_call_statements(statements: darray[Ast::Stmt], module_name: sview, table: lmut SymbolTable, local_names: mutable darray[sview]&, local_families: mutable darray[DeclId]&, local_states: mutable darray[u32]&, local_known: mutable darray[bool]&, function_names: darray[sview]&, parameter_positions: darray[usize]&, parameter_names: darray[sview]&, parameter_families: darray[DeclId]&, parameter_states: darray[u32]&, parameter_known: darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, local_names, local_families, local_states, local_known|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- walk_protocol_state_call_expression(expression, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- walk_protocol_state_call_expression(value, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            table <- add_protocol_state_local(name, type_expression, module_name, table, local_names, local_families, local_states, local_known)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- walk_protocol_state_call_expression(value, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            table <- walk_protocol_state_call_expression(target, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- walk_protocol_state_call_expression(returned, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- walk_protocol_state_call_expression(condition, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            then_mark: usize = local_names.count
+                            table <- walk_protocol_state_call_statements(then_body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                            local_names.truncate(then_mark)
+                            local_families.truncate(then_mark)
+                            local_states.truncate(then_mark)
+                            local_known.truncate(then_mark)
+                            else_mark: usize = local_names.count
+                            table <- walk_protocol_state_call_statements(else_body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                            local_names.truncate(else_mark)
+                            local_families.truncate(else_mark)
+                            local_states.truncate(else_mark)
+                            local_known.truncate(else_mark)
+                        Stmt.While(condition, body, line):
+                            table <- walk_protocol_state_call_expression(condition, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            loop_mark: usize = local_names.count
+                            table <- walk_protocol_state_call_statements(body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                            local_names.truncate(loop_mark)
+                            local_families.truncate(loop_mark)
+                            local_states.truncate(loop_mark)
+                            local_known.truncate(loop_mark)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- walk_protocol_state_call_expression(iterable, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            loop_mark: usize = local_names.count
+                            for variable in variables |local_names, local_families, local_states, local_known|:
+                                local_names.push(variable)
+                                local_families.push(DeclId{value: 4294967295})
+                                local_states.push(4294967295)
+                                local_known.push(false)
+                            table <- walk_protocol_state_call_statements(body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                            local_names.truncate(loop_mark)
+                            local_families.truncate(loop_mark)
+                            local_states.truncate(loop_mark)
+                            local_known.truncate(loop_mark)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            block_mark: usize = local_names.count
+                            local_names.push(binding) if binding != ""
+                            local_families.push(DeclId{value: 4294967295}) if binding != ""
+                            local_states.push(4294967295) if binding != ""
+                            local_known.push(false) if binding != ""
+                            table <- walk_protocol_state_call_statements(body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                            local_names.truncate(block_mark)
+                            local_families.truncate(block_mark)
+                            local_states.truncate(block_mark)
+                            local_known.truncate(block_mark)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- walk_protocol_state_call_expression(scrutinee, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                            for arm in arms |table, local_names, local_families, local_states, local_known|:
+                                arm_mark: usize = local_names.count
+                                protocol_call_add_unknown_pattern_binders(arm.pattern, local_names, local_families, local_states, local_known)
+                                table <- walk_protocol_state_call_expression(arm.guard, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                                table <- walk_protocol_state_call_statements(arm.body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                                local_names.truncate(arm_mark)
+                                local_families.truncate(arm_mark)
+                                local_states.truncate(arm_mark)
+                                local_known.truncate(arm_mark)
+                        Stmt.Contract(kind, expression, line):
+                            table <- walk_protocol_state_call_expression(expression, module_name, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known, table)
+                        _:
+                            pass
+
+        def walk_protocol_state_call_declarations(declarations: darray[Ast::Decl], module_name: sview, table: lmut SymbolTable, function_names: darray[sview]&, parameter_positions: darray[usize]&, parameter_names: darray[sview]&, parameter_families: darray[DeclId]&, parameter_states: darray[u32]&, parameter_known: darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            local_names: mutable darray[sview] = []
+                            local_families: mutable darray[DeclId] = []
+                            local_states: mutable darray[u32] = []
+                            local_known: mutable darray[bool] = []
+                            for parameter in parameters |table, local_names, local_families, local_states, local_known|:
+                                table <- add_protocol_state_local(parameter.name, parameter.type_expression, module_name, table, local_names, local_families, local_states, local_known)
+                            table <- walk_protocol_state_call_statements(body, module_name, table, local_names, local_families, local_states, local_known, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        Decl.Module(child_module, body, module_line):
+                            table <- walk_protocol_state_call_declarations(body, child_module, table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        Decl.Scoped(body, scoped_line):
+                            table <- walk_protocol_state_call_declarations(body, module_name, table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                        _:
+                            pass
+
+    public:
+        def check_protocol_state_call_arguments(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if table.resolved_state_families.count == 0
+                function_names: mutable darray[sview] = []
+                parameter_positions: mutable darray[usize] = []
+                parameter_names: mutable darray[sview] = []
+                parameter_families: mutable darray[DeclId] = []
+                parameter_states: mutable darray[u32] = []
+                parameter_known: mutable darray[bool] = []
+                table <- collect_protocol_call_parameters(file.top_decls, "", table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
+                table <- walk_protocol_state_call_declarations(file.top_decls, "", table, function_names, parameter_positions, parameter_names, parameter_families, parameter_states, parameter_known)
