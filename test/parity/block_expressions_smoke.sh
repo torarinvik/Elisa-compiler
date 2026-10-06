@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Run the forms, not just their parser: scope, value inference, update, and cleanup.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -22,7 +23,7 @@ for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_e
             obj, exe = work / (artifact + '.o'), work / artifact
             source = Path(root) / 'test/differential/cases' / (fixture + '.elisa')
             subprocess.run([compiler, '-emit', 'obj', level, '-o', str(obj), str(source)], check=True, timeout=60)
-            subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(Path(root)/'build/runtime/elisacore_runtime.o')], check=True)
+            subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(Path(root)/'build/runtime/elisacore_runtime.o')], check=True)
             result = subprocess.run([str(exe)], capture_output=True, timeout=90)
             assert result.returncode == 0, (fixture, compiler, level, result.returncode, result.stdout, result.stderr)
             outputs.append((result.stdout, result.stderr))

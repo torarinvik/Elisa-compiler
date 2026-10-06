@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -33,7 +34,7 @@ for optimization in 0 2; do
         cat "$stage0.compile.log" >&2
         exit 1
     fi
-    if ! clang -Wl,-dead_strip -o "$stage0" "$stage0_archive" >"$stage0.link.log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stage0" "$stage0_archive" >"$stage0.link.log" 2>&1; then
         echo "JSON opaque DOM smoke: failed to link stage0 at O$optimization" >&2
         cat "$stage0.link.log" >&2
         exit 1

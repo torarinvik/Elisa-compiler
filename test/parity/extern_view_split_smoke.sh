@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # `view[T]` parameters of a C-ABI extern cross as (ptr, len) in both compilers (docs/127
 # §3.3): the declared LLVM signatures are byte-identical, an extern without an explicit C
 # calling convention keeps %DynArrayView, and a program calling libc strnlen through a
@@ -34,7 +35,7 @@ codes = []
 for stage, compiler in enumerate((stage0, stage1)):
     obj, exe = work / f'split{stage}.o', work / f'split{stage}'
     subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(source)], check=True, timeout=60)
-    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
+    subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
     codes.append(subprocess.run([str(exe)], timeout=90).returncode)
 assert codes == [0, 0], codes
 print('extern_view_split: declarations byte-identical, runtime PASS', flush=True)
@@ -47,7 +48,7 @@ for stage, compiler in enumerate((stage0, stage1)):
     assert 'declare i64 @strnlen(ptr, i64)' in ll.read_text(), (compiler, 'declaration')
     obj, exe = work / f'bounds{stage}.o', work / f'bounds{stage}'
     subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(source)], check=True, timeout=60)
-    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
+    subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
     codes.append(subprocess.run([str(exe)], timeout=90).returncode)
 assert codes == [0, 0], codes
 print('extern_bounds: declaration, runtime PASS', flush=True)
@@ -116,7 +117,7 @@ for stage, r in enumerate(tail_results):
     assert r.returncode not in (139, -11), (f'stage{stage} CRASHED on a packed tail view crossing to C', r.returncode)
 assert tail_results[0].returncode == 0, ('stage0 must still compile the tail view', tail_results[0].stderr)
 tail_exe = work / 'tail0'
-subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(tail_exe), str(work / 'tail0.o'), str(work / 'sumf.o'),
+subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(tail_exe), str(work / 'tail0.o'), str(work / 'sumf.o'),
                 str(work / 'hooks.o'), str(root / 'build/runtime/elisacore_runtime.o')], check=True)
 assert subprocess.run([str(tail_exe)], timeout=90).returncode == 6, 'stage0 tail view must sum 1+2+3 through C'
 assert tail_results[1].returncode != 0, 'stage1 gained packed tail-view binding; promote this to a parity check'

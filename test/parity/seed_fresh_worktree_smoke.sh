@@ -13,7 +13,7 @@ mkdir -p "$WORK/scripts" "$WORK/src/driver" "$WORK/core/compiler/bin" "$WORK/cor
 # and the seed half shells out to write_profiler_hook_fallbacks.sh to refresh the
 # runtime's optional-hook object (3c7e6552), so that has to come along too or the
 # seed dies on a missing file in a worktree that is otherwise complete.
-for part in elisac_stage1.sh process_rss.sh assert_stage0_fresh.sh assert_stage1_fresh.sh elisac_stage1_seed.sh write_profiler_hook_fallbacks.sh build_runtime_object.sh stage1_provenance.py; do
+for part in platform.sh elisac_stage1.sh process_rss.sh assert_stage0_fresh.sh assert_stage1_fresh.sh elisac_stage1_seed.sh write_profiler_hook_fallbacks.sh build_runtime_object.sh stage1_provenance.py; do
   cp "$ROOT/scripts/$part" "$WORK/scripts/$part"
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"

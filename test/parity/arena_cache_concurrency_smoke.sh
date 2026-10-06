@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -33,7 +34,7 @@ for optimization in 0 2; do
         cat "$log" >&2
         exit 1
     fi
-    if ! clang -Wl,-dead_strip -o "$stage0_executable" "$stage0_archive" >"$log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stage0_executable" "$stage0_archive" >"$log" 2>&1; then
         echo "arena cache concurrency smoke: failed to link stage0 output at O$optimization" >&2
         cat "$log" >&2
         exit 1

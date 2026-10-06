@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage1 regression: a void error call with the explicit no-op recovery.
 #
 # `try f() else void` is a valid statement when f returns void error[E]. It still
@@ -14,7 +15,7 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 SOURCE="$ROOT/test/repro/try_void_else_void.elisa"
 PATHS_SOURCE="$ROOT/test/repro/try_void_recovery_paths.elisa"
-CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-try-void.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 

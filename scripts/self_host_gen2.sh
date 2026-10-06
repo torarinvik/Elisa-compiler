@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/platform.sh"  # host flags/paths: scripts/platform.sh
 # Attempt gen1 → gen2 product rebuild without stage0.
 #
 # Requires a seed product binary (scripts/elisac_stage1.sh --seed).
@@ -13,7 +14,7 @@ OUT_DIR="${1:-$ROOT/build/self_host_gen2}"
 mkdir -p "$OUT_DIR"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 
 [[ -x "$BIN" ]] || { echo "missing product binary $BIN" >&2; exit 2; }
@@ -22,7 +23,7 @@ unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN"
 # ELISA_TOOL_SHIM_DIR (Linux gate hosts): the clang shim that maps Apple link flags must win
 # over a system /usr/bin/clang.
-export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin:/usr/local/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
+export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:${ELISA_BREW_BIN:+$ELISA_BREW_BIN:}$ELISA_LLVM_BIN_DIR:/usr/local/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 DEFAULT_SELF_HOST_GEN2_MAX_RSS_KB=8388608
 DEFAULT_SELF_HOST_GEN2_POLL_SECONDS=0.05
@@ -70,13 +71,13 @@ file "$BIN"
 run_guarded_stage1
 # -stack_size 512MB (arm64 ld64 max) — same rationale as scripts/elisac_stage1.sh's
 # seed_build: emit_expression recurses once per AST level, and this is the product binary.
-clang -Wl,-dead_strip -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
 echo "wrote $OUT_DIR/elisac-stage1-gen2"
 # Fixture parity with gen2
 printf 'def main() -> i64:\n    return 42\n' >"$OUT_DIR/fix.elisa"
 export ELISA_STAGE1_BIN="$OUT_DIR/elisac-stage1-gen2"
 bash "$ROOT/scripts/elisac_stage1.sh" -o "$OUT_DIR/fix.o" "$OUT_DIR/fix.elisa"
-clang -Wl,-dead_strip -o "$OUT_DIR/fix" "$OUT_DIR/fix.o" "$RUNTIME_OBJ"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/fix" "$OUT_DIR/fix.o" "$RUNTIME_OBJ"
 set +e
 "$OUT_DIR/fix"
 rc=$?

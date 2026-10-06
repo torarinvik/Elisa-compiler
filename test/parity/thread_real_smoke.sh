@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage1 THREADING beachhead smoke: compile programs that spawn REAL OS threads via the
 # pthread externs through the stage1 backend and assert their real BEHAVIOR (exit code).
 # This is the first proof that stage1 emits the core concurrency primitives correctly —
@@ -16,7 +17,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 
 [ -x "$ELISACORE_BIN" ] || { echo "thread_real_smoke FAIL: no elisac" >&2; exit 1; }
 [ -x "$LLVM_CONFIG" ] || { echo "thread_real_smoke FAIL: no llvm-config" >&2; exit 1; }
@@ -55,7 +56,7 @@ thread_case() {
         echo "  FAIL $name: stage1 declined the thread program"; return; fi
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
         echo "  FAIL $name: link failed"; return; fi
     local r
     for r in $(seq 1 "$times"); do
@@ -115,7 +116,7 @@ mutex_case() {
     if [ -z "$emitted" ]; then echo "  FAIL $name: no [N x i8] opaque blob emitted (still a ptr handle?)"; return; fi
     if [ "$emitted" != "$csize" ]; then echo "  FAIL $name: stage1 sized $ctype as $emitted bytes, C sizeof is $csize (would corrupt)"; return; fi
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then echo "  FAIL $name: llc rejected the IR"; return; fi
-    if ! clang -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then echo "  FAIL $name: link failed"; return; fi
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then echo "  FAIL $name: link failed"; return; fi
     local r
     for r in 1 2 3 4 5; do
         RUN "$exe"; local got=$?

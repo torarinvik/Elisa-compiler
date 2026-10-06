@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Build test/breadth/emit_native (the stage0-compiled LLVM-IR emitter twelve gate checks
 # drive) ONCE, fresh and race-free. Sourced or executed; expects REPO_ROOT (or derives it).
 #
@@ -10,7 +11,7 @@
 REPO_ROOT="${REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 PROFILE_HOOKS="$ELISA_CORE/compiler/runtime/profile_hooks.c"
 EMIT_NATIVE="${ELISA_EMIT_NATIVE:-$REPO_ROOT/build/emit_native}"
 mkdir -p "$(dirname -- "$EMIT_NATIVE")"
@@ -42,7 +43,7 @@ if ! bash "$REPO_ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$_en_hooks" 2>
   echo "build_emit_native: could not generate profile hook fallback" >&2; sed -n '1,10p' "$_en_log" >&2
   rm -f "$_en_obj" "$_en_hooks" "$_en_log"; return 1 2>/dev/null || exit 1
 fi
-if ! clang -o "$_en_tmp" "$_en_obj" "$_en_hooks" -L"$_en_libdir" -lLLVM -Wl,-rpath,"$_en_libdir" 2>"$_en_log"; then
+if ! clang -o "$_en_tmp" "$_en_obj" "$_en_hooks" -L"$_en_libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$_en_libdir" 2>"$_en_log"; then
   echo "build_emit_native: could not link emit_native" >&2; sed -n '1,10p' "$_en_log" >&2
   rm -f "$_en_obj" "$_en_hooks" "$_en_tmp" "$_en_log"; return 1 2>/dev/null || exit 1
 fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Runtime benchmark for GENERATED code: each program is built by stage1 -O2, stage0 -O2 and
 # (as the floor) the equivalent C at clang -O2, exit codes are cross-checked, then each binary
 # is timed (best of REPEAT runs, child CPU time) and, with CALLGRIND=1, counted (instructions, noise-free).
@@ -32,10 +33,10 @@ for b in "${benches[@]}"; do
   src="$HERE/$b.elisa"
   if [[ -n "${S1_BIN:-}" ]]; then s1=("$S1_BIN" -emit obj); else s1=(bash "$ROOT/scripts/elisac_stage1.sh"); fi
   "${s1[@]}" -O2 -o "$OUT/$b.s1.o" "$src" >"$OUT/$b.s1.log" 2>&1 &&
-    clang -Wl,-dead_strip -o "$OUT/$b.s1" "$OUT/$b.s1.o" "$RUNTIME" >>"$OUT/$b.s1.log" 2>&1 || echo "$b: stage1 build failed (see $OUT/$b.s1.log)"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$b.s1" "$OUT/$b.s1.o" "$RUNTIME" >>"$OUT/$b.s1.log" 2>&1 || echo "$b: stage1 build failed (see $OUT/$b.s1.log)"
   if [[ -z "${SKIP_S0:-}" && -n "$S0" ]]; then
     "$S0" -emit obj -O2 -o "$OUT/$b.s0.o" "$src" >"$OUT/$b.s0.log" 2>&1 &&
-      clang -Wl,-dead_strip -o "$OUT/$b.s0" "$OUT/$b.s0.o" "$RUNTIME" >>"$OUT/$b.s0.log" 2>&1 || echo "$b: stage0 build failed"
+      clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$b.s0" "$OUT/$b.s0.o" "$RUNTIME" >>"$OUT/$b.s0.log" 2>&1 || echo "$b: stage0 build failed"
     # (Always with the runtime object: on Linux the clang shim ignores unresolved symbols,
     # so a runtime-less link "succeeds" and the program calls address 0.)
   fi

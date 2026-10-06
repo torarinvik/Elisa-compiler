@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage1 backend smoke: local SCOPE, `is`-binding SLOTS, and match ALTERNATION arms,
 # asserted by exit code.
 #
@@ -67,7 +68,7 @@ differential() {
     if ! "$ELISACORE_BIN" -emit obj -o "$WORK/$name.s0.o" "$WORK/$name.elisa" >"$WORK/$name.s0.log" 2>&1; then
         echo "  FAIL $name: stage0 did not compile the case"; sed -n '1,5p' "$WORK/$name.s0.log"; fail=$((fail + 1)); return
     fi
-    if ! clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME_OBJ" >>"$WORK/$name.s0.log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME_OBJ" >>"$WORK/$name.s0.log" 2>&1; then
         echo "  FAIL $name: stage0 object did not link"; sed -n '1,5p' "$WORK/$name.s0.log"; fail=$((fail + 1)); return
     fi
     RUN "$WORK/$name.s0"; local s0=$?
@@ -75,7 +76,7 @@ differential() {
     if ! ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/$name.s1.o" "$WORK/$name.elisa" >"$WORK/$name.s1.log" 2>&1; then
         echo "  FAIL $name: stage1 did not compile the case"; sed -n '1,5p' "$WORK/$name.s1.log"; fail=$((fail + 1)); return
     fi
-    if ! clang -Wl,-dead_strip -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME_OBJ" >>"$WORK/$name.s1.log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME_OBJ" >>"$WORK/$name.s1.log" 2>&1; then
         echo "  FAIL $name: stage1 object did not link"; sed -n '1,5p' "$WORK/$name.s1.log"; fail=$((fail + 1)); return
     fi
     RUN "$WORK/$name.s1"; local s1=$?

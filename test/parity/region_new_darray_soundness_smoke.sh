@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -57,11 +58,11 @@ run_valid_case() {
             bash "$compiler" -emit obj "-$opt" -o "$WORK/$name-$stage-$opt.o" "$source" >"$WORK/$name-$stage-$opt.log" 2>&1
         fi
         if [[ "$stage" == "stage0" ]]; then
-            if ! clang -Wl,-dead_strip -o "$WORK/$name-$stage-$opt" "$WORK/$name-$stage-$opt.o" >>"$WORK/$name-$stage-$opt.log" 2>&1; then
-                clang -Wl,-dead_strip -o "$WORK/$name-$stage-$opt" "$WORK/$name-$stage-$opt.o" "$RUNTIME" >>"$WORK/$name-$stage-$opt.log" 2>&1
+            if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name-$stage-$opt" "$WORK/$name-$stage-$opt.o" >>"$WORK/$name-$stage-$opt.log" 2>&1; then
+                clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name-$stage-$opt" "$WORK/$name-$stage-$opt.o" "$RUNTIME" >>"$WORK/$name-$stage-$opt.log" 2>&1
             fi
         else
-            clang -Wl,-dead_strip -o "$WORK/$name-$stage-$opt" "$WORK/$name-$stage-$opt.o" "$RUNTIME" >>"$WORK/$name-$stage-$opt.log" 2>&1
+            clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name-$stage-$opt" "$WORK/$name-$stage-$opt.o" "$RUNTIME" >>"$WORK/$name-$stage-$opt.log" 2>&1
         fi
         "$WORK/$name-$stage-$opt"
     done

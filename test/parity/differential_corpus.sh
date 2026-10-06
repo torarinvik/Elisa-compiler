@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # BEHAVIOURAL differential: compile a corpus of real programs with BOTH compilers, RUN
 # both, and require the same exit code.
 #
@@ -123,15 +124,15 @@ COMPILE() {
 #
 # Both compilers go through this same function, so whichever recipe wins is the same for
 # each and the comparison stays fair.
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LLVM_LIBDIR="$("$LLVM_CONFIG" --libdir 2>/dev/null || true)"
 link_program() {
     local out="$1" obj="$2"
-    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
-    clang -Wl,-dead_strip -o "$out" "$obj" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$out" "$obj" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
     [ -n "$LLVM_LIBDIR" ] || return 1
-    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" \
-        -L"$LLVM_LIBDIR" -lLLVM -Wl,-rpath,"$LLVM_LIBDIR" >/dev/null 2>&1 && return 0
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" \
+        -L"$LLVM_LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LLVM_LIBDIR" >/dev/null 2>&1 && return 0
     return 1
 }
 

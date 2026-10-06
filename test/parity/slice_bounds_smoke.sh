@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # `view[T]` indexing traps and slices CLAMP -- at -O0 and -O2, in both compilers.
 #
 # Two stage1 memory-safety defects (memsafe audit S1a/S1b, 2026-09-22), measured against
@@ -82,7 +83,7 @@ cs_slice 1 3 2'
 
 run_one() {   # $1 = label, $2 = compiler, $3 = opt, $4 = source, $5 = exe; prints exit code or BUILD
     "$2" -emit obj "$3" -o "$5.o" "$4" >"$5.log" 2>&1 || { echo "BUILD($(grep -a -m1 -i error "$5.log" | cut -c1-120))"; return; }
-    clang -Wl,-dead_strip -o "$5" "$5.o" "$WORK/hooks.c" "$RUNTIME" >>"$5.log" 2>&1 || { echo LINK; return; }
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$5" "$5.o" "$WORK/hooks.c" "$RUNTIME" >>"$5.log" 2>&1 || { echo LINK; return; }
     "$5" >/dev/null 2>&1
     echo $?
 }

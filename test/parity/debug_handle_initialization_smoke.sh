@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Debug builder and file handles stay absent until initialized, and valid DWARF
 # still reaches emitted objects when debug info is requested.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 [ -x "$STAGE1" ] || { echo "debug_handle_initialization_smoke FAIL: no stage1 compiler at $STAGE1" >&2; exit 1; }
 [ -x "$LLVM_CONFIG" ] || { echo "debug_handle_initialization_smoke SKIP: no llvm-config"; exit 0; }

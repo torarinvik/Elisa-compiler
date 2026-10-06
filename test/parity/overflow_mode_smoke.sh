@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Signed-overflow mode: `-foverflow=trap` (the DEFAULT) and `-foverflow=wrap`.
 #
 # `i64::MAX + 1`, computed from a runtime value so neither compiler can fold it, must:
@@ -50,7 +51,7 @@ run() {
         echo "overflow smoke FAILED: $label did not compile: $(head -n 1 "$exe.log")" >&2
         failed=$((failed + 1)); return
     fi
-    if ! clang -Wl,-dead_strip -o "$exe" "$exe.o" "$WORK/hooks.c" "$RUNTIME" >>"$exe.log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$exe.o" "$WORK/hooks.c" "$RUNTIME" >>"$exe.log" 2>&1; then
         echo "overflow smoke FAILED: $label did not link" >&2
         failed=$((failed + 1)); return
     fi

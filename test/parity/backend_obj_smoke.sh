@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # The DRIVER gate: stage1 emits a native OBJECT itself (target machine +
 # LLVMTargetMachineEmitToFile), with NO `llc` in the pipeline.
 #
@@ -12,7 +13,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 [ -x "$ELISACORE_BIN" ] || { echo "backend_obj_smoke FAIL: no elisac" >&2; exit 1; }
 [ -x "$LLVM_CONFIG" ] || { echo "backend_obj_smoke FAIL: no llvm-config" >&2; exit 1; }
 # arm64-only: the driver binds LLVMInitializeAArch64* directly, because
@@ -44,7 +45,7 @@ elisa_native_optional_hook_objects "$BUILD" "$ROOT"
 # profiler hooks, no runtime object), because a driver carries its own runtime; the runtime
 # object exists for the SMALL programs the driver emits, and is used on the per-case link
 # below. Same flags as the seed so this gate measures the link the product actually gets.
-clang -Wl,-dead_strip -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000 \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0
@@ -62,7 +63,7 @@ obj_case() {
     # The complete runtime object contains optional callback/varargs helpers whose host
     # symbols are intentionally supplied only by pymodule hosts. Dead-strip unused runtime
     # sections so a standalone native smoke program links the same way as the normal driver.
-    clang -Wl,-dead_strip -o "$dir/prog" "$dir/stage1_out.o" "$RUNTIME_OBJ" 2>/dev/null \
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$dir/prog" "$dir/stage1_out.o" "$RUNTIME_OBJ" 2>/dev/null \
       || { echo "  FAIL obj_$name: link"; return; }
     RUN "$dir/prog"; local got=$?
     if [ "$got" -ne "$want" ]; then echo "  FAIL obj_$name: got $got want $want"; return; fi
@@ -347,7 +348,7 @@ debug_ir_case() {
     local dir="$BUILD/obj_dbgir"; mkdir -p "$dir"
     if [ ! -f "$BUILD/emit_obj_debug_ir" ]; then
         if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj_debug_ir.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" 2>/dev/null \
-           || ! clang -Wl,-dead_strip -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
+           || ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
             echo "  FAIL obj_dbgir_$name: could not build emit_obj_debug_ir"; return
         fi
     fi

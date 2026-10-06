@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/platform.sh"  # host flags/paths: scripts/platform.sh
 # Host-facing entry point for the stage1 product compiler.
 #
 # Since §4.6 this parses NOTHING. `bin/elisac-stage1` is the compiler's only front door:
@@ -40,7 +41,7 @@ BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 if [[ -n "${ELISA_STAGE1_BIN:-}" && -f "$BIN" ]] && grep -a -q '^#!/usr/bin/env bash$' "$BIN"; then
   BIN="$ROOT/bin/elisac-stage1"
 fi
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 # Keep the host linker in the same LLVM installation as the C API library used to
 # build the stage1 product. Apple clang can link ordinary objects, but it may not
 # parse textual IR printed by a newer Homebrew LLVM (for example, LLVM 22 emits

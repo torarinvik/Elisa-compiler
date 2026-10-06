@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
     echo "easm_project_driver_smoke FAIL: stage0 compiler or llvm-config not found" >&2
     exit 1
@@ -33,7 +34,7 @@ fi
 # the profiler ABI unconditionally), which is what kept this gate red.
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$ROOT/build" "$ROOT"
-if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$("$LLVM_CONFIG" --libdir)" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_project_driver_smoke FAILED: project driver did not link"
     exit 1
 fi
@@ -72,7 +73,7 @@ mkdir -p "$artifact_root"
 cp "$ROOT/test/fixtures/easm/template_thunk.easm" "$artifact_root/template.easm"
 cp "$ROOT/test/fixtures/easm/project_export.easm" "$artifact_root/export.easm"
 cp "$ROOT/test/fixtures/easm/lockstep_equiv.easm" "$artifact_root/lockstep.easm"
-artifact=$(python3 "$ROOT/scripts/easm_project_driver.py" "$artifact_root" --driver "$ROOT/build/easm_project_driver" --mode artifact --llvm-mc "${LLVM_MC:-/opt/homebrew/opt/llvm/bin/llvm-mc}" --lockstep-symbolic)
+artifact=$(python3 "$ROOT/scripts/easm_project_driver.py" "$artifact_root" --driver "$ROOT/build/easm_project_driver" --mode artifact --llvm-mc "${LLVM_MC:-$ELISA_LLVM_BIN_DIR/llvm-mc}" --lockstep-symbolic)
 python3 -c 'import json,sys; a=json.loads(sys.argv[1]); assert "template" in a["report"]; assert "finish" in a["assembly"] or ".text" in a["assembly"]; assert a["templates"] and a["templates"][0]["image"]["patches"]' "$artifact" || {
     echo "easm_project_driver_smoke FAILED: template artifact integration was incomplete"
     exit 1

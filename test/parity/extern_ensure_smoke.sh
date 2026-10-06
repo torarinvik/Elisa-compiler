@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # docs/127 D8 — a native extern's `ensure` is CHECKED at the call boundary in both compilers.
 # Four things must agree: the guard is emitted for an untrusted extern and NOT for a
 # @trusted one, the bounded form reads the view's own length, a LYING library is stopped at
@@ -54,7 +55,7 @@ print('extern_ensure: one guard each, @trusted exempt, declarations byte-identic
 for stage, compiler in enumerate((stage0, stage1)):
     obj, exe = work / f'ens{stage}.o', work / f'ens{stage}'
     subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(source)], check=True, timeout=60)
-    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(runtime)], check=True)
+    subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(runtime)], check=True)
     code = subprocess.run([str(exe)], timeout=90).returncode
     assert code == 0, f'stage{stage} bounded fixture exit {code}'
 print('extern_ensure: bounded ensure over a view runs clean in both PASS', flush=True)
@@ -64,7 +65,7 @@ lying = work / 'lying.elisa'
 for stage, compiler in enumerate((stage0, stage1)):
     obj, exe = work / f'lie{stage}.o', work / f'lie{stage}'
     subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(lying)], check=True, timeout=60)
-    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'lying.o'), str(work/'hooks.o'), str(runtime)], check=True)
+    subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'lying.o'), str(work/'hooks.o'), str(runtime)], check=True)
     done = subprocess.run([str(exe)], capture_output=True, text=True, timeout=90)
     assert done.returncode != 0, f'stage{stage} accepted a lying extern (exit 0)'
     message = done.stdout + done.stderr

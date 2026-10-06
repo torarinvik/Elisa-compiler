@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 if [[ ! -x "$STAGE1" || ! -f "$RUNTIME" || ! -x "$CLANG" ]]; then
     echo "effect type reference smoke FAIL: local compiler/runtime/clang unavailable" >&2
     exit 1
@@ -18,7 +19,7 @@ ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" -O0 -emit obj \
     exit 1
 }
 if [[ "$(uname -s)" == Darwin ]]; then
-    "$CLANG" -Wl,-dead_strip "$WORK/check.o" "$RUNTIME" -o "$WORK/check"
+    "$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS "$WORK/check.o" "$RUNTIME" -o "$WORK/check"
 else
     "$CLANG" "$WORK/check.o" "$RUNTIME" -o "$WORK/check"
 fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Same-name exports must be reachable from C under their own names, with the C
 # ABI, from BOTH compilers: a scalar export is the implementation itself, an
 # 8-byte aggregate export is a wrapper (implementation renamed `.impl`), a
@@ -64,7 +65,7 @@ run_one() {
     # Mach-O prefixes C symbols with `_`; ELF does not.
     nm "$dir/mod.o" | grep -E " T _?${sym#_}\$" >/dev/null || { echo "export_same_name_smoke FAIL [$label]: $sym is not an external symbol"; nm "$dir/mod.o" | grep -i "$sym" || true; status=1; return; }
   done
-  if ! clang -Wl,-dead_strip -I"$dir" -o "$dir/caller" "$BUILD/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: link"; head -5 "$dir/link.log"; status=1; return; fi
+  if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -I"$dir" -o "$dir/caller" "$BUILD/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: link"; head -5 "$dir/link.log"; status=1; return; fi
   out="$("$dir/caller" || true)"
   if [ "$out" != "ALL OK" ]; then echo "export_same_name_smoke FAIL [$label]: C caller says: $out"; status=1; return; fi
   echo "export_same_name_smoke OK [$label]: ALL OK from C"

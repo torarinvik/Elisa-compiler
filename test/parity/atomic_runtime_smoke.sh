@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -63,7 +64,7 @@ for optimization in 0 2; do
     if ! "$STAGE0" -emit c-archive "-O$optimization" -o "$stage0_archive" "$SOURCE" >"$log" 2>&1; then
         fail "stage0 failed to emit archive at O$optimization: $(tail -n 12 "$log")"
     fi
-    if ! clang -Wl,-dead_strip -o "$stage0_executable" "$stage0_archive" >"$log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stage0_executable" "$stage0_archive" >"$log" 2>&1; then
         fail "could not link stage0 archive at O$optimization: $(tail -n 12 "$log")"
     fi
     for stage in stage0 stage1; do

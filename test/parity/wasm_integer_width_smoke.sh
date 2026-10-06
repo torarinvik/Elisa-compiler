@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Integer WIDTH consistency on wasm32, validated and EXECUTED.
 #
 # The report: a usize range loop with a literal bound of 1024 gave "expected i64, found i32".
@@ -16,7 +17,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 [[ -x "$ROOT/bin/elisac-stage1" ]] || { echo "wasm_integer_width FAIL: no stage1 product" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "wasm_integer_width SKIP: no node"; exit 0; }
-command -v wasm-ld >/dev/null 2>&1 || [[ -x /opt/homebrew/opt/llvm/bin/wasm-ld ]] || { echo "wasm_integer_width SKIP: no wasm-ld"; exit 0; }
+command -v wasm-ld >/dev/null 2>&1 || [[ -x $ELISA_LLVM_BIN_DIR/wasm-ld ]] || { echo "wasm_integer_width SKIP: no wasm-ld"; exit 0; }
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 

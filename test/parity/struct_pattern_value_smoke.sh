@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Value-position struct patterns must use the same destructuring path as slot matches.
 set -euo pipefail
 
@@ -17,7 +18,7 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0-valid.o" "$VALID" >/dev/null 2>&1
 "$STAGE1" -emit llvm -O0 -o "$WORK/stage1-valid.ll" "$VALID" >/dev/null 2>&1
 ! rg -q '!elisa\.declined' "$WORK/stage1-valid.ll"
-"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage1-valid.ll"
+"${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}" -passes=verify -disable-output "$WORK/stage1-valid.ll"
 
 set +e
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0-invalid.o" "$INVALID" >/dev/null 2>&1

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Bounded, SEEDED stress of the module-private-state family through BOTH compilers (issue #4 of
 # the 2026-09 correctness audit). Usage: test/stress/run_stress.sh [SEED] [COUNT]  (default 7, 15)
 #
@@ -50,8 +51,8 @@ for src in "$CORPUS"/*.elisa; do
   if [[ $rc -ne 0 ]]; then
     [[ $rc -ge 128 && -n "$(command -v lldb)" ]] && lldb --batch -o run -o bt -- "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" -emit obj -o "$OUT/$name.o" "$src" >> "$OUT/$name.err" 2>&1
     record "$name" FAIL $rc "$cmd"; fail=$((fail+1)); continue; fi
-  clang -Wl,-dead_strip -o "$OUT/$name.s1" "$OUT/$name.o" "$RUNTIME" >> "$OUT/$name.err" 2>&1 || { record "$name" FAIL link "$cmd"; fail=$((fail+1)); continue; }
-  clang -Wl,-dead_strip -o "$OUT/$name.s0" "$OUT/$name.s0.o" >> "$OUT/$name.err" 2>&1 || clang -Wl,-dead_strip -o "$OUT/$name.s0" "$OUT/$name.s0.o" "$RUNTIME" >> "$OUT/$name.err" 2>&1
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$name.s1" "$OUT/$name.o" "$RUNTIME" >> "$OUT/$name.err" 2>&1 || { record "$name" FAIL link "$cmd"; fail=$((fail+1)); continue; }
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$name.s0" "$OUT/$name.s0.o" >> "$OUT/$name.err" 2>&1 || clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$name.s0" "$OUT/$name.s0.o" "$RUNTIME" >> "$OUT/$name.err" 2>&1
   timeout 20 "$OUT/$name.s1"; r1=$?; timeout 20 "$OUT/$name.s0"; r0=$?
   if [[ $r1 -eq 0 && $r0 -eq 0 ]]; then pass=$((pass+1)); else echo "run: stage1=$r1 stage0=$r0" >> "$OUT/$name.err"; record "$name" FAIL "$r1/$r0" "$cmd"; fail=$((fail+1)); fi
 done

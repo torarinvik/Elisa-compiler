@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Index bounds checks are the DEFAULT, at every optimization level, in both compilers.
 #
 # A store one past a fixed array must trap (SIGTRAP via llvm.trap) rather than land
@@ -42,7 +43,7 @@ probe 40 >"$WORK/outside.elisa"
 
 build() {   # $1 = compiler, $2 = opt, $3 = source, $4 = exe; prints the first failure line
     "$1" -emit obj "$2" -o "$4.o" "$3" >"$4.log" 2>&1 || { head -n 1 "$4.log"; return 1; }
-    clang -Wl,-dead_strip -o "$4" "$4.o" "$WORK/hooks.c" "$RUNTIME" >>"$4.log" 2>&1 || { grep -m1 -i error "$4.log"; return 1; }
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$4" "$4.o" "$WORK/hooks.c" "$RUNTIME" >>"$4.log" 2>&1 || { grep -m1 -i error "$4.log"; return 1; }
 }
 
 check() {   # $1 = compiler label, $2 = compiler, $3 = opt level

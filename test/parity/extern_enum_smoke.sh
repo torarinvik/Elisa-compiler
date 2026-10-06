@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # docs/127 D9 — a C enum's value set is open at the ABI, so `match` exhaustiveness over one is
 # only sound for a value VALIDATED on the way in. Four things must agree between the compilers:
 # the validated fixture RUNS clean at -O0 and -O2, the unchecked reinterpretation is refused
@@ -40,7 +41,7 @@ for level in ('-O0', '-O2'):
     for stage, compiler in enumerate((stage0, stage1)):
         obj, exe = work / f'fx{stage}{level}.o', work / f'fx{stage}{level}'
         subprocess.run([compiler, '-emit', 'obj', level, '-o', str(obj), str(source)], check=True, timeout=120)
-        subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(runtime)], check=True)
+        subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(runtime)], check=True)
         code = subprocess.run([str(exe)], timeout=90).returncode
         assert code == 0, f'stage{stage} {level} fixture exit {code}'
 print('extern_enum: validated fixture runs clean in both, -O0 and -O2 PASS', flush=True)

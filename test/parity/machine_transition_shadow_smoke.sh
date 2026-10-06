@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # A payload binder may have the same spelling as a field in the successor state.
 # The binder must be live while `-> Next(expr)` is evaluated, while the transition
 # store must target the enclosing machine state slot after that binder's scope ends.
@@ -29,13 +30,13 @@ run_case() {
 
     for optimization in O0 O2; do
     "$STAGE0" -emit obj "-$optimization" -o "$WORK/stage0-$label-$optimization.o" "$source" >/dev/null
-    clang -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
+    clang $ELISA_LD_ALLOW_UNDEFINED $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS \
       -o "$WORK/stage0-$label-$optimization" "$WORK/stage0-$label-$optimization.o" "$RUNTIME"
 
     ELISA_STAGE1_BIN="$STAGE1" \
       bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" \
       -o "$WORK/stage1-$label-$optimization.o" "$source" >/dev/null
-    clang -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
+    clang $ELISA_LD_ALLOW_UNDEFINED $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS \
       -o "$WORK/stage1-$label-$optimization" "$WORK/stage1-$label-$optimization.o" "$RUNTIME"
 
     set +e

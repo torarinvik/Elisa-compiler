@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage0/stage1 soundness regression: packed common metadata includes its module.
 set -euo pipefail
 
@@ -24,7 +25,7 @@ cc -fno-builtin "$WORK/stage0.o" "$RUNTIME_OBJ" \
 ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" "$STAGE1" -emit exe -O0 -o "$WORK/stage1" "$FIXTURE" >/dev/null 2>&1
 ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" "$STAGE1" -emit llvm -O0 -o "$WORK/stage1.ll" "$FIXTURE" >/dev/null 2>&1
 ! rg -q '!elisa\.declined' "$WORK/stage1.ll"
-"${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify -disable-output "$WORK/stage1.ll"
+"${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}" -passes=verify -disable-output "$WORK/stage1.ll"
 
 set +e
 "$WORK/stage0"

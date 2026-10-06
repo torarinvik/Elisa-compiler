@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
-LLC="${LLC:-/opt/homebrew/opt/llvm/bin/llc}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
+LLC="${LLC:-$ELISA_LLVM_BIN_DIR/llc}"
 [ -x "$ELISACORE_BIN" ] || { echo "backend_trace_smoke FAIL: no elisac" >&2; exit 1; }
 [ -x "$LLVM_CONFIG" ] || { echo "backend_trace_smoke FAIL: no llvm-config" >&2; exit 1; }
 [ -x "$LLC" ] || { echo "backend_trace_smoke SKIP: no llc"; exit 0; }
@@ -33,7 +34,7 @@ EOF
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
 clang -o "$BUILD/emit_trace" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/puts_shim.o" \
-    -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+    -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
 
 src=$'def helper(x: i64) -> i64:\n    y: i64 = x + 1\n    return y\n\ndef main() -> i64:\n    return helper(41)\n'
 printf '%s' "$src" | "$BUILD/emit_trace" > "$BUILD/trace.ll"

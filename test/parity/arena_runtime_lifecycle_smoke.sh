@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -35,7 +36,7 @@ for case_name in arena_lifetime_evidence arena_reuse_identity arena_rewind_lifec
     fi
     # The full arena source includes unused varargs entry points whose host macros
     # are not linkable functions. Keep those unrelated sections out of this fixture.
-    if ! clang -Wl,-dead_strip -o "$stage0_executable" "$stage0_archive" >"$log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stage0_executable" "$stage0_archive" >"$log" 2>&1; then
         echo "arena runtime lifecycle smoke: failed to link stage0 $case_name" >&2
         cat "$log" >&2
         exit 1

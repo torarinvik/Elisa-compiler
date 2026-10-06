@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Reference payloads must preserve nullability, pointer values, and blob extents.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-OPT="${ELISA_OPT:-${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}}"
+OPT="${ELISA_OPT:-${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-enum-ref.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
@@ -35,7 +36,7 @@ for compiler in "${compilers[@]}"; do
     for level in 0 2; do
         "$compiler" -emit llvm "-O$level" -target-triple wasm32-unknown-wasi -o "$WORK/wasm.ll" "$ROOT/test/repro/enum_reference_payload_roundtrip.elisa"
         "$OPT" -passes=verify -disable-output "$WORK/wasm.ll"
-        "${ELISA_WASM_CLANG:-/opt/homebrew/opt/llvm/bin/clang}" --target=wasm32-unknown-wasi -c "$WORK/wasm.ll" -o "$WORK/wasm.o"
+        "${ELISA_WASM_CLANG:-$ELISA_LLVM_BIN_DIR/clang}" --target=wasm32-unknown-wasi -c "$WORK/wasm.ll" -o "$WORK/wasm.o"
         rg -q 'target datalayout = .*p:32:32' "$WORK/wasm.ll"
     done
 done

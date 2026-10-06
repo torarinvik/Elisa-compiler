@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/platform.sh"  # host flags/paths: scripts/platform.sh
 # Rebuild the stage1 DRIVERS (emit_native / emit_obj) and FAIL LOUDLY if stage0 rejects the
 # tree. Compiling by hand and eyeballing the output does not work: stage0 prints hundreds of
 # warning lines whose text contains "error" (error_out_param, __error_set_family, ...), so a
@@ -10,7 +11,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 
@@ -41,7 +42,7 @@ for driver in emit_native emit_obj; do
     # recurses once per AST level — see the depth guard in codegen_scope.elisa's
     # expression_type and scripts/elisac_stage1.sh's seed_build for the same flag on the
     # product binary.
-    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000 2>>"$log"; then
+    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M 2>>"$log"; then
         echo "build_drivers FAILED: could not link $driver"; status=1; continue
     fi
     echo "build_drivers ok: $driver"

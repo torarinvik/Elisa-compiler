@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage1 REAL-STD set smoke: compile the ACTUAL elisacore_std set path (open-addressing
 # hash set, arena_set_add_or_panic / arena_set_contains) through the stage1 backend and
 # assert the program's real BEHAVIOR (exit code). End-to-end proof that `set` — literal
@@ -21,7 +22,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 STD="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/runtime/elisacore_std"
 
 [ -x "$ELISACORE_BIN" ] || { echo "set_real_smoke FAIL: no elisac" >&2; exit 1; }
@@ -93,7 +94,7 @@ PY
         echo "  FAIL $name: stage1 declined the real-std set program"; return; fi
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
         echo "  FAIL $name: link failed"; return; fi
     RUN "$exe"; local got=$?
     if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT"; return; fi

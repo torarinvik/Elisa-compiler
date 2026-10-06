@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
     echo "easm_coq_memstate_fidelity_smoke FAIL: stage0 compiler or llvm-config not found" >&2
     exit 1
@@ -19,7 +20,7 @@ fi
 if ! clang -o "$ROOT/build/easm_coq_memstate_fidelity_smoke" \
     "$ROOT/build/easm_coq_memstate_fidelity_smoke.o" \
     "$ROOT/test/parity/profile_hooks.c" \
-    -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
+    -L"$($LLVM_CONFIG --libdir)" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
     echo "easm_coq_memstate_fidelity_smoke FAILED: could not link lattice mirror"
     exit 1
 fi

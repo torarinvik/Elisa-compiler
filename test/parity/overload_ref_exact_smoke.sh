@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # A non-generic overload whose parameter is `T&` is an EXACT match for a plain `T` argument
 # and must beat a generic. exact_overload_row_matches compared Ref against the value kind, so
 # a user `def has(m: dict[i64, i64]&, k: i64)` lost `has(m, k)` to the std's generic
@@ -29,7 +30,7 @@ run_with() {
     local compiler="$1" src="$2" tag="$3"
     "$compiler" -emit obj "$src" -o "$TMP/$tag.o" >"$TMP/$tag.log" 2>&1 || { echo "compile-fail"; return; }
     [ -s "$TMP/$tag.o" ] || { echo "no-object"; return; }
-    clang -Wl,-dead_strip -o "$TMP/$tag" "$TMP/$tag.o" "$TMP/stub.o" 2>/dev/null || { echo "link-fail"; return; }
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$TMP/$tag" "$TMP/$tag.o" "$TMP/stub.o" 2>/dev/null || { echo "link-fail"; return; }
     elisa_run_timeout 30 "$TMP/$tag" >/dev/null 2>&1; echo "rc=$?"
 }
 fail=0; n=0

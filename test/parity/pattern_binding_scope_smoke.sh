@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Regression for pattern-binding scope and dominance. Match arms that reuse a binding name
 # must write one shared entry-block slot; otherwise a post-match read can load an arm-local
 # alloca that does not dominate the join (or silently select the wrong shadowing binding).
@@ -30,7 +31,7 @@ run_stage1() {
 
 run_binary() {
     local tag="$1"
-    clang -Wl,-dead_strip -o "$WORK/$tag" "$WORK/$tag.o" "$RUNTIME" "$WORK/profile_hooks.o"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$tag" "$WORK/$tag.o" "$RUNTIME" "$WORK/profile_hooks.o"
     set +e
     "$WORK/$tag"
     local actual=$?

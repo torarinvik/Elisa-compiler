@@ -1,3 +1,4 @@
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Sourced by tools/local_run.sh jobs: the Mac verification env, in a FILE so the job's argv
 # stays short and neutral. Mirrors tools/remote_env.sh; both derive everything from the repo.
 LDIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -6,7 +7,7 @@ export REPO_ROOT="$LDIR"
 export ELISA_CORE="${ELISA_CORE:-$LDIR/../../Go projects/Elisa-core}"
 export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$LDIR/bin/elisac-stage1}"
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$LDIR/build/runtime/elisacore_runtime.o}"
-export LLVM_CONFIG="${LLVM_CONFIG:-$(command -v llvm-config || echo /opt/homebrew/opt/llvm/bin/llvm-config)}"
+export LLVM_CONFIG="${LLVM_CONFIG:-$(command -v llvm-config || echo $ELISA_LLVM_BIN_DIR/llvm-config)}"
 export ELISA_LLVM_BIN_DIR="$("$LLVM_CONFIG" --bindir)"
 export LLC="${LLC:-$ELISA_LLVM_BIN_DIR/llc}" LLVM_MC="${LLVM_MC:-$ELISA_LLVM_BIN_DIR/llvm-mc}"
 export ELISA_LLVM_OPT="${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}"

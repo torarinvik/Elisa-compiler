@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,7 +15,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 [[ -f "$RUNTIME" ]] || { echo "catch_result_type_smoke FAIL: missing runtime object $RUNTIME" >&2; exit 1; }
 
 ELISA_STAGE1_BIN="$BIN" "$WRAPPER" -o "$WORK/catch.o" "$ROOT/test/repro/catch_result_type.elisa"
-clang -Wl,-dead_strip -o "$WORK/catch" "$WORK/catch.o" "$RUNTIME"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/catch" "$WORK/catch.o" "$RUNTIME"
 
 set +e
 "$WORK/catch"

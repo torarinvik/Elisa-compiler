@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
@@ -15,9 +16,9 @@ for fixture in differential/cases/region_output_assignment parity/parser_scratch
         [[ "$stage" == 0 ]] || compiler="$STAGE1"
         "$compiler" -emit obj -O2 -o "$WORK/result.o" "$ROOT/test/$fixture.elisa"
         if [[ "$stage" == 0 && "$fixture" == parity/parser_scratch_lifetime ]]; then
-            clang -Wl,-dead_strip -o "$executable" "$WORK/result.o" "$WORK/hooks.o"
+            clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$executable" "$WORK/result.o" "$WORK/hooks.o"
         else
-            clang -Wl,-dead_strip -o "$executable" "$WORK/result.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+            clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$executable" "$WORK/result.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
         fi
         python3 - "$executable" "$WORK/output$stage" <<'PY'
 import subprocess, sys
@@ -48,7 +49,7 @@ capacity_outcome() {
     local compiler="$1" tag="$2"
     "$compiler" -emit obj -O2 -o "$WORK/capacity-$tag.o" "$ROOT/test/parity/region_cached_capacity.elisa" >"$WORK/capacity-$tag.build" 2>&1 || {
         echo "BUILD-FAILED"; return; }
-    clang -Wl,-dead_strip -o "$WORK/capacity-$tag" "$WORK/capacity-$tag.o" "$WORK/capacity-hooks.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o" >>"$WORK/capacity-$tag.build" 2>&1 || {
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/capacity-$tag" "$WORK/capacity-$tag.o" "$WORK/capacity-hooks.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o" >>"$WORK/capacity-$tag.build" 2>&1 || {
         echo "LINK-FAILED"; return; }
     local out; out="$("$WORK/capacity-$tag" 2>&1)"; local rc=$?
     # The assertion text names the failing invariant; keep it in the outcome so a CHANGE in

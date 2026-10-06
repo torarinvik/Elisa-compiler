@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Compile ordinary executables, then time paired runs without trace hooks.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -35,7 +36,7 @@ PY
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$OUT/hooks.o"
 for variant in baseline candidate; do
     "$COMPILER" -emit obj -O2 -o "$OUT/parser-$variant.o" "$OUT/parser-$variant.elisa"
-    clang -Wl,-dead_strip -o "$OUT/parser-$variant" "$OUT/parser-$variant.o" "$OUT/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/parser-$variant" "$OUT/parser-$variant.o" "$OUT/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
 done
 python3 "$ROOT/../elisa-profiler/scripts/benchmark-native.py" \
     --baseline "$OUT/parser-baseline" --candidate "$OUT/parser-candidate" \

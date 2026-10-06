@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Runtime parity for pointer-sized Elisa int and fixed-width C int.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -8,7 +9,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FIXTURE="$ROOT/test/repro/int_width_abi.elisa"
 WASM_LD="${WASM_LD:-$(command -v wasm-ld || true)}"
-[[ -x "$WASM_LD" ]] || WASM_LD="${ELISA_LLVM_BIN_DIR:-/opt/homebrew/opt/llvm/bin}/wasm-ld"
+[[ -x "$WASM_LD" ]] || WASM_LD="${ELISA_LLVM_BIN_DIR:-$ELISA_LLVM_BIN_DIR}/wasm-ld"
 
 # Use the actual shipped declarations, so this test catches incorrect ABI annotations
 # as well as a backend that fails to sign-extend an i32 C return into an Elisa int.

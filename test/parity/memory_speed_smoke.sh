@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
@@ -13,7 +14,7 @@ for fixture in memory_speed_helper_reuse memory_speed_capacity memory_speed_stac
         compiler="$STAGE0"
         [[ "$stage" == 0 ]] || compiler="$STAGE1"
         "$compiler" -emit obj -O2 -o "$WORK/$fixture-$stage.o" "$ROOT/test/differential/cases/$fixture.elisa"
-        clang -Wl,-dead_strip -o "$WORK/$fixture-$stage" "$WORK/$fixture-$stage.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$fixture-$stage" "$WORK/$fixture-$stage.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
         python3 - "$WORK/$fixture-$stage" "$WORK/output$stage" <<'PY'
 import subprocess,sys
 p=subprocess.run([sys.argv[1]],capture_output=True,timeout=90)

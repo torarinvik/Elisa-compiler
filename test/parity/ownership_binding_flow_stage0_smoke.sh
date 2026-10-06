@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:?set ELISACORE_BIN to the Stage0 compiler under test}"
@@ -16,7 +17,7 @@ for optimization in O0 O2; do
         tail -80 "$WORK/build.log" >&2
         exit 1
     }
-    clang -Wl,-dead_strip "$WORK/probe.a" -o "$WORK/probe"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS "$WORK/probe.a" -o "$WORK/probe"
     "$WORK/probe"
 done
 echo 'BindingId ownership facts pass O0/O2: branch consumption, dead paths, shadow/function isolation, serial zero, all 16 consume inputs'

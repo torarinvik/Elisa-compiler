@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Paired soundness controls for the typestate cleanup. Rejecting a fixture for
 # a backend decline is not a passing semantic rejection.
 set -euo pipefail
@@ -81,7 +82,7 @@ for compiler in "$STAGE0" "$STAGE1"; do
             exit 1
         }
         if [[ "$compiler" == "$STAGE0" ]]; then
-            elisa_run_timeout 30 "${ELISA_CLANG:-clang}" -Wl,-dead_strip -o "$WORK/named" "$output" >"$WORK/link.log" 2>&1 || {
+            elisa_run_timeout 30 "${ELISA_CLANG:-clang}" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/named" "$output" >"$WORK/link.log" 2>&1 || {
                 cat "$WORK/link.log" >&2
                 exit 1
             }

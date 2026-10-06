@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Aggregates of every C-ABI class must cross an export boundary exactly as clang's
 # C ABI expects, from BOTH compilers: a C caller is linked against each compiler's
 # object and emitted header and run on this host (arm64: HFA, [2 x i64], i64/iN,
@@ -19,7 +20,7 @@ run_one() {
   local dir="$BUILD/$label"; mkdir -p "$dir"
   if ! "$@" -emit obj -O0 -o "$dir/$fixture.o" "$FIX/$fixture.elisa" >"$dir/$fixture.obj.log" 2>&1; then echo "export_cabi_shapes_smoke FAIL [$label $fixture]: compile"; grep -v warning "$dir/$fixture.obj.log" | head -3; status=1; return; fi
   "$@" -emit header -o "$dir/$fixture.h" "$FIX/$fixture.elisa" >"$dir/$fixture.hdr.log" 2>&1 || { echo "export_cabi_shapes_smoke FAIL [$label $fixture]: header"; status=1; return; }
-  if ! clang -Wl,-dead_strip -I"$dir" -o "$dir/$fixture" "$FIX/${fixture}_caller.c" "$dir/$fixture.o" "$RUNTIME" >"$dir/$fixture.link.log" 2>&1; then echo "export_cabi_shapes_smoke FAIL [$label $fixture]: link"; head -5 "$dir/$fixture.link.log"; status=1; return; fi
+  if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -I"$dir" -o "$dir/$fixture" "$FIX/${fixture}_caller.c" "$dir/$fixture.o" "$RUNTIME" >"$dir/$fixture.link.log" 2>&1; then echo "export_cabi_shapes_smoke FAIL [$label $fixture]: link"; head -5 "$dir/$fixture.link.log"; status=1; return; fi
   out="$("$dir/$fixture" || true)"
   [ "$out" = "ALL OK" ] || { echo "export_cabi_shapes_smoke FAIL [$label $fixture]: C caller says: $out"; status=1; return; }
   echo "export_cabi_shapes_smoke OK [$label $fixture]: ALL OK from C"
