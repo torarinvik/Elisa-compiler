@@ -21,6 +21,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/emit_parity_lib.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -30,10 +31,10 @@ differ=0
 skipped=0
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa "$REPO_ROOT"/test/fixtures/unsafe/*.elisa; do
     name="$(basename "$src" .elisa)"
-    if ! "$ELISACORE_BIN" -emit unsafe "$src" </dev/null > "$WORK/s0" 2>/dev/null; then
+    if ! s0 -emit unsafe "$src" </dev/null > "$WORK/s0" 2>/dev/null; then
         skipped=$((skipped + 1)); continue
     fi
-    if ! bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit unsafe -o "$WORK/s1" "$src" >/dev/null 2>&1; then
+    if ! s1 -emit unsafe -o "$WORK/s1" "$src" >/dev/null 2>&1; then
         differ=$((differ + 1)); echo "FAILED: $name — stage0 reported, stage1 did not"; continue
     fi
     if cmp -s "$WORK/s0" "$WORK/s1"; then

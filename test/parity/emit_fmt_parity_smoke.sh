@@ -11,6 +11,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/emit_parity_lib.sh"
 
 BASELINE_FILE="$REPO_ROOT/test/fixtures/emit_fmt.baseline"
 baseline="$(tr -d '[:space:]' < "$BASELINE_FILE")"
@@ -21,8 +22,8 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 same=0
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
     name="$(basename "$src" .elisa)"
-    "$ELISACORE_BIN" -emit fmt "$src" </dev/null > "$WORK/$name.s0" 2>/dev/null || continue
-    bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit fmt -o "$WORK/$name.s1" "$src" >/dev/null 2>&1 || continue
+    s0 -emit fmt "$src" </dev/null > "$WORK/$name.s0" 2>/dev/null || continue
+    s1 -emit fmt -o "$WORK/$name.s1" "$src" >/dev/null 2>&1 || continue
     cmp -s "$WORK/$name.s0" "$WORK/$name.s1" && same=$((same + 1))
 done
 

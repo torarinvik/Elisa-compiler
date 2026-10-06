@@ -9,6 +9,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/emit_parity_lib.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -18,8 +19,8 @@ same=0
 for src in "$REPO_ROOT/test/breadth/easm_lockstep_parse_smoke.elisa" "$REPO_ROOT"/test/repro/*.elisa; do
     name="$(basename "$src" .elisa)"
     for mode in deps deps-json; do
-        "$ELISACORE_BIN" -emit "$mode" "$src" </dev/null > "$WORK/$name.$mode.s0" 2>/dev/null || continue
-        if ! bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit "$mode" -o "$WORK/$name.$mode.s1" "$src" >/dev/null 2>&1; then
+        s0 -emit "$mode" "$src" </dev/null > "$WORK/$name.$mode.s0" 2>/dev/null || continue
+        if ! s1 -emit "$mode" -o "$WORK/$name.$mode.s1" "$src" >/dev/null 2>&1; then
             echo "  FAIL $name ($mode): stage1 failed"; failed=$((failed + 1)); continue
         fi
         if cmp -s "$WORK/$name.$mode.s0" "$WORK/$name.$mode.s1"; then

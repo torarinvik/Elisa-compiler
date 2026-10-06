@@ -323,7 +323,12 @@ BINSEOF
 #   backend     -  / codegen smokes + the gen3 fixpoint
 #   answers     -  / the differential corpus + driver acceptance
 #   easm        -  / the easm group (its own serial lane)
-#   full      ~11m / 141 checks  everything. The ONLY profile a commit may rely on.
+#   quick     every check whose last MEASURED time is <= ELISA_GATE_QUICK_MAX seconds
+#             (default 120), plus any check never measured. Times come from
+#             build/gate-timings.tsv (rewritten by every run) and fall back to the committed
+#             test/parity/gate_timings.tsv. On 2026-10-06 that kept 176 of 211 checks and cut
+#             ~9.5 h of serial time to ~25 min; what it skipped is printed first.
+#   full      everything. The ONLY profile a commit may rely on.
 #
 # `answers` deserves its name: those two checks are the only ones in the entire suite that
 # compare what the compiler COMPUTES rather than what it accepts. Every other profile can be
@@ -352,9 +357,32 @@ profile_patterns() {
   esac
 }
 
+GATE_TIMINGS_LIVE="$REPO_ROOT/build/gate-timings.tsv"
+GATE_TIMINGS_SEED="$REPO_ROOT/test/parity/gate_timings.tsv"
+QUICK_MAX="${ELISA_GATE_QUICK_MAX:-120}"
+QUICK_SKIPPED=()
+
+# The last measured seconds for check NAME, or "" when it was never measured.
+gate_recorded_time() {
+  local file found=""
+  for file in "$GATE_TIMINGS_LIVE" "$GATE_TIMINGS_SEED"; do
+    [[ -f "$file" ]] || continue
+    found="$(awk -F'\t' -v n="$1" '$1 == n {t = $2} END {print t}' "$file")"
+    [[ -n "$found" ]] && break
+  done
+  printf '%s' "$found"
+}
+
 # Does NAME belong to the active profile?
 in_profile() {
   [[ "$GATE_PROFILE" == full ]] && return 0
+  if [[ "$GATE_PROFILE" == quick ]]; then
+    local measured
+    measured="$(gate_recorded_time "$1")"
+    [[ -z "$measured" || "$measured" -le "$QUICK_MAX" ]] && return 0
+    QUICK_SKIPPED+=("$(printf '%6ss  %s' "$measured" "$1")")
+    return 1
+  fi
   local pat
   for pat in $(profile_patterns "$GATE_PROFILE"); do
     # shellcheck disable=SC2053
@@ -519,6 +547,10 @@ if [[ "$GATE_PROFILE" == full ]]; then
 else
   echo "stage1 parity gate [PROFILE: $GATE_PROFILE] — ${total_checks} of ${TOTAL_AVAILABLE} checks, ${GATE_JOBS} at a time:"
 fi
+if [[ ${#QUICK_SKIPPED[@]} -gt 0 ]]; then
+  echo "  quick: SKIPPING ${#QUICK_SKIPPED[@]} checks measured over ${QUICK_MAX}s (run --profile full before committing):"
+  printf '%s\n' "${QUICK_SKIPPED[@]}" | sort -rn | sed 's/^/   /'
+fi
 
 # One NUL-delimited record per check: resultdir, name, then the command words. Records are
 # separated by a DOUBLE NUL. Built with -0 throughout because the repo path contains spaces.
@@ -582,6 +614,31 @@ fi
 rm -rf "$resultdir"
 
 rm -f /tmp/stage1_gate.$$.log
+# Remember what every check MEASURED this run, for `--profile quick`. A cached check reports
+# 0 s; that is not a measurement, so it keeps its previous time.
+mkdir -p "$(dirname "$GATE_TIMINGS_LIVE")"
+python3 - "$GATE_TIMINGS_LIVE" "$timings_file" <<'TIMEOF'
+import sys
+live, fresh = sys.argv[1], sys.argv[2]
+times = {}
+for path in (live, fresh):
+    try:
+        for line in open(path):
+            if line.startswith("#") or "\t" not in line:
+                continue
+            a, b = line.rstrip("\n").split("\t", 1)
+            name, secs = (a, b) if path == live else (b, a)
+            if path == fresh and secs == "0" and name in times:
+                continue
+            times[name] = secs
+    except OSError:
+        pass
+with open(live + ".tmp", "w") as out:
+    for name in sorted(times):
+        out.write(f"{name}\t{times[name]}\n")
+import os
+os.replace(live + ".tmp", live)
+TIMEOF
 if [[ -z "${ELISA_GATE_QUIET:-}" ]]; then
   echo "----------------------------------------"
   echo "slowest checks (seconds):"
@@ -603,6 +660,10 @@ if [[ $fail -eq 0 ]]; then
   else
     echo "stage1 parity gate [$GATE_PROFILE] OK: $pass checks passed — PARTIAL, not a commit gate"
     case "$GATE_PROFILE" in
+      quick)
+        echo "  NOT covered: the ${#QUICK_SKIPPED[@]} slow checks listed at the top (among them" >&2
+        echo "  usually the differential corpus and driver acceptance). Run --profile full" >&2
+        echo "  before committing." >&2 ;;
       fast|parser|semantic|emit|easm)
         echo "  NOT covered by this profile: the differential corpus and driver acceptance" >&2
         echo "  (the only checks that compare COMPUTED ANSWERS) and the gen3 fixpoint." >&2

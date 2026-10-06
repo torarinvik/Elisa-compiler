@@ -24,6 +24,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/emit_parity_lib.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -34,8 +35,8 @@ differ=0
 compare() {
     local label="$1"; local src="$2"; shift 2
     local s0 s1
-    s0="$("$ELISACORE_BIN" -emit "$@" "$src" </dev/null 2>/dev/null)"
-    s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit "$@" "$src" 2>/dev/null)"
+    s0="$(s0 -emit "$@" "$src" </dev/null 2>/dev/null)"
+    s1="$(s1 -emit "$@" "$src" 2>/dev/null)"
     if [ "$s0" = "$s1" ]; then
         same=$((same + 1))
     else
@@ -124,14 +125,14 @@ done
 # that started listing plain functions would show up here across hundreds of files.
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
     grep -q '^[[:space:]]*include "' "$src" && continue
-    "$ELISACORE_BIN" -emit tests "$src" </dev/null >/dev/null 2>&1 || continue
+    s0 -emit tests "$src" </dev/null >/dev/null 2>&1 || continue
     compare "corpus/$(basename "$src" .elisa)" "$src" tests
 done
 
 # stage0 refuses -o for all three; so must stage1.
 reject=0
 for mode in tests benches fixtures; do
-    if bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit "$mode" -o "$WORK/out" "$WORK/a.elisa" >/dev/null 2>&1; then
+    if s1 -emit "$mode" -o "$WORK/out" "$WORK/a.elisa" >/dev/null 2>&1; then
         echo "REJECT: -emit $mode accepted -o, stage0 refuses it"; reject=1
     fi
 done
