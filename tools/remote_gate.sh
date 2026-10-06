@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the stage1 verification list on a REMOTE Linux gate host (Phase T.6).
 #
-#   tools/remote_gate.sh "<ssh options and target>" [fast|full|gen3]     (default: fast)
+#   tools/remote_gate.sh "<ssh options and target>" [fast|full|gen3|check1,check2,...]     (default: fast)
 #   e.g. tools/remote_gate.sh "-p 50559 root@203.0.113.7" full
 #
 # Syncs this repo (src/ test/ scripts/ elisacore_std/ ...) and the stage0 checkout to the
@@ -23,7 +23,12 @@ case "$PROFILE" in
   fast) LIST="emit_ast_parity_smoke resolve_smoke diagnostics_smoke diagnostics_diff semantic_internal_diff semantic_acceptance_diff global_permissions_smoke" ;;
   gen3) LIST="self_host_gen3_smoke" ;;
   full) LIST="emit_ast_parity_smoke resolve_smoke diagnostics_smoke diagnostics_diff semantic_internal_diff semantic_acceptance_diff global_permissions_smoke differential_corpus adversarial_differential_smoke self_host_gen3_smoke" ;;
-  *) echo "unknown profile $PROFILE (fast|full|gen3)" >&2; exit 2 ;;
+  # Any other value is a comma-separated list of test/parity check names, so a fix can be
+  # validated on the host with only the checks it touches.
+  *,*|*_smoke|*_diff|*_corpus)
+    LIST="${PROFILE//,/ }"
+    for chk in $LIST; do [[ -f "$ROOT/test/parity/$chk.sh" ]] || { echo "no such check: $chk" >&2; exit 2; }; done ;;
+  *) echo "unknown profile $PROFILE (fast|full|gen3, or check1,check2,...)" >&2; exit 2 ;;
 esac
 # The remote script is passed on stdin with the three values substituted up front.
 { printf 'RDIR=%q\nRCORE=%q\nLIST=%q\n' "$RDIR" "$RCORE" "$LIST"; cat "$ROOT/tools/remote_gate_body.sh"; } | ssh $opts "$addr" "bash -s"
