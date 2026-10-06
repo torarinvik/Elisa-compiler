@@ -47,6 +47,8 @@ expect_rejected stage0 "$STAGE0" semantic imported_consumer_optional_enum_payloa
 expect_rejected stage1 "$STAGE1" obj imported_consumer_optional_enum_payload_mismatch.neg 'got optional'
 expect_rejected stage0 "$STAGE0" semantic imported_optional_enum_payload_expression_mismatch.neg 'got Expr?'
 expect_rejected stage1 "$STAGE1" obj imported_optional_enum_payload_expression_mismatch.neg 'got optional'
+expect_rejected stage0 "$STAGE0" semantic hierarchical_optional_enum_payload_mismatch_named.neg 'got Probe.Expr?'
+expect_rejected stage1 "$STAGE1" obj hierarchical_optional_enum_payload_mismatch_named.neg 'got optional'
 
 # Keep compatible optional forwarding, exact non-optional payloads, and generic/overloaded
 # calls accepted; the added gate must not become a blanket rejection of match-bound values.
@@ -54,7 +56,9 @@ for fixture in \
     hierarchical_enum_payload_valid.pos \
     hierarchical_optional_enum_payload_forward.pos \
     hierarchical_optional_enum_payload_generic.pos \
-    hierarchical_optional_enum_payload_overload.pos; do
+    hierarchical_optional_enum_payload_overload.pos \
+    hierarchical_optional_enum_payload_forward_named \
+    hierarchical_optional_enum_payload_refined; do
     expect_accepted stage0 "$STAGE0" semantic "$fixture"
     expect_accepted stage1 "$STAGE1" obj "$fixture"
 done
