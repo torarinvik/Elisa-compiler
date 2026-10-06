@@ -77,6 +77,11 @@ extend Semantic:
                         return storage_view_type_is_scalar_copy(type_expression) or hce_contains(owned, name)
                     Expr.Index(head, argument, _):
                         return ident_name_of(head) == "darray" and storage_owned_type_free(argument, owned)
+                    # `Geometry::Transform`: OWNED holds bare names, and a name stays out of it
+                    # while any same-named declaration may carry a borrow, so the last segment
+                    # is enough.
+                    Expr.Scope(_, name, _):
+                        return hce_contains(owned, name)
                     _:
                         return false
 
@@ -121,6 +126,7 @@ extend Semantic:
                         _:
                             pass
                 table <- storage_owned_block_nested(file.top_decls, false, table)
+                storage_owned_scope_rows(file, &owned, &flat, rows)
                 # Row field 3 is the declaring module ("" at top level), so a qualified call
                 # `M::f(...)` is recognised for exactly M's declaration.
                 for index in 0..<good.count |rows, bad, good, good_modules|:
@@ -130,6 +136,159 @@ extend Semantic:
                     rows.push(good_modules[index])
                     rows.push("")
                     rows.push("")
+
+        # One `[owned-scope]` row (vro row width) per function or extern: (marker, function,
+        # module, "1" when its result is fresh and borrow-free else "0", ""). The `[owned-fn]`
+        # rows key by bare name, so one unrelated same-named function in another module (an
+        # engine's `read` returning a struct) took the exemption from every `read`. MODULE is
+        # the innermost module name, "" at top level; two modules sharing an innermost name
+        # both match a call, which can only make it stricter.
+        #
+        # The global taint is scoped the same way: a bare mention of `n` inside module M means
+        # M's own `n` when M declares one, so M's untainted `n` shadows every other module's
+        # tainted `n` (`LongClip::slot` is not `PerfCache::slot`). A name M does not declare
+        # still counts if ANY declaration of it is tainted.
+        def storage_owned_scope_rows(file: Ast::File&, owned: darray[sview]&, flat: darray[sview]&, rows: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                modules: mutable darray[sview] = []
+                # Only functions have a body; BODY_OF indexes BODIES for them.
+                bodies: mutable darray[darray[Ast::Stmt]] = []
+                body_of: mutable darray[usize] = []
+                callable: mutable darray[bool] = []
+                fresh: mutable darray[bool] = []
+                tainted: mutable darray[bool] = []
+                storage_owned_scope_collect(file.top_decls, "", file.generic_param_lines, file.local_region_annotations, owned, flat, names, modules, bodies, body_of, callable, fresh, tainted)
+                changed: mutable bool = true
+                while changed |changed, names, modules, bodies, body_of, fresh, tainted|:
+                    changed <- false
+                    tainted_names: mutable darray[sview] = []
+                    for index in 0..<names.count |tainted_names, names, tainted|:
+                        tainted_names.push(names[index]) if tainted[index] and not hce_contains(&tainted_names, names[index])
+                    shadowed: mutable darray[sview] = []
+                    shadow_module: mutable sview = ""
+                    shadow_ready: mutable bool = false
+                    for index in 0..<names.count |changed, names, modules, bodies, body_of, fresh, tainted, tainted_names, shadowed, shadow_module, shadow_ready|:
+                        continue if tainted_names.count == 0 or not fresh[index] or tainted[index]
+                        if not shadow_ready or modules[index] != shadow_module:
+                            shadow_module <- modules[index]
+                            shadow_ready <- true
+                            shadowed <- storage_owned_module_shadows(shadow_module, &tainted_names, &names, &modules, &tainted)
+                        if lvre_stmts_mention(&bodies[body_of[index]], &tainted_names, &shadowed) != "":
+                            tainted[index] <- true
+                            changed <- true
+                for index in 0..<names.count |rows, names, modules, callable, fresh, tainted|:
+                    continue if not callable[index]
+                    clean: bool = fresh[index] and not tainted[index]
+                    rows.push("[owned-scope]")
+                    rows.push(names[index])
+                    rows.push(modules[index])
+                    rows.push("1" if clean else "0")
+                    rows.push("")
+
+        # The tainted names that MODULE itself declares, with none of its own declarations of
+        # the name tainted: inside MODULE a bare mention of one of them is that clean local one.
+        def storage_owned_module_shadows(module: sview, tainted_names: darray[sview]&, names: darray[sview]&, modules: darray[sview]&, tainted: darray[bool]&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                clean: mutable darray[sview] = []
+                dirty: mutable darray[sview] = []
+                for index in 0..<names.count |clean, dirty, module, tainted_names, names, modules, tainted|:
+                    continue if modules[index] != module or not hce_contains(tainted_names, names[index])
+                    if tainted[index]:
+                        dirty.push(names[index])
+                    else:
+                        clean.push(names[index])
+                shadowed: mutable darray[sview] = []
+                for name in clean |shadowed, dirty|:
+                    shadowed.push(name) if not hce_contains(&dirty, name) and not hce_contains(&shadowed, name)
+                return shadowed
+
+        def storage_owned_scope_collect(declarations: darray[Ast::Decl]&, module: sview, generic_lines: darray[u32]&, annotations: darray[Ast::LocalRegionAnnotation]&, owned: darray[sview]&, flat: darray[sview]&, names: mutable darray[sview]&, modules: mutable darray[sview]&, bodies: mutable darray[darray[Ast::Stmt]]&, body_of: mutable darray[usize]&, callable: mutable darray[bool]&, fresh: mutable darray[bool]&, tainted: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |module, generic_lines, annotations, owned, flat, names, modules, bodies, body_of, callable, fresh, tainted|:
+                    match declaration:
+                        Decl.Func(name, _, return_type, body, _, _, pos):
+                            is_fresh: mutable bool = false
+                            if return_type is declared:
+                                is_fresh <- storage_owned_type_free(declared, owned) and function_return_region(annotations, pos.line) == "" and not (any line in generic_lines where line == pos.line)
+                            names.push(name)
+                            modules.push(module)
+                            body_of.push(bodies.count)
+                            bodies.push(body)
+                            callable.push(true)
+                            fresh.push(is_fresh)
+                            tainted.push(false)
+                        Decl.Extern(name, _, _, _, _, _, _, _):
+                            names.push(name)
+                            modules.push(module)
+                            body_of.push(0)
+                            callable.push(true)
+                            fresh.push(false)
+                            tainted.push(false)
+                        # A global with a buffer taints its readers (see storage_owned_fn_collect).
+                        Decl.Const(name, type_expression, value, _, _):
+                            names.push(name)
+                            modules.push(module)
+                            body_of.push(0)
+                            callable.push(false)
+                            fresh.push(false)
+                            tainted.push(not storage_global_bufferless(type_expression, value, flat))
+                        Decl.Module(inner, body, _):
+                            storage_owned_scope_collect(body, module_last_segment(inner), generic_lines, annotations, owned, flat, names, modules, bodies, body_of, callable, fresh, tainted)
+                        Decl.Scoped(body, _):
+                            storage_owned_scope_collect(body, module, generic_lines, annotations, owned, flat, names, modules, bodies, body_of, callable, fresh, tainted)
+                        _:
+                            pass
+
+        # `x: T = f(...)` / `x: T = M::f(...)` whose callee, resolved by module, returns a fresh
+        # borrow-free value. A bare call resolves to the caller's own module and a qualified
+        # one to the module it names; when neither declares the function (a `using` import, a
+        # parent module, a type's associated function) this says nothing and the bare-name
+        # `[owned-fn]` rule stays in charge.
+        def storage_view_owned_scoped_call(value: Ast::Expr, view_fns: darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return storage_view_owned_scoped_call(inner, view_fns, table)
+                    Expr.Call(callee, _, _, _):
+                        called: mutable sview = ""
+                        module: mutable sview = table.storage_owned_module
+                        bare: mutable bool = false
+                        callee_pos: mutable Ast::Pos = Ast::expr_pos(callee)
+                        match callee:
+                            Expr.Ident(name, _):
+                                called <- name
+                                bare <- true
+                            Expr.Scope(qualifier, name, _):
+                                called <- name
+                                module <- storage_owned_qualifier(qualifier)
+                            _:
+                                pass
+                        false return if called == "" or (not bare and module == "")
+                        found: mutable bool = false
+                        row: mutable usize = 0
+                        while row + 4 < view_fns.count |row, found, view_fns, called, module|:
+                            if view_fns[row] == "[owned-scope]" and view_fns[row + 1] == called and view_fns[row + 2] == module:
+                                false return if view_fns[row + 3] != "1"
+                                found <- true
+                            row <- row + 5
+                        false return if not found
+                        true return if not bare
+                        # A function-valued local/parameter shadows a bare file function. Checked
+                        # last: it scans every lexical reference.
+                        return not (any pos in table.ref_pos where pos.offset == callee_pos.offset and pos.end_offset == callee_pos.end_offset)
+                    _:
+                        return false
+
+        # The module a qualifier names: `Ops` in `Ops::f`, `Inner` in `Outer::Inner::f`.
+        def storage_owned_qualifier(qualifier: Ast::Expr) -> sview:
+            match qualifier:
+                Expr.Ident(name, _):
+                    return name
+                Expr.Scope(_, name, _):
+                    return name
+                _:
+                    return sview("", 0, 0)
 
         # Unmodelled declarations must block the fallback, never disappear from
         # its candidate set. A zero-parameter sentinel also blocks arity changes.

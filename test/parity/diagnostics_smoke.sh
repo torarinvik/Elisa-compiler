@@ -290,6 +290,8 @@ NAMES=(
     fn_value_effect_row
     fn_value_effect_row_arg
     global_store_local_escape
+    lmut_field_bare_call
+    storage_owned_return_module_scope
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -546,6 +548,8 @@ EXPECTS=(
     "variable \"g\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]"
     "argument 1 to \"apply\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Memory]"
     'storing a reference to function-local storage into longer-lived storage'
+    'mutation of `lmut` value "report.cache" must be a reassignment'
+    'view "source" cannot be used: storage dependency facts were invalidated by darray push of doc'
 )
 
 total=0
