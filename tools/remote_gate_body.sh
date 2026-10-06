@@ -2,14 +2,20 @@
 set -uo pipefail
 export PATH=/usr/local/go/bin:/usr/local/bin:/usr/lib/llvm-21/bin:$PATH
 ulimit -s unlimited
+# rsync keeps the Mac uid; git refuses such repos unless they are marked safe.
+git config --global --get-all safe.directory | grep -qx "$RDIR" || git config --global --add safe.directory "$RDIR"
+git config --global --get-all safe.directory | grep -qx "$RCORE" || git config --global --add safe.directory "$RCORE"
 cd "$RDIR"
 export REPO_ROOT="$RDIR" ELISA_CORE="$RCORE" ELISACORE_BIN="$RCORE/compiler/bin/elisac" ELISA_STAGE1_BIN="$RDIR/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$RDIR/build/runtime/elisacore_runtime.o"
 export LLVM_CONFIG="$(command -v llvm-config)" ELISA_CLANG="$(command -v clang)"
 mkdir -p bin build/runtime
-[ -x "$ELISACORE_BIN" ] || (cd "$RCORE/compiler" && CGO_CFLAGS="-I/usr/lib/llvm-21/include" CGO_LDFLAGS="-L/usr/lib/llvm-21/lib -Wl,-rpath,/usr/lib/llvm-21/lib" go build -o bin/elisac ./src)
+# Always rebuild: Go's cache makes it seconds, and the seed needs VCS build info matching the synced tree.
+(cd "$RCORE/compiler" && CGO_CFLAGS="-I/usr/lib/llvm-21/include" CGO_LDFLAGS="-L/usr/lib/llvm-21/lib -Wl,-rpath,/usr/lib/llvm-21/lib" go build -o bin/elisac ./src)
 [ -f "$ELISA_RUNTIME_OBJ" ] || bash scripts/build_runtime_object.sh
 rm -rf build/.elisac-stage1-seed.lock
-bash scripts/elisac_stage1.sh --seed 2>&1 | grep -v "warning:" | tail -2
+if ! bash scripts/elisac_stage1.sh --seed >build/remote-seed.log 2>&1; then
+  grep -v "warning:" build/remote-seed.log | tail -20; echo "remote gate: seed failed; no checks run"; exit 1
+fi
 for chk in $LIST; do
   s=$(date +%s); echo "== $chk"
   bash "test/parity/$chk.sh" 2>&1 | grep -v "warning:" | tail -8
