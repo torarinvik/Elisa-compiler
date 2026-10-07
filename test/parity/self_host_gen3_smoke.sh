@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # BOOTSTRAP CLOSURE — the check the 123-smoke gate cannot make.
 #
 # `scripts/self_host_gen2.sh` proves only that gen1 can build a gen2 that compiles
@@ -223,7 +224,7 @@ echo "self_host_gen3_smoke stage B OK: gen2 compiled the compiler into gen3 ($(w
 # own output differs from what built it, and the compiler is not a fixed point of itself.
 # gen4 is built from the SAME input file and the SAME output path as gen3, so a byte diff
 # here is a real semantic difference, not a path or timestamp artifact.
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 if [ ! -x "$LLVM_CONFIG" ]; then
     echo "self_host_gen3_smoke stage C FAIL: no llvm-config at $LLVM_CONFIG" >&2
     exit 1
@@ -231,8 +232,8 @@ fi
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || fail "no runtime object at $RUNTIME_OBJ (run scripts/build_runtime_object.sh)"
-clang -Wl,-dead_strip -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ" \
-      -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" >"$WORK/gen3.link.log" 2>&1 \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ" \
+      -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" >"$WORK/gen3.link.log" 2>&1 \
   || fail "gen3 object did not link (see $WORK/gen3.link.log)"
 
 { printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen4.request"

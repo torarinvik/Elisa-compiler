@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage0 enforcement gate; this does not imply Stage1 parity.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,7 +21,7 @@ rg -q '^%Player__Alive = type \{ i64, i64 \}$' "$WORK/positive.ll"
 rg -q '^%Player__Dead = type \{ i64, i64 \}$' "$WORK/positive.ll"
 for optimization in 0 2; do
     elisa_run_timeout 30 "$STAGE0" -emit c-archive "-O$optimization" -o "$WORK/positive.a" "$ROOT/test/repro/derived_record_update_codegen_probe.elisa" || { status=$?; echo "O$optimization build failed: $status" >&2; exit "$status"; }
-    elisa_run_timeout 30 "${ELISA_CLANG:-clang}" -Wl,-dead_strip -o "$WORK/positive" "$WORK/positive.a"
+    elisa_run_timeout 30 "${ELISA_CLANG:-clang}" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/positive" "$WORK/positive.a"
     elisa_run_timeout 10 "$WORK/positive"
 done
 for fixture in derived_record_update_forged derived_record_update_single_unknown; do

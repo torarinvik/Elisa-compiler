@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
@@ -13,7 +14,7 @@ for fixture in loop_scratch_inferred loop_region_reuse_exits loop_scratch_borrow
         compiler="$STAGE0"
         [[ "$stage" == 0 ]] || compiler="$STAGE1"
         "$compiler" -emit obj -O2 -o "$WORK/result.o" "$ROOT/test/differential/cases/$fixture.elisa"
-        clang -Wl,-dead_strip -o "$WORK/result" "$WORK/result.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/result" "$WORK/result.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
         "$WORK/result" > "$WORK/output$stage"
     done
     cmp "$WORK/output0" "$WORK/output1"
@@ -49,7 +50,7 @@ assert len(lines) == 2 and all('!dbg !' in s for s in lines), lines
 PY_DEBUG
 # Each function prologue starts without the previous function's debug location.
 "$STAGE1" -emit obj -g -ftrace -O2 -o "$WORK/prologue.o" "$ROOT/test/differential/cases/trace_function_prologue_location.elisa"
-clang -Wl,-dead_strip -o "$WORK/prologue" "$WORK/prologue.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/prologue" "$WORK/prologue.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
 "$WORK/prologue"
 # Trace-value argument order must remain compatible with the collector ABI.
 "$STAGE1" -emit obj -ftrace -O2 -o "$WORK/traced.o" "$ROOT/test/differential/cases/loop_scratch_inferred.elisa"

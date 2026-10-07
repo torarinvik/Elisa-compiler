@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -39,7 +40,7 @@ compile_case() {
             cat "$log" >&2
             exit 1
         fi
-        if ! clang -Wl,-dead_strip -o "$stem" "$archive" >"$log" 2>&1; then
+        if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stem" "$archive" >"$log" 2>&1; then
             echo "runtime string view smoke: failed to link stage0 at O$optimization" >&2
             cat "$log" >&2
             exit 1
@@ -146,7 +147,7 @@ check_postfix_sview_cast() {
             cat "$log" >&2
             exit 1
         }
-        clang -Wl,-dead_strip -o "$output" "$output.a" >"$log" 2>&1 || {
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$output" "$output.a" >"$log" 2>&1 || {
             echo "runtime string view smoke: failed to link valid optional-cstr view for $stage" >&2
             cat "$log" >&2
             exit 1
@@ -224,7 +225,7 @@ check_region_lifetime() {
             cat "$good_log" >&2
             exit 1
         }
-        clang -Wl,-dead_strip -o "$good_out" "$good_out.a" >"$good_log" 2>&1 || {
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$good_out" "$good_out.a" >"$good_log" 2>&1 || {
             echo "runtime string view smoke: failed to link the safe $stage lifetime case" >&2
             cat "$good_log" >&2
             exit 1

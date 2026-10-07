@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # A machine transition installs all successor payloads as one transition. The
 # arguments must therefore be evaluated before any scalarized payload slot is
 # overwritten: Run(a, b) -> Check(b, a) is a swap, not Run(b, b).
@@ -21,11 +22,11 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 for optimization in O0 O2; do
     "$STAGE0" -emit obj "-$optimization" -o "$WORK/stage0-$optimization.o" "$SOURCE" >/dev/null
-    clang -Wl,-dead_strip -o "$WORK/stage0-$optimization" "$WORK/stage0-$optimization.o" "$RUNTIME"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/stage0-$optimization" "$WORK/stage0-$optimization.o" "$RUNTIME"
 
     ELISA_STAGE1_BIN="$STAGE1" \
       bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/stage1-$optimization.o" "$SOURCE" >/dev/null
-    clang -Wl,-dead_strip -o "$WORK/stage1-$optimization" "$WORK/stage1-$optimization.o" "$RUNTIME"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/stage1-$optimization" "$WORK/stage1-$optimization.o" "$RUNTIME"
 
     set +e
     "$WORK/stage0-$optimization"; stage0_rc=$?
@@ -41,11 +42,11 @@ done
 BRANCH_SOURCE="$ROOT/test/fixtures/machine_transition/branch_transitions.elisa"
 for optimization in O0 O2; do
     "$STAGE0" -emit obj "-$optimization" -o "$WORK/branch-stage0-$optimization.o" "$BRANCH_SOURCE" >/dev/null
-    clang -Wl,-dead_strip -o "$WORK/branch-stage0-$optimization" "$WORK/branch-stage0-$optimization.o" "$RUNTIME"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/branch-stage0-$optimization" "$WORK/branch-stage0-$optimization.o" "$RUNTIME"
 
     ELISA_STAGE1_BIN="$STAGE1" \
       bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/branch-stage1-$optimization.o" "$BRANCH_SOURCE" >/dev/null
-    clang -Wl,-dead_strip -o "$WORK/branch-stage1-$optimization" "$WORK/branch-stage1-$optimization.o" "$RUNTIME"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/branch-stage1-$optimization" "$WORK/branch-stage1-$optimization.o" "$RUNTIME"
 
     set +e
     "$WORK/branch-stage0-$optimization"; branch_stage0_rc=$?
@@ -63,7 +64,7 @@ VOID_CATCH_SOURCE="$ROOT/test/fixtures/machine_transition/void_catch_in_arm.elis
 for optimization in O0 O2; do
     ELISA_STAGE1_BIN="$STAGE1" \
       bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/void-catch-stage1-$optimization.o" "$VOID_CATCH_SOURCE" >/dev/null
-    clang -Wl,-dead_strip -o "$WORK/void-catch-stage1-$optimization" "$WORK/void-catch-stage1-$optimization.o" "$RUNTIME"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/void-catch-stage1-$optimization" "$WORK/void-catch-stage1-$optimization.o" "$RUNTIME"
 
     set +e
     "$WORK/void-catch-stage1-$optimization"; void_catch_rc=$?

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # GENERIC PROTOCOL IMPLS — `impl[T] P for C[T]:`.
 #
 # stage1 used to DECLINE every member of a generic impl and, because a unit is dropped whole
@@ -24,7 +25,7 @@ set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "generic-protocol-impl FAIL: no runtime object" >&2; exit 1; }
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 LLVM_CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 [ -x "$LLVM_CLANG" ] || LLVM_CLANG="$(command -v clang || true)"
@@ -100,7 +101,7 @@ EOF
     # harness is run against pinned toolchains and building would write outside the worktree.
     if [ -n "${ELISACORE_BIN:-}" ] && [ -x "${ELISACORE_BIN:-}" ]; then
         if "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/store_s0.o" "$WORK/store.elisa" >"$WORK/store_s0.log" 2>&1 \
-           && "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/store_s0" "$WORK/store_s0.o" "$RUNTIME_OBJ" >>"$WORK/store_s0.log" 2>&1; then
+           && "$LLVM_CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/store_s0" "$WORK/store_s0.o" "$RUNTIME_OBJ" >>"$WORK/store_s0.log" 2>&1; then
             s0_out=$("$WORK/store_s0" 2>/dev/null </dev/null); s0_rc=$?
             [ "$s0_out" = "ok" ] && [ "$s0_rc" = 3 ] || fail "stage0 disagrees: printed '$s0_out' exit $s0_rc, want 'ok' exit 3"
         else

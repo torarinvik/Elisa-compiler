@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Compile a REAL DOWNSTREAM PROGRAM with this compiler.
 #
 # Every gate beside this one feeds the compiler either a fixture or its own
@@ -30,7 +31,7 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" || exit $?
 
 # Two of the tests link SDL3. Without it the failure would be the host's, not the
 # compiler's, so say which it is rather than reporting a red gate.
-SDL_LIB="${ELISA_UI_SDL_LIB:-/opt/homebrew/lib}"
+SDL_LIB="${ELISA_UI_SDL_LIB:-$([ -n "$ELISA_BREW_BIN" ] && echo "${ELISA_BREW_BIN%/bin}/lib" || echo /usr/local/lib)}"
 [ -e "$SDL_LIB/libSDL3.dylib" ] || [ -e "$SDL_LIB/libSDL3.so" ] || {
     echo "downstream_elisa_ui_smoke SKIP: no SDL3 in $SDL_LIB (set ELISA_UI_SDL_LIB)"; exit 0; }
 

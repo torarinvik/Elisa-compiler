@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.14}"
-PYTHON_CONFIG="${PYTHON_CONFIG:-/opt/homebrew/bin/python3.14-config}"
-CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+PYTHON_BIN="${PYTHON_BIN:-$ELISA_PYTHON314_BIN}"
+PYTHON_CONFIG="${PYTHON_CONFIG:-$ELISA_PYTHON314_CONFIG}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 SOURCE="$ROOT/test/repro/pymodule_enum_defaults.elisa"
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \

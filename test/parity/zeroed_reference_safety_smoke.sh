@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Non-null references must never be materialized from a zero bit pattern.
 set -euo pipefail
 
@@ -368,7 +369,7 @@ run_positive() {
     "$compiler" -emit obj "-O$level" -o "$object" "$source"
     # Container controls exercise arena cleanup; link the same runtime as
     # real programs and discard runtime functions unused by this fixture.
-    "$CLANG" -Wl,-dead_strip -o "$binary" "$object" "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+    "$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$binary" "$object" "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
     set +e
     "$binary"
     local result=$?

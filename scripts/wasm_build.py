@@ -124,7 +124,7 @@ def write_text_if_changed(path: Path, contents: str) -> bool:
 
 def find_wasm_ld(explicit: str | None) -> str:
     candidates = [explicit, os.environ.get("WASM_LD")]
-    llvm_config = os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")
+    llvm_config = os.environ.get("LLVM_CONFIG") or shutil.which("llvm-config") or "/opt/homebrew/opt/llvm/bin/llvm-config"
     if Path(llvm_config).is_file():
         try:
             bindir = subprocess.check_output([llvm_config, "--bindir"], text=True).strip()

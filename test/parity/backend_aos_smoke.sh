@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 [ -x "$ELISACORE_BIN" ] || { echo "backend aos smoke FAIL: no elisac" >&2; exit 1; }
 [ -x "$LLVM_CONFIG" ] || { echo "backend aos smoke FAIL: no llvm-config" >&2; exit 1; }
 
@@ -24,7 +25,7 @@ clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 # the profiler ABI unconditionally), which is what kept this gate red.
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
 "$BUILD/driver" < "$ROOT/test/breadth/packed_aos_fixture.elisa" > "$BUILD/aos.ll"
 grep -q 'declare ptr @ctx_aos_store_new(ptr, i64)' "$BUILD/aos.ll"
 grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"
@@ -32,8 +33,8 @@ grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"
 # i64 (commit 33320f9 moved AoS record indices to 64-bit); this assertion said i32.
 grep -q 'declare ptr @ctx_aos_store_record(ptr, i64)' "$BUILD/aos.ll"
 
-"${LLC:-/opt/homebrew/opt/llvm/bin/llc}" -filetype=obj -o "$BUILD/aos.o" "$BUILD/aos.ll"
-clang -Wl,-dead_strip -o "$BUILD/aos" "$BUILD/aos.o" "$RUNTIME_OBJ" "$FALLBACK_OBJ" "$PROFILE_OBJ"
+"${LLC:-$ELISA_LLVM_BIN_DIR/llc}" -filetype=obj -o "$BUILD/aos.o" "$BUILD/aos.ll"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/aos" "$BUILD/aos.o" "$RUNTIME_OBJ" "$FALLBACK_OBJ" "$PROFILE_OBJ"
 set +e
 "$BUILD/aos"
 rc=$?

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Differential testing: compile every case with BOTH compiler generations, run
 # both binaries, and compare.
 #
@@ -72,9 +73,9 @@ one_case() {
   # stage0 bundles the runtime into its object; stage1 links against the
   # separately built runtime object. A case that pulls in std collections still
   # wants the runtime object, so fall back to linking it in.
-  clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" >>"$WORK/$name.s0.log" 2>&1 ||
-    clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME" >>"$WORK/$name.s0.log" 2>&1
-  clang -Wl,-dead_strip -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME" >>"$WORK/$name.s1.log" 2>&1
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.s0" "$WORK/$name.s0.o" >>"$WORK/$name.s0.log" 2>&1 ||
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME" >>"$WORK/$name.s0.log" 2>&1
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME" >>"$WORK/$name.s1.log" 2>&1
   if [[ ! -x "$WORK/$name.s0" || ! -x "$WORK/$name.s1" ]]; then
     echo "SKIP $name (link failed on one side)"; return 0
   fi

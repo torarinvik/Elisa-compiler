@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Same compiler, runtime, source and -O2 flags; one optimization at a time.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -45,14 +46,14 @@ for policy in helper reserve stack; do
         fi
         ELISA_DISABLE_MEMORY_HELPER="$helper" ELISA_DISABLE_MEMORY_RESERVE="$reserve" ELISA_DISABLE_MEMORY_STACK="$stack" \
             "$COMPILER" -emit obj -O2 -o "$OUT/$policy-$variant.o" "$OUT/$policy.elisa"
-        clang -Wl,-dead_strip -o "$OUT/$policy-$variant" "$OUT/$policy-$variant.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$policy-$variant" "$OUT/$policy-$variant.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
     done
 done
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 for policy in helper reserve stack; do
     "$STAGE0" -emit obj -O2 -o "$OUT/$policy-oracle.o" "$OUT/$policy.elisa"
-    clang -Wl,-dead_strip -o "$OUT/$policy-oracle" "$OUT/$policy-oracle.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$policy-oracle" "$OUT/$policy-oracle.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
     python3 - "$OUT" "$policy" <<'PY_ORACLE'
 from pathlib import Path
 import subprocess,sys

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Verify that stage1 declares/calls libc strlen with wasm32 size_t (i32), widens
 # the byte count for sview clamping, and produces runnable wasm matching stage0.
 set -euo pipefail
@@ -7,7 +8,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../nw-core/toolchain/elisac-stage0}"
 STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT}"
 STAGE1="${ELISA_STAGE1_BIN:-$STAGE1_ROOT/bin/elisac-stage1}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 FIXTURE="$ROOT/test/repro/wasm32_sview_strlen_abi.elisa"

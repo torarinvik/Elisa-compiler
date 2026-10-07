@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage1 REAL-STD dict smoke: compile the ACTUAL elisacore_std collections.elisa dict
 # (open-addressing hash table, grow/rehash, tombstones) through the stage1 backend and
 # assert the program's real BEHAVIOR (exit code). This is the end-to-end proof that dict
@@ -51,7 +52,7 @@ run_with() {
     local compiler="$1" src="$2" tag="$3"
     "$compiler" -emit obj "$src" -o "$TMP/$tag.o" >"$TMP/$tag.log" 2>&1 || { echo "compile-fail"; return; }
     [ -s "$TMP/$tag.o" ] || { echo "no-object"; return; }
-    clang -Wl,-dead_strip -o "$TMP/$tag" "$TMP/$tag.o" "$TMP/stub.o" 2>"$TMP/$tag.link" || { echo "link-fail"; return; }
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$TMP/$tag" "$TMP/$tag.o" "$TMP/stub.o" 2>"$TMP/$tag.link" || { echo "link-fail"; return; }
     RUN "$TMP/$tag" >/dev/null 2>&1; echo "rc=$?"
 }
 

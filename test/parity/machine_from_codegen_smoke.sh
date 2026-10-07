@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Canonical typed-state arrows must survive the self-hosted frontend, LLVM emission,
 # native linking, and execution. Expected: choose(true)=21, choose(false)=22, total=43.
 set -euo pipefail
@@ -9,7 +10,7 @@ trap 'rm -rf "$WORK"' EXIT
 bash "$ROOT/scripts/build_runtime_object.sh" >/dev/null
 for fixture in typed_state_arrows explicit_state_arrows; do
   bash "$ROOT/scripts/elisac_stage1.sh" -O2 -o "$WORK/$fixture.o" "$ROOT/test/fixtures/machine_from/$fixture.elisa"
-  clang -Wl,-dead_strip -o "$WORK/$fixture" "$WORK/$fixture.o" "$ROOT/build/runtime/elisacore_runtime.o"
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$fixture" "$WORK/$fixture.o" "$ROOT/build/runtime/elisacore_runtime.o"
   set +e
   "$WORK/$fixture"
   status=$?

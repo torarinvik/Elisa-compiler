@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Regression for the stage1 machine-expression lifetime bug.
 #
 # `append_machine_state_block` returns a nested darray of synthesized AST statements. The old
@@ -35,7 +36,7 @@ compile_and_run() {
         exit 1
     fi
     [ -s "$obj" ] || { echo "backend_machine_region_return_smoke FAIL: $label emitted no object" >&2; exit 1; }
-    if ! clang -fno-builtin -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" "$FALLBACK" >>"$log" 2>&1; then
+    if ! clang -fno-builtin $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" "$FALLBACK" >>"$log" 2>&1; then
         cat "$log" >&2
         echo "backend_machine_region_return_smoke FAIL: $label object did not link" >&2
         exit 1

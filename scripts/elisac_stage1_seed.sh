@@ -1,3 +1,4 @@
+. "$(dirname "${BASH_SOURCE[0]}")/platform.sh"  # host flags/paths: scripts/platform.sh
 # The one-time SEED build: compile the stage1 product with stage0, under a per-worktree and a
 # global lock so two checkouts cannot fight over the same LLVM installation, and with an RSS
 # ceiling so a runaway compile is killed with a message rather than by the OS.
@@ -216,7 +217,7 @@ seed_build() {
   else
     bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   fi
-  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir"
+  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$seed_object_output"
   ELISA_SEED_OUTPUT=""

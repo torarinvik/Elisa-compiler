@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LLVM_MC="${LLVM_MC:-$(command -v llvm-mc || true)}"
-if [[ -z "$LLVM_MC" && -x /opt/homebrew/opt/llvm/bin/llvm-mc ]]; then
-    LLVM_MC=/opt/homebrew/opt/llvm/bin/llvm-mc
+if [[ -z "$LLVM_MC" && -x $ELISA_LLVM_BIN_DIR/llvm-mc ]]; then
+    LLVM_MC=$ELISA_LLVM_BIN_DIR/llvm-mc
 fi
 if [[ -z "$LLVM_MC" ]]; then
     echo "easm_template_assembler_smoke SKIP: llvm-mc not found"

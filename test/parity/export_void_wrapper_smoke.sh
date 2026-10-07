@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -22,9 +23,9 @@ rg -q 'define void @export_void_public\(' "$WORK/stage1.ll"
 if command -v opt >/dev/null 2>&1; then
     opt -passes=verify "$WORK/stage0.ll" -disable-output
     opt -passes=verify "$WORK/stage1.ll" -disable-output
-elif [ -x /opt/homebrew/opt/llvm/bin/opt ]; then
-    "${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify "$WORK/stage0.ll" -disable-output
-    "${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify "$WORK/stage1.ll" -disable-output
+elif [ -x $ELISA_LLVM_BIN_DIR/opt ]; then
+    "${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}" -passes=verify "$WORK/stage0.ll" -disable-output
+    "${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}" -passes=verify "$WORK/stage1.ll" -disable-output
 fi
 
 echo "void export wrapper parity OK"

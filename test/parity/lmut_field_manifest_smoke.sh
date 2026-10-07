@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # `place.field <- f(place.field)` with an lmut parameter and a void result is the
 # docs/120 §8 arg-manifest on a field path: the call mutates the field through its
 # reference argument and nothing is stored. stage1 used to lower the void result as a
@@ -19,7 +20,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 for optimization in O0 O2; do
     "$STAGE0" -emit obj "-$optimization" -o "$WORK/stage0-$optimization.o" "$SOURCE" >/dev/null
-    clang -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
+    clang $ELISA_LD_ALLOW_UNDEFINED $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS \
         -o "$WORK/stage0-$optimization" "$WORK/stage0-$optimization.o" "$RUNTIME"
     set +e
     "$WORK/stage0-$optimization"
@@ -28,7 +29,7 @@ for optimization in O0 O2; do
     [[ "$rc" -eq 115 ]] || { echo "lmut field manifest smoke FAIL ($optimization): stage0 returned $rc, expected 115" >&2; exit 1; }
     ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" \
         -o "$WORK/stage1-$optimization.o" "$SOURCE" >/dev/null
-    clang -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
+    clang $ELISA_LD_ALLOW_UNDEFINED $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS \
         -o "$WORK/stage1-$optimization" "$WORK/stage1-$optimization.o" "$RUNTIME"
     set +e
     "$WORK/stage1-$optimization"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,7 +42,7 @@ clang -std=c11 -O2 -Wall -Wextra -Werror -c \
 "$STAGE0_BIN" -emit c-archive -O2 \
     -o "$BUILD/stage0.a" "$ROOT/test/parity/profiler_runtime_smoke.elisa" \
     >"$BUILD/stage0.log" 2>&1
-clang -Wl,-dead_strip -o "$BUILD/stage0" \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/stage0" \
     "$COLLECTOR_OBJ" "$BUILD/stage0.a"
 "$BUILD/stage0"
 
@@ -50,7 +51,7 @@ clang -Wl,-dead_strip -o "$BUILD/stage0" \
 "$STAGE1_BIN" -emit obj -O2 \
     -o "$BUILD/stage1.o" "$ROOT/test/parity/profiler_runtime_smoke.elisa" \
     >"$BUILD/stage1.log" 2>&1
-clang -Wl,-dead_strip -o "$BUILD/stage1" \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/stage1" \
     "$COLLECTOR_OBJ" "$BUILD/stage1.o" "$RUNTIME_OBJ"
 "$BUILD/stage1"
 
@@ -64,14 +65,14 @@ clang -std=c11 -O2 -Wall -Wextra -Werror -c \
 "$STAGE0_BIN" -emit c-archive -O2 \
     -o "$BUILD/stage0_arena_free.a" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
     >"$BUILD/stage0_arena_free.log" 2>&1
-clang -Wl,-dead_strip -o "$BUILD/stage0_arena_free" \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/stage0_arena_free" \
     "$FREE_COLLECTOR_OBJ" "$BUILD/stage0_arena_free.a"
 "$BUILD/stage0_arena_free"
 
 "$STAGE1_BIN" -emit c-archive -O2 \
     -o "$BUILD/stage1_arena_free.a" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
     >"$BUILD/stage1_arena_free.log" 2>&1
-clang -Wl,-dead_strip -o "$BUILD/stage1_arena_free" \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/stage1_arena_free" \
     "$FREE_COLLECTOR_OBJ" "$BUILD/stage1_arena_free.a"
 "$BUILD/stage1_arena_free"
 

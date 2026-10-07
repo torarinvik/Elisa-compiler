@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # STATIC PROTOCOL DISPATCH THROUGH A BOUND TYPE PARAMETER — `T.method(args)`.
 #
 #     def tag[T: Tagged](v: T) -> i64:
@@ -25,7 +26,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "protocol-static-dispatch FAIL: no runtime object" >&2; exit 1; }
 STD="$ROOT/elisacore_std"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 LLVM_CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 [ -x "$LLVM_CLANG" ] || LLVM_CLANG="$(command -v clang || true)"
@@ -69,7 +70,7 @@ fi
 # runs against pinned toolchains and building would write outside the worktree.
 if [ -n "${ELISACORE_BIN:-}" ] && [ -x "${ELISACORE_BIN:-}" ] && [ -x "$LLVM_CLANG" ]; then
     if "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/twoimpl.s0.o" "$WORK/twoimpl.elisa" >"$WORK/twoimpl.s0.log" 2>&1 \
-       && "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/twoimpl.s0" "$WORK/twoimpl.s0.o" "$RUNTIME_OBJ" >>"$WORK/twoimpl.s0.log" 2>&1; then
+       && "$LLVM_CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/twoimpl.s0" "$WORK/twoimpl.s0.o" "$RUNTIME_OBJ" >>"$WORK/twoimpl.s0.log" 2>&1; then
         "$WORK/twoimpl.s0" >/dev/null 2>&1 </dev/null; s0_rc=$?
         [ "$s0_rc" = 12 ] || fail "two-impl dispatch: stage0 exit $s0_rc, want 12"
     else

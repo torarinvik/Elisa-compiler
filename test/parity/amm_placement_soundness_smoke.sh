@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Automatic memory placement must never pick storage that dies before the value does.
 # Each fixture reproduced a use-after-free in stage1's automation layer (memsafe audit
 # 2026-09-26): the wrong placement gives a DIFFERENT exit code, not a crash, so the gate
@@ -18,7 +19,7 @@ failures=0
 run() {
     local compiler="$1" source="$2" opt="$3" tag="$4" rc=0
     "$compiler" -emit obj "$opt" -o "$WORK/$tag.o" "$source" > "$WORK/$tag.log" 2>&1 || { echo reject; return; }
-    clang -Wl,-dead_strip -o "$WORK/$tag" "$WORK/$tag.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$tag" "$WORK/$tag.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
     "$WORK/$tag" > /dev/null 2>&1 || rc=$?
     echo "$rc"
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -6,7 +7,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
-PYTHON312_BIN="${PYTHON312_BIN:-/opt/homebrew/bin/python3.12}"
+PYTHON312_BIN="${PYTHON312_BIN:-$ELISA_PYTHON312_BIN}"
 if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
     echo "pymodule pyi smoke SKIP (python3 unavailable)"
     exit 0

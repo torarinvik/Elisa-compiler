@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Link an Elisa object (default: the seed product's build/elisac_stage1.o) with the
 # allocation-hook profiler instead of the weak no-op hooks.
 #   tools/memprof/link.sh [OBJECT] [OUT]   -> OUT (default build/memprof/elisac-stage1-memprof)
@@ -13,6 +14,6 @@ LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 mkdir -p "$(dirname "$OUT")"
 "$CLANG" -O2 -fno-omit-frame-pointer -c -o "$OUT.hooks.o" "$ROOT/tools/memprof/elisa_memprof.c"
 libdir="$("$LLVM_CONFIG" --libdir)"
-"$CLANG" -Wl,-dead_strip -o "$OUT" "$OBJ" "$OUT.hooks.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir"
+"$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT" "$OBJ" "$OUT.hooks.o" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
 rm -f "$OUT.hooks.o"
 echo "wrote $OUT"

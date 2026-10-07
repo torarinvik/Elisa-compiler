@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Protocol value parameters specialize by receiver; execute both compiler outputs.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,7 +15,7 @@ for fixture in protocol_value_parameters protocol_parameter_in_module protocol_r
         compiler="$STAGE0"
         [[ "$stage" == 0 ]] || compiler="$STAGE1"
         "$compiler" -emit obj -o "$WORK/values$stage.o" "$ROOT/test/differential/cases/$fixture.elisa"
-        clang -Wl,-dead_strip -o "$WORK/values$stage" "$WORK/values$stage.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/values$stage" "$WORK/values$stage.o" "$WORK/hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
         "$WORK/values$stage" > "$WORK/output$stage"
         printf '%s: stage%s runtime PASS\n' "$fixture" "$stage"
     done

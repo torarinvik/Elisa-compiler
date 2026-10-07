@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Uninstrumented control for profiler observer overhead. Run on an otherwise idle host.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -12,7 +13,7 @@ for version in before after; do
     compiler="$BEFORE"
     [[ "$version" == before ]] || compiler="$AFTER"
     "$compiler" -emit obj -O2 -o "$OUT/$version.o" "$SOURCE"
-    clang -Wl,-dead_strip -o "$OUT/$version" "$OUT/$version.o" "$OUT/hooks.o" \
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$version" "$OUT/$version.o" "$OUT/hooks.o" \
         "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 done
 python3 - "$OUT" <<'PY'

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.14}"
-PYTHON_CONFIG="${PYTHON_CONFIG:-/opt/homebrew/bin/python3.14-config}"
-PYTHON312_BIN="${PYTHON312_BIN:-/opt/homebrew/bin/python3.12}"
-PYTHON312_CONFIG="${PYTHON312_CONFIG:-/opt/homebrew/bin/python3.12-config}"
-CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+PYTHON_BIN="${PYTHON_BIN:-$ELISA_PYTHON314_BIN}"
+PYTHON_CONFIG="${PYTHON_CONFIG:-$ELISA_PYTHON314_CONFIG}"
+PYTHON312_BIN="${PYTHON312_BIN:-$ELISA_PYTHON312_BIN}"
+PYTHON312_CONFIG="${PYTHON312_CONFIG:-$ELISA_PYTHON312_CONFIG}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 
 if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROOT/build/runtime/elisacore_runtime.o" ]]; then
     echo "pymodule optional structs smoke SKIP (Python/Homebrew clang/runtime unavailable)"

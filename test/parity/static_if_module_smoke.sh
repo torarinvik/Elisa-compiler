@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # A module declared once per `static if` / `static elif` / `static else` branch is ONE
 # module, not a redeclaration (stage0 walks only the active branch). A second declaration
 # in the SAME (active) branch is still rejected identically by both compilers; stage0 walks
@@ -37,7 +38,7 @@ for stage, compiler in enumerate((stage0, stage1)):
     obj, exe = work / f'nested{stage}.o', work / f'nested{stage}'
     r = subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(root/'test/differential/cases/nested_module_const.elisa')], capture_output=True, timeout=60)
     assert r.returncode == 0, (compiler, r.stderr)
-    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
+    subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
     codes.append(subprocess.run([str(exe)], timeout=90).returncode)
 assert codes == [0, 0], codes
 print('nested_module_const: stage0/stage1 runtime PASS', flush=True)
@@ -46,7 +47,7 @@ for stage, compiler in enumerate((stage0, stage1)):
     obj, exe = work / f'kinds{stage}.o', work / f'kinds{stage}'
     r = subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(root/'test/differential/cases/nested_module_const_kinds.elisa')], capture_output=True, timeout=60)
     assert r.returncode == 0, (compiler, r.stderr)
-    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
+    subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
     codes.append(subprocess.run([str(exe)], timeout=90).returncode)
 assert codes == [0, 0], codes
 print('nested_module_const_kinds: stage0/stage1 runtime PASS', flush=True)

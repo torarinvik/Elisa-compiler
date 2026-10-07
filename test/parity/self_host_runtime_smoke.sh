@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # SELF-HOSTING THE STANDARD LIBRARY: stage1 compiles elisacore_std's runtime support into an
 # object, and a program linked against THAT object gives the same answer as against the
 # stage0-built one.
@@ -88,7 +89,7 @@ elisa_native_optional_hook_objects "$WORK" "$ROOT"
 
 link_and_run() {
     local runtime="$1" out="$2"
-    if ! clang -Wl,-dead_strip -o "$out" "$WORK/prog.o" "$runtime" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" >"$WORK/link.log" 2>&1; then
+    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$out" "$WORK/prog.o" "$runtime" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" >"$WORK/link.log" 2>&1; then
         echo "  link failed against $runtime"; sed -n '1,6p' "$WORK/link.log"; return 255
     fi
     RUN "$out"; return $?

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -345,7 +346,7 @@ PY
 counted_loop_object="$WORK/counted-loop-native.o"
 counted_loop_program="$WORK/counted-loop-native"
 bash "$WRAPPER" -o "$counted_loop_object" "$counted_loop_source"
-clang -Wl,-dead_strip -o "$counted_loop_program" "$counted_loop_object" "$RUNTIME"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$counted_loop_program" "$counted_loop_object" "$RUNTIME"
 set +e
 "$counted_loop_program"
 counted_loop_native_status=$?
@@ -383,7 +384,7 @@ grep -q 'counted-loop body must use' "$WORK/unsupported-loop.stderr"
 native_object="$WORK/native.o"
 native_program="$WORK/native-program"
 bash "$WRAPPER" -o "$native_object" "$FIXTURE"
-clang -Wl,-dead_strip -o "$native_program" "$native_object" "$RUNTIME"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$native_program" "$native_object" "$RUNTIME"
 set +e
 "$native_program"
 native_status=$?
@@ -398,7 +399,7 @@ set -e
 local_object="$WORK/local-native.o"
 local_program="$WORK/local-native"
 bash "$WRAPPER" -o "$local_object" "$local_source"
-clang -Wl,-dead_strip -o "$local_program" "$local_object" "$RUNTIME"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$local_program" "$local_object" "$RUNTIME"
 set +e
 "$local_program"
 local_native_status=$?
@@ -449,7 +450,7 @@ assert instructions[2][0:3] == (19, 0, 0)
 assert all(instruction[3] == 1 and instruction[5] > instruction[4] for instruction in instructions)
 PY
   bash "$WRAPPER" -o "$case_object" "$case_source"
-  clang -Wl,-dead_strip -o "$case_program" "$case_object" "$RUNTIME"
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$case_program" "$case_object" "$RUNTIME"
   set +e
   "$case_program"
   local actual=$?

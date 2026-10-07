@@ -21,6 +21,8 @@ in place and hides stale reads unless something is allocated after the owner).
 Environment for stage1 (ELISA_RUNTIME_OBJ, ELISA_CLANG, PATH with the clang shim) is inherited.
 """
 import argparse, fcntl, hashlib, json, multiprocessing as mp, os, random, re, shutil, signal, subprocess, sys, tempfile, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+import elisa_platform  # host link flags: scripts/platform.sh
 
 GROW_OPS = ["{x}.push({n})", "{x}.push({n})\n{ind}{x}.push({n})", "{x}.clear()", "{x} <- [{n}, {n}]",
             "{x}.extend([{n}, {n}, {n}])"]
@@ -170,7 +172,7 @@ def evaluate(cfg, path, wd):
             exe = os.path.join(wd, "p" + opt); o = exe + ".o"
             rc, out = run([cfg["s1"], "-emit", "obj", opt, "-o", o, path], cfg["ctimeout"], cwd=wd)
             if rc == 0:
-                rc, out = run([cfg["cc"], "-fno-builtin", "-Wl,-dead_strip", "-o", exe, o, cfg["runtime"],
+                rc, out = run([cfg["cc"], "-fno-builtin", *elisa_platform.EXE_LINK, "-o", exe, o, cfg["runtime"],
                                cfg["fallback"]], cfg["ctimeout"], cwd=wd)
             if rc != 0 or not os.path.exists(exe):
                 r["exec"][opt] = "build_fail"

@@ -31,6 +31,8 @@ SKIP is not a failure of stage1. Many corpus programs are not runnable at all
 Only cases where stage0 produces a running binary can adjudicate anything.
 """
 import base64, subprocess, sys, os, re, tempfile, pathlib, collections, json
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "scripts"))
+import elisa_platform  # host link flags: scripts/platform.sh
 
 S = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO_ROOT", os.path.abspath(os.path.join(S, "..", "..", "..")))
@@ -76,8 +78,8 @@ def build_and_run(src_path, work, tag):
         r = run(["bash", WRAP, "-o", obj, src_path], timeout=90)
     if r.returncode != 0:
         return (False, None)
-    for extra in ([RT], [], [RT, "-L/opt/homebrew/opt/llvm/lib", "-lLLVM"]):
-        if run(["clang", "-Wl,-dead_strip", "-o", exe, obj] + extra).returncode == 0:
+    for extra in ([RT], [], [RT, f"-L{elisa_platform.LLVM_LIBDIR}", *elisa_platform.LLVM_LIBS]):
+        if run(["clang", *elisa_platform.EXE_LINK, "-o", exe, obj] + extra).returncode == 0:
             break
     else:
         return (False, None)

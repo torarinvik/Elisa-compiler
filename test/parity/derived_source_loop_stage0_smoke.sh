@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Stage0 executable/state counterclaims; range/alias classification is not proved.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,7 +22,7 @@ for optimization in 0 2; do
         exit 1
     }
     elisa_run_timeout 30 env DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}" \
-        "${ELISA_CLANG:-clang}" -Wl,-dead_strip -o "$WORK/native" "$WORK/native.a" >"$WORK/link.log" 2>&1 || {
+        "${ELISA_CLANG:-clang}" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/native" "$WORK/native.a" >"$WORK/link.log" 2>&1 || {
         cat "$WORK/link.log" >&2
         exit 1
     }

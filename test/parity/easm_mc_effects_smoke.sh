@@ -1,12 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ELISACORE_BIN=${ELISACORE_BIN:-"$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac"}
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG=${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}
-LLVM_MC=${LLVM_MC:-/opt/homebrew/opt/llvm/bin/llvm-mc}
-CXX=${CXX:-/opt/homebrew/opt/llvm/bin/clang++}
+LLVM_CONFIG=${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}
+LLVM_MC=${LLVM_MC:-$ELISA_LLVM_BIN_DIR/llvm-mc}
+CXX=${CXX:-$ELISA_LLVM_BIN_DIR/clang++}
 BUILD="$ROOT/build"
 
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ] || [ ! -x "$LLVM_MC" ] || [ ! -x "$CXX" ]; then
@@ -29,7 +30,7 @@ fi
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
 if ! timeout 45 "$CXX" "$BUILD/easm_effect_driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$BUILD/easm_effect_driver" \
-    -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)" \
+    -L"$($LLVM_CONFIG --libdir)" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$($LLVM_CONFIG --libdir)" \
     >"$BUILD/easm_effect_driver.linklog" 2>&1; then
     echo "easm_mc_effects_smoke FAILED: could not link effect driver"
     sed -n '1,80p' "$BUILD/easm_effect_driver.linklog"

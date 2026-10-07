@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -98,7 +99,7 @@ run_interpret_warning() {
 run_native_result() {
     local fixture="$1" expected="$2"
     local stem="$(basename "$fixture" .elisa)"
-    local clang="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+    local clang="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
     if [[ ! -x "$clang" ]]; then
         echo "native effect check SKIP: clang unavailable for $fixture"
         return
@@ -115,7 +116,7 @@ run_native_result() {
 }
 
 run_direct_equivalence() {
-    local llvm_diff="${ELISA_LLVM_DIFF:-/opt/homebrew/opt/llvm/bin/llvm-diff}"
+    local llvm_diff="${ELISA_LLVM_DIFF:-$ELISA_LLVM_BIN_DIR/llvm-diff}"
     # Off Homebrew, use the LLVM the harness was pointed at (silently skipped before).
     if [[ ! -x "$llvm_diff" && -z "${ELISA_LLVM_DIFF:-}" && -x "${ELISA_LLVM_BIN_DIR:-}/llvm-diff" ]]; then
         llvm_diff="$ELISA_LLVM_BIN_DIR/llvm-diff"

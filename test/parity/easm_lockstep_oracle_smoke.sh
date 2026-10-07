@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-LLVM_MC="${LLVM_MC:-/opt/homebrew/opt/llvm/bin/llvm-mc}"
+LLVM_MC="${LLVM_MC:-$ELISA_LLVM_BIN_DIR/llvm-mc}"
 CLANG="${CLANG:-$(command -v clang || true)}"
 if [ ! -x "$LLVM_MC" ] || [ -z "$CLANG" ]; then
     echo "easm_lockstep_oracle_smoke SKIP: llvm-mc or clang not found"

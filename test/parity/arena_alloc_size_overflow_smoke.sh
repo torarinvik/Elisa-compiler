@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -37,7 +38,7 @@ compile_case() {
         # The O0 c-archive also contains unused runtime entry points such as va_copy
         # that are supplied only when those features are used. Dead-strip unreachable
         # sections so this isolated allocator fixture need not stub unrelated varargs.
-        if ! clang -Wl,-dead_strip -o "$stem" "$archive" >"$log" 2>&1; then
+        if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stem" "$archive" >"$log" 2>&1; then
             echo "arena allocation overflow smoke: failed to link stage0 $case_name at O$optimization" >&2
             cat "$log" >&2
             exit 1

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # The nested optional AST-pattern path must branch on presence and never feed the
 # tagged optional aggregate directly to the packed-store handle conversion.
 set -euo pipefail
@@ -8,7 +9,7 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 SOURCE="$ROOT/test/fixtures/backend/nested_optional_ast_match.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-nested-optional-pattern.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 if [[ -x "$LLVM_CONFIG" ]]; then

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # A type declared in one module must not be captured by a same-named type in another.
 set -euo pipefail
 
@@ -6,7 +7,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 CLANG="${ELISA_CLANG:-$(dirname -- "$LLVM_CONFIG")/clang}"
 FIXTURE="$ROOT/test/repro/module_type_name_collision.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-module-type-collision.XXXXXX")"
@@ -20,8 +21,8 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0.o" "$FIXTURE"
 bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$WORK/hooks.c"
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
-"$CLANG" -Wl,-dead_strip -o "$WORK/stage0" "$WORK/stage0.o" "$RUNTIME_OBJ" \
-    "$WORK/hooks.c" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000
+"$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/stage0" "$WORK/stage0.o" "$RUNTIME_OBJ" \
+    "$WORK/hooks.c" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
 
 ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit exe -O0 -o "$WORK/stage1" "$FIXTURE"

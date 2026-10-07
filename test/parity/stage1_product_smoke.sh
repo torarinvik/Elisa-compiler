@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Standing product gate: stage1 product binary compiles a fixed fixture to a
 # native object that links and runs with exit 42 — without invoking stage0.
 #
@@ -29,7 +30,7 @@ fi
 # Isolate from stage0: no ELISACORE_BIN, no ~/.elisac on PATH for the compile step.
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN"
-export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
+export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:${ELISA_BREW_BIN:+$ELISA_BREW_BIN:}$ELISA_LLVM_BIN_DIR${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 fixture="$SCRATCH_DIR/fixture.elisa"
 obj="$SCRATCH_DIR/fixture.o"
@@ -46,7 +47,7 @@ bash "$WRAPPER" -o "$obj" "$fixture"
 # bridges whose foreign implementations are only needed by programs that use
 # those APIs. Dead-strip unused runtime sections so a scalar fixture does not
 # require every optional host bridge at link time.
-clang -Wl,-dead_strip -o "$prog" "$obj" "$RUNTIME"
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$prog" "$obj" "$RUNTIME"
 got="$("$prog"; echo $?)"
 # prog exit is in $?, capture carefully
 set +e

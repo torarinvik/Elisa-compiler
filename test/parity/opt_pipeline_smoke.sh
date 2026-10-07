@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # OPTIMISATION MUST NEVER CHANGE ANSWERS. stage1's -O1/-O2/-O3 run LLVM's `default<O{n}>`
 # pipeline (they were rejected outright while `default<O2>` trapped on large self-host
 # modules — those traps were the opaque-handle `==` and arena-identity miscompiles in the
@@ -14,7 +15,7 @@ set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "opt_pipeline FAIL: no runtime object" >&2; exit 1; }
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 LLVM_CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [ ! -x "$LLVM_CLANG" ]; then
@@ -48,7 +49,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
     if ! bash "$ROOT/scripts/elisac_stage1.sh" -O0 -o "$WORK/$name.o0.o" "$src" >/dev/null 2>&1; then
         continue    # a decline is the corpus's business, not this smoke's
     fi
-    "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
+    "$LLVM_CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
     if [ "$compile_only" -eq 1 ]; then
         # Some source-shape repros intentionally enter trusted undefined behavior from main.
         # They still exercise codegen at every optimization level, but are compile/link-only.
@@ -57,7 +58,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
                 echo "  FAIL $name: -$level compile failed where -O0 succeeded"
                 failed=$((failed + 1)); break
             fi
-            "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.$level" "$WORK/$name.$level.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -$level link"; failed=$((failed + 1)); break; }
+            "$LLVM_CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.$level" "$WORK/$name.$level.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -$level link"; failed=$((failed + 1)); break; }
         done
         checked=$((checked + 1))
         continue
@@ -69,7 +70,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         echo "  FAIL $name: -O2 compile failed where -O0 succeeded"
         failed=$((failed + 1)); continue
     fi
-    "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o2" "$WORK/$name.o2.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O2 link"; failed=$((failed + 1)); continue; }
+    "$LLVM_CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.o2" "$WORK/$name.o2.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O2 link"; failed=$((failed + 1)); continue; }
     RUN_TIMED "$WORK/$name.o2"; rc2=$?
     checked=$((checked + 1))
     if [ "$rc0" != "$rc2" ]; then
@@ -86,7 +87,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         echo "  FAIL $name: -O3 compile failed where -O0 succeeded"
         failed=$((failed + 1)); continue
     fi
-    "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o3" "$WORK/$name.o3.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O3 link"; failed=$((failed + 1)); continue; }
+    "$LLVM_CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name.o3" "$WORK/$name.o3.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O3 link"; failed=$((failed + 1)); continue; }
     RUN_TIMED "$WORK/$name.o3"; rc3=$?
     if [ "$rc0" != "$rc3" ]; then
         echo "  FAIL $name: -O0 exit $rc0, -O3 exit $rc3"

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
-CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 STAGE0="${ELISA_STAGE0_BIN:-${ELISACORE_BIN:-$HOME/.elisac/elisac-stage0}}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
@@ -28,8 +29,8 @@ printf '%s\n' \
 # -dead_strip, as every other smoke links the runtime object: its unreferenced
 # native-callback shims name symbols no program here defines, and without the
 # strip the link fails on them before the test runs at all.
-"$CLANG" -Wl,-dead_strip -o "$WORK/stage0" "$WORK/stage0.o" "$WORK/stub.o" "$RUNTIME_OBJ"
-"$CLANG" -Wl,-dead_strip -o "$WORK/stage1" "$WORK/stage1.o" "$WORK/stub.o" "$RUNTIME_OBJ"
+"$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/stage0" "$WORK/stage0.o" "$WORK/stub.o" "$RUNTIME_OBJ"
+"$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/stage1" "$WORK/stage1.o" "$WORK/stub.o" "$RUNTIME_OBJ"
 
 set +e
 "$WORK/stage0"
@@ -47,7 +48,7 @@ OPTIONAL_SOURCE="$ROOT/test/repro/extern_nullable_fn_param.elisa"
 printf '%s\n' \
     'void invoke_optional_callback(void *item, void (*handler)(void *)) { handler(item); }' \
     | "$CLANG" -x c -c -o "$WORK/optional-callback-stub.o" -
-"$CLANG" -Wl,-dead_strip -o "$WORK/optional-callback" \
+"$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/optional-callback" \
     "$WORK/optional-callback.o" "$WORK/optional-callback-stub.o" "$RUNTIME_OBJ"
 set +e
 "$WORK/optional-callback"

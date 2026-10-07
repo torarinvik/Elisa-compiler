@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 [ -x "$ELISACORE_BIN" ] || { echo "backend packed profile smoke FAIL: no elisac" >&2; exit 1; }
 [ -x "$LLVM_CONFIG" ] || { echo "backend packed profile smoke FAIL: no llvm-config" >&2; exit 1; }
 
@@ -20,14 +21,14 @@ RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 # the profiler ABI unconditionally), which is what kept this gate red.
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
 
 src=$'@packed_profile(retained_reads)\npacked enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Leaf(v: 42)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 printf '%s' "$src" | "$BUILD/driver" > "$BUILD/profile.ll"
 grep -q 'declare ptr @ctx_packed_store_state_new(ptr, i64)' "$BUILD/profile.ll"
 grep -q 'declare.*@ctx_packed_store_alloc_fixed_tagged_index_result' "$BUILD/profile.ll"
 grep -q 'call i64 @ctx_packed_store_read_index_word(ptr .* i32 .* i64 1)' "$BUILD/profile.ll"
-"${LLC:-/opt/homebrew/opt/llvm/bin/llc}" -filetype=obj -o "$BUILD/profile.o" "$BUILD/profile.ll"
+"${LLC:-$ELISA_LLVM_BIN_DIR/llc}" -filetype=obj -o "$BUILD/profile.o" "$BUILD/profile.ll"
 RUNTIME_LINK_INPUTS=("$BUILD/profile.o" "$RUNTIME_OBJ")
 # The native callback and varargs hooks are intentionally unresolved in the shared
 # runtime. This standalone executable has no embedding host, so provide the same

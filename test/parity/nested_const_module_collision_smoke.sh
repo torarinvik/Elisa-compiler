@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Nested module references inside sibling modules stay bound to their own namespace.
 set -euo pipefail
 
@@ -16,7 +17,7 @@ for pair in "stage0:$STAGE0" "stage1:$STAGE1"; do
     name="${pair%%:*}"
     compiler="${pair#*:}"
     "$compiler" -emit obj -O0 -o "$WORK/$name.o" "$ROOT/test/repro/nested_const_module_collision.elisa"
-    clang -Wl,-dead_strip -o "$WORK/$name" "$WORK/$name.o" \
+    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$name" "$WORK/$name.o" \
         "$WORK/profile_hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
     "$WORK/$name"
 done

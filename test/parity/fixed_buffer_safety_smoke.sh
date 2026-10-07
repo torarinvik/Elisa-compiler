@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,7 +35,7 @@ compile_case() {
             cat "$log" >&2
             exit 1
         fi
-        if ! clang -Wl,-dead_strip -o "$stem" "$archive" >"$log" 2>&1; then
+        if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$stem" "$archive" >"$log" 2>&1; then
             echo "fixed-buffer safety smoke: failed to link stage0 $case_name at O$optimization" >&2
             cat "$log" >&2
             exit 1
