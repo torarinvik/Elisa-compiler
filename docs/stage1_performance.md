@@ -148,3 +148,62 @@ invalid backend IR in an object build prints numbered values instead of names.
   support`, `--gc-sections`; on the box `-l:libzstd.so.1` since there is no libzstd.a)
   measured 0.014-0.017 s for the same compile, link 4 s, binary 94 MB unstripped. That is
   a build-script change (seed and gen2 link lines) left for a decision.
+
+## Round 4 (claude/s1-perf-r4: 0cdb5c72, bd9fdb13, 341f72ba, ddbc803d)
+
+Measured in one QUIET window on the gate box, 64 emit jobs, same input tree (main at
+8006b660), each compiler stage1-built. `check` is the median of three runs.
+
+| measure (self-host unit) | 8006b660 | ddbc803d |
+|---|---|---|
+| callgrind, `-emit check` (instructions) | 49.08 G | 44.07 G (-10.2%) |
+| `-emit check` wall | 19.5 s | 18.3 s |
+| semantic CPU (sum of passes) | 17.1 s | 16.1 s |
+| read+includes / lex / parse CPU | 0.24 / 0.33 / 1.22 s | 0.17 / 0.24 / 1.15 s |
+| `-O0` object wall | 34.1 s | 30.6 s |
+| `-O2` object wall (LLVM optimise) | 160 s (108 s) | 143 s (97 s) |
+| small file `-O0` | 0.024-0.039 s | 0.027-0.036 s |
+
+What changed:
+
+- `view_return_origin_rows` (an up-to-8-round whole-AST fixpoint) runs once per unit and is
+  lent to both passes that used it (~0.63 G).
+- Hash chains for scans callgrind still showed: enum-variant owners (`bare_enum_module`,
+  0.49 G), function effect owners/sources (`function_has_effect`, the global-permissions
+  dedup probe), generic-parameter names (`is_protocol_constraint_name`). Every chain falls
+  back to the old scan when it is not current.
+- `binding_import_module_owner` no longer allocates per call (its region teardown memset was
+  0.75 G); length/first-byte rejects before string compares in `type_of_name`,
+  `is_integer_type_name`, `is_lambda_keyword`, and the lexer's keyword table split by length
+  (~50 compares per identifier before).
+- Optimised builds give the runtime's `ctx_aos_store_record` an available_externally body
+  (the runtime's own code, 64-bit layout, trap on a bad chunk) so LLVM inlines every
+  packed-AST read; the linked definition stays authoritative and -O0 output is unchanged.
+  This changes -O2 code of every program that reads packed ASTs (fewer calls only);
+  differential_corpus is unchanged against main (same mismatch, same declines once the
+  load-dependent easm_* skips are accounted for).
+- `read_file` and `expand_includes` copy blocks instead of pushing bytes.
+
+Wall time moved less than instructions (memory-bound walks). What remains, measured:
+
+- Fusing the lint walks: the 108 `loop_view.top_decls` passes under 60 ms sum to ~1.5 s of
+  the semantic CPU on a loaded box (~5%), and fusion saves only their walk overhead, not their
+  checks. The expensive passes are the stateful ones (region storage, view provenance's
+  6-round fixpoint, borrow-after-move, resolve), and those are not fusable without merging
+  their state machines. Diagnostics are emitted in pass order (no sort), so a fused walk needs
+  per-check buffers spliced back at each pass's position and per-check coverage masks
+  (lambda descent, GetElse, contract skipping differ across the 152 walkers). Estimated gain
+  under 1 s; not done.
+- Parallel per-function checking: needs a per-thread arena and diagnostic buffer, and
+  read-only sharing of `SymbolTable` after collection. ~45 passes write table fields during
+  the walk (indexes, memo dicts, `local_type_*` scopes, `text_storage`), so each would have to
+  be split into a collect phase and a pure check phase first. A multi-week refactor; not
+  started.
+- -O2: LLVM's single-threaded module pipeline is still ~97 s of 143 s. Splitting it per
+  partition changes inlining and so needs runtime-parity proof first; not done this round.
+- Remaining callgrind hot spots: AST-walk self time in the stateful passes
+  (`lmut_mutation_check_statements`, `check_pointer_erasure_*`, `precondition_multiparam_walk`,
+  ~0.3-0.4 G each, inlined so not attributable further without debug info), the arena
+  allocator (`arena_alloc`/`arena_free`/`darray_grow`, ~1.6 G), and dict probes behind
+  `function_param_chain_head` / `symbol_chain_head` (~0.7 G each; ~350 instructions a call,
+  mostly name hashing and linear probing).
