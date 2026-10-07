@@ -1,0 +1,146 @@
+# never-leak lint (-Wnever-leak) — the PUSH LOOP kind: a darray built element by element
+#
+#     squares: mutable darray[i64] = []           squares: darray[i64] = [num * num for num in numbers if num > 0]
+#     for num in numbers:               ==>
+#         if num > 0:
+#             squares.push(num * num)
+#     use(squares)                                use(squares)
+#
+# A `mutable` darray that starts empty, that only a loop fills with `push`, and that only later
+# code reads, stays mutable and in scope after the loop for no reason. A comprehension builds it
+# in one expression as one immutable binding (and, over a range or a darray with no filter,
+# allocates it once instead of growing it push by push).
+#
+# CANDIDATE: `name: mutable darray[T] = []` whose first later mention is a plain `for` statement
+# of the shape
+#
+#     for VAR in ITER:            one loop variable, no `mutable`, no header, no `where`/`if`
+#         [if COND:]              an optional filter (no `else`)
+#             [for VAR2 in ITER2: another clause, same shape, any number of them
+#                 [if COND2:]]
+#                     name.push(VALUE)
+#
+# with every clause on its own line, `name` mentioned nowhere in the loop but as the receiver,
+# no `break`/`continue`/`return` in it, `name` read after the loop and never written, mutated
+# through a call or borrowed after it. The driver renders the rewrite from those lines (the
+# finding carries them: clause_lines[clause_first ..< clause_first + clause_count], the `for`
+# and `if` lines in order, then the push line) and checks each line has the plain shape.
+extend Semantic:
+    private:
+        # `mutable darray[T]` (a `darray` head under `mutable`).
+        def nl_mutable_darray_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, pos):
+                        false return if operator != TokenKind.Mutable
+                        match operand:
+                            Expr.Index(head, element, index_pos):
+                                if head is Expr.Ident(head_name, head_pos):
+                                    return head_name == "darray"
+                                return false
+                            Expr.IndexN(head, elements, index_pos):
+                                if head is Expr.Ident(head_name, head_pos):
+                                    return head_name == "darray"
+                                return false
+                            _:
+                                return false
+                    _:
+                        return false
+
+        # The empty literal `[]`.
+        def nl_empty_array(value: Ast::Expr) -> bool:
+            can Abort.Panic:
+                if value is Expr.Array(elements, pos):
+                    return elements.count == 0
+                return false
+
+        # One `for` clause of a push loop, recording its line, then what it holds.
+        def nl_push_loop_clause(statement: Ast::Stmt, name: sview, lines: mutable darray[u32]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.For(bind, variables, iterable, body, pos):
+                        false return if bind != "" or variables.count != 1 or body.count != 1
+                        false return if iterable is Expr.Refinement(_, _, _)
+                        lines.push(pos.line)
+                        return nl_push_loop_body(body[0], name, true, lines)
+                    _:
+                        return false
+
+        # What a clause holds: an optional `if COND:` filter (`filter_ok` is false right after
+        # one: a clause takes one filter), then the next clause or the push itself.
+        def nl_push_loop_body(statement: Ast::Stmt, name: sview, filter_ok: bool, lines: mutable darray[u32]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.For(_, _, _, _, _):
+                        return nl_push_loop_clause(statement, name, lines)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        false return if not filter_ok or else_body.count != 0 or then_body.count != 1
+                        lines.push(pos.line)
+                        return nl_push_loop_body(then_body[0], name, false, lines)
+                    Stmt.Expr(expression, pos):
+                        if expression is Expr.Call(callee, arguments, argument_names, call_pos):
+                            if callee is Expr.Field(receiver, method, field_pos):
+                                if receiver is Expr.Ident(receiver_name, receiver_pos):
+                                    false return if receiver_name != name or method != "push" or arguments.count != 1
+                                    lines.push(pos.line)
+                                    return true
+                        return false
+                    _:
+                        return false
+
+        # How many times `name` is mentioned in `statement` of the block.
+        def nl_mention_count(block: NeverLeakBlock&, walk: NeverLeakWalk&, name: sview, statement: usize) -> usize:
+            can Abort.Panic:
+                count: mutable usize = 0
+                for entry in block.m_starts[statement]..<block.m_ends[statement] |count, block, walk, name|:
+                    count <- count + 1 if walk.out[entry] == name
+                return count
+
+        # Finds the block's push loops, pushes their findings, and returns per local whether it
+        # is one (its ordinary and accumulator findings are then skipped).
+        def nl_push_loops(statements: darray[Ast::Stmt], block: NeverLeakBlock&, walk: mutable NeverLeakWalk&) -> darray[bool]:
+            can Memory.Allocate, Abort.Panic:
+                decl_count: usize = block.decl_names.count
+                statement_count: u32 = block.lines.count.u32()
+                found: mutable darray[bool] = []
+                for local in 0..<decl_count |found, block, walk, statements, statement_count|:
+                    found.push(false)
+                    continue if block.decl_skip[local] or not block.decl_mutable[local] or block.decl_lines[local] == 0
+                    name: sview = block.decl_names[local]
+                    decl_statement: usize = block.decl_stmts[local].usize()
+                    continue if decl_statement >= statements.count
+                    shaped_decl: mutable bool = false
+                    if statements[decl_statement] is Stmt.VarDecl(decl_name, type_expression, value, decl_pos):
+                        shaped_decl <- decl_name == name and nl_mutable_darray_type(type_expression) and nl_empty_array(value)
+                    continue if not shaped_decl
+                    loop: u32 = nl_next_mention(block, walk, name, block.decl_stmts[local] + 1, statement_count)
+                    continue if loop == NL_OUTER or loop.usize() >= statements.count
+                    lines: mutable darray[u32] = []
+                    continue if not nl_push_loop_clause(statements[loop.usize()], name, lines)
+                    # Every clause on a line of its own, in order (the driver rewrites by line).
+                    ordered: mutable bool = true
+                    for line_index in 1..<lines.count |ordered, lines|:
+                        ordered <- false if lines[line_index] <= lines[line_index - 1]
+                    continue if not ordered
+                    continue if nl_mention_count(block, walk, name, loop.usize()) != 1
+                    continue if block.j_starts[loop.usize()] != block.j_ends[loop.usize()]
+                    later: u32 = nl_next_mention(block, walk, name, loop + 1, statement_count)
+                    continue if later == NL_OUTER
+                    written: mutable bool = false
+                    for after in (loop + 1)..<statement_count |written, block, walk, name|:
+                        index: usize = after.usize()
+                        written <- true if nl_listed_in(walk.writes, block.w_starts[index], block.w_ends[index], name) or nl_listed_in(walk.holds, block.h_starts[index], block.h_ends[index], name) or nl_listed_in(walk.addr, block.a_starts[index], block.a_ends[index], name)
+                    continue if written
+                    finding: mutable NeverLeakFinding = NeverLeakFinding{name: name, category: NEVER_LEAK_PUSH_LOOP, function_name: walk.function_name, decl_line: block.decl_lines[local], last_use_line: block.lines[loop.usize()], raw_last_use_line: block.lines[later.usize()]}
+                    finding.after_last_line <- block.lines[(loop + 1).usize()]
+                    finding.reason_line <- nl_mention_line(block, walk, name, later, NL_MENTION_OTHER)
+                    finding.reason_line <- block.lines[later.usize()] if finding.reason_line == 0
+                    finding.last_stmt_kind <- NEVER_LEAK_STMT_LOOP
+                    finding.decl_next_line <- block.lines[decl_statement + 1]
+                    finding.clause_first <- walk.clause_lines.count.u32()
+                    finding.clause_count <- lines.count.u32()
+                    for line in lines |walk|:
+                        walk.clause_lines.push(line)
+                    walk.findings.push(finding)
+                    found[local] <- true
+                return found
