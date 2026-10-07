@@ -1,0 +1,253 @@
+# Same-call exclusivity, global half: a call that lends a GLOBAL (`f(&g)`, `f(&gp.a)`,
+# `f(&gv[0])`) to a callee that (transitively) touches that global by name.
+#
+# The callee then holds two names for one storage: `a <- 1; g <- 2; return a` returns 2
+# at -O0 but the equivalence `a == g` the reference promises is broken, and `&gv[0]` lent to
+# a callee that grows `gv` is a use after free (audit probes p03, p04, p33). Rejected when the
+# callee transitively WRITES the global (any borrow), or READS it while the borrow lands in a
+# `mutable T&` parameter (the callee's own writes through the parameter then race its reads
+# by name under `noalias`).
+#
+# The facts are per (function, global): a direct write is an assignment whose target root
+# is the global, a method call on it that is not a known read-only method, or any `&g...`
+# inside the body; every other mention is a read. A local or parameter of the same name
+# shadows the global. Calls through function values, externs and `Unsafe.*` are opaque
+# here (as everywhere in this check). Facts are only gathered when the file has a global.
+extend Semantic:
+    private:
+        # Methods that only read their receiver. Anything else called on a global counts as
+        # a write: unknown is treated as mutating, never the other way round.
+        def exclusivity_read_only_method(method: sview) -> bool:
+            return method == "count" or method == "len" or method == "get" or method == "contains" or method == "as_sview" or method == "as_cstr" or method == "view" or method == "keys" or method == "values" or method == "is_empty" or method == "first" or method == "last" or method == "find" or method == "has" or method == "items" or method == "index_of" or method == "starts_with" or method == "ends_with"
+
+        # The root identifier of a place chain (`g`, `g.a`, `g[0].b`), or "".
+        def exclusivity_place_root_ident(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Paren(inner, _):
+                        return exclusivity_place_root_ident(inner)
+                    Expr.Field(object, _, _):
+                        return exclusivity_place_root_ident(object)
+                    Expr.Index(object, _, _):
+                        return exclusivity_place_root_ident(object)
+                    Expr.IndexN(object, _, _):
+                        return exclusivity_place_root_ident(object)
+                    Expr.Slice(object, _, _, _):
+                        return exclusivity_place_root_ident(object)
+                    _:
+                        return ""
+
+        def exclusivity_is_global(name: sview, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return name != "" and exclusivity_name_listed(globals, name) and not exclusivity_name_listed(locals, name)
+
+        def exclusivity_note_global(name: sview, write: bool, globals: darray[sview]&, locals: darray[sview]&, out_names: mutable darray[sview]&, out_write: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if exclusivity_is_global(name, globals, locals):
+                    out_names.push(name)
+                    out_write.push(write)
+
+        def exclusivity_global_facts_arms(arms: darray[Ast::MatchArm], globals: darray[sview]&, locals: darray[sview]&, out_names: mutable darray[sview]&, out_write: mutable darray[bool]&, out_callees: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |out_names, out_write, out_callees|:
+                    exclusivity_global_facts_expression(arm.guard, globals, locals, out_names, out_write, out_callees)
+                    exclusivity_global_facts_statements(arm.body, globals, locals, out_names, out_write, out_callees)
+
+        def exclusivity_global_facts_list(expressions: darray[Ast::Expr], globals: darray[sview]&, locals: darray[sview]&, out_names: mutable darray[sview]&, out_write: mutable darray[bool]&, out_callees: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for element in expressions |out_names, out_write, out_callees|:
+                    exclusivity_global_facts_expression(element, globals, locals, out_names, out_write, out_callees)
+
+        def exclusivity_global_facts_expression(expression: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&, out_names: mutable darray[sview]&, out_write: mutable darray[bool]&, out_callees: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        exclusivity_note_global(name, false, globals, locals, out_names, out_write)
+                    Expr.Call(callee, arguments, argument_names, _):
+                        match callee:
+                            Expr.Ident(callee_name, _):
+                                out_callees.push(callee_name)
+                                exclusivity_note_global(callee_name, false, globals, locals, out_names, out_write)
+                            Expr.Scope(_, scoped_name, _):
+                                out_callees.push(scoped_name)
+                            Expr.Field(receiver, method, _):
+                                # `g.push(x)` grows the global; a declared `method` may be a
+                                # UFCS call, so its name is followed too.
+                                out_callees.push(method)
+                                receiver_root: sview = exclusivity_place_root_ident(receiver)
+                                exclusivity_note_global(receiver_root, not exclusivity_read_only_method(method), globals, locals, out_names, out_write)
+                                exclusivity_global_facts_expression(receiver, globals, locals, out_names, out_write, out_callees)
+                            _:
+                                exclusivity_global_facts_expression(callee, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_list(arguments, globals, locals, out_names, out_write, out_callees)
+                    Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                        exclusivity_global_facts_list(arguments, globals, locals, out_names, out_write, out_callees)
+                    Expr.Unary(operator, operand, _):
+                        if operator == TokenKind.Ampersand:
+                            exclusivity_note_global(exclusivity_place_root_ident(operand), true, globals, locals, out_names, out_write)
+                        exclusivity_global_facts_expression(operand, globals, locals, out_names, out_write, out_callees)
+                    Expr.Field(object, _, _):
+                        exclusivity_global_facts_expression(object, globals, locals, out_names, out_write, out_callees)
+                    Expr.Index(object, index, _):
+                        exclusivity_global_facts_expression(object, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(index, globals, locals, out_names, out_write, out_callees)
+                    Expr.Slice(object, low, high, _):
+                        exclusivity_global_facts_expression(object, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(low, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(high, globals, locals, out_names, out_write, out_callees)
+                    Expr.IndexN(object, arguments, _):
+                        exclusivity_global_facts_expression(object, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_list(arguments, globals, locals, out_names, out_write, out_callees)
+                    Expr.Binary(left, _, right, _):
+                        # `arena == &g` compares an address: a read, not a lent borrow.
+                        exclusivity_global_facts_operand(left, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_operand(right, globals, locals, out_names, out_write, out_callees)
+                    Expr.Move(operand, _):
+                        exclusivity_global_facts_expression(operand, globals, locals, out_names, out_write, out_callees)
+                    Expr.RegionNew(operand, _, _):
+                        exclusivity_global_facts_expression(operand, globals, locals, out_names, out_write, out_callees)
+                    Expr.Paren(inner, _):
+                        exclusivity_global_facts_expression(inner, globals, locals, out_names, out_write, out_callees)
+                    Expr.Array(elements, _):
+                        exclusivity_global_facts_list(elements, globals, locals, out_names, out_write, out_callees)
+                    Expr.Tuple(elements, _):
+                        exclusivity_global_facts_list(elements, globals, locals, out_names, out_write, out_callees)
+                    Expr.SetLit(elements, _):
+                        exclusivity_global_facts_list(elements, globals, locals, out_names, out_write, out_callees)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |out_names, out_write, out_callees|:
+                            exclusivity_global_facts_expression(entry.key, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_expression(entry.value, globals, locals, out_names, out_write, out_callees)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |out_names, out_write, out_callees|:
+                            exclusivity_global_facts_expression(field.value, globals, locals, out_names, out_write, out_callees)
+                    Expr.RecordUpdate(base, fields, _):
+                        exclusivity_global_facts_expression(base, globals, locals, out_names, out_write, out_callees)
+                        for field in fields |out_names, out_write, out_callees|:
+                            exclusivity_global_facts_expression(field.value, globals, locals, out_names, out_write, out_callees)
+                    Expr.If(condition, then_expression, else_expression, _):
+                        exclusivity_global_facts_expression(condition, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(then_expression, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(else_expression, globals, locals, out_names, out_write, out_callees)
+                    Expr.Match(scrutinee, arms, _):
+                        exclusivity_global_facts_expression(scrutinee, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_arms(arms, globals, locals, out_names, out_write, out_callees)
+                    Expr.Catch(guarded, arms, _):
+                        exclusivity_global_facts_expression(guarded, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_arms(arms, globals, locals, out_names, out_write, out_callees)
+                    Expr.Comprehension(_, iterable, condition, body, _):
+                        exclusivity_global_facts_expression(iterable, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(condition, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(body, globals, locals, out_names, out_write, out_callees)
+                    Expr.GetElse(guarded, recovery, _):
+                        exclusivity_global_facts_expression(guarded, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_statements(recovery, globals, locals, out_names, out_write, out_callees)
+                    Expr.Lambda(_, body, _):
+                        exclusivity_global_facts_statements(body, globals, locals, out_names, out_write, out_callees)
+                    Expr.Block(statements, value, _, _):
+                        exclusivity_global_facts_statements(statements, globals, locals, out_names, out_write, out_callees)
+                        exclusivity_global_facts_expression(value, globals, locals, out_names, out_write, out_callees)
+                    _:
+                        pass
+
+        def exclusivity_global_facts_operand(operand: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&, out_names: mutable darray[sview]&, out_write: mutable darray[bool]&, out_callees: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match operand:
+                    Expr.Unary(operator, place, _):
+                        if operator == TokenKind.Ampersand:
+                            exclusivity_global_facts_expression(place, globals, locals, out_names, out_write, out_callees)
+                            return
+                        exclusivity_global_facts_expression(operand, globals, locals, out_names, out_write, out_callees)
+                    _:
+                        exclusivity_global_facts_expression(operand, globals, locals, out_names, out_write, out_callees)
+
+        def exclusivity_global_facts_statements(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: darray[sview]&, out_names: mutable darray[sview]&, out_write: mutable darray[bool]&, out_callees: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_write, out_callees|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            exclusivity_global_facts_expression(expression, globals, locals, out_names, out_write, out_callees)
+                        Stmt.VarDecl(_, _, value, _):
+                            exclusivity_global_facts_expression(value, globals, locals, out_names, out_write, out_callees)
+                        Stmt.Assign(target, _, value, _):
+                            exclusivity_note_global(exclusivity_place_root_ident(target), true, globals, locals, out_names, out_write)
+                            exclusivity_global_facts_expression(target, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_expression(value, globals, locals, out_names, out_write, out_callees)
+                        Stmt.If(condition, then_body, else_body, _):
+                            exclusivity_global_facts_expression(condition, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_statements(then_body, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_statements(else_body, globals, locals, out_names, out_write, out_callees)
+                        Stmt.While(condition, body, _):
+                            exclusivity_global_facts_expression(condition, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_statements(body, globals, locals, out_names, out_write, out_callees)
+                        Stmt.For(_, _, iterable, body, _):
+                            exclusivity_global_facts_expression(iterable, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_statements(body, globals, locals, out_names, out_write, out_callees)
+                        Stmt.Block(_, _, _, body, _):
+                            exclusivity_global_facts_statements(body, globals, locals, out_names, out_write, out_callees)
+                        Stmt.Match(scrutinee, arms, _):
+                            exclusivity_global_facts_expression(scrutinee, globals, locals, out_names, out_write, out_callees)
+                            exclusivity_global_facts_arms(arms, globals, locals, out_names, out_write, out_callees)
+                        Stmt.Return(value, _):
+                            exclusivity_global_facts_expression(returned, globals, locals, out_names, out_write, out_callees) if value is returned
+                        _:
+                            pass
+
+        # One function's direct global facts and callees, appended to the flat fact tables
+        # (rows for function index N live at [starts[N], starts[N] + counts[N])).
+        def exclusivity_collect_global_facts(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], globals: darray[sview]&, fact_starts: mutable darray[usize]&, fact_counts: mutable darray[usize]&, fact_names: mutable darray[sview]&, fact_write: mutable darray[bool]&, callee_starts: mutable darray[usize]&, callee_counts: mutable darray[usize]&, callee_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fact_start: usize = fact_names.count
+                callee_start: usize = callee_names.count
+                if globals.count > 0:
+                    locals: mutable darray[sview] = []
+                    for parameter in parameters |locals|:
+                        locals.push(parameter.name)
+                    collect_local_names(body, locals)
+                    exclusivity_global_facts_statements(body, globals, locals, fact_names, fact_write, callee_names)
+                fact_starts.push(fact_start)
+                fact_counts.push(fact_names.count - fact_start)
+                callee_starts.push(callee_start)
+                callee_counts.push(callee_names.count - callee_start)
+
+        # Whether calling CALLEE_NAME may write (WANT_WRITE) or touch at all (otherwise) the
+        # global GLOBAL_NAME, following direct calls by name. Every declaration of the name is
+        # followed (overloads union); a name with no declaration contributes nothing.
+        def exclusivity_callee_touches_global(fns: ExclusivityFns&, callee_name: sview, global_name: sview, want_write: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                visited: mutable darray[bool] = []
+                for slot in 0..<fns.names.count |visited|:
+                    visited.push(false)
+                queue: mutable darray[usize] = []
+                exclusivity_functions_named(fns, callee_name, queue)
+                head: mutable usize = 0
+                while head < queue.count |head, queue, visited|:
+                    index: usize = queue[head]
+                    head <- head + 1
+                    continue if visited[index]
+                    visited[index] <- true
+                    row: mutable usize = fns.fact_starts[index]
+                    while row < fns.fact_starts[index] + fns.fact_counts[index] |row|:
+                        true return if fns.fact_names[row] == global_name and (fns.fact_write[row] or not want_write)
+                        row <- row + 1
+                    edge: mutable usize = fns.callee_starts[index]
+                    while edge < fns.callee_starts[index] + fns.callee_counts[index] |edge, queue|:
+                        exclusivity_functions_named(fns, fns.callee_names[edge], queue)
+                        edge <- edge + 1
+                return false
+
+        # Every declared function index named NAME: the hash slot answers a unique name
+        # directly; a shared slot (overload or collision) falls back to the scan.
+        def exclusivity_functions_named(fns: ExclusivityFns&, name: sview, out: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if fns.lookup.get(name_hash(name)) is entry:
+                    slot: usize = entry
+                    if slot != EXCLUSIVITY_LOOKUP_SCAN:
+                        out.push(slot) if fns.names[slot] == name
+                        return
+                    index: mutable usize = 0
+                    while index < fns.names.count |index, out|:
+                        out.push(index) if fns.names[index] == name
+                        index <- index + 1

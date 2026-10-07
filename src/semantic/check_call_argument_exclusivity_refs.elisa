@@ -1,0 +1,565 @@
+# Same-call exclusivity, borrow half: what an argument BORROWS, through the locals that
+# carry borrows from earlier statements.
+#
+# A ref-local row is (NAME, PLACE): NAME stands for a borrow of PLACE. A name may own several
+# rows (the union of what it may point at). The PLACE encodes the row's kind:
+#   - Expr.Absent: NAME is a by-value container owning the buffer its views point into;
+#   - Expr.Move(P): NAME is a VALUE that stores a borrow of P (`h = H{r: &x}`, a darray of
+#     such structs, `hs.push(H{r: &x})`); passing NAME in any parameter lends P (p13, p32);
+#   - anything else: NAME is a reference to that place (`r = &x`, `r = &x if c else &y`,
+#     `r = id(&x)` for a callee returning `T&`, `r2: T& = r`).
+# An argument expands to ENTRIES, one per place it may borrow. `&r.a` with `r = &p` is
+# `&p.a` (p21); a call returning `T&` borrows every place its arguments borrow (p11, p12);
+# a value `if` borrows both branches (p18). Each entry records how it was reached (`via`),
+# which the diagnostic names together with a rewrite.
+#
+# Rows are dropped for a name bound twice or reassigned: that loses an alias, it never
+# invents one. Out of scope, deliberately: raw pointers, `Unsafe.*` casts and trusted code
+# launder borrows out of this view (p29: `Unsafe.PointerCast` aliasing still miscompiles under
+# -fnoalias, and that is the cast's contract); a reference returned by a METHOD call
+# (`x.get_ref()`) is not followed (strict mode's check_mutable_alias_local covers that shape);
+# a held borrow is taken as shared, whatever the stored reference's own mutability.
+extend Semantic:
+    private:
+        struct ExclusivityRefs:
+            names: mutable darray[sview]
+            places: mutable darray[Ast::Expr]
+            # Locals and parameters whose type is a function type: calls through them are
+            # checked against that type's parameters (p17).
+            fn_names: mutable darray[sview]
+            fn_types: mutable darray[Ast::Expr]
+            # Every parameter and local of the function: these shadow globals.
+            locals: mutable darray[sview]
+
+        struct ExclusivityEntries:
+            places: mutable darray[Ast::Expr]
+            addressed: mutable darray[bool]
+            held: mutable darray[bool]
+            # "" direct, "ref" a ref local, "call" a returned reference, "held" a value
+            # storing a borrow, "lit" a literal storing one, "cond" a conditional borrow.
+            via_kind: mutable darray[sview]
+            via_name: mutable darray[sview]
+
+        def exclusivity_no_refs() -> ExclusivityRefs:
+            can Memory.Allocate, Abort.Panic:
+                return ExclusivityRefs{names: [], places: [], fn_names: [], fn_types: [], locals: []}
+
+        def exclusivity_no_entries() -> ExclusivityEntries:
+            can Memory.Allocate, Abort.Panic:
+                return ExclusivityEntries{places: [], addressed: [], held: [], via_kind: [], via_name: []}
+
+        def exclusivity_push_entry(entries: mutable ExclusivityEntries&, place: Ast::Expr, addressed: bool, held: bool, via_kind: sview, via_name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                entries.places.push(place)
+                entries.addressed.push(addressed)
+                entries.held.push(held)
+                entries.via_kind.push(via_kind)
+                entries.via_name.push(via_name)
+
+        # PLACE with its root identifier replaced by REPLACEMENT: `r.a` over `p` is `p.a`.
+        def exclusivity_substitute_root(place: Ast::Expr, replacement: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Ident(_, _):
+                        return replacement
+                    Expr.Paren(inner, position):
+                        return Ast::Expr.Paren(exclusivity_substitute_root(inner, replacement), position)
+                    Expr.Field(object, field, position):
+                        return Ast::Expr.Field(exclusivity_substitute_root(object, replacement), field, position)
+                    Expr.Index(object, index, position):
+                        return Ast::Expr.Index(exclusivity_substitute_root(object, replacement), index, position)
+                    Expr.Slice(object, low, high, position):
+                        return Ast::Expr.Slice(exclusivity_substitute_root(object, replacement), low, high, position)
+                    _:
+                        return place
+
+        # Whether some declared function named NAME returns a reference.
+        def exclusivity_returns_ref(fns: ExclusivityFns&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                candidates: mutable darray[usize] = []
+                exclusivity_functions_named(fns, name, candidates)
+                for index in candidates:
+                    true return if fns.returns_ref[index]
+                return false
+
+        # The rows of the place chain rooted at ROOT: reference rows become `&`-entries on the
+        # substituted place (when SUBSTITUTE_PLACE is not Absent) or on the row's place, held
+        # rows become held entries. Returns whether a reference row was found.
+        def exclusivity_root_rows(root: sview, substitute_place: Ast::Expr, refs: ExclusivityRefs&, entries: mutable ExclusivityEntries&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if root == ""
+                plain: mutable bool = false
+                row: mutable usize = 0
+                while row < refs.names.count |row, plain, entries|:
+                    if refs.names[row] == root:
+                        match refs.places[row]:
+                            Expr.Absent:
+                                pass
+                            Expr.Move(held_place, _):
+                                exclusivity_push_entry(entries, held_place, true, true, "held", root)
+                            _:
+                                plain <- true
+                                target: mutable Ast::Expr = refs.places[row]
+                                if not (substitute_place is Expr.Absent):
+                                    target <- exclusivity_substitute_root(substitute_place, refs.places[row])
+                                exclusivity_push_entry(entries, target, true, false, "ref", root)
+                    row <- row + 1
+                return plain
+
+        # Every place ARGUMENT may borrow, appended to ENTRIES (see the file comment).
+        def exclusivity_argument_borrows(argument: Ast::Expr, fns: ExclusivityFns&, refs: ExclusivityRefs&, entries: mutable ExclusivityEntries&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, _):
+                        exclusivity_argument_borrows(inner, fns, refs, entries)
+                    Expr.Move(operand, _):
+                        exclusivity_argument_borrows(operand, fns, refs, entries)
+                    Expr.Unary(operator, operand, _):
+                        if operator != TokenKind.Ampersand:
+                            exclusivity_push_entry(entries, argument, false, false, "", "")
+                            return
+                        through_ref: bool = exclusivity_root_rows(exclusivity_place_root_ident(operand), operand, refs, entries)
+                        exclusivity_push_entry(entries, operand, true, false, "", "") if not through_ref
+                    Expr.Ident(name, _):
+                        through_ref: bool = exclusivity_root_rows(name, Ast::Expr.Absent, refs, entries)
+                        exclusivity_push_entry(entries, argument, false, false, "", "") if not through_ref
+                    Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.Slice(_, _, _, _):
+                        # A bare place names the value (or reference) it holds; a held root still
+                        # lends what it stores.
+                        start: usize = entries.places.count
+                        exclusivity_root_rows(exclusivity_place_root_ident(argument), Ast::Expr.Absent, refs, entries)
+                        # Only the held rows are kept: a reference root's field VALUE is a copy.
+                        exclusivity_keep_held(entries, start)
+                        exclusivity_push_entry(entries, argument, false, false, "", "")
+                    Expr.If(_, then_expression, else_expression, _):
+                        start: usize = entries.places.count
+                        exclusivity_argument_borrows(then_expression, fns, refs, entries)
+                        exclusivity_argument_borrows(else_expression, fns, refs, entries)
+                        index: mutable usize = start
+                        while index < entries.places.count |index, entries|:
+                            entries.via_kind[index] <- "cond" if entries.via_kind[index] == "" and entries.addressed[index]
+                            index <- index + 1
+                    Expr.Call(callee, call_arguments, _, _):
+                        callee_name: sview = exclusivity_callee_name(callee)
+                        if callee_name == "" or not exclusivity_returns_ref(fns, callee_name):
+                            exclusivity_push_entry(entries, argument, false, false, "", "")
+                            return
+                        # The result borrows every reference argument, except an `Arena` it
+                        # was allocated from: `s = state_in(&arena); t = tree_in(&arena)` are
+                        # two fresh allocations, neither aliases the other or the arena header.
+                        inner: mutable ExclusivityEntries = exclusivity_no_entries()
+                        function_index: usize = exclusivity_unique_declared(fns, callee_name)
+                        argument_index: mutable usize = 0
+                        for call_argument in call_arguments |inner, argument_index|:
+                            allocator: mutable bool = false
+                            if function_index < fns.names.count and argument_index < fns.counts[function_index]:
+                                allocator <- rpu_struct_head(fns.params[fns.starts[function_index] + argument_index].type_expression) == "Arena"
+                            exclusivity_argument_borrows(call_argument, fns, refs, inner) if not allocator
+                            argument_index <- argument_index + 1
+                        exclusivity_push_borrowed(inner, false, "call", callee_name, entries)
+                    Expr.Construct(_, fields, _):
+                        inner: mutable ExclusivityEntries = exclusivity_no_entries()
+                        for field in fields |inner|:
+                            exclusivity_argument_borrows(field.value, fns, refs, inner)
+                        exclusivity_push_borrowed(inner, true, "lit", "", entries)
+                    Expr.RecordUpdate(base, fields, _):
+                        inner: mutable ExclusivityEntries = exclusivity_no_entries()
+                        exclusivity_argument_borrows(base, fns, refs, inner)
+                        for field in fields |inner|:
+                            exclusivity_argument_borrows(field.value, fns, refs, inner)
+                        exclusivity_push_borrowed(inner, true, "lit", "", entries)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        inner: mutable ExclusivityEntries = exclusivity_no_entries()
+                        for element in elements |inner|:
+                            exclusivity_argument_borrows(element, fns, refs, inner)
+                        exclusivity_push_borrowed(inner, true, "lit", "", entries)
+                    Expr.DictLit(dict_entries, _):
+                        inner: mutable ExclusivityEntries = exclusivity_no_entries()
+                        for entry in dict_entries |inner|:
+                            exclusivity_argument_borrows(entry.key, fns, refs, inner)
+                            exclusivity_argument_borrows(entry.value, fns, refs, inner)
+                        exclusivity_push_borrowed(inner, true, "lit", "", entries)
+                    _:
+                        exclusivity_push_entry(entries, argument, false, false, "", "")
+
+        # Drop the non-held entries appended since START.
+        def exclusivity_keep_held(entries: mutable ExclusivityEntries&, start: usize) -> void:
+            can Memory.Allocate, Abort.Panic:
+                kept: mutable ExclusivityEntries = exclusivity_no_entries()
+                index: mutable usize = start
+                while index < entries.places.count |index, kept|:
+                    exclusivity_push_entry(kept, entries.places[index], true, true, entries.via_kind[index], entries.via_name[index]) if entries.held[index]
+                    index <- index + 1
+                entries.places <- entries.places.truncate(start)
+                entries.addressed <- entries.addressed.truncate(start)
+                entries.held <- entries.held.truncate(start)
+                entries.via_kind <- entries.via_kind.truncate(start)
+                entries.via_name <- entries.via_name.truncate(start)
+                index <- 0
+                while index < kept.places.count |index, entries|:
+                    exclusivity_push_entry(entries, kept.places[index], true, true, kept.via_kind[index], kept.via_name[index])
+                    index <- index + 1
+
+        # The borrowed (`&`) entries of INNER, appended to ENTRIES as HELD (stored in a value)
+        # or as they are, tagged with VIA unless they already carry a more precise route.
+        # A literal always reports itself: a reference local stored in a field is still a
+        # borrow the literal now carries.
+        def exclusivity_push_borrowed(inner: ExclusivityEntries&, held: bool, via_kind: sview, via_name: sview, entries: mutable ExclusivityEntries&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index: mutable usize = 0
+                while index < inner.places.count |index, entries|:
+                    if inner.addressed[index]:
+                        keep_route: bool = inner.via_kind[index] != "" and not held
+                        kind: sview = inner.via_kind[index] if keep_route else via_kind
+                        name: sview = inner.via_name[index] if keep_route else via_name
+                        exclusivity_push_entry(entries, inner.places[index], true, held or inner.held[index], kind, name)
+                    index <- index + 1
+
+        # Whether VALUE (bound by an untyped `r = VALUE`) is itself a reference.
+        def exclusivity_is_borrow_value(value: Ast::Expr, fns: ExclusivityFns&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return exclusivity_is_borrow_value(inner, fns)
+                    Expr.Unary(operator, _, _):
+                        return operator == TokenKind.Ampersand
+                    Expr.If(_, then_expression, else_expression, _):
+                        return exclusivity_is_borrow_value(then_expression, fns) or exclusivity_is_borrow_value(else_expression, fns)
+                    Expr.Call(callee, _, _, _):
+                        callee_name: sview = exclusivity_callee_name(callee)
+                        return callee_name != "" and exclusivity_returns_ref(fns, callee_name)
+                    _:
+                        return false
+
+        # Whether VALUE can store a borrow in a VALUE binding: a literal aggregate, or a local
+        # already holding one (`h2 = h`).
+        def exclusivity_is_holder_value(value: Ast::Expr, candidates: ExclusivityRefs&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, _):
+                        return exclusivity_is_holder_value(inner, candidates)
+                    Expr.Construct(_, _, _) | Expr.RecordUpdate(_, _, _) | Expr.Array(_, _) | Expr.Tuple(_, _) | Expr.SetLit(_, _) | Expr.DictLit(_, _):
+                        return true
+                    Expr.Ident(name, _):
+                        row: mutable usize = 0
+                        while row < candidates.names.count |row|:
+                            true return if candidates.names[row] == name and (candidates.places[row] is Expr.Move(_, _))
+                            row <- row + 1
+                        return false
+                    _:
+                        return false
+
+        # Record that NAME (a value) stores every borrow VALUE carries.
+        def exclusivity_note_held_rows(name: sview, value: Ast::Expr, fns: ExclusivityFns&, candidates: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not exclusivity_is_holder_value(value, candidates)
+                entries: mutable ExclusivityEntries = exclusivity_no_entries()
+                exclusivity_argument_borrows(value, fns, candidates, entries)
+                index: mutable usize = 0
+                while index < entries.places.count |index, candidates|:
+                    if entries.addressed[index]:
+                        candidates.names.push(name)
+                        candidates.places.push(Ast::Expr.Move(entries.places[index], Ast::expr_pos(value)))
+                    index <- index + 1
+
+        def exclusivity_note_ref_candidate(name: sview, type_expression: Ast::Expr, value: Ast::Expr, fns: ExclusivityFns&, candidates: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                typed_ref: bool = type_marker_present_here(type_expression, TokenKind.Ampersand)
+                if chv_type_is_owned_container(type_expression) and not typed_ref:
+                    candidates.names.push(name)
+                    candidates.places.push(Ast::Expr.Absent)
+                    exclusivity_note_held_rows(name, value, fns, candidates)
+                    return
+                viewed: (address: bool, place: Ast::Expr) = exclusivity_view_borrow(value, candidates)
+                if viewed.address:
+                    candidates.names.push(name)
+                    candidates.places.push(viewed.place)
+                    return
+                if typed_ref or exclusivity_is_borrow_value(value, fns):
+                    entries: mutable ExclusivityEntries = exclusivity_no_entries()
+                    exclusivity_argument_borrows(value, fns, candidates, entries)
+                    index: mutable usize = 0
+                    while index < entries.places.count |index, candidates|:
+                        if entries.addressed[index]:
+                            candidates.names.push(name)
+                            stored: mutable Ast::Expr = entries.places[index]
+                            if entries.held[index]:
+                                stored <- Ast::Expr.Move(entries.places[index], Ast::expr_pos(value))
+                            candidates.places.push(stored)
+                        index <- index + 1
+                    return
+                exclusivity_note_held_rows(name, value, fns, candidates)
+
+        # `hs.push(H{r: &x})` (or append/insert/extend/put) stores the argument's borrows in hs.
+        def exclusivity_note_container_store(expression: Ast::Expr, fns: ExclusivityFns&, candidates: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(Expr.Field(receiver, method, _), call_arguments, _, _):
+                        storing: bool = method == "push" or method == "append" or method == "insert" or method == "extend" or method == "put"
+                        receiver_name: sview = exclusivity_ident_name(receiver)
+                        return if not storing or receiver_name == ""
+                        for call_argument in call_arguments |candidates|:
+                            exclusivity_note_held_rows(receiver_name, call_argument, fns, candidates)
+                    _:
+                        pass
+
+        # The parameters of a function-typed binding's `fn(...)` type, as synthetic
+        # declarations named "#1", "#2", ...; none when the type cannot be read.
+        def exclusivity_fn_value_params(type_expression: Ast::Expr, fns: ExclusivityFns&, out: mutable darray[Ast::ParamDecl]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                normalized: Ast::Expr = zeroed_normalize_function_type(type_expression, fns.fn_type_lines, fns.fn_type_exprs)
+                parameter_types: mutable darray[Ast::Expr] = []
+                return if not zeroed_function_type_params(normalized, parameter_types)
+                index: mutable usize = 0
+                while index < parameter_types.count |index, out|:
+                    out.push(Ast::ParamDecl{name: exclusivity_ordinal_name(index), type_expression: parameter_types[index], is_mutable: false, has_default: false, default_value: Ast::Expr.Invalid})
+                    index <- index + 1
+
+        def exclusivity_ordinal_name(index: usize) -> sview:
+            return when index:
+                0 -> "#1"
+                1 -> "#2"
+                2 -> "#3"
+                3 -> "#4"
+                4 -> "#5"
+                5 -> "#6"
+                6 -> "#7"
+                7 -> "#8"
+                _ -> "#n"
+
+        # Whether TYPE_EXPRESSION is a function type (`fn(...) -> R`, parsed as a Lambda).
+        def exclusivity_is_fn_type(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match zeroed_strip_binding_modifiers(type_expression):
+                    Expr.Lambda(_, _, _):
+                        return true
+                    _:
+                        return false
+
+        def exclusivity_scan_ref_arms(arms: darray[Ast::MatchArm], binders: mutable darray[sview]&, repeated: mutable darray[sview]&, assigned: mutable darray[sview]&, fns: ExclusivityFns&, candidates: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |binders, repeated, assigned, candidates|:
+                    pattern_names: mutable darray[sview] = []
+                    collect_pattern_binding_names(arm.pattern, pattern_names)
+                    for pattern_name in pattern_names |binders, repeated|:
+                        exclusivity_note_binder(pattern_name, binders, repeated)
+                    exclusivity_scan_ref_expression(arm.guard, binders, repeated, assigned, fns, candidates)
+                    exclusivity_scan_ref_statements(arm.body, binders, repeated, assigned, fns, candidates)
+
+        def exclusivity_scan_ref_expression(expression: Ast::Expr, binders: mutable darray[sview]&, repeated: mutable darray[sview]&, assigned: mutable darray[sview]&, fns: ExclusivityFns&, candidates: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, position):
+                        exclusivity_scan_ref_expression(callee, binders, repeated, assigned, fns, candidates)
+                        for argument in arguments |binders, repeated, assigned, candidates|:
+                            exclusivity_scan_ref_expression(argument, binders, repeated, assigned, fns, candidates)
+                    Expr.Binary(left, operator, right, position):
+                        exclusivity_scan_ref_expression(left, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(right, binders, repeated, assigned, fns, candidates)
+                    Expr.Unary(operator, operand, position):
+                        exclusivity_scan_ref_expression(operand, binders, repeated, assigned, fns, candidates)
+                    Expr.Paren(inner, position):
+                        exclusivity_scan_ref_expression(inner, binders, repeated, assigned, fns, candidates)
+                    Expr.Field(object, field, position):
+                        exclusivity_scan_ref_expression(object, binders, repeated, assigned, fns, candidates)
+                    Expr.Index(object, index, position):
+                        exclusivity_scan_ref_expression(object, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(index, binders, repeated, assigned, fns, candidates)
+                    Expr.Array(elements, position):
+                        for element in elements |binders, repeated, assigned, candidates|:
+                            exclusivity_scan_ref_expression(element, binders, repeated, assigned, fns, candidates)
+                    Expr.Tuple(elements, position):
+                        for element in elements |binders, repeated, assigned, candidates|:
+                            exclusivity_scan_ref_expression(element, binders, repeated, assigned, fns, candidates)
+                    Expr.Construct(type_expression, fields, position):
+                        for field in fields |binders, repeated, assigned, candidates|:
+                            exclusivity_scan_ref_expression(field.value, binders, repeated, assigned, fns, candidates)
+                    Expr.If(condition, then_expression, else_expression, position):
+                        exclusivity_scan_ref_expression(condition, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(then_expression, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(else_expression, binders, repeated, assigned, fns, candidates)
+                    Expr.Match(scrutinee, arms, position):
+                        exclusivity_scan_ref_expression(scrutinee, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_arms(arms, binders, repeated, assigned, fns, candidates)
+                    Expr.Catch(guarded, arms, position):
+                        exclusivity_scan_ref_expression(guarded, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_arms(arms, binders, repeated, assigned, fns, candidates)
+                    Expr.Comprehension(variable, iterable, condition, body, position):
+                        exclusivity_note_binder(variable, binders, repeated)
+                        exclusivity_scan_ref_expression(iterable, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(condition, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(body, binders, repeated, assigned, fns, candidates)
+                    Expr.GetElse(guarded, recovery, position):
+                        exclusivity_scan_ref_expression(guarded, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_statements(recovery, binders, repeated, assigned, fns, candidates)
+                    Expr.Lambda(lambda_params, body, position):
+                        for lambda_param in lambda_params |binders, repeated|:
+                            exclusivity_note_binder(lambda_param, binders, repeated)
+                        exclusivity_scan_ref_statements(body, binders, repeated, assigned, fns, candidates)
+                    Expr.Block(statements, value, captures, position):
+                        exclusivity_scan_ref_statements(statements, binders, repeated, assigned, fns, candidates)
+                        exclusivity_scan_ref_expression(value, binders, repeated, assigned, fns, candidates)
+                    _:
+                        pass
+
+        def exclusivity_scan_ref_statements(statements: darray[Ast::Stmt], binders: mutable darray[sview]&, repeated: mutable darray[sview]&, assigned: mutable darray[sview]&, fns: ExclusivityFns&, candidates: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |binders, repeated, assigned, candidates|:
+                    match statement:
+                        Stmt.Expr(expression, position):
+                            exclusivity_scan_ref_expression(expression, binders, repeated, assigned, fns, candidates)
+                            exclusivity_note_container_store(expression, fns, candidates)
+                        Stmt.VarDecl(name, type_expression, value, position):
+                            exclusivity_scan_ref_expression(value, binders, repeated, assigned, fns, candidates)
+                            exclusivity_note_binder(name, binders, repeated)
+                            exclusivity_note_ref_candidate(name, type_expression, value, fns, candidates)
+                            if exclusivity_is_fn_type(type_expression):
+                                candidates.fn_names.push(name)
+                                candidates.fn_types.push(type_expression)
+                        Stmt.Assign(target, operator, value, position):
+                            exclusivity_scan_ref_expression(value, binders, repeated, assigned, fns, candidates)
+                            target_name: sview = exclusivity_ident_name(target)
+                            if target_name != "" and operator == TokenKind.Assign and not exclusivity_name_listed(binders, target_name):
+                                # `r = &x` DEFINES a new local.
+                                exclusivity_note_binder(target_name, binders, repeated)
+                                exclusivity_note_ref_candidate(target_name, Ast::Expr.Absent, value, fns, candidates)
+                            elif target_name != "":
+                                assigned.push(target_name)
+                            else:
+                                exclusivity_scan_ref_expression(target, binders, repeated, assigned, fns, candidates)
+                        Stmt.If(condition, then_body, else_body, position):
+                            exclusivity_scan_ref_expression(condition, binders, repeated, assigned, fns, candidates)
+                            exclusivity_scan_ref_statements(then_body, binders, repeated, assigned, fns, candidates)
+                            exclusivity_scan_ref_statements(else_body, binders, repeated, assigned, fns, candidates)
+                        Stmt.While(condition, body, position):
+                            exclusivity_scan_ref_expression(condition, binders, repeated, assigned, fns, candidates)
+                            exclusivity_scan_ref_statements(body, binders, repeated, assigned, fns, candidates)
+                        Stmt.For(bind, variables, iterable, body, position):
+                            exclusivity_scan_ref_expression(iterable, binders, repeated, assigned, fns, candidates)
+                            for variable in variables |binders, repeated|:
+                                exclusivity_note_binder(variable, binders, repeated)
+                            exclusivity_scan_ref_statements(body, binders, repeated, assigned, fns, candidates)
+                        Stmt.Block(kind, clause, binding, body, position):
+                            if binding != "":
+                                exclusivity_note_binder(binding, binders, repeated)
+                            exclusivity_scan_ref_statements(body, binders, repeated, assigned, fns, candidates)
+                        Stmt.Match(scrutinee, arms, position):
+                            exclusivity_scan_ref_expression(scrutinee, binders, repeated, assigned, fns, candidates)
+                            exclusivity_scan_ref_arms(arms, binders, repeated, assigned, fns, candidates)
+                        Stmt.Return(value, position):
+                            exclusivity_scan_ref_expression(returned, binders, repeated, assigned, fns, candidates) if value is returned
+                        _:
+                            pass
+
+        # The borrow-carrying locals of one function, scanned straight into REFS. A name bound
+        # twice or reassigned keeps its rows with the name blanked: they no longer answer.
+        def exclusivity_collect_refs(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], fns: ExclusivityFns&, refs: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                binders: mutable darray[sview] = []
+                repeated: mutable darray[sview] = []
+                assigned: mutable darray[sview] = []
+                for parameter in parameters |binders, repeated, refs|:
+                    exclusivity_note_binder(parameter.name, binders, repeated)
+                    refs.locals.push(parameter.name)
+                    # A by-value container parameter owns the buffer its views point into.
+                    if chv_type_is_owned_container(parameter.type_expression) and not type_marker_present_here(parameter.type_expression, TokenKind.Ampersand):
+                        refs.names.push(parameter.name)
+                        refs.places.push(Ast::Expr.Absent)
+                    if exclusivity_is_fn_type(parameter.type_expression):
+                        refs.fn_names.push(parameter.name)
+                        refs.fn_types.push(parameter.type_expression)
+                exclusivity_scan_ref_statements(body, binders, repeated, assigned, fns, refs)
+                index: mutable usize = 0
+                while index < refs.names.count |index, refs|:
+                    dropped: bool = exclusivity_name_listed(repeated, refs.names[index]) or exclusivity_name_listed(assigned, refs.names[index])
+                    refs.names[index] <- "" if dropped
+                    index <- index + 1
+                index <- 0
+                while index < refs.fn_names.count |index, refs|:
+                    dropped: bool = exclusivity_name_listed(repeated, refs.fn_names[index]) or exclusivity_name_listed(assigned, refs.fn_names[index])
+                    refs.fn_names[index] <- "" if dropped
+                    index <- index + 1
+                collect_local_names(body, refs.locals)
+
+        # ---- The original single-referent API, still read by check_lmut_method_aliasing,
+        # check_region_param_ref_field and check_call_holder_view_store. ----
+
+        # Every declared function in the file (all modules), flattened: NAME, its parameters at
+        # [start, start+count) of PARAMS.
+        def exclusivity_collect_functions(declarations: darray[Ast::Decl], function_names: mutable darray[sview]&, starts: mutable darray[usize]&, counts: mutable darray[usize]&, params: mutable darray[Ast::ParamDecl]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, position):
+                            function_names.push(name)
+                            starts.push(params.count)
+                            counts.push(parameters.count)
+                            params.extend(parameters)
+                        Decl.Module(module_name, module_body, module_position):
+                            exclusivity_collect_functions(module_body, function_names, starts, counts, params)
+                        Decl.Scoped(scoped_body, scoped_position):
+                            exclusivity_collect_functions(scoped_body, function_names, starts, counts, params)
+                        _:
+                            pass
+
+        # The one declared function named NAME, or function_names.count when there is none or
+        # the name is ambiguous. A hash slot holding a single index answers directly (a name
+        # with that hash is either that entry or absent); a shared slot falls back to the scan.
+        def exclusivity_unique_function(function_names: darray[sview]&, function_lookup: dict[u64, usize]&, name: sview) -> usize:
+            can Abort.Panic:
+                slot: mutable usize = function_names.count
+                if function_lookup.get(name_hash(name)) is entry:
+                    slot <- entry
+                else:
+                    return function_names.count
+                if slot != EXCLUSIVITY_LOOKUP_SCAN:
+                    return slot if function_names[slot] == name
+                    return function_names.count
+                found: mutable usize = function_names.count
+                index: mutable usize = 0
+                while index < function_names.count:
+                    if function_names[index] == name:
+                        return function_names.count if found != function_names.count
+                        found <- index
+                    index <- index + 1
+                return found
+
+        # Whether ARGUMENT is `&PLACE`, and the place expression either way.
+        def exclusivity_strip_address(argument: Ast::Expr) -> (address: bool, place: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Unary(operator, operand, position):
+                        return (true, operand) if operator == TokenKind.Ampersand
+                        return (false, argument)
+                    Expr.Paren(inner, position):
+                        return exclusivity_strip_address(inner)
+                    _:
+                        return (false, argument)
+
+        # The ref rows of a function without the declared-function table: calls returning a
+        # reference are not followed (check_region_param_ref_field reads these rows).
+        def exclusivity_collect_ref_locals(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], refs: mutable ExclusivityRefs&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                no_fns: ExclusivityFns = ExclusivityFns{names: [], lookup: {}, starts: [], counts: [], params: [], returns_ref: [], fn_type_lines: [], fn_type_exprs: [], globals: [], fact_starts: [], fact_counts: [], fact_names: [], fact_write: [], callee_starts: [], callee_counts: [], callee_names: []}
+                exclusivity_collect_refs(parameters, body, no_fns, refs)
+
+        # A bare argument naming a resolved ref local stands for its `&PLACE` initializer: the
+        # name's first REFERENCE row (container rows mark a buffer-owning name and held rows a
+        # value storing a borrow; neither is a reference).
+        def exclusivity_resolve_ref_local(stripped: (address: bool, place: Ast::Expr), ref_names: darray[sview]&, ref_places: darray[Ast::Expr]&) -> (address: bool, place: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                return stripped if stripped.address
+                name: sview = exclusivity_ident_name(stripped.place)
+                return stripped if name == ""
+                index: mutable usize = 0
+                while index < ref_names.count |index|:
+                    if ref_names[index] == name:
+                        match ref_places[index]:
+                            Expr.Absent:
+                                pass
+                            Expr.Move(_, _):
+                                pass
+                            _:
+                                return (true, ref_places[index])
+                    index <- index + 1
+                return stripped

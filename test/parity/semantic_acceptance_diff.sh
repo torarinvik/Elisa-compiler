@@ -69,7 +69,11 @@ known_stage1_stricter_reason() {
         TestAnalyzePinsRuntimePreludeBuiltinExternPermissionContracts|\
         TestAnalyzePinsRuntimePreludeHeapPointerContracts|\
         TestAnalyzePinsRuntimeStage1BuiltinPermissionContracts)
-            printf '%s' 'pointer cast requires can\[Unsafe\]|mutable alias requires can\[Unsafe\]|warning: struct .* avoidable padding|warning: call to .* requires can\[Unsafe\]'
+            # stage0's copy of runtime.elisa lends &perm_arena to int_to_string_into /
+            # char_to_string_into, which allocate from perm_arena by name (borrow exclusivity,
+            # check_call_argument_exclusivity_globals.elisa); this repo's copy waives it with
+            # `trusted Unsafe.Alias`.
+            printf '%s' 'pointer cast requires can\[Unsafe\]|mutable alias requires can\[Unsafe\]|warning: struct .* avoidable padding|warning: call to .* requires can\[Unsafe\]|writes global "perm_arena" while the caller lends it as &perm_arena'
             ;;
         # Stage0 accepts `part: view[i32] = values[1:3]; return part` with `values: i32[4]`
         # by value: the view points into the callee frame. Linked and run, the caller reads
