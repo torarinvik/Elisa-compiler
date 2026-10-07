@@ -218,6 +218,12 @@ seed_build() {
     bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   fi
   "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
+  if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
+    "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" || {
+      echo "seed: refusing to publish a product built while its source inputs were changing" >&2
+      exit 2
+    }
+  fi
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$seed_object_output"
   ELISA_SEED_OUTPUT=""

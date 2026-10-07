@@ -172,8 +172,10 @@ source "$ROOT/scripts/elisac_stage1_seed.sh"
 
 if [[ "${1:-}" == "--seed" ]]; then
   bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0_BIN"
+  seed_input_fingerprint="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT")"
+  ELISA_STAGE1_SEED_INPUTS="$seed_input_fingerprint"
   seed_build
-  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record "$ROOT" "$BIN"
+  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record "$ROOT" "$BIN" "$seed_input_fingerprint"
   exit 0
 fi
 
