@@ -1,0 +1,173 @@
+# never-leak lint (-Wnever-leak) — the ACCUMULATOR kind: the loop anti-pattern
+#
+#     sum: mutable usize = 0                      sum: usize =
+#     for num in numbers:              ==>            for num in numbers |sum: usize = 0| -> sum:
+#         sum <- sum + num                                sum <- sum + num
+#     use(sum)                                    use(sum)
+#
+# A `mutable` local that only a loop writes and only later code reads stays mutable and in
+# scope after the loop for no reason. Declared in the loop header and yielded with `->`, it is
+# one immutable binding the loop alone computes; the backend binds it to the accumulator's own
+# slot (src/backend/codegen_loop_value_binding.elisa), so the machine code is the same at -O0 and
+# -O2 (test/parity/loop_value_codegen_smoke.sh).
+#
+# CANDIDATE: a `name: mutable T = …` local whose first mention after its declaration is a
+# plain `for`/`while` statement that writes it with `<-` (or a compound assignment), and which
+# is mentioned again after that loop. Its OWN UPDATE is that `<-` statement, including the
+# condition of an `if` that holds nothing else (`best <- v if v > best`).
+#
+# THE REWRITE APPLIES (NEVER_LEAK_ACC_OK) when, in addition, every mention inside the loop is
+# part of the local's own update (`sum <- sum + num`, `hit <- i`), nothing after the loop writes
+# it, mutates it through a call or takes its address, T is a scalar or an optional scalar, and
+# the loop has no `break`/`continue` aimed at an enclosing loop (which may not leave a loop
+# value). Several such locals of one loop make one finding with a tuple-valued loop.
+#
+# Otherwise the candidate is reported with the reason (strict mode only; the driver decides),
+# and its ordinary last-use finding, if any, still stands. The driver adds NEVER_LEAK_ACC_SHAPE
+# when the declaration or the loop header spans several lines.
+extend Semantic:
+    private:
+        # `mutable T` (possibly under further qualifiers).
+        def nl_mutable_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, pos):
+                        true return if operator == TokenKind.Mutable
+                        return false
+                    _:
+                        return false
+
+        # A builtin scalar, or an optional of one, under an optional `mutable`.
+        def nl_scalar_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, pos):
+                        false return if operator != TokenKind.Mutable and operator != TokenKind.Question
+                        return nl_scalar_type(operand)
+                    Expr.Ident(name, pos):
+                        return name != "void" and nl_builtin_class(name) == NL_SCALAR
+                    _:
+                        return false
+
+        def nl_listed_in(list: darray[sview]&, first: usize, stop: usize, name: sview) -> bool:
+            can Abort.Panic:
+                for entry in first..<stop |list, name|:
+                    true return if list[entry] == name
+                return false
+
+        # The first statement in [from, count) that mentions `name`, or NL_OUTER.
+        def nl_next_mention(block: NeverLeakBlock&, walk: NeverLeakWalk&, name: sview, from: u32, count: u32) -> u32:
+            can Abort.Panic:
+                statement: mutable u32 = from
+                while statement < count |statement, block, walk, name, count|:
+                    true_hit: bool = nl_listed_in(walk.out, block.m_starts[statement.usize()], block.m_ends[statement.usize()], name)
+                    statement return if true_hit
+                    statement <- statement + 1
+                return NL_OUTER
+
+        # The line of the first mention of `name` in `statement` of mention kind `kind`
+        # (NL_MENTION_*; 0 when there is none).
+        def nl_mention_line(block: NeverLeakBlock&, walk: NeverLeakWalk&, name: sview, statement: u32, kind: u8) -> u32:
+            can Abort.Panic:
+                for entry in block.m_starts[statement.usize()]..<block.m_ends[statement.usize()] |block, walk, name, kind|:
+                    if walk.out[entry] == name and walk.out_update[entry] == kind:
+                        line: u32 = walk.out_lines[entry]
+                        line return if line != 0
+                        return block.lines[statement.usize()]
+                return 0
+
+        def nl_push_listed(walk: mutable NeverLeakWalk&, name: sview, decl_line: u32, write_line: u32, read_line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                walk.names.push(name)
+                walk.name_lines.push(decl_line)
+                walk.name_lines.push(write_line)
+                walk.name_lines.push(read_line)
+
+        # Why the rewrite does not apply to the candidate `local` of `loop`, or NEVER_LEAK_ACC_OK;
+        # `reason_line` gets the line that shows it.
+        def nl_accumulator_reason(block: NeverLeakBlock&, walk: NeverLeakWalk&, local: usize, loop: u32, count: u32, reason_line: mutable u32&) -> u8:
+            can Abort.Panic:
+                name: sview = block.decl_names[local]
+                inside: u32 = nl_mention_line(block, walk, name, loop, NL_MENTION_OTHER)
+                if inside != 0:
+                    reason_line <- inside
+                    return NEVER_LEAK_ACC_READ_INSIDE
+                after: mutable u32 = loop + 1
+                while after < count |after, block, walk, name, reason_line|:
+                    index: usize = after.usize()
+                    written: bool = nl_listed_in(walk.writes, block.w_starts[index], block.w_ends[index], name) or nl_listed_in(walk.holds, block.h_starts[index], block.h_ends[index], name) or nl_listed_in(walk.addr, block.a_starts[index], block.a_ends[index], name)
+                    if written:
+                        reason_line <- block.lines[index]
+                        return NEVER_LEAK_ACC_WRITTEN_AFTER
+                    after <- after + 1
+                if not block.decl_scalar[local]:
+                    reason_line <- block.decl_lines[local]
+                    return NEVER_LEAK_ACC_NOT_SCALAR
+                loop_index: usize = loop.usize()
+                for jump in block.j_starts[loop_index]..<block.j_ends[loop_index] |block, walk, loop_index, reason_line|:
+                    if walk.jumps[jump] <= block.loop_depth:
+                        reason_line <- block.lines[loop_index]
+                        return NEVER_LEAK_ACC_ESCAPES
+                return NEVER_LEAK_ACC_OK
+
+        # Finds the block's accumulators, pushes their findings, and returns per local whether
+        # it is a rewritable accumulator (whose ordinary finding is then skipped).
+        def nl_accumulators(block: NeverLeakBlock&, walk: mutable NeverLeakWalk&, statement_count: u32) -> darray[bool]:
+            can Memory.Allocate, Abort.Panic:
+                decl_count: usize = block.decl_names.count
+                rewritable: mutable darray[bool] = []
+                loops: mutable darray[u32] = []
+                reasons: mutable darray[u8] = []
+                reason_lines: mutable darray[u32] = []
+                write_lines: mutable darray[u32] = []
+                read_lines: mutable darray[u32] = []
+                for local in 0..<decl_count |block, walk, statement_count, rewritable, loops, reasons, reason_lines, write_lines, read_lines|:
+                    rewritable.push(false)
+                    loops.push(NL_OUTER)
+                    reasons.push(NEVER_LEAK_ACC_OK)
+                    reason_lines.push(0)
+                    write_lines.push(0)
+                    read_lines.push(0)
+                    continue if block.decl_skip[local] or not block.decl_mutable[local] or block.decl_lines[local] == 0
+                    name: sview = block.decl_names[local]
+                    loop: u32 = nl_next_mention(block, walk, name, block.decl_stmts[local] + 1, statement_count)
+                    continue if loop == NL_OUTER
+                    continue if block.kinds[loop.usize()] != NEVER_LEAK_STMT_LOOP
+                    continue if not nl_listed_in(walk.writes, block.w_starts[loop.usize()], block.w_ends[loop.usize()], name)
+                    later: u32 = nl_next_mention(block, walk, name, loop + 1, statement_count)
+                    continue if later == NL_OUTER
+                    loops[local] <- loop
+                    write_lines[local] <- nl_mention_line(block, walk, name, loop, NL_MENTION_TARGET)
+                    read_lines[local] <- nl_mention_line(block, walk, name, later, NL_MENTION_OTHER)
+                    reason_line: mutable u32 = 0
+                    reason: u8 = nl_accumulator_reason(block, walk, local, loop, statement_count, reason_line)
+                    reasons[local] <- reason
+                    reason_lines[local] <- reason_line
+                    rewritable[local] <- reason == NEVER_LEAK_ACC_OK
+                # One finding per loop for its rewritable accumulators, one per excluded candidate.
+                last_statement: mutable u32 = statement_count - 1
+                while last_statement > 0 and block.lines[last_statement.usize()] == 0 |last_statement, block|:
+                    last_statement <- last_statement - 1
+                emitted: mutable darray[bool] = []
+                for seed in 0..<decl_count |emitted|:
+                    emitted.push(false)
+                for local in 0..<decl_count |block, walk, rewritable, loops, reasons, reason_lines, write_lines, read_lines, emitted, last_statement|:
+                    continue if loops[local] == NL_OUTER or emitted[local]
+                    loop: u32 = loops[local]
+                    finding: mutable NeverLeakFinding = NeverLeakFinding{name: block.decl_names[local], category: NEVER_LEAK_ACCUMULATOR, function_name: walk.function_name, decl_line: block.decl_lines[local], last_use_line: block.lines[loop.usize()], raw_last_use_line: read_lines[local]}
+                    finding.after_last_line <- block.lines[(loop + 1).usize()]
+                    finding.block_last_line <- block.lines[last_statement.usize()]
+                    finding.visible_count <- last_statement - loop
+                    finding.last_stmt_kind <- NEVER_LEAK_STMT_LOOP
+                    finding.acc_reason <- reasons[local]
+                    finding.reason_line <- reason_lines[local]
+                    finding.acc_first <- walk.names.count.u32()
+                    walk.findings.push(finding)
+                    index: usize = walk.findings.count - 1
+                    for member in local..<decl_count |block, walk, rewritable, loops, write_lines, read_lines, emitted, local, loop, index|:
+                        same_group: bool = member == local or (rewritable[local] and rewritable[member] and loops[member] == loop)
+                        continue if not same_group
+                        emitted[member] <- true
+                        nl_push_listed(walk, block.decl_names[member], block.decl_lines[member], write_lines[member], read_lines[member])
+                        walk.findings[index].acc_count <- walk.findings[index].acc_count + 1
+                return rewritable

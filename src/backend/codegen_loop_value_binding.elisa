@@ -1,0 +1,165 @@
+# Stage1 backend — a LOOP VALUE bound straight to a local (docs/119 §3):
+#
+#     sum: usize =                                  total, count =
+#         for x in xs |sum: usize = 0| -> sum:          for x in xs |total: i64 = 0, count: usize = 0| -> (total, count):
+#             sum <- sum + x                                ...
+#
+# The parser builds `Block([acc decls…, loop], yield)`. Emitted as a value block, the yield is
+# LOADED out of the accumulator's slot and STORED into a second slot for the binding, so at -O0
+# the scoped form costs one extra stack slot and a copy over the `mutable` + loop form it
+# replaces (mem2reg removes it at -O2). The `-Wnever-leak` accumulator rewrite promises the
+# same machine code, so a binding whose yield names its own header accumulators takes the
+# accumulator's slot over instead: the loop runs in the binding's scope, the header names are
+# dropped from scope, and the binding names the very slot the loop wrote. The loop's own
+# `break` still exits only the loop (the header loop is the innermost), and a zero-iteration
+# loop leaves the initial values in place, so the value is the accumulators at loop exit.
+#
+# Only when every yielded accumulator is a scalar or an optional of one (no drop cleanup to
+# move with the slot), is annotated, and — for an annotated binding — has exactly the
+# binding's type. Anything else keeps the general value-block path.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+        # The accumulator declarations of a loop-value block: every statement but the last is a
+        # VarDecl and the last is a `for`/`while`. Empty when the block has another shape.
+        def loop_value_header_names(block_statements: darray[Stmt]&) -> darray[sview] can[Abort.Panic, Memory.Allocate]:
+            names: mutable darray[sview] = []
+            return names if block_statements.count < 2
+            last_index: usize = block_statements.count - 1
+            loop_ok: bool = block_statements[last_index] is Stmt.For or block_statements[last_index] is Stmt.While
+            return names if not loop_ok
+            for index in 0..<last_index |names, block_statements|:
+                match block_statements[index]:
+                    Stmt.VarDecl(header_name, header_type, header_value, header_line):
+                        names.push(header_name) if not (header_type is Expr.Invalid)
+                        names.push("") if header_type is Expr.Invalid
+                    _:
+                        names.push("")
+            return names
+
+        # A slot that can change owner without moving a cleanup: scalars and optional scalars.
+        def loop_value_slot_type_ok(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            kind: TypeKind = value_type.kind
+            true return if kind == TypeKind.Signed or kind == TypeKind.Unsigned or kind == TypeKind.Bool or kind == TypeKind.Float
+            false return if kind != TypeKind.Optional
+            payload: ValueType = optional_payload_of(value_type, structs)
+            return payload.kind == TypeKind.Signed or payload.kind == TypeKind.Unsigned or payload.kind == TypeKind.Bool or payload.kind == TypeKind.Float
+
+        def loop_value_same_type(left: ValueType, right: ValueType) -> bool:
+            return left.kind == right.kind and left.bits == right.bits
+
+        # Every yielded name is a distinct, annotated header accumulator of an eligible type
+        # (and of the binding's own type when the binding is annotated).
+        def loop_value_bindable(bound: darray[sview]&, bound_types: darray[ValueType]&, block_statements: darray[Stmt]&, yielded: darray[sview]&, headers: darray[sview]&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            yield_index: mutable usize = 0
+            while yield_index < yielded.count |yield_index, bound, bound_types, block_statements, yielded, headers, structs|:
+                false return if yielded[yield_index] == "" or bound[yield_index] == "_"
+                false return if not loop_value_header_ok(block_statements, headers, yielded[yield_index], bound_types[yield_index], structs)
+                other_index: mutable usize = 0
+                while other_index < yield_index |other_index, yielded, yield_index|:
+                    false return if yielded[other_index] == yielded[yield_index]
+                    other_index <- other_index + 1
+                yield_index <- yield_index + 1
+            return true
+
+        def loop_value_header_ok(block_statements: darray[Stmt]&, headers: darray[sview]&, name: sview, bound_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header_index: mutable usize = 0
+            while header_index < headers.count |header_index, block_statements, headers, name, bound_type, structs|:
+                if headers[header_index] == name:
+                    match block_statements[header_index]:
+                        Stmt.VarDecl(check_name, check_type, check_value, check_line):
+                            header_value_type: ValueType = annotation_value_type(check_type, structs)
+                            false return if not loop_value_slot_type_ok(header_value_type, structs)
+                            true return if bound_type.kind == TypeKind.Unmodeled
+                            return loop_value_same_type(header_value_type, bound_type)
+                        _:
+                            return false
+                header_index <- header_index + 1
+            return false
+
+        # Run the loop-value block's statements in the CURRENT scope, then rebind each
+        # `yielded[i]` header slot as `bound[i]`. `bound_types[i]` is the binding's declared
+        # type (Unmodeled for an unannotated binding). `handled` is false when the shape does
+        # not qualify, in which case nothing was emitted.
+        def emit_loop_value_into_bindings(bound: darray[sview]&, bound_types: darray[ValueType]&, block_statements: darray[Stmt]&, yielded: darray[sview]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- false
+            EmitStatus.Open return if bound.count == 0 or bound.count != yielded.count
+            headers: darray[sview] = loop_value_header_names(block_statements)
+            EmitStatus.Open return if headers.count == 0
+            EmitStatus.Open return if not loop_value_bindable(bound, bound_types, block_statements, yielded, headers, structs)
+            handled <- true
+            block_mark: usize = scope_mark(local_scope)
+            status: EmitStatus = emit_statements(block_statements, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+            slots: mutable darray[LLVMValueRef] = []
+            types: mutable darray[ValueType] = []
+            if status == EmitStatus.Open:
+                for slot_index in 0..<yielded.count |slots, types, local_scope, yielded|:
+                    if lookup_slot(local_scope, yielded[slot_index]) is header_slot:
+                        slots.push(header_slot)
+                        types.push(lookup_type(local_scope, yielded[slot_index]))
+            scope_restore(local_scope, block_mark)
+            status return if status != EmitStatus.Open
+            EmitStatus.Declined return if slots.count != yielded.count
+            for bind_index in 0..<bound.count |local_scope, bound, slots, types|:
+                declare_local(local_scope, bound[bind_index], slots[bind_index], types[bind_index])
+            return EmitStatus.Open
+
+        # A binding's RHS block (`x: T =` NEWLINE loop) wraps the loop's own value block as its
+        # tail: `Block([], Block([decls…, loop], yield))`. Peel statement-less wrappers.
+        def loop_value_unwrapped(value: Expr) -> Expr:
+            match value:
+                Expr.Block(wrapper_statements, wrapper_value, wrapper_captures, wrapper_pos):
+                    if wrapper_statements.count == 0 and wrapper_captures.count == 0 and wrapper_value is Expr.Block:
+                        return loop_value_unwrapped(wrapper_value)
+                _:
+                    pass
+            return value
+
+        # `name[: T] = for … |name: T = init| -> name:` (see the file header).
+        def emit_loop_value_vardecl(var_name: sview, var_type: Expr, var_value: Expr, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- false
+            # A `mutable` binding keeps its own slot: the scope marks it records are not moved.
+            if var_type is Expr.Unary(qualifier, qualified, qualifier_pos):
+                EmitStatus.Open return if qualifier == TokenKind.Mutable
+            match loop_value_unwrapped(var_value):
+                Expr.Block(block_statements, block_value, block_captures, block_pos):
+                    match block_value:
+                        Expr.Ident(yield_name, yield_pos):
+                            bound: darray[sview] = [var_name]
+                            bound_type: ValueType = unmodeled_type() if var_type is Expr.Invalid else annotation_value_type(var_type, structs)
+                            EmitStatus.Open return if not (var_type is Expr.Invalid) and bound_type.kind == TypeKind.Unmodeled
+                            bound_types: darray[ValueType] = [bound_type]
+                            yielded: darray[sview] = [yield_name]
+                            return emit_loop_value_into_bindings(bound, bound_types, block_statements, yielded, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, handled)
+                        _:
+                            pass
+                _:
+                    pass
+            return EmitStatus.Open
+
+        # `a, b = for … |a: T = x, b: U = y| -> (a, b):` — the tuple form, fresh `=` targets only.
+        def emit_loop_value_tuple(targets: darray[Expr]&, value_expression: Expr, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- false
+            match loop_value_unwrapped(value_expression):
+                Expr.Block(block_statements, block_value, block_captures, block_pos):
+                    match block_value:
+                        Expr.Tuple(elements, tuple_pos):
+                            EmitStatus.Open return if elements.count != targets.count
+                            bound: mutable darray[sview] = []
+                            bound_types: mutable darray[ValueType] = []
+                            yielded: mutable darray[sview] = []
+                            for index in 0..<targets.count |bound, bound_types, yielded, targets, elements|:
+                                if targets[index] is Expr.Ident(target_name, target_pos):
+                                    bound.push(target_name)
+                                if elements[index] is Expr.Ident(element_name, element_pos):
+                                    yielded.push(element_name)
+                                bound_types.push(unmodeled_type())
+                            EmitStatus.Open return if bound.count != targets.count or yielded.count != targets.count
+                            return emit_loop_value_into_bindings(bound, bound_types, block_statements, yielded, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, handled)
+                        _:
+                            pass
+                _:
+                    pass
+            return EmitStatus.Open
