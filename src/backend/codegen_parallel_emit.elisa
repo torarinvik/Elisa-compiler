@@ -45,6 +45,8 @@ extend Backend:
         const PART_LINKAGE_INTERNAL: u32 = 8
         const PART_LINKAGE_PRIVATE: u32 = 9
         const PART_VISIBILITY_HIDDEN: u32 = 1
+        # Instructions per forked emitter below which another worker costs more than it saves.
+        const PART_MIN_WEIGHT_PER_JOB: i64 = 20000
 
         def part_linkage_is_local(linkage: u32) -> bool:
             linkage == PART_LINKAGE_INTERNAL or linkage == PART_LINKAGE_PRIVATE
@@ -120,16 +122,33 @@ extend Backend:
             strip_function_body(f)
             elisa_part_clear_personality(f, null) if LLVMHasPersonalityFn(f) != 0
 
-        # Owner of every function, in module order (-1: not partitioned).
-        def part_function_owners(m: LLVMModuleRef, jobs: i64) -> darray[i64] can[Abort.Panic, Memory.Allocate]:
+        # Instruction weight (+1) of every function the pass distributes, in module order;
+        # -1 for one it leaves alone.
+        def part_function_weights(m: LLVMModuleRef) -> darray[i64] can[Abort.Panic, Memory.Allocate]:
             weights: mutable darray[i64] = []
-            total: mutable i64 = 0
             function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
-            while function_opt is function |weights, total, function_opt|:
+            while function_opt is function |weights, function_opt|:
                 weight: i64 = part_function_weight(function) + 1 if part_function_owned(function) else -1
                 weights.push(weight)
-                total <- total + weight if weight > 0
                 function_opt <- LLVMGetNextFunction(function)
+            weights
+
+        def part_total_weight(weights: darray[i64]&) -> i64 can[Abort.Panic]:
+            total: mutable i64 = 0
+            for weight in weights |total|:
+                total <- total + weight if weight > 0
+            total
+
+        # Workers worth forking for TOTAL instructions: each costs a fork, a code generator
+        # set-up and a part file for `ld -r` (~1 ms), which dominated small units (a 30-line
+        # file spent 26 ms of 50 in 32-way emission, 3 ms serially).
+        def part_effective_jobs(total: i64, jobs: i64) -> i64:
+            useful: i64 = total / PART_MIN_WEIGHT_PER_JOB
+            1 return if useful < 1
+            useful if useful < jobs else jobs
+
+        # Owner of every function, in module order (-1: not partitioned).
+        def part_function_owners(weights: darray[i64]&, total: i64, jobs: i64) -> darray[i64] can[Abort.Panic, Memory.Allocate]:
             owners: mutable darray[i64] = []
             prefix: mutable i64 = 0
             for weight in weights |owners, prefix, total, jobs|:
@@ -223,9 +242,13 @@ extend Backend:
 
         # Emit `m` to `path` with `jobs` forked code generators; serial when jobs <= 1.
         # The module is unchanged in the parent.
-        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, jobs: i64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+            return emit_object(machine, m, path) if requested_jobs <= 1
+            weights: darray[i64] = part_function_weights(m)
+            total: i64 = part_total_weight(weights)
+            jobs: i64 = part_effective_jobs(total, requested_jobs)
             return emit_object(machine, m, path) if jobs <= 1
-            owners: darray[i64] = part_function_owners(m, jobs)
+            owners: darray[i64] = part_function_owners(weights, total, jobs)
             children: mutable darray[i32] = []
             for part in 0..<jobs.usize() |children, owners, machine, m, path|:
                 child: i32 = fork()
@@ -258,7 +281,12 @@ extend Backend:
                 part_shell_quote(command, part_file)
             command.push(0)
             if all_ok:
+                # The include line map can outgrow one exec string, and `system` then fails
+                # with E2BIG before the shell starts; `ld -r` never reads it.
+                line_map: mutable darray[u8] = []
+                line_map_hidden: bool = Lexer::line_map_suspend(&line_map)
                 all_ok <- system_backend((&command[0]).cast[cstr]) == 0
+                Lexer::line_map_resume(&line_map, line_map_hidden)
             for part in 0..<jobs.usize() |path|:
                 part_file: darray[u8] = part_path(path, part.i64())
                 _ = unlink_backend((&part_file[0]).cast[cstr])
