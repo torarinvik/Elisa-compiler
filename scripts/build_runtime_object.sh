@@ -19,6 +19,16 @@ BUILD_SCRIPT="$ROOT/scripts/build_runtime_object.sh"
 PRODUCT="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 ELISA_CLANG_TOOL="${ELISA_CLANG:-$(command -v clang || true)}"
+# Host predicates, exactly as scripts/elisac_stage1.sh exports them. This script calls the RAW
+# product, which reads its `ELISA_TARGET_OS_*` / `ARCH_*` consts from these flags and defaults
+# to macOS/arm64 without them. Called directly on a Linux x86-64 host (a gate check, a smoke),
+# it built a DARWIN runtime: perf_cores referenced sysctlbyname and the arena mmap'd with
+# MAP_ANON=0x1000, so every region allocation panicked ("arena allocation failed", exit 134)
+# -- 20+ fabricated differential-corpus mismatches, hidden from the link by the Linux shim's
+# --unresolved-symbols=ignore-all.
+if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export ELISA_HOST_WINDOWS=1 ;; esac
+if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 
 [[ -x "$PRODUCT" ]] || {
   echo "missing stage1 product: $PRODUCT (run: $ROOT/scripts/elisac_stage1.sh --seed, which builds the runtime after the product)" >&2
@@ -53,6 +63,8 @@ runtime_input_digest() {
     "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$PRODUCT" "$ELISA_CLANG_TOOL" || return
     # So is the optimisation level: an -O0 and an -O2 object are different products.
     printf 'opt-level %s\n' "$RUNTIME_OPT_LEVEL"
+    # And the target: an object stamped under other host flags must not count as fresh.
+    printf 'host-flags linux=%s windows=%s x86_64=%s\n' "${ELISA_HOST_LINUX:-}" "${ELISA_HOST_WINDOWS:-}" "${ELISA_HOST_X86_64:-}"
   } | LC_ALL=C sort | "${HASH_COMMAND[@]}" | awk '{print $1}'
 }
 runtime_object_digest() {

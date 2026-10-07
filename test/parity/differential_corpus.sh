@@ -125,13 +125,34 @@ COMPILE() {
 # each and the comparison stays fair.
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 LLVM_LIBDIR="$("$LLVM_CONFIG" --libdir 2>/dev/null || true)"
+#
+# On Linux the gate's clang shim (tools/linux_shim/clang) links with
+# --unresolved-symbols=ignore-all, so recipe 2 "succeeds" for a program that includes the
+# runtime prelude but still calls a runtime-only helper (ctx_string_view_index, ...): the
+# call goes to address 0 and the ORACLE segfaults (stage0=139), which read as 20 stage1
+# MISMATCHes on the gate box. On macOS the same link fails and the program is a SKIP. So a
+# Linux link is refused when the executable leaves unresolved a symbol the RUNTIME defines:
+# the runtime was needed and is missing. Other unresolved names stay accepted, as Apple ld
+# with -dead_strip accepts them: an extern referenced only from dead code (the
+# opaque_extern_field fixtures, guest_overlay_source_smoke) survives GNU --gc-sections as a
+# reference but is never called.
+RUNTIME_DEFINED="$WORK/runtime_defined.txt"
+if [[ "$(uname -s)" == Linux && ! -f "$RUNTIME_DEFINED" ]]; then
+    nm --defined-only "$RUNTIME_OBJ" 2>/dev/null | awk 'NF==3 {print $3}' | sort -u > "$RUNTIME_DEFINED.$$"
+    mv -f "$RUNTIME_DEFINED.$$" "$RUNTIME_DEFINED"
+fi
+link_resolved() {
+    [ "$(uname -s)" = Linux ] || return 0
+    ! nm -u "$1" 2>/dev/null | awk '$1=="U" && $2 !~ /@/ {print $2}' | sort -u \
+        | comm -12 - "$RUNTIME_DEFINED" | grep -q .
+}
 link_program() {
     local out="$1" obj="$2"
-    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
-    clang -Wl,-dead_strip -o "$out" "$obj" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
+    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && link_resolved "$out" && return 0
+    clang -Wl,-dead_strip -o "$out" "$obj" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && link_resolved "$out" && return 0
     [ -n "$LLVM_LIBDIR" ] || return 1
     clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" \
-        -L"$LLVM_LIBDIR" -lLLVM -Wl,-rpath,"$LLVM_LIBDIR" >/dev/null 2>&1 && return 0
+        -L"$LLVM_LIBDIR" -lLLVM -Wl,-rpath,"$LLVM_LIBDIR" >/dev/null 2>&1 && link_resolved "$out" && return 0
     return 1
 }
 
