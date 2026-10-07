@@ -42,7 +42,8 @@ if [[ "$rhead" != "$head" ]]; then
 fi
 # A stage0 worktree's .git is a file naming a Mac path; keep the host's own .git then.
 core_git=(); [[ -d "$ELISA_CORE/.git" ]] || core_git=(--exclude .git)
-rsync -az --exclude compiler/bin "${core_git[@]}" -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
+# --delete: a file left from a newer stage0 would otherwise be compiled into this one.
+rsync -az --delete --exclude compiler/bin "${core_git[@]}" -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
 case "$PROFILE" in
   fast) LIST="emit_ast_parity_smoke resolve_smoke diagnostics_smoke diagnostics_diff semantic_internal_diff semantic_acceptance_diff global_permissions_smoke" ;;
   gen3) LIST="self_host_gen3_smoke" ;;
