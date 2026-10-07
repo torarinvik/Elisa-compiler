@@ -1,0 +1,321 @@
+# never-leak lint (-Wnever-leak, stage1 only, OFF unless requested).
+#
+# THE RULE. A local binding must be used in the LAST statement of the block that declares it.
+# A local whose last use comes earlier stays visible across statements that no longer need it;
+# the fix is to nest it, with the statements that use it, in a block expression that ends with
+# its last use:
+#
+#     lol =                     # instead of   bar = "hello"
+#         bar = "hello"         #              lol = baz(bar)
+#         baz(bar)              #              biz(lol)
+#     biz(lol)
+#
+# WHAT COUNTS AS A USE: any mention in a statement, including inside its nested blocks,
+# closures, loop bodies and match arms (a shadowing inner local counts as a use of the outer
+# one, which only ever hides a finding). A mention inside a `defer` body counts as a use by the
+# block's last statement, since that is when it runs. A local that a still-live local may
+# BORROW is used for as long as that local is (check_never_leak_types.elisa explains the
+# classification), so `s = load(); v = s.view(); use(v)` is legal.
+#
+# EXEMPT: function parameters, `_`-prefixed names, pattern and loop binders, locals declared
+# twice in one block (shadowing chains), locals never used after their declaration (the
+# unused-local hint owns those), and everything under `-permissive` (the driver never asks).
+#
+# LOOPS (category LOOP below). A loop is one statement: a counter or accumulator declared before
+# a loop and last used by that loop is flagged like any local, and its fix is to move it into
+# the loop header (`while i < n |i: usize = 0|:`), which scopes it to the loop. A local declared
+# inside a loop body is checked against the body's own last statement. A local assigned inside a
+# loop and read after it is an ordinary local whose last use is after the loop.
+#
+# CATEGORIES. CHAIN: the last use is a binding (`x = …`, `x: T = …`, `x <- …`, `a, b = …`), so
+# the statements nest mechanically into its block expression. PLAIN: the last use is a plain
+# statement; Elisa has no bare statement block, so the fix needs a scoped block statement
+# (`region NAME:`), a binding, or a helper. OVERLAP: another local declared inside the range is
+# still needed after it, so no nesting works without reordering or a tuple-valued block.
+# BORROW_EXEMPT: legal only because a live local may borrow it (recorded for measurement).
+#
+# COST. One walk per function (check_never_leak_walk.elisa); a block then reads its own range of
+# the walk's identifier list, so the work is linear per block.
+extend Semantic:
+    public:
+        const NEVER_LEAK_CHAIN: u8 = 1
+        const NEVER_LEAK_PLAIN: u8 = 2
+        const NEVER_LEAK_BORROW_EXEMPT: u8 = 3
+        const NEVER_LEAK_OVERLAP: u8 = 4
+        const NEVER_LEAK_LOOP: u8 = 5
+
+        # Statement shapes, as the driver needs them to render a rewrite.
+        const NEVER_LEAK_STMT_PLAIN: u8 = 0
+        const NEVER_LEAK_STMT_BIND: u8 = 1
+        const NEVER_LEAK_STMT_REBIND: u8 = 2
+        const NEVER_LEAK_STMT_LOOP: u8 = 3
+        const NEVER_LEAK_STMT_DEFER: u8 = 4
+
+        struct NeverLeakFinding:
+            name: mutable sview
+            category: mutable u8
+            function_name: mutable sview
+            # The declaring statement's first line and the last-use statement's first line.
+            decl_line: mutable u32
+            last_use_line: mutable u32
+            # The last use before borrow extension (differs from last_use_line when `keeper`
+            # keeps the local alive).
+            raw_last_use_line: mutable u32
+            keeper: mutable sview = ""
+            # First line of the statement after the last use, and of the block's last statement.
+            after_last_line: mutable u32 = 0
+            block_last_line: mutable u32 = 0
+            # How many statements of the block follow the last use.
+            visible_count: mutable u32 = 0
+            last_stmt_kind: mutable u8 = 0
+            bind_name: mutable sview = ""
+            value_column: mutable u32 = 0
+            # Outer bindings the moved statements write with `<-`: a value block needs them in
+            # its `|...|` header.
+            captures: mutable darray[sview] = []
+            other_name: mutable sview = ""
+            # All locals declared inside the range and needed after it (other_name is the first).
+            others: mutable darray[sview] = []
+            other_decl_line: mutable u32 = 0
+            other_after_decl_line: mutable u32 = 0
+            other_last_line: mutable u32 = 0
+            reorder_ok: mutable bool = false
+            # Extra block levels the fixes of this block would stack around this local.
+            depth: mutable u32 = 1
+            # Softened-rule measurement: used by the very next statement / last used there.
+            used_next: mutable bool = false
+            last_is_next: mutable bool = false
+            # Loop-header measurement: the declaring statement is a binding, the next statement
+            # starts on `decl_next_line`, and nothing between the declaration and the last use
+            # reads the local.
+            decl_is_binding: mutable bool = false
+            decl_next_line: mutable u32 = 0
+            between_use: mutable bool = false
+
+        def never_leak_findings(file: Ast::File&, findings: mutable darray[NeverLeakFinding]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                types: mutable NeverLeakTypes = NeverLeakTypes{}
+                nl_build_types(file, types)
+                walk: mutable NeverLeakWalk = NeverLeakWalk{}
+                nl_walk_decls(file.top_decls, types, walk)
+                for finding in walk.findings |findings|:
+                    findings.push(finding)
+
+    private:
+        const NL_OUTER: u32 = 4294967295
+
+        struct NeverLeakWalk:
+            env_names: mutable darray[sview] = []
+            env_classes: mutable darray[u8] = []
+            out: mutable darray[sview] = []
+            addr: mutable darray[sview] = []
+            writes: mutable darray[sview] = []
+            # Bindings a statement may store a borrow into (written roots, method receivers,
+            # mutable and `&` arguments).
+            holds: mutable darray[sview] = []
+            holds_whole: mutable darray[bool] = []
+            # Places passed where a borrow of them can be taken (see nl_push_lend_place).
+            lend: mutable darray[sview] = []
+            findings: mutable darray[NeverLeakFinding] = []
+            function_name: mutable sview = ""
+
+        # One block's statements (index-parallel columns) and the locals it declares.
+        struct NeverLeakBlock:
+            lines: mutable darray[u32] = []
+            m_starts: mutable darray[usize] = []
+            m_ends: mutable darray[usize] = []
+            a_starts: mutable darray[usize] = []
+            a_ends: mutable darray[usize] = []
+            w_starts: mutable darray[usize] = []
+            w_ends: mutable darray[usize] = []
+            h_starts: mutable darray[usize] = []
+            h_ends: mutable darray[usize] = []
+            l_starts: mutable darray[usize] = []
+            l_ends: mutable darray[usize] = []
+            kinds: mutable darray[u8] = []
+            bind_names: mutable darray[sview] = []
+            value_columns: mutable darray[u32] = []
+            decl_names: mutable darray[sview] = []
+            decl_stmts: mutable darray[u32] = []
+            decl_classes: mutable darray[u8] = []
+            decl_lines: mutable darray[u32] = []
+            decl_skip: mutable darray[bool] = []
+
+        def nl_walk_decls(declarations: darray[Ast::Decl], types: NeverLeakTypes&, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |walk, types|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            walk.env_names.truncate(0)
+                            walk.env_classes.truncate(0)
+                            walk.out.truncate(0)
+                            walk.addr.truncate(0)
+                            walk.writes.truncate(0)
+                            walk.holds.truncate(0)
+                            walk.holds_whole.truncate(0)
+                            walk.lend.truncate(0)
+                            walk.function_name <- name
+                            for parameter in parameters |walk, types|:
+                                walk.env_names.push(parameter.name)
+                                walk.env_classes.push(nl_pack(nl_type_class(types, parameter.type_expression), nl_type_content_class(types, parameter.type_expression)))
+                            nl_block(body, (Ast::Expr.Absent), false, types, walk)
+                        Decl.Module(name, body, line):
+                            nl_walk_decls(body, types, walk)
+                        Decl.Scoped(body, line):
+                            nl_walk_decls(body, types, walk)
+                        _:
+                            pass
+
+        def nl_block(statements: darray[Ast::Stmt], tail_value: Ast::Expr, has_tail: bool, types: NeverLeakTypes&, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                env_base: usize = walk.env_names.count
+                block: mutable NeverLeakBlock = NeverLeakBlock{}
+                for statement in statements |block, walk, types|:
+                    nl_open_statement(block, walk, statement_line(statement))
+                    nl_stmt(statement, types, walk)
+                    nl_close_statement(block, walk)
+                    nl_declare_statement(statement, block, types, walk)
+                if has_tail:
+                    nl_open_statement(block, walk, expr_pos(tail_value).line)
+                    nl_expr(tail_value, types, walk)
+                    nl_close_statement(block, walk)
+                if block.decl_names.count > 0 and block.lines.count > 1:
+                    nl_analyze_block(block, walk, env_base)
+                walk.env_names.truncate(env_base)
+                walk.env_classes.truncate(env_base)
+
+        def nl_open_statement(block: mutable NeverLeakBlock&, walk: NeverLeakWalk&, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                block.lines.push(line)
+                block.m_starts.push(walk.out.count)
+                block.a_starts.push(walk.addr.count)
+                block.w_starts.push(walk.writes.count)
+                block.h_starts.push(walk.holds.count)
+                block.l_starts.push(walk.lend.count)
+                block.kinds.push(NEVER_LEAK_STMT_PLAIN)
+                block.bind_names.push("")
+                block.value_columns.push(0)
+
+        def nl_close_statement(block: mutable NeverLeakBlock&, walk: NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                block.m_ends.push(walk.out.count)
+                block.a_ends.push(walk.addr.count)
+                block.w_ends.push(walk.writes.count)
+                block.h_ends.push(walk.holds.count)
+                block.l_ends.push(walk.lend.count)
+
+        def nl_set_binding(block: mutable NeverLeakBlock&, kind: u8, name: sview, value: Ast::Expr) -> void:
+            can Abort.Panic:
+                last: usize = block.kinds.count - 1
+                block.kinds[last] <- kind
+                block.bind_names[last] <- name
+                start: Ast::Pos = nl_expr_start(value)
+                # A value that starts on a later line (a block value) has no inline column.
+                block.value_columns[last] <- start.column if start.line == block.lines[last] else 0
+
+        # Where an expression BEGINS: a node's own position is its operator or call paren, so
+        # follow the leftmost operand (`a.f(x) + 1` begins at `a`; `x if c else y` at `x`).
+        def nl_expr_start(expression: Ast::Expr) -> Ast::Pos:
+            can Abort.Panic:
+                own: Ast::Pos = expr_pos(expression)
+                inner: Ast::Pos = match expression:
+                    Expr.Call(callee, arguments, argument_names, pos): nl_expr_start(callee)
+                    Expr.Binary(left, operator, right, pos): nl_expr_start(left)
+                    Expr.Field(object, field, pos): nl_expr_start(object)
+                    Expr.Scope(base, name, pos): nl_expr_start(base)
+                    Expr.Index(object, index, pos): nl_expr_start(object)
+                    Expr.IndexN(object, arguments, pos): nl_expr_start(object)
+                    Expr.Slice(object, low, high, pos): nl_expr_start(object)
+                    Expr.If(condition, then_value, else_value, pos): nl_expr_start(then_value)
+                    Expr.Refinement(base, predicate, pos): nl_expr_start(base)
+                    Expr.Construct(type_expression, fields, pos): nl_expr_start(type_expression)
+                    Expr.RecordUpdate(base, fields, pos): nl_expr_start(base)
+                    _: own
+                own return if inner.line == 0 or inner.line > own.line or (inner.line == own.line and inner.column >= own.column)
+                return inner
+
+        def nl_declare(block: mutable NeverLeakBlock&, walk: mutable NeverLeakWalk&, name: sview, local_class: u8, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                walk.env_names.push(name)
+                walk.env_classes.push(local_class)
+                return if name == "" or sview_at(name, 0) == 95
+                duplicate: mutable bool = false
+                for existing in 0..<block.decl_names.count |block, duplicate, name|:
+                    if block.decl_names[existing] == name:
+                        block.decl_skip[existing] <- true
+                        duplicate <- true
+                block.decl_names.push(name)
+                block.decl_stmts.push((block.lines.count - 1).u32())
+                block.decl_classes.push(local_class)
+                block.decl_lines.push(line)
+                block.decl_skip.push(duplicate)
+
+        def nl_declare_statement(statement: Ast::Stmt, block: mutable NeverLeakBlock&, types: NeverLeakTypes&, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.VarDecl(name, type_expression, value, pos):
+                        nl_declare(block, walk, name, nl_decl_class(type_expression, value, types, walk), pos.line)
+                        nl_set_binding(block, NEVER_LEAK_STMT_BIND, name, value)
+                    Stmt.Assign(target, operator, value, pos):
+                        if operator == TokenKind.Assign and nl_declaring_target(target):
+                            match target:
+                                Expr.Ident(name, ident_pos):
+                                    nl_declare(block, walk, name, nl_expr_class(value, types, walk), pos.line)
+                                    nl_set_binding(block, NEVER_LEAK_STMT_BIND, name, value)
+                                Expr.Tuple(elements, tuple_pos):
+                                    for element in elements |block, walk, pos|:
+                                        nl_declare(block, walk, ident_name_of(element), NL_BORROW, pos.line)
+                                    nl_set_binding(block, NEVER_LEAK_STMT_BIND, "", value)
+                                _:
+                                    pass
+                        elif operator == TokenKind.LArrow:
+                            nl_set_binding(block, NEVER_LEAK_STMT_REBIND, ident_name_of(target), value)
+                    Stmt.While(condition, body, pos):
+                        block.kinds[block.kinds.count - 1] <- NEVER_LEAK_STMT_LOOP
+                    Stmt.For(bind, variables, iterable, body, pos):
+                        block.kinds[block.kinds.count - 1] <- NEVER_LEAK_STMT_LOOP
+                    Stmt.Block(kind, clause, binding, body, pos):
+                        if kind == "defer":
+                            block.kinds[block.kinds.count - 1] <- NEVER_LEAK_STMT_DEFER
+                        elif nl_transparent_block(kind):
+                            # Locals a `let`/`trusted:` wrapper declares belong to this block.
+                            for nested in body |block, walk, types|:
+                                match nested:
+                                    Stmt.VarDecl(name, type_expression, value, nested_pos):
+                                        nl_declare(block, walk, name, nl_decl_class(type_expression, value, types, walk), nested_pos.line)
+                                    Stmt.Assign(target, operator, value, nested_pos):
+                                        if operator == TokenKind.Assign:
+                                            match target:
+                                                Expr.Ident(name, ident_pos):
+                                                    nl_declare(block, walk, name, nl_expr_class(value, types, walk), nested_pos.line)
+                                                _:
+                                                    pass
+                                    _:
+                                        pass
+                    _:
+                        pass
+
+        def nl_push_pair(stmts: mutable darray[u32]&, decls: mutable darray[u32]&, statement: u32, decl: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                count: usize = stmts.count
+                return if count > 0 and stmts[count - 1] == statement and decls[count - 1] == decl
+                stmts.push(statement)
+                decls.push(decl)
+
+        # Whether statement `statement` may borrow the local `name`: it took `&name` (the only
+        # way into a SCALAR or a view), or it lent storage the local owns.
+        def nl_borrowable(block: NeverLeakBlock&, walk: NeverLeakWalk&, statement: usize, name: sview, owns: bool) -> bool:
+            can Abort.Panic:
+                for index in block.a_starts[statement]..<block.a_ends[statement] |block, walk, name|:
+                    true return if walk.addr[index] == name
+                false return if not owns
+                for index in block.l_starts[statement]..<block.l_ends[statement] |block, walk, name|:
+                    true return if walk.lend[index] == name
+                return false
+
+        # Whether a (statement, decl) mention pair exists with the statement in [low, high].
+        def nl_mentioned(stmts: darray[u32]&, decls: darray[u32]&, decl: u32, low: u32, high: u32) -> bool:
+            can Abort.Panic:
+                for index in 0..<stmts.count |stmts, decls, decl, low, high|:
+                    true return if decls[index] == decl and stmts[index] >= low and stmts[index] <= high
+                return false

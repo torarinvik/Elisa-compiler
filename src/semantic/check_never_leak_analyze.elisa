@@ -1,0 +1,243 @@
+# never-leak lint (-Wnever-leak) — one block's verdicts, from the ranges the walk recorded.
+#
+# 1. Last use: one pass over the block's identifier entries, matching each against the block's
+#    locals, recording (statement, local) MENTION pairs. HOLDER pairs come from the bindings a
+#    statement may store a borrow into (`walk.holds`: `<-` roots, method receivers, `mutable`/
+#    `lmut` and `&` arguments) whose class HOLDS, plus the HOLDS locals it declares; a holder from
+#    an enclosing scope is NL_OUTER (it outlives the block).
+# 2. Borrow extension: a local that OWNS storage and is LENT by a statement (`walk.lend`: passed to
+#    a view/ref parameter, a method receiver, sliced, stored in a literal) or whose address is
+#    taken lives as long as every holder of that statement. A small fixpoint (holders may be
+#    declared before or after the local).
+# 3. Categories, overlap and the nesting depth the fixes would add (see check_never_leak.elisa).
+extend Semantic:
+    private:
+        def nl_analyze_block(block: mutable NeverLeakBlock&, walk: mutable NeverLeakWalk&, env_base: usize) -> void:
+            can Memory.Allocate, Abort.Panic:
+                statement_count: u32 = block.lines.count.u32()
+                decl_count: usize = block.decl_names.count
+                last: mutable darray[u32] = []
+                used_next: mutable darray[bool] = []
+                for seed in 0..<decl_count |last, used_next, block|:
+                    last.push(block.decl_stmts[seed])
+                    used_next.push(false)
+                mention_stmts: mutable darray[u32] = []
+                mention_decls: mutable darray[u32] = []
+                holder_stmts: mutable darray[u32] = []
+                holder_decls: mutable darray[u32] = []
+                holder_names: mutable darray[sview] = []
+                decl_cursor: mutable usize = 0
+                for statement in 0..<block.lines.count |block, walk, last, used_next, mention_stmts, mention_decls, holder_stmts, holder_decls, holder_names, decl_cursor, statement_count, decl_count, env_base|:
+                    here: u32 = statement.u32()
+                    use_at: mutable u32 = here
+                    use_at <- statement_count - 1 if block.kinds[statement] == NEVER_LEAK_STMT_DEFER
+                    for entry in block.m_starts[statement]..<block.m_ends[statement] |block, walk, last, used_next, mention_stmts, mention_decls, holder_stmts, holder_decls, holder_names, here, use_at, decl_count, env_base|:
+                        name: sview = walk.out[entry]
+                        for decl in 0..<decl_count |block, last, used_next, mention_stmts, mention_decls, name, here, use_at|:
+                            if block.decl_stmts[decl] < here and block.decl_names[decl] == name:
+                                last[decl] <- use_at if use_at > last[decl]
+                                used_next[decl] <- true if block.decl_stmts[decl] + 1 == here
+                                nl_push_pair(mention_stmts, mention_decls, here, decl.u32())
+                    # Holders: the bindings this statement may store a borrow into.
+                    for hold in block.h_starts[statement]..<block.h_ends[statement] |block, walk, holder_stmts, holder_decls, holder_names, here, decl_count, env_base|:
+                        held: sview = walk.holds[hold]
+                        held_local: mutable usize = decl_count
+                        for decl in 0..<decl_count |held_local, block, held, here|:
+                            held_local <- decl if block.decl_stmts[decl] < here and block.decl_names[decl] == held
+                        whole: bool = walk.holds_whole[hold]
+                        if held_local < decl_count:
+                            if nl_holds(nl_holder_class(block.decl_classes[held_local], whole)):
+                                nl_push_holder(holder_stmts, holder_decls, holder_names, here, held_local.u32(), held)
+                        else:
+                            outer: u8 = nl_env_packed(walk, held, env_base)
+                            if nl_holds(nl_holder_class(outer, whole)):
+                                nl_push_holder(holder_stmts, holder_decls, holder_names, here, NL_OUTER, held)
+                    # A local this statement declares holds whatever its initializer read.
+                    while decl_cursor < decl_count and block.decl_stmts[decl_cursor] <= here |decl_cursor, block, holder_stmts, holder_decls, holder_names, here|:
+                        if block.decl_stmts[decl_cursor] == here and nl_holds(nl_full(block.decl_classes[decl_cursor])):
+                            nl_push_holder(holder_stmts, holder_decls, holder_names, here, decl_cursor.u32(), block.decl_names[decl_cursor])
+                        decl_cursor <- decl_cursor + 1
+                effective: mutable darray[u32] = []
+                keepers: mutable darray[sview] = []
+                for copy in 0..<decl_count |effective, keepers, last|:
+                    effective.push(last[copy])
+                    keepers.push("")
+                nl_extend_by_holders(block, walk, mention_stmts, mention_decls, holder_stmts, holder_decls, holder_names, effective, keepers, statement_count)
+                nl_classify_block(block, walk, last, effective, keepers, used_next, mention_stmts, mention_decls, statement_count)
+
+        def nl_holder_class(class_byte: u8, whole: bool) -> u8:
+            return nl_full(class_byte) if whole else nl_content(class_byte)
+
+        def nl_push_holder(stmts: mutable darray[u32]&, decls: mutable darray[u32]&, names: mutable darray[sview]&, statement: u32, decl: u32, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                count: usize = stmts.count
+                return if count > 0 and stmts[count - 1] == statement and decls[count - 1] == decl
+                stmts.push(statement)
+                decls.push(decl)
+                names.push(name)
+
+        def nl_extend_by_holders(block: NeverLeakBlock&, walk: NeverLeakWalk&, mention_stmts: darray[u32]&, mention_decls: darray[u32]&, holder_stmts: darray[u32]&, holder_decls: darray[u32]&, holder_names: darray[sview]&, effective: mutable darray[u32]&, keepers: mutable darray[sview]&, statement_count: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if holder_stmts.count == 0
+                last_statement: u32 = statement_count - 1
+                rounds: mutable i64 = 0
+                while rounds < 6 |rounds, block, walk, mention_stmts, mention_decls, holder_stmts, holder_decls, holder_names, effective, keepers, last_statement|:
+                    changed: mutable bool = false
+                    holder_cursor: mutable usize = 0
+                    for pair in 0..<mention_stmts.count |changed, holder_cursor, block, walk, mention_stmts, mention_decls, holder_stmts, holder_decls, holder_names, effective, keepers, last_statement|:
+                        here: u32 = mention_stmts[pair]
+                        local: usize = mention_decls[pair].usize()
+                        while holder_cursor < holder_stmts.count and holder_stmts[holder_cursor] < here |holder_cursor, holder_stmts, here|:
+                            holder_cursor <- holder_cursor + 1
+                        continue if effective[local] >= last_statement
+                        # Only storage the local OWNS can be borrowed (a view's target lives elsewhere).
+                        borrowable: bool = nl_borrowable(block, walk, here.usize(), block.decl_names[local], nl_owns(nl_full(block.decl_classes[local])))
+                        continue if not borrowable
+                        scan: mutable usize = holder_cursor
+                        while scan < holder_stmts.count and holder_stmts[scan] == here |scan, changed, local, last_statement, holder_stmts, holder_decls, holder_names, effective, keepers|:
+                            holder: u32 = holder_decls[scan]
+                            if holder == NL_OUTER:
+                                if effective[local] < last_statement:
+                                    effective[local] <- last_statement
+                                    keepers[local] <- holder_names[scan]
+                                    changed <- true
+                            elif holder.usize() != local and effective[holder.usize()] > effective[local]:
+                                effective[local] <- effective[holder.usize()]
+                                keepers[local] <- holder_names[scan]
+                                changed <- true
+                            scan <- scan + 1
+                    break if not changed
+                    rounds <- rounds + 1
+
+        # The first other local declared inside (decl, last] that is still needed after `last`
+        # (block.decl_names.count when there is none). A binding AT `last` is the block's value.
+        def nl_overlap(block: NeverLeakBlock&, effective: darray[u32]&, last: darray[u32]&, local: usize, end: u32, from: usize) -> usize:
+            can Abort.Panic:
+                start: u32 = block.decl_stmts[local]
+                for other in from..<block.decl_names.count |block, effective, last, local, end, start|:
+                    continue if other == local
+                    declared: u32 = block.decl_stmts[other]
+                    continue if declared <= start or declared > end
+                    continue if last[other] <= declared and not block.decl_skip[other]
+                    continue if effective[other] <= end
+                    continue if declared == end and block.kinds[end.usize()] == NEVER_LEAK_STMT_BIND
+                    return other
+                return block.decl_names.count
+
+        def nl_classify_block(block: NeverLeakBlock&, walk: mutable NeverLeakWalk&, last: darray[u32]&, effective: darray[u32]&, keepers: darray[sview]&, used_next: darray[bool]&, mention_stmts: darray[u32]&, mention_decls: darray[u32]&, statement_count: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Synthetic trailing statements (line 0, e.g. a loop header's desugaring) are not
+                # the block's last statement for this rule.
+                last_statement: mutable u32 = statement_count - 1
+                while last_statement > 0 and block.lines[last_statement.usize()] == 0 |last_statement, block|:
+                    last_statement <- last_statement - 1
+                first_finding: usize = walk.findings.count
+                for local in 0..<block.decl_names.count |block, walk, last, effective, keepers, used_next, mention_stmts, mention_decls, last_statement|:
+                    continue if block.decl_skip[local]
+                    start: u32 = block.decl_stmts[local]
+                    continue if last[local] <= start
+                    continue if block.decl_lines[local] == 0
+                    end: u32 = effective[local]
+                    continue if end >= last_statement and last[local] >= last_statement
+                    finding: mutable NeverLeakFinding = NeverLeakFinding{name: block.decl_names[local], category: NEVER_LEAK_CHAIN, function_name: walk.function_name, decl_line: block.decl_lines[local], last_use_line: block.lines[end.usize()], raw_last_use_line: block.lines[last[local].usize()]}
+                    finding.keeper <- keepers[local]
+                    finding.block_last_line <- block.lines[last_statement.usize()]
+                    finding.used_next <- used_next[local]
+                    finding.last_is_next <- end == start + 1
+                    if end >= last_statement:
+                        finding.category <- NEVER_LEAK_BORROW_EXEMPT
+                        walk.findings.push(finding)
+                        continue
+                    finding.after_last_line <- block.lines[(end + 1).usize()]
+                    finding.decl_is_binding <- block.kinds[start.usize()] == NEVER_LEAK_STMT_BIND
+                    finding.decl_next_line <- block.lines[(start + 1).usize()]
+                    finding.between_use <- nl_mentioned(mention_stmts, mention_decls, local.u32(), start + 1, end - 1) if end > start + 1
+                    finding.visible_count <- last_statement - end
+                    finding.last_stmt_kind <- block.kinds[end.usize()]
+                    finding.bind_name <- block.bind_names[end.usize()]
+                    finding.value_column <- block.value_columns[end.usize()]
+                    other: usize = nl_overlap(block, effective, last, local, end, 0)
+                    if block.kinds[end.usize()] == NEVER_LEAK_STMT_LOOP:
+                        finding.category <- NEVER_LEAK_LOOP
+                    elif other < block.decl_names.count:
+                        finding.category <- NEVER_LEAK_OVERLAP
+                        other_declared: u32 = block.decl_stmts[other]
+                        finding.other_name <- block.decl_names[other]
+                        # Every local the tuple-valued block must yield, in declaration order.
+                        next_other: mutable usize = other
+                        while next_other < block.decl_names.count |next_other, finding, block, effective, last, local, end|:
+                            finding.others.push(block.decl_names[next_other])
+                            next_other <- nl_overlap(block, effective, last, local, end, next_other + 1)
+                        finding.other_decl_line <- block.lines[other_declared.usize()]
+                        finding.other_after_decl_line <- block.lines[(other_declared + 1).usize()]
+                        finding.other_last_line <- block.lines[effective[other].usize()]
+                        # Moving the other declaration below `end` works when nothing between
+                        # reads it and it reads nothing declared inside the nested range.
+                        reorder: mutable bool = not nl_mentioned(mention_stmts, mention_decls, other.u32(), other_declared + 1, end)
+                        for inner in 0..<block.decl_names.count |reorder, block, mention_stmts, mention_decls, start, other_declared|:
+                            if block.decl_stmts[inner] >= start and block.decl_stmts[inner] < other_declared:
+                                reorder <- false if nl_mentioned(mention_stmts, mention_decls, inner.u32(), other_declared, other_declared)
+                        finding.reorder_ok <- reorder
+                    elif block.kinds[end.usize()] == NEVER_LEAK_STMT_PLAIN:
+                        finding.category <- NEVER_LEAK_PLAIN
+                    elif block.kinds[end.usize()] == NEVER_LEAK_STMT_DEFER:
+                        finding.category <- NEVER_LEAK_PLAIN
+                    if finding.category == NEVER_LEAK_CHAIN:
+                        nl_collect_captures(block, walk, start, end, finding)
+                    walk.findings.push(finding)
+                nl_assign_depths(walk, first_finding, block)
+
+        # Outer bindings the statements [start, end] write with `<-` (not locals they declare,
+        # and not the `x <- …` target the block's value is assigned to).
+        def nl_collect_captures(block: NeverLeakBlock&, walk: NeverLeakWalk&, start: u32, end: u32, finding: mutable NeverLeakFinding&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in start.usize()..<(end + 1).usize() |block, walk, start, end, finding|:
+                    for entry in block.w_starts[statement]..<block.w_ends[statement] |block, walk, start, end, finding, statement|:
+                        written: sview = walk.writes[entry]
+                        skip: mutable bool = written == "" or any captured in finding.captures where captured == written
+                        skip <- true if statement == end.usize() and block.kinds[statement] == NEVER_LEAK_STMT_REBIND and written == block.bind_names[statement]
+                        for decl in 0..<block.decl_names.count |skip, block, written, start, end|:
+                            skip <- true if block.decl_names[decl] == written and block.decl_stmts[decl] >= start and block.decl_stmts[decl] <= end
+                        finding.captures.push(written) if not skip
+
+        # Nesting depth of each fix: a local's block lands inside the statement of its last use,
+        # which may itself be inside another flagged local's range (a chain nests one level per
+        # link). Locals sharing a last use share one block.
+        def nl_assign_depths(walk: mutable NeverLeakWalk&, first_finding: usize, block: NeverLeakBlock&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                count: usize = walk.findings.count
+                return if count <= first_finding + 1
+                # Process by descending last-use line; findings are few per block.
+                remaining: mutable usize = count - first_finding
+                done: mutable darray[bool] = []
+                for mark in first_finding..<count |done|:
+                    done.push(false)
+                while remaining > 0 |remaining, done, walk, first_finding, count|:
+                    pick: mutable usize = count
+                    for candidate in first_finding..<count |pick, done, walk, first_finding|:
+                        continue if done[candidate - first_finding]
+                        if pick == count or walk.findings[candidate].last_use_line > walk.findings[pick].last_use_line:
+                            pick <- candidate
+                    done[pick - first_finding] <- true
+                    remaining <- remaining - 1
+                    continue if not nl_nestable(walk.findings[pick].category)
+                    end_line: u32 = walk.findings[pick].last_use_line
+                    deepest: mutable u32 = 0
+                    for outer in first_finding..<count |deepest, walk, end_line|:
+                        continue if not nl_nestable(walk.findings[outer].category)
+                        outer_end: u32 = walk.findings[outer].last_use_line
+                        if outer_end > end_line and nl_group_start(walk, first_finding, count, outer_end) <= end_line:
+                            deepest <- walk.findings[outer].depth if walk.findings[outer].depth > deepest
+                    walk.findings[pick].depth <- deepest + 1
+
+        def nl_nestable(category: u8) -> bool:
+            return category == NEVER_LEAK_CHAIN or category == NEVER_LEAK_PLAIN or category == NEVER_LEAK_LOOP
+
+        # The first line of the block a group of locals sharing last use `end_line` nests into.
+        def nl_group_start(walk: NeverLeakWalk&, first_finding: usize, count: usize, end_line: u32) -> u32:
+            can Abort.Panic:
+                start: mutable u32 = end_line
+                for index in first_finding..<count |start, walk, end_line|:
+                    if walk.findings[index].last_use_line == end_line and nl_nestable(walk.findings[index].category):
+                        start <- walk.findings[index].decl_line if walk.findings[index].decl_line < start
+                return start
