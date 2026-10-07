@@ -16,7 +16,10 @@
 set -uo pipefail
 SSH_TARGET="${1:?ssh options and target, e.g. \"-p 50559 root@host\"}"; PROFILE="${2:-fast}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
+# Resolve stage0 beside the MAIN checkout: a linked worktree may live at any depth.
+MAIN_ROOT="$(cd -- "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || echo "$ROOT")"
+ELISA_CORE="${ELISA_CORE:-$MAIN_ROOT/../../Go projects/Elisa-core}"
+[[ -f "$ELISA_CORE/compiler/go.mod" ]] || { echo "remote_gate.sh: no stage0 at '$ELISA_CORE' (set ELISA_CORE)" >&2; exit 2; }
 RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/Elisa-core}"
 addr="${SSH_TARGET##* }"; opts="${SSH_TARGET% *}"; [[ "$addr" == "$SSH_TARGET" ]] && opts=""
 # The tree WITHOUT .git: in a linked worktree .git is a file naming a Mac path, useless on
