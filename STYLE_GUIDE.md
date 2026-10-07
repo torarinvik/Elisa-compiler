@@ -322,6 +322,37 @@ in-place either. `g <- f(g, ..)` on a global threads through a local copy (the c
 `g` by name). stage0 has no value-threading: it rejects writing a by-value parameter, so
 threaded code builds with stage1 only.
 
+**The lint.** `-Wnever-leak` (section 8) points at the sites. It never forces the form. Gentle
+mode reports only an owned local `darray`/`dict` changed by a statement-level `push`, `clear`
+or `put`. Those sites have a paste-ready rebinding with the same machine code, and both
+compilers build it. `-Wnever-leak=strict` also lists the in-place calls no rewrite fits, each
+with the reason: a borrow, a field of a borrow, a global, a local of a `region`/`in` block's
+arena, or a side-effect-only call of your own `-> void` function that takes an owned local as
+`mutable T&`. From `test/fixtures/never_leak/expected-strict.txt`:
+
+```text
+illegal.elisa:128: warning: owned local `xs` is changed in place by a statement that drops the call's result [-Wnever-leak]
+  `xs`: declared on line 127; changed in place on line 128 by `xs.push(seed)`
+  kind: value-threading (an owned local that a statement changes through an in-place call whose result it drops)
+  why: the line reads as a call made for its effect, and nothing at its start says that `xs` changes; as a rebinding, `xs <- ...` names the value the line changes, the way every other update of a local does
+  fix: thread the value through the call (same machine code as the in-place form at -O0 and -O2):
+          xs <- xs.push(seed)
+illegal.elisa:129: warning: owned local `xs` is changed in place by a statement that drops the call's result [-Wnever-leak]
+  `xs`: declared on line 127; changed in place on line 129 by `fill(&xs, seed)`
+  kind: value-threading candidate (an in-place call no value-threading rewrite fits; reported by -Wnever-leak=strict only)
+  no value-threading rewrite applies: `fill` takes `xs` as `mutable darray[i64]&` and returns nothing, so the call is there only for its effect and has no value form to call; give `fill` one that takes `out: darray[i64]` by value and returns it (`-> darray[i64]`, STYLE_GUIDE.md section 6), and the call becomes `xs <- fill(xs, seed)`
+```
+
+Measured with `-Wnever-leak=strict` (rewritable sites, then candidates by reason):
+
+| Corpus | Rewritable | Borrow | Field of a borrow | Global | Arena | Side-effect-only | Multi-line |
+|---|---|---|---|---|---|---|---|
+| compiler (`src/driver/elisac.elisa`) | 2418 | 3033 | 369 | 0 | 4 | 2030 | 1 |
+| `test/fixtures` (1305 files) | 246 | 953 | 1503 | 4 | 69 | 379 | 0 |
+| `test/differential` (171 files) | 67 | 19 | 17 | 0 | 10 | 16 | 0 |
+| `test/breadth` (56 files) | 39659 | 18643 | 5871 | 0 | 0 | 1476 | 0 |
+| `test/bench` (21 files) | 41 | 50 | 85 | 0 | 1 | 5 | 0 |
+
 ## 7. Borrow exclusivity
 
 The compiler now enforces (`src/semantic/check_call_argument_exclusivity*.elisa`) that no two
@@ -379,6 +410,7 @@ Finding kinds:
 | overlap | a later local declared in the range is needed after it | reorder, then nest |
 | loop | last use is a loop it feeds | move into the loop header |
 | accumulator | a `mutable` local only a loop writes and only later code reads | loop expression (section 5) |
+| value-thread | an owned local changed by a statement-level `push`/`clear`/`put` | `xs <- xs.push(v)` (section 6) |
 
 A real diagnostic (`test/fixtures/never_leak/expected-strict.txt`):
 
@@ -429,4 +461,5 @@ own lines, so paste it. The `note:` line appears only in strict mode. Now a `pla
 - New code follows the guide by default.
 - Port a file when you are already touching it; do not make style-only sweeps of whole files.
 - Turn on `-Werror=never-leak=strict` per directory once it is clean (`test/fixtures/never_leak/
-  legal.elisa` and `fixed.elisa` are clean under both levels, and show the target shape).
+  legal.elisa` is clean under both levels; `fixed.elisa` is clean under gentle, and strict lists
+  only the candidates no rewrite fits).
