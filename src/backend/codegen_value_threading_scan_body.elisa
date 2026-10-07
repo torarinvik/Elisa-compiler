@@ -1,0 +1,339 @@
+# Stage1 backend — value-threading, part 2: the call shapes a function body may use (see
+# codegen_value_threading_scan.elisa), shared by the scan and the rewrite so the two agree.
+extend Backend:
+    private:
+        # The shape of one statement. `kind`: 0 none, 1 `place <- f(.., place, ..)`,
+        # 2 `place, other <- f(..)` (two-element result), 3 `y = f(..)`, 4 `return f(..)`,
+        # 5 `g <- f(.., g, ..)` for a place that is not a local (a global): threaded through
+        # a local copy, since the callee may read the global by name.
+        struct VtShape:
+            kind: u32
+            function_index: i64
+
+        def vt_no_shape() -> VtShape:
+            return VtShape{kind: 0, function_index: -1}
+
+        # Whether PLACE may be lent in place: rooted at a local of the caller. The caller's own
+        # threaded parameter is one too: it is already a reference, passed on as it is.
+        def vt_place_lendable(place: Expr, locals: darray[sview]&, own_param: sview) -> bool can[Abort.Panic]:
+            root: sview = Ast::value_thread_place_root(place)
+            return root != "" and vt_name_listed(locals, root)
+
+        def vt_statement_shape(statement: Stmt, functions: darray[Ast::ValueThreadFn]&, locals: darray[sview]&, own_param: sview) -> VtShape can[Abort.Panic, Memory.Allocate]:
+            match statement:
+                Stmt.Assign(target, operator, Expr.Call(callee, arguments, argument_names, _), _):
+                    return vt_no_shape() if operator != TokenKind.LArrow
+                    call_index: i64 = Ast::value_thread_call_index(functions, callee, arguments, argument_names)
+                    return vt_no_shape() if call_index < 0
+                    function: Ast::ValueThreadFn = functions[call_index.usize()]
+                    threaded: Expr = Ast::value_thread_call_argument(function, callee, arguments)
+                    if not vt_place_lendable(threaded, locals, own_param):
+                        global_root: sview = Ast::value_thread_place_root(threaded)
+                        lendable_copy: bool = global_root != "" and function.tuple_slot < 0 and Ast::value_thread_place_equal(target, threaded) and vt_leading_arguments_simple(function, callee, arguments)
+                        return VtShape{kind: 5, function_index: call_index} if lendable_copy
+                        return vt_no_shape()
+                    if function.tuple_slot < 0:
+                        return VtShape{kind: 1, function_index: call_index} if Ast::value_thread_place_equal(target, threaded)
+                        return vt_no_shape()
+                    if target is Expr.Array(targets, _):
+                        return VtShape{kind: 2, function_index: call_index} if targets.count == 2 and Ast::value_thread_place_equal(targets[function.tuple_slot.usize()], threaded)
+                    return vt_no_shape()
+                Stmt.VarDecl(_, _, Expr.Call(declared_callee, declared_arguments, declared_names, _), _):
+                    declared_index: i64 = Ast::value_thread_call_index(functions, declared_callee, declared_arguments, declared_names)
+                    return vt_no_shape() if declared_index < 0
+                    declared_function: Ast::ValueThreadFn = functions[declared_index.usize()]
+                    return vt_no_shape() if declared_function.tuple_slot >= 0 or not vt_leading_arguments_simple(declared_function, declared_callee, declared_arguments)
+                    return VtShape{kind: 3, function_index: declared_index}
+                Stmt.Return(return_value, _):
+                    returned_call: Expr = get return_value else (Ast::Expr.Absent)
+                    if returned_call is Expr.Call(returned_callee, returned_arguments, returned_names, _):
+                        returned_index: i64 = Ast::value_thread_call_index(functions, returned_callee, returned_arguments, returned_names)
+                        return vt_no_shape() if returned_index < 0 or own_param != ""
+                        returned_function: Ast::ValueThreadFn = functions[returned_index.usize()]
+                        return vt_no_shape() if returned_function.tuple_slot >= 0 or not vt_leading_arguments_simple(returned_function, returned_callee, returned_arguments)
+                        return VtShape{kind: 4, function_index: returned_index}
+                    return vt_no_shape()
+                _:
+                    return vt_no_shape()
+
+        # Scan a statement list the rewrite enters (see the file header of part 1).
+        def vt_scan_statements(statements: darray[Stmt], functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&, locals: darray[sview]&, own_param: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in statements |ok|:
+                shape: VtShape = vt_statement_shape(statement, functions, locals, own_param)
+                if shape.kind != 0:
+                    match statement:
+                        Stmt.Assign(target, _, Expr.Call(callee, arguments, _, _), _):
+                            vt_scan_expr(target, functions, ok)
+                            vt_scan_call_parts(callee, arguments, functions, ok)
+                        Stmt.VarDecl(_, _, Expr.Call(declared_callee, declared_arguments, _, _), _):
+                            vt_scan_call_parts(declared_callee, declared_arguments, functions, ok)
+                        Stmt.Return(return_value, _):
+                            returned_call: Expr = get return_value else (Ast::Expr.Absent)
+                            if returned_call is Expr.Call(returned_callee, returned_arguments, _, _):
+                                vt_scan_call_parts(returned_callee, returned_arguments, functions, ok)
+                        _:
+                            pass
+                    continue
+                match statement:
+                    Stmt.Expr(statement_expression, _):
+                        vt_scan_value(statement_expression, functions, ok, locals, own_param)
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        vt_scan_value(declared_value, functions, ok, locals, own_param)
+                    Stmt.Assign(target, _, assign_value, _):
+                        vt_scan_expr(target, functions, ok)
+                        vt_scan_value(assign_value, functions, ok, locals, own_param)
+                    Stmt.Return(return_value, _):
+                        if return_value is present_return:
+                            vt_scan_value(present_return, functions, ok, locals, own_param)
+                    Stmt.Contract(_, contract_expression, _):
+                        vt_scan_expr(contract_expression, functions, ok)
+                    Stmt.Block(_, _, _, block_body, _):
+                        vt_scan_statements(block_body, functions, ok, locals, own_param)
+                    Stmt.If(condition, then_body, else_body, _):
+                        vt_scan_expr(condition, functions, ok)
+                        vt_scan_statements(then_body, functions, ok, locals, own_param)
+                        vt_scan_statements(else_body, functions, ok, locals, own_param)
+                    Stmt.While(while_condition, while_body, _):
+                        vt_scan_expr(while_condition, functions, ok)
+                        vt_scan_statements(while_body, functions, ok, locals, own_param)
+                    Stmt.For(_, _, iterable, for_body, _):
+                        vt_scan_expr(iterable, functions, ok)
+                        vt_scan_statements(for_body, functions, ok, locals, own_param)
+                    Stmt.Match(scrutinee, arms, _):
+                        vt_scan_expr(scrutinee, functions, ok)
+                        for arm in arms |ok|:
+                            vt_scan_expr(arm.guard, functions, ok)
+                            vt_scan_statements(arm.body, functions, ok, locals, own_param)
+                    _:
+                        pass
+
+        # A statement's whole value: a value block is entered as statements, anything else
+        # is scanned strictly.
+        def vt_scan_value(value: Expr, functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&, locals: darray[sview]&, own_param: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            if value is Expr.Block(block_statements, block_value, _, _):
+                vt_scan_statements(block_statements, functions, ok, locals, own_param)
+                # The tail may itself be a value block: `xs: T =` over a loop expression.
+                vt_scan_value(block_value, functions, ok, locals, own_param)
+                return
+            vt_scan_expr(value, functions, ok)
+
+        # Whether a threaded function's own body reads like an `&` body for its parameter
+        # NAME: no `&name`, no shadowing declaration, and no wholesale `name <- e` other than
+        # the in-place container forms.
+        def vt_param_body_ok(statements: darray[Stmt], name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            for statement in statements:
+                match statement:
+                    Stmt.VarDecl(declared_name, _, declared_value, _):
+                        return false if declared_name == name or not vt_value_ok(declared_value, name)
+                    Stmt.Assign(target, operator, assign_value, _):
+                        # `name <- f(.., name, ..)` is allowed here and checked against the
+                        # lowered functions by vt_own_assignments_ok.
+                        reassigned: bool = Ast::value_thread_is_name(target, name) or vt_targets_name(target, name)
+                        if reassigned and operator != TokenKind.PlusEq:
+                            return false if operator != TokenKind.LArrow or not (vt_in_place_update(assign_value, name) or assign_value is Expr.Call(_, _, _, _))
+                        return false if vt_expr_lends(target, name) or not vt_value_ok(assign_value, name)
+                    Stmt.Expr(statement_expression, _):
+                        return false if not vt_value_ok(statement_expression, name)
+                    Stmt.Return(return_value, _):
+                        if return_value is present_return:
+                            return false if vt_expr_lends(present_return, name)
+                    Stmt.Contract(_, contract_expression, _):
+                        return false if vt_expr_lends(contract_expression, name)
+                    Stmt.Block(_, _, _, block_body, _):
+                        return false if not vt_param_body_ok(block_body, name)
+                    Stmt.If(condition, then_body, else_body, _):
+                        return false if vt_expr_lends(condition, name) or not vt_param_body_ok(then_body, name) or not vt_param_body_ok(else_body, name)
+                    Stmt.While(while_condition, while_body, _):
+                        return false if vt_expr_lends(while_condition, name) or not vt_param_body_ok(while_body, name)
+                    Stmt.For(_, variables, iterable, for_body, _):
+                        return false if vt_name_listed(variables, name) or vt_expr_lends(iterable, name) or not vt_param_body_ok(for_body, name)
+                    Stmt.Match(scrutinee, arms, _):
+                        return false if vt_expr_lends(scrutinee, name)
+                        for arm in arms:
+                            return false if vt_expr_lends(arm.guard, name) or not vt_param_body_ok(arm.body, name)
+                    _:
+                        pass
+            return true
+
+        # Whether a multi-target `<-` names NAME among its targets.
+        def vt_targets_name(target: Expr, name: sview) -> bool can[Abort.Panic]:
+            if target is Expr.Array(targets, _):
+                for each_target in targets:
+                    return true if Ast::value_thread_is_name(each_target, name)
+            return false
+
+        # Every wholesale reassignment of the threaded parameter NAME in STATEMENTS is a
+        # threaded call on it that is itself lowered (`arr <- push_one(arr, i)` becomes
+        # `push_one(arr, i)`, passing the reference on); in-place container updates aside.
+        def vt_own_assignments_ok(statements: darray[Stmt], functions: darray[Ast::ValueThreadFn]&, ok: darray[bool]&, locals: darray[sview]&, name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            for statement in statements:
+                match statement:
+                    Stmt.Assign(target, operator, assign_value, _):
+                        if (Ast::value_thread_is_name(target, name) or vt_targets_name(target, name)) and operator == TokenKind.LArrow and not vt_in_place_update(assign_value, name):
+                            shape: VtShape = vt_statement_shape(statement, functions, locals, name)
+                            return false if shape.kind == 0 or not ok[shape.function_index.usize()]
+                        return false if not vt_own_value_ok(assign_value, functions, ok, locals, name)
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        return false if not vt_own_value_ok(declared_value, functions, ok, locals, name)
+                    Stmt.Expr(statement_expression, _):
+                        return false if not vt_own_value_ok(statement_expression, functions, ok, locals, name)
+                    Stmt.Block(_, _, _, block_body, _):
+                        return false if not vt_own_assignments_ok(block_body, functions, ok, locals, name)
+                    Stmt.If(_, then_body, else_body, _):
+                        return false if not vt_own_assignments_ok(then_body, functions, ok, locals, name) or not vt_own_assignments_ok(else_body, functions, ok, locals, name)
+                    Stmt.While(_, while_body, _):
+                        return false if not vt_own_assignments_ok(while_body, functions, ok, locals, name)
+                    Stmt.For(_, _, _, for_body, _):
+                        return false if not vt_own_assignments_ok(for_body, functions, ok, locals, name)
+                    Stmt.Match(_, arms, _):
+                        for arm in arms:
+                            return false if not vt_own_assignments_ok(arm.body, functions, ok, locals, name)
+                    _:
+                        pass
+            return true
+
+        def vt_own_value_ok(value: Expr, functions: darray[Ast::ValueThreadFn]&, ok: darray[bool]&, locals: darray[sview]&, name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            if value is Expr.Block(block_statements, block_value, _, _):
+                return vt_own_assignments_ok(block_statements, functions, ok, locals, name) and vt_own_value_ok(block_value, functions, ok, locals, name)
+            return true
+
+        # One round of the own-body fixpoint: drop every threaded function whose body
+        # reassigns its parameter through a call that is not lowered. True when one dropped.
+        def vt_own_round(declarations: darray[Decl], functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            dropped: mutable bool = false
+            for declaration in declarations |ok, dropped|:
+                match declaration:
+                    Decl.Func(function_name, params, _, body, _, _, _):
+                        own_index: i64 = Ast::value_thread_find(functions, function_name, params.count)
+                        if own_index >= 0 and ok[own_index.usize()]:
+                            locals: mutable darray[sview] = [param.name for param in params]
+                            vt_collect_locals(body, &locals)
+                            if not vt_own_assignments_ok(body, functions, ok, locals, functions[own_index.usize()].param_name):
+                                ok[own_index.usize()] <- false
+                                dropped <- true
+                    Decl.Module(_, module_body, _):
+                        dropped <- vt_own_round(module_body, functions, ok) or dropped
+                    Decl.Scoped(scoped_body, _):
+                        dropped <- vt_own_round(scoped_body, functions, ok) or dropped
+                    _:
+                        pass
+            return dropped
+
+        # A statement's whole value: a value block's statements (whose returns the rewrite
+        # sees) or an ordinary expression.
+        def vt_value_ok(value: Expr, name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            if value is Expr.Block(block_statements, block_value, _, _):
+                return vt_param_body_ok(block_statements, name) and vt_value_ok(block_value, name)
+            return not vt_expr_lends(value, name)
+
+        # Whether STATEMENTS hold a `return` (a return the rewrite would not see when they sit
+        # inside an expression).
+        def vt_has_return(statements: darray[Stmt]) -> bool can[Abort.Panic]:
+            for statement in statements:
+                match statement:
+                    Stmt.Return(_, _):
+                        return true
+                    Stmt.Block(_, _, _, block_body, _):
+                        return true if vt_has_return(block_body)
+                    Stmt.If(_, then_body, else_body, _):
+                        return true if vt_has_return(then_body) or vt_has_return(else_body)
+                    Stmt.While(_, while_body, _):
+                        return true if vt_has_return(while_body)
+                    Stmt.For(_, _, _, for_body, _):
+                        return true if vt_has_return(for_body)
+                    Stmt.Match(_, arms, _):
+                        for arm in arms:
+                            return true if vt_has_return(arm.body)
+                    Stmt.Expr(Expr.Block(loop_statements, _, _, _), _):
+                        return true if vt_has_return(loop_statements)
+                    _:
+                        pass
+            return false
+
+        # `name <- name.push(v)` (and the other in-place darray/dict updates).
+        def vt_in_place_update(value: Expr, name: sview) -> bool can[Abort.Panic]:
+            if value is Expr.Call(Expr.Field(receiver, method, _), _, _, _):
+                return Ast::value_thread_is_name(receiver, name) and (method == "push" or method == "truncate" or method == "resize" or method == "clear" or method == "extend" or method == "put")
+            return false
+
+        # Whether EXPRESSION takes `&name` or holds a statement that breaks vt_param_body_ok.
+        def vt_expr_lends(expression: Expr, name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            match expression:
+                Expr.Unary(operator, operand, _):
+                    return true if operator == TokenKind.Ampersand and Ast::value_thread_is_name(operand, name)
+                    return vt_expr_lends(operand, name)
+                Expr.Call(callee, arguments, _, _):
+                    return true if vt_expr_lends(callee, name)
+                    for argument in arguments:
+                        return true if vt_expr_lends(argument, name)
+                Expr.StaticEffectCall(_, _, _, effect_arguments, _, _):
+                    for effect_argument in effect_arguments:
+                        return true if vt_expr_lends(effect_argument, name)
+                Expr.Field(field_object, _, _):
+                    return vt_expr_lends(field_object, name)
+                Expr.Index(index_object, index_value, _):
+                    return vt_expr_lends(index_object, name) or vt_expr_lends(index_value, name)
+                Expr.Slice(slice_object, slice_low, slice_high, _):
+                    return vt_expr_lends(slice_object, name) or vt_expr_lends(slice_low, name) or vt_expr_lends(slice_high, name)
+                Expr.IndexN(index_n_object, index_n_arguments, _):
+                    return true if vt_expr_lends(index_n_object, name)
+                    for index_n_argument in index_n_arguments:
+                        return true if vt_expr_lends(index_n_argument, name)
+                Expr.Binary(left, _, right, _):
+                    return vt_expr_lends(left, name) or vt_expr_lends(right, name)
+                Expr.Move(moved, _) | Expr.RegionNew(moved, _, _) | Expr.Paren(moved, _):
+                    return vt_expr_lends(moved, name)
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements:
+                        return true if vt_expr_lends(element, name)
+                Expr.DictLit(entries, _):
+                    for entry in entries:
+                        return true if vt_expr_lends(entry.key, name) or vt_expr_lends(entry.value, name)
+                Expr.Construct(_, fields, _):
+                    for field in fields:
+                        return true if vt_expr_lends(field.value, name)
+                Expr.RecordUpdate(record_base, record_fields, _):
+                    return true if vt_expr_lends(record_base, name)
+                    for record_field in record_fields:
+                        return true if vt_expr_lends(record_field.value, name)
+                Expr.If(condition, then_expr, else_expr, _):
+                    return vt_expr_lends(condition, name) or vt_expr_lends(then_expr, name) or vt_expr_lends(else_expr, name)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    return true if vt_expr_lends(scrutinee, name)
+                    for arm in arms:
+                        return true if vt_expr_lends(arm.guard, name) or not vt_param_body_ok(arm.body, name) or vt_has_return(arm.body)
+                Expr.Comprehension(_, iterable, comprehension_condition, comprehension_body, _):
+                    return vt_expr_lends(iterable, name) or vt_expr_lends(comprehension_condition, name) or vt_expr_lends(comprehension_body, name)
+                Expr.Refinement(refined_base, refined_predicate, _):
+                    return vt_expr_lends(refined_base, name) or vt_expr_lends(refined_predicate, name)
+                Expr.GetElse(guarded, recovery, _):
+                    return vt_expr_lends(guarded, name) or not vt_param_body_ok(recovery, name) or vt_has_return(recovery)
+                Expr.Lambda(_, lambda_body, _):
+                    return not vt_param_body_ok(lambda_body, name)
+                Expr.Block(block_statements, block_value, _, _):
+                    return not vt_param_body_ok(block_statements, name) or vt_has_return(block_statements) or vt_expr_lends(block_value, name)
+                _:
+                    pass
+            return false
+
+        # Which threaded functions of FUNCTIONS every body in DECLARATIONS allows lowering.
+        def vt_scan_declarations(declarations: darray[Decl], functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations |ok|:
+                match declaration:
+                    Decl.Func(function_name, params, _, body, _, _, _):
+                        locals: mutable darray[sview] = [param.name for param in params]
+                        vt_collect_locals(body, &locals)
+                        own_param: mutable sview = ""
+                        own_index: i64 = Ast::value_thread_find(functions, function_name, params.count)
+                        if own_index >= 0:
+                            own_param <- functions[own_index.usize()].param_name
+                            ok[own_index.usize()] <- false if not vt_param_body_ok(body, own_param)
+                        vt_scan_statements(body, functions, ok, locals, own_param)
+                    Decl.Module(_, module_body, _):
+                        vt_scan_declarations(module_body, functions, ok)
+                    Decl.Scoped(scoped_body, _):
+                        vt_scan_declarations(scoped_body, functions, ok)
+                    Decl.Const(_, _, const_value, _, _):
+                        vt_scan_expr(const_value, functions, ok)
+                    _:
+                        pass

@@ -1,0 +1,172 @@
+# Value-threading call sites, part 2: classifying each threaded call by where it sits (see
+# check_value_threading.elisa for the rules and the four diagnostics).
+extend Semantic:
+    private:
+        # Where a threaded call sits. 0: inside some larger expression; 1: the whole right side
+        # of `target <- call`; 2: a bare statement (its result dropped); 3: a declaration's or
+        # return's whole value.
+        struct VtcSite:
+            context: u32
+            target: Ast::Expr
+
+        def vtc_inner_site() -> VtcSite:
+            return VtcSite{context: 0, target: (Ast::Expr.Absent)}
+
+        def vtc_report(diagnostic: Diagnostic, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.diagnostics <- table.diagnostics.push(diagnostic)
+
+        # The root name expression of a field/element place.
+        def vtc_place_root_expr(place: Ast::Expr) -> Ast::Expr:
+            match place:
+                Expr.Field(field_object, _, _):
+                    return vtc_place_root_expr(field_object)
+                Expr.Index(index_object, _, _):
+                    return vtc_place_root_expr(index_object)
+                Expr.Paren(inner, _):
+                    return vtc_place_root_expr(inner)
+                _:
+                    return place
+
+        # Check one call (CALLEE, ARGUMENTS) to threaded FUNCTION at SITE.
+        def vtc_check_call(function: Ast::ValueThreadFn&, call: Ast::Expr, callee: Ast::Expr, arguments: darray[Ast::Expr], site: VtcSite, bindings: VtcScope&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                place: Ast::Expr = Ast::value_thread_call_argument(function, callee, arguments)
+                root: sview = Ast::value_thread_place_root(place)
+                # Point at the callee for a dropped result, else at the argument that moves.
+                callee_at: Ast::Pos = Ast::expr_pos(callee)
+                at: mutable Ast::Pos = callee_at if site.context == 2 or root == "" else Ast::expr_pos(place)
+                # A field or element place spans from its root name to its end, not just the dot.
+                if site.context != 2 and root != "" and not (place is Expr.Ident(_, _)):
+                    root_at: Ast::Pos = Ast::expr_pos(vtc_place_root_expr(place))
+                    end_column: mutable u32 = at.end_column
+                    # A field's own position is its dot; end after the field name.
+                    if place is Expr.Field(_, field_name, field_at):
+                        end_column <- field_at.column + 1 + sview_len(field_name).u32()
+                    at <- Ast::Pos{line: root_at.line, column: root_at.column, offset: root_at.offset, end_line: at.end_line, end_column: end_column, end_offset: at.end_offset}
+                if site.context == 2:
+                    suggestion: sview = vtc_thread_text(place, call) if root != "" else sview("", 0, 0)
+                    table <- vtc_report(Diagnostic{kind: DiagnosticKind.ValueThreadResultDropped, name: vtc_text(place) if root != "" else function.param_name, pos: at, line: at.line, actual: function.name, expected: function.param_name, detail: suggestion}, table)
+                    return
+                return if root == ""
+                replaced: mutable bool = false
+                if site.context == 1:
+                    if function.tuple_slot < 0:
+                        replaced <- Ast::value_thread_place_equal(site.target, place)
+                    elif site.target is Expr.Array(targets, _):
+                        replaced <- targets.count == 2 and Ast::value_thread_place_equal(targets[function.tuple_slot.usize()], place)
+                place_text: sview = vtc_text(place)
+                if vtc_listed(bindings.borrowed, root):
+                    type_bytes: mutable darray[u8] = []
+                    for borrowed_index in 0..<bindings.borrowed.count |type_bytes|:
+                        vtc_render_type(bindings.borrowed_types[borrowed_index], &type_bytes) if bindings.borrowed[borrowed_index] == root and type_bytes.count == 0
+                    table <- vtc_report(Diagnostic{kind: DiagnosticKind.ValueThreadBorrowedPlace, name: place_text, pos: at, line: at.line, actual: function.name, expected: vtc_thread_text(place, call), detail: root, detail2: Parser::persist_name_bytes(&type_bytes, 0), detail3: vtc_ref_call_text(function, callee, arguments, place)}, table)
+                    return
+                return if replaced
+                if not vtc_listed(bindings.locals, root):
+                    if vtc_listed(bindings.globals, root):
+                        table <- vtc_report(Diagnostic{kind: DiagnosticKind.ValueThreadMoveOut, name: place_text, pos: at, line: at.line, actual: function.name, expected: vtc_thread_text(place, call), detail: "global", detail2: root}, table)
+                    return
+                return if place is Expr.Ident(_, _)
+                what: sview = "element" if place is Expr.Index(_, _, _) else "field"
+                table <- vtc_report(Diagnostic{kind: DiagnosticKind.ValueThreadMoveOut, name: place_text, pos: at, line: at.line, actual: function.name, expected: vtc_thread_text(place, call), detail: what, detail2: root}, table)
+
+        # Every threaded call inside EXPRESSION (at SITE when EXPRESSION is itself the call).
+        def vtc_check_expr(expression: Ast::Expr, site: VtcSite, functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, _):
+                        call_index: i64 = Ast::value_thread_call_index(functions, callee, arguments, argument_names)
+                        if call_index >= 0:
+                            table <- vtc_check_call(functions[call_index.usize()], expression, callee, arguments, site, bindings, table)
+                        if callee is Expr.Field(receiver, _, _):
+                            table <- vtc_check_expr(receiver, vtc_inner_site(), functions, bindings, table)
+                        for argument in arguments |table|:
+                            table <- vtc_check_expr(argument, vtc_inner_site(), functions, bindings, table)
+                    Expr.Field(field_object, _, _):
+                        table <- vtc_check_expr(field_object, vtc_inner_site(), functions, bindings, table)
+                    Expr.Index(index_object, index_value, _):
+                        table <- vtc_check_expr(index_object, vtc_inner_site(), functions, bindings, table)
+                        table <- vtc_check_expr(index_value, vtc_inner_site(), functions, bindings, table)
+                    Expr.Binary(left, _, right, _):
+                        table <- vtc_check_expr(left, vtc_inner_site(), functions, bindings, table)
+                        table <- vtc_check_expr(right, vtc_inner_site(), functions, bindings, table)
+                    Expr.Unary(_, operand, _) | Expr.Paren(operand, _) | Expr.Move(operand, _):
+                        table <- vtc_check_expr(operand, vtc_inner_site(), functions, bindings, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |table|:
+                            table <- vtc_check_expr(element, vtc_inner_site(), functions, bindings, table)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |table|:
+                            table <- vtc_check_expr(field.value, vtc_inner_site(), functions, bindings, table)
+                    Expr.If(condition, then_expr, else_expr, _):
+                        table <- vtc_check_expr(condition, vtc_inner_site(), functions, bindings, table)
+                        table <- vtc_check_expr(then_expr, vtc_inner_site(), functions, bindings, table)
+                        table <- vtc_check_expr(else_expr, vtc_inner_site(), functions, bindings, table)
+                    Expr.Match(scrutinee, arms, _):
+                        table <- vtc_check_expr(scrutinee, vtc_inner_site(), functions, bindings, table)
+                        for arm in arms |table|:
+                            table <- vtc_check_statements(arm.body, functions, bindings, table)
+                    Expr.Block(block_statements, block_value, _, _):
+                        table <- vtc_check_statements(block_statements, functions, bindings, table)
+                        table <- vtc_check_expr(block_value, vtc_inner_site(), functions, bindings, table)
+                    _:
+                        pass
+
+        def vtc_check_statements(statements: darray[Ast::Stmt], functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table|:
+                    match statement:
+                        Stmt.Expr(statement_expression, _):
+                            table <- vtc_check_expr(statement_expression, VtcSite{context: 2, target: (Ast::Expr.Absent)}, functions, bindings, table)
+                        Stmt.Assign(target, operator, assign_value, _):
+                            assign_context: u32 = 1 if operator == TokenKind.LArrow else 0
+                            table <- vtc_check_expr(assign_value, VtcSite{context: assign_context, target: target}, functions, bindings, table)
+                            table <- vtc_check_expr(target, vtc_inner_site(), functions, bindings, table)
+                        Stmt.VarDecl(_, _, declared_value, _):
+                            table <- vtc_check_expr(declared_value, VtcSite{context: 3, target: (Ast::Expr.Absent)}, functions, bindings, table)
+                        Stmt.Return(return_value, _):
+                            if return_value is present_return:
+                                table <- vtc_check_expr(present_return, VtcSite{context: 3, target: (Ast::Expr.Absent)}, functions, bindings, table)
+                        Stmt.Block(_, _, _, block_body, _):
+                            table <- vtc_check_statements(block_body, functions, bindings, table)
+                        Stmt.If(condition, then_body, else_body, _):
+                            table <- vtc_check_expr(condition, vtc_inner_site(), functions, bindings, table)
+                            table <- vtc_check_statements(then_body, functions, bindings, table)
+                            table <- vtc_check_statements(else_body, functions, bindings, table)
+                        Stmt.While(while_condition, while_body, _):
+                            table <- vtc_check_expr(while_condition, vtc_inner_site(), functions, bindings, table)
+                            table <- vtc_check_statements(while_body, functions, bindings, table)
+                        Stmt.For(_, _, iterable, for_body, _):
+                            table <- vtc_check_expr(iterable, vtc_inner_site(), functions, bindings, table)
+                            table <- vtc_check_statements(for_body, functions, bindings, table)
+                        Stmt.Match(scrutinee, arms, _):
+                            table <- vtc_check_expr(scrutinee, vtc_inner_site(), functions, bindings, table)
+                            for arm in arms |table|:
+                                table <- vtc_check_statements(arm.body, functions, bindings, table)
+                        _:
+                            pass
+
+        def vtc_check_declarations(declarations: darray[Ast::Decl], functions: darray[Ast::ValueThreadFn]&, globals: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(_, params, _, body, _, _, _):
+                            bindings: VtcScope = vtc_function_scope(params, body, globals)
+                            table <- vtc_check_statements(body, functions, bindings, table)
+                            table <- vtc_check_moves(body, functions, bindings, table)
+                        Decl.Module(_, module_body, _):
+                            table <- vtc_check_declarations(module_body, functions, globals, table)
+                        Decl.Scoped(scoped_body, _):
+                            table <- vtc_check_declarations(scoped_body, functions, globals, table)
+                        _:
+                            pass
+
+    public:
+        def check_value_threading(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                functions: darray[Ast::ValueThreadFn] = Ast::value_thread_functions(file.top_decls)
+                return if functions.count == 0
+                globals: mutable darray[sview] = []
+                vtc_collect_globals(file.top_decls, &globals)
+                table <- vtc_check_declarations(file.top_decls, functions, globals, table)

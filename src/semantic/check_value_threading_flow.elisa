@@ -1,0 +1,262 @@
+# Value-threading call sites, part 3: a local used after it was moved into a threaded call.
+#
+#     done = push_one(arr, 4)     # `arr` is moved here
+#     arr.count                   # ValueThreadUseAfterMove, pointing at `arr <- push_one(arr, 4)`
+#
+# Statements run in order; a branch or loop body is walked on a COPY of the state and
+# afterwards a local counts as moved if any path that falls through moved it. A loop body is
+# walked twice so a move in one iteration meets a use in the next. `name <- value` and
+# `name = value` refill the local. Each local is reported once, at its first later use.
+# Only bare locals are tracked: a moved field or element is already rejected where it moves.
+#
+# The state is one slot per local of the function (VtcScope.locals): the line it moved on
+# (0 = not moved), the function it moved into and the rewrite to suggest, plus whether it
+# was reported. Branch copies are merged back slot by slot, as check_borrow_after_move does.
+extend Semantic:
+    private:
+        struct VtcSlots:
+            lines: mutable darray[u32]
+            columns: mutable darray[u32]
+            end_columns: mutable darray[u32]
+            functions: mutable darray[sview]
+            hints: mutable darray[sview]
+
+        def vtc_slot_of(bindings: VtcScope&, name: sview) -> i64:
+            can Abort.Panic:
+                for slot in 0..<bindings.locals.count:
+                    return slot.i64() if bindings.locals[slot] == name
+                return -1
+
+        def vtc_slots_copy(slots: VtcSlots&) -> VtcSlots:
+            can Memory.Allocate, Abort.Panic:
+                return VtcSlots{lines: [line for line in slots.lines], columns: [column for column in slots.columns], end_columns: [column for column in slots.end_columns], functions: [function for function in slots.functions], hints: [hint for hint in slots.hints]}
+
+        # SLOTS takes every move of OTHER it lacks.
+        def vtc_slots_merge(slots: mutable VtcSlots&, other: VtcSlots&) -> void:
+            can Abort.Panic:
+                for slot in 0..<slots.lines.count |slots|:
+                    if slots.lines[slot] == 0 and other.lines[slot] != 0:
+                        slots.lines[slot] <- other.lines[slot]
+                        slots.columns[slot] <- other.columns[slot]
+                        slots.end_columns[slot] <- other.end_columns[slot]
+                        slots.functions[slot] <- other.functions[slot]
+                        slots.hints[slot] <- other.hints[slot]
+
+        def vtc_slots_clear(slots: mutable VtcSlots&) -> void:
+            can Abort.Panic:
+                for slot in 0..<slots.lines.count |slots|:
+                    slots.lines[slot] <- 0
+
+        # Whether a statement list ends in a jump (its moves never fall through).
+        def vtc_ends_in_jump(statements: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                return false if statements.count == 0
+                last_statement: Ast::Stmt = statements[statements.count - 1]
+                return last_statement is Stmt.Return(_, _) or last_statement is Stmt.Break(_, _) or last_statement is Stmt.Continue(_, _)
+
+        # The first occurrence of NAME as a read inside EXPRESSION, or a zero position.
+        def vtc_first_use(expression: Ast::Expr, name: sview) -> Ast::Pos:
+            can Memory.Allocate, Abort.Panic:
+                none: Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+                match expression:
+                    Expr.Ident(ident_name, ident_pos):
+                        return ident_pos if ident_name == name
+                    Expr.Call(callee, arguments, _, _):
+                        callee_use: Ast::Pos = vtc_first_use(callee, name)
+                        return callee_use if callee_use.line != 0
+                        for argument in arguments:
+                            argument_use: Ast::Pos = vtc_first_use(argument, name)
+                            return argument_use if argument_use.line != 0
+                    Expr.Field(field_object, _, _):
+                        return vtc_first_use(field_object, name)
+                    Expr.Index(index_object, index_value, _):
+                        object_use: Ast::Pos = vtc_first_use(index_object, name)
+                        return object_use if object_use.line != 0
+                        return vtc_first_use(index_value, name)
+                    Expr.Slice(slice_object, slice_low, slice_high, _):
+                        slice_use: Ast::Pos = vtc_first_use(slice_object, name)
+                        return slice_use if slice_use.line != 0
+                        low_use: Ast::Pos = vtc_first_use(slice_low, name)
+                        return low_use if low_use.line != 0
+                        return vtc_first_use(slice_high, name)
+                    Expr.Binary(left, _, right, _):
+                        left_use: Ast::Pos = vtc_first_use(left, name)
+                        return left_use if left_use.line != 0
+                        return vtc_first_use(right, name)
+                    Expr.Unary(_, operand, _) | Expr.Paren(operand, _) | Expr.Move(operand, _):
+                        return vtc_first_use(operand, name)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements:
+                            element_use: Ast::Pos = vtc_first_use(element, name)
+                            return element_use if element_use.line != 0
+                    Expr.Construct(_, fields, _):
+                        for field in fields:
+                            field_use: Ast::Pos = vtc_first_use(field.value, name)
+                            return field_use if field_use.line != 0
+                    Expr.If(condition, then_expr, else_expr, _):
+                        condition_use: Ast::Pos = vtc_first_use(condition, name)
+                        return condition_use if condition_use.line != 0
+                        then_use: Ast::Pos = vtc_first_use(then_expr, name)
+                        return then_use if then_use.line != 0
+                        return vtc_first_use(else_expr, name)
+                    _:
+                        pass
+                return none
+
+        # The local a statement refills (`name <- v`, `name = v`), or "".
+        def vtc_refilled(statement: Ast::Stmt) -> sview:
+            can Abort.Panic:
+                match statement:
+                    Stmt.Assign(target, operator, _, _):
+                        if target is Expr.Ident(target_name, _):
+                            return target_name if operator == TokenKind.LArrow or operator == TokenKind.Assign
+                    Stmt.VarDecl(declared_name, _, _, _):
+                        return declared_name
+                    _:
+                        pass
+                return sview("", 0, 0)
+
+        # The expressions a statement reads itself (not its nested bodies or value blocks).
+        def vtc_statement_reads(statement: Ast::Stmt) -> darray[Ast::Expr]:
+            can Memory.Allocate, Abort.Panic:
+                reads: mutable darray[Ast::Expr] = []
+                match statement:
+                    Stmt.Expr(statement_expression, _):
+                        reads.push(statement_expression) if not (statement_expression is Expr.Block(_, _, _, _))
+                    Stmt.Assign(target, _, assign_value, _):
+                        reads.push(assign_value) if not (assign_value is Expr.Block(_, _, _, _))
+                        reads.push(target) if not (target is Expr.Ident(_, _))
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        reads.push(declared_value) if not (declared_value is Expr.Block(_, _, _, _))
+                    Stmt.Return(return_value, _):
+                        if return_value is present_return:
+                            reads.push(present_return)
+                    Stmt.If(condition, _, _, _):
+                        reads.push(condition)
+                    Stmt.While(while_condition, _, _):
+                        reads.push(while_condition)
+                    Stmt.For(_, _, iterable, _, _):
+                        reads.push(iterable)
+                    Stmt.Match(scrutinee, _, _):
+                        reads.push(scrutinee)
+                    _:
+                        pass
+                return reads
+
+        # Report every moved local STATEMENT reads.
+        def vtc_report_uses(statement: Ast::Stmt, bindings: VtcScope&, slots: VtcSlots&, reported: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                reads: darray[Ast::Expr] = vtc_statement_reads(statement)
+                return if reads.count == 0
+                for slot in 0..<slots.lines.count |reported, table|:
+                    continue if slots.lines[slot] == 0 or reported[slot]
+                    for read in reads |reported, table|:
+                        use_at: Ast::Pos = vtc_first_use(read, bindings.locals[slot])
+                        if use_at.line != 0 and not reported[slot]:
+                            reported[slot] <- true
+                            table <- vtc_report(Diagnostic{kind: DiagnosticKind.ValueThreadUseAfterMove, name: bindings.locals[slot], pos: use_at, line: use_at.line, actual: slots.functions[slot], expected: "", secondary_line: slots.lines[slot], secondary_column: slots.columns[slot], secondary_end_column: slots.end_columns[slot], detail: slots.hints[slot]}, table)
+
+        # Record the bare locals EXPRESSION moves into a threaded call without putting them
+        # back into REFILL (the `<-` target of the statement, or Absent).
+        def vtc_expr_moves(expression: Ast::Expr, refill: Ast::Expr, functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, slots: mutable VtcSlots&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_pos):
+                    call_index: i64 = Ast::value_thread_call_index(functions, callee, arguments, argument_names)
+                    if call_index >= 0:
+                        function: Ast::ValueThreadFn = functions[call_index.usize()]
+                        place: Ast::Expr = Ast::value_thread_call_argument(function, callee, arguments)
+                        if place is Expr.Ident(moved_name, _):
+                            kept: mutable bool = false
+                            if function.tuple_slot < 0:
+                                kept <- Ast::value_thread_place_equal(refill, place)
+                            elif refill is Expr.Array(refill_targets, _):
+                                kept <- refill_targets.count == 2 and Ast::value_thread_place_equal(refill_targets[function.tuple_slot.usize()], place)
+                            slot: i64 = vtc_slot_of(bindings, moved_name)
+                            if not kept and slot >= 0 and not vtc_listed(bindings.borrowed, moved_name):
+                                moved_at: Ast::Pos = Ast::expr_pos(place)
+                                slots.lines[slot.usize()] <- moved_at.line
+                                slots.columns[slot.usize()] <- moved_at.column
+                                slots.end_columns[slot.usize()] <- moved_at.end_column
+                                slots.functions[slot.usize()] <- function.name
+                                slots.hints[slot.usize()] <- vtc_thread_text(place, expression)
+                    for argument in arguments |slots|:
+                        vtc_expr_moves(argument, (Ast::Expr.Absent), functions, bindings, slots)
+
+        def vtc_statement_moves(statement: Ast::Stmt, functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, slots: mutable VtcSlots&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        vtc_expr_moves(declared_value, (Ast::Expr.Absent), functions, bindings, slots)
+                    Stmt.Assign(target, operator, assign_value, _):
+                        refill: Ast::Expr = target if operator == TokenKind.LArrow else (Ast::Expr.Absent)
+                        vtc_expr_moves(assign_value, refill, functions, bindings, slots)
+                    Stmt.Expr(statement_expression, _):
+                        # A bare threaded call is already ValueThreadResultDropped; only the
+                        # calls inside its arguments move anything further.
+                        if statement_expression is Expr.Call(_, dropped_arguments, _, _):
+                            for dropped_argument in dropped_arguments |slots|:
+                                vtc_expr_moves(dropped_argument, (Ast::Expr.Absent), functions, bindings, slots)
+                        else:
+                            vtc_expr_moves(statement_expression, (Ast::Expr.Absent), functions, bindings, slots)
+                    _:
+                        pass
+
+        # Walk STATEMENTS, updating SLOTS in place.
+        def vtc_walk(statements: darray[Ast::Stmt], functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, slots: mutable VtcSlots&, reported: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |slots, reported, table|:
+                    table <- vtc_report_uses(statement, bindings, slots, reported, table)
+                    match statement:
+                        Stmt.If(_, then_body, else_body, _):
+                            else_slots: mutable VtcSlots = vtc_slots_copy(slots)
+                            table <- vtc_walk(then_body, functions, bindings, slots, reported, table)
+                            vtc_slots_clear(slots) if vtc_ends_in_jump(then_body)
+                            table <- vtc_walk(else_body, functions, bindings, &else_slots, reported, table)
+                            vtc_slots_merge(slots, else_slots) if not vtc_ends_in_jump(else_body)
+                        Stmt.While(_, loop_body, _) | Stmt.For(_, _, _, loop_body, _):
+                            entry_slots: VtcSlots = vtc_slots_copy(slots)
+                            table <- vtc_walk(loop_body, functions, bindings, slots, reported, table)
+                            table <- vtc_walk(loop_body, functions, bindings, slots, reported, table)
+                            vtc_slots_merge(slots, entry_slots)
+                        Stmt.Block(_, _, _, block_body, _):
+                            table <- vtc_walk(block_body, functions, bindings, slots, reported, table)
+                        Stmt.Match(_, arms, _):
+                            arm_entry: VtcSlots = vtc_slots_copy(slots)
+                            vtc_slots_clear(slots) if arms.count > 0
+                            for arm in arms |slots, reported, table|:
+                                arm_slots: mutable VtcSlots = vtc_slots_copy(arm_entry)
+                                table <- vtc_walk(arm.body, functions, bindings, &arm_slots, reported, table)
+                                vtc_slots_merge(slots, arm_slots) if not vtc_ends_in_jump(arm.body)
+                        _:
+                            # A loop inside a value block is its own For/While, walked twice there.
+                            table <- vtc_walk_value(vtc_statement_block(statement), functions, bindings, slots, reported, table)
+                            refilled: sview = vtc_refilled(statement)
+                            refilled_slot: i64 = vtc_slot_of(bindings, refilled) if refilled != "" else -1
+                            slots.lines[refilled_slot.usize()] <- 0 if refilled_slot >= 0
+                            vtc_statement_moves(statement, functions, bindings, slots)
+
+        # A value block's statements, then its tail when that is a value block too.
+        def vtc_walk_value(value: Ast::Expr, functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, slots: mutable VtcSlots&, reported: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if value is Expr.Block(nested_statements, nested_value, _, _):
+                    table <- vtc_walk(nested_statements, functions, bindings, slots, reported, table)
+                    table <- vtc_walk_value(nested_value, functions, bindings, slots, reported, table)
+
+        # The value block a statement carries as its whole value (a captured loop), else Absent.
+        def vtc_statement_block(statement: Ast::Stmt) -> Ast::Expr:
+            can Abort.Panic:
+                match statement:
+                    Stmt.Expr(statement_expression, _):
+                        return statement_expression
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        return declared_value
+                    Stmt.Assign(_, _, assign_value, _):
+                        return assign_value
+                    _:
+                        return (Ast::Expr.Absent)
+
+        def vtc_check_moves(body: darray[Ast::Stmt], functions: darray[Ast::ValueThreadFn]&, bindings: VtcScope&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                slots: mutable VtcSlots = VtcSlots{lines: [0.u32() for local in bindings.locals], columns: [0.u32() for local in bindings.locals], end_columns: [0.u32() for local in bindings.locals], functions: [sview("", 0, 0) for local in bindings.locals], hints: [sview("", 0, 0) for local in bindings.locals]}
+                reported: mutable darray[bool] = [false for local in bindings.locals]
+                table <- vtc_walk(body, functions, bindings, &slots, &reported, table)

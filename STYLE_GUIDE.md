@@ -19,7 +19,7 @@ Status key: **[working]** examples compile with stage1 today; **[in progress]** 
 3. [region blocks](#3-region-blocks)
 4. [Loop header captures](#4-loop-header-captures)
 5. [Loop expressions](#5-loop-expressions)
-6. [Value-threading (planned)](#6-value-threading-planned)
+6. [Value-threading](#6-value-threading)
 7. [Borrow exclusivity](#7-borrow-exclusivity)
 8. [Compiler flags and reading a diagnostic](#8-compiler-flags-and-reading-a-diagnostic)
 9. [When not to apply the style](#9-when-not-to-apply-the-style)
@@ -200,22 +200,98 @@ found: usize? =
 
 If the loop finishes without breaking, `found` is `null`, the initial value.
 
-## 6. Value-threading (planned)
+## 6. Value-threading
 
-**[planned, Phase 2: design only, does not compile today.]** For an owned value, thread it
-through the call instead of lending it:
+**[working]** (stage1). For an owned value, thread it through the call instead of lending it:
+the function takes the value by value and hands it back, and the caller puts it back in the
+same statement.
 
-```text
-Prefer:      arr <- arr.push(x)
-Instead of:  push(&arr, x)
+```elisa
+def push_one(arr: darray[i64], x: i64) -> darray[i64]:
+    arr.push(x)
+    return arr
 
-Prefer:      a, last = a.pop()
+def main() -> i64:
+    arr: mutable darray[i64] = []
+    arr <- push_one(arr, 4)
+    arr <- arr.push_one(5)
+    return 0 if arr.count == 2 else 1
 ```
 
-`&` stays for data reached through borrows, fields of borrowed structs, arenas, globals, and
-side-effect-only functions. The two spellings must compile to identical machine code; this is a
-readability and exclusivity win, not an optimisation. One form works today: a pure function can
-already be threaded through a global (section 7).
+```text
+Prefer:      arr <- push_one(arr, 4)          def push_one(arr: darray[i64], x: i64) -> darray[i64]
+Instead of:  push_one(&arr, 4)                def push_one(arr: mutable darray[i64]&, x: i64) -> void
+```
+
+This is a readability and exclusivity win, not an optimisation: the two spellings compile to
+identical machine code at `-O0` and `-O2` (`test/parity/value_threading_codegen_smoke.sh`
+holds a darray push and pop, a small and a 72-byte struct, an owned struct's field, and a
+collection threaded through a loop, both as a capture and as a loop value). The compiler
+rewrites the value form into the `&` form before code generation
+(`src/backend/codegen_value_threading*.elisa`).
+
+**The signature.** A parameter is threaded ("owned in, owned out") when it is a by-value
+parameter of an owning type (a `darray`/`dict`/`set`, a struct; never a scalar or a view),
+written WITHOUT `mutable`; the result type is that same type; every `return` hands it back;
+and the body writes it. Writing a by-value parameter is an error everywhere else, so the
+signature itself is the opt-in. A second result rides along as a two-element tuple, with the
+threaded value in one slot:
+
+```elisa
+def pop_one(arr: darray[i64]) -> (rest: darray[i64], last: i64):
+    v: i64 = arr.pop()
+    return arr, v
+
+def main() -> i64:
+    a: mutable darray[i64] = [1, 2, 3]
+    last: mutable i64 = 0
+    a, last <- pop_one(a)
+    return 0 if last == 3 and a.count == 2 else 1
+```
+
+**The call.** The argument is moved into the call, so put the result back in the same
+statement:
+
+- `x <- f(x, ..)` or `x <- x.f(..)` on a local: `x` is never observably moved out;
+- `s.items <- f(s.items, ..)` on an OWNED `s` (a field is briefly empty within one statement);
+- `y = f(x, ..)` moves `x` into `y`: `x` cannot be used afterwards;
+- `return f(x, ..)`, and a threaded function passing its own parameter on
+  (`arr <- push_one(arr, i)` inside another threaded function).
+
+A loop threads a collection through its header, either as a capture or as a loop value:
+
+```elisa
+def push_one(arr: darray[i64], x: i64) -> darray[i64]:
+    arr.push(x)
+    return arr
+
+def main() -> i64:
+    filled: darray[i64] =
+        for i in 0..<4 |filled: darray[i64] = []| -> filled:
+            filled <- push_one(filled, i)
+    grown: mutable darray[i64] = []
+    for i in 0..<4 |grown|:
+        grown <- grown.push_one(i)
+    return 0 if filled.count == 4 and grown.count == 4 else 1
+```
+
+**The errors.** Each names the rewrite in your own names
+(`test/fixtures/value_threading/expected.txt`):
+
+```text
+illegal.elisa:15:5-13: the result of "push_one" is the updated "arr" (it takes "arr" by value and hands it back), and this statement drops it, so the call changes nothing; put it back: arr <- push_one(arr, 1)
+illegal.elisa:19:35-42: "s.items" is reached through the borrow "s" (s: State&), so it cannot be moved into "push_one", which takes it by value and hands it back; keep the & form, push_one(&s.items, 2) with a mutable & parameter, or own "s" by value and write s.items <- push_one(s.items, 2)
+illegal.elisa:24:35-42: "s.items" is a field of "s"; moving it into "push_one", which takes it by value and hands it back, would leave "s" incomplete; put the result back in the same statement: s.items <- push_one(s.items, 3)
+illegal.elisa:28:35-43: global "registry" cannot be moved into "push_one", which takes it by value and hands it back; put the result back in the same statement: registry <- push_one(registry, 4)
+illegal.elisa:34:12-15: "arr" was moved into "push_one" at illegal.elisa:33:35-38 (which takes it by value and hands back the updated value) and cannot be used afterwards; use the call's result, or keep "arr" by writing arr <- push_one(arr, 5)
+```
+
+`&` stays for data reached through borrows (`s: State&`), arenas, side-effect-only functions,
+and a function you also call in expression position or pass as a value: such a call keeps the
+threaded function by value (a copy, the same meaning), so its other calls are no longer
+in-place either. `g <- f(g, ..)` on a global threads through a local copy (the callee may read
+`g` by name). stage0 has no value-threading: it rejects writing a by-value parameter, so
+threaded code builds with stage1 only.
 
 ## 7. Borrow exclusivity
 

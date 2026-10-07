@@ -1,0 +1,134 @@
+# Value-threading, "owned in, owned out" (STYLE_GUIDE.md section 6). The shared, purely
+# syntactic half: which parameter of a `def` is threaded, and which calls reach one.
+#
+#     def push_one(arr: darray[i64], x: i64) -> darray[i64]:
+#         arr.push(x)
+#         return arr
+#
+#     arr <- push_one(arr, 4)        # the value form: compiles exactly like push_one(&arr, 4)
+#
+# A parameter is THREADED when all of these hold:
+#   - it is passed by value (no `mutable`, `&`, `lmut`, `?` or other qualifier on it) and has
+#     an owning type: a `darray`/`dict`/`set`/... application, a struct name, a qualified type;
+#     never one of the scalar or view builtins (i64, bool, sview, cstr, ...);
+#   - the result type is that same type (`-> darray[i64]`), or a two-element tuple holding it
+#     in exactly one slot (`-> (rest: darray[i64], last: i64)`);
+#   - every `return` in the body hands it back: `return arr`, or `return arr, last` with `arr`
+#     in that slot, and there is at least one;
+#   - the body WRITES it: a `<-`/compound assignment rooted at it, a statement-position method
+#     call on it, or a `&arr` argument. A body that only reads it is an identity function and
+#     stays an ordinary by-value function.
+#   - the function carries no decorator other than inline/cold/hot (an exported or foreign
+#     ABI is never rewritten), and is not `main`.
+#
+# Writing to an immutable by-value parameter is an error everywhere else, so no existing
+# program has this shape: the rule changes nothing that compiled before. The parser marks the
+# parameter (`value_thread`, and `is_mutable` so the body's writes are legal); semantic checks
+# the call sites (check_value_threading*.elisa) and the backend lowers the function and its
+# calls to the `&` form (codegen_value_threading*.elisa). Both read the table built here, so
+# they agree on which calls are threaded.
+extend Ast:
+    public:
+        # One threaded function. `slot` is the threaded parameter; `tuple_slot` is -1 when
+        # the whole result is that parameter, else its position in the two-element result.
+        struct ValueThreadFn:
+            name: sview
+            arity: usize
+            slot: usize
+            tuple_slot: i64
+            param_name: sview
+            param_type: Expr
+            pos: Pos
+
+        def value_thread_scalar_name(name: sview) -> bool:
+            return name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "i128" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "u128" or name == "usize" or name == "isize" or name == "int" or name == "uint" or name == "f16" or name == "f32" or name == "f64" or name == "bool" or name == "char" or name == "byte" or name == "rune" or name == "sview" or name == "cstr" or name == "str" or name == "void" or name == "never" or name == "any" or name == "fstr"
+
+        # An owning by-value type: a collection application, a struct name, a qualified name.
+        def value_thread_owning_type(type_expression: Expr) -> bool:
+            match type_expression:
+                Expr.Ident(type_name, _):
+                    return not value_thread_scalar_name(type_name)
+                Expr.Index(head, _, _):
+                    return head is Expr.Ident(_, _)
+                Expr.IndexN(head_n, _, _):
+                    return head_n is Expr.Ident(_, _)
+                Expr.Scope(_, _, _):
+                    return true
+                _:
+                    return false
+
+        # Structural equality of two type annotations (positions ignored).
+        def value_thread_type_equal(left: Expr, right: Expr) -> bool:
+            match left:
+                Expr.Ident(left_name, _):
+                    if right is Expr.Ident(right_name, _):
+                        return left_name == right_name
+                Expr.Scope(left_base, left_scope_name, _):
+                    if right is Expr.Scope(right_base, right_scope_name, _):
+                        return left_scope_name == right_scope_name and value_thread_type_equal(left_base, right_base)
+                Expr.Index(left_head, left_argument, _):
+                    if right is Expr.Index(right_head, right_argument, _):
+                        return value_thread_type_equal(left_head, right_head) and value_thread_type_equal(left_argument, right_argument)
+                Expr.IndexN(left_head_n, left_arguments, _):
+                    if right is Expr.IndexN(right_head_n, right_arguments, _):
+                        return false if left_arguments.count != right_arguments.count or not value_thread_type_equal(left_head_n, right_head_n)
+                        for argument_index in 0..<left_arguments.count:
+                            return false if not value_thread_type_equal(left_arguments[argument_index], right_arguments[argument_index])
+                        return true
+                Expr.Paren(left_inner, _):
+                    return value_thread_type_equal(left_inner, right)
+                _:
+                    pass
+            if right is Expr.Paren(right_inner, _):
+                return value_thread_type_equal(left, right_inner)
+            return false
+
+        def value_thread_is_name(expression: Expr, name: sview) -> bool:
+            if expression is Expr.Ident(expression_name, _):
+                return expression_name == name
+            return false
+
+        # The binding a place expression (`x`, `x.f.g`, `x[i]`) is rooted at, or "".
+        def value_thread_place_root(expression: Expr) -> sview:
+            match expression:
+                Expr.Ident(root_name, _):
+                    return root_name
+                Expr.Field(field_object, _, _):
+                    return value_thread_place_root(field_object)
+                Expr.Index(index_object, _, _):
+                    return value_thread_place_root(index_object)
+                Expr.Paren(paren_inner, _):
+                    return value_thread_place_root(paren_inner)
+                _:
+                    return sview("", 0, 0)
+
+        # Whether an index is simple enough to evaluate twice: a name or a literal.
+        def value_thread_simple_index(expression: Expr) -> bool:
+            return expression is Expr.Ident(_, _) or expression is Expr.IntLit(_, _)
+
+        # Whether two place expressions name the same storage: the same root and the same
+        # field/index chain, indices being equal names or literals.
+        def value_thread_place_equal(left: Expr, right: Expr) -> bool:
+            match left:
+                Expr.Ident(left_name, _):
+                    if right is Expr.Ident(right_name, _):
+                        return left_name == right_name
+                Expr.Field(left_object, left_field, _):
+                    if right is Expr.Field(right_object, right_field, _):
+                        return left_field == right_field and value_thread_place_equal(left_object, right_object)
+                Expr.Index(left_index_object, left_index, _):
+                    if right is Expr.Index(right_index_object, right_index, _):
+                        return false if not value_thread_simple_index(left_index) or not value_thread_simple_index(right_index)
+                        same_index: mutable bool = false
+                        if left_index is Expr.Ident(left_index_name, _):
+                            same_index <- value_thread_is_name(right_index, left_index_name)
+                        if left_index is Expr.IntLit(left_index_value, _):
+                            if right_index is Expr.IntLit(right_index_value, _):
+                                same_index <- left_index_value == right_index_value
+                        return same_index and value_thread_place_equal(left_index_object, right_index_object)
+                _:
+                    pass
+            return false
+
+include "./ast_value_threading_mark.elisa"
+include "./ast_value_threading_table.elisa"

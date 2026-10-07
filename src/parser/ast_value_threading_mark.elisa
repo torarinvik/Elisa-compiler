@@ -1,0 +1,182 @@
+# Value-threading, part 2: deciding that a declaration's parameter is threaded (the rules
+# are listed in ast_value_threading.elisa). The parser calls value_thread_mark on every
+# `def` it builds.
+extend Ast:
+    public:
+        # -1 when some `return` in STATEMENTS does not hand back NAME (in TUPLE_SLOT of a
+        # two-element tuple, or as the whole value when TUPLE_SLOT is -1); otherwise how many
+        # returns there are. Lambdas are other functions and are not entered.
+        def value_thread_return_count(statements: darray[Stmt], name: sview, tuple_slot: i64) -> i64:
+            total: mutable i64 = 0
+            for statement in statements |total|:
+                found: i64 = value_thread_statement_returns(statement, name, tuple_slot)
+                return -1 if found < 0
+                total <- total + found
+            return total
+
+        def value_thread_return_value_ok(value: Expr, name: sview, tuple_slot: i64) -> bool:
+            return value_thread_is_name(value, name) if tuple_slot < 0
+            if value is Expr.Tuple(elements, _):
+                return elements.count == 2 and value_thread_is_name(elements[tuple_slot.usize()], name) and not value_thread_is_name(elements[1 - tuple_slot.usize()], name)
+            return false
+
+        def value_thread_statement_returns(statement: Stmt, name: sview, tuple_slot: i64) -> i64:
+            match statement:
+                Stmt.Return(return_value, _):
+                    if return_value is present_value:
+                        return 1 if value_thread_return_value_ok(present_value, name, tuple_slot)
+                    return -1
+                Stmt.Block(_, _, _, block_body, _):
+                    return value_thread_return_count(block_body, name, tuple_slot)
+                Stmt.If(_, then_body, else_body, _):
+                    then_count: i64 = value_thread_return_count(then_body, name, tuple_slot)
+                    else_count: i64 = value_thread_return_count(else_body, name, tuple_slot)
+                    return -1 if then_count < 0 or else_count < 0
+                    return then_count + else_count
+                Stmt.While(_, while_body, _):
+                    return value_thread_return_count(while_body, name, tuple_slot)
+                Stmt.For(_, _, _, for_body, _):
+                    return value_thread_return_count(for_body, name, tuple_slot)
+                Stmt.Match(_, arms, _):
+                    arms_total: mutable i64 = 0
+                    for arm in arms |arms_total|:
+                        arm_count: i64 = value_thread_return_count(arm.body, name, tuple_slot)
+                        return -1 if arm_count < 0
+                        arms_total <- arms_total + arm_count
+                    return arms_total
+                Stmt.Expr(statement_expression, _):
+                    # A loop with a capture header is an Expr.Block statement; its body may return.
+                    return value_thread_block_returns(statement_expression, name, tuple_slot)
+                Stmt.VarDecl(_, _, declared_value, _):
+                    return value_thread_block_returns(declared_value, name, tuple_slot)
+                Stmt.Assign(_, _, assign_value, _):
+                    return value_thread_block_returns(assign_value, name, tuple_slot)
+                _:
+                    return 0
+
+        # The returns inside a value block that is a statement's whole value.
+        def value_thread_block_returns(value: Expr, name: sview, tuple_slot: i64) -> i64:
+            if value is Expr.Block(block_statements, block_value, _, _):
+                inner: i64 = value_thread_return_count(block_statements, name, tuple_slot)
+                tail_count: i64 = value_thread_block_returns(block_value, name, tuple_slot)
+                return -1 if inner < 0 or tail_count < 0
+                return inner + tail_count
+            return 0
+
+        # Whether EXPRESSION writes NAME: a `&name...` argument anywhere inside it, or a
+        # statement inside a value block that writes it.
+        def value_thread_expression_writes(expression: Expr, name: sview) -> bool:
+            match expression:
+                Expr.Unary(operator, operand, _):
+                    return true if operator == TokenKind.Ampersand and value_thread_place_root(operand) == name
+                    return value_thread_expression_writes(operand, name)
+                Expr.Call(callee, arguments, _, _):
+                    # `arr.pop()` in any position: a container method that updates its receiver.
+                    if callee is Expr.Field(method_receiver, method_name, _):
+                        return true if value_thread_place_root(method_receiver) == name and value_thread_mutating_method(method_name)
+                    return true if value_thread_expression_writes(callee, name)
+                    for argument in arguments:
+                        return true if value_thread_expression_writes(argument, name)
+                    return false
+                Expr.Field(field_object, _, _):
+                    return value_thread_expression_writes(field_object, name)
+                Expr.Paren(inner, _):
+                    return value_thread_expression_writes(inner, name)
+                Expr.Binary(left, _, right, _):
+                    return value_thread_expression_writes(left, name) or value_thread_expression_writes(right, name)
+                Expr.If(condition, then_expr, else_expr, _):
+                    return value_thread_expression_writes(condition, name) or value_thread_expression_writes(then_expr, name) or value_thread_expression_writes(else_expr, name)
+                Expr.Block(block_statements, block_value, _, _):
+                    return value_thread_body_writes(block_statements, name) or value_thread_expression_writes(block_value, name)
+                _:
+                    return false
+
+        def value_thread_body_writes(statements: darray[Stmt], name: sview) -> bool:
+            for statement in statements:
+                return true if value_thread_statement_writes(statement, name)
+            return false
+
+        def value_thread_statement_writes(statement: Stmt, name: sview) -> bool:
+            match statement:
+                Stmt.Assign(target, operator, assign_value, _):
+                    return true if operator != TokenKind.Assign and value_thread_place_root(target) == name
+                    if target is Expr.Array(targets, _):
+                        for each_target in targets:
+                            return true if value_thread_place_root(each_target) == name
+                    return value_thread_expression_writes(assign_value, name)
+                Stmt.Expr(statement_expression, _):
+                    # A statement-position method call on the parameter: its result is
+                    # dropped, so it is there for its effect on the receiver.
+                    if statement_expression is Expr.Call(call_callee, _, _, _):
+                        if call_callee is Expr.Field(receiver, _, _):
+                            return true if value_thread_place_root(receiver) == name
+                    return value_thread_expression_writes(statement_expression, name)
+                Stmt.VarDecl(_, _, declared_value, _):
+                    return value_thread_expression_writes(declared_value, name)
+                Stmt.Return(return_value, _):
+                    if return_value is present_return:
+                        return value_thread_expression_writes(present_return, name)
+                    return false
+                Stmt.Block(_, _, _, block_body, _):
+                    return value_thread_body_writes(block_body, name)
+                Stmt.If(condition, then_body, else_body, _):
+                    return value_thread_expression_writes(condition, name) or value_thread_body_writes(then_body, name) or value_thread_body_writes(else_body, name)
+                Stmt.While(while_condition, while_body, _):
+                    return value_thread_expression_writes(while_condition, name) or value_thread_body_writes(while_body, name)
+                Stmt.For(_, _, iterable, for_body, _):
+                    return value_thread_expression_writes(iterable, name) or value_thread_body_writes(for_body, name)
+                Stmt.Match(scrutinee, arms, _):
+                    return true if value_thread_expression_writes(scrutinee, name)
+                    for arm in arms:
+                        return true if value_thread_body_writes(arm.body, name)
+                    return false
+                _:
+                    return false
+
+        # The builtin container methods that update their receiver in place.
+        def value_thread_mutating_method(method: sview) -> bool:
+            return method == "push" or method == "pop" or method == "insert" or method == "remove" or method == "clear" or method == "extend" or method == "resize" or method == "truncate" or method == "put" or method == "reserve" or method == "append" or method == "add" or method == "discard" or method == "sort" or method == "reverse" or method == "swap" or method == "fill" or method == "push_front" or method == "pop_front" or method == "retain" or method == "drain"
+
+        def value_thread_decorators_allowed(decorators: darray[Annotation]) -> bool:
+            for decorator in decorators:
+                return false if decorator.name != "inline" and decorator.name != "cold" and decorator.name != "hot"
+            return true
+
+        # The tuple slot RETURN_TYPE threads a parameter of type PARAM_TYPE through: -1 for
+        # the whole result, 0 or 1 for a two-element tuple, -2 when it does not.
+        def value_thread_result_slot(return_type: Expr, param_type: Expr) -> i64:
+            return -1 if value_thread_type_equal(return_type, param_type)
+            if return_type is Expr.Tuple(result_elements, _):
+                return -2 if result_elements.count != 2
+                first: bool = value_thread_type_equal(result_elements[0], param_type)
+                second: bool = value_thread_type_equal(result_elements[1], param_type)
+                return 0 if first and not second
+                return 1 if second and not first
+            return -2
+
+        # The threaded parameter of `def NAME(PARAMS) -> RETURN_TYPE: BODY`, or -1.
+        def value_thread_param_index(function_name: sview, params: darray[ParamDecl], return_type: Expr?, body: darray[Stmt], decorators: darray[Annotation]) -> i64:
+            return -1 if function_name == "main" or not value_thread_decorators_allowed(decorators)
+            if return_type is result_type:
+                for param_index in 0..<params.count:
+                    param: ParamDecl = params[param_index]
+                    if not param.is_mutable and not param.has_default and not param.is_affine and value_thread_owning_type(param.type_expression):
+                        tuple_slot: i64 = value_thread_result_slot(result_type, param.type_expression)
+                        if tuple_slot >= -1:
+                            returns: i64 = value_thread_return_count(body, param.name, tuple_slot)
+                            return param_index.i64() if returns > 0 and value_thread_body_writes(body, param.name)
+            return -1
+
+        # PARAMS with the threaded one (if any) marked: `value_thread`, and `is_mutable` so
+        # the body may write it.
+        def value_thread_mark(function_name: sview, params: darray[ParamDecl], return_type: Expr?, body: darray[Stmt], decorators: darray[Annotation]) -> darray[ParamDecl]:
+            threaded: i64 = value_thread_param_index(function_name, params, return_type, body, decorators)
+            return params if threaded < 0
+            marked: mutable darray[ParamDecl] = []
+            for param_index in 0..<params.count |marked|:
+                param: ParamDecl = params[param_index]
+                if param_index.i64() == threaded:
+                    marked.push(ParamDecl{name: param.name, name_pos: param.name_pos, type_expression: param.type_expression, is_mutable: true, has_default: param.has_default, default_value: param.default_value, is_affine: param.is_affine, value_thread: true})
+                else:
+                    marked.push(param)
+            return marked

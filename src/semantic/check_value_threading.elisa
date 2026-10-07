@@ -1,0 +1,235 @@
+# Value-threading call sites (STYLE_GUIDE.md section 6; the form itself is defined in
+# src/parser/ast_value_threading.elisa). A threaded parameter takes its argument BY VALUE and
+# the function hands the updated value back, so the argument is MOVED into the call:
+#
+#     arr <- push_one(arr, 4)          # fine: the same place is refilled in the same statement
+#     s.items <- push_one(s.items, 4)  # fine on an owned `s`
+#     done = push_one(arr, 4)          # fine: `arr` is moved, and unusable afterwards
+#
+# Rejected, each with the rewrite spelled out in the user's own names:
+#   - ValueThreadResultDropped: the call is a bare statement, so the updated value is lost;
+#   - ValueThreadBorrowedPlace: the argument is reached through a borrow (`s: State&`), which
+#     cannot give up its storage even for one statement;
+#   - ValueThreadMoveOut: a field, element or global moved without being put back;
+#   - ValueThreadUseAfterMove: a local used after it was moved (check_value_threading_flow).
+#
+# Calls are matched exactly as the backend matches them (Ast::value_thread_functions): by
+# name and argument count, functions with a unique name only.
+extend Semantic:
+    private:
+        # The bindings of one function the checks need: which names are locals, and which of
+        # those are borrows.
+        struct VtcScope:
+            locals: mutable darray[sview]
+            borrowed: mutable darray[sview]
+            borrowed_types: mutable darray[Ast::Expr]
+            globals: darray[sview]
+
+        def vtc_listed(names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                return any listed in names where listed == name
+
+        # Whether a declared type is a borrow: `T&`, `mutable T&`, `lmut T`.
+        def vtc_type_borrows(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        return true if operator == TokenKind.Ampersand or operator == TokenKind.Lmut
+                        return vtc_type_borrows(operand) if operator == TokenKind.Mutable
+                        return false
+                    Expr.Paren(inner, _):
+                        return vtc_type_borrows(inner)
+                    _:
+                        return false
+
+        def vtc_collect_globals(declarations: darray[Ast::Decl], globals: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |globals|:
+                    match declaration:
+                        Decl.Const(const_name, _, _, _, _):
+                            globals.push(const_name)
+                        Decl.Module(_, module_body, _):
+                            vtc_collect_globals(module_body, globals)
+                        Decl.Scoped(scoped_body, _):
+                            vtc_collect_globals(scoped_body, globals)
+                        _:
+                            pass
+
+        def vtc_collect_locals(statements: darray[Ast::Stmt], bindings: mutable VtcScope&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |bindings|:
+                    match statement:
+                        Stmt.VarDecl(declared_name, declared_type, declared_value, _):
+                            bindings.locals.push(declared_name)
+                            borrows: mutable bool = vtc_type_borrows(declared_type)
+                            if declared_value is Expr.Unary(declared_operator, _, _):
+                                borrows <- borrows or declared_operator == TokenKind.Ampersand
+                            if borrows:
+                                bindings.borrowed.push(declared_name)
+                                bindings.borrowed_types.push(declared_type)
+                            vtc_collect_value_locals(declared_value, bindings)
+                        Stmt.Assign(_, _, assign_value, _):
+                            vtc_collect_value_locals(assign_value, bindings)
+                        Stmt.Expr(statement_expression, _):
+                            vtc_collect_value_locals(statement_expression, bindings)
+                        Stmt.Block(_, _, block_binding, block_body, _):
+                            bindings.locals.push(block_binding) if block_binding != ""
+                            vtc_collect_locals(block_body, bindings)
+                        Stmt.If(_, then_body, else_body, _):
+                            vtc_collect_locals(then_body, bindings)
+                            vtc_collect_locals(else_body, bindings)
+                        Stmt.While(_, while_body, _):
+                            vtc_collect_locals(while_body, bindings)
+                        Stmt.For(_, variables, _, for_body, _):
+                            bindings.locals.extend(variables)
+                            vtc_collect_locals(for_body, bindings)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms |bindings|:
+                                vtc_collect_locals(arm.body, bindings)
+                        _:
+                            pass
+
+        def vtc_collect_value_locals(value: Ast::Expr, bindings: mutable VtcScope&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if value is Expr.Block(block_statements, block_value, _, _):
+                    vtc_collect_locals(block_statements, bindings)
+                    vtc_collect_value_locals(block_value, bindings)
+
+        def vtc_function_scope(params: darray[Ast::ParamDecl], body: darray[Ast::Stmt], globals: darray[sview]&) -> VtcScope:
+            can Memory.Allocate, Abort.Panic:
+                bindings: mutable VtcScope = VtcScope{locals: [], borrowed: [], borrowed_types: [], globals: [global_name for global_name in globals]}
+                for param in params |bindings|:
+                    bindings.locals.push(param.name)
+                    if vtc_type_borrows(param.type_expression):
+                        bindings.borrowed.push(param.name)
+                        bindings.borrowed_types.push(param.type_expression)
+                vtc_collect_locals(body, &bindings)
+                return bindings
+
+        # The source spelling of a simple expression into OUT; "…" for anything else.
+        def vtc_render(expression: Ast::Expr, out: mutable darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(ident_name, _):
+                        out.extend(ident_name)
+                    Expr.IntLit(int_value, _):
+                        push_int(out, int_value)
+                    Expr.FloatLit(float_text, _):
+                        out.extend(float_text)
+                    Expr.BoolLit(bool_value, _):
+                        out.extend("true" if bool_value else "false")
+                    Expr.StringLit(string_text, _):
+                        out.extend(string_text)
+                    Expr.Field(field_object, field_name, _):
+                        vtc_render(field_object, out)
+                        out.push(46)
+                        out.extend(field_name)
+                    Expr.Scope(scope_base, scope_name, _):
+                        vtc_render(scope_base, out)
+                        out.extend("::")
+                        out.extend(scope_name)
+                    Expr.Index(index_object, index_value, _):
+                        vtc_render(index_object, out)
+                        out.push(91)
+                        vtc_render(index_value, out)
+                        out.push(93)
+                    Expr.Paren(paren_inner, _):
+                        out.push(40)
+                        vtc_render(paren_inner, out)
+                        out.push(41)
+                    Expr.Unary(operator, operand, _):
+                        if operator == TokenKind.Ampersand:
+                            out.push(38)
+                        elif operator == TokenKind.Minus:
+                            out.push(45)
+                        elif operator == TokenKind.Mutable:
+                            out.extend("mutable ")
+                        elif operator == TokenKind.Not:
+                            out.extend("not ")
+                        vtc_render(operand, out)
+                    Expr.Call(call_callee, call_arguments, _, _):
+                        vtc_render(call_callee, out)
+                        out.push(40)
+                        for argument_index in 0..<call_arguments.count |out|:
+                            out.extend(", ") if argument_index > 0
+                            vtc_render(call_arguments[argument_index], out)
+                        out.push(41)
+                    _:
+                        out.extend("…")
+
+        # A type annotation's spelling (`mutable darray[i64]&`, `State&`).
+        def vtc_render_type(type_expression: Ast::Expr, out: mutable darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        if operator == TokenKind.Mutable:
+                            out.extend("mutable ")
+                            vtc_render_type(operand, out)
+                        elif operator == TokenKind.Ampersand:
+                            vtc_render_type(operand, out)
+                            out.push(38)
+                        elif operator == TokenKind.Lmut:
+                            out.extend("lmut ")
+                            vtc_render_type(operand, out)
+                        else:
+                            vtc_render(type_expression, out)
+                    Expr.Index(type_head, type_argument, _):
+                        vtc_render_type(type_head, out)
+                        out.push(91)
+                        vtc_render_type(type_argument, out)
+                        out.push(93)
+                    Expr.IndexN(type_head_n, type_arguments, _):
+                        vtc_render_type(type_head_n, out)
+                        out.push(91)
+                        for type_index in 0..<type_arguments.count |out|:
+                            out.extend(", ") if type_index > 0
+                            vtc_render_type(type_arguments[type_index], out)
+                        out.push(93)
+                    _:
+                        vtc_render(type_expression, out)
+
+        def vtc_text(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                bytes: mutable darray[u8] = []
+                vtc_render(expression, &bytes)
+                return Parser::persist_name_bytes(&bytes, 0)
+
+        # The call spelled with its threaded argument borrowed: `push_one(&s.items, 4)`, or
+        # `s.items.push_one(4)` for the method spelling.
+        def vtc_ref_call_text(function: Ast::ValueThreadFn&, callee: Ast::Expr, arguments: darray[Ast::Expr], place: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                bytes: mutable darray[u8] = []
+                if callee is Expr.Field(_, method_name, _):
+                    vtc_render(place, &bytes) if function.slot == 0
+                    if function.slot != 0:
+                        vtc_render(callee, &bytes)
+                    else:
+                        bytes.push(46)
+                        bytes.extend(method_name)
+                    bytes.push(40)
+                    for method_index in 0..<arguments.count |bytes|:
+                        bytes.extend(", ") if method_index > 0
+                        bytes.push(38) if function.slot > 0 and method_index == function.slot - 1
+                        vtc_render(arguments[method_index], &bytes)
+                    bytes.push(41)
+                    return Parser::persist_name_bytes(&bytes, 0)
+                vtc_render(callee, &bytes)
+                bytes.push(40)
+                for argument_index in 0..<arguments.count |bytes|:
+                    bytes.extend(", ") if argument_index > 0
+                    bytes.push(38) if argument_index == function.slot
+                    vtc_render(arguments[argument_index], &bytes)
+                bytes.push(41)
+                return Parser::persist_name_bytes(&bytes, 0)
+
+        # `place <- call` spelled out, with the call as written.
+        def vtc_thread_text(place: Ast::Expr, call: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                bytes: mutable darray[u8] = []
+                vtc_render(place, &bytes)
+                bytes.extend(" <- ")
+                vtc_render(call, &bytes)
+                return Parser::persist_name_bytes(&bytes, 0)
+
+include "./check_value_threading_sites.elisa"
+include "./check_value_threading_flow.elisa"

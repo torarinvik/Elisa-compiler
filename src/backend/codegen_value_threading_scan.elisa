@@ -1,0 +1,210 @@
+# Stage1 backend — value-threading, part 1: which threaded functions can be LOWERED.
+#
+# codegen_value_threading.elisa rewrites a threaded function (ast_value_threading.elisa) to
+# its `&` form and every call to it to the matching `&` call. That is only sound when every
+# reference to the function is a call in one of the shapes the rewrite knows:
+#
+#     x <- f(.., x, ..)           x.f <- f(.., x.f, ..)        (the same place both sides)
+#     x, last <- f(.., x, ..)     (a two-element result, the place in its slot)
+#     y = f(.., e, ..)            return f(.., e, ..)          (a fresh copy is threaded)
+#
+# with the threaded place rooted at a LOCAL of the calling function (a global may be read by
+# the callee by name, so lending it in place could change what the callee sees). Anything
+# else — a call in an expression, a function value, a call inside a lambda — and the
+# function keeps its by-value ABI: the program means the same either way, so the fallback is
+# always correct, only not in place. A threaded function's own body must also read like an
+# `&` body: no `&p` of the parameter itself and no wholesale `p <- e` other than the in-place
+# container forms (`p <- p.push(v)`).
+#
+# Statement lists are entered where the rewrite enters them: nested statements, and a value
+# block that IS a statement, a declaration's value, an assignment's value or a returned value
+# (a loop with a capture header). Any other expression is scanned strictly: a reference to a
+# threaded function there is not lowered.
+extend Backend:
+    private:
+        def vt_mark_bad(functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&, name: sview) -> void can[Abort.Panic]:
+            for function_index in 0..<functions.count |ok|:
+                ok[function_index] <- false if functions[function_index].name == name
+
+        def vt_name_listed(names: darray[sview]&, name: sview) -> bool can[Abort.Panic]:
+            for listed in names:
+                return true if listed == name
+            return false
+
+        # Every name a function body binds: its parameters, declarations and loop variables.
+        def vt_collect_locals(statements: darray[Stmt], names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in statements |names|:
+                match statement:
+                    Stmt.VarDecl(declared_name, _, declared_value, _):
+                        names.push(declared_name)
+                        vt_collect_block_locals(declared_value, names)
+                    Stmt.Assign(_, _, assign_value, _):
+                        vt_collect_block_locals(assign_value, names)
+                    Stmt.Expr(statement_expression, _):
+                        vt_collect_block_locals(statement_expression, names)
+                    Stmt.Return(return_value, _):
+                        if return_value is present_return:
+                            vt_collect_block_locals(present_return, names)
+                    Stmt.Block(_, _, _, block_body, _):
+                        vt_collect_locals(block_body, names)
+                    Stmt.If(_, then_body, else_body, _):
+                        vt_collect_locals(then_body, names)
+                        vt_collect_locals(else_body, names)
+                    Stmt.While(_, while_body, _):
+                        vt_collect_locals(while_body, names)
+                    Stmt.For(_, variables, _, for_body, _):
+                        names.extend(variables)
+                        vt_collect_locals(for_body, names)
+                    Stmt.Match(_, arms, _):
+                        for arm in arms |names|:
+                            vt_collect_locals(arm.body, names)
+                    _:
+                        pass
+
+        def vt_collect_block_locals(expression: Expr, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if expression is Expr.Block(block_statements, block_value, _, _):
+                vt_collect_locals(block_statements, names)
+                vt_collect_block_locals(block_value, names)
+
+        # Whether an argument can be evaluated out of order: a name, a literal, a field chain.
+        def vt_simple_argument(expression: Expr) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.Ident(_, _) | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _):
+                    return true
+                Expr.Field(field_object, _, _):
+                    return vt_simple_argument(field_object)
+                _:
+                    return false
+
+        # Arguments ahead of the threaded slot are evaluated AFTER the threaded value once a
+        # declaration or return is split, so they must have no effects.
+        def vt_leading_arguments_simple(function: Ast::ValueThreadFn&, callee: Expr, arguments: darray[Expr]) -> bool can[Abort.Panic]:
+            if callee is Expr.Field(receiver, _, _):
+                return true if function.slot == 0
+                return false if not vt_simple_argument(receiver)
+                for method_index in 0..<(function.slot - 1):
+                    return false if not vt_simple_argument(arguments[method_index])
+                return true
+            for argument_index in 0..<function.slot:
+                return false if not vt_simple_argument(arguments[argument_index])
+            return true
+
+        # Scan the parts of a sanctioned call other than the callee name.
+        def vt_scan_call_parts(callee: Expr, arguments: darray[Expr], functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if callee is Expr.Field(receiver, _, _):
+                vt_scan_expr(receiver, functions, ok)
+            for argument in arguments |ok|:
+                vt_scan_expr(argument, functions, ok)
+
+        # Strict scan: every reference to a threaded function in EXPRESSION is unsanctioned.
+        def vt_scan_expr(expression: Expr, functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate]:
+            match expression:
+                Expr.Ident(ident_name, _):
+                    vt_mark_bad(functions, ok, ident_name)
+                Expr.Call(callee, arguments, _, _):
+                    called: sview = Ast::value_thread_callee_name(callee)
+                    vt_mark_bad(functions, ok, called) if called != ""
+                    vt_scan_call_parts(callee, arguments, functions, ok)
+                    if callee is Expr.Scope(scope_base, _, _):
+                        vt_scan_expr(scope_base, functions, ok)
+                Expr.StaticEffectCall(_, _, _, effect_arguments, _, _):
+                    for effect_argument in effect_arguments |ok|:
+                        vt_scan_expr(effect_argument, functions, ok)
+                Expr.Field(field_object, _, _):
+                    vt_scan_expr(field_object, functions, ok)
+                Expr.Scope(_, scoped_name, _):
+                    vt_mark_bad(functions, ok, scoped_name)
+                Expr.Index(index_object, index_value, _):
+                    vt_scan_expr(index_object, functions, ok)
+                    vt_scan_expr(index_value, functions, ok)
+                Expr.Slice(slice_object, slice_low, slice_high, _):
+                    vt_scan_expr(slice_object, functions, ok)
+                    vt_scan_expr(slice_low, functions, ok)
+                    vt_scan_expr(slice_high, functions, ok)
+                Expr.IndexN(index_n_object, index_n_arguments, _):
+                    vt_scan_expr(index_n_object, functions, ok)
+                    for index_n_argument in index_n_arguments |ok|:
+                        vt_scan_expr(index_n_argument, functions, ok)
+                Expr.Binary(left, _, right, _):
+                    vt_scan_expr(left, functions, ok)
+                    vt_scan_expr(right, functions, ok)
+                Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.RegionNew(operand, _, _) | Expr.Paren(operand, _):
+                    vt_scan_expr(operand, functions, ok)
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements |ok|:
+                        vt_scan_expr(element, functions, ok)
+                Expr.DictLit(entries, _):
+                    for entry in entries |ok|:
+                        vt_scan_expr(entry.key, functions, ok)
+                        vt_scan_expr(entry.value, functions, ok)
+                Expr.Construct(_, fields, _):
+                    for field in fields |ok|:
+                        vt_scan_expr(field.value, functions, ok)
+                Expr.RecordUpdate(record_base, record_fields, _):
+                    vt_scan_expr(record_base, functions, ok)
+                    for record_field in record_fields |ok|:
+                        vt_scan_expr(record_field.value, functions, ok)
+                Expr.If(condition, then_expr, else_expr, _):
+                    vt_scan_expr(condition, functions, ok)
+                    vt_scan_expr(then_expr, functions, ok)
+                    vt_scan_expr(else_expr, functions, ok)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    vt_scan_expr(scrutinee, functions, ok)
+                    for arm in arms |ok|:
+                        vt_scan_expr(arm.guard, functions, ok)
+                        vt_scan_strict_statements(arm.body, functions, ok)
+                Expr.Comprehension(_, iterable, comprehension_condition, comprehension_body, _):
+                    vt_scan_expr(iterable, functions, ok)
+                    vt_scan_expr(comprehension_condition, functions, ok)
+                    vt_scan_expr(comprehension_body, functions, ok)
+                Expr.Refinement(refined_base, refined_predicate, _):
+                    vt_scan_expr(refined_base, functions, ok)
+                    vt_scan_expr(refined_predicate, functions, ok)
+                Expr.GetElse(guarded, recovery, _):
+                    vt_scan_expr(guarded, functions, ok)
+                    vt_scan_strict_statements(recovery, functions, ok)
+                Expr.Lambda(_, lambda_body, _):
+                    vt_scan_strict_statements(lambda_body, functions, ok)
+                Expr.Block(block_statements, block_value, _, _):
+                    vt_scan_strict_statements(block_statements, functions, ok)
+                    vt_scan_expr(block_value, functions, ok)
+                _:
+                    pass
+
+        # Statements nobody rewrites: every expression in them is scanned strictly.
+        def vt_scan_strict_statements(statements: darray[Stmt], functions: darray[Ast::ValueThreadFn]&, ok: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in statements |ok|:
+                match statement:
+                    Stmt.Expr(statement_expression, _):
+                        vt_scan_expr(statement_expression, functions, ok)
+                    Stmt.VarDecl(_, _, declared_value, _):
+                        vt_scan_expr(declared_value, functions, ok)
+                    Stmt.Assign(target, _, assign_value, _):
+                        vt_scan_expr(target, functions, ok)
+                        vt_scan_expr(assign_value, functions, ok)
+                    Stmt.Return(return_value, _):
+                        if return_value is present_return:
+                            vt_scan_expr(present_return, functions, ok)
+                    Stmt.Contract(_, contract_expression, _):
+                        vt_scan_expr(contract_expression, functions, ok)
+                    Stmt.Block(_, _, _, block_body, _):
+                        vt_scan_strict_statements(block_body, functions, ok)
+                    Stmt.If(condition, then_body, else_body, _):
+                        vt_scan_expr(condition, functions, ok)
+                        vt_scan_strict_statements(then_body, functions, ok)
+                        vt_scan_strict_statements(else_body, functions, ok)
+                    Stmt.While(while_condition, while_body, _):
+                        vt_scan_expr(while_condition, functions, ok)
+                        vt_scan_strict_statements(while_body, functions, ok)
+                    Stmt.For(_, _, iterable, for_body, _):
+                        vt_scan_expr(iterable, functions, ok)
+                        vt_scan_strict_statements(for_body, functions, ok)
+                    Stmt.Match(scrutinee, arms, _):
+                        vt_scan_expr(scrutinee, functions, ok)
+                        for arm in arms |ok|:
+                            vt_scan_expr(arm.guard, functions, ok)
+                            vt_scan_strict_statements(arm.body, functions, ok)
+                    _:
+                        pass
+
+include "./codegen_value_threading_scan_body.elisa"

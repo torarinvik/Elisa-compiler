@@ -1,0 +1,199 @@
+# Stage1 backend — value-threading, part 3: lowering "owned in, owned out" to the `&` form.
+#
+# A threaded function (ast_value_threading.elisa) and every call to it are rewritten, before
+# any declaration or body is emitted, into exactly the AST the `&` spelling parses to:
+#
+#     def push_one(arr: darray[i64], x: i64) -> darray[i64]:     def push_one(arr: mutable darray[i64]&, x: i64) -> void:
+#         arr.push(x)                                     ==>         arr.push(x)
+#         return arr                                                  return
+#
+#     arr <- push_one(arr, 4)                             ==>     push_one(&arr, 4)
+#     a, last <- pop_one(a)       (-> (rest: T, last: U))  ==>     last <- pop_one(&a)
+#     y = push_one(xs, 4)                                 ==>     y: mutable darray[i64] = xs
+#                                                                 push_one(&y, 4)
+#     return push_one(xs, 4)                              ==>     the same, through a local
+#
+# Because the two spellings reach the emitter as the same tree, they compile to the same
+# machine code by construction (test/parity/value_threading_codegen_smoke.sh holds it). A
+# by-value parameter is a copy of the argument, so threading a copy (`y = f(xs)`) or the
+# place itself (`xs <- f(xs)`) in place means exactly what the by-value call meant. Functions
+# the scan (codegen_value_threading_scan*.elisa) cannot lower keep their by-value ABI.
+extend Backend:
+    private:
+        # Every threaded function of FILE that the bodies in TOP allow lowering.
+        def vt_lowerable_functions(file: Ast::File&, top: darray[Decl]) -> darray[Ast::ValueThreadFn] can[Abort.Panic, Memory.Allocate]:
+            functions: darray[Ast::ValueThreadFn] = Ast::value_thread_functions(file.top_decls)
+            return functions if functions.count == 0
+            ok: mutable darray[bool] = [true for function in functions]
+            vt_scan_declarations(top, functions, &ok)
+            while vt_own_round(top, functions, &ok):
+                pass
+            lowered: mutable darray[Ast::ValueThreadFn] = []
+            for function_index in 0..<functions.count |lowered|:
+                lowered.push(functions[function_index]) if ok[function_index]
+            return lowered
+
+        # TOP with every lowerable threaded function and call rewritten to the `&` form.
+        def lower_value_threading(file: Ast::File&, top: darray[Decl]) -> darray[Decl] can[Abort.Panic, Memory.Allocate]:
+            functions: darray[Ast::ValueThreadFn] = vt_lowerable_functions(file, top)
+            return top if functions.count == 0
+            return vt_rewrite_declarations(top, functions)
+
+        def vt_rewrite_declarations(declarations: darray[Decl], functions: darray[Ast::ValueThreadFn]&) -> darray[Decl] can[Abort.Panic, Memory.Allocate]:
+            rewritten: mutable darray[Decl] = []
+            for declaration in declarations |rewritten|:
+                match declaration:
+                    Decl.Func(function_name, params, return_type, body, effects, decorators, function_pos):
+                        locals: mutable darray[sview] = [param.name for param in params]
+                        vt_collect_locals(body, &locals)
+                        own_index: i64 = Ast::value_thread_find(functions, function_name, params.count)
+                        if own_index < 0:
+                            rewritten.push(Ast::Decl.Func(function_name, params, return_type, vt_rewrite_statements(body, functions, locals, "", -1), effects, decorators, function_pos))
+                            continue
+                        own: Ast::ValueThreadFn = functions[own_index.usize()]
+                        lent_params: mutable darray[Ast::ParamDecl] = []
+                        for param_index in 0..<params.count |lent_params|:
+                            param: Ast::ParamDecl = params[param_index]
+                            if param_index == own.slot:
+                                type_pos: Ast::Pos = Ast::expr_pos(param.type_expression)
+                                lent_type: Expr = (Ast::Expr.Unary(TokenKind.Mutable, (Ast::Expr.Unary(TokenKind.Ampersand, param.type_expression, type_pos)), type_pos))
+                                lent_params.push(Ast::ParamDecl{name: param.name, name_pos: param.name_pos, type_expression: lent_type, is_mutable: true, has_default: param.has_default, default_value: param.default_value, is_affine: param.is_affine, value_thread: true})
+                            else:
+                                lent_params.push(param)
+                        lent_return: mutable Expr? = return_type
+                        if return_type is result_type:
+                            lent_return <- vt_lent_return_type(result_type, own.tuple_slot)
+                        rewritten.push(Ast::Decl.Func(function_name, lent_params, lent_return, vt_rewrite_statements(body, functions, locals, own.param_name, own.tuple_slot), effects, decorators, function_pos))
+                    Decl.Module(module_name, module_body, module_pos):
+                        rewritten.push(Ast::Decl.Module(module_name, vt_rewrite_declarations(module_body, functions), module_pos))
+                    Decl.Scoped(scoped_body, scoped_pos):
+                        rewritten.push(Ast::Decl.Scoped(vt_rewrite_declarations(scoped_body, functions), scoped_pos))
+                    _:
+                        rewritten.push(declaration)
+            return rewritten
+
+        # `-> T` becomes `-> void`; `-> (rest: T, last: U)` becomes `-> U`.
+        def vt_lent_return_type(result_type: Expr, tuple_slot: i64) -> Expr can[Abort.Panic, Memory.Allocate]:
+            if tuple_slot >= 0:
+                if result_type is Expr.Tuple(result_elements, _):
+                    return result_elements[1 - tuple_slot.usize()]
+            return (Ast::Expr.Ident("void", Ast::expr_pos(result_type)))
+
+        # The call with its threaded argument replaced by LENT: `&place` in an argument slot;
+        # for the method spelling with the receiver threaded, the receiver itself (a method
+        # call borrows its receiver, which is what `place.f(..)` with a `&` parameter does).
+        # The caller's own threaded parameter is already a reference: it is passed on bare,
+        # as an `&` body passes a `mutable T&` parameter on.
+        def vt_lent_call(callee: Expr, arguments: darray[Expr], argument_names: darray[sview], call_pos: Ast::Pos, function: Ast::ValueThreadFn&, place: Expr, own_param: sview) -> Expr can[Abort.Panic, Memory.Allocate]:
+            passes_own: bool = own_param != "" and Ast::value_thread_is_name(place, own_param)
+            borrowed: Expr = place if passes_own else (Ast::Expr.Unary(TokenKind.Ampersand, place, Ast::expr_pos(place)))
+            lent_arguments: mutable darray[Expr] = []
+            lent_callee: mutable Expr = callee
+            if callee is Expr.Field(_, method_name, method_pos):
+                if function.slot == 0:
+                    lent_callee <- (Ast::Expr.Field(place, method_name, method_pos))
+                for argument_index in 0..<arguments.count |lent_arguments|:
+                    lent_arguments.push(borrowed if function.slot > 0 and argument_index == function.slot - 1 else arguments[argument_index])
+            else:
+                for plain_index in 0..<arguments.count |lent_arguments|:
+                    lent_arguments.push(borrowed if plain_index == function.slot else arguments[plain_index])
+            return (Ast::Expr.Call(lent_callee, lent_arguments, argument_names, call_pos))
+
+        def vt_rewrite_statements(statements: darray[Stmt], functions: darray[Ast::ValueThreadFn]&, locals: darray[sview]&, own_param: sview, own_tuple_slot: i64) -> darray[Stmt] can[Abort.Panic, Memory.Allocate]:
+            rewritten: mutable darray[Stmt] = []
+            for statement in statements |rewritten|:
+                vt_rewrite_statement(statement, functions, locals, own_param, own_tuple_slot, &rewritten)
+            return rewritten
+
+        # Rewrite one statement into OUT (a split declaration or return becomes several).
+        def vt_rewrite_statement(statement: Stmt, functions: darray[Ast::ValueThreadFn]&, locals: darray[sview]&, own_param: sview, own_tuple_slot: i64, out: mutable darray[Stmt]&) -> void can[Abort.Panic, Memory.Allocate]:
+            shape: VtShape = vt_statement_shape(statement, functions, locals, own_param)
+            if shape.kind != 0:
+                function: Ast::ValueThreadFn = functions[shape.function_index.usize()]
+                vt_rewrite_call_statement(statement, shape, function, own_param, out)
+                return
+            match statement:
+                Stmt.Return(return_value, return_pos):
+                    if own_param != "":
+                        if return_value is present_return:
+                            if own_tuple_slot < 0:
+                                out.push((Ast::Stmt.Return(null, return_pos)))
+                                return
+                            if present_return is Expr.Tuple(returned_elements, _):
+                                out.push((Ast::Stmt.Return(returned_elements[1 - own_tuple_slot.usize()], return_pos)))
+                                return
+                    if return_value is returned_block:
+                        out.push((Ast::Stmt.Return(vt_rewrite_value(returned_block, functions, locals, own_param, own_tuple_slot), return_pos)))
+                        return
+                    out.push(statement)
+                Stmt.Expr(statement_expression, expression_pos):
+                    out.push((Ast::Stmt.Expr(vt_rewrite_value(statement_expression, functions, locals, own_param, own_tuple_slot), expression_pos)))
+                Stmt.VarDecl(declared_name, declared_type, declared_value, declared_pos):
+                    out.push((Ast::Stmt.VarDecl(declared_name, declared_type, vt_rewrite_value(declared_value, functions, locals, own_param, own_tuple_slot), declared_pos)))
+                Stmt.Assign(target, operator, assign_value, assign_pos):
+                    out.push((Ast::Stmt.Assign(target, operator, vt_rewrite_value(assign_value, functions, locals, own_param, own_tuple_slot), assign_pos)))
+                Stmt.Block(kind, clause, binding, block_body, block_pos):
+                    out.push((Ast::Stmt.Block(kind, clause, binding, vt_rewrite_statements(block_body, functions, locals, own_param, own_tuple_slot), block_pos)))
+                Stmt.If(condition, then_body, else_body, if_pos):
+                    out.push((Ast::Stmt.If(condition, vt_rewrite_statements(then_body, functions, locals, own_param, own_tuple_slot), vt_rewrite_statements(else_body, functions, locals, own_param, own_tuple_slot), if_pos)))
+                Stmt.While(while_condition, while_body, while_pos):
+                    out.push((Ast::Stmt.While(while_condition, vt_rewrite_statements(while_body, functions, locals, own_param, own_tuple_slot), while_pos)))
+                Stmt.For(bind, variables, iterable, for_body, for_pos):
+                    out.push((Ast::Stmt.For(bind, variables, iterable, vt_rewrite_statements(for_body, functions, locals, own_param, own_tuple_slot), for_pos)))
+                Stmt.Match(scrutinee, arms, match_pos):
+                    rewritten_arms: mutable darray[Ast::MatchArm] = []
+                    for arm in arms |rewritten_arms|:
+                        rewritten_arms.push(Ast::MatchArm{pattern: arm.pattern, body: vt_rewrite_statements(arm.body, functions, locals, own_param, own_tuple_slot), guard: arm.guard, pos: arm.pos})
+                    out.push((Ast::Stmt.Match(scrutinee, rewritten_arms, match_pos)))
+                _:
+                    out.push(statement)
+
+        # A statement's whole value: a value block (a loop with a capture header, a bare
+        # block value) has its statements rewritten; anything else is left as written.
+        def vt_rewrite_value(value: Expr, functions: darray[Ast::ValueThreadFn]&, locals: darray[sview]&, own_param: sview, own_tuple_slot: i64) -> Expr can[Abort.Panic, Memory.Allocate]:
+            if value is Expr.Block(block_statements, block_value, block_captures, block_pos):
+                return (Ast::Expr.Block(vt_rewrite_statements(block_statements, functions, locals, own_param, own_tuple_slot), vt_rewrite_value(block_value, functions, locals, own_param, own_tuple_slot), block_captures, block_pos))
+            return value
+
+        def vt_rewrite_call_statement(statement: Stmt, shape: VtShape, function: Ast::ValueThreadFn&, own_param: sview, out: mutable darray[Stmt]&) -> void can[Abort.Panic, Memory.Allocate]:
+            match statement:
+                Stmt.Assign(target, _, Expr.Call(callee, arguments, argument_names, call_pos), assign_pos):
+                    place: Expr = Ast::value_thread_call_argument(function, callee, arguments)
+                    lent: Expr = vt_lent_call(callee, arguments, argument_names, call_pos, function, place, own_param)
+                    if shape.kind == 1:
+                        out.push((Ast::Stmt.Expr(lent, assign_pos)))
+                        return
+                    if shape.kind == 5:
+                        copy_name: sview = "__vt_global"
+                        copy_holder: Expr = (Ast::Expr.Ident(copy_name, assign_pos))
+                        out.push((Ast::Stmt.VarDecl(copy_name, vt_copy_type((Ast::Expr.Absent), function), place, assign_pos)))
+                        out.push((Ast::Stmt.Expr(vt_lent_call(callee, arguments, argument_names, call_pos, function, copy_holder, ""), assign_pos)))
+                        out.push((Ast::Stmt.Assign(target, TokenKind.LArrow, copy_holder, assign_pos)))
+                        return
+                    if target is Expr.Array(targets, _):
+                        out.push((Ast::Stmt.Assign(targets[1 - function.tuple_slot.usize()], TokenKind.LArrow, lent, assign_pos)))
+                Stmt.VarDecl(declared_name, declared_type, Expr.Call(declared_callee, declared_arguments, declared_names, declared_call_pos), declared_pos):
+                    copied: Expr = Ast::value_thread_call_argument(function, declared_callee, declared_arguments)
+                    copy_type: Expr = vt_copy_type(declared_type, function)
+                    out.push((Ast::Stmt.VarDecl(declared_name, copy_type, copied, declared_pos)))
+                    holder: Expr = (Ast::Expr.Ident(declared_name, declared_pos))
+                    out.push((Ast::Stmt.Expr(vt_lent_call(declared_callee, declared_arguments, declared_names, declared_call_pos, function, holder, ""), declared_pos)))
+                Stmt.Return(return_value, return_pos):
+                    returned_call: Expr = get return_value else (Ast::Expr.Absent)
+                    if returned_call is Expr.Call(returned_callee, returned_arguments, returned_names, returned_call_pos):
+                        returned_copy: Expr = Ast::value_thread_call_argument(function, returned_callee, returned_arguments)
+                        holder_name: sview = "__vt_returned"
+                        out.push((Ast::Stmt.VarDecl(holder_name, vt_copy_type((Ast::Expr.Absent), function), returned_copy, return_pos)))
+                        returned_holder: Expr = (Ast::Expr.Ident(holder_name, return_pos))
+                        out.push((Ast::Stmt.Expr(vt_lent_call(returned_callee, returned_arguments, returned_names, returned_call_pos, function, returned_holder, ""), return_pos)))
+                        out.push((Ast::Stmt.Return(returned_holder, return_pos)))
+                _:
+                    out.push(statement)
+
+        # The declared type of the local a threaded copy lives in: the declaration's own
+        # annotation, else the parameter's type; `mutable` either way.
+        def vt_copy_type(declared_type: Expr, function: Ast::ValueThreadFn&) -> Expr can[Abort.Panic, Memory.Allocate]:
+            if declared_type is Expr.Unary(declared_operator, _, _):
+                return declared_type if declared_operator == TokenKind.Mutable
+            base: Expr = function.param_type if declared_type is Expr.Absent or declared_type is Expr.Invalid else declared_type
+            return (Ast::Expr.Unary(TokenKind.Mutable, base, Ast::expr_pos(base)))
