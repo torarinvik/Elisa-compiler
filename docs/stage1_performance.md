@@ -39,6 +39,7 @@ Generated-code quality is never traded for compile speed.
 | + region-annotation windows, owned-candidate chains | 22.9 | - | - | - | - | - | ~8 |
 | + ref_pos offset chains | 21.3 | 44.2 | 135.9 | 0.055 | 20.9 | 21.3 | ~8 |
 | + field/declared-name/generic-instance/scope-owner indexes | 20.4 | 36.8 | 134.1 | 0.058 | 19.4 | 19.5 | 5-20 |
+| backend round (claude/s1-perf-be, 43990782), stage1-built | 21.1 | 30.2 | 138.7 | 0.030 | 16.4 | 16.3 | 8-13 |
 
 Box timings are noisy (other agents share it): the same `-emit ast` run measured 66 s and
 10 s minutes apart. Compare rows only by phase CPU times when the difference is small.
@@ -66,3 +67,62 @@ object emission 9.7.
 Baseline hot spots (check, before 42aedbe6): check_destroyed_region 758.9 s,
 resolve_declarations 56.1 s, check_fn_value_effect_row 16.1 s,
 check_region_storage_stability 6.6 s.
+
+## Backend round (claude/s1-perf-be)
+
+Measured against the round-1 compiler on the same tree (`-emit obj`, 32 emit jobs):
+
+| phase (self-host unit) | before | after |
+|---|---|---|
+| LLVM IR generation | 9.2 s | 5.6-5.8 s |
+| verify | 0.8 s (critical path) | overlapped with -O0 emission |
+| -O0 object emission (wall) | ~5 s + 0.8 s verify | 3.4-3.7 s |
+| -O2 object emission (wall) | 9.7 s | 7.8 s |
+| small file | 0.058 s | 0.030 s (0.015 s with LLVM linked statically, below) |
+
+What changed, by commit:
+
+- 5889320e: the include line map (`ELISA_STAGE1_LINE_MAP`) is parsed once per environment
+  string, not per `source_original_line` call; it is hidden from `system` children (the
+  self-host map is >128 KB, one exec string's limit, so `ld -r` for parallel emission and
+  `-emit exe` links failed with E2BIG from long tree paths); parallel emission forks at most
+  one worker per 20000 instructions (a 30-line file spent 26 of 50 ms forking 32 workers).
+- 2a2c93df, db32e19e, 43990782: hash chains (`codegen_name_chains.elisa`,
+  `codegen_annotation_pair_index.elisa`) for const/struct/enum/generic-template name lookups,
+  region-fact and local-binding line lookups, and (owner, name) annotation questions;
+  packed row widths memoized under a layout stamp; generic-instance chain heads indexed by
+  struct slot; LLVM value names discarded for object/exe output (`setName` was 8%).
+- 666677ed, c795e4c5: emission workers are forked as a tree (32 sequential forks of a 2 GB
+  process cost ~2 s); at -O0 other partitions' functions become available_externally
+  instead of having their bodies erased (erasing dirtied every copy-on-write page in every
+  worker); at -O2 they are still erased (an optimising machine runs IR codegen passes over
+  available_externally bodies). The verifier runs in the parent during -O0 emission. Main
+  no longer disposes the module before exiting.
+
+Objects are byte-identical through all of it (self-host -O0 and -O2, 32 jobs), and the
+stage1 binary is a fixpoint. The only visible output change: a verifier diagnostic for
+invalid backend IR in an object build prints numbered values instead of names.
+
+### Remaining, measured
+
+- IR generation (callgrind, 19.2 G instructions after this round, from 29.0 G): diffuse.
+  `ctx_aos_store_record` (AST store reads, 9.5%), `emit_module_bodies` self time (6.6%),
+  `register_module_types`/`register_enums_from_metadata` (3.4/3.3%), `declare_function`
+  (3.6%), region forwarding scans (~7%), ~1.5% `getenv` from per-call option probes
+  (`darray_llvm_type`, `scalar_type_of_name`, ...). Parallelising IR generation per
+  partition is not feasible with the current shared, mutating `StructTable`.
+- -O2: LLVM's `default<O2>` is 93-100 s single-threaded on 2.03M instructions / 9350
+  functions. `opt -time-passes` on the module: InstCombine 20%, Inliner 7.6%, SimplifyCFG
+  7.1%, GVN 7.0%, SROA 5.7%, JumpThreading 5.3%, then a long tail; analyses (MemorySSA,
+  DomTree, Loop) ~8 s. No pass is pathological and the IR has no obviously wasteful shape
+  (470k loads, 346k stores, 185k allocas, 14k `llvm.trap` blocks from checks). Cutting it
+  materially needs parallel optimisation (ThinLTO-style per-partition pipelines with
+  imported callee bodies), which changes inlining and so must be proven at runtime parity
+  first; not done.
+- Small file: 0.030 s, of which ~15 ms is loading `libLLVM.so` (relocations and static
+  initialisers; an empty C program linked to it takes 17-20 ms). Relinking the same
+  object against LLVM's static archives (`llvm-config --link-static --libs core passes
+  x86 aarch64 arm riscv webassembly bitwriter bitreader analysis irreader target mc
+  support`, `--gc-sections`; on the box `-l:libzstd.so.1` since there is no libzstd.a)
+  measured 0.014-0.017 s for the same compile, link 4 s, binary 94 MB unstripped. That is
+  a build-script change (seed and gen2 link lines) left for a decision.
