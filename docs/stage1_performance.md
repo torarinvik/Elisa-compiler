@@ -39,6 +39,13 @@ Generated-code quality is never traded for compile speed.
 | + region-annotation windows, owned-candidate chains | 22.9 | - | - | - | - | - | ~8 |
 | + ref_pos offset chains | 21.3 | 44.2 | 135.9 | 0.055 | 20.9 | 21.3 | ~8 |
 | + field/declared-name/generic-instance/scope-owner indexes | 20.4 | 36.8 | 134.1 | 0.058 | 19.4 | 19.5 | 5-20 |
+| claude/s1-perf-fe: + AST-printer views (`-emit ast` self 20.5 -> 2.1 s) | 20.8 | - | - | - | - | - | ~6 |
+| + incremental param-growth fixpoint, store-through chains | 20.4 | - | - | - | - | - | 13-24 |
+| + private-field / destroyed-alias chains | 20.0 | - | - | - | - | - | 13-24 |
+
+The last two rows were measured in one run on a loaded box, next to 0317f89f's compiler at
+24.8 s; per-pass CPU (ms): region_storage_stability 1566 -> 1306, call_holder_view_store
+587 -> 274, private_fields 311 -> 159.
 
 Box timings are noisy (other agents share it): the same `-emit ast` run measured 66 s and
 10 s minutes apart. Compare rows only by phase CPU times when the difference is small.
@@ -55,8 +62,23 @@ Box timings are noisy (other agents share it): the same `-emit ast` run measured
 - `-O2` 134 s: LLVM's module O2 pipeline is 93 s, single-threaded. Splitting it per
   partition would change inlining across partitions, i.e. generated code, so it is not
   done.
-- `-emit ast` on a unit that includes the semantic layer takes ~10 s: a separate
-  quadratic in the AST printer (`emit_ast_decl`), not yet addressed.
+- `-emit ast` (self) is 2.1 s, of which read+lex+parse is 1.8 s. It was 20 s: a per-param
+  scan to the end of the token stream (`emit_ast_param_grown_in_body`) and per-declaration
+  scans of the whole enum-annotation table, now one set of sorted/filtered views
+  (`src/driver/elisac_emit_ast_marks.elisa`).
+
+### Parallel semantic checking (measured, not committed)
+
+A fork-based scheduler was built and verified on the self unit (diagnostics byte-identical
+to the serial run): a call-closure scan of the semantic sources classified 345 of the ~410
+pipeline passes as diagnostic-only (write no table field but `diagnostics`, read no
+diagnostics); runs of them between other passes went to forked children (a leader per run
+that forks its lanes, lanes balanced on measured pass cost), findings spliced back in pass
+order. On the gate box it gave only 20-22 s -> 17-19 s: the ~45 non-pure passes stay on the
+parent (~8 s), each fork of the compiler-sized process costs the forking process ~45 ms
+under the box's gVisor kernel, and every fork re-shares the parent's pages so its writer
+passes run ~1.5x slower on copy-on-write faults. Worth revisiting once the writer passes are
+cheaper, or on a host with ordinary fork costs.
 
 Phase detail at the last row (-O2): parse 1.2, lex 0.33, semantic ~19 (largest passes:
 region_storage_stability 3.0, destroyed_region 1.0, borrow_after_move 1.0,
