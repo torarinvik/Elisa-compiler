@@ -11,9 +11,10 @@
 #   - stage1 builds both files and both programs exit 0;
 #   - stage0 builds and runs the `&` form, as the oracle for the expected exit. stage0 has no
 #     value-threading (it rejects the write to an immutable parameter), so the value forms are
-#     stage1-only. The builtin pairs on dicts and `remove_at` include the stage1 runtime
-#     (elisacore_std/elisacore_runtime.elisa), which stage0 rejects, so those are stage1-only
-#     entirely; the smoke names them;
+#     stage1-only. A pair whose first line says `stage1-only` is stage1-only entirely, and the
+#     smoke names it: the builtin pairs on dicts and `remove_at` include the stage1 runtime
+#     (elisacore_std/elisacore_runtime.elisa), which stage0 rejects, and stage0 cannot infer
+#     the region parameter of the field pair's `push_one(&s.items, 7)`;
 #   - stage1 compiles the two files to IDENTICAL machine code at -O0 and at -O2. This is the
 #     promise behind the form: the values are only threaded through, never copied.
 set -euo pipefail
@@ -45,7 +46,7 @@ for value in "$PAIRS"/*_value.elisa; do
         "$WORK/$base.s1" || fail "$base (stage1) exited $?"
     done
     base="$(basename "$ref" .elisa)"
-    if grep -q '^include .*elisacore_runtime.elisa' "$ref"; then
+    if head -1 "$ref" | grep -q 'stage1-only'; then
         stage1_only="$stage1_only $name"
     else
         "$STAGE0" -emit c-archive -O2 -o "$WORK/$base.a" "$ref" >"$WORK/$base.log" 2>&1 || fail "stage0 failed to build $base: $(cat "$WORK/$base.log")"
