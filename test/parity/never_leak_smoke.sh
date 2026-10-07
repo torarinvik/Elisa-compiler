@@ -13,7 +13,11 @@
 #   - the full warning text is exactly expected-strict.txt under -Wnever-leak=strict and
 #     expected-gentle.txt under -Wnever-leak, -W never-leak and -Wnever-leak=gentle (gentle is
 #     the default: it accepts a local whose last use is the next statement and does not report
-#     accumulator or value-threading candidates no rewrite fits: 20 vs 8 findings).
+#     accumulator or value-threading candidates no rewrite fits: 21 vs 9 findings, push loops
+#     included).
+#   - illegal_stage1.elisa holds the findings whose rewrites only stage1 compiles (a block that
+#     `continue`s its loop, a nested comprehension): the full text is expected-stage1.txt in both
+#     modes, and fixed_stage1.elisa (those rewrites applied verbatim) is clean and runs.
 #   - -Werror=never-leak[=strict] fails the compile; -permissive turns it off.
 set -euo pipefail
 
@@ -87,9 +91,26 @@ expect_text expected-gentle.txt -W never-leak
 expect_text expected-gentle.txt -Wnever-leak=gentle
 expect_text expected-strict.txt -W never-leak=strict
 warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-strict.txt")"
-[[ "$warnings" -eq 20 ]] || fail "expected-strict.txt must hold 20 findings, has $warnings"
+[[ "$warnings" -eq 21 ]] || fail "expected-strict.txt must hold 21 findings, has $warnings"
 warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-gentle.txt")"
-[[ "$warnings" -eq 8 ]] || fail "expected-gentle.txt must hold 8 findings, has $warnings"
+[[ "$warnings" -eq 9 ]] || fail "expected-gentle.txt must hold 9 findings, has $warnings"
+
+# The stage1-only rewrites: the same text in both modes, the fixed file clean and running.
+for flag in -Wnever-leak -Wnever-leak=strict; do
+    check "$flag" "$FIXTURES/illegal_stage1.elisa"
+    [[ "$status" -eq 0 ]] || fail "illegal_stage1.elisa ($flag) exited $status: $output"
+    text="${output//"$FIXTURES/"/}"
+    [[ "$text" == "$(cat "$FIXTURES/expected-stage1.txt")" ]] || fail "illegal_stage1.elisa ($flag) output differs from expected-stage1.txt:
+$(diff "$FIXTURES/expected-stage1.txt" <(printf '%s\n' "$text") || true)"
+    check "$flag" "$FIXTURES/fixed_stage1.elisa"
+    [[ "$status" -eq 0 && "$output" != *"never-leak"* ]] || fail "fixed_stage1.elisa ($flag) must draw no finding (exit $status): $output"
+done
+warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-stage1.txt")"
+[[ "$warnings" -eq 2 ]] || fail "expected-stage1.txt must hold 2 findings, has $warnings"
+check -Werror=never-leak "$FIXTURES/illegal_stage1.elisa"
+[[ "$status" -ne 0 && "$output" == *": error: local \`sums\` is filled by a push loop"* ]] || fail "-Werror=never-leak must fail illegal_stage1.elisa (exit $status): $output"
+bash "$WRAPPER" -emit exe -o "$WORK/fixed_stage1.s1" "$FIXTURES/fixed_stage1.elisa" >"$WORK/build.log" 2>&1 || fail "stage1 cannot build fixed_stage1.elisa: $(cat "$WORK/build.log")"
+"$WORK/fixed_stage1.s1" || fail "fixed_stage1.elisa (stage1) exited $?"
 
 for flag in -Werror=never-leak -Werror=never-leak=strict; do
     check "$flag" "$FIXTURES/illegal.elisa"
@@ -101,4 +122,4 @@ check -Wnever-leak=strict -Werror=never-leak "$FIXTURES/illegal.elisa"
 check -permissive -Wnever-leak "$FIXTURES/illegal.elisa"
 [[ "$status" -eq 0 && "$output" != *"never-leak"* ]] || fail "-permissive must turn the lint off: $output"
 
-echo "never-leak smoke OK: off by default, strict 20 and gentle 8 findings (accumulators and value-threading included) pinned verbatim, legal and rewritten fixtures clean, fixed.elisa runs on both compilers"
+echo "never-leak smoke OK: off by default, strict 21 and gentle 9 findings (accumulators, value-threading and push loops included) pinned verbatim, the stage1-only rewrites pinned in both modes, legal and rewritten fixtures clean, fixed.elisa runs on both compilers and fixed_stage1.elisa on stage1"
