@@ -5,13 +5,13 @@
 #   - OFF by default: illegal.elisa draws no finding without the flag (every gate unaffected).
 #   - legal.elisa draws none in either mode. fixed.elisa (illegal.elisa with each STRICT rewrite
 #     applied verbatim) draws none under gentle and, under strict, only the accumulator candidate
-#     no rewrite fits (`best`); both compilers build and run it (exit 0 checks the results).
+#     no rewrite fits (`seen`); both compilers build and run it (exit 0 checks the results).
 #   - the stat rows of illegal.elisa are exactly expected-rows.txt (category, local, line; the
 #     rows are the same in both modes).
 #   - the full warning text is exactly expected-strict.txt under -Wnever-leak=strict and
 #     expected-gentle.txt under -Wnever-leak, -W never-leak and -Wnever-leak=gentle (gentle is
 #     the default: it accepts a local whose last use is the next statement and does not report
-#     accumulator candidates no rewrite fits: 10 vs 5 findings).
+#     accumulator candidates no rewrite fits: 11 vs 6 findings).
 #   - -Werror=never-leak[=strict] fails the compile; -permissive turns it off.
 set -euo pipefail
 
@@ -39,7 +39,7 @@ for legal in legal fixed; do
         allowed=0
         if [[ "$legal" == fixed && "$flag" == -Wnever-leak=strict ]]; then
             allowed=1
-            [[ "$output" == *"accumulator \`best\` stays mutable"*"no loop-value rewrite applies"* ]] || fail "fixed.elisa under strict must report only \`best\` (no rewrite fits): $output"
+            [[ "$output" == *"accumulator \`seen\` stays mutable"*"no loop-value rewrite applies"* ]] || fail "fixed.elisa under strict must report only \`seen\` (no rewrite fits): $output"
         fi
         [[ "$findings" -eq "$allowed" ]] || fail "$legal.elisa drew $findings findings under $flag (expected $allowed): $output"
     done
@@ -83,9 +83,9 @@ expect_text expected-gentle.txt -W never-leak
 expect_text expected-gentle.txt -Wnever-leak=gentle
 expect_text expected-strict.txt -W never-leak=strict
 warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-strict.txt")"
-[[ "$warnings" -eq 10 ]] || fail "expected-strict.txt must hold 10 findings, has $warnings"
+[[ "$warnings" -eq 11 ]] || fail "expected-strict.txt must hold 11 findings, has $warnings"
 warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-gentle.txt")"
-[[ "$warnings" -eq 5 ]] || fail "expected-gentle.txt must hold 5 findings, has $warnings"
+[[ "$warnings" -eq 6 ]] || fail "expected-gentle.txt must hold 6 findings, has $warnings"
 
 for flag in -Werror=never-leak -Werror=never-leak=strict; do
     check "$flag" "$FIXTURES/illegal.elisa"
@@ -97,4 +97,4 @@ check -Wnever-leak=strict -Werror=never-leak "$FIXTURES/illegal.elisa"
 check -permissive -Wnever-leak "$FIXTURES/illegal.elisa"
 [[ "$status" -eq 0 && "$output" != *"never-leak"* ]] || fail "-permissive must turn the lint off: $output"
 
-echo "never-leak smoke OK: off by default, strict 10 and gentle 5 findings (accumulators included) pinned verbatim, legal and rewritten fixtures clean, fixed.elisa runs on both compilers"
+echo "never-leak smoke OK: off by default, strict 11 and gentle 6 findings (accumulators included) pinned verbatim, legal and rewritten fixtures clean, fixed.elisa runs on both compilers"
