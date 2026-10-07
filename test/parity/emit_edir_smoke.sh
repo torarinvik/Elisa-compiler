@@ -10,7 +10,7 @@ WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/fixtures/edir/arithmetic.elisa"
 # EDIR codec/program versions emitted by ElisaEDIR::Schema.
 EDIR_SCHEMA_VERSION=4
-EDIR_PROGRAM_VERSION=5
+EDIR_PROGRAM_VERSION=8
 export EDIR_SCHEMA_VERSION EDIR_PROGRAM_VERSION
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -19,6 +19,12 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 [[ -f "$RUNTIME" ]] || { echo "emit_edir_smoke FAIL: missing runtime object $RUNTIME" >&2; exit 1; }
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN" ELISA_RUNTIME_OBJ="$RUNTIME"
+NATIVE_CLANG="${ELISA_CLANG:-clang}"
+case "$(uname -s)" in
+  Darwin) NATIVE_LINK_FLAGS=(-Wl,-dead_strip) ;;
+  Linux) NATIVE_LINK_FLAGS=(-no-pie -Wl,--gc-sections) ;;
+  *) echo "emit_edir_smoke FAIL: unsupported native host" >&2; exit 1 ;;
+esac
 
 emit_edir() {
   local source_root="$1" output_path="$2" source_path="$3"
@@ -465,7 +471,7 @@ check_arithmetic_case - 42 40 3 2
 check_arithmetic_case '*' 6 7 11 42
 check_arithmetic_case / 84 2 12 42
 
-# Schema 4 / program version 5 supplies explicit function ranges and direct call targets. This
+# Schema 4 / program version 8 supplies explicit function ranges and direct call targets. This
 # compiler-owned fixture exercises a regular helper call and bounded tail recursion.
 functions_source="$ROOT/test/fixtures/edir/function_calls.elisa"
 functions_artifact="$WORK/function-calls.edir"
