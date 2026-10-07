@@ -105,6 +105,23 @@ lo, hi =
 
 Reading outer bindings needs no capture; mutating one does. A trivial initializer needs no block.
 
+**Early exits.** **[working]** (stage1) A `break` or `continue` inside a block leaves it for the
+enclosing loop, so a guard can sit next to the local it tests. On that path the binding is never
+made, exactly as in the statement form, and the block compiles to the same machine code
+(`test/parity/early_exit_codegen_smoke.sh`):
+
+```elisa
+for value in values:
+    doubled: i64 =
+        tmp: i64 = value * 2
+        continue if tmp < 0
+        tmp + 1
+    sum += doubled
+```
+
+The one block a jump may not leave is one with a `|capture|` header: it writes the captured
+values back only when it ends. stage0 rejects every jump out of a block, so this is stage1 only.
+
 ## 3. region blocks
 
 For statements that bind nothing, `region NAME_scope:` is the scope. Name it `<local>_scope`
@@ -199,6 +216,50 @@ found: usize? =
 ```
 
 If the loop finishes without breaking, `found` is `null`, the initial value.
+
+**Labelled loops.** **[working]** (stage1) `'name:` before a `for` or `while` labels it, and
+`break 'name` / `continue 'name` reach it from any depth, including from a block inside an
+inner loop. On a loop expression, `break 'name VALUE [if COND]` sets its `-> accumulator` and
+leaves it, so a nested search needs no flag:
+
+```elisa
+found: i64 =
+    'rows: for row in 0..<height |hit: i64 = -1| -> hit:
+        for col in 0..<width:
+            break 'rows row * width + col if grid[row][col] == want
+
+'rows: for row in 0..<height:
+    for col in 0..<width:
+        continue 'rows if grid[row][col] == 0
+        sink(grid[row][col])
+```
+
+The label sits on the loop's own line; only loops take one. Both forms compile to the same
+machine code as the `mutable` local with a labelled statement loop
+(`test/fixtures/early_exit_pairs/`).
+
+### Comprehensions
+
+**[working]** A list, dict or set built by one loop is a comprehension. Clauses nest left to
+right, each with an optional `if` filter; later clauses may read earlier binders. Nested clauses
+are stage1 only.
+
+```elisa
+squares: darray[i64] = [num * num for num in numbers if num > 3]
+sums: darray[i64] = [x * 10 + y for x in xs if x > 1 for y in ys]
+lookup: dict[i64, i64] = {x: x * x for x in xs}
+parity: set[i64] = {x % 2 for x in xs}
+pairs = [(x, x * 2) for x in xs]            # unlabeled tuples: fields `_0`, `_1`
+for a, b in pairs:                          # tuples destructure by position
+    sink(a + b)
+```
+
+Prefer a comprehension to an empty `mutable` darray filled by a push loop (the never-leak
+*push loop* kind, section 8, prints the rewrite). It is one immutable binding, and with no filter
+over a range or a darray it allocates the result once instead of growing it push by push.
+Tuple types are named (`darray[(a: i64, b: i64)]`); `darray[(i64, i64)]` is an error, as in
+stage0. Dicts and sets need the stage1 runtime (`include "elisacore_std/elisacore_runtime.elisa"`).
+Bracket-free generators (`sum(x for x in xs)`) do not exist; write a loop expression.
 
 ## 6. Value-threading
 
@@ -405,12 +466,13 @@ Finding kinds:
 | Kind | Meaning | Fix |
 | --- | --- | --- |
 | chain | last use binds another local | nest in a block expression |
-| chain with a loop jump | as chain, but a `break`/`continue` lies between | helper function |
+| chain with a loop jump | as chain, but a `break`/`continue` lies between | nest in a block expression (the jump may leave it); a helper only if the block needs a `|capture|` |
 | plain | last use is a statement with no value | `region` block (section 1) |
 | overlap | a later local declared in the range is needed after it | reorder, then nest |
 | loop | last use is a loop it feeds | move into the loop header |
 | accumulator | a `mutable` local only a loop writes and only later code reads | loop expression (section 5) |
 | value-thread | an owned local changed by a statement-level `push`/`clear`/`put` | `xs <- xs.push(v)` (section 6) |
+| push loop | an empty `mutable` darray only a loop fills with `push` and only later code reads | comprehension (section 5) |
 
 A real diagnostic (`test/fixtures/never_leak/expected-strict.txt`):
 
@@ -438,6 +500,18 @@ own lines, so paste it. The `note:` line appears only in strict mode. Now a `pla
           return count
 ```
 
+A `push loop` one (both levels; `test/fixtures/never_leak/expected-gentle.txt`). The fix replaces
+the named lines, here the declaration and the loop, with the one line it prints:
+
+```text
+illegal.elisa:95: warning: local `squares` is filled by a push loop and stays mutable after it [-Wnever-leak]
+  `squares`: declared `mutable` and empty on line 95; filled only by the loop on lines 96-98, one `squares.push` per element that passes its filter; read only after it (first read: line 99)
+  kind: push loop (a `mutable` darray that starts empty, that only a loop fills with `push`, and that only code after the loop reads)
+  why: once the loop ends `squares` is complete, yet it stays `mutable` and in scope, so any later line could still change it; a comprehension builds the same elements in the same order as one immutable binding, in one expression (over a range or a darray with no filter it also allocates the array once, instead of growing it push by push)
+  fix: replace lines 95-98 with:
+          squares: darray[i64] = [num * num for num in numbers if num > 3]
+```
+
 ## 9. When not to apply the style
 
 - **Borrow-exempt sites.** A buffer backing a live view must stay visible; nesting it would
@@ -451,8 +525,9 @@ own lines, so paste it. The `note:` line appears only in strict mode. Now a `pla
 
 - **Arenas.** A `region` frees what it allocates; do not wrap code whose allocations must
   outlive the scope.
-- **Loop jumps.** A `break`/`continue` between a local and its last use blocks nesting (kind
-  "chain with a loop jump"). Extract a helper function instead of contorting the loop.
+- **Loop jumps into a capture block.** A `break`/`continue` may leave a block expression, but
+  not one with a `|capture|` header (section 2). When nesting would need one, extract a helper
+  function instead of contorting the loop.
 - **Side-effect-only calls and globals** stay plain statements (section 1), in a `region` when
   they have locals.
 
