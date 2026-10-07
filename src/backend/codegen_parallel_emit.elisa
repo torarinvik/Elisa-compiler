@@ -6,9 +6,10 @@
 # for N > 1 workers, the finished, verified module is partitioned by function: defined
 # functions are split into N contiguous runs of roughly equal instruction count, and the
 # process forks a tree of workers, one per run. Each child keeps the bodies of its own run,
-# marks every other definition available_externally (code generation skips it), and
-# writes `<out>.part<k>.o`; the parent then merges the parts with a relocatable link
-# (`ld -r`) into the requested object.
+# marks every other definition available_externally (code generation skips it; an
+# optimising machine erases it instead, see part_restrict_module), and writes
+# `<out>.part<k>.o`; the parent then merges the parts with a relocatable link (`ld -r`)
+# into the requested object.
 #
 # Linkage is rewritten identically in every partition so cross-partition references
 # resolve: a function or mutable/external global with internal or private linkage
@@ -34,6 +35,9 @@ extern LLVMAliasGetAliasee(alias: LLVMValueRef) -> LLVMValueRef
 extern LLVMIsDeclaration(global_value: LLVMValueRef) -> i32
 extern LLVMIsGlobalConstant(global_value: LLVMValueRef) -> i32
 extern LLVMSetVisibility(global_value: LLVMValueRef, visibility: u32) -> void
+extern LLVMHasPersonalityFn(fn: LLVMValueRef) -> i32
+@link_name("LLVMSetPersonalityFn")
+extern elisa_part_clear_personality(fn: LLVMValueRef, personality: LLVMValueRef?) -> void
 @link_name("LLVMSetInitializer")
 extern elisa_part_clear_initializer(global_value: LLVMValueRef, value: LLVMValueRef?) -> void
 
@@ -141,6 +145,13 @@ extend Backend:
             1 return if useful < 1
             useful if useful < jobs else jobs
 
+        # Turn a definition into a declaration. strip_function_body erases every
+        # instruction of every block before deleting any block: deleting block k while a
+        # later block's branch still names it corrupted the heap in every forked child.
+        def part_strip_body(f: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            strip_function_body(f)
+            elisa_part_clear_personality(f, null) if LLVMHasPersonalityFn(f) != 0
+
         # Owner of every function, in module order (-1: not partitioned).
         def part_function_owners(weights: darray[i64]&, total: i64, jobs: i64) -> darray[i64] can[Abort.Panic, Memory.Allocate]:
             owners: mutable darray[i64] = []
@@ -156,7 +167,7 @@ extend Backend:
             owners
 
         # Rewrite the module into partition `part` of `jobs` (runs in the forked child).
-        def part_restrict_module(m: LLVMModuleRef, owners: darray[i64]&, part: i64) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def part_restrict_module(m: LLVMModuleRef, owners: darray[i64]&, part: i64, strip: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             ordinal: mutable i64 = 0
             global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
             while global_opt is global_value |ordinal, global_opt, part|:
@@ -173,11 +184,17 @@ extend Backend:
                 owner: i64 = owners[function_index]
                 if owner >= 0:
                     part_externalize(function, ordinal)
-                    # Another partition's function stays a body the code generator skips
-                    # (MachineFunctionPass never runs on available_externally functions).
-                    # Erasing its body instead touched every page of the module in every
-                    # child (copy-on-write) and was most of each worker's time.
-                    LLVMSetLinkage(function, PART_LINKAGE_AVAILABLE_EXTERNALLY) if owner != part
+                    # Unoptimised: another partition's function stays a body the code
+                    # generator skips (MachineFunctionPass never runs on available_externally
+                    # functions); erasing it instead touched every page of the module in every
+                    # child (copy-on-write) and was most of each worker's time. An optimising
+                    # target machine still runs its IR-level passes (CodeGenPrepare, LSR, ...)
+                    # over every body, so there the body is erased.
+                    if owner != part:
+                        if strip:
+                            part_strip_body(function)
+                        else:
+                            LLVMSetLinkage(function, PART_LINKAGE_AVAILABLE_EXTERNALLY)
                 ordinal <- ordinal + 1
                 function_index <- function_index + 1
                 function_opt <- LLVMGetNextFunction(function)
@@ -193,7 +210,7 @@ extend Backend:
         # one part is left, fork a child for the upper half and keep the lower; then emit
         # the one remaining part and wait for every child this process forked. The exit
         # status is 0 only when this part and every part below it in the tree were written.
-        def part_fork_range(machine: void&, m: LLVMModuleRef, path: cstr, owners: darray[i64]&, first: i64, stop: i64) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def part_fork_range(machine: void&, m: LLVMModuleRef, path: cstr, owners: darray[i64]&, first: i64, stop: i64, strip: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             low: mutable i64 = first
             high: mutable i64 = stop
             kids: mutable darray[i32] = []
@@ -206,7 +223,7 @@ extend Backend:
                 else:
                     kids.push(kid)
                     high <- middle
-            part_restrict_module(m, owners, low)
+            part_restrict_module(m, owners, low, strip)
             child_path: darray[u8] = part_path(path, low)
             ok: mutable bool = emit_object(machine, m, (&child_path[0]).cast[cstr])
             for kid in kids |ok|:
@@ -269,18 +286,20 @@ extend Backend:
 
         # Emit `m` to `path` with `jobs` forked code generators; serial when jobs <= 1.
         # The module is unchanged in the parent.
-        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
-            return emit_object_parallel_status(machine, m, path, requested_jobs, false) == 0
+        # OPTIMIZED: `machine` was configured above -O0 (see part_restrict_module).
+        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, optimized: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+            return emit_object_parallel_status(machine, m, path, requested_jobs, false, optimized) == 0
 
         # emit_object_parallel for a module NOT yet verified: the LLVM verifier runs in the
         # parent while the forked code generators work (it was ~0.8 s of the self-host -O0
         # build on the critical path). 0 = written, 2 = the verifier rejected the module
-        # (its diagnostic is printed; no object is written), 4 = emission failed. A serial
+        # (its diagnostic is printed; no object is written), 4 = emission failed. For an
+        # unoptimised machine only. A serial
         # emission verifies first, exactly as before.
         def emit_object_parallel_verifying(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
-            return emit_object_parallel_status(machine, m, path, requested_jobs, true)
+            return emit_object_parallel_status(machine, m, path, requested_jobs, true, false)
 
-        def emit_object_parallel_status(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, verify: bool) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+        def emit_object_parallel_status(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, verify: bool, optimized: bool) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
             jobs: mutable i64 = requested_jobs
             weights: mutable darray[i64] = []
             total: mutable i64 = 0
@@ -299,7 +318,7 @@ extend Backend:
             children: mutable darray[i32] = []
             root_child: i32 = fork()
             if root_child == 0:
-                part_fork_range(machine, m, path, owners, 0, jobs)
+                part_fork_range(machine, m, path, owners, 0, jobs, optimized)
             children.push(root_child)
             verified: bool = not verify or LLVMVerifyModule(m, PART_VERIFY_PRINT_MESSAGE, null) == 0
             all_ok: mutable bool = verified
