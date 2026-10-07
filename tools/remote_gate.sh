@@ -40,7 +40,9 @@ if [[ "$rhead" != "$head" ]]; then
     git config --global --get-all safe.directory | grep -qx $RDIR || git config --global --add safe.directory $RDIR
     git fetch -q $RDIR.bundle HEAD && git reset -q $head && rm -f $RDIR.bundle"
 fi
-rsync -az --exclude compiler/bin -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
+# A stage0 worktree's .git is a file naming a Mac path; keep the host's own .git then.
+core_git=(); [[ -d "$ELISA_CORE/.git" ]] || core_git=(--exclude .git)
+rsync -az --exclude compiler/bin "${core_git[@]}" -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
 case "$PROFILE" in
   fast) LIST="emit_ast_parity_smoke resolve_smoke diagnostics_smoke diagnostics_diff semantic_internal_diff semantic_acceptance_diff global_permissions_smoke" ;;
   gen3) LIST="self_host_gen3_smoke" ;;
