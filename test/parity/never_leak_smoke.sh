@@ -26,32 +26,51 @@ check "$FIXTURES/illegal.elisa"
 [[ "$output" != *"never-leak"* ]] || fail "the lint ran without being requested: $output"
 
 for legal in legal fixed; do
-    check -Wnever-leak "$FIXTURES/$legal.elisa"
-    [[ "$status" -eq 0 ]] || fail "$legal.elisa exited $status: $output"
-    [[ "$output" != *"[-Wnever-leak]"* ]] || fail "$legal.elisa drew a finding: $output"
+    for flag in -Wnever-leak -Wnever-leak=strict; do
+        check "$flag" "$FIXTURES/$legal.elisa"
+        [[ "$status" -eq 0 ]] || fail "$legal.elisa ($flag) exited $status: $output"
+        [[ "$output" != *"[-Wnever-leak]"* ]] || fail "$legal.elisa drew a finding under $flag: $output"
+    done
 done
 
 export ELISA_STAGE1_NEVER_LEAK_STATS=1
-check -W never-leak "$FIXTURES/illegal.elisa"
-[[ "$status" -eq 0 ]] || fail "a warning must not fail the compile (exit $status): $output"
-rows="$(printf '%s\n' "$output" | awk -F'\t' '$1 == "never-leak-stat" { n = split($2, at, ":"); print $3 "\t" $4 "\t" at[n] }')"
-expected="$(grep -v '^#' "$FIXTURES/expected.tsv")"
-[[ "$rows" == "$expected" ]] || fail "rows differ from expected.tsv:
+for flag in -Wnever-leak -Wnever-leak=strict; do
+    check "$flag" "$FIXTURES/illegal.elisa"
+    [[ "$status" -eq 0 ]] || fail "a warning must not fail the compile ($flag, exit $status): $output"
+    rows="$(printf '%s\n' "$output" | awk -F'\t' '$1 == "never-leak-stat" { n = split($2, at, ":"); print $3 "\t" $4 "\t" at[n] }')"
+    expected="$(grep -v '^#' "$FIXTURES/expected.tsv")"
+    [[ "$rows" == "$expected" ]] || fail "rows ($flag) differ from expected.tsv:
 $(diff <(printf '%s\n' "$expected") <(printf '%s\n' "$rows") || true)"
-warnings="$(printf '%s\n' "$output" | grep -c 'warning: local .* stays visible after its last use \[-Wnever-leak\]' || true)"
-fixes="$(printf '%s\n' "$output" | grep -c '^  fix\|^  no block rewrite' || true)"
-[[ "$warnings" -eq 6 && "$fixes" -ge 6 ]] || fail "expected 6 warnings each with a fix, got $warnings warnings and $fixes fixes"
-[[ "$output" == *"      lol: i64 =
-          bar: i64 = seed + 1
-          baz(bar)
-      sink(lol)"* ]] || fail "the chain rewrite is not the user's own code nested under the binding: $output"
-[[ "$output" == *"while index < limit |index: i64 = 0|:"* ]] || fail "the loop-header rewrite is missing: $output"
+done
 unset ELISA_STAGE1_NEVER_LEAK_STATS
 
-check -Werror=never-leak "$FIXTURES/illegal.elisa"
-[[ "$status" -ne 0 && "$output" == *": error: local"* ]] || fail "-Werror=never-leak must fail the compile (exit $status)"
+# The full text, with the fixture directory stripped from each location.
+expect_text() {
+    local wanted="$1"; shift
+    check "$@" "$FIXTURES/illegal.elisa"
+    [[ "$status" -eq 0 ]] || fail "$* exited $status: $output"
+    text="${output//"$FIXTURES/"/}"
+    [[ "$text" == "$(cat "$FIXTURES/$wanted")" ]] || fail "$* output differs from $wanted:
+$(diff "$FIXTURES/$wanted" <(printf '%s\n' "$text") || true)"
+}
+expect_text expected-strict.txt -Wnever-leak=strict
+expect_text expected-gentle.txt -Wnever-leak
+expect_text expected-gentle.txt -W never-leak
+expect_text expected-gentle.txt -Wnever-leak=gentle
+expect_text expected-strict.txt -W never-leak=strict
+warnings="$(grep -c 'stays visible after its last use \[-Wnever-leak\]' "$FIXTURES/expected-strict.txt")"
+[[ "$warnings" -eq 6 ]] || fail "expected-strict.txt must hold 6 findings, has $warnings"
+warnings="$(grep -c 'stays visible after its last use \[-Wnever-leak\]' "$FIXTURES/expected-gentle.txt")"
+[[ "$warnings" -eq 2 ]] || fail "expected-gentle.txt must hold 2 findings, has $warnings"
+
+for flag in -Werror=never-leak -Werror=never-leak=strict; do
+    check "$flag" "$FIXTURES/illegal.elisa"
+    [[ "$status" -ne 0 && "$output" == *": error: local"* ]] || fail "$flag must fail the compile (exit $status)"
+done
+check -Wnever-leak=strict -Werror=never-leak "$FIXTURES/illegal.elisa"
+[[ "$output" == *"error: local \`bar\`"* ]] || fail "-Werror=never-leak after =strict must stay strict: $output"
 
 check -permissive -Wnever-leak "$FIXTURES/illegal.elisa"
 [[ "$status" -eq 0 && "$output" != *"never-leak"* ]] || fail "-permissive must turn the lint off: $output"
 
-echo "never-leak smoke OK: off by default, 6 findings with rewrites, legal and rewritten fixtures clean"
+echo "never-leak smoke OK: off by default, strict 6 and gentle 2 findings pinned verbatim, legal and rewritten fixtures clean"
