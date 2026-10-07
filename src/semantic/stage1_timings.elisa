@@ -1,0 +1,128 @@
+# ELISA_STAGE1_TIMINGS=1: per-phase wall and CPU time on stderr.
+#
+# `PhaseTimer::mark(name)` closes the phase that ended at this point and prints
+#   stage1-timing: NAME wall_ms=W cpu_ms=C
+# measured since the previous mark (or since `PhaseTimer::start`). `PhaseTimer::minor(name)`
+# closes a fine-grained phase (one semantic pass): it prints only when that phase took at
+# least 20 ms; shorter ones are summed into one "(short passes)" row before the next `mark`.
+# When the variable is unset the first call caches "off" and every later call is one load and
+# a branch, so marks may sit between semantic passes without cost.
+#
+# Lives at top level (not inside `Semantic`) so the driver and the semantic layer share one
+# clock without either depending on the other's module.
+static if ELISA_TARGET_OS_LINUX:
+    module PhaseTimerClock:
+        public:
+            const MONOTONIC: i32 = 1
+            const PROCESS_CPU: i32 = 2
+static else:
+    module PhaseTimerClock:
+        public:
+            const MONOTONIC: i32 = 6
+            const PROCESS_CPU: i32 = 12
+
+@link_name("clock_gettime")
+extern phase_timer_clock_gettime(clock: i32, out: void&) -> i32
+
+@link_name("getenv")
+extern phase_timer_getenv(name: cstr) -> u8&?
+
+# `writev`, not `write`: the runtime already declares `write` with its own types, and a
+# second declaration of one native symbol must match it exactly.
+@link_name("writev")
+extern phase_timer_writev(fd: i32, iov: void&, count: i32) -> i64
+
+# 0 = not yet probed, 1 = disabled, 2 = enabled.
+global mutable phase_timer_state: u8
+global mutable phase_timer_last_wall_ns: i64
+global mutable phase_timer_last_cpu_ns: i64
+global mutable phase_timer_minor_count: i64
+global mutable phase_timer_minor_wall_ns: i64
+global mutable phase_timer_minor_cpu_ns: i64
+
+module PhaseTimer:
+    public:
+        def enabled() -> bool can[Abort.Panic, Memory.Allocate]:
+            if phase_timer_state == 0:
+                phase_timer_state <- 1
+                if phase_timer_getenv("ELISA_STAGE1_TIMINGS") is value:
+                    first: u8 = value
+                    phase_timer_state <- 2 if first != 0 and first != 48
+                if phase_timer_state == 2:
+                    phase_timer_last_wall_ns <- clock_ns(PhaseTimerClock::MONOTONIC)
+                    phase_timer_last_cpu_ns <- clock_ns(PhaseTimerClock::PROCESS_CPU)
+            return phase_timer_state == 2
+
+        # Probe the variable and set the reference point (call once at process start).
+        def start() -> void can[Abort.Panic, Memory.Allocate]:
+            _ = enabled()
+
+        def minor(name: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            return if phase_timer_state == 1
+            return if not enabled()
+            wall: i64 = clock_ns(PhaseTimerClock::MONOTONIC)
+            cpu: i64 = clock_ns(PhaseTimerClock::PROCESS_CPU)
+            wall_spent: i64 = wall - phase_timer_last_wall_ns
+            cpu_spent: i64 = cpu - phase_timer_last_cpu_ns
+            if wall_spent >= 20000000 or cpu_spent >= 20000000:
+                print_row(name, wall_spent, cpu_spent)
+            else:
+                phase_timer_minor_count <- phase_timer_minor_count + 1
+                phase_timer_minor_wall_ns <- phase_timer_minor_wall_ns + wall_spent
+                phase_timer_minor_cpu_ns <- phase_timer_minor_cpu_ns + cpu_spent
+            phase_timer_last_wall_ns <- clock_ns(PhaseTimerClock::MONOTONIC)
+            phase_timer_last_cpu_ns <- clock_ns(PhaseTimerClock::PROCESS_CPU)
+
+        def mark(name: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            return if phase_timer_state == 1
+            return if not enabled()
+            wall: i64 = clock_ns(PhaseTimerClock::MONOTONIC)
+            cpu: i64 = clock_ns(PhaseTimerClock::PROCESS_CPU)
+            if phase_timer_minor_count > 0:
+                print_row("(short passes, each <20ms)", phase_timer_minor_wall_ns, phase_timer_minor_cpu_ns)
+                phase_timer_minor_count <- 0
+                phase_timer_minor_wall_ns <- 0
+                phase_timer_minor_cpu_ns <- 0
+            print_row(name, wall - phase_timer_last_wall_ns, cpu - phase_timer_last_cpu_ns)
+            phase_timer_last_wall_ns <- clock_ns(PhaseTimerClock::MONOTONIC)
+            phase_timer_last_cpu_ns <- clock_ns(PhaseTimerClock::PROCESS_CPU)
+
+    private:
+        def print_row(name: sview, wall_spent: i64, cpu_spent: i64) -> void can[Abort.Panic, Memory.Allocate]:
+            line: mutable darray[u8] = []
+            push_text(line, "stage1-timing: ")
+            push_text(line, name)
+            push_text(line, " wall_ms=")
+            push_millis(line, wall_spent)
+            push_text(line, " cpu_ms=")
+            push_millis(line, cpu_spent)
+            line.push(10)
+            base: uintptr = (&line[0]).cast[uintptr] can Unsafe.PointerCast
+            iov: mutable darray[u64] = [base.u64(), line.count.u64()]
+            raw: void& = (&iov[0]).cast[void&] can Unsafe.PointerCast
+            _ = phase_timer_writev(2, raw, 1)
+
+        def clock_ns(clock: i32) -> i64 can[Abort.Panic, Memory.Allocate]:
+            spec: mutable darray[i64] = [0, 0]
+            raw: void& = (&spec[0]).cast[void&] can Unsafe.PointerCast
+            _ = phase_timer_clock_gettime(clock, raw)
+            return spec[0] * 1000000000 + spec[1]
+
+        def push_text(line: mutable darray[u8]&, text: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            for byte in text |line|:
+                line.push(byte)
+
+        # Milliseconds with one decimal, e.g. 1234.5.
+        def push_millis(line: mutable darray[u8]&, nanos: i64) -> void can[Abort.Panic, Memory.Allocate]:
+            tenths: i64 = (nanos if nanos > 0 else 0) / 100000
+            whole: i64 = tenths / 10
+            digits: mutable darray[u8] = []
+            magnitude: mutable i64 = whole
+            digits.push(48) if magnitude == 0
+            while magnitude > 0 |digits, magnitude|:
+                digits.push((48 + magnitude % 10).u8())
+                magnitude <- magnitude / 10
+            for reverse_index in 0..<digits.count |line, digits|:
+                line.push(digits[digits.count - 1 - reverse_index])
+            line.push(46)
+            line.push((48 + tenths % 10).u8())

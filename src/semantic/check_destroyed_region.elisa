@@ -28,7 +28,10 @@ extend Semantic:
             can Abort.Panic:
                 found: mutable u32 = NO_REGION_BINDING
                 found_line: mutable u32 = 0
-                for annotation_index in 0..<annotations.count |found, found_line, annotations, region, function_line, use_line|:
+                # Only rows on lines function_line..max(function_line, use_line) can match.
+                window_high: u32 = use_line if use_line > function_line else function_line
+                window_end: usize = region_annotation_window_end(annotations, window_high)
+                for annotation_index in region_annotation_window_start(annotations, function_line)..<window_end |found, found_line, annotations, region, function_line, use_line|:
                     annotation: Ast::LocalRegionAnnotation = annotations[annotation_index]
                     is_function_param: bool = annotation.name == "__region_param" and annotation.line == function_line
                     is_open_region: bool = annotation.name == "__region_local" and annotation.line >= function_line and annotation.line <= use_line and (annotation.end_line == 0 or use_line <= annotation.end_line)
@@ -189,16 +192,18 @@ extend Semantic:
                         return ""
 
 
-        # Match a qualified call against the full module owner recorded on a summary.
-        # Do not reduce paths to a basename: aliases and same-leaf modules must not share
-        # effects. Unresolved aliases simply fail this comparison and remain opaque.
-        # A statement `match` (not `return match`): the arm's local path arrays need a region,
-        # which an expression arm cannot give them.
-        def destroyed_direct_call_matches_module(callee: Ast::Expr, owner: sview, summary_names: darray[sview]&, summary_formals: darray[sview]&) -> bool:
+        # The module path a qualified call names, or false when the call must stay opaque.
+        # Callers match it against the full module owner recorded on a summary with
+        # module_symbol_matches. Do not reduce paths to a basename: aliases and same-leaf
+        # modules must not share effects; unresolved aliases fail that comparison and remain
+        # opaque. The path depends only on the callee, so a caller testing many summary rows
+        # computes it once (the alias scan below walks every row; doing it per row was
+        # quadratic in the summary count). A statement `match` (not `return match`): the
+        # arm's local path arrays need a region, which an expression arm cannot give them.
+        def destroyed_direct_call_module_path(callee: Ast::Expr, summary_names: darray[sview]&, summary_formals: darray[sview]&, module_names: mutable darray[sview]&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match callee:
                     Expr.Scope(scope_base, _, _):
-                        module_names: mutable darray[sview] = []
                         module_dotted: mutable darray[bool] = []
                         false return if not type_path_collect(scope_base, module_names, module_dotted) or module_names.count == 0 or (any separator_is_dot in module_dotted where separator_is_dot)
                         # Alias facts are represented as reserved rows in the summary table.
@@ -210,11 +215,32 @@ extend Semantic:
                         for alias_row in 0..<summary_names.count |module_names, summary_names, summary_formals|:
                             if summary_names[alias_row] == "__destroyed_region_module_alias__" and alias_row * 2 < summary_formals.count and summary_formals[alias_row * 2] == module_names[0]:
                                 return false
-                        return module_symbol_matches(owner, "", module_names, 0, module_names.count)
+                        return true
                     Expr.Index(base, _, _) | Expr.IndexN(base, _, _) | Expr.Paren(base, _) | Expr.Move(base, _):
-                        return destroyed_direct_call_matches_module(base, owner, summary_names, summary_formals)
+                        return destroyed_direct_call_module_path(base, summary_names, summary_formals, module_names)
                     _:
                         return false
+
+
+        # Summary rows by name: (name hash -> first/last row) plus a per-row next link, so
+        # each chain lists its rows in ascending order. Every summary consumer used to scan
+        # all rows per call site (rows ~ functions in the unit, so quadratic per pass);
+        # following the chain visits exactly the rows a full scan would act on, in the same
+        # order. A chain may hold other names with the same hash: callers still compare names.
+        def destroyed_summary_index_push(name: sview, row: usize, summary_row_heads: mutable dict[u64, u32]&, summary_row_tails: mutable dict[u64, u32]&, summary_row_next: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                hash: u64 = name_hash(name)
+                summary_row_next.push(SYMBOL_INDEX_ROW_NONE)
+                tail_row: u32 = found_tail if summary_row_tails.get(hash) is found_tail else SYMBOL_INDEX_ROW_NONE
+                if tail_row != SYMBOL_INDEX_ROW_NONE:
+                    summary_row_next[tail_row.usize()] <- row.u32()
+                else:
+                    summary_row_heads <- summary_row_heads.put(hash, row.u32())
+                summary_row_tails <- summary_row_tails.put(hash, row.u32())
+
+        def destroyed_summary_first_row(summary_row_heads: dict[u64, u32]&, name: sview) -> u32:
+            can Abort.Panic:
+                return head if summary_row_heads.get(name_hash(name)) is head else SYMBOL_INDEX_ROW_NONE
 
 
         def destroyed_direct_call_is_qualified(callee: Ast::Expr) -> bool:
@@ -374,7 +400,11 @@ extend Semantic:
 
         def function_regions_of_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, function_line: u32, use_line: u32, out: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for annotation in annotations |out|:
+                # Only rows on lines function_line..use_line can match.
+                window_start: usize = region_annotation_window_start(annotations, function_line)
+                window_end: usize = region_annotation_window_end(annotations, use_line)
+                for annotation_index in window_start..<(window_end if window_end > window_start else window_start) |out, annotations, name, function_line, use_line|:
+                    annotation: Ast::LocalRegionAnnotation = annotations[annotation_index]
                     # A type with no region of its own depends on none (see local_region_annotation_of).
                     is_local_value: bool = annotation.name == name and annotation.line >= function_line and annotation.line <= use_line and not local_type_cannot_carry_region(annotation.type_expression)
                     binding_id: u32 = region_binding_id_at(annotations, annotation.region, function_line, annotation.line) if is_local_value and annotation.region != "" else NO_REGION_BINDING
@@ -386,7 +416,10 @@ extend Semantic:
         def function_region_of_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, function_line: u32, use_line: u32) -> sview:
             can Abort.Panic:
                 found: mutable sview = ""
-                for annotation in annotations |found|:
+                window_start: usize = region_annotation_window_start(annotations, function_line)
+                window_end: usize = region_annotation_window_end(annotations, use_line)
+                for annotation_index in window_start..<(window_end if window_end > window_start else window_start) |found, annotations, name, function_line, use_line|:
+                    annotation: Ast::LocalRegionAnnotation = annotations[annotation_index]
                     is_local_value: bool = annotation.name == name and annotation.line >= function_line and annotation.line <= use_line and not local_type_cannot_carry_region(annotation.type_expression)
                     found <- annotation.region if is_local_value
                 return found
@@ -1037,7 +1070,7 @@ extend Semantic:
         # function-valued local/parameter. Its body is opaque at this call site, so passing
         # a known Arena owner is an invalidation boundary even when the callback name itself
         # is not statically tied to a reset helper.
-        def destroyed_apply_unresolved_owner_call(operation: sview, callee: Ast::Expr, arguments: darray[Ast::Expr], summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, local_function_names: darray[sview]&, external_names: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, use_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&) -> void:
+        def destroyed_apply_unresolved_owner_call(operation: sview, callee: Ast::Expr, arguments: darray[Ast::Expr], summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, summary_row_heads: dict[u64, u32]&, summary_row_tails: dict[u64, u32]&, summary_row_next: darray[u32]&, local_function_names: darray[sview]&, external_names: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, use_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 is_builtin_arena_operation: bool = operation == "arena_free" or operation == "arena_reset" or operation == "arena_rewind"
                 return if is_builtin_arena_operation
@@ -1060,8 +1093,14 @@ extend Semantic:
                 callee_qualified: bool = destroyed_direct_call_is_qualified(callee)
                 is_known_definition: mutable bool = false
                 if callee_qualified:
-                    for summary_index in 0..<summary_names.count |is_known_definition, summary_names, summary_params, summary_formals, operation, callee|:
-                        is_known_definition <- true if summary_names[summary_index] == operation and summary_index < summary_params.count and summary_index * 2 < summary_formals.count and destroyed_direct_call_matches_module(callee, summary_formals[summary_index * 2], summary_names, summary_formals)
+                    callee_module_names: mutable darray[sview] = []
+                    callee_has_module_path: bool = destroyed_direct_call_module_path(callee, summary_names, summary_formals, callee_module_names)
+                    if callee_has_module_path:
+                        summary_index_chain: mutable u32 = destroyed_summary_first_row(summary_row_heads, operation)
+                        while summary_index_chain != SYMBOL_INDEX_ROW_NONE |summary_index_chain, is_known_definition, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, operation, callee_module_names, summary_row_next|:
+                            summary_index: usize = summary_index_chain.usize()
+                            is_known_definition <- true if summary_names[summary_index] == operation and summary_index < summary_params.count and summary_index * 2 < summary_formals.count and module_symbol_matches(summary_formals[summary_index * 2], "", callee_module_names, 0, callee_module_names.count)
+                            summary_index_chain <- summary_row_next[summary_index]
                 else:
                     is_known_definition <- any local_name in local_function_names where local_name == operation
                 # Extern summaries currently have no module-owner column. A qualified
@@ -1104,7 +1143,7 @@ extend Semantic:
                             pass
 
 
-        def destroyed_summary_collect_expression(expression: Ast::Expr, params: darray[Ast::ParamDecl]&, alias_names: darray[sview]&, alias_params: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, out: mutable darray[u32]&) -> void:
+        def destroyed_summary_collect_expression(expression: Ast::Expr, params: darray[Ast::ParamDecl]&, alias_names: darray[sview]&, alias_params: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, summary_row_heads: dict[u64, u32]&, summary_row_tails: dict[u64, u32]&, summary_row_next: darray[u32]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, out: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
@@ -1123,10 +1162,14 @@ extend Semantic:
                                 if sources.count == 0:
                                     for parameter_index in 0..<params.count |out, params|:
                                         out.push(parameter_index.u32()) if destroyed_type_is_arena_reference(params[parameter_index].type_expression) and not any existing in out where existing == parameter_index.u32()
-                        for summary_index in 0..<summary_names.count |out, summary_names, summary_params, summary_formals, operation, called_qualified, callee, arguments, argument_names, params, alias_names, alias_params|:
+                        called_module_names: mutable darray[sview] = []
+                        called_has_module_path: bool = called_qualified and destroyed_direct_call_module_path(callee, summary_names, summary_formals, called_module_names)
+                        summary_index_chain: mutable u32 = destroyed_summary_first_row(summary_row_heads, operation)
+                        while summary_index_chain != SYMBOL_INDEX_ROW_NONE |summary_index_chain, out, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, operation, called_qualified, callee, called_module_names, called_has_module_path, arguments, argument_names, params, alias_names, alias_params, summary_row_next|:
+                            summary_index: usize = summary_index_chain.usize()
                             row_owner: sview = summary_formals[summary_index * 2] if summary_index * 2 < summary_formals.count else ""
                             row_formal: sview = summary_formals[summary_index * 2 + 1] if summary_index * 2 + 1 < summary_formals.count else ""
-                            owner_matches: bool = destroyed_direct_call_matches_module(callee, row_owner, summary_names, summary_formals) if called_qualified else true
+                            owner_matches: bool = not called_qualified or (summary_names[summary_index] == operation and called_has_module_path and module_symbol_matches(row_owner, "", called_module_names, 0, called_module_names.count))
                             if summary_names[summary_index] == operation and owner_matches and summary_index < summary_params.count and summary_index * 2 + 1 < summary_formals.count:
                                 if summary_params[summary_index] == NO_ARENA_SUMMARY_PARAM:
                                     out.push(NO_ARENA_SUMMARY_PARAM) if not any existing in out where existing == NO_ARENA_SUMMARY_PARAM
@@ -1145,6 +1188,7 @@ extend Semantic:
                                     else:
                                         for parameter_index in 0..<params.count |out, params|:
                                             out.push(parameter_index.u32()) if destroyed_type_is_arena_reference(params[parameter_index].type_expression) and not any existing in out where existing == parameter_index.u32()
+                            summary_index_chain <- summary_row_next[summary_index]
                         # A bare parameter name in callee position is a callable by the time
                         # this pass runs. Do not re-parse its fn type here: parser type nodes
                         # have multiple legal wrappers, and missing this effect would let a
@@ -1172,9 +1216,9 @@ extend Semantic:
                                 if not is_known_local and not is_known_external:
                                     for parameter_index in forwarded |out|:
                                         out.push(parameter_index) if not any existing in out where existing == parameter_index
-                        destroyed_summary_collect_expression(callee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(callee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
                         # Candidate handler bodies are not yet represented in the local
                         # function-summary table. They may mutate an arena captured by the
@@ -1185,105 +1229,105 @@ extend Semantic:
                             destroyed_summary_source_parameters(destroyed_arena_owner_source_name(argument), params, alias_names, alias_params, sources)
                             for parameter_index in sources |out|:
                                 out.push(parameter_index) if not any existing in out where existing == parameter_index
-                        destroyed_summary_collect_expression(effect_type, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(effect_type, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Slice(object, low, high, line):
-                        destroyed_summary_collect_expression(object, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(low, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(high, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(object, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(low, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(high, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.IndexN(object, arguments, line):
-                        destroyed_summary_collect_expression(object, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(object, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        for argument in arguments |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(argument, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.RegionNew(inner, _, line):
-                        destroyed_summary_collect_expression(inner, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(inner, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Paren(inner, line) | Expr.Move(inner, line) | Expr.Unary(operator, inner, line):
-                        destroyed_summary_collect_expression(inner, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(inner, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
-                        for element in elements |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(element, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        for element in elements |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(element, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.DictLit(entries, line):
-                        for entry in entries |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(entry.key, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_expression(entry.value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        for entry in entries |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(entry.key, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(entry.value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Construct(type_expression, fields, line):
-                        destroyed_summary_collect_expression(type_expression, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        for field in fields |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(field.value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(type_expression, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        for field in fields |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(field.value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.RecordUpdate(base, fields, line):
-                        destroyed_summary_collect_expression(base, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        for field in fields |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(field.value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(base, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        for field in fields |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(field.value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.If(condition, then_value, else_value, line):
-                        destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(then_value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(else_value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(then_value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(else_value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
-                        destroyed_summary_collect_expression(scrutinee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        for arm in arms |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                            destroyed_summary_collect_expression(arm.guard, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_statements(arm.body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(scrutinee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        for arm in arms |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                            destroyed_summary_collect_expression(arm.guard, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_statements(arm.body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Comprehension(variable, iterable, condition, body, line):
-                        destroyed_summary_collect_expression(iterable, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(iterable, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Refinement(base, predicate, line):
-                        destroyed_summary_collect_expression(base, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(predicate, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(base, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(predicate, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.GetElse(guarded, recovery, line):
-                        destroyed_summary_collect_expression(guarded, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_statements(recovery, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(guarded, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_statements(recovery, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Block(statements, value, captures, line):
-                        destroyed_summary_collect_statements(statements, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_statements(statements, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Binary(left, operator, right, line) | Expr.Index(left, right, line):
-                        destroyed_summary_collect_expression(left, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                        destroyed_summary_collect_expression(right, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(left, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(right, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     Expr.Field(object, field, line) | Expr.Scope(object, field, line):
-                        destroyed_summary_collect_expression(object, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                        destroyed_summary_collect_expression(object, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                     _:
                         pass
 
 
-        def destroyed_summary_collect_statements(statements: darray[Ast::Stmt], params: darray[Ast::ParamDecl]&, alias_names: darray[sview]&, alias_params: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, out: mutable darray[u32]&) -> void:
+        def destroyed_summary_collect_statements(statements: darray[Ast::Stmt], params: darray[Ast::ParamDecl]&, alias_names: darray[sview]&, alias_params: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, summary_row_heads: dict[u64, u32]&, summary_row_tails: dict[u64, u32]&, summary_row_next: darray[u32]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, out: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
+                for statement in statements |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
                     match statement:
                         Stmt.Expr(expression, line):
-                            destroyed_summary_collect_expression(expression, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(expression, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.Block(kind, clause, binding, body, line):
-                            destroyed_summary_collect_statements(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_statements(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            destroyed_summary_collect_expression(value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.Assign(target, operator, value, line):
-                            destroyed_summary_collect_expression(target, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_expression(value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(target, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(value, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.If(condition, then_body, else_body, line):
-                            destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_statements(then_body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_statements(else_body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_statements(then_body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_statements(else_body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.While(condition, body, line):
-                            destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_statements(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(condition, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_statements(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.For(bind, variables, iterable, body, line):
-                            destroyed_summary_collect_expression(iterable, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            destroyed_summary_collect_statements(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(iterable, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_statements(body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.Return(value, line):
-                            destroyed_summary_collect_expression(returned, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out) if value is returned
+                            destroyed_summary_collect_expression(returned, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out) if value is returned
                         Stmt.Match(scrutinee, arms, line):
-                            destroyed_summary_collect_expression(scrutinee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
-                            for arm in arms |params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out|:
-                                destroyed_summary_collect_statements(arm.body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(scrutinee, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
+                            for arm in arms |params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out|:
+                                destroyed_summary_collect_statements(arm.body, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         Stmt.Contract(kind, expression, line):
-                            destroyed_summary_collect_expression(expression, params, alias_names, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, out)
+                            destroyed_summary_collect_expression(expression, params, alias_names, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, out)
                         _:
                             pass
 
 
-        def destroyed_collect_arena_invalidation_summaries(declarations: darray[Ast::Decl], module_name: sview, summary_names: mutable darray[sview]&, summary_params: mutable darray[u32]&, summary_formals: mutable darray[sview]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, changed: mutable bool&) -> void:
+        def destroyed_collect_arena_invalidation_summaries(declarations: darray[Ast::Decl], module_name: sview, summary_names: mutable darray[sview]&, summary_params: mutable darray[u32]&, summary_formals: mutable darray[sview]&, summary_row_heads: mutable dict[u64, u32]&, summary_row_tails: mutable dict[u64, u32]&, summary_row_next: mutable darray[u32]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, changed: mutable bool&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, changed|:
+                for declaration in declarations |summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, changed|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
                             # Scan every body. Function type aliases and wrappers may hide a
@@ -1297,36 +1341,44 @@ extend Semantic:
                                 collect_aliases <- false
                                 destroyed_summary_collect_aliases(body, params, aliases, alias_params, collect_aliases)
                             invalidated: mutable darray[u32] = []
-                            destroyed_summary_collect_statements(body, params, aliases, alias_params, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, invalidated)
+                            destroyed_summary_collect_statements(body, params, aliases, alias_params, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, invalidated)
                             if invalidated.count == 0:
                                 known: mutable bool = false
-                                for row in 0..<summary_names.count |known, summary_names, summary_params, summary_formals, name, module_name|:
+                                row_chain: mutable u32 = destroyed_summary_first_row(summary_row_heads, name)
+                                while row_chain != SYMBOL_INDEX_ROW_NONE |row_chain, known, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, name, module_name, summary_row_next|:
+                                    row: usize = row_chain.usize()
                                     known <- true if summary_names[row] == name and row < summary_params.count and row * 2 + 1 < summary_formals.count and summary_formals[row * 2] == module_name
+                                    row_chain <- summary_row_next[row]
                                 if not known:
+                                    destroyed_summary_index_push(name, summary_names.count, summary_row_heads, summary_row_tails, summary_row_next)
                                     summary_names.push(name)
                                     summary_params.push(NO_ARENA_SUMMARY_EFFECT)
                                     summary_formals.push(module_name)
                                     summary_formals.push("")
                                     changed <- true
-                            for parameter_index in invalidated |summary_names, summary_params, summary_formals, name, module_name, changed|:
+                            for parameter_index in invalidated |summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, name, module_name, changed|:
                                 exists: mutable bool = false
-                                for row in 0..<summary_names.count |exists, summary_names, summary_params, summary_formals, name, module_name, parameter_index|:
+                                row_chain: mutable u32 = destroyed_summary_first_row(summary_row_heads, name)
+                                while row_chain != SYMBOL_INDEX_ROW_NONE |row_chain, exists, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, name, module_name, parameter_index, summary_row_next|:
+                                    row: usize = row_chain.usize()
                                     exists <- true if summary_names[row] == name and row < summary_params.count and row * 2 + 1 < summary_formals.count and summary_formals[row * 2] == module_name and summary_params[row] == parameter_index
+                                    row_chain <- summary_row_next[row]
                                 if not exists:
+                                    destroyed_summary_index_push(name, summary_names.count, summary_row_heads, summary_row_tails, summary_row_next)
                                     summary_names.push(name)
                                     summary_params.push(parameter_index)
                                     summary_formals.push(module_name)
                                     summary_formals.push("") if parameter_index == NO_ARENA_SUMMARY_PARAM else summary_formals.push(params[parameter_index.usize()].name)
                                     changed <- true
                         Decl.Module(name, body, line):
-                            destroyed_collect_arena_invalidation_summaries(body, name, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, changed)
+                            destroyed_collect_arena_invalidation_summaries(body, name, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, changed)
                         Decl.Scoped(body, line):
-                            destroyed_collect_arena_invalidation_summaries(body, module_name, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, changed)
+                            destroyed_collect_arena_invalidation_summaries(body, module_name, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, changed)
                         _:
                             pass
 
 
-        def destroyed_apply_arena_invalidation(expression: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, use_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&) -> void:
+        def destroyed_apply_arena_invalidation(expression: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, use_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, summary_row_heads: dict[u64, u32]&, summary_row_tails: dict[u64, u32]&, summary_row_next: darray[u32]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
@@ -1347,10 +1399,14 @@ extend Semantic:
                             # owners beyond its explicit arguments. Without a callable effect
                             # proof, invalidate all tracked regions conservatively.
                             destroyed_push_all(destroyed)
-                        for summary_index in 0..<summary_names.count |summary_names, summary_params, summary_formals, operation, called_qualified, callee, arguments, argument_names, annotations, function_line, use_line, destroyed, alias_ids, alias_roots|:
+                        called_module_names: mutable darray[sview] = []
+                        called_has_module_path: bool = called_qualified and destroyed_direct_call_module_path(callee, summary_names, summary_formals, called_module_names)
+                        summary_index_chain: mutable u32 = destroyed_summary_first_row(summary_row_heads, operation)
+                        while summary_index_chain != SYMBOL_INDEX_ROW_NONE |summary_index_chain, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, operation, called_qualified, callee, called_module_names, called_has_module_path, arguments, argument_names, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_row_next|:
+                            summary_index: usize = summary_index_chain.usize()
                             row_owner: sview = summary_formals[summary_index * 2] if summary_index * 2 < summary_formals.count else ""
                             row_formal: sview = summary_formals[summary_index * 2 + 1] if summary_index * 2 + 1 < summary_formals.count else ""
-                            owner_matches: bool = destroyed_direct_call_matches_module(callee, row_owner, summary_names, summary_formals) if called_qualified else true
+                            owner_matches: bool = not called_qualified or (summary_names[summary_index] == operation and called_has_module_path and module_symbol_matches(row_owner, "", called_module_names, 0, called_module_names.count))
                             if summary_names[summary_index] == operation and owner_matches and summary_index < summary_params.count and summary_index * 2 + 1 < summary_formals.count:
                                 if summary_params[summary_index] == NO_ARENA_SUMMARY_PARAM:
                                     # The callee invokes an unknown function parameter. Its
@@ -1370,112 +1426,113 @@ extend Semantic:
                                             destroyed_push_all(destroyed)
                                     else:
                                         destroyed_push_all(destroyed)
+                            summary_index_chain <- summary_row_next[summary_index]
                         destroyed_apply_opaque_external_invalidation(operation, arguments, argument_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, annotations, function_line, use_line, destroyed, alias_ids, alias_roots)
-                        destroyed_apply_unresolved_owner_call(operation, callee, arguments, summary_names, summary_params, summary_formals, local_function_names, opaque_function_names, annotations, function_line, use_line, destroyed, alias_ids, alias_roots)
-                        destroyed_apply_arena_invalidation(callee, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_unresolved_owner_call(operation, callee, arguments, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, opaque_function_names, annotations, function_line, use_line, destroyed, alias_ids, alias_roots)
+                        destroyed_apply_arena_invalidation(callee, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
                         # The selected handler can reset storage through an installation
                         # capture, which is invisible among the operation's explicit args.
                         # Until candidate effect summaries are part of the semantic facts,
                         # fail closed for all tracked arena dependencies.
                         destroyed_push_all(destroyed)
-                        destroyed_apply_arena_invalidation(effect_type, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(effect_type, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Slice(object, low, high, line):
-                        destroyed_apply_arena_invalidation(object, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(low, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(high, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(object, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(low, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(high, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.IndexN(object, arguments, line):
-                        destroyed_apply_arena_invalidation(object, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(object, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for argument in arguments |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(argument, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.RegionNew(inner, _, line):
-                        destroyed_apply_arena_invalidation(inner, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(inner, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Paren(inner, line) | Expr.Move(inner, line) | Expr.Unary(operator, inner, line):
-                        destroyed_apply_arena_invalidation(inner, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(inner, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
-                        for element in elements |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(element, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for element in elements |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(element, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.DictLit(entries, line):
-                        for entry in entries |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(entry.key, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation(entry.value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for entry in entries |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(entry.key, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(entry.value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Construct(type_expression, fields, line):
-                        destroyed_apply_arena_invalidation(type_expression, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        for field in fields |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(field.value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(type_expression, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for field in fields |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(field.value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.RecordUpdate(base, fields, line):
-                        destroyed_apply_arena_invalidation(base, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        for field in fields |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(field.value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(base, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for field in fields |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(field.value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.If(condition, then_value, else_value, line):
-                        destroyed_apply_arena_invalidation(condition, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(then_value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(else_value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(condition, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(then_value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(else_value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
-                        destroyed_apply_arena_invalidation(scrutinee, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        for arm in arms |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                            destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation_statements(arm.body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(scrutinee, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        for arm in arms |annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                            destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(arm.body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Comprehension(variable, iterable, condition, body, line):
-                        destroyed_apply_arena_invalidation(iterable, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(condition, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(body, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(iterable, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(condition, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(body, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Refinement(base, predicate, line):
-                        destroyed_apply_arena_invalidation(base, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(predicate, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(base, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(predicate, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.GetElse(guarded, recovery, line):
-                        destroyed_apply_arena_invalidation(guarded, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation_statements(recovery, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(guarded, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation_statements(recovery, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Block(statements, value, captures, line):
-                        destroyed_apply_arena_invalidation_statements(statements, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation_statements(statements, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(value, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Binary(left, operator, right, line) | Expr.Index(left, right, line):
-                        destroyed_apply_arena_invalidation(left, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                        destroyed_apply_arena_invalidation(right, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(left, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(right, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     Expr.Field(object, field, line) | Expr.Scope(object, field, line):
-                        destroyed_apply_arena_invalidation(object, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                        destroyed_apply_arena_invalidation(object, annotations, function_line, use_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                     _:
                         pass
 
 
-        def destroyed_apply_arena_invalidation_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&) -> void:
+        def destroyed_apply_arena_invalidation_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, destroyed: mutable darray[u32]&, alias_ids: darray[u32]&, alias_roots: darray[u32]&, summary_names: darray[sview]&, summary_params: darray[u32]&, summary_formals: darray[sview]&, summary_row_heads: dict[u64, u32]&, summary_row_tails: dict[u64, u32]&, summary_row_next: darray[u32]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                for statement in statements |annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
                     match statement:
                         Stmt.Block("destroy", clause, binding, body, position):
                             binding_id: u32 = region_binding_id_at(annotations, clause[0], function_line, position.line) if clause.count > 0 else NO_REGION_BINDING
                             destroyed_mark_region_binding(destroyed, binding_id, alias_ids, alias_roots) if clause.count > 0
-                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.Block(kind, clause, binding, body, position):
-                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.Expr(expression, position) | Stmt.VarDecl(_, _, expression, position):
-                            destroyed_apply_arena_invalidation(expression, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(expression, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.Assign(target, operator, value, position):
-                            destroyed_apply_arena_invalidation(target, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation(value, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(target, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(value, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.If(condition, then_body, else_body, position):
-                            destroyed_apply_arena_invalidation(condition, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation_statements(then_body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation_statements(else_body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(condition, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(then_body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(else_body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.While(condition, body, position):
-                            destroyed_apply_arena_invalidation(condition, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(condition, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.For(bind, variables, iterable, body, position):
-                            destroyed_apply_arena_invalidation(iterable, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(iterable, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation_statements(body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.Return(value, position):
-                            destroyed_apply_arena_invalidation(returned, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params) if value is returned
+                            destroyed_apply_arena_invalidation(returned, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params) if value is returned
                         Stmt.Match(scrutinee, arms, position):
-                            destroyed_apply_arena_invalidation(scrutinee, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            for arm in arms |annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
-                                destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                                destroyed_apply_arena_invalidation_statements(arm.body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(scrutinee, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            for arm in arms |annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params|:
+                                destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                                destroyed_apply_arena_invalidation_statements(arm.body, annotations, function_line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         Stmt.Contract(kind, expression, position):
-                            destroyed_apply_arena_invalidation(expression, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(expression, annotations, function_line, position.line, destroyed, alias_ids, alias_roots, summary_names, summary_params, summary_formals, summary_row_heads, summary_row_tails, summary_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                         _:
                             pass
 
@@ -1635,7 +1692,7 @@ extend Semantic:
         # state. Its captured locals keep their enclosing provenance, while lambda
         # parameters shadow same-named enclosing locals. Effects inside the body must be
         # ordered against reads there; they must not be applied at closure construction.
-        def destroyed_validate_lambda_body(lambda_params: darray[sview]&, lambda_body: darray[Ast::Stmt]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, view_fns: darray[sview]&, params: darray[Ast::ParamDecl]&, function_line: u32, borrow_names: darray[sview]&, borrow_regions: darray[u32]&, lambda_dep_names: darray[sview]&, lambda_dep_regions: darray[u32]&, arena_owner_alias_ids: darray[u32]&, arena_owner_alias_roots: darray[u32]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+        def destroyed_validate_lambda_body(lambda_params: darray[sview]&, lambda_body: darray[Ast::Stmt]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, view_fns: darray[sview]&, params: darray[Ast::ParamDecl]&, function_line: u32, borrow_names: darray[sview]&, borrow_regions: darray[u32]&, lambda_dep_names: darray[sview]&, lambda_dep_regions: darray[u32]&, arena_owner_alias_ids: darray[u32]&, arena_owner_alias_roots: darray[u32]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, arena_invalidation_row_heads: dict[u64, u32]&, arena_invalidation_row_tails: dict[u64, u32]&, arena_invalidation_row_next: darray[u32]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 scoped_annotations: mutable darray[Ast::LocalRegionAnnotation] = []
                 for annotation in annotations:
@@ -1664,7 +1721,7 @@ extend Semantic:
                         scoped_alias_ids.push(alias_id)
                         scoped_alias_roots.push(arena_owner_alias_roots[alias_index]) if alias_index < arena_owner_alias_roots.count
                 scoped_destroyed: mutable darray[u32] = []
-                table <- walk_destroyed_region_statements(lambda_body, scoped_annotations, allocation_regions, allocation_lines, view_fns, scoped_params, function_line, scoped_destroyed, scoped_borrow_names, scoped_borrow_regions, scoped_lambda_dep_names, scoped_lambda_dep_regions, scoped_alias_ids, scoped_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
+                table <- walk_destroyed_region_statements(lambda_body, scoped_annotations, allocation_regions, allocation_lines, view_fns, scoped_params, function_line, scoped_destroyed, scoped_borrow_names, scoped_borrow_regions, scoped_lambda_dep_names, scoped_lambda_dep_regions, scoped_alias_ids, scoped_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
 
         def diagnose_destroyed_expression(expression: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, destroyed: darray[u32]&, borrow_names: darray[sview]&, borrow_regions: darray[u32]&, lambda_dep_names: darray[sview]&, lambda_dep_regions: darray[u32]&, function_line: u32, line: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -1756,7 +1813,7 @@ extend Semantic:
                     return region_binding_name(region_id, annotations) if region_id != DESTROYED_REGION_ALL
                 return "unknown"
 
-        def walk_destroyed_region_statements(statements: darray[Ast::Stmt]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, view_fns: darray[sview]&, params: darray[Ast::ParamDecl]&, function_line: u32, destroyed: mutable darray[u32]&, borrow_names: mutable darray[sview]&, borrow_regions: mutable darray[u32]&, lambda_dep_names: mutable darray[sview]&, lambda_dep_regions: mutable darray[u32]&, arena_owner_alias_ids: mutable darray[u32]&, arena_owner_alias_roots: mutable darray[u32]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, branch_sensitive: bool, table: lmut SymbolTable) -> void:
+        def walk_destroyed_region_statements(statements: darray[Ast::Stmt]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, view_fns: darray[sview]&, params: darray[Ast::ParamDecl]&, function_line: u32, destroyed: mutable darray[u32]&, borrow_names: mutable darray[sview]&, borrow_regions: mutable darray[u32]&, lambda_dep_names: mutable darray[sview]&, lambda_dep_regions: mutable darray[u32]&, arena_owner_alias_ids: mutable darray[u32]&, arena_owner_alias_roots: mutable darray[u32]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, arena_invalidation_row_heads: dict[u64, u32]&, arena_invalidation_row_tails: dict[u64, u32]&, arena_invalidation_row_next: darray[u32]&, local_function_names: darray[sview]&, local_reference_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, branch_sensitive: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |destroyed, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, table|:
                     match statement:
@@ -1767,7 +1824,7 @@ extend Semantic:
                             destroyed_register_arena_owner_alias(name, value, annotations, params, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
                             local_callable_invocation: bool = destroyed_is_local_callable_invocation(value, local_reference_names)
                             table <- diagnose_destroyed_expression(value, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if local_callable_invocation
-                            destroyed_apply_arena_invalidation(value, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(value, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             allocation_region: sview = allocation_region_at(allocation_regions, allocation_lines, line.line)
                             allocation_region_id: u32 = region_binding_id_at(annotations, allocation_region, function_line, line.line) if allocation_region != "" else NO_REGION_BINDING
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DestroyedRegionUse, name: name, pos: Ast::expr_pos(value), line: line.line, expected: "allocate", actual: region_binding_name(allocation_region_id, annotations)}) if allocation_region_id != NO_REGION_BINDING and destroyed_region_id_contains(destroyed, allocation_region_id)
@@ -1788,7 +1845,7 @@ extend Semantic:
                             match value:
                                 Expr.Lambda(lambda_params, lambda_body, lambda_line):
                                     destroyed_register_lambda_dependencies(name, lambda_params, lambda_body, annotations, borrow_names, borrow_regions, destroyed, function_line, line.line, lambda_dep_names, lambda_dep_regions)
-                                    table <- destroyed_validate_lambda_body(lambda_params, lambda_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
+                                    table <- destroyed_validate_lambda_body(lambda_params, lambda_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
                                 _:
                                     destroyed_copy_lambda_dependencies(name, value, lambda_dep_names, lambda_dep_regions)
                             if destroyed_type_is_callable_binding(type_expression, table) and not any dependency_name in lambda_dep_names where dependency_name == name:
@@ -1798,17 +1855,17 @@ extend Semantic:
                                 unknown_region: u32 = UNKNOWN_LAMBDA_DEPENDENCY if source_name == "" or not is_known_function and not is_known_external else NO_REGION_BINDING
                                 destroyed_add_lambda_dependency(name, unknown_region, lambda_dep_names, lambda_dep_regions)
                         Stmt.Assign(target, operator, value, line):
-                            destroyed_apply_arena_invalidation(target, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(target, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             local_callable_invocation: bool = destroyed_is_local_callable_invocation(value, local_reference_names)
                             table <- diagnose_destroyed_expression(value, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if local_callable_invocation
-                            destroyed_apply_arena_invalidation(value, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(value, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             destroyed_rebind_arena_owner_alias(destroyed_use_root_name(target), value, annotations, function_line, line.line, branch_sensitive, destroyed, arena_owner_alias_ids, arena_owner_alias_roots) if operator == TokenKind.LArrow
                             table <- diagnose_destroyed_expression(value, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if not local_callable_invocation
                             target_name: sview = destroyed_use_root_name(target)
                             match value:
                                 Expr.Lambda(lambda_params, lambda_body, lambda_line):
                                     destroyed_register_lambda_dependencies(target_name, lambda_params, lambda_body, annotations, borrow_names, borrow_regions, destroyed, function_line, line.line, lambda_dep_names, lambda_dep_regions)
-                                    table <- destroyed_validate_lambda_body(lambda_params, lambda_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
+                                    table <- destroyed_validate_lambda_body(lambda_params, lambda_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
                                 _:
                                     destroyed_copy_lambda_dependencies(target_name, value, lambda_dep_names, lambda_dep_regions)
                             source_name: sview = destroyed_lambda_alias_source(value)
@@ -1832,25 +1889,25 @@ extend Semantic:
                         Stmt.Expr(expression, line):
                             local_callable_invocation: bool = destroyed_is_local_callable_invocation(expression, local_reference_names)
                             table <- diagnose_destroyed_expression(expression, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if local_callable_invocation
-                            destroyed_apply_arena_invalidation(expression, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(expression, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             table <- diagnose_destroyed_expression(expression, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if not local_callable_invocation
                         Stmt.Return(value, line):
                             local_callable_invocation: bool = destroyed_is_local_callable_invocation(returned, local_reference_names) if value is returned else false
                             table <- diagnose_destroyed_expression(returned, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if value is returned and local_callable_invocation
-                            destroyed_apply_arena_invalidation(returned, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params) if value is returned
+                            destroyed_apply_arena_invalidation(returned, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params) if value is returned
                             table <- diagnose_destroyed_expression(returned, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table) if value is returned and not local_callable_invocation
                         Stmt.If(condition, then_body, else_body, line):
                             table <- diagnose_destroyed_expression(condition, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
-                            destroyed_apply_arena_invalidation(condition, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(condition, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             if arena_owner_alias_ids.count != arena_owner_alias_roots.count:
                                 destroyed_push_all(destroyed)
-                                table <- walk_destroyed_region_statements(then_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
-                                table <- walk_destroyed_region_statements(else_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
+                                table <- walk_destroyed_region_statements(then_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
+                                table <- walk_destroyed_region_statements(else_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
                             else:
                                 base_alias_ids: mutable darray[u32] = []
                                 base_alias_roots: mutable darray[u32] = []
                                 destroyed_copy_owner_alias_roots(arena_owner_alias_ids, arena_owner_alias_roots, destroyed, base_alias_ids, base_alias_roots)
-                                table <- walk_destroyed_region_statements(then_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
+                                table <- walk_destroyed_region_statements(then_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
                                 then_result_ids: mutable darray[u32] = []
                                 then_result_roots: mutable darray[u32] = []
                                 destroyed_copy_owner_alias_roots(arena_owner_alias_ids, arena_owner_alias_roots, destroyed, then_result_ids, then_result_roots)
@@ -1859,7 +1916,7 @@ extend Semantic:
                                 for base_index in 0..<base_alias_ids.count |base_alias_ids, base_alias_roots, arena_owner_alias_ids, arena_owner_alias_roots|:
                                     arena_owner_alias_ids.push(base_alias_ids[base_index])
                                     arena_owner_alias_roots.push(base_alias_roots[base_index]) if base_index < base_alias_roots.count
-                                table <- walk_destroyed_region_statements(else_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
+                                table <- walk_destroyed_region_statements(else_body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
                                 for then_index in 0..<then_result_ids.count |then_result_ids, then_result_roots, destroyed, arena_owner_alias_ids, arena_owner_alias_roots|:
                                     if then_index < then_result_roots.count:
                                         destroyed_add_arena_owner_alias_root(then_result_ids[then_index], then_result_roots[then_index], destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
@@ -1873,20 +1930,20 @@ extend Semantic:
                                             destroyed_push_all(destroyed)
                         Stmt.While(condition, body, line):
                             table <- diagnose_destroyed_expression(condition, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
-                            destroyed_apply_arena_invalidation(condition, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
+                            destroyed_apply_arena_invalidation(condition, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
                             # The next loop test occurs after a body execution and may read
                             # through a view invalidated in that body.
                             table <- diagnose_destroyed_expression(condition, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
                         Stmt.For(bind, variables, iterable, body, line):
                             table <- diagnose_destroyed_expression(iterable, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
-                            destroyed_apply_arena_invalidation(iterable, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
+                            destroyed_apply_arena_invalidation(iterable, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, true, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, branch_sensitive, table)
+                            table <- walk_destroyed_region_statements(body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, branch_sensitive, table)
                         Stmt.Match(scrutinee, arms, line):
                             table <- diagnose_destroyed_expression(scrutinee, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
-                            destroyed_apply_arena_invalidation(scrutinee, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(scrutinee, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             base_alias_ids: mutable darray[u32] = []
                             base_alias_roots: mutable darray[u32] = []
                             merged_alias_ids: mutable darray[u32] = []
@@ -1901,8 +1958,8 @@ extend Semantic:
                                     arena_owner_alias_roots.clear()
                                     destroyed_copy_owner_alias_roots(base_alias_ids, base_alias_roots, destroyed, arena_owner_alias_ids, arena_owner_alias_roots)
                                     table <- diagnose_destroyed_expression(arm.guard, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
-                                    destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
-                                    table <- walk_destroyed_region_statements(arm.body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, branch_sensitive, table)
+                                    destroyed_apply_arena_invalidation(arm.guard, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                                    table <- walk_destroyed_region_statements(arm.body, annotations, allocation_regions, allocation_lines, view_fns, params, function_line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, branch_sensitive, table)
                                     if destroyed_statements_terminate(arm.body):
                                         # This arm returns; its invalidation facts are
                                         # unreachable after the match and must not poison
@@ -1922,12 +1979,12 @@ extend Semantic:
                                     else:
                                         destroyed_push_all(destroyed)
                         Stmt.Contract(kind, expression, line):
-                            destroyed_apply_arena_invalidation(expression, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
+                            destroyed_apply_arena_invalidation(expression, annotations, function_line, line.line, destroyed, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params)
                             table <- diagnose_destroyed_expression(expression, annotations, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, function_line, line.line, table)
                         _:
                             pass
 
-        def check_destroyed_region_declarations(declarations: darray[Ast::Decl], file: Ast::File&, view_fns: darray[sview]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
+        def check_destroyed_region_declarations(declarations: darray[Ast::Decl], file: Ast::File&, view_fns: darray[sview]&, arena_invalidation_names: darray[sview]&, arena_invalidation_params: darray[u32]&, arena_invalidation_formals: darray[sview]&, arena_invalidation_row_heads: dict[u64, u32]&, arena_invalidation_row_tails: dict[u64, u32]&, arena_invalidation_row_next: darray[u32]&, local_function_names: darray[sview]&, opaque_function_names: darray[sview]&, opaque_function_starts: darray[usize]&, opaque_function_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
@@ -1953,11 +2010,11 @@ extend Semantic:
                                     if parameter_regions.count == 0 and destroyed_type_is_pool_owner_or_handle(parameter.type_expression):
                                         borrow_names.push(parameter.name)
                                         borrow_regions.push(UNKNOWN_REGION_DEPENDENCY)
-                            table <- walk_destroyed_region_statements(body, file.local_region_annotations, file.allocation_region_names, file.allocation_region_lines, view_fns, params, line.line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
+                            table <- walk_destroyed_region_statements(body, file.local_region_annotations, file.allocation_region_names, file.allocation_region_lines, view_fns, params, line.line, destroyed, borrow_names, borrow_regions, lambda_dep_names, lambda_dep_regions, arena_owner_alias_ids, arena_owner_alias_roots, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, local_reference_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, false, table)
                         Decl.Module(name, body, line):
-                            table <- check_destroyed_region_declarations(body, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
+                            table <- check_destroyed_region_declarations(body, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
                         Decl.Scoped(body, line):
-                            table <- check_destroyed_region_declarations(body, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
+                            table <- check_destroyed_region_declarations(body, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, extern_params, table)
                         _:
                             pass
 
@@ -1975,8 +2032,12 @@ extend Semantic:
                 # Retain module-alias spellings beside summary rows so qualified calls
                 # through aliases cannot accidentally match a different module's owner.
                 # Duplicate aliases remain represented; either way, matching fails closed.
-                for annotation in table.protocol_annotations:
+                arena_invalidation_row_heads: mutable dict[u64, u32] = {}
+                arena_invalidation_row_tails: mutable dict[u64, u32] = {}
+                arena_invalidation_row_next: mutable darray[u32] = []
+                for annotation in table.protocol_annotations |arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next|:
                     if annotation.name == "__using_alias":
+                        destroyed_summary_index_push("__destroyed_region_module_alias__", arena_invalidation_names.count, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next)
                         arena_invalidation_names.push("__destroyed_region_module_alias__")
                         arena_invalidation_params.push(NO_ARENA_SUMMARY_PARAM)
                         arena_invalidation_formals.push(annotation.owner)
@@ -1985,7 +2046,7 @@ extend Semantic:
                 destroyed_collect_local_function_names(file.top_decls, local_function_names)
                 destroyed_collect_opaque_function_signatures(file.top_decls, opaque_function_names, opaque_function_starts, opaque_function_arities)
                 summaries_changed: mutable bool = true
-                while summaries_changed |summaries_changed, file, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities|:
+                while summaries_changed |summaries_changed, file, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities|:
                     summaries_changed <- false
-                    destroyed_collect_arena_invalidation_summaries(file.top_decls, "", arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, summaries_changed)
-                table <- check_destroyed_region_declarations(file.top_decls, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, file.extern_params, table)
+                    destroyed_collect_arena_invalidation_summaries(file.top_decls, "", arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, opaque_function_names, summaries_changed)
+                table <- check_destroyed_region_declarations(file.top_decls, file, view_fns, arena_invalidation_names, arena_invalidation_params, arena_invalidation_formals, arena_invalidation_row_heads, arena_invalidation_row_tails, arena_invalidation_row_next, local_function_names, opaque_function_names, opaque_function_starts, opaque_function_arities, file.extern_params, table)
