@@ -221,6 +221,68 @@ extend Backend:
             # counterpart of stage0's GenerateLLVMIRWithOpt family; callers choose the exact
             # pipeline string (for example, `default<O2>`), while the target machine supplies
             # the module's target-specific legality and cost model. LLVM returns NULL on success.
+        # Give the runtime's AST-record lookup an available_externally body so an optimising
+        # pipeline can inline it. `ctx_aos_store_record(state, index)` is linked from the
+        # runtime object (runtime_external_only); every packed-AST field read calls it, and as
+        # an opaque call it cost ~9 instructions plus the call per read (~7% of the self-host
+        # semantic gate). The body below is the runtime's own code, instruction for
+        # instruction, on its 64-bit PackedAoSStore layout -- chunks.data at 0, chunks.count
+        # at 8, record_bytes at 32, 256 records per chunk; an out-of-range chunk traps as the
+        # bounds check does there. available_externally keeps the linked definition
+        # authoritative: the optimiser drops this copy after inlining, and unoptimised builds
+        # never see it (their objects are unchanged).
+        def inline_aos_store_record(m: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if LLVMGetNamedFunction(m, "ctx_aos_store_record") is record_fn:
+                inline_aos_store_record_body(m, record_fn)
+
+
+        def inline_aos_store_record_body(m: LLVMModuleRef, record_fn: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if LLVMIsDeclaration(record_fn) == 0 or LLVMCountParams(record_fn) != 2
+            state: LLVMValueRef = LLVMGetParam(record_fn, 0)
+            record_index: LLVMValueRef = LLVMGetParam(record_fn, 1)
+            # LLVMPointerTypeKind = 12, LLVMIntegerTypeKind = 8.
+            return if LLVMGetTypeKind(LLVMTypeOf(state)) != 12 or LLVMGetTypeKind(LLVMTypeOf(record_index)) != 8
+            return if LLVMGetIntTypeWidth(LLVMTypeOf(record_index)) != 64
+            ctx: LLVMContextRef = LLVMGetModuleContext(m)
+            i8_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+            i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+            entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, record_fn, "entry")
+            in_range: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, record_fn, "in.range")
+            out_of_range: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, record_fn, "out.of.range")
+            LLVMPositionBuilderAtEnd(builder, entry)
+            chunk_index: LLVMValueRef = LLVMBuildLShr(builder, record_index, LLVMConstInt(i64_type, 8, 0), "chunk.index")
+            count_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 8, 0)]
+            count_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i8_type, state, (&count_offset[0]).cast[void&], 1, "chunks.count.ptr")
+            chunk_count: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, count_pointer, "chunks.count")
+            # LLVMIntUGE = 35.
+            outside: LLVMValueRef = LLVMBuildICmp(builder, 35, chunk_index, chunk_count, "chunk.outside")
+            _ = LLVMBuildCondBr(builder, outside, out_of_range, in_range)
+            LLVMPositionBuilderAtEnd(builder, out_of_range)
+            trap_name: sview = "llvm.trap"
+            trap_storage: mutable darray[u8] = []
+            trap_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(trap_name, trap_storage), sview_len(trap_name))
+            trap_fn: LLVMValueRef = LLVMGetIntrinsicDeclaration(m, trap_id, null, 0)
+            trap_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            _ = LLVMBuildCall2(builder, trap_type, trap_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, in_range)
+            data: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, state, "chunks.data")
+            slot_index: mutable darray[LLVMValueRef] = [chunk_index]
+            slot_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i64_type, data, (&slot_index[0]).cast[void&], 1, "chunk.slot")
+            chunk_base: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, slot_pointer, "chunk.base")
+            record_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 32, 0)]
+            record_bytes_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i8_type, state, (&record_offset[0]).cast[void&], 1, "record.bytes.ptr")
+            record_bytes: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, record_bytes_pointer, "record.bytes")
+            in_chunk: LLVMValueRef = LLVMBuildAnd(builder, record_index, LLVMConstInt(i64_type, 255, 0), "in.chunk")
+            offset: LLVMValueRef = LLVMBuildMul(builder, in_chunk, record_bytes, "record.offset")
+            address: LLVMValueRef = LLVMBuildAdd(builder, chunk_base, offset, "record.address")
+            _ = LLVMBuildRet(builder, LLVMBuildIntToPtr(builder, address, pointer_type, "record"))
+            LLVMDisposeBuilder(builder)
+            LLVMSetLinkage(record_fn, PART_LINKAGE_AVAILABLE_EXTERNALLY)
+
+
         def run_optimization(machine: void&, m: LLVMModuleRef, pipeline: sview) -> bool can[Abort.Panic, Memory.Allocate]:
             pipeline_storage: mutable darray[u8] = []
             options: LLVMPassBuilderOptionsRef = LLVMCreatePassBuilderOptions()
