@@ -11,7 +11,9 @@
 #   - stage1 builds both files and both programs exit 0;
 #   - stage0 builds and runs the `&` form, as the oracle for the expected exit. stage0 has no
 #     value-threading (it rejects the write to an immutable parameter), so the value forms are
-#     stage1-only;
+#     stage1-only. The builtin pairs on dicts and `remove_at` include the stage1 runtime
+#     (elisacore_std/elisacore_runtime.elisa), which stage0 rejects, so those are stage1-only
+#     entirely; the smoke names them;
 #   - stage1 compiles the two files to IDENTICAL machine code at -O0 and at -O2. This is the
 #     promise behind the form: the values are only threaded through, never copied.
 set -euo pipefail
@@ -32,6 +34,7 @@ ulimit -c 0 || true
 disassemble() { objdump -d --no-show-raw-insn "$1" | sed -n '/^Disassembly/,$p'; }
 
 pairs=0
+stage1_only=""
 for value in "$PAIRS"/*_value.elisa; do
     name="$(basename "$value" _value.elisa)"
     ref="$PAIRS/${name}_ref.elisa"
@@ -42,9 +45,13 @@ for value in "$PAIRS"/*_value.elisa; do
         "$WORK/$base.s1" || fail "$base (stage1) exited $?"
     done
     base="$(basename "$ref" .elisa)"
-    "$STAGE0" -emit c-archive -O2 -o "$WORK/$base.a" "$ref" >"$WORK/$base.log" 2>&1 || fail "stage0 failed to build $base: $(cat "$WORK/$base.log")"
-    clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$base.s0" "$WORK/$base.a" >"$WORK/$base.log" 2>&1 || fail "could not link stage0 $base: $(cat "$WORK/$base.log")"
-    "$WORK/$base.s0" || fail "$base (stage0) exited $?"
+    if grep -q '^include .*elisacore_runtime.elisa' "$ref"; then
+        stage1_only="$stage1_only $name"
+    else
+        "$STAGE0" -emit c-archive -O2 -o "$WORK/$base.a" "$ref" >"$WORK/$base.log" 2>&1 || fail "stage0 failed to build $base: $(cat "$WORK/$base.log")"
+        clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/$base.s0" "$WORK/$base.a" >"$WORK/$base.log" 2>&1 || fail "could not link stage0 $base: $(cat "$WORK/$base.log")"
+        "$WORK/$base.s0" || fail "$base (stage0) exited $?"
+    fi
     for level in -O0 -O2; do
         bash "$WRAPPER" "$level" -emit obj -o "$WORK/value.o" "$value" >"$WORK/obj.log" 2>&1 || fail "stage1 $level obj of ${name}_value: $(cat "$WORK/obj.log")"
         bash "$WRAPPER" "$level" -emit obj -o "$WORK/ref.o" "$ref" >"$WORK/obj.log" 2>&1 || fail "stage1 $level obj of ${name}_ref: $(cat "$WORK/obj.log")"
@@ -55,5 +62,5 @@ $(diff "$WORK/value.s" "$WORK/ref.s" | head -30)"
     done
     pairs=$((pairs + 1))
 done
-[[ "$pairs" -ge 7 ]] || fail "expected at least 7 pairs, found $pairs"
-echo "value threading codegen smoke OK: $pairs pairs, identical machine code at -O0 and -O2 (stage0 runs the & forms)"
+[[ "$pairs" -ge 13 ]] || fail "expected at least 13 pairs, found $pairs"
+echo "value threading codegen smoke OK: $pairs pairs, identical machine code at -O0 and -O2 (stage0 runs the & forms except the stage1-only:$stage1_only)"

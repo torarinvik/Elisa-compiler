@@ -44,6 +44,6 @@ text="${output//"$FIXTURES/"/}"
 [[ "$text" == "$(cat "$FIXTURES/expected.txt")" ]] || fail "illegal.elisa output differs from expected.txt:
 $(diff "$FIXTURES/expected.txt" <(printf '%s\n' "$text") || true)"
 findings="$(grep -c '^illegal.elisa:' "$FIXTURES/expected.txt" || true)"
-[[ "$findings" -eq 5 ]] || fail "expected.txt must hold 5 findings, has $findings"
+[[ "$findings" -eq 6 ]] || fail "expected.txt must hold 6 findings, has $findings"
 
 echo "value threading smoke OK: legal and fixed check clean and run at -O0/-O2, illegal.elisa's $findings findings pinned verbatim"

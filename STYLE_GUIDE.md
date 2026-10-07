@@ -275,6 +275,34 @@ def main() -> i64:
     return 0 if filled.count == 4 and grown.count == 4 else 1
 ```
 
+**Builtin containers.** The in-place container methods have value forms too. Each compiles
+to the same machine code as the in-place statement (the builtin pairs in
+`test/fixtures/value_threading_pairs/`):
+
+| Value form | In-place form |
+|---|---|
+| `xs <- xs.push(v)` | `xs.push(v)` |
+| `xs <- xs.clear()` | `xs.clear()` |
+| `xs, last <- xs.pop()` | `last <- xs.pop()` |
+| `xs, item <- xs.remove_at(i)` | `item <- xs.remove_at(i)` |
+| `d <- d.put(k, v)` | `d.put(k, v)` |
+| `d, found <- d.remove(k)` | `found <- d.remove(k)` |
+
+```elisa
+def main() -> i64:
+    xs: mutable darray[i64] = []
+    for i in 0..<5 |xs|:
+        xs <- xs.push(i)
+    last: mutable i64 = 0
+    xs, last <- xs.pop()
+    return 0 if last == 4 and xs.count == 4 else 1
+```
+
+The two-result forms need the container itself as the first target: `ys, last <- xs.pop()`
+is rejected with both spellings (the last error below). `remove_at` and dicts need the stage1 runtime
+(`include "elisacore_std/elisacore_runtime.elisa"`). stage1 has no in-place `insert` on a
+`darray` yet, so it has no value form either.
+
 **The errors.** Each names the rewrite in your own names
 (`test/fixtures/value_threading/expected.txt`):
 
@@ -284,6 +312,7 @@ illegal.elisa:19:35-42: "s.items" is reached through the borrow "s" (s: State&),
 illegal.elisa:24:35-42: "s.items" is a field of "s"; moving it into "push_one", which takes it by value and hands it back, would leave "s" incomplete; put the result back in the same statement: s.items <- push_one(s.items, 3)
 illegal.elisa:28:35-43: global "registry" cannot be moved into "push_one", which takes it by value and hands it back; put the result back in the same statement: registry <- push_one(registry, 4)
 illegal.elisa:34:12-15: "arr" was moved into "push_one" at illegal.elisa:33:35-38 (which takes it by value and hands back the updated value) and cannot be used afterwards; use the call's result, or keep "arr" by writing arr <- push_one(arr, 5)
+illegal.elisa:40:5-7: `ys, last <- xs.pop()` would update "xs" in place and leave its first target unchanged: the two-result form threads the container itself, so its first target must be "xs"; write xs, last <- xs.pop(), or last <- xs.pop()
 ```
 
 `&` stays for data reached through borrows (`s: State&`), arenas, side-effect-only functions,
