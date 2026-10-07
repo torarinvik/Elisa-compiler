@@ -158,8 +158,11 @@ The header binding is mutable inside the loop and invisible after it.
 A loop with a `-> yield` header is an expression; its result is the captures at loop exit, and
 zero iterations yield the initial values. A bare `for`/`while` in value position is an error.
 Loop expressions exist on main (see `test/differential/cases/loop_break_value.elisa`).
-**[working]** The never-leak *accumulator* finding kind that nudges you toward them is
-**[in progress]** on branch `claude/never-leak-accumulator`; the style itself is usable now.
+**[working]** The never-leak *accumulator* finding kind points you to these sites, and the
+scoped form compiles to the same machine code as the `mutable` + loop form at -O0 and -O2
+(`test/parity/loop_value_codegen_smoke.sh`). Gentle mode and `-Werror=never-leak` report only
+accumulators with a rewrite; `-Wnever-leak=strict` also lists candidates no rewrite fits, with the
+exact reason (read inside the loop, changed after it, not a scalar, outer `break`/`continue`).
 
 Prefer:
 
@@ -270,7 +273,7 @@ Finding kinds:
 | plain | last use is a statement with no value | `region` block (section 1) |
 | overlap | a later local declared in the range is needed after it | reorder, then nest |
 | loop | last use is a loop it feeds | move into the loop header |
-| accumulator | **[in progress]** fold loop fed by a local | loop expression (section 5) |
+| accumulator | a `mutable` local only a loop writes and only later code reads | loop expression (section 5) |
 
 A real diagnostic (`test/fixtures/never_leak/expected-strict.txt`):
 
