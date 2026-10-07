@@ -26,7 +26,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 7
+PROGRAM_VERSION = 8
 INSTRUCTION_COUNT = 4
 FUNCTION_COUNT = 2
 LOCAL_COUNT = 1
@@ -79,7 +79,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 7
+PROGRAM_VERSION = 8
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -125,7 +125,7 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 7
+PROGRAM_VERSION = 8
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
@@ -161,10 +161,10 @@ assert struct.unpack_from("<I", data, function_count_offset)[0] == FUNCTION_COUN
 PY
 done
 
-for read_operation in read_byte try_read_byte; do
+for read_operation in read_byte try_read_byte try_close try_reopen; do
 for optimization in 0 2; do
   VIRTUAL_FILE_FIXTURE="$ROOT/test/fixtures/edir/host_virtual_file_read.elisa"
-  [[ "$read_operation" == try_read_byte ]] && VIRTUAL_FILE_FIXTURE="$ROOT/test/fixtures/edir/host_virtual_file_try_read_byte.elisa"
+  if [[ "$read_operation" != read_byte ]]; then VIRTUAL_FILE_FIXTURE="$ROOT/test/fixtures/edir/host_virtual_file_$read_operation.elisa"; fi
   artifact="$WORK/host-virtual-file-read-O$optimization.edir"
   ELISA_EDIR_SOURCE_ROOT="$ROOT" ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir "-O$optimization" -o "$artifact" "$VIRTUAL_FILE_FIXTURE"
   python3 - "$artifact" "$VIRTUAL_FILE_FIXTURE" "$read_operation" <<'PY'
@@ -173,13 +173,13 @@ import struct
 import sys
 
 SCHEMA = 4
-PROGRAM_VERSION = 7
+PROGRAM_VERSION = 8
 INSTRUCTION_COUNT = 2
 FUNCTION_COUNT = 1
 LOCAL_COUNT = 0
 HAS_RETURN = 1
 SOURCE_FILE_COUNT = 1
-OPCODE_VIRTUAL_FILE_READ_BYTE = 27 if sys.argv[3] == "try_read_byte" else 24
+OPCODE_VIRTUAL_FILE_READ_BYTE = {"read_byte":24,"try_read_byte":27,"try_close":30,"try_reopen":31}[sys.argv[3]]
 OPCODE_RETURN = 19
 RESOURCE_HANDLE = 7
 NO_OPERAND = 0
@@ -226,7 +226,7 @@ artifact, source = map(Path, sys.argv[1:3])
 operation = sys.argv[3]
 data = artifact.read_bytes()
 schema, version, count, locals_count = struct.unpack_from("<IIQQ", data)
-assert (schema, version, count, locals_count) == (4, 7, 2, 0)
+assert (schema, version, count, locals_count) == (4, 8, 2, 0)
 header = 29 + 36 + struct.unpack_from("<I", data, 29 + 32)[0]
 expected = {"write_byte": (25, 7, 255), "seek": (26, 7, 2), "try_write_byte": (28, 7, 255), "try_seek": (29, 7, 2)}[operation]
 assert struct.unpack_from("<Hqq", data, header) == expected
@@ -270,13 +270,16 @@ for operation in write_byte try_write_byte; do
   fi
   test ! -s "$WORK/reject.edir"
 done
+for operation in try_read_byte try_close try_reopen; do
 for call in '()' '(0)' '(-1)' '(1, 2)' '(handle: 1)'; do
   fixture="$WORK/reject-read.elisa"
-  printf '%s\n' 'module DebuggerHostEffects:' '    extern virtual_file_try_read_byte(handle: i64) -> i64 can[IO]' '' 'def main() -> i64 can[IO]:' "    return DebuggerHostEffects::virtual_file_try_read_byte$call" > "$fixture"
+  printf '%s\n' 'module DebuggerHostEffects:' "    extern virtual_file_$operation(handle: i64) -> i64 can[IO]" '' 'def main() -> i64 can[IO]:' "    return DebuggerHostEffects::virtual_file_$operation$call" > "$fixture"
   if ELISA_ALLOW_STALE_STAGE1=0 bash "$WRAPPER" -emit edir -O0 -o "$WORK/reject.edir" "$fixture" > "$WORK/reject.log" 2>&1; then
-    echo "unexpectedly accepted try-read $call" >&2; exit 1
+    echo "unexpectedly accepted $operation $call" >&2; exit 1
   fi
   test ! -s "$WORK/reject.edir"
+done
+
 done
 
 echo "emit_edir_host_effect_smoke OK: namespaced clock/random/console/virtual-file calls lower at O0 and O2 with source identity"
