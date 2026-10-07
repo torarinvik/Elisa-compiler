@@ -36,6 +36,27 @@ Generated-code quality is never traded for compile speed.
 | 8648f223 (baseline + timings), stage0 seed | 857.9 | - | - | - | 315 (idle box, reported) | 1182 (idle box, reported) | ~10 |
 | 42aedbe6 (indexed scans), stage0 seed | 27.6 | - | - | - | - | - | ~7 |
 | + sorted view-origin rows, stage1-built | 23.8 | 41.5 | 137.3 | 0.06 | 21.2 | 21.4 | 4-10 |
+| + region-annotation windows, owned-candidate chains | 22.9 | - | - | - | - | - | ~8 |
+| + ref_pos offset chains | 21.3 | 44.2 | 135.9 | 0.055 | 20.9 | 21.3 | ~8 |
+| + field/declared-name/generic-instance/scope-owner indexes | 20.4 | 36.8 | 134.1 | 0.058 | 19.4 | 19.5 | 5-20 |
+
+Box timings are noisy (other agents share it): the same `-emit ast` run measured 66 s and
+10 s minutes apart. Compare rows only by phase CPU times when the difference is small.
+
+## Where the time goes now (last row)
+
+- `-emit check` 20.4 s: ~400 semantic passes, each walking the whole AST; no single pass
+  above 1.6 s (region_storage_stability 1.5, borrow_after_move ~1.0, resolve_declarations
+  0.9, destroyed_region 0.55, call_holder_view_store 0.54). The remaining gap to 2 s is
+  structural (pass count x AST walks, `ctx_aos_store_record` AST reads ~6% of
+  instructions), not one quadratic loop: it needs fused walks / shared facts.
+- `-O0` 36.8 s: frontend ~20, LLVM IR generation 9.2 (const/struct/enum/generic
+  `*_index_of` linear lookups are the next visible items), verify 0.8, emit ~5.
+- `-O2` 134 s: LLVM's module O2 pipeline is 93 s, single-threaded. Splitting it per
+  partition would change inlining across partitions, i.e. generated code, so it is not
+  done.
+- `-emit ast` on a unit that includes the semantic layer takes ~10 s: a separate
+  quadratic in the AST printer (`emit_ast_decl`), not yet addressed.
 
 Phase detail at the last row (-O2): parse 1.2, lex 0.33, semantic ~19 (largest passes:
 region_storage_stability 3.0, destroyed_region 1.0, borrow_after_move 1.0,
