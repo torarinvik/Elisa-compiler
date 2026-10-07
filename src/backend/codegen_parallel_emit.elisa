@@ -27,6 +27,9 @@
 extern fork() -> i32
 extern waitpid(pid: i32, status: mutable i32&, options: i32) -> i32
 extern _exit(status: i32) -> void
+extern setpgid(pid: i32, pgid: i32) -> i32
+@link_name("kill")
+extern kill_backend(pid: i32, signal: i32) -> i32
 extern LLVMGetFirstGlobal(m: LLVMModuleRef) -> LLVMValueRef?
 extern LLVMGetNextGlobal(global_value: LLVMValueRef) -> LLVMValueRef?
 extern LLVMGetFirstGlobalAlias(m: LLVMModuleRef) -> LLVMValueRef?
@@ -50,6 +53,7 @@ extend Backend:
         const PART_VISIBILITY_HIDDEN: u32 = 1
         # LLVMPrintMessageAction: print the verifier's diagnostic to stderr and return.
         const PART_VERIFY_PRINT_MESSAGE: i32 = 1
+        const PART_SIGKILL: i32 = 9
         # Instructions per forked emitter below which another worker costs more than it saves.
         const PART_MIN_WEIGHT_PER_JOB: i64 = 20000
 
@@ -290,9 +294,9 @@ extend Backend:
         def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, optimized: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
             return emit_object_parallel_status(machine, m, path, requested_jobs, false, optimized) == 0
 
-        # emit_object_parallel for a module NOT yet verified: the LLVM verifier runs in the
-        # parent while the forked code generators work (it was ~0.8 s of the self-host -O0
-        # build on the critical path). 0 = written, 2 = the verifier rejected the module
+        # emit_object_parallel for a module NOT yet verified: the LLVM verifier runs first,
+        # before any worker forks (overlapping it with the workers let rejected IR reach
+        # instruction selection). 0 = written, 2 = the verifier rejected the module
         # (its diagnostic is printed; no object is written), 4 = emission failed. For an
         # unoptimised machine only. A serial
         # emission verifies first, exactly as before.
@@ -307,8 +311,10 @@ extend Backend:
                 weights <- part_function_weights(m)
                 total <- part_total_weight(weights)
                 jobs <- part_effective_jobs(total, requested_jobs)
+            # Verify before any worker forks: instruction selection over IR the verifier rejects
+            # can crash or hang LLVM, and a hung worker would block the waitpid below.
+            2 return if verify and LLVMVerifyModule(m, PART_VERIFY_PRINT_MESSAGE, null) != 0
             if jobs <= 1:
-                2 return if verify and LLVMVerifyModule(m, PART_VERIFY_PRINT_MESSAGE, null) != 0
                 0 return if emit_object(machine, m, path)
                 return 4
             owners: darray[i64] = part_function_owners(weights, total, jobs)
@@ -317,11 +323,14 @@ extend Backend:
             # from the parent put ~2 s before the last worker started.
             children: mutable darray[i32] = []
             root_child: i32 = fork()
+            # The worker tree gets its own process group, so a failure can stop every worker,
+            # orphans of a dead mid-tree worker included, before the part files are unlinked.
             if root_child == 0:
+                _ = setpgid(0, 0)
                 part_fork_range(machine, m, path, owners, 0, jobs, optimized)
+            _ = setpgid(root_child, root_child) if root_child > 0
             children.push(root_child)
-            verified: bool = not verify or LLVMVerifyModule(m, PART_VERIFY_PRINT_MESSAGE, null) == 0
-            all_ok: mutable bool = verified
+            all_ok: mutable bool = true
             for child in children |all_ok|:
                 if child < 0:
                     all_ok <- false
@@ -329,6 +338,7 @@ extend Backend:
                     status: mutable i32 = 0
                     waited: i32 = waitpid(child, &status, 0)
                     all_ok <- false if waited != child or status != 0
+            _ = kill_backend(0 - root_child, PART_SIGKILL) if not all_ok and root_child > 0
             command: mutable darray[u8] = []
             if getenv("ELISA_LD") is linker_text:
                 part_push_cstr(command, linker_text.cast[cstr])
@@ -353,7 +363,6 @@ extend Backend:
             for part in 0..<jobs.usize() |path|:
                 part_file: darray[u8] = part_path(path, part.i64())
                 _ = unlink_backend((&part_file[0]).cast[cstr])
-            2 return if not verified
             0 return if all_ok
             return 4
 
