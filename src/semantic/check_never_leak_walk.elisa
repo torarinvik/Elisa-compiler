@@ -1,0 +1,428 @@
+# never-leak lint (-Wnever-leak) — the ONE walk over a function body.
+#
+# Every identifier the walk meets is appended to `walk.out` (and, under a unary `&`, to
+# `walk.addr`; the root of every `<-`/compound target to `walk.writes`). A block records where
+# each of its statements' entries start and end, so after its statements are walked it reads
+# "which statements mention which locals" off those ranges. Nested blocks (branch and loop
+# bodies, value blocks, lambda bodies, match arms) are analysed as they are met, and their
+# entries stay in `out`, so a use inside a nested block counts as a use by the statement that
+# contains it. Each AST node is visited once; the analysis of a block reads its own range of
+# `out`, so the cost grows with nesting depth, not with the square of a body.
+extend Semantic:
+    private:
+        # Statement blocks whose locals stay visible AFTER the block (the clause is a
+        # lowering wrapper or a grant, not a scope). Measured with stage1 -emit check:
+        # `trusted:` leaks its locals, `can …:` and `region …:` do not.
+        def nl_transparent_block(kind: sview) -> bool:
+            can Abort.Panic:
+                return when kind:
+                    "let" | "move" | "expect" | "static" | "static_assert" | "signal" | "destroy" | "trusted" -> true
+                    _ -> false
+
+        # The packed class byte of the innermost binding named NAME below `limit` (0 if none).
+        def nl_env_packed(walk: NeverLeakWalk&, name: sview, limit: usize) -> u8:
+            can Abort.Panic:
+                probe: mutable usize = limit
+                while probe > 0 |probe|:
+                    probe <- probe - 1
+                    walk.env_classes[probe] return if walk.env_names[probe] == name
+                return 0
+
+        def nl_env_class(walk: NeverLeakWalk&, name: sview, limit: usize) -> u8:
+            can Abort.Panic:
+                probe: mutable usize = limit
+                while probe > 0 |probe|:
+                    probe <- probe - 1
+                    nl_full(walk.env_classes[probe]) return if walk.env_names[probe] == name
+                return 0
+
+        # The root binding a `<-` target writes (`a.b[i] <- v` writes `a`). Every root also goes to
+        # `holds`; `also_write` is false for a binding that may only acquire a borrow (a method
+        # receiver) without needing a value block's `|capture|`.
+        def nl_push_write_roots(target: Ast::Expr, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # `r <- &x` rebinds the binding itself, so its own (reference) class matters;
+                # every other write stores into what the binding refers to.
+                match target:
+                    Expr.Ident(name, pos):
+                        walk.holds.push(name)
+                        walk.holds_whole.push(true)
+                        walk.writes.push(name)
+                    _:
+                        nl_push_roots(target, walk, true)
+
+        def nl_push_roots(target: Ast::Expr, walk: mutable NeverLeakWalk&, also_write: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, pos):
+                        walk.holds.push(name)
+                        walk.holds_whole.push(false)
+                        walk.writes.push(name) if also_write
+                    Expr.Field(object, field, pos):
+                        nl_push_roots(object, walk, also_write)
+                    Expr.Index(object, index, pos):
+                        nl_push_roots(object, walk, also_write)
+                    Expr.Paren(inner, pos):
+                        nl_push_roots(inner, walk, also_write)
+                    Expr.Unary(operator, operand, pos):
+                        nl_push_roots(operand, walk, also_write)
+                    Expr.Move(operand, pos):
+                        nl_push_roots(operand, walk, also_write)
+                    Expr.Tuple(elements, pos):
+                        for element in elements |walk, also_write|:
+                            nl_push_roots(element, walk, also_write)
+                    _:
+                        pass
+
+        # Builtin container methods that mutate their receiver.
+        def nl_mutating_method(name: sview) -> bool:
+            can Abort.Panic:
+                return when name:
+                    "push" | "extend" | "truncate" | "pop" | "insert" | "remove" | "clear" | "append" | "put" | "set" | "add" | "reserve" | "resize" | "swap" | "sort" | "fill" -> true
+                    _ -> false
+
+        # Which bindings a call may store a borrow into: a method receiver, an argument passed
+        # to a `mutable`/`lmut` parameter, and any `&x` argument. A callee this file does not
+        # declare (a function value, a lambda parameter) may store into every argument; an
+        # `extern` or a builtin free function stores none.
+        def nl_record_call_holds(callee: Ast::Expr, arguments: darray[Ast::Expr], types: NeverLeakTypes&, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                mask: mutable u64 = 0
+                shift: mutable u64 = 0
+                every: mutable bool = false
+                callee_name: mutable sview = ""
+                match callee:
+                    Expr.Field(object, method, pos):
+                        nl_push_roots(object, walk, nl_mutating_method(method))
+                        callee_name <- method
+                        shift <- 1
+                    Expr.Ident(name, pos):
+                        callee_name <- name
+                        every <- nl_env_class(walk, name, walk.env_names.count) != 0
+                    Expr.Scope(base, name, pos):
+                        callee_name <- name
+                    _:
+                        every <- true
+                holding: mutable u64 = 0
+                if callee_name != "":
+                    if types.mutable_params.get(name_hash(callee_name)) is found_mask:
+                        mask <- found_mask
+                    if types.holding_params.get(name_hash(callee_name)) is found_holding:
+                        holding <- found_holding
+                    elif types.externs.get(name_hash(callee_name)) is extern_mark:
+                        holding <- 0
+                    else:
+                        # A builtin or undeclared callee: any argument may be borrowed.
+                        holding <- 18446744073709551615
+                else:
+                    holding <- 18446744073709551615
+                match callee:
+                    Expr.Field(object, method, pos):
+                        nl_push_lend_place(object, walk)
+                    _:
+                        pass
+                for argument_index in 0..<arguments.count |mask, holding, shift, every, walk, arguments|:
+                    position: u64 = argument_index.u64() + shift
+                    passes_mutable: bool = position < 64 and (mask & (1.u64() << position)) != 0
+                    nl_push_lend_place(arguments[argument_index], walk) if every or position >= 64 or (holding & (1.u64() << position)) != 0
+                    if every or passes_mutable:
+                        nl_push_roots(arguments[argument_index], walk, true)
+                    else:
+                        match arguments[argument_index]:
+                            Expr.Unary(operator, operand, pos):
+                                nl_push_roots(operand, walk, false) if operator == TokenKind.Ampersand
+                            _:
+                                pass
+                # A UFCS call `x.f(...)` whose first parameter is mutable writes its receiver.
+                match callee:
+                    Expr.Field(object, method, pos):
+                        nl_push_roots(object, walk, true) if (mask & 1) != 0
+                    _:
+                        pass
+
+        # A place passed where a borrow of it can be taken (`f(buf)` into an `sview` parameter,
+        # `buf.view()`, `buf[a:b]`, `S{name: buf}`, `v: sview = buf`): its root is LENT, so a
+        # holder in the same statement may keep a view of storage it owns.
+        def nl_push_lend_place(place: Ast::Expr, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Ident(name, pos):
+                        walk.lend.push(name)
+                    Expr.Field(object, field, pos):
+                        nl_push_lend_place(object, walk)
+                    Expr.Index(object, index, pos):
+                        nl_push_lend_place(object, walk)
+                    Expr.Slice(object, low, high, pos):
+                        nl_push_lend_place(object, walk)
+                    Expr.Paren(inner, pos):
+                        nl_push_lend_place(inner, walk)
+                    _:
+                        pass
+
+        # `&x`, `&x[i]` and `&x.f` all take the address of storage `x` owns.
+        def nl_push_addr_root(operand: Ast::Expr, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match operand:
+                    Expr.Ident(name, pos):
+                        walk.addr.push(name)
+                    Expr.Field(object, field, pos):
+                        nl_push_addr_root(object, walk)
+                    Expr.Index(object, index, pos):
+                        nl_push_addr_root(object, walk)
+                    Expr.Paren(inner, pos):
+                        nl_push_addr_root(inner, walk)
+                    _:
+                        pass
+
+        # Whether an `=` target only names fresh locals (so it is a declaration, not a use).
+        def nl_declaring_target(target: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match target:
+                    Expr.Ident(name, pos):
+                        return true
+                    Expr.Tuple(elements, pos):
+                        return not any element in elements where not nl_declaring_target(element)
+                    _:
+                        return false
+
+        def nl_stmt(statement: Ast::Stmt, types: NeverLeakTypes&, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, pos):
+                        nl_expr(expression, types, walk)
+                    Stmt.VarDecl(name, type_expression, value, pos):
+                        nl_expr(type_expression, types, walk)
+                        # `v: sview = buf` may convert, i.e. borrow, the place it copies.
+                        nl_push_lend_place(value, walk)
+                        nl_expr(value, types, walk)
+                    Stmt.Assign(target, operator, value, pos):
+                        nl_push_lend_place(value, walk)
+                        if operator == TokenKind.Assign and nl_declaring_target(target):
+                            nl_expr(value, types, walk)
+                        else:
+                            nl_push_write_roots(target, walk) if operator != TokenKind.Assign
+                            nl_expr(target, types, walk)
+                            nl_expr(value, types, walk)
+                    Stmt.Block(kind, clause, binding, body, pos):
+                        for clause_name in clause |walk|:
+                            walk.out.push(clause_name)
+                        if nl_transparent_block(kind):
+                            for nested in body |walk, types|:
+                                nl_stmt(nested, types, walk)
+                        else:
+                            binding_base: usize = walk.env_names.count
+                            if binding != "":
+                                walk.env_names.push(binding)
+                                walk.env_classes.push(NL_BORROW)
+                            nl_block(body, (Ast::Expr.Absent), false, types, walk)
+                            walk.env_names.truncate(binding_base)
+                            walk.env_classes.truncate(binding_base)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        nl_expr(condition, types, walk)
+                        nl_block(then_body, (Ast::Expr.Absent), false, types, walk)
+                        nl_block(else_body, (Ast::Expr.Absent), false, types, walk)
+                    Stmt.While(condition, body, pos):
+                        nl_expr(condition, types, walk)
+                        walk.loop_depth <- walk.loop_depth + 1
+                        nl_block(body, (Ast::Expr.Absent), false, types, walk)
+                        walk.loop_depth <- walk.loop_depth - 1
+                    Stmt.For(bind, variables, iterable, body, pos):
+                        nl_expr(iterable, types, walk)
+                        variable_base: usize = walk.env_names.count
+                        for variable in variables |walk|:
+                            walk.env_names.push(variable)
+                            walk.env_classes.push(NL_BORROW)
+                        walk.loop_depth <- walk.loop_depth + 1
+                        nl_block(body, (Ast::Expr.Absent), false, types, walk)
+                        walk.loop_depth <- walk.loop_depth - 1
+                        walk.env_names.truncate(variable_base)
+                        walk.env_classes.truncate(variable_base)
+                    Stmt.Return(value, pos):
+                        if value is returned:
+                            nl_expr(returned, types, walk)
+                    Stmt.Match(scrutinee, arms, pos):
+                        nl_expr(scrutinee, types, walk)
+                        for arm in arms |walk, types|:
+                            nl_expr(arm.guard, types, walk)
+                            nl_block(arm.body, (Ast::Expr.Absent), false, types, walk)
+                    Stmt.Contract(kind, expression, pos):
+                        nl_expr(expression, types, walk)
+                    Stmt.Break(label, pos):
+                        walk.jumps.push(walk.loop_depth)
+                    Stmt.Continue(label, pos):
+                        walk.jumps.push(walk.loop_depth)
+                    _:
+                        pass
+
+        def nl_expr(expression: Ast::Expr, types: NeverLeakTypes&, walk: mutable NeverLeakWalk&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, pos):
+                        walk.out.push(name)
+                    Expr.Call(callee, arguments, argument_names, pos):
+                        nl_expr(callee, types, walk)
+                        for argument in arguments |walk, types|:
+                            nl_expr(argument, types, walk)
+                        nl_record_call_holds(callee, arguments, types, walk)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, pos):
+                        for candidate in candidates |walk, types|:
+                            for capture in candidate.captures |walk, types|:
+                                nl_expr(capture, types, walk)
+                        for argument in arguments |walk, types|:
+                            nl_expr(argument, types, walk)
+                    Expr.Field(object, field, pos):
+                        nl_expr(object, types, walk)
+                    Expr.Scope(base, name, pos):
+                        nl_expr(base, types, walk)
+                    Expr.Index(object, index, pos):
+                        nl_expr(object, types, walk)
+                        nl_expr(index, types, walk)
+                    Expr.IndexN(object, arguments, pos):
+                        nl_expr(object, types, walk)
+                        for argument in arguments |walk, types|:
+                            nl_expr(argument, types, walk)
+                    Expr.Slice(object, low, high, pos):
+                        nl_push_lend_place(object, walk)
+                        nl_expr(object, types, walk)
+                        nl_expr(low, types, walk)
+                        nl_expr(high, types, walk)
+                    Expr.Binary(left, operator, right, pos):
+                        nl_expr(left, types, walk)
+                        nl_expr(right, types, walk)
+                    Expr.Unary(operator, operand, pos):
+                        nl_push_addr_root(operand, walk) if operator == TokenKind.Ampersand
+                        nl_expr(operand, types, walk)
+                    Expr.Move(operand, pos):
+                        nl_expr(operand, types, walk)
+                    Expr.RegionNew(operand, region, pos):
+                        nl_expr(operand, types, walk)
+                    Expr.Paren(inner, pos):
+                        nl_expr(inner, types, walk)
+                    Expr.Array(elements, pos):
+                        for element in elements |walk, types|:
+                            nl_push_lend_place(element, walk)
+                            nl_expr(element, types, walk)
+                    Expr.Tuple(elements, pos):
+                        for element in elements |walk, types|:
+                            nl_push_lend_place(element, walk)
+                            nl_expr(element, types, walk)
+                    Expr.SetLit(elements, pos):
+                        for element in elements |walk, types|:
+                            nl_expr(element, types, walk)
+                    Expr.DictLit(entries, pos):
+                        for entry in entries |walk, types|:
+                            nl_expr(entry.key, types, walk)
+                            nl_expr(entry.value, types, walk)
+                    Expr.Construct(type_expression, fields, pos):
+                        for field in fields |walk, types|:
+                            nl_push_lend_place(field.value, walk)
+                            nl_expr(field.value, types, walk)
+                    Expr.RecordUpdate(base, fields, pos):
+                        nl_expr(base, types, walk)
+                        for field in fields |walk, types|:
+                            nl_expr(field.value, types, walk)
+                    Expr.If(condition, then_value, else_value, pos):
+                        nl_expr(condition, types, walk)
+                        nl_expr(then_value, types, walk)
+                        nl_expr(else_value, types, walk)
+                    Expr.Match(scrutinee, arms, pos):
+                        nl_expr(scrutinee, types, walk)
+                        for arm in arms |walk, types|:
+                            nl_expr(arm.guard, types, walk)
+                            nl_block(arm.body, (Ast::Expr.Absent), false, types, walk)
+                    Expr.Catch(guarded, arms, pos):
+                        nl_expr(guarded, types, walk)
+                        for arm in arms |walk, types|:
+                            nl_expr(arm.guard, types, walk)
+                            nl_block(arm.body, (Ast::Expr.Absent), false, types, walk)
+                    Expr.Comprehension(variable, iterable, condition, body, pos):
+                        nl_expr(iterable, types, walk)
+                        nl_expr(condition, types, walk)
+                        nl_expr(body, types, walk)
+                    Expr.Refinement(base, predicate, pos):
+                        nl_expr(base, types, walk)
+                        nl_expr(predicate, types, walk)
+                    Expr.GetElse(guarded, recovery, pos):
+                        nl_expr(guarded, types, walk)
+                        nl_block(recovery, (Ast::Expr.Absent), false, types, walk)
+                    Expr.Lambda(parameters, body, pos):
+                        parameter_base: usize = walk.env_names.count
+                        for parameter in parameters |walk|:
+                            walk.env_names.push(parameter)
+                            walk.env_classes.push(NL_BORROW)
+                        nl_block(body, (Ast::Expr.Absent), false, types, walk)
+                        walk.env_names.truncate(parameter_base)
+                        walk.env_classes.truncate(parameter_base)
+                    Expr.Block(statements, value, captures, pos):
+                        for capture_name in captures |walk|:
+                            walk.out.push(capture_name)
+                        nl_block(statements, value, true, types, walk)
+                    _:
+                        pass
+
+        # The class of an initializer, for an unannotated local.
+        def nl_expr_class(expression: Ast::Expr, types: NeverLeakTypes&, walk: NeverLeakWalk&) -> u8:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(value, pos):
+                        return NL_SCALAR
+                    Expr.FloatLit(text, pos):
+                        return NL_SCALAR
+                    Expr.BoolLit(value, pos):
+                        return NL_SCALAR
+                    Expr.CharLit(text, pos):
+                        return NL_SCALAR
+                    Expr.Ident(name, pos):
+                        known: u8 = nl_env_class(walk, name, walk.env_names.count)
+                        return NL_BORROW if known == 0 else known
+                    Expr.Binary(left, operator, right, pos):
+                        comparison: bool = operator == TokenKind.EqEq or operator == TokenKind.BangEq or operator == TokenKind.Lt or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.GtEq or operator == TokenKind.And or operator == TokenKind.Or
+                        NL_SCALAR return if comparison
+                        return nl_max(nl_expr_class(left, types, walk), nl_expr_class(right, types, walk))
+                    Expr.StringLit(text, pos):
+                        return NL_VIEW
+                    Expr.Unary(operator, operand, pos):
+                        NL_VIEW return if operator == TokenKind.Ampersand
+                        NL_SCALAR return if operator == TokenKind.Not or operator == TokenKind.Bang
+                        return nl_expr_class(operand, types, walk)
+                    Expr.Paren(inner, pos):
+                        return nl_expr_class(inner, types, walk)
+                    Expr.Move(operand, pos):
+                        return nl_expr_class(operand, types, walk)
+                    Expr.Call(callee, arguments, argument_names, pos):
+                        return nl_call_class(types, callee)
+                    Expr.Construct(type_expression, fields, pos):
+                        return nl_type_class(types, type_expression)
+                    Expr.Field(object, field, pos):
+                        NL_SCALAR return if field == "count" or field == "len" or field == "length" or field == "size" or field == "capacity"
+                        NL_SCALAR return if nl_expr_class(object, types, walk) == NL_SCALAR
+                        return NL_BORROW
+                    Expr.Index(object, index, pos):
+                        return nl_expr_class(object, types, walk)
+                    Expr.If(condition, then_value, else_value, pos):
+                        return nl_max(nl_expr_class(then_value, types, walk), nl_expr_class(else_value, types, walk))
+                    Expr.Tuple(elements, pos):
+                        worst: mutable u8 = NL_SCALAR
+                        for element in elements |worst, types, walk|:
+                            worst <- nl_max(worst, nl_expr_class(element, types, walk))
+                        return worst
+                    Expr.Array(elements, pos):
+                        worst: mutable u8 = NL_OWNED
+                        for element in elements |worst, types, walk|:
+                            worst <- nl_max(worst, nl_expr_class(element, types, walk))
+                        return worst
+                    Expr.Block(statements, value, captures, pos):
+                        return nl_expr_class(value, types, walk)
+                    _:
+                        return NL_BORROW
+
+        # A declared local's packed class: its annotation when it has one, else its initializer's.
+        def nl_decl_class(type_expression: Ast::Expr, value: Ast::Expr, types: NeverLeakTypes&, walk: NeverLeakWalk&) -> u8:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Invalid:
+                        return nl_expr_class(value, types, walk)
+                    Expr.Absent:
+                        return nl_expr_class(value, types, walk)
+                    _:
+                        return nl_pack(nl_type_class(types, type_expression), nl_type_content_class(types, type_expression))

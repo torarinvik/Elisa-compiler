@@ -1,0 +1,308 @@
+# Driver — rendering one never-leak finding (see elisac_never_leak.elisa). Every message names the
+# local, its declaration and last use, the statements it stays visible across, and a rewrite
+# built from the user's own lines: a block expression for a binding, a scoped `region` block for
+# a plain statement, a loop header for a loop counter, and a reorder or tuple-valued block when
+# two lifetimes overlap.
+
+def nl_report_finding(finding: Semantic::NeverLeakFinding&, names: darray[sview]&, source: NeverLeakSource&, mode: u8, strict: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    text: mutable darray[u8] = []
+    nl_push_location(text, source, finding.decl_line)
+    if mode == 2:
+        emit_tokens_push_sview(text, ": error: local ")
+    else:
+        emit_tokens_push_sview(text, ": warning: local ")
+    nl_push_name(text, finding.name)
+    emit_tokens_push_sview(text, " stays visible after its last use [-Wnever-leak]\n  declared on ")
+    nl_push_line_ref(text, source, finding.decl_line)
+    emit_tokens_push_sview(text, ", last used on ")
+    nl_push_line_ref(text, source, finding.last_use_line)
+    emit_tokens_push_sview(text, "; still visible across ")
+    append_decimal(text, finding.visible_count)
+    emit_tokens_push_sview(text, " later statement" if finding.visible_count == 1 else " later statements")
+    emit_tokens_push_sview(text, " (")
+    nl_push_line_ref(text, source, finding.after_last_line)
+    if finding.block_last_line > finding.after_last_line:
+        emit_tokens_push_sview(text, " to ")
+        nl_push_line_ref(text, source, finding.block_last_line)
+    emit_tokens_push_sview(text, ", starting with ")
+    nl_push_quoted_line(text, source, finding.after_last_line)
+    emit_tokens_push_sview(text, ")\n  kind: ")
+    emit_tokens_push_sview(text, nl_category_phrase(finding))
+    text.push(10)
+    if strict and finding.last_is_next:
+        emit_tokens_push_sview(text, "  note: -Wnever-leak=gentle (the default) accepts this local: its last use is the statement right after its declaration\n")
+    if finding.keeper != "" and finding.last_use_line != finding.raw_last_use_line:
+        emit_tokens_push_sview(text, "  it must live until ")
+        nl_push_line_ref(text, source, finding.last_use_line)
+        emit_tokens_push_sview(text, ", not just ")
+        nl_push_line_ref(text, source, finding.raw_last_use_line)
+        emit_tokens_push_sview(text, ": ")
+        nl_push_name(text, finding.keeper)
+        emit_tokens_push_sview(text, " may borrow from it, so the block below keeps both\n")
+    if finding.category == Semantic::NEVER_LEAK_CHAIN:
+        nl_render_chain(text, finding, names, source)
+    elif finding.category == Semantic::NEVER_LEAK_OVERLAP:
+        nl_render_overlap(text, finding, names, source)
+    elif finding.category == Semantic::NEVER_LEAK_LOOP:
+        nl_render_loop(text, finding, source)
+    else:
+        nl_render_plain(text, finding, source)
+    write_stderr(text)
+
+
+# The category in plain words: why the local outlives its use, and so which rewrite applies.
+def nl_category_phrase(finding: Semantic::NeverLeakFinding&) -> sview can[Abort.Panic]:
+    if finding.category == Semantic::NEVER_LEAK_CHAIN and finding.escapes:
+        return "chain with a loop jump (its last use binds another local, but a `break`/`continue` lies in between)"
+    if finding.category == Semantic::NEVER_LEAK_CHAIN:
+        return "chain (its last use binds another local, so that binding can take the statements as a block expression)"
+    if finding.category == Semantic::NEVER_LEAK_OVERLAP:
+        return "overlap (a local declared after it is still needed after its last use)"
+    if finding.category == Semantic::NEVER_LEAK_LOOP:
+        return "loop (its last use is a loop it feeds: a counter, accumulator or loop input)"
+    return "plain (its last use is a statement with no value to bind)"
+
+
+# Where the last-use statement's value starts on its first line, or the line's end when the value
+# begins on a later line (a block value).
+def nl_value_start(finding: Semantic::NeverLeakFinding&, source: NeverLeakSource&) -> usize can[Abort.Panic]:
+    start: usize = nl_line_start(source, finding.last_use_line)
+    stop: usize = nl_line_end(source, finding.last_use_line)
+    column: usize = finding.value_column.usize()
+    return stop if column == 0 or start + column - 1 >= stop else start + column - 1
+
+
+# The binding header of the last-use statement (`lol =`, `count: i64 =`, `total <-`), right-trimmed.
+def nl_push_header(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, source: NeverLeakSource&) -> void can[Abort.Panic, Memory.Allocate]:
+    start: usize = nl_line_start(source, finding.last_use_line)
+    stop: mutable usize = nl_value_start(finding, source)
+    while stop > start and (source.bytes[stop - 1] == 32 or source.bytes[stop - 1] == 9) |stop, source, start|:
+        stop <- stop - 1
+    nl_push_spaces(text, 6)
+    nl_push_bytes(text, source, start, stop)
+
+
+# The last-use statement's value, re-indented one level deeper, with `suffix` after its last line.
+def nl_push_value(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, source: NeverLeakSource&, suffix: sview, prefix: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    value_start: usize = nl_value_start(finding, source)
+    line_stop: usize = nl_line_end(source, finding.last_use_line)
+    last_line: u32 = nl_statement_last_line(source, finding.last_use_line, finding.after_last_line)
+    indent: usize = nl_indent_width(source, finding.decl_line)
+    if value_start < line_stop:
+        nl_push_spaces(text, 6 + indent + 4)
+        emit_tokens_push_sview(text, prefix)
+        nl_push_bytes(text, source, value_start, line_stop)
+        if last_line == finding.last_use_line:
+            emit_tokens_push_sview(text, suffix)
+        text.push(10)
+    if last_line > finding.last_use_line:
+        nl_push_shifted_range(text, source, finding.last_use_line + 1, last_line - 1, 4 if value_start < line_stop else 0)
+        nl_push_spaces(text, 6)
+        if value_start < line_stop:
+            nl_push_spaces(text, 4)
+        nl_push_bytes(text, source, nl_line_start(source, last_line), nl_line_end(source, last_line))
+        emit_tokens_push_sview(text, suffix)
+        text.push(10)
+
+
+def nl_push_next_statement(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, source: NeverLeakSource&) -> void can[Abort.Panic, Memory.Allocate]:
+    nl_push_shifted_line(text, source, finding.after_last_line, 0)
+
+
+def nl_render_chain(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, names: darray[sview]&, source: NeverLeakSource&) -> void can[Abort.Panic, Memory.Allocate]:
+    if finding.escapes:
+        # A `break`/`continue` aimed at an enclosing loop may not leave a value block
+        # (docs/119 E5), so the mechanical rewrite would not compile.
+        emit_tokens_push_sview(text, "  the statements to nest contain a `break`/`continue` for an enclosing loop, which may not leave a block expression, so the binding cannot take them as its block; move ")
+        nl_push_line_ref(text, source, finding.decl_line)
+        emit_tokens_push_sview(text, " to ")
+        nl_push_line_ref(text, source, finding.last_use_line)
+        emit_tokens_push_sview(text, " into a helper that returns ")
+        if finding.bind_name != "":
+            nl_push_name(text, finding.bind_name)
+        else:
+            emit_tokens_push_sview(text, "the bound value")
+        emit_tokens_push_sview(text, " as an optional (the caller then breaks or continues on `null`)\n")
+        return
+    emit_tokens_push_sview(text, "  fix: nest it in a block expression that ends with its last use:\n")
+    nl_push_header(text, finding, source)
+    if finding.captures_count > 0:
+        emit_tokens_push_sview(text, " |")
+        for capture_index in 0..<finding.captures_count |text, finding, names|:
+            emit_tokens_push_sview(text, ", ") if capture_index > 0
+            emit_tokens_push_sview(text, names[(finding.captures_first + capture_index).usize()])
+        text.push(124)
+    text.push(10)
+    nl_push_shifted_range(text, source, finding.decl_line, finding.last_use_line - 1, 4)
+    nl_push_value(text, finding, source, "", "")
+    nl_push_next_statement(text, finding, source)
+    if finding.captures_count > 0:
+        emit_tokens_push_sview(text, "  (the `|...|` header lets the block write the outer bindings it updates; list any it mutates through a call too)\n")
+
+
+def nl_render_plain(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, source: NeverLeakSource&) -> void can[Abort.Panic, Memory.Allocate]:
+    last_line: u32 = nl_statement_last_line(source, finding.last_use_line, finding.after_last_line)
+    indent: usize = nl_indent_width(source, finding.decl_line)
+    emit_tokens_push_sview(text, "  fix: the last use ")
+    nl_push_quoted_line(text, source, finding.last_use_line)
+    emit_tokens_push_sview(text, " is a plain statement, which cannot end a block expression, and Elisa has no bare statement block; scope the statements in a `region` block:\n")
+    nl_push_spaces(text, 6 + indent)
+    emit_tokens_push_sview(text, "region ")
+    emit_tokens_push_sview(text, finding.name)
+    emit_tokens_push_sview(text, "_scope:\n")
+    nl_push_shifted_range(text, source, finding.decl_line, last_line, 4)
+    nl_push_next_statement(text, finding, source)
+    emit_tokens_push_sview(text, "  (a `region` block also frees what those statements allocate when it ends; if something allocated there must outlive it, bind the last use's result with a block expression instead, or move ")
+    nl_push_line_ref(text, source, finding.decl_line)
+    emit_tokens_push_sview(text, " to ")
+    nl_push_line_ref(text, source, last_line)
+    emit_tokens_push_sview(text, " into a helper function)\n")
+
+
+def nl_render_overlap(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, names: darray[sview]&, source: NeverLeakSource&) -> void can[Abort.Panic, Memory.Allocate]:
+    indent: usize = nl_indent_width(source, finding.decl_line)
+    last_line: u32 = nl_statement_last_line(source, finding.last_use_line, finding.after_last_line)
+    emit_tokens_push_sview(text, "  no nesting works as written: ")
+    nl_push_name(text, finding.other_name)
+    emit_tokens_push_sview(text, ", declared on ")
+    nl_push_line_ref(text, source, finding.other_decl_line)
+    emit_tokens_push_sview(text, " inside that range, is still used on ")
+    nl_push_line_ref(text, source, finding.other_last_line)
+    if finding.others_count > 1:
+        emit_tokens_push_sview(text, " (and ")
+        append_decimal(text, (finding.others_count - 1).u32())
+        emit_tokens_push_sview(text, " more")
+        text.push(41)
+    emit_tokens_push_sview(text, ", so a block ending on ")
+    nl_push_line_ref(text, source, finding.last_use_line)
+    emit_tokens_push_sview(text, " would hide it too\n")
+    binding: bool = finding.bind_name != "" and (finding.last_stmt_kind == Semantic::NEVER_LEAK_STMT_BIND or finding.last_stmt_kind == Semantic::NEVER_LEAK_STMT_REBIND)
+    if finding.reorder_ok and finding.others_count == 1:
+        # Nothing between reads the other local and its initializer reads nothing declared in
+        # the range, so its declaration can move below the last use and the range nests.
+        other_last: u32 = nl_statement_last_line(source, finding.other_decl_line, finding.other_after_decl_line)
+        emit_tokens_push_sview(text, "  fix (reorder): move the declaration of ")
+        nl_push_name(text, finding.other_name)
+        emit_tokens_push_sview(text, " below the last use, if its initializer has no effect the moved statements depend on, then nest:\n")
+        if binding:
+            nl_push_header(text, finding, source)
+            text.push(10)
+            nl_push_shifted_range(text, source, finding.decl_line, finding.other_decl_line - 1, 4)
+            nl_push_shifted_range(text, source, other_last + 1, finding.last_use_line - 1, 4)
+            nl_push_value(text, finding, source, "", "")
+        else:
+            nl_push_spaces(text, 6 + indent)
+            emit_tokens_push_sview(text, "region ")
+            emit_tokens_push_sview(text, finding.name)
+            emit_tokens_push_sview(text, "_scope:\n")
+            nl_push_shifted_range(text, source, finding.decl_line, finding.other_decl_line - 1, 4)
+            nl_push_shifted_range(text, source, other_last + 1, last_line, 4)
+        nl_push_shifted_range(text, source, finding.other_decl_line, other_last, 0)
+        nl_push_next_statement(text, finding, source)
+        return
+    if not binding:
+        # A plain last use cannot be a block's value, and a block whose value is the other local
+        # would end with a statement that does not use this one; only reordering or a helper
+        # satisfies the rule.
+        emit_tokens_push_sview(text, "  no block rewrite satisfies the rule: the last use ")
+        nl_push_quoted_line(text, source, finding.last_use_line)
+        emit_tokens_push_sview(text, " is a plain statement, so it cannot be the value that carries ")
+        nl_push_name(text, finding.other_name)
+        emit_tokens_push_sview(text, " out. ")
+        emit_tokens_push_sview(text, "Reordering does not work either (")
+        nl_push_name(text, finding.other_name)
+        emit_tokens_push_sview(text, " is read before the last use, or its initializer reads a local declared in the range); move ")
+        nl_push_line_ref(text, source, finding.decl_line)
+        emit_tokens_push_sview(text, " to ")
+        nl_push_line_ref(text, source, last_line)
+        emit_tokens_push_sview(text, " into a helper function that returns ")
+        nl_push_name(text, finding.other_name)
+        emit_tokens_push_sview(text, ":\n")
+        nl_push_spaces(text, 6 + indent)
+        emit_tokens_push_sview(text, finding.other_name)
+        emit_tokens_push_sview(text, " = compute_")
+        emit_tokens_push_sview(text, finding.other_name)
+        emit_tokens_push_sview(text, "(...)\n")
+        nl_push_next_statement(text, finding, source)
+        return
+    if finding.others_count > 2 or finding.escapes:
+        if finding.escapes:
+            emit_tokens_push_sview(text, "  the range contains a `break`/`continue` for an enclosing loop, which may not leave a block expression; reorder the declarations so each local's uses are contiguous, or move ")
+        else:
+            emit_tokens_push_sview(text, "  a tuple-valued block would have to yield ")
+            append_decimal(text, (finding.others_count + 1).u32())
+            emit_tokens_push_sview(text, " values; reorder the declarations so each local's uses are contiguous, or move ")
+        nl_push_line_ref(text, source, finding.decl_line)
+        emit_tokens_push_sview(text, " to ")
+        nl_push_line_ref(text, source, last_line)
+        emit_tokens_push_sview(text, " into a helper function\n")
+        return
+    emit_tokens_push_sview(text, "  fix (tuple): yield the binding and the locals still needed from one block (a yielded local that is assigned later must stay `mutable`):\n")
+    nl_push_spaces(text, 6 + indent)
+    if finding.last_stmt_kind == Semantic::NEVER_LEAK_STMT_REBIND:
+        emit_tokens_push_sview(text, "rebind ")
+    emit_tokens_push_sview(text, finding.bind_name)
+    suffix: mutable darray[u8] = []
+    for other_index in 0..<finding.others_count |text, suffix, finding, names|:
+        other: sview = names[(finding.others_first + other_index).usize()]
+        emit_tokens_push_sview(text, ", ")
+        emit_tokens_push_sview(text, other)
+        emit_tokens_push_sview(suffix, ", ")
+        emit_tokens_push_sview(suffix, other)
+    suffix.push(41)
+    emit_tokens_push_sview(text, " =\n")
+    nl_push_shifted_range(text, source, finding.decl_line, finding.last_use_line - 1, 4)
+    nl_push_value(text, finding, source, bytes_view_range(suffix, 0, suffix.count), "(")
+    nl_push_next_statement(text, finding, source)
+
+
+def nl_render_loop(text: mutable darray[u8]&, finding: Semantic::NeverLeakFinding&, source: NeverLeakSource&) -> void can[Abort.Panic, Memory.Allocate]:
+    indent: usize = nl_indent_width(source, finding.decl_line)
+    emit_tokens_push_sview(text, "  its last use is the loop ")
+    nl_push_quoted_line(text, source, finding.last_use_line)
+    text.push(10)
+    decl_last: u32 = nl_statement_last_line(source, finding.decl_line, finding.decl_next_line)
+    loop_start: usize = nl_line_start(source, finding.last_use_line)
+    loop_stop: mutable usize = nl_line_end(source, finding.last_use_line)
+    while loop_stop > loop_start and (source.bytes[loop_stop - 1] == 32 or source.bytes[loop_stop - 1] == 9) |loop_stop, source, loop_start|:
+        loop_stop <- loop_stop - 1
+    header_ok: bool = finding.decl_is_binding and not finding.between_use and decl_last == finding.decl_line and loop_stop > loop_start and source.bytes[loop_stop - 1] == 58
+    if not header_ok:
+        emit_tokens_push_sview(text, "  fix: scope the declaration and the loop together:\n")
+        nl_push_spaces(text, 6 + indent)
+        emit_tokens_push_sview(text, "region ")
+        emit_tokens_push_sview(text, finding.name)
+        emit_tokens_push_sview(text, "_scope:\n")
+        nl_push_shifted_range(text, source, finding.decl_line, nl_statement_last_line(source, finding.last_use_line, finding.after_last_line), 4)
+        nl_push_next_statement(text, finding, source)
+        return
+    emit_tokens_push_sview(text, "  fix: move it into the loop header, which scopes it to the loop (initialised once, before the first iteration):\n")
+    nl_push_spaces(text, 6)
+    # An existing `|...|` header just before the `:` gains the declaration as one more entry.
+    has_header: bool = loop_stop - loop_start >= 2 and source.bytes[loop_stop - 2] == 124
+    insert_at: usize = loop_stop - 2 if has_header else loop_stop - 1
+    nl_push_bytes(text, source, loop_start, insert_at)
+    if has_header:
+        emit_tokens_push_sview(text, ", ")
+    else:
+        emit_tokens_push_sview(text, " |")
+    decl_start: usize = nl_line_start(source, finding.decl_line) + nl_indent_width(source, finding.decl_line)
+    # A header accumulator is mutable by construction, so its `mutable` qualifier is dropped.
+    nl_push_without_mutable(text, source, decl_start, nl_line_end(source, finding.decl_line))
+    emit_tokens_push_sview(text, "|:\n")
+    nl_push_shifted_range(text, source, finding.last_use_line + 1, nl_statement_last_line(source, finding.last_use_line, finding.after_last_line), 0)
+    nl_push_next_statement(text, finding, source)
+
+
+def nl_push_without_mutable(buffer: mutable darray[u8]&, source: NeverLeakSource&, start: usize, stop: usize) -> void can[Abort.Panic, Memory.Allocate]:
+    cursor: mutable usize = start
+    while cursor < stop |cursor, buffer, source, start, stop|:
+        skip: mutable bool = cursor + 8 <= stop and (cursor == start or source.bytes[cursor - 1] == 32)
+        if skip:
+            for offset in 0..<sview_len("mutable ") |skip, source, cursor|:
+                skip <- false if source.bytes[cursor + offset.usize()] != sview_at("mutable ", offset)
+        if skip:
+            cursor <- cursor + 8
+        else:
+            buffer.push(source.bytes[cursor])
+            cursor <- cursor + 1
