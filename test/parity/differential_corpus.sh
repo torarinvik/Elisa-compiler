@@ -131,11 +131,20 @@ LLVM_LIBDIR="$("$LLVM_CONFIG" --libdir 2>/dev/null || true)"
 # runtime prelude but still calls a runtime-only helper (ctx_string_view_index, ...): the
 # call goes to address 0 and the ORACLE segfaults (stage0=139), which read as 20 stage1
 # MISMATCHes on the gate box. On macOS the same link fails and the program is a SKIP. So a
-# Linux link is only accepted when the executable has no unresolved non-library symbol
-# (glibc imports carry an @VERSION; a bare `U name` is a symbol nobody defines).
+# Linux link is refused when the executable leaves unresolved a symbol the RUNTIME defines:
+# the runtime was needed and is missing. Other unresolved names stay accepted, as Apple ld
+# with -dead_strip accepts them: an extern referenced only from dead code (the
+# opaque_extern_field fixtures, guest_overlay_source_smoke) survives GNU --gc-sections as a
+# reference but is never called.
+RUNTIME_DEFINED="$WORK/runtime_defined.txt"
+if [[ "$(uname -s)" == Linux && ! -f "$RUNTIME_DEFINED" ]]; then
+    nm --defined-only "$RUNTIME_OBJ" 2>/dev/null | awk 'NF==3 {print $3}' | sort -u > "$RUNTIME_DEFINED.$$"
+    mv -f "$RUNTIME_DEFINED.$$" "$RUNTIME_DEFINED"
+fi
 link_resolved() {
     [ "$(uname -s)" = Linux ] || return 0
-    ! nm -u "$1" 2>/dev/null | awk '$1=="U" && $2 !~ /@/ {found=1} END {exit !found}'
+    ! nm -u "$1" 2>/dev/null | awk '$1=="U" && $2 !~ /@/ {print $2}' | sort -u \
+        | comm -12 - "$RUNTIME_DEFINED" | grep -q .
 }
 link_program() {
     local out="$1" obj="$2"
