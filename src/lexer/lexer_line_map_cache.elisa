@@ -1,0 +1,166 @@
+# Parsed ELISA_STAGE1_LINE_MAP, cached per environment string.
+#
+# source_original_line / source_line_is_runtime_std used to copy the whole map out of the
+# environment and re-parse it on every call. The backend asks once per debug location, panic
+# site, overload probe and decline, and the compiler's own map is ~2k entries (>128 KB), so
+# that was a visible slice of LLVM IR generation. The entries are parsed once per distinct
+# getenv pointer into the fixed tables below (the backend has scalar globals only); a lookup
+# is then a binary search when the FLAT column never decreases, a scan of the table when it
+# does. Both answers are exactly what the per-call parse produced, including its handling of
+# malformed maps (see lexer.elisa). A map with more entries than the table holds keeps the
+# per-call parse.
+const LEXER_LINE_MAP_CAPACITY: usize = 65536
+# getenv pointer the tables were built from; 0 = nothing cached.
+global mutable lexer_line_map_key: uintptr
+# 1 = tables valid for lexer_line_map_key, 2 = the map overflowed the tables.
+global mutable lexer_line_map_state: u8
+global mutable lexer_line_map_count: usize
+global mutable lexer_line_map_flat: array[u32, 65536]
+global mutable lexer_line_map_orig: array[u32, 65536]
+# 1 when the entry's PATH contains `elisacore_std/`.
+global mutable lexer_line_map_std: array[u8, 65536]
+# A malformed FLAT field (or an entry without a separator) makes every original-line lookup
+# answer the flat line and every runtime-std lookup answer false.
+global mutable lexer_line_map_flat_bad: bool
+# A malformed ORIG field makes every original-line lookup answer the flat line.
+global mutable lexer_line_map_orig_bad: bool
+global mutable lexer_line_map_sorted: bool
+
+extend Lexer:
+    public:
+        # Hide ELISA_STAGE1_LINE_MAP from a child process: copy it into STORAGE and unset it.
+        # The compiler's own map is larger than one exec argument string may be (128 KB), so a
+        # `system` call made with it in the environment fails with E2BIG before the shell
+        # runs. Returns whether there was a map to restore.
+        def line_map_suspend(storage: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            storage.truncate(0)
+            false return if not source_line_map_value("ELISA_STAGE1_LINE_MAP", storage)
+            _ = lexer_unsetenv("ELISA_STAGE1_LINE_MAP")
+            lexer_line_map_key <- 0
+            lexer_line_map_state <- 0
+            return true
+
+        # Put back a map taken by line_map_suspend.
+        def line_map_resume(storage: mutable darray[u8]&, suspended: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not suspended
+            storage.push(0)
+            _ = lexer_setenv("ELISA_STAGE1_LINE_MAP", (&storage[0]).cast[cstr], 1)
+            storage.pop()
+            lexer_line_map_key <- 0
+            lexer_line_map_state <- 0
+
+    private:
+        # Whether the tables describe the current map (building them if needed). False when
+        # there is no map or it does not fit: callers then take the per-call parse.
+        def line_map_cache_ready() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if getenv("ELISA_STAGE1_LINE_MAP") is value_bytes:
+                key: uintptr = value_bytes.cast[uintptr]
+                if key == lexer_line_map_key and lexer_line_map_state != 0:
+                    return lexer_line_map_state == 1
+                line_map_cache_build()
+                lexer_line_map_key <- key
+                return lexer_line_map_state == 1
+            return false
+
+        def line_map_cache_build() -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            map_storage: mutable darray[u8] = []
+            _ = source_line_map_value("ELISA_STAGE1_LINE_MAP", &map_storage)
+            lexer_line_map_state <- 1
+            lexer_line_map_count <- 0
+            lexer_line_map_flat_bad <- false
+            lexer_line_map_orig_bad <- false
+            lexer_line_map_sorted <- true
+            marker: sview = "elisacore_std/"
+            marker_len: usize = sview_len(marker)
+            cursor: mutable usize = 0.usize()
+            while cursor < map_storage.count |cursor, map_storage, marker, marker_len|:
+                entry_stop: mutable usize = cursor
+                while entry_stop < map_storage.count |entry_stop, map_storage|:
+                    break if map_storage[entry_stop] == SOURCE_LINE_MAP_NEWLINE
+                    entry_stop <- entry_stop + 1.usize()
+                scan: mutable usize = cursor
+                entry_flat: mutable u32 = 0
+                flat_ok: mutable bool = true
+                while scan < entry_stop |scan, entry_flat, flat_ok, map_storage|:
+                    break if map_storage[scan] == SOURCE_LINE_MAP_SEPARATOR
+                    if map_storage[scan] < SOURCE_LINE_MAP_DIGIT_ZERO or map_storage[scan] > SOURCE_LINE_MAP_DIGIT_ZERO + 9:
+                        flat_ok <- false
+                        break
+                    entry_flat <- entry_flat * 10 + (map_storage[scan] - SOURCE_LINE_MAP_DIGIT_ZERO).u32()
+                    scan <- scan + 1.usize()
+                if not flat_ok or scan >= entry_stop:
+                    # Both per-call parses stop at the first such entry with a fixed answer.
+                    lexer_line_map_flat_bad <- true
+                    return
+                scan <- scan + 1.usize()
+                entry_orig: mutable u32 = 0
+                orig_ok: mutable bool = true
+                while scan < entry_stop |scan, entry_orig, orig_ok, map_storage|:
+                    break if map_storage[scan] == SOURCE_LINE_MAP_SEPARATOR
+                    orig_ok <- false if map_storage[scan] < SOURCE_LINE_MAP_DIGIT_ZERO or map_storage[scan] > SOURCE_LINE_MAP_DIGIT_ZERO + 9
+                    entry_orig <- entry_orig * 10 + (map_storage[scan] - SOURCE_LINE_MAP_DIGIT_ZERO).u32() if orig_ok
+                    scan <- scan + 1.usize()
+                lexer_line_map_orig_bad <- true if not orig_ok
+                is_std: mutable u8 = 0
+                start: mutable usize = scan + 1.usize()
+                while start + marker_len <= entry_stop |start, is_std, map_storage, marker, marker_len|:
+                    matched: mutable bool = true
+                    for offset in 0..<marker_len |matched, map_storage, start, marker|:
+                        matched <- false if map_storage[start + offset] != sview_at(marker, offset)
+                    if matched:
+                        is_std <- 1
+                        break
+                    start <- start + 1.usize()
+                if lexer_line_map_count >= LEXER_LINE_MAP_CAPACITY:
+                    lexer_line_map_state <- 2
+                    return
+                if lexer_line_map_count > 0 and entry_flat < lexer_line_map_flat[lexer_line_map_count - 1]:
+                    lexer_line_map_sorted <- false
+                lexer_line_map_flat[lexer_line_map_count] <- entry_flat
+                lexer_line_map_orig[lexer_line_map_count] <- entry_orig
+                lexer_line_map_std[lexer_line_map_count] <- is_std
+                lexer_line_map_count <- lexer_line_map_count + 1
+                cursor <- entry_stop + 1.usize()
+
+        # The entry the per-call parse settles on for FLAT_LINE: the greatest FLAT <= FLAT_LINE,
+        # the last such entry on ties; -1 when there is none or that FLAT is 0.
+        def line_map_cache_best(flat_line: u32) -> i64 can[Abort.Panic]:
+            best: mutable i64 = -1
+            if lexer_line_map_sorted:
+                # Last index whose FLAT <= flat_line.
+                low: mutable usize = 0
+                high: mutable usize = lexer_line_map_count
+                while low < high |low, high, flat_line|:
+                    middle: usize = low + (high - low) / 2
+                    if lexer_line_map_flat[middle] <= flat_line:
+                        low <- middle + 1
+                    else:
+                        high <- middle
+                best <- low.i64() - 1
+            else:
+                best_flat: mutable u32 = 0
+                for index in 0..<lexer_line_map_count |best, best_flat, flat_line|:
+                    entry_flat: u32 = lexer_line_map_flat[index]
+                    if entry_flat <= flat_line and entry_flat >= best_flat:
+                        best_flat <- entry_flat
+                        best <- index.i64()
+            -1 return if best < 0
+            -1 return if lexer_line_map_flat[best.usize()] == 0
+            return best
+
+        def line_map_cached_original_line(flat_line: u32) -> u32 can[Abort.Panic]:
+            flat_line return if lexer_line_map_flat_bad or lexer_line_map_orig_bad
+            best: i64 = line_map_cache_best(flat_line)
+            flat_line return if best < 0
+            return lexer_line_map_orig[best.usize()] + (flat_line - lexer_line_map_flat[best.usize()])
+
+        def line_map_cached_is_runtime_std(flat_line: u32) -> bool can[Abort.Panic]:
+            false return if lexer_line_map_flat_bad
+            best: i64 = line_map_cache_best(flat_line)
+            false return if best < 0
+            return lexer_line_map_std[best.usize()] != 0
+
+@link_name("unsetenv")
+extern lexer_unsetenv(name: cstr) -> i32
+@link_name("setenv")
+extern lexer_setenv(name: cstr, value: cstr, overwrite: i32) -> i32
