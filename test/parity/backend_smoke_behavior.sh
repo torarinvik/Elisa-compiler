@@ -264,6 +264,12 @@ run_case darray_literal   'def main() -> i64:\n    xs: darray[i64] = [40, 2, 99]
 # stored header pointer before the darray operation, rather than treating the pointer slot as
 # the header itself.
 run_case darray_ref_field 'struct Holder:\n    w: mutable darray[i64]&\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    h: Holder = Holder{w: &xs}\n    h.w.push(42)\n    return h.w[0]\n' 42
+# A `T&` FIELD of an indexed struct element read as a scalar (`return hs[0].r`) loads through
+# the ref. The no-address field path converted the pointer instead (ptrtoint), returning the
+# referent's ADDRESS; the param-written value must be seen through the element's ref.
+run_case darray_elem_ref_field_param 'struct H:\n    r: i64&\n\ndef f(hs: darray[H]&, b: mutable i64&) -> i64:\n    can Abort.Panic:\n        b <- 2\n        return hs[0].r\n\ndef main() -> i64:\n    can Memory.Allocate, Abort.Panic:\n        x: mutable i64 = 0\n        hs: mutable darray[H] = [H{r: &x}]\n        return f(&hs, &x)\n' 2
+run_case darray_elem_ref_field_local 'struct H:\n    r: i64&\n\ndef main() -> i64:\n    can Memory.Allocate, Abort.Panic:\n        x: mutable i64 = 40\n        hs: mutable darray[H] = []\n        hs.push(H{r: &x})\n        y: i64 = hs[0].r\n        return y + 2\n' 42
+run_case call_result_ref_field 'struct H:\n    r: i64&\n\ndef mk(p: i64&) -> H:\n    return H{r: p}\n\ndef main() -> i64:\n    x: mutable i64 = 42\n    return mk(&x).r\n' 42
 # A fixed-array spread is a value copy, not a darray-header copy. The backend must
 # materialize the source once and append each fixed slot in order.
 run_case darray_spread_fixed_array 'def main() -> i64:\n    source: i64[2] = [7, 35]\n    xs: darray[i64] = [...source, 0]\n    return xs[0] + xs[1]\n'  42
