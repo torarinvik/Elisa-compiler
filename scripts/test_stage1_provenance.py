@@ -21,10 +21,19 @@ with tempfile.TemporaryDirectory() as directory:
     product.parent.mkdir()
     product.write_bytes(b"stage1 product")
 
-    stage1_provenance.record(root, product)
+    seed_inputs = stage1_provenance.input_fingerprint(root)
+    assert stage1_provenance.check_inputs(root, seed_inputs) == 0
+    stage1_provenance.record(root, product, seed_inputs)
     assert stage1_provenance.check(root, product) == 0
 
     (root / "src" / "unit.elisa").write_text("module Unit:\n    def changed() -> i64: return 1\n")
+    assert stage1_provenance.check_inputs(root, seed_inputs) == 2
+    try:
+        stage1_provenance.record(root, product, seed_inputs)
+    except RuntimeError as error:
+        assert "changed during seed" in str(error)
+    else:
+        raise AssertionError("record accepted sources that changed during seed")
     assert stage1_provenance.check(root, product) == 2
 
     (root / "src" / "unit.elisa").write_text("module Unit:\n    pass\n")

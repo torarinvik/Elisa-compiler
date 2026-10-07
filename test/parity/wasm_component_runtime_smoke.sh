@@ -56,6 +56,10 @@ build_fixture \
     "$ROOT/test/fixtures/wasm/component_bounded_sview.wit" \
     "$ROOT/test/fixtures/wasm/component_bounded_sview.elisa" \
     bounded-sview
+build_fixture \
+    "$ROOT/test/fixtures/wasm/component_panic_paths.wit" \
+    "$ROOT/test/fixtures/wasm/component_panic_paths.elisa" \
+    panic-paths
 
 # Keep stage0's component ABI path covered as well.  This is optional so the
 # normal stage1 smoke remains runnable from a checkout that has not built a
@@ -107,4 +111,4 @@ if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name 
     exit 1
 fi
 
-echo "wasm component runtime smoke OK: bounded views, canonical strings, lists, options, results, records, dynamic containers, scalar returns, and repeated arena lifetimes componentize with freestanding allocation and no JS/TS artifacts"
+echo "wasm component runtime smoke OK: bounded views, canonical strings, lists, options, results, records, dynamic containers, scalar returns, repeated arena lifetimes, and panic paths componentize with freestanding allocation and no JS/TS artifacts"
