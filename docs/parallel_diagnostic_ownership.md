@@ -30,14 +30,15 @@ Zero-result jobs skip allocation and indexing. Zero-length text becomes an empty
 view. Nonempty text is copied by its exact byte count, preserving embedded NULs.
 The serial path remains the existing ordered pass runner.
 
-`scripts/semantic_parallel_diagnostic_audit.py` checks both constructors against the
+`scripts/semantic_parallel_diagnostic_audit.py` checks all three constructors against the
 actual Diagnostic declaration, checks every textual field's backing/copy mapping,
 and verifies every other field is preserved. Adding a defaulted field without
-updating either transfer fails the audit.
+updating every transfer fails the audit.
 
 ## Evidence and remaining qualification
 
-Only small probes have been built so far. **This is not yet evidence that the full
+The first private fresh seed passed provenance and strict relinking, but its full
+parallel selfcheck crashed at the diagnostic export boundary. **This is not yet evidence that the full
 parallel compiler works or is faster.** Full seed/gen2, determinism, semantic gates,
 corpus differential checks and quiet timing remain for parent coordination.
 
@@ -70,4 +71,31 @@ python3 scripts/semantic_parallel_diagnostic_audit.py
 The probe includes the runtime directly. Its private hooks.c was copied from
 `/root/work/r8-probe/rt/hooks.c`; the existing shared hooks.o lacked newer callback
 stub symbols, so it was rebuilt privately. No shared runtime object is linked or
-changed, no full compiler seed was started, and no timed benchmark was run.
+changed. No timed benchmark was run.
+
+
+## Diagnostic-only export boundary
+
+Production qualification of checkpoint 4212814 found a main-thread SIGSEGV in
+`run_semantic_gate+5676`: `cmpl $0x6e657241,(%rax)` dereferenced an unmapped
+`diagnostic.name` while testing the runtime-carrier name `Arena`. All worker
+threads had exited. `check_full_diagnostics` shallow-copied table-owned text into
+its caller's output, then released the local table region before reporting.
+Private trace: `parallel-self-gdb-detail.log`.
+
+The export now clones all 17 text payloads into independent byte arrays explicitly
+allocated in the caller output region `@r`. These allocations are reclaimed with
+that region; their temporary array headers do not own a separate allocation
+lifetime. Only scalar addresses cross the conservative frontend view-dependency
+boundary, and each reconstructed view uses the exact validated source byte count.
+All scalar fields are preserved. Filtering and diagnostic order are unchanged.
+Both serial and parallel output use this boundary.
+
+`probe-export.elisa` reproduces the worker, local table, and caller output ownership
+layers. Its producing function returns after freeing every job arena and its local
+table region; only then does main inspect every field in the 800 returned records.
+The O2 build and run passed (exit 0), including embedded NUL bytes and an
+additional record with all 17 text fields empty. Reproduce with
+the commands above, substituting `probe-export` for `probe-immutable`.
+Final complete-source stage0 semantic check passed (`export-sourcecheck-final.done`,
+exit 0). Full updated production qualification remains pending.
