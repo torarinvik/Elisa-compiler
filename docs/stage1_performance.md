@@ -311,3 +311,34 @@ Plan, in order:
    arenas/diagnostic buffers, spliced back in pass order. The fork experiment of round 3
    showed fork costs (~45 ms each, CoW faults) eat the gain on this host; threads sharing the
    frozen table avoid both.
+
+## Round 6 (claude/perf-r6): sized AST records
+
+The packed AST store used one fixed 148-byte row per node (4-byte tag + `[36 x i32]`, sized
+by `Decl.Func`), so most nodes carried 100+ bytes of padding through every walk. Hierarchies
+with at least 48 variants (`PACKED_AST_SIZED_MIN_VARIANTS`, i.e. the compiler's own AST) now
+get one record per node sized to its variant (4 + 4 x row slots, rounded to 8), bump-allocated
+from 64 KB blocks; chunk slots hold record addresses (`record_bytes == 0` marks a sized store,
+`ctx_aos_store_alloc_sized` / `ctx_aos_store_sized_record`). The in-record layout is unchanged,
+so no match or field site changes; small AST-shaped fixtures keep the fixed row. Rejected
+earlier: widening the row (148 -> 292 bytes made check 13-18% and ast 22% slower), which
+confirmed stride is the cost.
+
+Measured in one QUIET window on the gate box (load rose from 3 to ~24 mid-window from other
+tenants; round 1 is the quiet one), five rotated rounds, both compilers self-built at -O2:
+
+| measure (self-host unit) | main b26659e2 | perf-r6 |
+|---|---|---|
+| `-emit check` wall, quiet round (load ~3) | 18.07 s | 14.88 s (-18%) |
+| `-emit check` wall, median of 5 | 20.49 s | 16.92 s (-17%) |
+| semantic CPU, quiet round | 16.2 s | 13.2 s |
+| `-emit ast` wall, median of 5 | 2.03 s | 1.85 s |
+| `-emit tokens` wall, median of 5 | 0.89 s | 0.87 s (unchanged) |
+
+Verification: fast gates at baseline (emit_ast 28, diagnostics_diff 409, semantic_internal 54,
+semantic_acceptance 3); never_leak, borrow_exclusivity, loop_value_codegen, backend_aos and
+packed_aos_row_width smokes OK; backend_native 565/566 (the known arm64-triple check);
+self_host_gen3 fixpoint. Corpus (2854 files): tokens/ast/check identical everywhere; -O0
+objects identical except 37 programs that compile the compiler's AST (expected: they now use
+sized records), and those 37 executables give identical exit codes and output under both
+compilers. The new compiler rebuilds itself to a byte-identical object.
