@@ -41,7 +41,9 @@ process_observe() {
 process_sleep() {
   if (( elisa_rss_have_proc )) && (( BASH_VERSINFO[0] >= 4 )); then
     if [[ -z "$elisa_rss_sleep_fd" ]]; then
-      exec {elisa_rss_sleep_fd}<> <(:) 2>/dev/null || elisa_rss_sleep_fd="none"
+      # The group keeps the 2>/dev/null to this open: on a bare `exec` it would silence
+      # the caller's stderr for the rest of the shell (seed errors vanished that way).
+      { exec {elisa_rss_sleep_fd}<> <(:); } 2>/dev/null || elisa_rss_sleep_fd="none"
     fi
     if [[ "$elisa_rss_sleep_fd" != "none" ]]; then
       read -r -t "$1" -u "$elisa_rss_sleep_fd" _ 2>/dev/null || true
