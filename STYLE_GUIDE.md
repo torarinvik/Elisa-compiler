@@ -445,6 +445,25 @@ def thread_global() -> void:
 
 For two borrows, split them onto disjoint fields, or pass one by value.
 
+### Mutable global grants
+
+Access to a `global mutable` binding requires an explicit capability by default: reads need
+`Global.Read`, writes need `Global.Write`, and read-modify-write needs both. Declare the grant
+on the function or around the access with a `can` block; callers must also have the capability
+when they invoke a function that accesses the global. Immutable `global` and `const` bindings
+do not require these grants. `-permissive` bypasses mutable-global grant checks for diagnostic
+and migration workflows.
+
+```elisa
+global mutable count: i64 = 0
+
+def read_count() -> i64 can[Global.Read]:
+    return count
+
+def increment() -> void can[Global.Read, Global.Write]:
+    count <- count + 1
+```
+
 ## 8. Compiler flags and reading a diagnostic
 
 `-Wnever-leak` is opt-in and stage1 only.

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# The Global{Read, Write} permission family, differentially against stage0.
+# The legacy all-global Global{Read, Write} inference/reporting dial, differentially
+# against stage0. Default mutable-global access grants have a separate CLI smoke.
 #
 # stage0 infers the family from the body and propagates it to callers, but only ENFORCES it
 # under `-Wglobals` (which `-Wstrict` implies). stage1 mirrors that dial as the `# globals`
 # replay header. This gate holds three things:
 #
-#   1. OFF BY DEFAULT on both compilers. A program that reads and writes globals is silent
-#      without the dial — the property that lets the family exist at all without rewriting
-#      the `can` row of every program that touches a global.
+#   1. The legacy all-global report is OFF BY DEFAULT on both compilers. This harness runs
+#      the stage1 reporter permissively to isolate that optional report from mandatory direct
+#      `global mutable` grants; `mutable_global_cli_smoke.sh` covers default grant enforcement.
 #   2. BYTE-EXACT agreement under the dial over the corpus below: read-only vs read+write,
 #      transitivity, `const` purity, the member-selective `trusted` firewall, an index-rooted
 #      store, and a `can` grant at the call site.
@@ -55,12 +56,13 @@ stage0_globals() {   # $1 = source file, $2 = "on"|"off"
 
 stage1_globals() {   # $1 = source file, $2 = "on"|"off"
     local src="$WORK/replay.elisa"
-    if [ "$2" = "on" ]; then printf '# globals\n' > "$src"; else : > "$src"; fi
+    printf '# permissive\n' > "$src"
+    if [ "$2" = "on" ]; then printf '# globals\n' >> "$src"; fi
     cat "$1" >> "$src"
     # `call to "bump" requires can[Global] ...; add can[Global.Read, Global.Write] or ...`
     # (or `add can Global.Read or ...` for a single member). Reduce each warning to
     # `CALLEE can[members]` — the same shape stage0_globals renders its inference in.
-    "$RPT" < "$src" \
+    ELISA_STAGE1_PERMISSIVE=1 "$RPT" < "$src" \
         | awk '/^D [0-9]+$/{d=1;next} d && /^  L[0-9]+ /{sub(/^  L[0-9]+ /,"");print}' \
         | grep 'can\[Global' \
         | sed -E -e 's/.*call to "([A-Za-z_][A-Za-z0-9_.]*)".*add can\[([^]]*)\].*/\1 can[\2]/' \
@@ -115,6 +117,16 @@ expect_silent_by_default() {   # $1 = case name, $2 = source file
     if [ -n "$s0" ] || [ -n "$s1" ]; then
         printf 'global permissions smoke FAILED: %s is not silent without the dial\nstage0: %s\nstage1: %s\n' \
             "$1" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
+        failed=$((failed + 1))
+    fi
+}
+
+expect_stage1_effect() {  # $1 = case name, $2 = source file, $3 = dial, $4 = callee, $5 = members
+    local actual
+    actual="$(stage1_globals "$2" "$3")"
+    if ! printf '%s\n' "$actual" | grep -F -x -q "$4 can[$5]"; then
+        printf 'global permissions smoke FAILED: %s did not retain %s can[%s] with dial %s\nactual: %s\n' \
+            "$1" "$4" "$5" "$3" "${actual//$'\n'/ | }" >&2
         failed=$((failed + 1))
     fi
 }
@@ -257,7 +269,8 @@ def main() -> i64:
     caller()
     return 0
 EOF
-expect_same "grouped signature and local grant" "$WORK/grouped_signature.elisa"
+# The exact local grant covers both grouped members, so there is no call-site warning.
+# The grouped signature itself is also compiled by the focused effect-handler fixture.
 expect_silent_by_default "grouped signature and local grant" "$WORK/grouped_signature.elisa"
 
 cat > "$WORK/grouped_member_selective.elisa" <<'EOF'
@@ -274,8 +287,10 @@ def main() -> i64:
     caller()
     return 0
 EOF
-expect_agree "grouped member remains selective" "$WORK/grouped_member_selective.elisa"
-expect_silent_by_default "grouped member remains selective" "$WORK/grouped_member_selective.elisa"
+# `Global{Read}` is selective: the write call retains its `Global.Write` requirement. This
+# ordinary call-effect diagnostic remains visible even when the optional inference dial is off.
+expect_stage1_effect "grouped member remains selective with dial" "$WORK/grouped_member_selective.elisa" on write_hot Global.Write
+expect_stage1_effect "grouped member remains selective by default" "$WORK/grouped_member_selective.elisa" off write_hot Global.Write
 
 # --- former divergences --------------------------------------------------------------
 
