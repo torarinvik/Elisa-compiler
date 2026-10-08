@@ -98,6 +98,13 @@ extend Semantic:
             inline_refs: mutable darray[sview] = []
             inline_spans: mutable darray[Ast::Pos] = []
             inline_prefix_ends: mutable darray[u32] = []
+            global_mutable_heads: mutable dict[u64, usize] = {}
+            global_mutable_owners: mutable darray[sview] = []
+            global_mutable_offsets: mutable darray[u32] = []
+            global_mutable_lines: mutable darray[u32] = []
+            global_mutable_modules: mutable darray[sview] = []
+            global_mutable_next: mutable darray[usize] = []
+            import_annotations: mutable darray[Ast::EnumAnnotation] = []
             grants: mutable darray[sview] = []
             firewalls: mutable darray[sview] = []
             annotations: darray[Ast::EnumAnnotation]
@@ -117,6 +124,26 @@ extend Semantic:
                     module_scope <- state.parents[module_scope]
                 return false
 
+        def ga_index_mutable_annotations(state: mutable GlobalAuthority&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for annotation in state.annotations |state|:
+                    continue if annotation.name != "__global_mutable"
+                    hash: u64 = name_hash(annotation.owner)
+                    previous: usize = head if state.global_mutable_heads.get(hash) is head else GLOBAL_AUTHORITY_NONE
+                    index: usize = state.global_mutable_owners.count
+                    state.global_mutable_owners.push(annotation.owner)
+                    state.global_mutable_offsets.push(annotation.offset)
+                    state.global_mutable_lines.push(annotation.line)
+                    state.global_mutable_modules.push(annotation.module)
+                    state.global_mutable_next.push(previous)
+                    state.global_mutable_heads <- state.global_mutable_heads.put(hash, index)
+
+        def ga_index_import_annotations(state: mutable GlobalAuthority&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for annotation in state.annotations |state|:
+                    continue if annotation.owner != "__from_member" and annotation.name != "__binding_wildcard_import"
+                    state.import_annotations.push(annotation)
+
         def ga_collect(declarations: darray[Ast::Decl], module_scope: usize, state: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations:
@@ -126,7 +153,12 @@ extend Semantic:
                                 state.global_types.push(type_expression)
                                 state.globals.push(name)
                                 state.global_scopes.push(module_scope)
-                                state.writable.push(any annotation in state.annotations where annotation.owner == name and annotation.name == "__global_mutable" and annotation.line == at.line and annotation.offset == at.offset and ga_module_text(annotation.module, state) == module_scope)
+                                writable: mutable bool = false
+                                candidate: mutable usize = head if state.global_mutable_heads.get(name_hash(name)) is head else GLOBAL_AUTHORITY_NONE
+                                while candidate < state.global_mutable_owners.count |candidate, writable, state|:
+                                    writable <- true if state.global_mutable_owners[candidate] == name and state.global_mutable_offsets[candidate] == at.offset and state.global_mutable_lines[candidate] == at.line and ga_module_text(state.global_mutable_modules[candidate], state) == module_scope
+                                    candidate <- state.global_mutable_next[candidate]
+                                state.writable.push(writable)
                         Decl.Func(name, parameters, return_type, _, effects, decorators, at):
                             minimum: mutable usize = 0
                             for parameter in parameters |minimum|:
@@ -210,7 +242,7 @@ extend Semantic:
                     current <- state.parents[current]
                 # Import metadata is paired by lexical owner and token identity; a
                 # selective import cannot grant every member of its source module.
-                for import_row in state.annotations:
+                for import_row in state.import_annotations:
                     continue if not ga_import_visible(import_row.module, state, module_scope)
                     if import_row.owner == "__from_member" and import_row.name == name:
                         for source in state.annotations:
@@ -279,7 +311,7 @@ extend Semantic:
                     state.functions.count return if qualified or current >= state.modules.count
                     break if current == 0
                     current <- state.parents[current]
-                for import_row in state.annotations:
+                for import_row in state.import_annotations:
                     continue if not ga_import_visible(import_row.module, state, module_scope)
                     if import_row.owner == "__from_member" and import_row.name == name:
                         for source in state.annotations:
@@ -321,19 +353,65 @@ extend Semantic:
 
         def ga_index_inline_grants(state: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for outer in 1..<state.inline_spans.count |state|:
-                    index: mutable usize = outer
-                    while index > 0 and state.inline_spans[index].offset < state.inline_spans[index - 1].offset |index, state|:
-                        span: Ast::Pos = state.inline_spans[index]
-                        ref: sview = state.inline_refs[index]
-                        lexical_scope: usize = state.inline_scopes[index]
-                        state.inline_spans[index] <- state.inline_spans[index - 1]
-                        state.inline_refs[index] <- state.inline_refs[index - 1]
-                        state.inline_scopes[index] <- state.inline_scopes[index - 1]
-                        state.inline_spans[index - 1] <- span
-                        state.inline_refs[index - 1] <- ref
-                        state.inline_scopes[index - 1] <- lexical_scope
-                        index <- index - 1
+                # The sort buffers are temporary, while the indexed arrays belong to the
+                # caller's authority state. Keep buffers in an explicit region and copy
+                # their scalar elements back in place so no scratch container escapes.
+                region scratch:
+                    order: mutable darray[usize] = []
+                    scratch_order: mutable darray[usize] = []
+                    visited: mutable darray[bool] = []
+                    # Reserve all buffers before filling any of them, so later growth
+                    # cannot strand old capacities in the chained region.
+                    order.reserve(state.inline_spans.count)
+                    scratch_order.reserve(state.inline_spans.count)
+                    visited.reserve(state.inline_spans.count)
+                    for index in 0..<state.inline_spans.count |order, scratch_order, visited|:
+                        order.push(index)
+                        scratch_order.push(index)
+                        visited.push(false)
+                    width: mutable usize = 1
+                    while width < order.count |width, order, scratch_order, state|:
+                        start: mutable usize = 0
+                        while start < order.count |start, width, order, scratch_order, state|:
+                            middle: usize = start + width if start + width < order.count else order.count
+                            stop: usize = start + 2 * width if start + 2 * width < order.count else order.count
+                            left: mutable usize = start
+                            right: mutable usize = middle
+                            target: mutable usize = start
+                            while target < stop |target, left, right, middle, stop, order, scratch_order, state|:
+                                take_right: bool = right < stop and (left >= middle or state.inline_spans[order[right]].offset < state.inline_spans[order[left]].offset)
+                                if take_right:
+                                    scratch_order[target] <- order[right]
+                                    right <- right + 1
+                                else:
+                                    scratch_order[target] <- order[left]
+                                    left <- left + 1
+                                target <- target + 1
+                            start <- stop
+                        for index in 0..<order.count |order, scratch_order|:
+                            order[index] <- scratch_order[index]
+                        width <- width * 2
+                    # Apply the sorted permutation in place. Keeping only usize/Bool
+                    # scratch arrays avoids putting borrowed grant views in this region;
+                    # each value copied below comes directly from the caller-owned rows.
+                    for start in 0..<order.count |visited, order, state|:
+                        continue if visited[start]
+                        current: mutable usize = start
+                        saved_ref: sview = state.inline_refs[start]
+                        saved_span: Ast::Pos = state.inline_spans[start]
+                        saved_scope: usize = state.inline_scopes[start]
+                        while true |current, visited, order, state, saved_ref, saved_span, saved_scope|:
+                            visited[current] <- true
+                            source: usize = order[current]
+                            if source == start:
+                                state.inline_refs[current] <- saved_ref
+                                state.inline_spans[current] <- saved_span
+                                state.inline_scopes[current] <- saved_scope
+                                break
+                            state.inline_refs[current] <- state.inline_refs[source]
+                            state.inline_spans[current] <- state.inline_spans[source]
+                            state.inline_scopes[current] <- state.inline_scopes[source]
+                            current <- source
                 longest: mutable u32 = 0
                 for span in state.inline_spans |longest, state|:
                     longest <- max(longest, span.end_offset)
@@ -1311,7 +1389,9 @@ extend Semantic:
 
         def check_mutable_global_authority(file: Ast::File&, table: lmut SymbolTable, strict_unsafe: bool = false) -> void:
             can Memory.Allocate, Abort.Panic:
-                state: mutable GlobalAuthority = GlobalAuthority{parents: [0], modules: [""], module_starts: [0], module_lengths: [0], globals: [], global_scopes: [], global_types: [], writable: [], functions: [], function_heads: {}, function_next: [], function_scopes: [], function_offsets: [], function_lines: [], function_variadic: [], function_return_types: [], parameter_starts: [], parameter_counts: [], parameter_minimum: [], enum_names: [], enum_scopes: [], struct_names: [], struct_scopes: [], field_owners: [], field_scopes: [], field_names: [], field_types: [], alias_names: [], alias_scopes: [], alias_types: [], parameter_functions: [], parameter_names: [], parameter_types: [], parameter_defaults: [], default_depth: 0, reads: [], writes: [], edge_from: [], edge_to: [], edge_reads: [], edge_writes: [], local_floor: 0, local_limit: GLOBAL_AUTHORITY_NONE, locals: [], local_types: [], local_callees: [], return_type: null, lambda_depth: 0, inline_refs: [], inline_spans: [], inline_prefix_ends: [], grants: [], firewalls: [], annotations: file.enum_annotations, generic_lines: file.generic_param_lines, generic_names: file.generic_param_names, module_scope: 0, function: 0, report: false}
+                state: mutable GlobalAuthority = GlobalAuthority{parents: [0], modules: [""], module_starts: [0], module_lengths: [0], globals: [], global_scopes: [], global_types: [], writable: [], functions: [], function_heads: {}, function_next: [], function_scopes: [], function_offsets: [], function_lines: [], function_variadic: [], function_return_types: [], parameter_starts: [], parameter_counts: [], parameter_minimum: [], enum_names: [], enum_scopes: [], struct_names: [], struct_scopes: [], field_owners: [], field_scopes: [], field_names: [], field_types: [], alias_names: [], alias_scopes: [], alias_types: [], parameter_functions: [], parameter_names: [], parameter_types: [], parameter_defaults: [], default_depth: 0, reads: [], writes: [], edge_from: [], edge_to: [], edge_reads: [], edge_writes: [], local_floor: 0, local_limit: GLOBAL_AUTHORITY_NONE, locals: [], local_types: [], local_callees: [], return_type: null, lambda_depth: 0, inline_refs: [], inline_spans: [], inline_prefix_ends: [], global_mutable_heads: {}, global_mutable_owners: [], global_mutable_offsets: [], global_mutable_lines: [], global_mutable_modules: [], global_mutable_next: [], import_annotations: [], grants: [], firewalls: [], annotations: file.enum_annotations, generic_lines: file.generic_param_lines, generic_names: file.generic_param_names, module_scope: 0, function: 0, report: false}
+                ga_index_import_annotations(&state)
+                ga_index_mutable_annotations(&state)
                 state.strict_unsafe <- strict_unsafe
                 ga_collect(file.top_decls, 0, &state)
                 for annotation in state.annotations:
