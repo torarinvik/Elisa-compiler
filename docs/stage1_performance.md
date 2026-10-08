@@ -342,3 +342,38 @@ self_host_gen3 fixpoint. Corpus (2854 files): tokens/ast/check identical everywh
 objects identical except 37 programs that compile the compiler's AST (expected: they now use
 sized records), and those 37 executables give identical exit codes and output under both
 compilers. The new compiler rebuilds itself to a byte-identical object.
+
+## HANDOFF (round 8, parallel semantic passes, WIP on claude/parallel-check)
+
+Done:
+- stage0 (Elisa-core, claude/parallel-check d965439b): `submit` of a worker with a hidden
+  `__packed_store_` param captures the submitting scope's store; workers that build nodes
+  (including payload-less variants such as `Expr.Absent`) are rejected. go test failures are
+  the same 290 as main.
+- stage1: store-capturing submit in codegen (codegen_submit_store_capture.elisa), 64 MB pool
+  worker stacks, the parallel runner (semantic_parallel.elisa), the generated pass list
+  (semantic_parallel_passes.elisa, 221 passes), and the audit/generator
+  scripts/semantic_parallel_gen.py (`--check/--write/--report`; run `--write` on main's
+  sequential semantic_api.elisa).
+- The seed builds. Serial `-emit check` of the self-host unit works (~18.5 s).
+
+Open bug: a parallel `-emit check` segfaults in par_pass_run's splice loop because a job's
+diagnostics live in memory that has been unmapped. The worker's local table sits in the worker
+frame's auto region, so the lmut pass writes allocate there and are freed at return. Neither
+`in arena:` on the job's heap Arena& nor a local Arena that is moved into the job fixes it.
+Stage0 cannot infer an lmut region for a table declared in an `in` block or reached through a
+heap ref (probe: r8-probe/p7.elisa). Ways forward:
+- Have the worker deep-copy its diagnostics into job-owned heap memory before it returns.
+- Teach region inference to bind a heap ref to a region.
+
+Next:
+- Fix the bug above.
+- Run gen2, det.sh, gates.sh (fast gates, the smokes, self_host_gen3), the corpus diff and the
+  QUIET timing, then write the round-8 table.
+- Land stage0, then stage1.
+- Bigger lever: remove the `Expr.Absent` sentinel constructions. 62 passes are blocked only by
+  these.
+
+Box (ssh -p 53652 root@38.49.42.120): /root/work/r8-core (stage0), r8-s1 (stage1 tree),
+r8-probe (seed.sh, gen2.sh, gates.sh, det.sh, run.sh), r8-main, r8-g2*, r8-chk.*, r8-core-test,
+r8-core-main.

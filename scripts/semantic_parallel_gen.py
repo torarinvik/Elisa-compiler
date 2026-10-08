@@ -12,7 +12,10 @@ proves that from the source, conservatively:
     any `in <table>.<field>:` region block and any `&<table>.<field>` borrow (read-only borrows
     included), where <table> is any parameter or local declared with a SymbolTable type;
   * a diagnostics read is any use of `<table>.diagnostics` other than `<- ....push(` on it;
-  * a global write is any assignment to or borrow of a `global mutable` name.
+  * a global write is any assignment to, borrow of, or `in <global>:` region block over a
+    `global mutable` name;
+  * an AST write is any AST node construction (a variant of Expr/Stmt/Decl/Pattern/Node used
+    as a value): it grows the shared AST store.
 
 Passes run in `check_full_into` (semantic_api.elisa) as `table <- pass(ARGS) [if COND]`. A
 maximal run of consecutive append-only passes whose ARGS/COND use only `file`, `loop_view`,
@@ -180,7 +183,8 @@ def analyze(defs, globals_):
                 for m in glob_re.finditer(text):
                     rest = text[m.end():m.end() + 4]
                     lead = text[max(0, m.start() - 2):m.start()]
-                    if re.match(r"\s*<-", rest) or re.match(r"(?:\[[^\]]*\])?\.\w+\s*<-", text[m.end():m.end() + 40]) or "&" in lead:
+                    allocates = re.search(r"\bin\s+$", text[max(0, m.start() - 4):m.start()]) is not None
+                    if allocates or re.match(r"\s*<-", rest) or re.match(r"(?:\[[^\]]*\])?\.\w+\s*<-", text[m.end():m.end() + 40]) or "&" in lead:
                         writes.add("global:" + m.group(1))
             for site in ast_constructions(text):
                 writes.add("ast:" + site)

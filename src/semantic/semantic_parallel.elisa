@@ -8,7 +8,7 @@
 #
 # - each job gets a shallow byte copy of the table whose `diagnostics` starts empty (the copy
 #   shares every other row with the frozen table, which no job writes);
-# - each job allocates inside its own arena (`in job.arena:`), never in the table's region,
+# - each job allocates inside its own arena (`in arena:`), never in the table's region,
 #   so no allocator state is shared between threads; the arenas are not freed, because the
 #   diagnostics they hold (names, rendered text) are spliced into the table;
 # - the worker reads the AST through the submitting scope's store, which `submit` captures
@@ -30,6 +30,9 @@ extend Semantic:
             view_bits: uintptr
             flags: ParPassFlags
             pass_id: u32
+            # The job's own arena: no allocator state is shared with another thread. It is never
+            # freed (a local Arena would be, at the worker's return), because the diagnostics
+            # spliced into the table live in it.
             arena: mutable Arena
             # The job's result: the frozen table's bytes with the job's own diagnostics.
             table: mutable SymbolTable
@@ -47,13 +50,20 @@ extend Semantic:
                 file: heap Ast::File& = job.file_bits.cast[heap Ast::File&]
                 view: heap Ast::File& = job.view_bits.cast[heap Ast::File&]
                 # A shallow copy of the frozen table: it shares every row, and only its
-                # diagnostics (fresh, in the job's arena) are written.
+                # diagnostics (fresh) are written. The passes run `in scratch:` so their
+                # region-polymorphic writes (diagnostics, their text) land in a private arena
+                # rather than this frame's region, which is freed when the worker returns. The
+                # arena is then moved into the job (and the local's bytes cleared, not assigned:
+                # assignment would release it, so the frame's release frees nothing): the spliced diagnostics live in it.
+                scratch: mutable Arena = zeroed
                 table: mutable SymbolTable = SymbolTable()
                 _ = memcpy((&table).cast[mutable void&], job.shared_bits.cast[void&], size_of(SymbolTable))
-                in job.arena:
+                in scratch:
                     table.diagnostics <- []
                     table <- par_pass_call(job.pass_id, file, view, job.flags, table)
                 _ = memcpy((&job.table).cast[mutable void&], (&table).cast[void&], size_of(SymbolTable))
+                _ = memcpy((&job.arena).cast[mutable void&], (&scratch).cast[void&], size_of(Arena))
+                _ = memset((&scratch).cast[mutable void&], 0, size_of(Arena))
                 return 0
 
         # True when ELISA_SEMANTIC_SERIAL is set to anything but "0" or "".
@@ -78,21 +88,23 @@ extend Semantic:
                 view_bits: uintptr = view.cast[void&].uintptr()
                 for offset in 0..<count |jobs, shared_bits, file_bits, view_bits, flags, first|:
                     jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, table: SymbolTable()})
-                base: uintptr = (&jobs[0]).cast[void&].uintptr()
-                stride: uintptr = size_of(ParPassJob).uintptr()
+                # Each job's address, taken from the buffer itself (not base + i * size_of).
+                job_addresses: mutable darray[uintptr] = []
+                for offset in 0..<count |job_addresses, jobs|:
+                    job_addresses.push((&jobs[offset.usize()]).cast[void&].uintptr())
                 cores: i64 = perf_cores()
                 workers: usize = count.usize() if cores <= 0 or cores.u64() >= count.u64() else cores.usize()
                 nursery workers(workers):
                     for offset in 0..<count:
-                        submit par_pass_worker(ParPassTicket{job_bits: base + offset.uintptr() * stride, ast: null})
+                        submit par_pass_worker(ParPassTicket{job_bits: job_addresses[offset.usize()], ast: null})
                 # Every job's table must still be the frozen table's bytes outside `diagnostics`:
                 # anything else is a pass that reassigned, grew or rebuilt a table field, i.e. one
                 # the audit misclassified. Then splice the diagnostics in pass order.
                 diagnostics_offset: usize = ((&table.diagnostics).cast[void&].uintptr() - shared_bits).usize()
                 diagnostics_end: usize = diagnostics_offset + size_of(darray[Diagnostic])
                 table_size: usize = size_of(SymbolTable)
-                for offset in 0..<count |table, base, stride, shared_bits, diagnostics_offset, diagnostics_end, table_size|:
-                    job: heap ParPassJob& = (base + offset.uintptr() * stride).cast[heap ParPassJob&]
+                for job_bits in job_addresses |table, shared_bits, diagnostics_offset, diagnostics_end, table_size|:
+                    job: heap ParPassJob& = job_bits.cast[heap ParPassJob&]
                     copy_bits: uintptr = (&job.table).cast[void&].uintptr()
                     head_same: bool = memcmp(copy_bits.cast[void&], shared_bits.cast[void&], diagnostics_offset) == 0
                     tail_same: bool = memcmp((copy_bits + diagnostics_end.uintptr()).cast[void&], (shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
