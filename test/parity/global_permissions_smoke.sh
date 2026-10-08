@@ -241,6 +241,42 @@ for case_file in reads_writes store_and_grant trusted_firewall rooted_store qual
     expect_silent_by_default "$case_file" "$WORK/$case_file.elisa"
 done
 
+# Grouped permission clauses retain every member in both signatures and local grants.
+# A one-member group remains selective: Global{Read} must not cover a Global.Write call.
+cat > "$WORK/grouped_signature.elisa" <<'EOF'
+global mutable hot: i32 = 0
+
+def bump() -> void can[Global{Read, Write}]:
+    hot += 1
+
+def caller() -> void:
+    can Global{Read, Write}:
+        bump()
+
+def main() -> i64:
+    caller()
+    return 0
+EOF
+expect_same "grouped signature and local grant" "$WORK/grouped_signature.elisa"
+expect_silent_by_default "grouped signature and local grant" "$WORK/grouped_signature.elisa"
+
+cat > "$WORK/grouped_member_selective.elisa" <<'EOF'
+global mutable hot: i32 = 0
+
+def write_hot() -> void can[Global.Write]:
+    hot <- 1
+
+def caller() -> void:
+    can Global{Read}:
+        write_hot()
+
+def main() -> i64:
+    caller()
+    return 0
+EOF
+expect_agree "grouped member remains selective" "$WORK/grouped_member_selective.elisa"
+expect_silent_by_default "grouped member remains selective" "$WORK/grouped_member_selective.elisa"
+
 # --- former divergences --------------------------------------------------------------
 
 # A parameter named after a global is a parameter, not global storage.
