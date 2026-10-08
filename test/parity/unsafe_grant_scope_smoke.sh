@@ -898,6 +898,28 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    "grouped unsafe capability covers listed members": (
+        "# strict\n# unsafe\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def memory_api() -> void can[Memory{Allocate, Release}]:\n    return\n"
+        "def good() -> void:\n"
+        "    can Unsafe{PointerCast, RawExtern}:\n"
+        "        unsafe_api()\n"
+        "    can Memory{Allocate, Release}:\n"
+        "        memory_api()\n"
+        "        value: i64 = 1\n"
+        "def main() -> i64:\n    good()\n    return 0\n",
+        None,
+    ),
+    "grouped unsafe capability remains member-selective": (
+        "# strict\n# unsafe\n"
+        "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def bad() -> void:\n"
+        "    can Unsafe{RawExtern}:\n"
+        "        unsafe_api()\n"
+        "def main() -> i64:\n    return 0\n",
+        'call to "unsafe_api" requires can[Unsafe]',
+    ),
     "buffer reference parameter still needs buffer capability": (
         "# strict\n# unsafe\n"
         "def bad(buffer: mutable darray[u8]&) -> void:\n"
@@ -942,6 +964,7 @@ with tempfile.TemporaryDirectory(prefix="elisa-unsafe-grants-") as temp:
             message in output
             for message in (
                 "mutable alias requires",
+                "unknown permission",
                 "unchecked index requires",
                 "mutable global access requires",
                 "pointer arithmetic requires",

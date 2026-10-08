@@ -114,7 +114,7 @@ def main() -> i64:
     callback: fn()->i64 = helper
     return callback()
 CASE
-run_case grouped_signature_only 'mutable global write requires can[Global]' <<'CASE'
+run_case grouped_signature_only 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def update() -> i64 can[Global{Read,Write}]:
     hot <- hot + 1
@@ -234,12 +234,12 @@ def main() -> i64:
         pointer: i64& = (&local).cast[i64&]
         return pointer
 CASE
-run_case direct_read 'mutable global read requires can[Global]' <<'CASE'
+run_case direct_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     return hot
 CASE
-run_case direct_write 'mutable global write requires can[Global]' <<'CASE'
+run_case direct_write 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     hot <- 2
@@ -251,14 +251,14 @@ def main() -> i64:
     can Global.Read:
         return hot
 CASE
-run_case wrong_member 'mutable global write requires can[Global]' <<'CASE'
+run_case wrong_member 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     can Global.Read:
         hot <- 2
     return 0
 CASE
-run_case compound_read 'mutable global read requires can[Global]' <<'CASE'
+run_case compound_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     can Global.Write:
@@ -291,27 +291,27 @@ def main() -> i64:
     hot: i64 = 7
     return hot
 CASE
-run_case initializer_before_binding 'mutable global read requires can[Global]' <<'CASE'
+run_case initializer_before_binding 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     hot: i64 = hot
     return hot
 CASE
-run_case shadow_scope_exit 'mutable global read requires can[Global]' <<'CASE'
+run_case shadow_scope_exit 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     block:
         hot: i64 = 2
     return hot
 CASE
-run_case qualified_read 'mutable global read requires can[Global]' <<'CASE'
+run_case qualified_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box:
     public:
         global mutable hot: i64 = 1
 def main() -> i64:
     return Box::hot
 CASE
-run_case imported_read 'mutable global read requires can[Global]' <<'CASE'
+run_case imported_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box:
     public:
         global mutable hot: i64 = 1
@@ -319,7 +319,7 @@ using Box::hot
 def main() -> i64:
     return hot
 CASE
-run_case alias_read 'mutable global read requires can[Global]' <<'CASE'
+run_case alias_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box:
     public:
         global mutable hot: i64 = 1
@@ -327,7 +327,7 @@ using Box as B
 def main() -> i64:
     return B::hot
 CASE
-run_case index_read 'mutable global read requires can[Global]' <<'CASE'
+run_case index_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable slots: array[i64, 4] = [0, 0, 0, 0]
 global mutable cursor: i64 = 0
 def main() -> i64:
@@ -343,7 +343,7 @@ def reader() -> i64:
 def main() -> i64:
     return reader()
 CASE
-run_case trusted_firewall 'mutable global read requires can[Global]' <<'CASE'
+run_case trusted_firewall 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def reader() -> i64:
     trusted Global.Read:
@@ -351,25 +351,25 @@ def reader() -> i64:
 def main() -> i64:
     return reader()
 CASE
-run_case empty_trusted 'mutable global read requires can[Global]' <<'CASE'
+run_case empty_trusted 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     trusted:
         return hot
 CASE
-run_case bracketed_wrong_member 'mutable global write requires can[Global]' <<'CASE'
+run_case bracketed_wrong_member 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     trusted [Global.Read]:
         hot <- 2
     return 0
 CASE
-run_case signature_is_not_local_authority 'mutable global read requires can[Global]' <<'CASE'
+run_case signature_is_not_local_authority 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64 can[Global.Read]:
     return hot
 CASE
-run_case mutable_reference 'mutable global write requires can[Global]' <<'CASE'
+run_case mutable_reference 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     can Global.Read:
@@ -377,7 +377,7 @@ def main() -> i64:
         reference <- 2
     return 0
 CASE
-run_case mutable_argument 'mutable global write requires can[Global]' <<'CASE'
+run_case mutable_argument 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def update(value: mutable i64&) -> void:
     value <- 2
@@ -386,7 +386,7 @@ def main() -> i64:
         update(&hot)
     return 0
 CASE
-run_case inferred_alias 'mutable global write requires can[Global]' <<'CASE'
+run_case inferred_alias 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     can Global.Read:
@@ -401,7 +401,7 @@ def main() -> i64:
         reference: i64& = &hot
         return reference
 CASE
-run_case mutable_ref_return 'mutable global write requires can[Global]' <<'CASE'
+run_case mutable_ref_return 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def expose() -> mutable i64&:
     can Global.Read:
@@ -484,7 +484,7 @@ def choose(value: i64) -> i64:
 def main() -> i64:
     return choose(true)
 CASE
-run_case nested_module_import 'mutable global read requires can[Global]' <<'CASE'
+run_case nested_module_import 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box:
     public:
         module Inner:
@@ -503,7 +503,7 @@ def apply(callback: fn() -> i64 can[Global.Read]) -> i64:
 def main() -> i64:
     return apply(reader)
 CASE
-run_case nested_module_qualified 'mutable global read requires can[Global]' <<'CASE'
+run_case nested_module_qualified 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box:
     public:
         module Inner:
@@ -512,7 +512,7 @@ module Box:
 def main() -> i64:
     return Box::Inner::hot
 CASE
-run_case verbatim_module_qualified 'mutable global read requires can[Global]' <<'CASE'
+run_case verbatim_module_qualified 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box::Inner:
     public:
         global mutable hot: i64 = 1
@@ -529,7 +529,7 @@ module Immutable:
 def main() -> i64:
     return Immutable::hot
 CASE
-run_case explicit_global_arena 'mutable global write requires can[Global]' <<'CASE'
+run_case explicit_global_arena 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable arena: Arena = zeroed
 def grow(out: mutable darray[i32]&) -> void:
     can Global.Read:
@@ -553,7 +553,7 @@ def main() -> i64:
     value: i64 = 0
     return reader[i64](value)
 CASE
-run_case wrapped_inferred_ref 'mutable global write requires can[Global]' <<'CASE'
+run_case wrapped_inferred_ref 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     can Global.Read:
@@ -600,7 +600,7 @@ from Box import Item
 def main(item: Item) -> i64:
     return item.read()
 CASE
-run_case writable_cast 'mutable global write requires can[Global]' <<'CASE'
+run_case writable_cast 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     can Global.Read, Unsafe.PointerCast:
@@ -608,14 +608,14 @@ def main() -> i64:
         reference <- 2
     return 0
 CASE
-run_case default_reader 'mutable global read requires can[Global]' <<'CASE'
+run_case default_reader 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def reader(value: i64 = hot) -> i64:
     return value
 def main() -> i64:
     return reader()
 CASE
-run_case collection_mutation 'mutable global write requires can[Global]' <<'CASE'
+run_case collection_mutation 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable values: darray[i64] = []
 def main() -> i64:
     can Global.Read:
@@ -773,7 +773,7 @@ def reader(value: i64 = hot) -> i64:
 def main() -> i64:
     return reader() can Global.Read
 CASE
-run_case qualified_global_arena 'mutable global write requires can[Global]' <<'CASE'
+run_case qualified_global_arena 'accesses a global mutable binding without Global.Write' <<'CASE'
 module Stores:
     global mutable arena: Arena = zeroed
 def grow(out: mutable darray[i32]&) -> void:
@@ -790,7 +790,7 @@ def grow(out: mutable darray[i32]&) -> void:
         in Stores::arena:
             out.push(1)
 CASE
-run_case aliased_global_arena 'mutable global write requires can[Global]' <<'CASE'
+run_case aliased_global_arena 'accesses a global mutable binding without Global.Write' <<'CASE'
 module Stores:
     global mutable arena: Arena = zeroed
 using Stores as Storage
@@ -799,7 +799,7 @@ def grow(out: mutable darray[i32]&) -> void:
         in Storage::arena:
             out.push(1)
 CASE
-run_case scoped_alias_wrong_member 'mutable global write requires can[Global]' <<'CASE'
+run_case scoped_alias_wrong_member 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 0
 module ReadOnly:
     alias Access = Global.Read

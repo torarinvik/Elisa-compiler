@@ -168,6 +168,7 @@ run_direct_equivalence() {
 }
 
 run_positive "static_handler_bare.elisa"
+run_positive "grouped_permission_family_rows.elisa"
 run_positive "static_handler_capture.elisa"
 run_positive "static_handler_scope_named.elisa"
 run_positive "static_handler_qualified.elisa"

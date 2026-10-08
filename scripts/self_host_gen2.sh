@@ -48,7 +48,9 @@ terminate_guarded_pid() {
 
 run_guarded_stage1() {
   local pid rss peak=0
-  bash "$ROOT/scripts/elisac_stage1.sh" -o "$OUT_DIR/elisac_stage1_gen2.o" "$ROOT/src/driver/elisac.elisa" &
+  # The compiler's own source has not completed its local mutable-global grants yet. Keep
+  # the bootstrap compile permissive; ordinary user compilations still enforce them by default.
+  bash "$ROOT/scripts/elisac_stage1.sh" -permissive -o "$OUT_DIR/elisac_stage1_gen2.o" "$ROOT/src/driver/elisac.elisa" &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     process_observe "$pid"
