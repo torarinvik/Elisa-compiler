@@ -1,0 +1,178 @@
+# Breadth reporter: read one source file on stdin, run the full stage1
+# lex -> parse -> check pipeline, and print a terse machine-readable report:
+#   P <n>                     number of parse errors
+#     <kindcode> L<line> <context-token>   ... one per parse error
+#   D <n>                     number of semantic diagnostics
+#     <kindcode> L<line> <name>            ... one per diagnostic
+# Used by breadth/run.sh to sweep the external corpora and surface real gaps.
+include "../../src/semantic/semantic.elisa"
+using Bytes
+
+extern read(fd: int, buf: void&, count: usize) -> isize can[Console]
+extern write(fd: int, buf: void&, count: usize) -> isize can[Console]
+
+
+def read_all() -> darray[u8] can[Console, Memory.Allocate, Abort.Panic]:
+    buf: mutable darray[u8] = []
+    chunk: mutable darray[u8] = [0 for _ in 0..<8192]
+    while true:
+        n: isize = read(0, (&chunk[0]).cast[void&], 8192) can Console
+        break if n <= 0
+        i: mutable isize = 0
+        while i < n:
+            buf.push(chunk[i.usize()])
+            i <- i + 1
+    buf.push(0)
+    return buf
+
+
+def parse_kind_code(k: Ast::ParseErrorKind) -> i64:
+    # docs/119 §4: a pure enum→code classifier reads best as a match expression.
+    return match k:
+        Ast::ParseErrorKind.ExpectedToken: 0
+        Ast::ParseErrorKind.UnexpectedToken: 1
+        Ast::ParseErrorKind.ExpectedDeclaration: 2
+        _: 3
+
+
+def emit(s: darray[u8]) -> void can[Console, Memory.Allocate, Abort.Panic]:
+    return if s.count == 0
+    _ = write(1, (&s[0]).cast[void&], s.count.usize()) can Console
+
+
+# Detect the independent replay-mode header lines (`# strict`, `# flow-strict`, `# std`)
+# across the leading comment block. Each `#` line is classified and its flag OR-ed in, so
+# combinations (e.g. a strict trusted-stdlib source) are honoured. Only the first few lines
+# are scanned — headers always lead the source.
+def header_flags(src: darray[u8]&) -> (strict: bool, flow: bool, std: bool, flow_warn: bool, smt: bool, warn_discard: bool, progress: bool, extern_contracts: bool, raw_unsafe: bool, proofhole: bool, regioncap: i64, globals: bool, nopath: bool):
+    can Abort.Panic:
+        strict: mutable bool = false
+        flow: mutable bool = false
+        std: mutable bool = false
+        flow_warn: mutable bool = false
+        smt: mutable bool = false
+        warn_discard: mutable bool = false
+        progress: mutable bool = false
+        extern_contracts: mutable bool = false
+        raw_unsafe: mutable bool = false
+        proofhole: mutable bool = false
+        globals: mutable bool = false
+        nopath: mutable bool = false
+        regioncap: mutable i64 = 64
+        base: mutable usize = 0
+        line: mutable usize = 0
+        # The window used to be a fixed FIVE lines, which a row enabling many axes at once
+        # could overflow -- the gate had to hand-order its headers to keep the important one
+        # inside it. Scan the whole LEADING COMMENT BLOCK instead and stop at the first line
+        # that is not a `#` comment, so headers can never be pushed out and the scan still
+        # never reaches real source. Blank lines continue the block (a fixture may separate
+        # its headers from its code); the cap only bounds a pathological all-comment file.
+        while line < 32 and base < src.count and (src[base] == 35 or src[base] == 10) |base, line, strict, flow, std, flow_warn, smt, warn_discard, progress, extern_contracts, raw_unsafe, proofhole, globals, nopath, regioncap|:
+            if src[base] == 35:
+                # `# unsafe` — stage0's pure EnforceUnsafePermissions (NOT the strict-proofs
+                # union `# strict`); gates the raw-extern-call obligation alone.
+                raw_unsafe <- true if base + 7 < src.count and src[base + 2] == 117 and src[base + 3] == 110 and src[base + 4] == 115 and src[base + 5] == 97 and src[base + 6] == 102 and src[base + 7] == 101
+                # `# progress` — stage0's EnforceProgressSafety fingerprint.
+                progress <- true if base + 5 < src.count and src[base + 2] == 112 and src[base + 3] == 114 and src[base + 4] == 111 and src[base + 5] == 103
+                # `# strict` = base+2..7 spell "strict"; the char after must NOT be `-`
+                # (that is `# strict-externs`, a distinct independent axis).
+                spells_strict: bool = base + 7 < src.count and src[base + 2] == 115 and src[base + 3] == 116 and src[base + 4] == 114 and src[base + 5] == 105 and src[base + 6] == 99 and src[base + 7] == 116
+                followed_by_dash: bool = base + 8 < src.count and src[base + 8] == 45
+                extern_contracts <- true if spells_strict and followed_by_dash
+                strict <- true if spells_strict and not followed_by_dash
+                flow <- true if base + 7 < src.count and src[base + 2] == 102 and src[base + 3] == 108 and src[base + 4] == 111 and src[base + 5] == 119 and src[base + 6] == 45 and src[base + 7] == 115
+                std <- true if base + 4 < src.count and src[base + 2] == 115 and src[base + 3] == 116 and src[base + 4] == 100 and (base + 5 >= src.count or src[base + 5] == 10 or src[base + 5] == 32)
+                # `# flow` (mode 1, -Wflow) — distinguished from `# flow-strict` by the char
+                # after `flow` being end-of-line/space, not `-`.
+                flow_warn <- true if base + 5 < src.count and src[base + 2] == 102 and src[base + 3] == 108 and src[base + 4] == 111 and src[base + 5] == 119 and (base + 6 >= src.count or src[base + 6] == 10 or src[base + 6] == 32)
+                # `# smt` — stage0's EnableSMT fingerprint; provability differs by tier.
+                smt <- true if base + 4 < src.count and src[base + 2] == 115 and src[base + 3] == 109 and src[base + 4] == 116 and (base + 5 >= src.count or src[base + 5] == 10 or src[base + 5] == 32)
+                # `# warn-discard` — stage0's WarnDiscardedValues (docs/119 W1) opt-in.
+                warn_discard <- true if base + 5 < src.count and src[base + 2] == 119 and src[base + 3] == 97 and src[base + 4] == 114 and src[base + 5] == 110
+                # `# proofhole` — stage0's EmitProofHoleHints; emits assertion proof-hole warnings.
+                proofhole <- true if base + 10 < src.count and src[base + 2] == 112 and src[base + 3] == 114 and src[base + 4] == 111 and src[base + 5] == 111 and src[base + 6] == 102 and src[base + 7] == 104 and src[base + 8] == 111 and src[base + 9] == 108 and src[base + 10] == 101
+                # `# globals` — stage0's EnforceGlobalPermissions (`-Wglobals`, which `-Wstrict`
+                # implies). An INDEPENDENT axis, like `# unsafe`: the fingerprint records it
+                # separately, so `# strict` must not silently imply it here.
+                globals <- true if base + 8 < src.count and src[base + 2] == 103 and src[base + 3] == 108 and src[base + 4] == 111 and src[base + 5] == 98 and src[base + 6] == 97 and src[base + 7] == 108 and src[base + 8] == 115
+                # `# nopath` — the analyzed source has NO real on-disk path. stage0 gates its
+                # whole internal-runtime-carrier surface on the path
+                # (semantic/runtime_carrier_warnings.go, shouldRejectRuntimeCarrierTypeUse):
+                # a bare filename that does not resolve, or an internal root, stays silent.
+                # Every row of the internal-suite oracle is analyzed under a bare fixture name,
+                # so the replay must say so or stage1 reports a carrier warning stage0 never had.
+                nopath <- true if base + 7 < src.count and src[base + 2] == 110 and src[base + 3] == 111 and src[base + 4] == 112 and src[base + 5] == 97 and src[base + 6] == 116 and src[base + 7] == 104
+                # `# regioncap N` — stage0's regionStackCap (an analyzer global some tests override
+                # from the production default 64). Bytes base+2..10 = "regioncap"; a space then digits.
+                is_regioncap: bool = base + 10 < src.count and src[base + 2] == 114 and src[base + 3] == 101 and src[base + 4] == 103 and src[base + 5] == 105 and src[base + 6] == 111 and src[base + 7] == 110 and src[base + 8] == 99 and src[base + 9] == 97 and src[base + 10] == 112
+                if is_regioncap:
+                    digit_at: mutable usize = base + 11
+                    while digit_at < src.count and src[digit_at] == 32 |digit_at|:
+                        digit_at <- digit_at + 1
+                    parsed: mutable i64 = 0
+                    saw_digit: mutable bool = false
+                    while digit_at < src.count and src[digit_at] >= 48 and src[digit_at] <= 57 |digit_at, parsed, saw_digit|:
+                        parsed <- parsed * 10 + (src[digit_at].i64() - 48)
+                        saw_digit <- true
+                        digit_at <- digit_at + 1
+                    regioncap <- parsed if saw_digit
+            while base < src.count and src[base] != 10 |base|:
+                base <- base + 1
+            base <- base + 1
+            line <- line + 1
+        return (strict, flow, std, flow_warn, smt, warn_discard, progress, extern_contracts, raw_unsafe, proofhole, regioncap, globals, nopath)
+
+
+def main() -> void can[Console, Memory.Allocate, Abort.Panic]:
+    src: darray[u8] = read_all()
+    return if src.count <= 1
+    slen: usize = src.count - 1
+    tokens: darray[Lexer::Token] = frontend_tokenize_with_length(&src[0], &src[0], slen)
+    file: mutable Ast::File = frontend_parser_parse_file(&src[0], tokens) can Global{Read,Write}
+    # `static generate` expansion (task #35): recognized blocks are spliced into an expanded
+    # source and re-parsed ONCE, so generated declarations flow through analysis coherently.
+    # A caller-owned buffer keeps their source spans alive; unrecognized blocks copy through.
+    expanded: mutable darray[u8] = []
+    if frontend_preprocess_static_generate(&src[0], slen, tokens, file, expanded):
+        expanded_length: usize = expanded.count
+        expanded_tokens: darray[Lexer::Token] = frontend_tokenize_with_length(&expanded[0], &expanded[0], expanded_length)
+        file <- frontend_parser_parse_file(&expanded[0], expanded_tokens) can Global{Read,Write}
+    out: mutable darray[u8] = []
+    push_str(out, "P ")
+    push_int(out, file.errors.count.i64())
+    out.push(10)
+    for e in file.errors:
+        push_str(out, "  ")
+        push_int(out, parse_kind_code(e.kind))
+        push_str(out, " L")
+        push_int(out, e.line.i64())
+        push_str(out, " ")
+        push_sview(out, e.context)
+        out.push(10)
+    # Differential replay may request stage0 AnalyzeOptions modes via leading `#` comment
+    # lines. They remain valid Elisa comments (the lexer ignores them) and keep the
+    # reporter's stdin protocol usable by every existing smoke test. The three modes are
+    # independent axes and may be combined (a case can be both `# strict` and `# std`), so
+    # each is detected across the leading comment lines rather than only line 0.
+    header: (strict: bool, flow: bool, std: bool, flow_warn: bool, smt: bool, warn_discard: bool, progress: bool, extern_contracts: bool, raw_unsafe: bool, proofhole: bool, regioncap: i64, globals: bool, nopath: bool) = header_flags(src)
+    # THE DRIVER'S OWN ENTRY POINT, not `check_full`. Every differential gate reads this
+    # reporter as a stand-in for `elisac`, so it has to see the stream the driver sees:
+    # `check_full_diagnostics` is where the cross-check suppressions live (a missing-return
+    # deferred to a non-exhaustive match on the same line; the duplicate `ensure` copies), and
+    # reading `table.diagnostics` straight off `check_full` silently skipped all of them.
+    diagnostics: mutable darray[Semantic::Diagnostic] = []
+    Semantic::check_full_diagnostics(file, &diagnostics, header.strict, header.flow, header.std, header.flow_warn, header.smt, header.warn_discard, header.progress, header.extern_contracts, header.raw_unsafe, header.proofhole, header.regioncap, header.globals, not header.nopath) can Global{Read,Write}
+    push_str(out, "D ")
+    push_int(out, diagnostics.count.i64())
+    out.push(10)
+    for d in diagnostics:
+        push_str(out, "S ")
+        push_int(out, Semantic::diagnostic_severity(d).i64())
+        out.push(10)
+        push_str(out, "  L")
+        push_int(out, d.line.i64())
+        push_str(out, " ")
+        for b in Semantic::diagnostic_message(d):
+            out.push(b)
+        out.push(10)
+    emit(out)
