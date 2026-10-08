@@ -56,3 +56,34 @@ overlay checking. Refinement return checking still reaches other allocations,
 including `container_element_annotation` and `law_predicate_by_name`. Historical
 multiparam timing (213.4 ms) motivates this batch; it is not a measured gain.
 Fresh seed and product-level focused checks follow the qualified source checkpoint.
+
+## Hot-pass receiver and assignment follow-up
+
+The isolated `codex/hot-pass-sentinels` batch starts at d6593153 and removes exactly
+two additional placeholders. `storage_view_call_origin_sources` carries an optional
+receiver, retaining a present real Absent expression and the original receiver/static
+arity choice and argument shift. `bam_bind` accepts the already-decided
+`holds_reference` flag: declarations retain the original absent-or-reference annotation
+predicate, while untyped assignments pass true without constructing an annotation node.
+
+The direct `hot_pass_sentinel_behavior_probe.elisa` tests receiver and static forms,
+shifted origin positions, thread origins, unknown-overload precedence and a real Absent
+receiver. It also tests genuine Absent declaration annotations/values, explicit reference
+and value-copy annotations, untyped borrow assignment, retargeting tombstones, unchanged
+other borrows, and owner reinitialization.
+
+With explicit Linux/x86_64 host flags, complete source admission passed under core778
+and the retained predecessor Stage1 product. The new probe compiled, strictly linked
+without ignored unresolved symbols, and ran with exit 0 at O0 and O2. Predecessor product
+and matching runtime digests are the b667627e/f903d6f4 values above. Logs remain in
+`/root/work/codex-hot-pass-sentinels/build` (`stage0-linux-semantic`,
+`predecessor-linux-semantic`, `hot-probe-linux-O0`, `hot-probe-linux-O2` and their done,
+link and run records). Initial probe objects without the host flags selected a macOS
+helper; those builds are not qualification evidence.
+
+This does not establish either pass's parallel eligibility or a measured gain.
+Region-storage checking still synthesizes Field/Call/Ident nodes in derived-origin
+helpers. Borrow checking still reaches annotation helpers that construct Absent nodes.
+Historical pass profiles (1331 ms and 514 ms) motivate investigation only. A fresh
+experimental compiler, broader output comparison and quiet timing remain pending;
+no integration has occurred.
