@@ -1,0 +1,111 @@
+# Stage1 backend — store-capturing `submit` (docs/stage1_performance.md, round 8).
+#
+# A worker that reads the AST takes the store as a hidden trailing parameter that source cannot
+# name, and `pool_submit1`'s `fn(A) -> R` has no slot for it. `submit worker(arg)` of such a worker
+# therefore CAPTURES the submitting scope's active store, as stage0 does
+# (Elisa-core semantic/analyzer_submit_store_capture.go):
+#
+#     capture = malloc({A, Store}); capture <- {arg, active_store}
+#     pool_submit1[uintptr, R](pool, __submit_store_thunk, capture as uintptr)
+#     def __submit_store_thunk(bits: uintptr) -> R:
+#         {arg, store} = load bits; free(bits); return worker(arg, store)
+#
+# The store is shared with the worker thread, which may only read it (both compilers' semantic
+# layers reject a worker that builds nodes); the capture block belongs to the task and is freed
+# by its thunk before the worker runs. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        # The FnTable row a `submit` worker named by a bare identifier resolves to: the
+        # enclosing module's member first, then a top-level function. -1 when neither exists.
+        def submit_worker_index(name: sview, fns: FnTable&, structs: StructTable&) -> i64 can[Abort.Panic]:
+            if structs.current_owner != "":
+                owned: i64 = function_index_of(fns, structs.current_owner, name)
+                owned return if owned >= 0
+            return function_index_of(fns, "", name)
+
+        # True when the worker row takes the AST store and nothing else hidden, so
+        # emit_store_capturing_submit can call it as `worker(arg, store)`.
+        def submit_worker_captures_store(index: i64, fns: FnTable&) -> bool can[Abort.Panic]:
+            false return if index < 0
+            row: usize = index.usize()
+            false return if not fns.needs_store[row] or fns.arena_counts[row] != 0 or fns.is_error[row]
+            false return if fns.param_count[row] != 1 or fns.is_variadic[row] or fns.is_extern[row]
+            return LLVMCountParams(fns.handles[row]) == 2
+
+        # Lower `submit worker(argument)` for a store-taking worker (see the file comment).
+        # Returns the submitted Task value, or null to decline.
+        def emit_store_capturing_submit(worker_index: i64, submit_pool: sview, argument: Expr, argument_type: ValueType, return_type: ValueType, line: Ast::Pos, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if not submit_worker_captures_store(worker_index, fns) or runtime.active_store_enum < 0
+            null return if value_type_uses_sret(return_type, structs, ctx)
+            worker: LLVMValueRef = fns.handles[worker_index.usize()]
+            worker_type: LLVMTypeRef = LLVMGlobalGetValueType(worker)
+            argument_llvm: LLVMTypeRef = LLVMTypeOf(LLVMGetParam(worker, 0))
+            store_llvm: LLVMTypeRef = LLVMTypeOf(LLVMGetParam(worker, 1))
+            # The argument must travel by value: a by-address aggregate would point into the
+            # submitting frame, which the task may outlive.
+            null return if LLVMGetTypeKind(argument_llvm) != LLVMGetTypeKind(llvm_type_of(argument_type, structs, ctx))
+            return_llvm: LLVMTypeRef = LLVMGetReturnType(worker_type)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            bits_llvm: LLVMTypeRef = LLVMIntTypeInContext(ctx, target_pointer_bits())
+            capture_fields: mutable darray[LLVMTypeRef] = [argument_llvm, store_llvm]
+            capture_fields_pointer: void& = (&capture_fields[0]).cast[void&] can Unsafe.PointerCast
+            capture_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, capture_fields_pointer, 2, 0)
+            malloc_params: mutable darray[LLVMTypeRef] = [LLVMInt64TypeInContext(ctx)]
+            malloc_params_pointer: void& = (&malloc_params[0]).cast[void&] can Unsafe.PointerCast
+            malloc_type: LLVMTypeRef = LLVMFunctionType(pointer_type, malloc_params_pointer, 1, 0)
+            malloc_fn: LLVMValueRef = declare_or_get_named(m, "malloc", malloc_type)
+            free_params: mutable darray[LLVMTypeRef] = [pointer_type]
+            free_params_pointer: void& = (&free_params[0]).cast[void&] can Unsafe.PointerCast
+            free_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), free_params_pointer, 1, 0)
+            free_fn: LLVMValueRef = declare_or_get_named(m, "free", free_type)
+
+            # The entry thunk: unpack the capture, release it, call the worker with the store.
+            thunk_params: mutable darray[LLVMTypeRef] = [bits_llvm]
+            thunk_params_pointer: void& = (&thunk_params[0]).cast[void&] can Unsafe.PointerCast
+            thunk_type: LLVMTypeRef = LLVMFunctionType(return_llvm, thunk_params_pointer, 1, 0)
+            thunk: LLVMValueRef = LLVMAddFunction(m, "__submit_store_thunk", thunk_type)
+            # 8 = InternalLinkage: one private copy per submit site.
+            LLVMSetLinkage(thunk, 8)
+            thunk_builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+            LLVMPositionBuilderAtEnd(thunk_builder, LLVMAppendBasicBlockInContext(ctx, thunk, "entry"))
+            thunk_capture: LLVMValueRef = LLVMBuildIntToPtr(thunk_builder, LLVMGetParam(thunk, 0), pointer_type, "capture")
+            thunk_argument: LLVMValueRef = LLVMBuildLoad2(thunk_builder, argument_llvm, LLVMBuildStructGEP2(thunk_builder, capture_type, thunk_capture, 0, "capture.arg.slot"), "capture.arg")
+            thunk_store: LLVMValueRef = LLVMBuildLoad2(thunk_builder, store_llvm, LLVMBuildStructGEP2(thunk_builder, capture_type, thunk_capture, 1, "capture.store.slot"), "capture.store")
+            free_args: mutable darray[LLVMValueRef] = [thunk_capture]
+            free_args_pointer: void& = (&free_args[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(thunk_builder, free_type, free_fn, free_args_pointer, 1, "")
+            worker_args: mutable darray[LLVMValueRef] = [thunk_argument, thunk_store]
+            worker_args_pointer: void& = (&worker_args[0]).cast[void&] can Unsafe.PointerCast
+            # 0 = LLVMVoidTypeKind: a void call must be unnamed.
+            returns_void: bool = LLVMGetTypeKind(return_llvm) == 0
+            worker_result: LLVMValueRef = LLVMBuildCall2(thunk_builder, worker_type, worker, worker_args_pointer, 2, "" if returns_void else "worker")
+            if returns_void:
+                _ = LLVMBuildRetVoid(thunk_builder)
+            else:
+                _ = LLVMBuildRet(thunk_builder, worker_result)
+            LLVMDisposeBuilder(thunk_builder)
+
+            # The submission: build the capture here, hand its address to pool_submit1[uintptr, R].
+            if emit_expression(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is argument_value:
+                malloc_args: mutable darray[LLVMValueRef] = [LLVMSizeOf(capture_type)]
+                malloc_args_pointer: void& = (&malloc_args[0]).cast[void&] can Unsafe.PointerCast
+                capture: LLVMValueRef = LLVMBuildCall2(builder, malloc_type, malloc_fn, malloc_args_pointer, 1, "submit.capture")
+                _ = LLVMBuildStore(builder, argument_value, LLVMBuildStructGEP2(builder, capture_type, capture, 0, "submit.capture.arg"))
+                _ = LLVMBuildStore(builder, runtime.active_store, LLVMBuildStructGEP2(builder, capture_type, capture, 1, "submit.capture.store"))
+                capture_bits: LLVMValueRef = LLVMBuildPtrToInt(builder, capture, bits_llvm, "submit.capture.bits")
+                submit_types: darray[ValueType] = [ValueType{kind: TypeKind.Unsigned, bits: target_pointer_bits()}, copied_type(return_type)]
+                if instantiate_generic("pool_submit1", submit_types, generics, structs, m, ctx) is target:
+                    null return if LLVMCountParams(target) != 3
+                    pool_wanted: ValueType = instantiation_param_type("pool_submit1", submit_types, 0, generics, structs)
+                    pool_expression: Expr = Expr.Ident(submit_pool, line)
+                    pool_value: mutable LLVMValueRef? = null
+                    if indirect_aggregate_argument_address(pool_expression, pool_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pool_address:
+                        pool_value <- pool_address
+                    elif emit_expression(pool_expression, pool_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pool_emitted:
+                        pool_value <- materialize_indirect_aggregate_argument(pool_emitted, pool_wanted, structs, ctx, builder)
+                    if pool_value is resolved_pool:
+                        submit_args: mutable darray[LLVMValueRef] = [resolved_pool, thunk, capture_bits]
+                        submit_args_pointer: void& = (&submit_args[0]).cast[void&] can Unsafe.PointerCast
+                        return LLVMBuildCall2(builder, LLVMGlobalGetValueType(target), target, submit_args_pointer, 3, "submit.task")
+            return null

@@ -1,0 +1,101 @@
+# Stage1 semantic layer — append-only passes on worker threads (docs/stage1_performance.md,
+# rounds 7-8). A pass is append-only when, through every helper it calls, the only SymbolTable
+# field it writes is `diagnostics` and it never reads earlier diagnostics
+# (scripts/semantic_parallel_audit.py proves it for every pass listed in
+# semantic_parallel_passes.elisa). Such a pass sees the table exactly as the passes before it
+# left it, whatever its neighbours in the same run do, so a run of them executes concurrently
+# over a frozen table:
+#
+# - each job gets a shallow byte copy of the table whose `diagnostics` starts empty (the copy
+#   shares every other row with the frozen table, which no job writes);
+# - each job allocates inside its own arena (`in job.arena:`), never in the table's region,
+#   so no allocator state is shared between threads; the arenas are not freed, because the
+#   diagnostics they hold (names, rendered text) are spliced into the table;
+# - the worker reads the AST through the submitting scope's store, which `submit` captures
+#   (a worker may only read a captured store; both compilers reject one that builds nodes);
+# - after every job joins, each job's copy is compared with the frozen table (everything but
+#   `diagnostics` must be byte-identical: a pass that reassigned, grew or rebuilt a table field
+#   is a misclassified pass and aborts the compile), and the diagnostics are appended in pass
+#   order, which is exactly the order the sequential passes would have produced.
+#
+# ELISA_SEMANTIC_SERIAL=1 runs the same passes in the same order on the calling thread.
+#
+# Continues semantic_api.elisa.
+
+extend Semantic:
+    private:
+        struct ParPassJob:
+            shared_bits: uintptr
+            file_bits: uintptr
+            view_bits: uintptr
+            flags: ParPassFlags
+            pass_id: u32
+            arena: mutable Arena
+            # The job's result: the frozen table's bytes with the job's own diagnostics.
+            table: mutable SymbolTable
+
+        # What a worker receives. `ast` is always null: its type is what makes the worker an
+        # AST reader, so both compilers thread the AST store into it and `submit` captures the
+        # submitting scope's store for it.
+        struct ParPassTicket:
+            job_bits: uintptr
+            ast: Ast::Decl?
+
+        def par_pass_worker(ticket: ParPassTicket) -> u32:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                job: mutable heap ParPassJob& = ticket.job_bits.cast[mutable heap ParPassJob&]
+                file: heap Ast::File& = job.file_bits.cast[heap Ast::File&]
+                view: heap Ast::File& = job.view_bits.cast[heap Ast::File&]
+                # A shallow copy of the frozen table: it shares every row, and only its
+                # diagnostics (fresh, in the job's arena) are written.
+                table: mutable SymbolTable = SymbolTable()
+                _ = memcpy((&table).cast[mutable void&], job.shared_bits.cast[void&], size_of(SymbolTable))
+                in job.arena:
+                    table.diagnostics <- []
+                    table <- par_pass_call(job.pass_id, file, view, job.flags, table)
+                _ = memcpy((&job.table).cast[mutable void&], (&table).cast[void&], size_of(SymbolTable))
+                return 0
+
+        # True when ELISA_SEMANTIC_SERIAL is set to anything but "0" or "".
+        def par_pass_serial() -> bool:
+            can Abort.Panic, Memory.Allocate:
+                if phase_timer_getenv("ELISA_SEMANTIC_SERIAL") is value_bytes:
+                    first: u8 = value_bytes
+                    return first != 0 and first != 48
+                return false
+
+        # Run passes [first, first + count) of par_pass_call over `table` and append their
+        # diagnostics in id order: concurrently, or in order on this thread when serial.
+        def par_pass_run(file: Ast::File&, view: Ast::File&, flags: ParPassFlags, table: lmut SymbolTable, first: u32, count: u32) -> void:
+            can Memory.Allocate, Abort.Panic, Parallel, Unsafe.PointerCast:
+                if count < 2 or par_pass_serial():
+                    for offset in 0..<count |table, file, view, flags, first|:
+                        table <- par_pass_call(first + offset, file, view, flags, table)
+                    return
+                jobs: mutable darray[ParPassJob] = []
+                shared_bits: uintptr = (&table).cast[void&].uintptr()
+                file_bits: uintptr = file.cast[void&].uintptr()
+                view_bits: uintptr = view.cast[void&].uintptr()
+                for offset in 0..<count |jobs, shared_bits, file_bits, view_bits, flags, first|:
+                    jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, table: SymbolTable()})
+                base: uintptr = (&jobs[0]).cast[void&].uintptr()
+                stride: uintptr = size_of(ParPassJob).uintptr()
+                cores: i64 = perf_cores()
+                workers: usize = count.usize() if cores <= 0 or cores.u64() >= count.u64() else cores.usize()
+                nursery workers(workers):
+                    for offset in 0..<count:
+                        submit par_pass_worker(ParPassTicket{job_bits: base + offset.uintptr() * stride, ast: null})
+                # Every job's table must still be the frozen table's bytes outside `diagnostics`:
+                # anything else is a pass that reassigned, grew or rebuilt a table field, i.e. one
+                # the audit misclassified. Then splice the diagnostics in pass order.
+                diagnostics_offset: usize = ((&table.diagnostics).cast[void&].uintptr() - shared_bits).usize()
+                diagnostics_end: usize = diagnostics_offset + size_of(darray[Diagnostic])
+                table_size: usize = size_of(SymbolTable)
+                for offset in 0..<count |table, base, stride, shared_bits, diagnostics_offset, diagnostics_end, table_size|:
+                    job: heap ParPassJob& = (base + offset.uintptr() * stride).cast[heap ParPassJob&]
+                    copy_bits: uintptr = (&job.table).cast[void&].uintptr()
+                    head_same: bool = memcmp(copy_bits.cast[void&], shared_bits.cast[void&], diagnostics_offset) == 0
+                    tail_same: bool = memcmp((copy_bits + diagnostics_end.uintptr()).cast[void&], (shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
+                    panic("semantic_parallel: a pass run concurrently wrote a SymbolTable field other than diagnostics") if not (head_same and tail_same)
+                    for diagnostic in job.table.diagnostics |table|:
+                        table.diagnostics <- table.diagnostics.push(diagnostic)
