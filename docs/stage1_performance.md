@@ -207,3 +207,107 @@ Wall time moved less than instructions (memory-bound walks). What remains, measu
   allocator (`arena_alloc`/`arena_free`/`darray_grow`, ~1.6 G), and dict probes behind
   `function_param_chain_head` / `symbol_chain_head` (~0.7 G each; ~350 instructions a call,
   mostly name hashing and linear probing).
+
+## Round 5 (claude/perf-r5)
+
+Measured in one QUIET window on the gate box (load ~1.3), three rotated runs each, same
+input tree (main at 40914111), each compiler built by the shared seed at -O2, 64 emit jobs.
+
+| measure (self-host unit) | 40914111 | perf-r5 |
+|---|---|---|
+| `-emit check` wall (3 runs) | 18.5 / 18.7 / 18.9 s | 17.6 / 18.1 / 18.4 s |
+| semantic CPU (sum of passes) | 16.8 s | 15.8-16.6 s |
+| `-emit ast` / `-emit tokens` wall | 1.86-1.93 / 0.80-0.82 s | 1.85-1.90 / 0.83-0.85 s (unchanged) |
+
+### Where the misses are (cachegrind, `--cache-sim=yes`, `-emit check`, 40914111)
+
+47.7 G instructions, 12.3 G data reads, 1.08 G D1 read misses (8.8%), 274 M LL read misses
+(2.2%; the simulated LL is the box's 40 MB L3 per socket). Two different kinds:
+
+- **AST streaming.** The packed AST store is one array of fixed 148-byte records (the size of
+  the largest variant, `Decl.Func`: name, four darrays, return type, Pos), far larger than
+  L3. Every whole-AST walker shows ~1.03 M LL misses (one stream of the AST per pass; ~150
+  walkers ~ 150 M of the 274 M). Cutting this needs a denser node layout (per-variant size
+  classes, or `Pos`/darray headers moved to side tables) -- a codegen change for the sealed
+  compiler AST and every `Decl.Func(...)` match site, or fewer walks (fusion). Not done.
+- **Side-table rescans.** Passes that scan the whole `enum_annotations` table, `top_decls`,
+  `table.symbols` or the diagnostics per declaration/call/statement: L1 misses that hit L2/L3
+  (high D1mr, few LL misses). These were fixed this round; every replacement visits exactly
+  the rows the scan matched, in the same order:
+
+| pass | was | now | pass CPU (loaded box) |
+|---|---|---|---|
+| check_append_only_store | annotation scan per struct | owner NameSet | 955 -> 119 ms |
+| check_protocol_variance | 4 annotation scans per impl method | prefiltered rows | 577 -> <20 ms |
+| check_uninitialized_zeroed | nested protocol_annotations scans per alias path | `SymbolTable.using_alias_rows` | 421 -> 112 ms |
+| check_thread_shareability | annotation scan per empty block | `__submit` rows only | 287 -> 93 ms |
+| check_destroyed_region | quadratic function-name dedup | NameSet | 658 -> 546 ms |
+| check_contract_wellformed, check_impl_conformance, check_region_param_ref_field, lmut rebind-claim / mutation passes, check_handler_capture_escape, check_call_of_invalid, check_poisoned_operand, enum value wall, qualified module names | per-site scans | owner/line chains, NameSets, line windows, skip when no poisoning diagnostic | |
+
+On a quiet box the gain is smaller than the loaded-box pass CPU suggests (~0.6 s, 3-4%):
+the rescans were L2/L3 hits, cheap when the box is idle and expensive when other jobs evict
+the caches. What remains of `-emit check` is the AST streaming above plus the stateful
+passes (region_storage_stability ~2 s, resolve 0.9 s, borrow_after_move 0.7 s).
+
+### -O2 parallel optimisation (measured, not committed)
+
+Prototype with LLVM's own tools on the self-host module (`-emit bc -O0`, internal symbols
+externalized as hidden `elisa.part.*` first, as the partitioner does):
+
+| pipeline | optimise + codegen wall (loaded box) |
+|---|---|
+| `opt default<O2>` + `llc -O2`, one module | 160 + 95 s |
+| `llvm-split -j32` + 32x `thinlto-pre-link<O2>` + lld ThinLTO (`--thinlto-jobs=32`) | 24 + 6 + 54 s |
+
+Runtime of the resulting compilers (QUIET, 3 rotated runs, same bitcode, neither has the
+`ctx_aos_store_record` inline body): ThinLTO vs full-module O2 is +0.4-1.8% on `-emit check`,
++2.5% on `-emit ast`, +3-4% on `-emit tokens`. That is real ThinLTO (summaries, importing,
+whole-program internalization at the executable link); an in-process per-partition pipeline
+that cannot internalize across the object boundary would only be worse. Parity fails, so
+nothing is defaulted. At -O0/-O1 there is little optimisation to split. The useful shape, if
+taken further: emit ThinLTO bitcode partitions from the existing fork tree and let the final
+link run the backends (the executable link is where internalization is legal); this changes
+the product from an object to a link step and would need the same parity proof.
+
+### Parallel per-function checking: inventory and plan
+
+408 `PhaseTimer::minor("sem:...")` passes in `src/semantic/semantic_api.elisa`. Apart from
+the setup steps (symbol collection, hash indexes, metadata copies), only ~25 passes write a
+SymbolTable field other than `diagnostics` during their walk:
+
+- producers later passes read: resolve_declarations (`ref_*`, `definition_references`,
+  `binding_moves`, `binding_declared_types`, transition candidates), record_protocol_ownership,
+  check_global_permissions / check_abstract_effects / check_ungranted_panic (effect rows),
+  check_redundant_cast (`ref_reinterpret_lines`), check_pointer_erasure_cast (unsafe rows),
+  region_storage_stability (`param_growth_rows`);
+- private memo/indexes: check_fn_value_effect_row (`fver_*`), check_readonly_refs,
+  check_private_fields, check_firm_arg_type_mismatch (`firm_extern_*`), the region-storage
+  segment/candidate/ref_pos chains, check_tuple_var_scalar_mismatch;
+- per-function scratch: `local_type_*` scopes, `current_module` save/restore (about ten passes,
+  e.g. borrow_after_move, region_escape, construct_field_type), `text_storage` for type-path
+  text, `walk_depth`, `current_function_*`.
+
+The hot passes destroyed_region, append_only_store, view_provenance,
+call_argument_exclusivity, protocol_variance, contract_wellformed, uninitialized_zeroed and
+call_holder_view_store already write only diagnostics.
+
+Tried this round and backed out: splitting region_storage_stability into a collect pass and
+a check walk. Its summary rows (`view_fns`) are sviews built in the pass's own inferred region
+(`storage_owned_fn_rows`, the sort), and stage0's region checker rightly rejects storing them
+in the table for a later pass. A collect step has to copy such rows into table-owned storage
+(as the param-growth rows already are, via `text_storage`), which is step 3 below.
+
+Plan, in order:
+
+1. Move per-walk cursor state out of SymbolTable: a `WalkCursor { current_module,
+   local_type_*, walk_depth, current_function_* }` passed to walkers instead of
+   save/restoring table fields. Mechanical but touches the shared type helpers that read
+   `table.current_module` (annotation_type_id, type_of_name, ...).
+2. Collect steps for the memo passes (fver, readonly, firm externs, private fields): build
+   each index once before the check phase, as done here for region storage.
+3. Give `text_storage` per-worker arenas (type-path text is scratch) or precompute it.
+4. Then the 345 diagnostic-only passes plus the split check walks are pure over a frozen
+   table and can run per function (or per pass group) on threads with per-thread
+   arenas/diagnostic buffers, spliced back in pass order. The fork experiment of round 3
+   showed fork costs (~45 ms each, CoW faults) eat the gain on this host; threads sharing the
+   frozen table avoid both.
