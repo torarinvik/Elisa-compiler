@@ -901,7 +901,7 @@ cases = {
     "grouped unsafe capability covers listed members": (
         "# strict\n# unsafe\n"
         "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
-        "def memory_api() -> void can[Memory.Allocate, Memory.Release]:\n    return\n"
+        "def memory_api() -> void can[Memory{Allocate, Release}]:\n    return\n"
         "def good() -> void:\n"
         "    can Unsafe{PointerCast, RawExtern}:\n"
         "        unsafe_api()\n"
