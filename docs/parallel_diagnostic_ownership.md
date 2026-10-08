@@ -20,6 +20,11 @@ outer array grows, but their bytes never grow after insertion. The internal poin
 boundary in par_pass_parent_view relies on precisely that invariant. This avoids
 the existing text_storage buffer's fixed 65536-byte capacity and relocation hazards.
 Each job arena is explicitly freed after its last diagnostic is copied.
+The parent copy receives a scalar address into the still-live job record, reads it
+through an internal heap Diagnostic reference, and finishes cloning before freeing
+the job. This avoids conservatively treating a temporary Diagnostic value as an
+escaping local reference. SymbolTable retains its ordinary constructor: zeroed
+initialization is invalid because some of its fields require live sview backing.
 
 Zero-result jobs skip allocation and indexing. Zero-length text becomes an empty
 view. Nonempty text is copied by its exact byte count, preserving embedded NULs.
