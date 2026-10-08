@@ -31,20 +31,62 @@ extend Backend:
                     location: ErrorVariantLocation = error_variant_location_expr(expression, family, structs)
                     if location.ordinal >= 0:
                         descriptor: LLVMValueRef = LLVMConstNull(llvm_type_of(expected, structs, ctx))
-                        tag: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), (location.ordinal + 1).u64(), 0)
+                        tag: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), location.ordinal.u64(), 0)
                         return LLVMBuildInsertValue(builder, descriptor, tag, 0, "error.compare.variant")
             return emit_expression(expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
 
+        # Materialize the active native error variant in ordinary enum storage.
+        # Native tags are one-based and fields concatenate across variants;
+        # ordinary enums use zero-based tags and one shared payload area.
+        def error_status_to_enum(status: LLVMValueRef, family: sview, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            family_index: i64 = penum_index_of(structs, family)
+            null return if family_index < 0
+            value_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: family_index.u32()}
+            value_llvm: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            value_slot: LLVMValueRef = build_entry_alloca(builder, value_llvm, "caught.error.value")
+            code: LLVMValueRef = error_status_code(status, ctx, builder)
+            ordinal: LLVMValueRef = LLVMBuildSub(builder, code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 1, 0), "caught.error.ordinal")
+            initial: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMConstNull(value_llvm), ordinal, 0, "caught.error.initial")
+            _ = LLVMBuildStore(builder, initial, value_slot)
+            if error_set_has_payload(structs, family):
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                variant_start: usize = structs.penum_variant_start[family_index.usize()]
+                variant_count: usize = structs.penum_variant_count[family_index.usize()]
+                for offset in 0..<variant_count |status, code, value_slot, value_llvm, family_index, variant_start, structs, function, ctx, builder|:
+                    variant_slot: usize = variant_start + offset
+                    field_count: usize = structs.penum_field_type_count[variant_slot]
+                    continue if field_count == 0
+                    active_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "caught.error.active")
+                    next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "caught.error.next")
+                    active: LLVMValueRef = LLVMBuildICmp(builder, 32, code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (offset + 1).u64(), 0), "caught.error.is.active")
+                    _ = LLVMBuildCondBr(builder, active, active_block, next_block)
+                    LLVMPositionBuilderAtEnd(builder, active_block)
+                    payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, value_llvm, value_slot, 1, "caught.error.payload")
+                    field_base: usize = error_set_variant_field_base(structs, family_index, offset)
+                    tuple_type: LLVMTypeRef = penum_field_tuple_type(variant_slot, structs, ctx)
+                    for field_index in 0..<field_count |status, field_base, field_count, tuple_type, payload_pointer, builder|:
+                        field_value: LLVMValueRef = LLVMBuildExtractValue(builder, status, (field_base + field_index).u32(), "caught.error.field")
+                        field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, tuple_type, payload_pointer, field_index.u32(), "caught.error.field.ptr") if field_count > 1 else payload_pointer
+                        _ = LLVMBuildStore(builder, field_value, field_pointer)
+                    _ = LLVMBuildBr(builder, next_block)
+                    LLVMPositionBuilderAtEnd(builder, next_block)
+            return LLVMBuildLoad2(builder, value_llvm, value_slot, "caught.error.enum")
+
         # Status codes reserve zero for success; a fieldless error value stores
         # the zero-based enum ordinal. Do not pretend payload errors are scalars.
-        def bind_scalar_catch_error(name: sview, family: sview, code: LLVMValueRef, local_scope: mutable Scope&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def bind_native_catch_error(name: sview, family: sview, status: LLVMValueRef, local_scope: mutable Scope&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             resolved_family: sview = resolved_error_family(family, structs)
-            return if name == "" or resolved_family == "" or error_set_has_payload(structs, resolved_family)
+            return if name == "" or resolved_family == ""
+            code: LLVMValueRef = error_status_code(status, ctx, builder)
             error_type: ValueType = annotation_ident_value_type(resolved_family, 0, structs)
             # Composite fieldless families retain a payload-enum descriptor so
             # equality resolves source variants at their composite offsets.
             if error_type.kind == TypeKind.PayloadEnum:
-                composite_value: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMConstNull(llvm_type_of(error_type, structs, ctx)), code, 0, "catch.error.composite")
+                composite_value: mutable LLVMValueRef = LLVMConstNull(llvm_type_of(error_type, structs, ctx))
+                if error_status_to_enum(status, resolved_family, structs, ctx, builder) is converted_value:
+                    composite_value <- converted_value
+                else:
+                    return
                 composite_name: mutable darray[u8] = []
                 composite_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(error_type, structs, ctx), sview_to_cstr(name, composite_name))
                 _ = LLVMBuildStore(builder, composite_value, composite_slot)
