@@ -491,7 +491,7 @@ EXPECTS=(
     "enum \"Shape\" has no variant \"Nope\""
     "enum \"Shape\" has no variant \"Nope\""
     "non-exhaustive catch over Problem; missing Problem.Second"
-    "may not jump out of a value block (docs/119 E5)"
+    "header (docs/119 E5): its captured values are written back only when the block ends"
     "undefined identifier \"z\""
     "value block may not mutate the outer binding \"x\" (docs/119 E4)"
     "undefined assignment target \"_\" (use = to introduce a new local; <- requires an existing mutable target)"
@@ -847,6 +847,15 @@ run_case call_argument_alias pos "$ca_pos" 'call "f" passes "t" to mutable refer
 run_case call_argument_alias pos "$ca_pos" 'call "grow" passes "vv" to mutable reference parameter "v" while argument for "first" refers to overlapping memory'
 run_case call_argument_alias pos "$ca_pos" 'call "poke" passes "c" to mutable reference parameter "other" while argument for "self" refers to overlapping memory'
 run_case call_argument_alias pos "$ca_pos" 'call "f" passes "m" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+run_case call_argument_alias pos "$ca_pos" 'call "f" passes "source" to mutable reference parameter "b" while argument for "a" refers to overlapping memory'
+returned_alias_out="$("$RPT" < "$ca_pos" 2>&1)"
+returned_alias_count="$(grep -Fc 'call "f" passes "source" to mutable reference parameter "b" while argument for "a" refers to overlapping memory' <<< "$returned_alias_out")"
+if [[ "$returned_alias_count" -eq 3 ]]; then
+    echo "  PASS call_argument_alias.pos (direct, wrapped and conditional returned-ref origins rejected)"
+else
+    echo "  FAIL call_argument_alias.pos: expected 3 returned-ref origin diagnostics, got $returned_alias_count" >&2
+    failed=$((failed + 1))
+fi
 run_case call_argument_alias neg "$ca_neg" "refers to overlapping memory"
 echo "-- affine_container_reference --"
 acr_pos="$FIXTURES/affine_container_reference.pos.elisa"
