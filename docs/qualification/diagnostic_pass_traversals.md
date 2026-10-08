@@ -90,4 +90,67 @@ use `-no-pie`, `--no-undefined`, LLVM21 plus libm/pthread/dl, and a 512 MiB stac
 No duplicate-definition or unresolved-symbol suppression was used.
 
 This route is a native oracle qualification, not a self-hosted Stage1 compiler
-qualification or installation. Matched 256/1024/4096 scaling remains pending.
+qualification or installation. Matched scaling below qualifies the targeted traversal changes; full Stage1 qualification remains pending.
+
+
+## Matched traversal scaling
+
+`test/repro/diagnostic_pass_scaling_probe.elisa` constructs 256, 1024, or 4096
+unique float-parameter functions in an explicit local AST store. Construction and
+builtin seeding precede the measured phases. `collect_range` exercises the unique
+scope duplicate path; each of the three comparison passes exercises primitive
+shadowing lookup. The workload emits every diagnostic text byte with a length
+prefix, including embedded NUL, then every scalar and all six Pos fields.
+
+Both source trees received the identical coherent runtime and operation-grant
+overlays recorded above. Core3a admitted the fixture (v3 exit0); inherited
+nonfatal Unsafe warnings remain in its stderr. All four native O0/O2 products
+compiled, linked, and ran successfully with one LLVM worker and the 12 GiB guard.
+Observed compiler RSS peaks were 5345996/5594840 KiB for baseline/candidate O0,
+and 5150100/5525800 KiB for O2.
+
+All twelve scaling executions passed. At every count and optimization level,
+baseline and candidate diagnostic streams were byte-identical. The harness also
+required exactly N+86 symbols, zero duplicates, and 2N diagnostics, and decoded
+every record to the stream end. Thus equality cannot pass on empty ASTs or empty
+checker output. All source digests remained unchanged through these controls.
+
+Exploratory **process CPU milliseconds**, one sample per product/count on the
+shared box:
+
+| Optimization | Functions | Product | collect_range | self_comparison | float_equality | negated_comparison |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| O0 | 256 | baseline | 1.1 | 2.2 | 1.9 | 1.7 |
+| O0 | 256 | candidate | 0.7 | 0.4 | 0.5 | 0.3 |
+| O0 | 1024 | baseline | 11.7 | 20.6 | 21.1 | 20.1 |
+| O0 | 1024 | candidate | 2.6 | 1.7 | 2.2 | 1.3 |
+| O0 | 4096 | baseline | 142.7 | 256.4 | 253.1 | 247.6 |
+| O0 | 4096 | candidate | 10.9 | 7.4 | 8.9 | 5.2 |
+| O2 | 256 | baseline | 0.6 | 0.4 | 0.5 | 0.3 |
+| O2 | 256 | candidate | 0.3 | 0.2 | 0.3 | 0.1 |
+| O2 | 1024 | baseline | 7.5 | 3.2 | 3.5 | 2.9 |
+| O2 | 1024 | candidate | 1.4 | 1.0 | 1.3 | 0.6 |
+| O2 | 4096 | baseline | 88.7 | 69.5 | 70.6 | 68.0 |
+| O2 | 4096 | candidate | 5.9 | 4.4 | 5.3 | 2.5 |
+
+At 4096 functions, total process user+system CPU was 0.99/0.12 seconds at O0
+and 0.38/0.10 seconds at O2 (baseline/candidate); GNU time's 0.01-second
+resolution limits small-count totals. Runtime maximum RSS was 140752/141348 KiB
+at O0 and 137660/138576 KiB at O2. The measured traversal scaling supports the
+quadratic-work diagnosis and its removal. It does not establish quiet wall-time
+improvement or end-to-end self-hosted Stage1/compiler-vs-Zig performance.
+
+Private reproducibility records under `/root/work/codex-diagnostic-pass-traversals`:
+
+- `codex-diagnostic-core3a-scaling.sh`, `codex-diagnostic-scaling-controller.sh`,
+  and `diagnostic_scaling_measure.py` contain exact commands and validation.
+- `results/scaling-core3a-source-v3.*` retain source admission.
+- `results/scaling-native-v1.controller.log` and per-product compile/link/run
+  statuses retain terminal outcomes and guard peaks.
+- `results/scaling-source-v1.{before,after}.json` are equal source manifests;
+  `results/scaling-native-v1.products.json` records all eight object/executable
+  hashes, and `results/scaling-fixture-v1.sha256` records the identical fixture.
+- `results/scaling-measure-v1/results.json`, `status`, binary streams, phase
+  stderr, and GNU time resource files retain all twelve execution controls.
+
+No source was integrated into main or installed by this lane.
