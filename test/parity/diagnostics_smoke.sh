@@ -491,7 +491,7 @@ EXPECTS=(
     "enum \"Shape\" has no variant \"Nope\""
     "enum \"Shape\" has no variant \"Nope\""
     "non-exhaustive catch over Problem; missing Problem.Second"
-    "may not jump out of a value block with a `|capture|` header (docs/119 E5)"
+    "header (docs/119 E5): its captured values are written back only when the block ends"
     "undefined identifier \"z\""
     "value block may not mutate the outer binding \"x\" (docs/119 E4)"
     "undefined assignment target \"_\" (use = to introduce a new local; <- requires an existing mutable target)"
