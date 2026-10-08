@@ -1,0 +1,73 @@
+# Stage1 backend — SIZED AST records. Part of `module Backend` (see codegen.elisa).
+#
+# The fixed AoS row is as wide as the widest variant of the whole hierarchy: 148 bytes for
+# the compiler's AST (`Decl.Func`), while most nodes need 28-48 (Ident, Binary, Field,
+# Call, ...). Every semantic pass streams the AST, and the 148-byte stride made each walk an
+# L3-missing stream (docs/stage1_performance.md, rounds 5-6). A large compiler-AST hierarchy
+# therefore gets a SIZED store (runtime: ctx_aos_store_new(arena, 0)): each record is
+# allocated at its own variant's size and a handle resolves through a per-node address
+# table. The record's internal layout ({i32 tag, payload at byte 4}) is unchanged, so every
+# match/read site is the same; only store creation, allocation, row zeroing and the inlined
+# record lookup differ. Small AST-shaped hierarchies (test programs) keep the fixed row, so
+# their objects are unchanged.
+
+extend Backend:
+    private:
+        # Variants across the AST refinements from which a hierarchy is "large". The
+        # compiler's own AST has ~75; test hierarchies a handful.
+        const PACKED_AST_SIZED_MIN_VARIANTS: usize = 48
+
+        def packed_ast_variant_total(structs: StructTable&) -> usize can[Abort.Panic]:
+            total: mutable usize = 0
+            for enum_slot in 0..<structs.packed_names.count |total, structs|:
+                continue if not packed_is_ast_refinement(structs, enum_slot.i64())
+                total <- total + structs.packed_variant_count[enum_slot]
+            total
+
+        # Whether ENUM_INDEX lives in a sized AST store (packed mode 2 only; callers check).
+        def packed_ast_sized_records(structs: mutable StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0
+            resolved_root: i64 = packed_root_index_of(structs, enum_index)
+            false return if not packed_is_ast_root_row(structs, resolved_root)
+            false return if not (packed_program_has_ast_refinements(structs) or (resolved_root >= 0 and packed_owner_at(structs, resolved_root.usize()) == "Ast"))
+            packed_ast_variant_total(structs) >= PACKED_AST_SIZED_MIN_VARIANTS
+
+        # Whether any store in this program is sized (selects the inlined lookup body).
+        def packed_program_sized_records(structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            root: i64 = program_hierarchy_root_index(structs)
+            packed_ast_sized_records(structs, root)
+
+        # Bytes of the record for variant SLOT: the u32 tag plus that variant's payload.
+        def packed_sized_record_bytes(structs: mutable StructTable&, variant_slot: usize) -> u64 can[Abort.Panic]:
+            4 return if not structs.packed_has_payload[variant_slot]
+            4 + 4 * packed_variant_row_slots(structs, variant_slot).u64()
+
+        # The store-creation row-bytes argument: 0 selects the sized runtime mode.
+        def packed_store_runtime_row_bytes(structs: mutable StructTable&, enum_index: i64, packed_mode: i64) -> i64 can[Abort.Panic]:
+            0 return if packed_mode == 2 and packed_ast_sized_records(structs, enum_index)
+            packed_row_bytes(structs, enum_index)
+
+        # `ctx_aos_store_alloc_sized(arena, state, bytes) -> {ptr, u32}`, declared on first use.
+        def packed_sized_alloc_fn(m: LLVMModuleRef, alloc_type: LLVMTypeRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            if LLVMGetNamedFunction(m, sview_to_cstr("ctx_aos_store_alloc_sized", name_storage)) is existing:
+                return existing
+            name_storage.truncate(0)
+            return LLVMAddFunction(m, sview_to_cstr("ctx_aos_store_alloc_sized", name_storage), alloc_type)
+
+        def packed_sized_alloc_type(ctx: LLVMContextRef, result_type: LLVMTypeRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, LLVMInt64TypeInContext(ctx)]
+            return LLVMFunctionType(result_type, (&params[0]).cast[void&], 3, 0)
+
+        # Allocate a sized record for VARIANT_SLOT and zero it; returns the alloc result
+        # ({row pointer, u32 handle}), like the fixed path's ctx_aos_store_alloc call.
+        def packed_sized_alloc(structs: mutable StructTable&, variant_slot: usize, arena: LLVMValueRef, state: LLVMValueRef, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            bytes: u64 = packed_sized_record_bytes(structs, variant_slot)
+            alloc_type: LLVMTypeRef = packed_sized_alloc_type(ctx, runtime.packed_alloc_result_type)
+            args: mutable darray[LLVMValueRef] = [arena, state, LLVMConstInt(LLVMInt64TypeInContext(ctx), bytes, 0)]
+            result: LLVMValueRef = LLVMBuildCall2(builder, alloc_type, packed_sized_alloc_fn(m, alloc_type), (&args[0]).cast[void&], 3, "packed.sized.alloc")
+            row: LLVMValueRef = LLVMBuildExtractValue(builder, result, 0, "packed.sized.ptr")
+            zero_type: LLVMTypeRef = LLVMArrayType(LLVMInt32TypeInContext(ctx), (bytes / 4).u32())
+            _ = LLVMBuildStore(builder, LLVMConstNull(zero_type), row)
+            return result
