@@ -1,132 +1,83 @@
 #!/usr/bin/env bash
-# The legacy all-global Global{Read, Write} inference/reporting dial, differentially
-# against stage0. Default mutable-global access grants have a separate CLI smoke.
-#
-# stage0 infers the family from the body and propagates it to callers, but only ENFORCES it
-# under `-Wglobals` (which `-Wstrict` implies). stage1 mirrors that dial as the `# globals`
-# replay header. This gate holds three things:
-#
-#   1. The legacy all-global report is OFF BY DEFAULT on both compilers. This harness runs
-#      the stage1 reporter permissively to isolate that optional report from mandatory direct
-#      `global mutable` grants; `mutable_global_cli_smoke.sh` covers default grant enforcement.
-#   2. BYTE-EXACT agreement under the dial over the corpus below: read-only vs read+write,
-#      transitivity, `const` purity, the member-selective `trusted` firewall, an index-rooted
-#      store, and a `can` grant at the call site.
-#   3. Shadowing and bracketed effect-list syntax agree as well; both were former
-#      divergences fixed alongside this gate.
-set -uo pipefail
+# Compare Stage0 and Stage1 inferred Global rows while keeping accesses and calls under
+# explicit local grants. Focused authority tests cover default diagnostic enforcement.
+set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export REPO_ROOT
-export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+export ELISA_CORE
+STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}"
+export STAGE1_BIN RUNTIME_OBJ
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
-source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
-RPT="${ELISA_PARSE_REPORT:-$REPO_ROOT/build/parse_report}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 failed=0
+ROW_REPORT_OBJ="$WORK/mutable_global_authority_report.o"
+ROW_REPORT="$WORK/mutable_global_authority_report"
+bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit obj -O2 -permissive \
+    -o "$ROW_REPORT_OBJ" "$REPO_ROOT/test/parity/mutable_global_authority_report.elisa"
+clang -O2 "$ROW_REPORT_OBJ" "$RUNTIME_OBJ" "$REPO_ROOT/test/parity/profile_hooks.c" -o "$ROW_REPORT"
 
-# Location prefixes differ (stage0 spells a column range, stage1 an `L<line>` tag), so both
-# sides are compared on the message text alone — the same normalisation diagnostics_diff.sh
-# uses, and the reason a wording drift on either side still fails this gate.
-norm() {
-    sed -E -e 's/^[^:]*:[0-9]+:[0-9]+(-[0-9]+(:[0-9]+)?)?:[[:space:]]*//' \
-           -e 's/^  L[0-9]+[[:space:]]*//' -e 's/[[:space:]]+/ /g' \
-           -e 's/call to "[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)"/call to "\1"/' \
-           -e 's/^ //' -e 's/ $//' | sort
+stage0_globals() {
+    "$ELISACORE_BIN" -emit semantic "$1" \
+        | awk '
+            /^func / { fn = $2; sub(/^.*\./, "", fn) }
+            /fact_snapshot:.*required_effects=\[/ {
+                effects = $0
+                sub(/^.*required_effects=\[/, "", effects)
+                sub(/\].*$/, "", effects)
+                count = split(effects, parts, /, */)
+                for (i = 1; i <= count; i++)
+                    if (parts[i] == "Global.Read" || parts[i] == "Global.Write")
+                        print fn " " parts[i]
+            }
+        ' | sort -u
 }
 
-stage0_globals() {   # $1 = source file, $2 = "on"|"off"
-    # stage0 no longer ENFORCES Global permissions (its `-Wglobals` dial is gone: "unknown
-    # option", measured 2026-09-05), but it still INFERS them: `-emit semantic` prints, per
-    # function, `required_effects=[Global.Read, Global.Write]`. That inference is the oracle
-    # now. Render it in the shape stage1's `# globals` warnings use — one line per function
-    # that requires anything, `NAME can[Global.Read, Global.Write]` — so both sides compare
-    # on the same text. The "off" dial has no stage0 side any more; see expect_silent_by_default.
-    [ "$2" = "on" ] || return 0
-    "$ELISACORE_BIN" -emit semantic "$1" 2>/dev/null \
-        | awk '/^func /{fn=$2; sub(/.*\./,"",fn)} /required_effects=\[/{
-              s=$0; sub(/.*required_effects=\[/,"",s); sub(/\].*/,"",s);
-              n=split(s,parts,/, /); g="";
-              for(i=1;i<=n;i++){ if(parts[i] ~ /^Global\./){ g=(g==""?parts[i]:g ", " parts[i]) } }
-              if(g!="") print fn " can[" g "]" }' \
+stage1_globals() {
+    local src="$WORK/rows-$(basename "$1")"
+    { printf '# rows\n# permissive\n'; cat "$1"; } > "$src"
+    "$ROW_REPORT" < "$src" \
+        | awk '$1 == "R" && $2 != "" && ($3 == "Global.Read" || $3 == "Global.Write") { print $2 " " $3 }' \
         | sort -u
 }
 
-stage1_globals() {   # $1 = source file, $2 = "on"|"off"
-    local src="$WORK/replay.elisa"
-    printf '# permissive\n' > "$src"
-    if [ "$2" = "on" ]; then printf '# globals\n' >> "$src"; fi
-    cat "$1" >> "$src"
-    # `call to "bump" requires can[Global] ...; add can[Global.Read, Global.Write] or ...`
-    # (or `add can Global.Read or ...` for a single member). Reduce each warning to
-    # `CALLEE can[members]` — the same shape stage0_globals renders its inference in.
-    ELISA_STAGE1_PERMISSIVE=1 "$RPT" < "$src" \
-        | awk '/^D [0-9]+$/{d=1;next} d && /^  L[0-9]+ /{sub(/^  L[0-9]+ /,"");print}' \
-        | grep 'can\[Global' \
-        | sed -E -e 's/.*call to "([A-Za-z_][A-Za-z0-9_.]*)".*add can\[([^]]*)\].*/\1 can[\2]/' \
-                 -e 's/.*call to "([A-Za-z_][A-Za-z0-9_.]*)".*add can ([A-Za-z.]+) .*/\1 can[\2]/' \
-                 -e 's/^[A-Za-z_][A-Za-z0-9_]*\.//' \
-        | sort -u
-}
-
-# stage0's inference names EVERY function that requires Global (an uncalled `main` included);
-# stage1's dial warns per CALL SITE and so names only callees. Compare on the callees stage1
-# reports: for each of those, the two inferred member sets must be identical. A function
-# stage1 failed to warn about is caught by the fixture-specific halves below, not here.
-restrict_to_callees() {   # $1 = stage0 lines, $2 = stage1 lines
-    local names; names="$(printf '%s\n' "$2" | sed -E 's/ can\[.*//' | sort -u)"
-    [ -n "$names" ] || { printf '%s\n' "$1"; return; }
-    printf '%s\n' "$1" | grep -F -w -f <(printf '%s\n' "$names") || true
-}
-
-expect_agree() {     # $1 = case name, $2 = source file
-    local s0 s1
-    s0="$(stage0_globals "$2" on)"
-    s1="$(stage1_globals "$2" on)"
+expect_agree() {
+    local name="$1" s0 s1
+    s0="$(stage0_globals "$2")"
+    s1="$(stage1_globals "$2")"
     if [ -z "$s0" ]; then
-        echo "global permissions smoke FAILED: $1 produced no stage0 Global diagnostic to compare" >&2
+        echo "global permissions smoke FAILED: $name produced no stage0 Global row" >&2
         failed=$((failed + 1))
         return
     fi
-    s0="$(restrict_to_callees "$s0" "$s1")"
     if [ "$s0" != "$s1" ]; then
-        printf 'global permissions smoke FAILED: %s\nstage0: %s\nstage1: %s\n' \
-            "$1" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
+        printf 'global permissions smoke FAILED: %s\nStage0: %s\nStage1: %s\n' \
+            "$name" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
         failed=$((failed + 1))
     fi
 }
 
-expect_same() {      # $1 = case name, $2 = source file (agreement may be silence)
-    local s0 s1
-    s0="$(stage0_globals "$2" on)"
-    s1="$(stage1_globals "$2" on)"
-    s0="$(restrict_to_callees "$s0" "$s1")"
+expect_same() {
+    local name="$1" s0 s1
+    s0="$(stage0_globals "$2")"
+    s1="$(stage1_globals "$2")"
     if [ "$s0" != "$s1" ]; then
-        printf 'global permissions smoke FAILED: %s\nstage0: %s\nstage1: %s\n' \
-            "$1" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
+        printf 'global permissions smoke FAILED: %s\nStage0: %s\nStage1: %s\n' \
+            "$name" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
         failed=$((failed + 1))
     fi
 }
 
-expect_silent_by_default() {   # $1 = case name, $2 = source file
-    local s0 s1
-    s0="$(stage0_globals "$2" off)"
-    s1="$(stage1_globals "$2" off)"
-    if [ -n "$s0" ] || [ -n "$s1" ]; then
-        printf 'global permissions smoke FAILED: %s is not silent without the dial\nstage0: %s\nstage1: %s\n' \
-            "$1" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
-        failed=$((failed + 1))
-    fi
-}
-
-expect_stage1_effect() {  # $1 = case name, $2 = source file, $3 = dial, $4 = callee, $5 = members
-    local actual
-    actual="$(stage1_globals "$2" "$3")"
-    if ! printf '%s\n' "$actual" | grep -F -x -q "$4 can[$5]"; then
-        printf 'global permissions smoke FAILED: %s did not retain %s can[%s] with dial %s\nactual: %s\n' \
-            "$1" "$4" "$5" "$3" "${actual//$'\n'/ | }" >&2
+expect_stage1_row() {
+    local name="$1" file="$2" expected="$3" rows
+    rows="$(stage1_globals "$file")"
+    if ! printf '%s\n' "$rows" | grep -F -x -q "$expected"; then
+        printf 'global permissions smoke FAILED: %s missing row %s\nRows: %s\n' \
+            "$name" "$expected" "${rows//$'\n'/ | }" >&2
         failed=$((failed + 1))
     fi
 }
@@ -141,7 +92,8 @@ global cold: i32 = 7
 const frozen: i32 = 9
 
 def bump() -> void:
-    hot <- hot + 1
+    can Global{Read, Write}:
+        hot <- hot + 1
 
 def peek() -> i32:
     return cold
@@ -150,11 +102,14 @@ def frozen_peek() -> i32:
     return frozen
 
 def caller() -> i32:
-    bump()
-    return peek() + frozen_peek()
+    can Global{Read, Write}:
+        bump()
+    can Global.Read:
+        return peek() + frozen_peek()
 
 def main() -> i64:
-    caller()
+    can Global{Read, Write}:
+        caller()
     return 0
 EOF
 
@@ -165,15 +120,18 @@ global mutable hot: i32 = 0
 global cold: i32 = 7
 
 def store_only() -> void:
-    hot <- 1
+    can Global.Write:
+        hot <- 1
 
 def granted() -> i32:
     can Global.Read:
         return cold
 
 def user() -> i32:
-    store_only()
-    return granted()
+    can Global.Write:
+        store_only()
+    can Global.Read:
+        return granted()
 
 def main() -> i64:
     can Global{Read, Write}:
@@ -181,31 +139,35 @@ def main() -> i64:
     return 0
 EOF
 
-# `trusted` is the firewall, and selective: naming Global.Read leaves Global.Write required,
-# naming the bare family discharges both, and naming an unrelated family discharges neither.
+# `trusted` only drops Unsafe tracking. Naming Global.Read or the whole Global family does not
+# authorize mutable access or suppress its inferred rows; those accesses need local can grants.
 cat > "$WORK/trusted_firewall.elisa" <<'EOF'
 global mutable hot: i32 = 0
 global cold: i32 = 7
 
 def read_only_trusted() -> void:
-    trusted Global.Read:
-        hot <- hot + 1
+    can Global{Read, Write}:
+        trusted Global.Read:
+            hot <- hot + 1
 
 def whole_family_trusted() -> void:
-    trusted Global:
-        hot <- hot + 1
+    can Global{Read, Write}:
+        trusted Global:
+            hot <- hot + 1
 
 def unrelated_trusted() -> i32:
     trusted Unsafe.Alias:
         return cold
 
 def user() -> i32:
-    read_only_trusted()
-    whole_family_trusted()
+    can Global{Read, Write}:
+        read_only_trusted()
+        whole_family_trusted()
     return unrelated_trusted()
 
 def main() -> i64:
-    user()
+    can Global{Read, Write}:
+        user()
     return 0
 EOF
 
@@ -216,17 +178,21 @@ global mutable slots: array[i32, 4] = [0, 0, 0, 0]
 global mutable cursor: i32 = 0
 
 def store_at() -> void:
-    slots[cursor] <- 1
+    can Global{Read, Write}:
+        slots[cursor] <- 1
 
 def bump_compound() -> void:
-    cursor += 1
+    can Global{Read, Write}:
+        cursor += 1
 
 def user() -> void:
-    store_at()
-    bump_compound()
+    can Global{Read, Write}:
+        store_at()
+        bump_compound()
 
 def main() -> i64:
-    user()
+    can Global{Read, Write}:
+        user()
     return 0
 EOF
 
@@ -238,59 +204,65 @@ global mutable hot: i32 = 0
 module Boxes:
     public:
         def build() -> i32:
-            return hot
+            can Global.Read:
+                return hot
 
 def wrapper() -> i32:
-    return Boxes::build()
+    can Global.Read:
+        return Boxes::build()
 
 def main() -> i64:
-    wrapper()
+    can Global.Read:
+        wrapper()
     return 0
 EOF
 
 for case_file in reads_writes store_and_grant trusted_firewall rooted_store qualified_return; do
     expect_agree "$case_file" "$WORK/$case_file.elisa"
-    expect_silent_by_default "$case_file" "$WORK/$case_file.elisa"
 done
 
 # Grouped permission clauses retain every member in both signatures and local grants.
-# A one-member group remains selective: Global{Read} must not cover a Global.Write call.
+# The separate mutable-global authority smoke rejects a one-member Global{Read} grant
+# when the operation needs Global.Write.
 cat > "$WORK/grouped_signature.elisa" <<'EOF'
 global mutable hot: i32 = 0
 
 def bump() -> void can[Global{Read, Write}]:
-    hot += 1
+    can Global{Read, Write}:
+        hot += 1
 
 def caller() -> void:
     can Global{Read, Write}:
         bump()
 
 def main() -> i64:
-    caller()
+    can Global{Read, Write}:
+        caller()
     return 0
 EOF
 # The exact local grant covers both grouped members, so there is no call-site warning.
 # The grouped signature itself is also compiled by the focused effect-handler fixture.
-expect_silent_by_default "grouped signature and local grant" "$WORK/grouped_signature.elisa"
+expect_agree "grouped signature and local grant" "$WORK/grouped_signature.elisa"
 
 cat > "$WORK/grouped_member_selective.elisa" <<'EOF'
 global mutable hot: i32 = 0
 
 def write_hot() -> void can[Global.Write]:
-    hot <- 1
+    can Global.Write:
+        hot <- 1
 
 def caller() -> void:
-    can Global{Read}:
+    can Global.Write:
         write_hot()
 
 def main() -> i64:
-    caller()
+    can Global.Write:
+        caller()
     return 0
 EOF
-# `Global{Read}` is selective: the write call retains its `Global.Write` requirement. This
-# ordinary call-effect diagnostic remains visible even when the optional inference dial is off.
-expect_stage1_effect "grouped member remains selective with dial" "$WORK/grouped_member_selective.elisa" on write_hot Global.Write
-expect_stage1_effect "grouped member remains selective by default" "$WORK/grouped_member_selective.elisa" off write_hot Global.Write
+# The function and its caller both retain the member-specific write row.
+expect_agree "grouped member remains selective" "$WORK/grouped_member_selective.elisa"
+expect_stage1_row "grouped member remains selective" "$WORK/grouped_member_selective.elisa" "caller Global.Write"
 
 # --- former divergences --------------------------------------------------------------
 
@@ -312,17 +284,105 @@ cat > "$WORK/bracketed_trusted.elisa" <<'EOF'
 global mutable hot: i32 = 0
 
 def read_only_trusted() -> void:
-    trusted [Global.Read]:
-        hot <- hot + 1
+    can Global{Read, Write}:
+        trusted [Global.Read]:
+            hot <- hot + 1
 
 def main() -> i64:
-    read_only_trusted()
+    can Global{Read, Write}:
+        read_only_trusted()
     return 0
 EOF
 expect_agree "bracketed trusted clause" "$WORK/bracketed_trusted.elisa"
+
+cat > "$WORK/rows.elisa" <<'EOF'
+# rows
+# permissive
+global mutable hot: i32 = 0
+global mutable slots: array[i32, 4] = [0, 0, 0, 0]
+global mutable cursor: i32 = 0
+global cold: i32 = 7
+const frozen: i32 = 9
+
+def reader() -> i32:
+    can Global.Read:
+        return hot
+
+def writer() -> void:
+    can Global.Write:
+        hot <- 1
+
+def increment() -> void:
+    can Global{Read,Write}:
+        hot <- hot + 1
+
+def root_store() -> void:
+    can Global{Read,Write}:
+        slots[cursor] <- 1
+        cursor += 1
+
+def caller() -> i32:
+    can Global{Read,Write}:
+        writer()
+        increment()
+        root_store()
+    can Global.Read:
+        return reader() + cold + frozen
+
+def main() -> i64:
+    can Global{Read,Write}:
+        caller()
+    return 0
+EOF
+
+stage0_rows() {
+    "$ELISACORE_BIN" -emit semantic "$WORK/rows.elisa" \
+        | awk '
+            /^func / { fn = $2; sub(/^.*\./, "", fn) }
+            /fact_snapshot:.*required_effects=\[/ {
+                effects = $0
+                sub(/^.*required_effects=\[/, "", effects)
+                sub(/\].*$/, "", effects)
+                count = split(effects, parts, /, */)
+                for (i = 1; i <= count; i++)
+                    if (parts[i] == "Global.Read" || parts[i] == "Global.Write")
+                        print fn " " parts[i]
+            }
+        ' | sort -u
+}
+
+stage1_rows() {
+    "$ROW_REPORT" < "$WORK/rows.elisa" \
+        | awk '$1 == "R" && $2 != "" && ($3 == "Global.Read" || $3 == "Global.Write") { print $2 " " $3 }' \
+        | sort -u
+}
+
+stage0_rows_actual="$(stage0_rows)"
+stage1_rows_actual="$(stage1_rows)"
+if [ "$stage0_rows_actual" != "$stage1_rows_actual" ]; then
+    printf 'global permissions smoke FAILED: inferred rows differ\nStage0:\n%s\nStage1:\n%s\n' \
+        "$stage0_rows_actual" "$stage1_rows_actual" >&2
+    failed=$((failed + 1))
+fi
+for expected in \
+    'reader Global.Read' \
+    'writer Global.Write' \
+    'increment Global.Read' \
+    'increment Global.Write' \
+    'root_store Global.Read' \
+    'root_store Global.Write' \
+    'caller Global.Read' \
+    'caller Global.Write' \
+    'main Global.Read' \
+    'main Global.Write'; do
+    if ! printf '%s\n' "$stage1_rows_actual" | grep -F -x -q "$expected"; then
+        echo "global permissions smoke FAILED: missing inferred row '$expected'" >&2
+        failed=$((failed + 1))
+    fi
+done
 
 if [ "$failed" -ne 0 ]; then
     echo "global permissions smoke FAILED: $failed check(s)" >&2
     exit 1
 fi
-echo "global permissions smoke OK: 7 agreeing cases (5 checked with dial on and off)" >&2
+echo "global permissions smoke OK: Stage0/Stage1 rows agree across local grants, propagation, trusted scopes, shadowing, and grouped effects" >&2

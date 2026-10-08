@@ -31,12 +31,15 @@ EOF
 
 cat >"$WORK/granted.elisa" <<'EOF'
 global mutable count: i64 = 0
-def read_count() -> i64 can[Global.Read]:
-    return count
-def write_count() -> void can[Global.Write]:
-    count <- 1
-def increment() -> void can[Global.Read, Global.Write]:
-    count <- count + 1
+def read_count() -> i64:
+    can Global.Read:
+        return count
+def write_count() -> void:
+    can Global.Write:
+        count <- 1
+def increment() -> void:
+    can Global{Read,Write}:
+        count <- count + 1
 EOF
 
 check() {

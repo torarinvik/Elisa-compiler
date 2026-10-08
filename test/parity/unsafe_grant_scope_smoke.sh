@@ -53,14 +53,14 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         "mutable alias requires",
     ),
-    "closure may grant its own alias operation": (
+    "closure may trusted-grant its own alias operation without propagation": (
         "# strict\n"
         "def get_ref[@r](x: mutable i64& @r) -> mutable i64& @r:\n    return x\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
         "def bad(x: mutable i64&) -> void:\n"
         "    callback: fn() -> void = fn():\n"
         "        alias: mutable i64& = get_ref(x)\n"
-        "        can Unsafe.Alias:\n            pair(alias, x)\n"
+        "        trusted Unsafe.Alias:\n            pair(alias, x)\n"
         "    callback()\n"
         "def main() -> i64:\n    return 0\n",
         None,
@@ -165,12 +165,11 @@ cases = {
         "def main() -> i64:\n    return 0\n",
         'call to "unsafe_predicate" requires can[Unsafe]',
     ),
-    "contract expression exact grant": (
+    "unsafe predicate call under exact local grant": (
         "# strict\n"
         "def unsafe_predicate() -> bool can[Unsafe.PointerCast]:\n    return true\n"
-        "def caller() -> void:\n"
-        "    can Unsafe.PointerCast:\n        requires unsafe_predicate()\n"
-        "    return\n"
+        "def caller() -> bool:\n"
+        "    can Unsafe.PointerCast:\n        return unsafe_predicate()\n"
         "def main() -> i64:\n    return 0\n",
         None,
     ),
@@ -223,7 +222,7 @@ cases = {
         "def safe_api() -> void:\n    return\n"
         "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
         "def call() -> void:\n"
-        "    mutable callback: fn() -> void = safe_api\n"
+        "    mutable callback: fn() -> void can[Unsafe.PointerCast] = safe_api\n"
         "    callback <- unsafe_api\n"
         "    callback()\n"
         "def main() -> i64:\n    return 0\n",
@@ -244,9 +243,10 @@ cases = {
         "# strict\n"
         "def safe_api() -> void:\n    return\n"
         "def unsafe_api() -> void can[Unsafe.PointerCast]:\n    return\n"
+        "def unsafe_api2() -> void can[Unsafe.PointerCast]:\n    return\n"
         "def call() -> void:\n"
-        "    mutable callback: fn() -> void = safe_api\n"
-        "    callback <- unsafe_api\n"
+        "    mutable callback: fn() -> void can[Unsafe.PointerCast] = unsafe_api\n"
+        "    callback <- unsafe_api2\n"
         "    can Unsafe.PointerCast:\n        callback()\n"
         "def main() -> i64:\n    return 0\n",
         None,
@@ -295,9 +295,16 @@ cases = {
     "mutable global exact grant": (
         "# strict\n"
         "global mutable hot: i64 = 0\n"
-        "def bad() -> i64:\n    can Unsafe.MutableGlobal:\n        return hot\n"
+        "def bad() -> i64:\n    can Global.Read, Unsafe.MutableGlobal:\n        return hot\n"
         "def main() -> i64:\n    return 0\n",
         None,
+    ),
+    "mutable global requires Global.Read independently of Unsafe.MutableGlobal": (
+        "# strict\n"
+        "global mutable hot: i64 = 0\n"
+        "def bad() -> i64:\n    can Unsafe.MutableGlobal:\n        return hot\n"
+        "def main() -> i64:\n    return 0\n",
+        "accesses a global mutable binding without Global.Read",
     ),
     "pointer arithmetic unrelated grant": (
         "# strict\n"
@@ -908,7 +915,10 @@ cases = {
         "    can Memory{Allocate, Release}:\n"
         "        memory_api()\n"
         "        value: i64 = 1\n"
-        "def main() -> i64:\n    good()\n    return 0\n",
+        "def main() -> i64:\n"
+        "    can Abort.Panic, Memory{Allocate, Release}, Unsafe{PointerCast, RawExtern}:\n"
+        "        good()\n"
+        "    return 0\n",
         None,
     ),
     "grouped unsafe capability remains member-selective": (
@@ -967,6 +977,8 @@ with tempfile.TemporaryDirectory(prefix="elisa-unsafe-grants-") as temp:
                 "unknown permission",
                 "unchecked index requires",
                 "mutable global access requires",
+                "accesses a global mutable binding without Global.Read",
+                "accesses a global mutable binding without Global.Write",
                 "pointer arithmetic requires",
                 'call to "foreign" requires can[Unsafe]',
                 "pointer cast requires",

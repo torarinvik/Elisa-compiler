@@ -32,7 +32,7 @@ run_case() {
         failed=$((failed+1))
     fi
     if printf '%s\n' "$output" | grep -q '^S '; then
-        if ! printf '%s\n' "$output" | awk -v expected="$expected" -v name="$name" '/^S /{severity=$2} /requires can\[Global\]/{if(severity==1)global_error=1} /requires can\[Unsafe\]/{if(severity==1)unsafe_error=1} END{if(expected ~ /requires can\[Global\]/ && name!="immutable_call_legacy_opt_in" && !global_error)exit 1; if(expected ~ /requires can\[Unsafe\]/ && !unsafe_error)exit 1}'; then
+        if ! printf '%s\n' "$output" | awk -v expected="$expected" -v name="$name" '/^S /{severity=$2} /requires can\[Global\]|accesses a global mutable binding without Global\./{if(severity==1)global_error=1} /requires can\[Unsafe\]/{if(severity==1)unsafe_error=1} END{if((expected ~ /requires can\[Global\]/ || expected ~ /accesses a global mutable binding without Global\./) && name!="immutable_call_legacy_opt_in" && !global_error)exit 1; if(expected ~ /requires can\[Unsafe\]/ && !unsafe_error)exit 1}'; then
             printf 'FAIL %s: mandatory effect diagnostic is not severity 1\n%s\n' "$name" "$output" >&2
             failed=$((failed+1))
         fi
@@ -43,7 +43,7 @@ global mutable hot: i64 = 1
 def main() -> i64:
     return hot can Global.Read
 CASE
-run_case inline_span_direct_sibling_negative 'requires can[Global]' <<'CASE'
+run_case inline_span_direct_sibling_negative 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable hot: i64 = 1
 def main() -> i64:
     return (hot can Global.Read) + hot
@@ -877,15 +877,13 @@ def reader() -> i64:
 def main() -> i64:
     return reader() can ReadState, WriteState, Storage
 CASE
-run_case scoped_nested_alias_body_wrong_member 'requires can[Global]' <<'CASE'
+run_case scoped_nested_alias_body_wrong_member 'accesses a global mutable binding without Global.Write' <<'CASE'
 global mutable hot: i64 = 0
-module Readers:
+module Writers:
     alias Member = Global.Read
     alias Access = Member
-module Writers:
-    alias Member = Global.Write
-    def main() -> void:
-        can Readers::Access:
+    def bad() -> void:
+        can Access:
             hot <- 1
 CASE
 run_case returned_callback_keeps_actual_write 'requires can[Global]' <<'CASE'
