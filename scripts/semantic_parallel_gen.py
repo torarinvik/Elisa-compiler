@@ -352,6 +352,12 @@ def main(argv):
             for b in bad:
                 print("  " + b)
             return 1
+        from semantic_parallel_diagnostic_audit import main as audit_diagnostic_ownership
+        try:
+            audit_diagnostic_ownership()
+        except AssertionError as error:
+            print("semantic_parallel_gen: " + str(error))
+            return 1
         print("semantic_parallel_gen: %d concurrent passes, all append-only" % len(listed_passes()))
         return 0
     if mode == "--report":

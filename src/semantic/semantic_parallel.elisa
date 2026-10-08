@@ -8,9 +8,10 @@
 #
 # - each job gets a shallow byte copy of the table whose `diagnostics` starts empty (the copy
 #   shares every other row with the frozen table, which no job writes);
-# - each job allocates inside its own arena (`in arena:`), never in the table's region,
-#   so no allocator state is shared between threads; the arenas are not freed, because the
-#   diagnostics they hold (names, rendered text) are spliced into the table;
+# - passes allocate in each worker's inferred local region; before returning the worker
+#   explicitly deep-copies its diagnostics and every text payload into a private job arena;
+# - after joining, diagnostics are copied into the caller table's region in pass order,
+#   then each job arena is released;
 # - the worker reads the AST through the submitting scope's store, which `submit` captures
 #   (a worker may only read a captured store; both compilers reject one that builds nodes);
 # - after every job joins, each job's copy is compared with the frozen table (everything but
@@ -30,9 +31,7 @@ extend Semantic:
             view_bits: uintptr
             flags: ParPassFlags
             pass_id: u32
-            # The job's own arena: no allocator state is shared with another thread. It is never
-            # freed (a local Arena would be, at the worker's return), because the diagnostics
-            # spliced into the table live in it.
+            # Owns the result until the join copies it into the parent table, then is freed.
             arena: mutable Arena
             # The job's result: the frozen table's bytes with the job's own diagnostics.
             table: mutable SymbolTable
@@ -44,26 +43,137 @@ extend Semantic:
             job_bits: uintptr
             ast: Ast::Decl?
 
+        # Explicit allocation is essential: an `in` block does not change the inferred
+        # owner of writes through a worker-local lmut SymbolTable.
+        def par_pass_job_text(arena: mutable Arena&, text: sview) -> sview:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                return "" if text.len == 0
+                panic("semantic_parallel: invalid diagnostic text length") if text.len < 0
+                data: mutable heap u8& = arena_alloc(arena, text.len.usize()).cast[mutable heap u8&]
+                _ = memcpy(data.cast[mutable void&], text.data.cast[void&], text.len.usize())
+                return unsafe_sview_bounded_bytes(data, text.len.usize())
+
+        # Each view gets an independent buffer. Growing the outer backing array cannot
+        # relocate a view's bytes, unlike growing SymbolTable.text_storage.
+        def par_pass_parent_text[@r](text: sview, table: mutable SymbolTable& @r) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bytes: mutable darray[u8] @r = []
+                for index in 0..<text.len.usize() |bytes, text|:
+                    bytes.push(text.data[index])
+                table.parallel_diagnostic_text.push(bytes)
+
+        def par_pass_parent_view(table: SymbolTable&, index: usize) -> sview:
+            can Unsafe.PointerCast:
+                bytes: darray[u8] = table.parallel_diagnostic_text[index]
+                return "" if bytes.count == 0
+                # Individual backing buffers never grow after insertion. Erase the outer
+                # container dependency: its growth moves descriptors, not these byte buffers.
+                bits: uintptr = (&bytes[0]).cast[void&].uintptr()
+                return unsafe_sview_bounded_bytes(bits.cast[u8&], bytes.count)
+
+        def par_pass_parent_diagnostic(source: Diagnostic, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                first: usize = table.parallel_diagnostic_text.count
+                table <- par_pass_parent_text(source.name, table)
+                table <- par_pass_parent_text(source.expected, table)
+                table <- par_pass_parent_text(source.actual, table)
+                table <- par_pass_parent_text(source.detail, table)
+                table <- par_pass_parent_text(source.const_enum_module_expected, table)
+                table <- par_pass_parent_text(source.const_enum_module_actual, table)
+                table <- par_pass_parent_text(source.detail2, table)
+                table <- par_pass_parent_text(source.detail3, table)
+                table <- par_pass_parent_text(source.effect_ref_1, table)
+                table <- par_pass_parent_text(source.effect_ref_2, table)
+                table <- par_pass_parent_text(source.effect_ref_3, table)
+                table <- par_pass_parent_text(source.effect_ref_4, table)
+                table <- par_pass_parent_text(source.effect_ref_5, table)
+                table <- par_pass_parent_text(source.effect_ref_6, table)
+                table <- par_pass_parent_text(source.effect_ref_7, table)
+                table <- par_pass_parent_text(source.effect_ref_8, table)
+                table <- par_pass_parent_text(source.error_set, table)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{
+                    name: par_pass_parent_view(table, first + 0),
+                    expected: par_pass_parent_view(table, first + 1),
+                    actual: par_pass_parent_view(table, first + 2),
+                    detail: par_pass_parent_view(table, first + 3),
+                    const_enum_module_expected: par_pass_parent_view(table, first + 4),
+                    const_enum_module_actual: par_pass_parent_view(table, first + 5),
+                    detail2: par_pass_parent_view(table, first + 6),
+                    detail3: par_pass_parent_view(table, first + 7),
+                    effect_ref_1: par_pass_parent_view(table, first + 8),
+                    effect_ref_2: par_pass_parent_view(table, first + 9),
+                    effect_ref_3: par_pass_parent_view(table, first + 10),
+                    effect_ref_4: par_pass_parent_view(table, first + 11),
+                    effect_ref_5: par_pass_parent_view(table, first + 12),
+                    effect_ref_6: par_pass_parent_view(table, first + 13),
+                    effect_ref_7: par_pass_parent_view(table, first + 14),
+                    effect_ref_8: par_pass_parent_view(table, first + 15),
+                    error_set: par_pass_parent_view(table, first + 16),
+                    line: source.line,
+                    pos: source.pos,
+                    kind: source.kind,
+                    expected_count: source.expected_count,
+                    actual_count: source.actual_count,
+                    state_code: source.state_code,
+                    secondary_line: source.secondary_line,
+                    secondary_column: source.secondary_column,
+                    secondary_end_column: source.secondary_end_column,
+                    effect_ref_count: source.effect_ref_count
+                })
+
         def par_pass_worker(ticket: ParPassTicket) -> u32:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
                 job: mutable heap ParPassJob& = ticket.job_bits.cast[mutable heap ParPassJob&]
                 file: heap Ast::File& = job.file_bits.cast[heap Ast::File&]
                 view: heap Ast::File& = job.view_bits.cast[heap Ast::File&]
-                # A shallow copy of the frozen table: it shares every row, and only its
-                # diagnostics (fresh) are written. The passes run `in scratch:` so their
-                # region-polymorphic writes (diagnostics, their text) land in a private arena
-                # rather than this frame's region, which is freed when the worker returns. The
-                # arena is then moved into the job (and the local's bytes cleared, not assigned:
-                # assignment would release it, so the frame's release frees nothing): the spliced diagnostics live in it.
-                scratch: mutable Arena = zeroed
-                table: mutable SymbolTable = SymbolTable()
+                table: mutable SymbolTable = zeroed
                 _ = memcpy((&table).cast[mutable void&], job.shared_bits.cast[void&], size_of(SymbolTable))
-                in scratch:
-                    table.diagnostics <- []
-                    table <- par_pass_call(job.pass_id, file, view, job.flags, table)
+                table.diagnostics <- []
+                table <- par_pass_call(job.pass_id, file, view, job.flags, table)
                 _ = memcpy((&job.table).cast[mutable void&], (&table).cast[void&], size_of(SymbolTable))
-                _ = memcpy((&job.arena).cast[mutable void&], (&scratch).cast[void&], size_of(Arena))
-                _ = memset((&scratch).cast[mutable void&], 0, size_of(Arena))
+                # Clone the records before this frame releases its inferred arena. All
+                # textual fields must also be cloned, even source views and empty defaults.
+                owned: mutable darray[Diagnostic] = zeroed
+                owned.count <- table.diagnostics.count
+                owned.capacity <- table.diagnostics.count
+                if owned.count > 0:
+                    items: mutable heap Diagnostic& = arena_alloc(&job.arena, owned.count * size_of(Diagnostic)).cast[mutable heap Diagnostic&]
+                    owned.items as & <- items
+                    _ = memcpy(items.cast[mutable void&], (&table.diagnostics[0]).cast[void&], owned.count * size_of(Diagnostic))
+                for index in 0..<owned.count |owned, job|:
+                    source: Diagnostic = owned[index]
+                    owned[index] <- Diagnostic{
+                        name: par_pass_job_text(&job.arena, source.name),
+                        expected: par_pass_job_text(&job.arena, source.expected),
+                        actual: par_pass_job_text(&job.arena, source.actual),
+                        detail: par_pass_job_text(&job.arena, source.detail),
+                        const_enum_module_expected: par_pass_job_text(&job.arena, source.const_enum_module_expected),
+                        const_enum_module_actual: par_pass_job_text(&job.arena, source.const_enum_module_actual),
+                        detail2: par_pass_job_text(&job.arena, source.detail2),
+                        detail3: par_pass_job_text(&job.arena, source.detail3),
+                        effect_ref_1: par_pass_job_text(&job.arena, source.effect_ref_1),
+                        effect_ref_2: par_pass_job_text(&job.arena, source.effect_ref_2),
+                        effect_ref_3: par_pass_job_text(&job.arena, source.effect_ref_3),
+                        effect_ref_4: par_pass_job_text(&job.arena, source.effect_ref_4),
+                        effect_ref_5: par_pass_job_text(&job.arena, source.effect_ref_5),
+                        effect_ref_6: par_pass_job_text(&job.arena, source.effect_ref_6),
+                        effect_ref_7: par_pass_job_text(&job.arena, source.effect_ref_7),
+                        effect_ref_8: par_pass_job_text(&job.arena, source.effect_ref_8),
+                        error_set: par_pass_job_text(&job.arena, source.error_set),
+                        line: source.line,
+                        pos: source.pos,
+                        kind: source.kind,
+                        expected_count: source.expected_count,
+                        actual_count: source.actual_count,
+                        state_code: source.state_code,
+                        secondary_line: source.secondary_line,
+                        secondary_column: source.secondary_column,
+                        secondary_end_column: source.secondary_end_column,
+                        effect_ref_count: source.effect_ref_count
+                    }
+                # Raw record transfer avoids rebinding the explicit arena-owned buffer
+                # through an inferred lmut region. No darray layout assumption is needed.
+                _ = memcpy((&job.table.diagnostics).cast[mutable void&], (&owned).cast[void&], size_of(darray[Diagnostic]))
                 return 0
 
         # True when ELISA_SEMANTIC_SERIAL is set to anything but "0" or "".
@@ -77,7 +187,7 @@ extend Semantic:
         # Run passes [first, first + count) of par_pass_call over `table` and append their
         # diagnostics in id order: concurrently, or in order on this thread when serial.
         def par_pass_run(file: Ast::File&, view: Ast::File&, flags: ParPassFlags, table: lmut SymbolTable, first: u32, count: u32) -> void:
-            can Memory.Allocate, Abort.Panic, Parallel, Unsafe.PointerCast:
+            can Memory.Allocate, Memory.Release, Abort.Panic, Parallel, Unsafe.PointerCast:
                 if count < 2 or par_pass_serial():
                     for offset in 0..<count |table, file, view, flags, first|:
                         table <- par_pass_call(first + offset, file, view, flags, table)
@@ -87,7 +197,7 @@ extend Semantic:
                 file_bits: uintptr = file.cast[void&].uintptr()
                 view_bits: uintptr = view.cast[void&].uintptr()
                 for offset in 0..<count |jobs, shared_bits, file_bits, view_bits, flags, first|:
-                    jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, table: SymbolTable()})
+                    jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, table: zeroed})
                 # Each job's address, taken from the buffer itself (not base + i * size_of).
                 job_addresses: mutable darray[uintptr] = []
                 for offset in 0..<count |job_addresses, jobs|:
@@ -109,5 +219,9 @@ extend Semantic:
                     head_same: bool = memcmp(copy_bits.cast[void&], shared_bits.cast[void&], diagnostics_offset) == 0
                     tail_same: bool = memcmp((copy_bits + diagnostics_end.uintptr()).cast[void&], (shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
                     panic("semantic_parallel: a pass run concurrently wrote a SymbolTable field other than diagnostics") if not (head_same and tail_same)
+                # Validate every job before the splice mutates parent backing storage.
+                for job_bits in job_addresses |table|:
+                    job: mutable heap ParPassJob& = job_bits.cast[mutable heap ParPassJob&]
                     for diagnostic in job.table.diagnostics |table|:
-                        table.diagnostics <- table.diagnostics.push(diagnostic)
+                        table <- par_pass_parent_diagnostic(diagnostic, table)
+                    arena_free(&job.arena)
