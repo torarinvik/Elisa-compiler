@@ -1,5 +1,14 @@
 extend Semantic:
     private:
+        # A semantic projection of call origins; this is an ordinary record, not an AST node.
+        struct StorageViewOriginProjection:
+            value: Ast::Expr
+            into_arguments: darray[Ast::Expr]
+            carry_arguments: darray[Ast::Expr]
+            into_fields: darray[sview]
+            carry_fields: darray[sview]
+            projected: bool
+
         # The root of the container addressed by `&place` when PLACE is an index into it:
         # `&xs[i]` -> "xs", `&bag.items[i]` -> "bag" (stage0 keys the latter on "bag.items"
         # and matches a mutation of "bag"; keying on the root is the conservative superset).
@@ -188,7 +197,7 @@ extend Semantic:
                 # dependency too. Retain old rows conservatively for uncertain control flow.
                 if sources.count == 0 and any existing in alias_names where existing == name:
                     storage_view_append_value_sources(value, alias_names, alias_sources, alias_is_view, view_fns, sources)
-                origin_value: Ast::Expr = storage_view_call_field_value(value, view_fns)
+                origin_value: StorageViewOriginProjection = storage_view_call_field_value(value, view_fns)
                 for source in sources |alias_names, alias_sources, alias_is_view, name, value, origin_value|:
                     storage_view_push_origin_rows(origin_value, name, source, is_view_alias, alias_names, alias_sources, alias_is_view)
 
@@ -274,7 +283,7 @@ extend Semantic:
                 # struct values, which the comment above warns about.
                 literal_view: bool = storage_view_literal_holds_view(value)
                 storage_view_append_value_sources(value, alias_names, alias_sources, alias_is_view, view_fns, sources) if literal_view and sources.count == 0
-                origin_value: Ast::Expr = storage_view_call_field_value(value, view_fns)
+                origin_value: StorageViewOriginProjection = storage_view_call_field_value(value, view_fns)
                 for source in sources |alias_names, alias_sources, alias_is_view, name, value, origin_value, summarised_call, literal_view|:
                     row_is_view: bool = return_type_is_view(type_expression) or storage_view_type_is_reference(type_expression) or captures_storage or payload_view or summarised_call or literal_view or (storage_view_expr_carries_borrow(value, alias_names, alias_sources, alias_is_view) and not storage_view_type_is_scalar_copy(type_expression))
                     storage_view_push_origin_rows(origin_value, name, source, row_is_view, alias_names, alias_sources, alias_is_view)
@@ -950,7 +959,7 @@ extend Semantic:
         # A summarised call whose result views exactly one argument THROUGH a field
         # (`name(&h)` returning `bytes_view_range(self.buf, ..)`) is spelled as that field path
         # (`h.buf`) for field-origin keying, so growing a sibling field keeps the view.
-        def storage_view_call_field_value(value: Ast::Expr, view_fns: darray[sview]&) -> Ast::Expr:
+        def storage_view_call_field_value(value: Ast::Expr, view_fns: darray[sview]&) -> StorageViewOriginProjection:
             can Memory.Allocate, Abort.Panic:
                 match value:
                     Expr.Paren(inner, _):
@@ -958,36 +967,63 @@ extend Semantic:
                     Expr.Call(callee, arguments, _, _):
                         into_arguments: darray[Ast::Expr] = vro_origin_arguments(callee, arguments, view_fns, false)
                         carry_arguments: darray[Ast::Expr] = vro_origin_arguments(callee, arguments, view_fns, true)
-                        value return if into_arguments.count + carry_arguments.count == 0
-                        into_fields: darray[sview] = vro_origin_fields(callee, arguments, view_fns, false)
-                        carry_fields: darray[sview] = vro_origin_fields(callee, arguments, view_fns, true)
-                        value return if into_fields.count != into_arguments.count or carry_fields.count != carry_arguments.count
-                        # Several origins (`name return if ..` beside `return bytes_view_range(p.buf, ..)`):
-                        # spell each as its field path and let storage_view_field_origins key them per
-                        # root, so an origin through another root does not widen `p`'s to "[bare]".
-                        origins: mutable darray[Ast::Expr] = []
-                        for index in 0..<into_arguments.count |origins, into_arguments, into_fields|:
-                            origins.push(storage_view_origin_spelling(into_arguments[index], into_fields[index]))
-                        for index in 0..<carry_arguments.count |origins, carry_arguments, carry_fields|:
-                            origins.push(storage_view_origin_spelling(carry_arguments[index], carry_fields[index]))
-                        return origins[0] if origins.count == 1
-                        names: darray[sview] = []
-                        return Ast::Expr.Call(Ast::Expr.Ident("", Ast::expr_pos(value)), origins, names, Ast::expr_pos(value))
+                        if into_arguments.count + carry_arguments.count > 0:
+                            into_fields: darray[sview] = vro_origin_fields(callee, arguments, view_fns, false)
+                            carry_fields: darray[sview] = vro_origin_fields(callee, arguments, view_fns, true)
+                            if into_fields.count == into_arguments.count and carry_fields.count == carry_arguments.count:
+                                return StorageViewOriginProjection{value: value, into_arguments: into_arguments, carry_arguments: carry_arguments, into_fields: into_fields, carry_fields: carry_fields, projected: true}
                     _:
-                        return value
+                        pass
+                return StorageViewOriginProjection{value: value, into_arguments: [], carry_arguments: [], into_fields: [], carry_fields: [], projected: false}
 
-        def storage_view_origin_spelling(argument: Ast::Expr, field: sview) -> Ast::Expr:
-            can Memory.Allocate:
-                argument return if field == ""
-                return Ast::Expr.Field(vro_strip_borrow(argument), field, Ast::expr_pos(argument))
+        # Evaluate the same field-origin walk that a synthetic Field would receive.
+        def storage_view_projected_field_origins(argument: Ast::Expr, field: sview, root: sview, alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if field == "":
+                    storage_view_field_origins(argument, root, alias_names, alias_sources, out)
+                    return
+                object: Ast::Expr = vro_strip_borrow(argument)
+                match object:
+                    Expr.Ident(name, _):
+                        if name == root:
+                            storage_view_add_origin(field, out)
+                        elif any alias in alias_names where alias == name:
+                            storage_view_add_origin("[bare]", out)
+                    _:
+                        storage_view_field_origins(object, root, alias_names, alias_sources, out)
+
+        def storage_view_projected_origins(projection: StorageViewOriginProjection&, root: sview, alias_names: darray[sview]&, alias_sources: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if not projection.projected:
+                    storage_view_field_origins(projection.value, root, alias_names, alias_sources, out)
+                    return
+                # Multiple origins previously used Call(Ident(""), origins): retain the
+                # empty callee's exact behavior, including unusual empty-name alias rows.
+                if projection.into_arguments.count + projection.carry_arguments.count > 1:
+                    if root == "":
+                        storage_view_add_origin("[bare]", out)
+                    else:
+                        known: mutable bool = false
+                        found: mutable bool = false
+                        for i in 0..<alias_names.count |known, found, out, root, alias_names, alias_sources|:
+                            if alias_names[i] == "":
+                                known <- true
+                                if alias_sources[i] == root:
+                                    found <- true
+                                    storage_view_add_origin(alias_sources[i - 1] if i > 0 and alias_names[i - 1] == "[field]" else "[bare]", out)
+                        storage_view_add_origin("[bare]", out) if known and not found
+                for index in 0..<projection.into_arguments.count |out, projection, root, alias_names, alias_sources|:
+                    storage_view_projected_field_origins(projection.into_arguments[index], projection.into_fields[index], root, alias_names, alias_sources, out)
+                for index in 0..<projection.carry_arguments.count |out, projection, root, alias_names, alias_sources|:
+                    storage_view_projected_field_origins(projection.carry_arguments[index], projection.carry_fields[index], root, alias_names, alias_sources, out)
 
         # One (marker, alias) row pair per field through which VALUE mentions SOURCE, or a single
         # unmarked (whole-root) row. A view of `p.a` or `p.b` is two marked rows; growth or
         # replacement kills it when ANY of its rows is not spared, so this is exact, not wider.
-        def storage_view_push_origin_rows(origin_value: Ast::Expr, name: sview, source: sview, is_view: bool, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&) -> void:
+        def storage_view_push_origin_rows(origin_value: StorageViewOriginProjection, name: sview, source: sview, is_view: bool, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 origins: mutable darray[sview] = []
-                storage_view_field_origins(origin_value, source, alias_names, alias_sources, origins)
+                storage_view_projected_origins(&origin_value, source, alias_names, alias_sources, origins)
                 whole: bool = origins.count == 0 or any origin in origins where origin == "[bare]"
                 if whole:
                     alias_names.push(name)
