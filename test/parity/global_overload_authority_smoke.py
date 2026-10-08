@@ -11,7 +11,14 @@ for case in cases:
     output = result.stdout + result.stderr
     parsed = re.search(r"^P 0$", output, re.M)
     family = missing.split(".")[0] if missing else None
-    good = result.returncode == 0 and parsed and (re.search(r"^D 0$", output, re.M) if not missing else f"requires can[{family}]" in output and missing.split(".")[-1] in output and re.search(r"^S 1$", output, re.M))
+    # The canonical authority checker reports a missing operation grant as
+    # "add can Family.Member". Accept the older checker wording too so this
+    # control remains useful across the reporter migration.
+    missing_grant = (
+        f"requires can[{family}" in output
+        or f"add can {missing}" in output
+    ) if missing else False
+    good = result.returncode == 0 and parsed and (re.search(r"^D 0$", output, re.M) if not missing else missing_grant and re.search(rf"\b{re.escape(missing.split('.')[-1])}\b", output) and re.search(r"^S 1$", output, re.M))
     if rows is not None:
         actual_rows = {}
         for function, ref, mandatory in re.findall(r"^R (\S+) (\S+) ([01])$", output, re.M):

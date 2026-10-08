@@ -44,7 +44,7 @@ check mixed 'can[Global{Read,Write}, Unsafe.PointerCast]' <<'CASE'
 def f() -> i32 can[Global.Read, Global.Write, Unsafe.PointerCast]:
     return 0 can Global.Read, Global.Write, Unsafe.PointerCast
 CASE
-check interrupted 'can[Global.Read, Unsafe.PointerCast, Global.Write]' <<'CASE'
+check interrupted 'can[Global{Read,Write}, Unsafe.PointerCast]' <<'CASE'
 def f() -> i32 can[Global.Read, Unsafe.PointerCast, Global.Write]:
     return 0
 CASE
@@ -52,7 +52,7 @@ check duplicate 'can[Global{Read,Read}]' <<'CASE'
 def f() -> i32 can[Global.Read, Global.Read]:
     return 0
 CASE
-check whole_family 'can[Global.Read, Global, Global.Write]' <<'CASE'
+check whole_family 'can[Global{Read,Write}, Global]' <<'CASE'
 def f() -> i32 can[Global.Read, Global, Global.Write]:
     return 0
 CASE
@@ -82,7 +82,7 @@ check via_ref 'can[Writer[sview] via Console.Write, Global{Read,Write}]' <<'CASE
 def f() -> i32 can[Writer[sview] via Console.Write, Global.Read, Global.Write]:
     return 0
 CASE
-check via_interrupt 'can[Global.Read, Writer[sview] via Console.Write, Global.Write]' <<'CASE'
+check via_interrupt 'can[Global{Read,Write}, Writer[sview] via Console.Write]' <<'CASE'
 def f() -> i32 can[Global.Read, Writer[sview] via Console.Write, Global.Write]:
     return 0
 CASE
