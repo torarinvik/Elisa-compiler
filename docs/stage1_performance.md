@@ -436,3 +436,34 @@ fast gates at baseline, corpus diff (tokens/ast/check/-O0 objects), the compiler
 itself to an identical object, plus 20 repeated `-emit check` runs of the self-host unit with
 byte-identical diagnostics (determinism under scheduling), and a ThreadSanitizer build of the
 check path on the box.
+
+### Cold-Pos split: status (WIP, not on main)
+
+Commit d6d10088 on claude/perf-r7-pos (codegen_packed_cold_pos.elisa; runtime
+`ctx_aos_store_side_slot` + side chunks for sized stores). Verified so far:
+- the self-built compiler (p2) gives the same self-host `-emit check` output as main;
+- p2 rebuilds itself to a byte-identical object (p2.o == p3.o);
+- a parser probe built by the new codegen reports the same positions as main's;
+- stage0 6f0988a2 `-emit semantic` accepts the tree.
+
+Pitfalls fixed on the way:
+- every whole-payload read must go through the cold-aware loader, including the nested `is`/sub-pattern binders;
+- the cold decision must be program-level (`packed_cold_pos_program`) plus "enum is an AST refinement or root". A per-enum-index check made `Ast::expr_pos` read spans from the record.
+
+Remaining before landing:
+1. Results of the full gate on stage0 6f0988a2. It was launched from the worktree with
+   `ELISA_REMOTE_DIR=/root/work/r7-gate ELISA_REMOTE_CORE=/root/work/r5-core` and logs to
+   /private/tmp/claude-501/r7gate.log. Baselines: emit_ast 28, diagnostics_diff 409,
+   semantic_internal 54, semantic_acceptance 3, backend_native 565/566 (the arm64-triple row is
+   known to fail).
+2. The stage0 seed and self_host_gen3 against stage0 **778c8281**, using a private copy:
+   `ELISA_CORE=claude-worktrees/r7-core778 ELISA_REMOTE_CORE=/root/work/r7-core778 ... gen3`.
+   Never touch /root/Elisa-core.
+3. The corpus diff. /root/work/r7/corpjob.sh writes cb.m (main) and cb.n (branch).
+   tokens/ast/check must be identical. -O0 objects may differ only for programs that include
+   the compiler AST; for those, run the executables and compare exit codes and output, as in
+   round 6.
+4. A QUIET-window table: mm (main built by itself) against p2, over check/ast/tokens, using
+   /root/work/r5/quiet.sh.
+5. Rebase onto origin/main, fast-forward main, and remove the worktrees (perf-r7-pos,
+   r7-core, r7-core778) and the box directory /root/work/r7.
