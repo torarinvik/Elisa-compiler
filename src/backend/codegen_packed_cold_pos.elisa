@@ -1,0 +1,142 @@
+# Stage1 backend — COLD positions for sized AST records. Part of `module Backend` (see codegen.elisa).
+#
+# Every AST variant that carries a source span has it as its LAST field, `pos: Pos` (six u32,
+# 24 bytes), and in a sized record (codegen_packed_sized_records.elisa) that span is often
+# half the node: `Binary(left, op, right, pos)` is 12 hot bytes and 24 position bytes. Almost
+# every semantic walk streams the AST and almost none reads a position, so the spans only
+# dilute the cache lines the walks pull in (docs/stage1_performance.md, round 7).
+#
+# A sized AST store therefore keeps each node's `Pos` in the store's side slot (3 uintptr
+# words per handle, side chunks indexed by the same handle as the address chunks), and the
+# record holds only the fields before it. Because `Pos` is always last, no other field moves:
+# the record is the old record truncated at the span. Only whole-payload loads and stores
+# change -- they copy the record prefix and the cold span separately -- and at -O2 a load
+# whose bound `pos` is never used drops the cold copy entirely.
+
+extend Backend:
+    private:
+        const PACKED_COLD_POS_BYTES: u64 = 24
+        const PACKED_COLD_POS_WORDS: u32 = 3
+
+        def packed_is_cold_pos_type(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            false return if value_type.kind != TypeKind.Struct
+            false return if value_type.bits.usize() >= structs.names.count
+            false return if structs.names[value_type.bits.usize()] != "Pos"
+            packed_row_field_bytes(value_type, structs) == PACKED_COLD_POS_BYTES
+
+        # Whether the program's sized AST store keeps spans cold. Decided once for the whole
+        # program (not per enum index): a reader and the constructor that wrote a node must
+        # agree, and the enum index a match sees can resolve differently from the
+        # constructor's (a module-local `Expr` vs `Ast::Expr`). Only when the hierarchy has no
+        # side-tabled commons: those write the whole side slot from a buffer sized for them.
+        def packed_cold_pos_program(structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            false return if not packed_program_sized_records(structs)
+            root: i64 = program_hierarchy_root_index(structs)
+            packed_side_common_word_count_at_slot(structs, root, packed_aos_common_count(structs, root)) == 0
+
+        # Whether ENUM_INDEX's nodes live in that store: the AST root or one of its refinements.
+        def packed_cold_pos_store(structs: mutable StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or not packed_cold_pos_program(structs)
+            packed_is_ast_refinement(structs, enum_index) or packed_is_ast_root_row(structs, enum_index) or packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index))
+
+        # Whether VARIANT_SLOT's payload ends in the AST `Pos` span.
+        def packed_variant_cold_pos(structs: mutable StructTable&, variant_slot: usize) -> bool can[Abort.Panic]:
+            false return if variant_slot >= structs.packed_field_type_count.count
+            count: usize = structs.packed_field_type_count[variant_slot]
+            false return if count == 0
+            last: ValueType = copied_type(structs.packed_field_types[structs.packed_field_type_start[variant_slot] + count - 1])
+            packed_is_cold_pos_type(last, structs)
+
+        def packed_cold_pos_applies(structs: mutable StructTable&, enum_index: i64, variant_slot: usize) -> bool can[Abort.Panic]:
+            packed_cold_pos_store(structs, enum_index) and packed_variant_cold_pos(structs, variant_slot)
+
+        # The payload bytes before the span: its C-layout offset (fields before it, each at
+        # its own alignment; `Pos` itself is 4-aligned).
+        def packed_variant_hot_bytes(structs: mutable StructTable&, variant_slot: usize) -> u64 can[Abort.Panic]:
+            count: usize = structs.packed_field_type_count[variant_slot]
+            start: usize = structs.packed_field_type_start[variant_slot]
+            offset: mutable u64 = 0
+            for field_index in 0..<(count - 1) |offset, start, structs|:
+                member: ValueType = copied_type(structs.packed_field_types[start + field_index])
+                member_align: u64 = packed_row_field_align(member, structs)
+                offset <- offset + (member_align - (offset % member_align)) if member_align > 0 and offset % member_align != 0
+                offset <- offset + packed_row_field_bytes(member, structs)
+            offset <- offset + (PACKED_U32_SIZE_BYTES - (offset % PACKED_U32_SIZE_BYTES)) if offset % PACKED_U32_SIZE_BYTES != 0
+            offset
+
+        # Side words a store rooted at ROOT_INDEX needs: its commons, or the cold span.
+        def packed_store_side_words(structs: mutable StructTable&, root_index: i64, packed_mode: i64) -> u32 can[Abort.Panic]:
+            commons: u32 = packed_side_common_word_count_at_slot(structs, root_index, packed_aos_common_count(structs, root_index))
+            PACKED_COLD_POS_WORDS return if packed_mode == 2 and commons == 0 and packed_cold_pos_store(structs, root_index)
+            commons
+
+        # `ctx_aos_store_side_slot(state, i64 index) -> ptr`: the node's cold span.
+        def packed_cold_pos_address(state: LLVMValueRef, handle: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            m: LLVMModuleRef = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)))
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            params: mutable darray[LLVMTypeRef] = [pointer_type, i64_type]
+            slot_type: LLVMTypeRef = LLVMFunctionType(pointer_type, (&params[0]).cast[void&], 2, 0)
+            name_storage: mutable darray[u8] = []
+            slot_fn: mutable LLVMValueRef = LLVMConstNull(pointer_type)
+            if LLVMGetNamedFunction(m, sview_to_cstr("ctx_aos_store_side_slot", name_storage)) is existing:
+                slot_fn <- existing
+            else:
+                name_storage.truncate(0)
+                slot_fn <- LLVMAddFunction(m, sview_to_cstr("ctx_aos_store_side_slot", name_storage), slot_type)
+            index: LLVMValueRef = handle if LLVMGetIntTypeWidth(LLVMTypeOf(handle)) == 64 else LLVMBuildZExt(builder, handle, i64_type, "cold.pos.index")
+            args: mutable darray[LLVMValueRef] = [state, index]
+            return LLVMBuildCall2(builder, slot_type, slot_fn, (&args[0]).cast[void&], 2, "cold.pos.slot")
+
+        def packed_cold_pos_hot_bytes(value_llvm: LLVMTypeRef, structs: mutable StructTable&, variant_slot: usize) -> u64? can[Abort.Panic]:
+            count: usize = structs.packed_field_type_count[variant_slot]
+            0 return if count == 1
+            # LLVMStructTypeKind = 10: a multi-field payload is a struct of its fields.
+            null return if LLVMGetTypeKind(value_llvm) != 10 or LLVMCountStructElementTypes(value_llvm).usize() != count
+            hot: u64 = LLVMOffsetOfElement(structs.target_data, value_llvm, (count - 1).u32())
+            null return if hot != packed_variant_hot_bytes(structs, variant_slot)
+            hot
+
+        # Whole-payload load of a dynamic-AoS AST row: record prefix + cold span.
+        def packed_ast_row_load_payload(value_type: ValueType, variant_slot: usize, structs: mutable StructTable&, enum_index: i64, row: LLVMValueRef, state: LLVMValueRef, handle: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if not packed_cold_pos_applies(structs, enum_index, variant_slot):
+                return packed_dynamic_row_load_value(value_type, packed_variant_row_slots(structs, variant_slot), structs, enum_index, row, ctx, builder)
+            value_llvm: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            if packed_cold_pos_hot_bytes(value_llvm, structs, variant_slot) is hot:
+                i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                temp: LLVMValueRef = build_entry_alloca(builder, value_llvm, "cold.load.temp")
+                if hot > 0:
+                    source: LLVMValueRef = packed_dynamic_row_payload_words(structs, enum_index, row, ctx, builder, "cold.load.hot")
+                    _ = LLVMBuildMemCpy(builder, temp, 4, source, 4, LLVMConstInt(i64_type, hot, 0))
+                offsets: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, hot, 0)]
+                span: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), temp, (&offsets[0]).cast[void&], 1, "cold.load.span")
+                _ = LLVMBuildMemCpy(builder, span, 4, packed_cold_pos_address(state, handle, ctx, builder), 8, LLVMConstInt(i64_type, PACKED_COLD_POS_BYTES, 0))
+                return LLVMBuildLoad2(builder, value_llvm, temp, "cold.load.value")
+            return null
+
+        # Whole-payload store of a dynamic-AoS AST row: record prefix + cold span.
+        def packed_ast_row_store_payload(value: LLVMValueRef, value_type: ValueType, variant_slot: usize, structs: mutable StructTable&, enum_index: i64, row: LLVMValueRef, state: LLVMValueRef, handle: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if not packed_cold_pos_applies(structs, enum_index, variant_slot):
+                return packed_dynamic_row_store_value(value, value_type, packed_variant_row_slots(structs, variant_slot), structs, enum_index, row, ctx, builder)
+            value_llvm: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            if packed_cold_pos_hot_bytes(value_llvm, structs, variant_slot) is hot:
+                i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                temp: LLVMValueRef = build_entry_alloca(builder, value_llvm, "cold.store.temp")
+                _ = LLVMBuildStore(builder, value, temp)
+                if hot > 0:
+                    destination: LLVMValueRef = packed_dynamic_row_payload_words(structs, enum_index, row, ctx, builder, "cold.store.hot")
+                    _ = LLVMBuildMemCpy(builder, destination, 4, temp, 4, LLVMConstInt(i64_type, hot, 0))
+                offsets: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, hot, 0)]
+                span: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), temp, (&offsets[0]).cast[void&], 1, "cold.store.span")
+                _ = LLVMBuildMemCpy(builder, packed_cold_pos_address(state, handle, ctx, builder), 8, span, 4, LLVMConstInt(i64_type, PACKED_COLD_POS_BYTES, 0))
+                return true
+            return false
+
+        # A typed-row whole-payload load (`{tag, payload}` GEP + load at the payload type), used
+        # by the nested-pattern binders; a cold-position variant takes the split load instead,
+        # since its record ends where the span would start.
+        def packed_typed_row_load_payload(value_type: ValueType, variant_slot: usize, structs: mutable StructTable&, enum_index: i64, row_type: LLVMTypeRef, row: LLVMValueRef, state: LLVMValueRef, handle: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if packed_cold_pos_applies(structs, enum_index, variant_slot):
+                return packed_ast_row_load_payload(value_type, variant_slot, structs, enum_index, row, state, handle, ctx, builder)
+            pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, row_type, row, packed_payload_row_field_index(structs, enum_index), "packed.payload.ptr")
+            return LLVMBuildLoad2(builder, llvm_type_of(value_type, structs, ctx), pointer, "packed.payload")

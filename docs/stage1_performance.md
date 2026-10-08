@@ -377,3 +377,62 @@ Next:
 Box (ssh -p 53652 root@38.49.42.120): /root/work/r8-core (stage0), r8-s1 (stage1 tree),
 r8-probe (seed.sh, gen2.sh, gates.sh, det.sh, run.sh), r8-main, r8-g2*, r8-chk.*, r8-core-test,
 r8-core-main.
+## Round 7 (claude/perf-r7-pos)
+
+### Profile after sized records (cachegrind, `-emit check`, 7ec9def9)
+
+45.7 G instructions, 742 M D1 read misses (was 1.08 G), 263 M LL read misses (was 274 M).
+Sized records cut L1 traffic; the LL stream barely moved: ~90% of LL misses are in semantic
+passes, spread over ~300 functions, each whole-AST walk ~0.9 M misses (~56 MB, more than the
+40 MB L3). The AST is ~3.3 M nodes / ~150 MB of records, and the 24-byte `Pos` span that ends
+55 of the 68 payload variants is about half of it.
+
+Per-pass CPU (quiet box): semantic passes ~12.7 s of ~15 s. An audit of every pass's
+transitive SymbolTable writes (helpers included, `in table.X:` region blocks, `&table.X`
+borrows, mutable globals) finds 307 of 438 passes append-only (write only `diagnostics`, never
+read earlier ones): ~5.1 s in 39 contiguous runs, ~4.3 s saved if each run ran in parallel
+(bounded by its longest pass). That is the larger lever, but it is blocked (below), so this
+round takes the cold-`Pos` split.
+
+### Option 1 (pending): threads over a frozen table
+
+**Blocker.** Every function that touches the AST takes the store as a hidden trailing
+parameter (`runtime.active_store`, codegen_declare.elisa). A thread entry cannot supply it,
+the source cannot name it, `spawn1`/`spawn_raw` are rejected outside the runtime std, and
+stage0 rejects `nursery: submit worker(job)` because `pool_submit1`'s `fn(A) -> R` type
+cannot carry the store region (`__packed_store_Ast_Node: <invalid>` vs `Store[Local]`). The
+worker itself is otherwise ready (claude/perf-r7, `semantic_parallel.elisa`: shallow byte copy
+of the table with empty diagnostics, per-job arena via `in job.arena:`, splice in pass order;
+stage1 accepts it).
+
+**stage0 change (Elisa-core).** Let a submitted function's packed-store region unify with the
+submitting scope's store: when checking `pool_submit1`/`spawn1` and the `submit` desugar,
+instantiate the callee's implicit `__packed_store_*` region parameters from the caller's
+active store instead of leaving them `<invalid>`; the store is frozen for the nursery's
+lifetime, so the thread-shareability rule should treat a read-only store handle like a
+`static` ref (and reject constructors/mutation inside the submitted function). Codegen:
+capture the store pointer in the work item and pass it as the hidden argument in the
+generated entry thunk.
+
+**stage1 change.** The same two pieces: (1) the semantic rule (`check_thread_shareability`,
+`check_thread_transfer_provenance`) accepts a submitted function that only reads the
+caller's AST store; (2) codegen for `submit f(x)` when `f` needs `ast_store_needed`: box
+`{arg, active_store}` into the work1 state and emit a per-callee entry thunk that unpacks it
+and calls `f(arg, store)`. Then `semantic_parallel.elisa` replaces each append-only run
+(largest runs first) with `par_pass_run`.
+
+**Risks.** Data races through state the audit misses (the audit is textual: a helper writing
+the table under another name, or a lazily built index in the table, would race; mitigate by
+re-running the audit in `scripts/test.sh` and failing on any new writer in a parallel run);
+allocator sharing (per-job arenas are required, never the table's region); nondeterministic
+diagnostic order (the splice is by pass id, so order is fixed by construction; pin it with
+diagnostics_diff); thread stacks (passes recurse deeply; workers need the main thread's
+512 MB stack, so the pool must be created with an explicit stack size); and a stage0 change
+that lands in the shared seed, so the seed provenance has to move with it.
+
+**Gates.** Elisa-core's own suite for the stage0 change; then the usual set here: stage0 seed,
+self_host_gen3, never_leak / borrow_exclusivity / loop_value_codegen / backend_native smokes,
+fast gates at baseline, corpus diff (tokens/ast/check/-O0 objects), the compiler rebuilding
+itself to an identical object, plus 20 repeated `-emit check` runs of the self-host unit with
+byte-identical diagnostics (determinism under scheduling), and a ThreadSanitizer build of the
+check path on the box.
