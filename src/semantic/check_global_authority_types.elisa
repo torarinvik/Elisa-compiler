@@ -99,19 +99,23 @@ extend Semantic:
                     _:
                         return state.alias_names.count
 
-        def ga_mutable_parameter(type_expression: Ast::Expr, state: GlobalAuthority&, depth: u32) -> bool:
+        def ga_mutable_parameter(type_expression: Ast::Expr, state: GlobalAuthority&, depth: u32, origin: usize = GLOBAL_AUTHORITY_NONE) -> bool:
             can Memory.Allocate, Abort.Panic:
-                false return if depth > 32
-                alias: usize = ga_alias(type_expression, state)
-                ga_mutable_parameter(state.alias_types[alias], state, depth + 1) return if alias < state.alias_names.count
+                true return if depth > 32
+                lexical_scope: usize = state.module_scope if origin == GLOBAL_AUTHORITY_NONE else origin
+                alias: usize = match type_expression:
+                    Expr.Ident(name, _): ga_resolve(name, lexical_scope, false, state.alias_names, state.alias_scopes, state)
+                    Expr.Scope(base, name, _): ga_resolve(name, ga_module(base, state, lexical_scope), true, state.alias_names, state.alias_scopes, state)
+                    _: state.alias_names.count
+                ga_mutable_parameter(state.alias_types[alias], state, depth + 1, state.alias_scopes[alias]) return if alias < state.alias_names.count
                 match type_expression:
                     Expr.Unary(operator, operand, _):
                         true return if operator == TokenKind.Lmut
-                        return vtc_type_borrows(operand) if operator == TokenKind.Mutable
-                        return ga_mutable_parameter(operand, state, depth + 1) if operator == TokenKind.Question
+                        return vtc_type_borrows(ga_type_alias_result(operand, lexical_scope, state, depth + 1)) if operator == TokenKind.Mutable
+                        return ga_mutable_parameter(operand, state, depth + 1, lexical_scope) if operator == TokenKind.Question
                         return false
                     Expr.Paren(inner, _):
-                        return ga_mutable_parameter(inner, state, depth + 1)
+                        return ga_mutable_parameter(inner, state, depth + 1, lexical_scope)
                     _:
                         return false
 
@@ -169,6 +173,192 @@ extend Semantic:
                     _:
                         return (false, false)
 
+        # Generic metadata is used only to decline narrowing; collisions stay unknown.
+        def ga_generic_head(head: sview, state: GlobalAuthority&) -> bool:
+            can Abort.Panic:
+                for index in 0..<min(state.generic_lines.count, state.generic_names.count):
+                    true return if state.generic_lines[index] < 2147483648.u32() and state.generic_names[index] == head
+                return false
+
+        def ga_builtin_head(head: sview) -> bool:
+            return head == "bool" or head == "char" or head == "cstr" or head == "sview" or head == "dstr" or head == "usize" or head == "isize" or head == "uintptr" or head == "i8" or head == "i16" or head == "i32" or head == "i64" or head == "u8" or head == "u16" or head == "u32" or head == "u64" or head == "f32" or head == "f64"
+
+        def ga_closed_builtin(expression: Ast::Expr, origin: usize, state: GlobalAuthority&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 32
+                head: sview = ga_type_head(expression)
+                false return if ga_generic_head(head, state)
+                owner: usize = match expression:
+                    Expr.Scope(base, _, _): ga_module(base, state, origin)
+                    _: origin
+                alias: usize = ga_resolve(head, owner, expression is Expr.Scope, state.alias_names, state.alias_scopes, state)
+                if (expression is Expr.Ident or expression is Expr.Scope) and alias < state.alias_names.count:
+                    return ga_closed_builtin(state.alias_types[alias], state.alias_scopes[alias], state, depth + 1)
+                match expression:
+                    Expr.Ident(name, _):
+                        false return if not ga_builtin_head(name) or ga_generic_head(name, state)
+                        false return if ga_resolve(name, origin, false, state.enum_names, state.enum_scopes, state) < state.enum_names.count
+                        return ga_known_struct(expression, origin, state, 0) == state.struct_names.count
+                    _:
+                        return false
+
+        def ga_builtin_unshadowed(expression: Ast::Expr, origin: usize, state: GlobalAuthority&) -> bool:
+            return ga_closed_builtin(expression, origin, state, 0) can Memory.Allocate, Abort.Panic
+
+        # Pointer, optional, container and unresolved annotations are not exact type
+        # evidence. Every actual must be closed before a lower-scoring row is excluded.
+        def ga_arguments_known(arguments: darray[Ast::Expr], state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for argument in arguments:
+                    annotation: Ast::Expr = get ga_annotation(argument, state, 0) else return false
+                    false return if ga_generic_head(ga_type_head(annotation), state)
+                    resolved: Ast::Expr = ga_type_alias_result(annotation, state.module_scope, state, 0)
+                    match resolved:
+                        Expr.Ident(head, _):
+                            false return if ga_generic_head(head, state)
+                            nominal: usize = ga_known_struct(annotation, state.module_scope, state, 0)
+                            continue if nominal < state.struct_names.count
+                            continue if ga_builtin_unshadowed(annotation, state.module_scope, state) and nominal == state.struct_names.count
+                            return false
+                        Expr.Scope(_, _, _):
+                            continue if ga_known_struct(annotation, state.module_scope, state, 0) < state.struct_names.count
+                            return false
+                        Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _) | Expr.StringLit(_, _):
+                            continue
+                        _:
+                            return false
+                return true
+
+        # Wrapped type syntax retains its declaration scope. Decline cross-scope
+        # wrappers instead of reinterpreting nested nominal names in the caller.
+        def ga_return_portable(expression: Ast::Expr, origin: usize, state: GlobalAuthority&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 32
+                head: sview = ga_type_head(expression)
+                false return if ga_generic_head(head, state)
+                qualified: bool = expression is Expr.Scope
+                alias_owner: usize = match expression:
+                    Expr.Scope(base, _, _): ga_module(base, state, origin)
+                    _: origin
+                alias: usize = ga_resolve(head, alias_owner, qualified, state.alias_names, state.alias_scopes, state)
+                if (expression is Expr.Ident or expression is Expr.Scope) and alias < state.alias_names.count:
+                    declared_alias: usize = ga_known_struct(expression, origin, state, depth)
+                    caller_alias: usize = ga_known_struct(expression, state.module_scope, state, depth)
+                    true return if declared_alias < state.struct_names.count and declared_alias == caller_alias
+                    false return if origin != state.module_scope or state.alias_scopes[alias] != state.module_scope
+                    return ga_return_portable(state.alias_types[alias], state.alias_scopes[alias], state, depth + 1)
+                match expression:
+                    Expr.Ident(name, _) | Expr.Scope(_, name, _):
+                        false return if ga_generic_head(name, state)
+                        declared: usize = ga_known_struct(expression, origin, state, depth)
+                        caller: usize = ga_known_struct(expression, state.module_scope, state, depth)
+                        true return if declared < state.struct_names.count and declared == caller
+                        true return if ga_builtin_unshadowed(expression, origin, state) and ga_builtin_unshadowed(expression, state.module_scope, state)
+                        return origin == state.module_scope and declared == caller
+                    Expr.Index(base, element, _):
+                        false return if origin != state.module_scope
+                        return ga_return_portable(base, origin, state, depth + 1) and ga_return_portable(element, origin, state, depth + 1)
+                    Expr.IndexN(base, elements, _):
+                        false return if origin != state.module_scope
+                        false return if not ga_return_portable(base, origin, state, depth + 1)
+                        for element in elements:
+                            false return if not ga_return_portable(element, origin, state, depth + 1)
+                        return true
+                    Expr.Unary(_, inner, _) | Expr.Refinement(inner, _, _) | Expr.Paren(inner, _):
+                        false return if origin != state.module_scope
+                        return ga_return_portable(inner, origin, state, depth + 1)
+                    Expr.Lambda(_, _, _):
+                        return true
+                    _:
+                        return origin == state.module_scope
+
+        # A first best return cannot type a surrounding call when several callees
+        # remain viable. Keep callback/reference facts for a unique callee, but do not
+        # reinterpret a nominal return in a different lexical module.
+        def ga_unique_call_return(slot: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&, method: bool = false) -> Ast::Expr?:
+            can Memory.Allocate, Abort.Panic:
+                null return if slot >= state.functions.count
+                selected_count: mutable usize = 0
+                while next_candidate < state.functions.count |next_candidate: usize = ga_candidate_head(slot, state), selected_count|:
+                    candidate: usize = next_candidate
+                    next_candidate <- state.function_next[candidate]
+                    selected_count <- selected_count + 1 if ga_candidate_selected(candidate, slot, arguments, labels, state, method)
+                    null return if selected_count > 1
+                result_option: Ast::Expr? = state.function_return_types[slot]
+                result: Ast::Expr = get result_option else return null
+                origin: usize = state.function_scopes[slot]
+                null return if not ga_return_portable(result, origin, state, 0)
+                return result
+
+        # Bound metadata preserves the complete protocol path and declaration identity.
+        def ga_bound_protocol(receiver: Ast::Expr, state: GlobalAuthority&) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                annotation: Ast::Expr = get ga_annotation(receiver, state, 0) else return state.protocol_names.count
+                state.protocol_names.count return if not (annotation is Expr.Ident)
+                generic: sview = ga_type_head(annotation)
+                state.protocol_names.count return if state.function >= state.function_offsets.count
+                for bound in state.annotations:
+                    continue if bound.line != 3900000130 or bound.owner != generic or bound.offset != state.function_offsets[state.function] or bound.detail_line != state.function_lines[state.function] or ga_module_text(bound.module, state) != state.function_scopes[state.function]
+                    last_scope: mutable usize = sview_len(bound.name)
+                    for index in 0..<sview_len(bound.name) |last_scope|:
+                        last_scope <- index if sview_at(bound.name, index) == 58 and index + 1 < sview_len(bound.name) and sview_at(bound.name, index + 1) == 58
+                    if last_scope < sview_len(bound.name):
+                        owner: usize = ga_text_module(bound.name[0:last_scope], state.function_scopes[state.function], state)
+                        return ga_resolve(bound.name[last_scope + 2:sview_len(bound.name)], owner, true, state.protocol_names, state.protocol_scopes, state)
+                    return ga_resolve(bound.name, state.function_scopes[state.function], false, state.protocol_names, state.protocol_scopes, state)
+                return state.protocol_names.count
+
+        def ga_protocol_member(candidate: usize, protocol: usize, state: GlobalAuthority&) -> bool:
+            can Abort.Panic:
+                false return if candidate >= state.functions.count
+                for member in state.annotations:
+                    continue if member.owner != "__protocol_method_scope" or member.offset != state.function_offsets[candidate] or ga_module_text(member.module, state) != state.function_scopes[candidate]
+                    true return if protocol == state.protocol_names.count
+                    true return if member.name == state.protocol_names[protocol] and ga_module_text(member.module, state) == state.protocol_scopes[protocol]
+                return false
+
+        # int/void are Core builtins too; ordinary overload scoring deliberately
+        # keeps its prior closed-type set. These facts are only for cast hooks.
+        def ga_cast_builtin(expression: Ast::Expr, origin: usize, state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if ga_builtin_unshadowed(expression, origin, state)
+                false return if not (expression is Expr.Ident)
+                name: sview = ga_type_head(expression)
+                false return if name != "int" and name != "void"
+                return not ga_generic_head(name, state) and ga_known_struct(expression, origin, state, 0) == state.struct_names.count and ga_resolve(name, origin, false, state.enum_names, state.enum_scopes, state) == state.enum_names.count and ga_resolve(name, origin, false, state.alias_names, state.alias_scopes, state) == state.alias_names.count
+
+        def ga_cast_heads_match(first: sview, second: sview) -> bool:
+            # Keep integer aliases conservative without guessing a target ABI.
+            first_kind: sview = "i64" if first == "int" or first == "isize" else ("u64" if first == "usize" or first == "uintptr" else first)
+            second_kind: sview = "i64" if second == "int" or second == "isize" else ("u64" if second == "usize" or second == "uintptr" else second)
+            return first_kind == second_kind
+
+        # Match Core's lexical postfix cast spelling, before semantic type probing.
+        # dstr and arbitrary lowercase aliases remain ordinary methods.
+        def ga_postfix_cast_name(name: sview) -> bool:
+            can Abort.Panic:
+                true return if name == "void" or name == "bool" or name == "char" or name == "int" or name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "isize" or name == "s8" or name == "s16" or name == "s32" or name == "s64" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "usize" or name == "uintptr" or name == "f32" or name == "f64" or name == "sview" or name == "cstr"
+                return sview_len(name) > 0 and sview_at(name, 0) >= 65 and sview_at(name, 0) <= 90
+
+        def ga_postfix_callee(callee: Ast::Expr) -> Ast::Expr:
+            match callee:
+                Expr.Unary(operator, inner, _):
+                    return inner if operator == TokenKind.Question and inner is Expr.Field else callee
+                _:
+                    return callee
+
+        # Conversion recognition additionally requires a bare zero-argument Field
+        # call at the consumer; wrapped callees and explicit arguments stay UFCS.
+        def ga_target_conversion(callee: Ast::Expr, state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match ga_postfix_callee(callee):
+                    Expr.Field(_, target, at):
+                        false return if not ga_postfix_cast_name(target)
+                        raw: Ast::Expr = Ast::Expr.Ident(target, at)
+                        return ga_builtin_head(target) or target == "void" or target == "int" or target == "s8" or target == "s16" or target == "s32" or target == "s64" or ga_generic_head(target, state) or ga_known_struct(raw, state.module_scope, state, 0) < state.struct_names.count or ga_resolve(target, state.module_scope, false, state.enum_names, state.enum_scopes, state) < state.enum_names.count or ga_alias(raw, state) < state.alias_names.count
+                    _:
+                        return false
+
         def ga_annotation(expression: Ast::Expr, state: GlobalAuthority&, depth: u32) -> Ast::Expr?:
             can Memory.Allocate, Abort.Panic:
                 null return if depth > 32
@@ -183,9 +373,18 @@ extend Semantic:
                         owner: usize = ga_known_struct(base_type, state.module_scope, state, depth + 1)
                         null return if owner == state.struct_names.count
                         for index in 0..<state.field_owners.count:
-                            state.field_types[index] return if state.field_owners[index] == state.struct_names[owner] and state.field_scopes[index] == state.struct_scopes[owner] and state.field_names[index] == field
+                            if state.field_owners[index] == state.struct_names[owner] and state.field_scopes[index] == state.struct_scopes[owner] and state.field_names[index] == field:
+                                null return if not ga_return_portable(state.field_types[index], state.field_scopes[index], state, depth + 1)
+                                return state.field_types[index]
                         return null
                     Expr.Call(callee, arguments, labels, _):
+                        if arguments.count == 0 and labels.count == 0 and ga_target_conversion(callee, state):
+                            null return if callee is Expr.Unary
+                            match callee:
+                                Expr.Field(_, target, at):
+                                    result: Ast::Expr = Ast::Expr.Ident(target, at)
+                                    return result if ga_builtin_unshadowed(result, state.module_scope, state) else null
+                                _: pass
                         slot: mutable usize = ga_named_callee_slot(callee, state)
                         match ga_callable_core(callee):
                             Expr.Field(receiver, method, _):
@@ -195,12 +394,11 @@ extend Semantic:
                                 actual_labels: mutable darray[sview] = [""]
                                 actuals.extend(arguments)
                                 actual_labels.extend(labels)
-                                slot <- ga_select_function(slot, actuals, actual_labels, state)
+                                slot <- ga_select_function(slot, actuals, actual_labels, state, true)
+                                return ga_unique_call_return(slot, actuals, actual_labels, state, true)
                             _:
                                 slot <- ga_select_function(slot, arguments, labels, state)
-                        if slot < state.functions.count and state.function_return_types[slot] is return_type:
-                            return ga_type_alias_result(return_type, state.function_scopes[slot], state, depth + 1)
-                        return null
+                        return ga_unique_call_return(slot, arguments, labels, state)
                     Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.Unary(_, inner, _):
                         return ga_annotation(inner, state, depth + 1)
                     Expr.Index(base, _, _):
@@ -245,22 +443,88 @@ extend Semantic:
                     seen <- seen + 1
                 return null
 
-        # Unresolved equal candidates must retain every possible mutable capability.
-        def ga_candidate_score(candidate: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&) -> i64:
+        def ga_arity_fits(candidate: usize, count: usize, state: GlobalAuthority&, method: bool = false) -> bool:
+            can Abort.Panic:
+                false return if candidate >= state.parameter_counts.count
+                variadic: bool = candidate < state.function_variadic.count and state.function_variadic[candidate]
+                true return if method and (variadic or state.parameter_minimum[candidate] < state.parameter_counts[candidate])
+                return count >= state.parameter_minimum[candidate] and (variadic or count <= state.parameter_counts[candidate])
+
+        def ga_has_variadic_candidate(selected: usize, state: GlobalAuthority&) -> bool:
+            can Abort.Panic:
+                false return if selected >= state.functions.count
+                while next_candidate < state.functions.count |next_candidate: usize = ga_candidate_head(selected, state)|:
+                    candidate: usize = next_candidate
+                    next_candidate <- state.function_next[candidate]
+                    true return if state.functions[candidate] == state.functions[selected] and state.function_scopes[candidate] == state.function_scopes[selected] and candidate < state.function_variadic.count and state.function_variadic[candidate]
+                return false
+
+        # UFCS ranks only the receiver. Unknown shapes retain every viable row.
+        def ga_method_receiver_rank(candidate: usize, arguments: darray[Ast::Expr], state: GlobalAuthority&) -> i64:
             can Memory.Allocate, Abort.Panic:
-                -1 return if arguments.count < state.parameter_minimum[candidate] or arguments.count > state.parameter_counts[candidate]
+                -2 return if arguments.count == 0
+                formal: Ast::Expr = get ga_argument_type(candidate, 0, "", state) else return -2
+                actual: Ast::Expr = get ga_annotation(arguments[0], state, 0) else return -2
+                formal_resolved: Ast::Expr = ga_type_alias_result(formal, state.function_scopes[candidate], state, 0)
+                actual_resolved: Ast::Expr = ga_type_alias_result(actual, state.module_scope, state, 0)
+                -2 return if not (formal is Expr.Ident or formal is Expr.Scope) or not (actual is Expr.Ident or actual is Expr.Scope)
+                -2 return if not (formal_resolved is Expr.Ident or formal_resolved is Expr.Scope) or not (actual_resolved is Expr.Ident or actual_resolved is Expr.Scope)
+                -2 return if ga_generic_head(ga_type_head(actual), state)
+                formal_head: sview = ga_type_head(formal)
+                if formal is Expr.Ident and ga_generic_head(formal_head, state):
+                    -2 return if candidate >= state.function_lines.count
+                    line: u32 = state.function_lines[candidate]
+                    for other in 0..<state.function_lines.count:
+                        -2 return if other != candidate and state.function_lines[other] == line
+                    for index in 0..<min(state.generic_lines.count, state.generic_names.count):
+                        1 return if state.generic_lines[index] == line and state.generic_names[index] == formal_head
+                    return -2
+                formal_struct: usize = ga_known_struct(formal, state.function_scopes[candidate], state, 0)
+                actual_struct: usize = ga_known_struct(actual, state.module_scope, state, 0)
+                if formal_struct < state.struct_names.count and actual_struct < state.struct_names.count:
+                    return 2 if formal_struct == actual_struct else -1
+                formal_builtin: bool = ga_builtin_unshadowed(formal, state.function_scopes[candidate], state)
+                actual_builtin: bool = ga_builtin_unshadowed(actual, state.module_scope, state)
+                if formal_builtin and actual_builtin:
+                    return 2 if ga_type_head(formal_resolved) == ga_type_head(actual_resolved) else -2
+                -1 return if (formal_struct < state.struct_names.count and actual_builtin) or (actual_struct < state.struct_names.count and formal_builtin)
+                return -2
+
+        def ga_method_candidates_known(selected: usize, arguments: darray[Ast::Expr], state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if selected >= state.functions.count
+                while next_candidate < state.functions.count |next_candidate: usize = ga_candidate_head(selected, state)|:
+                    candidate: usize = next_candidate
+                    next_candidate <- state.function_next[candidate]
+                    continue if state.functions[candidate] != state.functions[selected] or state.function_scopes[candidate] != state.function_scopes[selected]
+                    continue if not ga_arity_fits(candidate, arguments.count, state, true)
+                    false return if ga_method_receiver_rank(candidate, arguments, state) == -2
+                return true
+
+        # Unresolved equal candidates must retain every possible mutable capability.
+        def ga_candidate_score(candidate: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&, method: bool = false) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                -1 return if not ga_arity_fits(candidate, arguments.count, state, method)
+                if method:
+                    receiver_rank: i64 = ga_method_receiver_rank(candidate, arguments, state)
+                    return 0 if receiver_rank == -2 else receiver_rank
                 score: mutable i64 = 0
                 fits: mutable bool = true
                 for index in 0..<arguments.count |score, fits|:
                     label: sview = labels[index] if index < labels.count else sview("", 0, 0)
                     if ga_argument_type(candidate, index, label, state) is parameter_type:
                         if ga_annotation(arguments[index], state, 0) is argument_type:
+                            continue if ga_generic_head(ga_type_head(parameter_type), state) or ga_generic_head(ga_type_head(argument_type), state)
                             parameter_struct: usize = ga_known_struct(parameter_type, state.function_scopes[candidate], state, 0)
                             argument_struct: usize = ga_known_struct(argument_type, state.module_scope, state, 0)
                             fits <- false if parameter_struct < state.struct_names.count and argument_struct < state.struct_names.count and parameter_struct != argument_struct
-                            parameter_head: sview = ga_type_head(ga_type_alias_result(parameter_type, state.function_scopes[candidate], state, 0))
-                            argument_head: sview = ga_type_head(ga_type_alias_result(argument_type, state.module_scope, state, 0))
-                            if parameter_head == argument_head and parameter_head != "":
+                            parameter_resolved: Ast::Expr = ga_type_alias_result(parameter_type, state.function_scopes[candidate], state, 0)
+                            argument_resolved: Ast::Expr = ga_type_alias_result(argument_type, state.module_scope, state, 0)
+                            parameter_head: sview = ga_type_head(parameter_resolved)
+                            argument_head: sview = ga_type_head(argument_resolved)
+                            fits <- false if parameter_struct < state.struct_names.count and argument_struct == state.struct_names.count and ga_builtin_unshadowed(argument_type, state.module_scope, state) and not ga_generic_head(argument_head, state)
+                            fits <- false if argument_struct < state.struct_names.count and parameter_struct == state.struct_names.count and ga_builtin_unshadowed(parameter_type, state.function_scopes[candidate], state) and not ga_generic_head(parameter_head, state)
+                            if (parameter_struct < state.struct_names.count and parameter_struct == argument_struct and (parameter_type is Expr.Ident or parameter_type is Expr.Scope) and (argument_type is Expr.Ident or argument_type is Expr.Scope) and (parameter_resolved is Expr.Ident or parameter_resolved is Expr.Scope) and (argument_resolved is Expr.Ident or argument_resolved is Expr.Scope)) or (parameter_head == argument_head and parameter_head != "" and ga_builtin_unshadowed(parameter_type, state.function_scopes[candidate], state) and ga_builtin_unshadowed(argument_type, state.module_scope, state)):
                                 score <- score + 2
                             else:
                                 literal_kind: sview = match argument_type:
@@ -269,16 +533,16 @@ extend Semantic:
                                     Expr.FloatLit(_, _): "float"
                                     Expr.StringLit(_, _): "string"
                                     _: ""
-                                fits <- false if literal_kind != "" and literal_never_fits(literal_kind, parameter_head)
+                                fits <- false if literal_kind != "" and ga_builtin_unshadowed(parameter_type, state.function_scopes[candidate], state) and not ga_generic_head(parameter_head, state) and literal_never_fits(literal_kind, parameter_head)
                                 # Different nominal/generic/alias heads are unresolved here,
                                 # not proof that the overload cannot run.
                                 known_kind: sview = "bool" if argument_head == "bool" else ("int" if argument_head == "i64" or argument_head == "i32" or argument_head == "u32" or argument_head == "u64" else "")
-                                fits <- false if literal_kind == "" and known_kind != "" and literal_never_fits(known_kind, parameter_head)
+                                fits <- false if literal_kind == "" and known_kind != "" and ga_builtin_unshadowed(argument_type, state.module_scope, state) and ga_builtin_unshadowed(parameter_type, state.function_scopes[candidate], state) and not ga_generic_head(argument_head, state) and not ga_generic_head(parameter_head, state) and literal_never_fits(known_kind, parameter_head)
                     else:
-                        fits <- false if state.functions[candidate] != ""
+                        fits <- false if state.functions[candidate] != "" and not (candidate < state.function_variadic.count and state.function_variadic[candidate])
                 return score if fits else -1
 
-        def ga_select_function(first: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&) -> usize:
+        def ga_select_function(first: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&, method: bool = false) -> usize:
             can Memory.Allocate, Abort.Panic:
                 state.functions.count return if first >= state.functions.count
                 first return if state.functions[first] == ""
@@ -288,26 +552,38 @@ extend Semantic:
                     candidate: usize = next_candidate
                     next_candidate <- state.function_next[candidate]
                     continue if state.functions[candidate] != state.functions[first] or state.function_scopes[candidate] != state.function_scopes[first]
-                    score: i64 = ga_candidate_score(candidate, arguments, labels, state)
+                    score: i64 = ga_candidate_score(candidate, arguments, labels, state, method)
                     if score > best_score:
                         selected <- candidate
                         best_score <- score
                 return selected
 
-        def ga_candidate_selected(candidate: usize, selected: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&) -> bool:
+        def ga_candidate_selected(candidate: usize, selected: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: GlobalAuthority&, method: bool = false) -> bool:
             can Memory.Allocate, Abort.Panic:
                 false return if selected >= state.functions.count
                 candidate == selected return if state.functions[selected] == ""
                 false return if state.functions[candidate] != state.functions[selected] or state.function_scopes[candidate] != state.function_scopes[selected]
-                return ga_candidate_score(candidate, arguments, labels, state) >= 0
+                score: i64 = ga_candidate_score(candidate, arguments, labels, state, method)
+                false return if score < 0
+                if method:
+                    return score == ga_candidate_score(selected, arguments, labels, state, true) if ga_method_candidates_known(selected, arguments, state) else true
+                true return if ga_has_variadic_candidate(selected, state)
+                return score == ga_candidate_score(selected, arguments, labels, state) if ga_arguments_known(arguments, state) else true
 
-        def ga_argument_mutates(slot: usize, position: usize, label: sview, state: GlobalAuthority&) -> bool:
+        def ga_argument_mutates(slot: usize, position: usize, label: sview, state: GlobalAuthority&, depth: u32 = 0) -> bool:
             can Memory.Allocate, Abort.Panic:
+                true return if depth > 32 or slot == state.unknown_callback_slot
                 false return if slot >= state.functions.count
+                for edge in 0..<state.callback_origin_from.count:
+                    if state.callback_origin_from[edge] == slot:
+                        true return if ga_argument_mutates(state.callback_origin_to[edge], position, label, state, depth + 1)
                 seen: mutable usize = 0
                 end: usize = min(state.parameter_starts[slot] + state.parameter_counts[slot], state.parameter_types.count)
                 for index in state.parameter_starts[slot]..<end |seen|:
                     selected: bool = state.parameter_names[index] == label if label != "" else seen == position
-                    ga_mutable_parameter(state.parameter_types[index], state, 0) return if selected
+                    ga_mutable_parameter(state.parameter_types[index], state, 0, state.function_scopes[slot]) return if selected
                     seen <- seen + 1
+                if label != "":
+                    for index in state.parameter_starts[slot]..<end:
+                        true return if ga_mutable_parameter(state.parameter_types[index], state, 0, state.function_scopes[slot])
                 return false

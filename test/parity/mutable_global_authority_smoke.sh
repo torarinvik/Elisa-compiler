@@ -72,7 +72,7 @@ def reader() -> i64:
 def main() -> i64:
     return reader() can Global.Write
 CASE
-run_case nested_trusted_same_member clean <<'CASE'
+run_case nested_trusted_same_member 'requires can[Global]' <<'CASE'
 global mutable hot: i64 = 1
 def reader(depth: i64) -> i64:
     if depth > 0:
@@ -343,7 +343,7 @@ def reader() -> i64:
 def main() -> i64:
     return reader()
 CASE
-run_case trusted_firewall clean <<'CASE'
+run_case trusted_firewall 'mutable global read requires can[Global]' <<'CASE'
 global mutable hot: i64 = 1
 def reader() -> i64:
     trusted Global.Read:
