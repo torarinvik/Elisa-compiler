@@ -64,7 +64,7 @@ for name, source, expected in cases:
     for line in result.stdout.splitlines():
         if line.startswith("S "):
             severity = int(line.split()[1])
-        elif "requires can[Global]" in line and "warning:" not in line:
+        elif ("requires can[Global]" in line or "accesses a global mutable binding without Global." in line) and "warning:" not in line:
             assert severity == 1, (name, "mandatory Global must be an error", result.stdout)
             messages.append(line)
     observed = set()
