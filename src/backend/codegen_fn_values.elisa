@@ -40,10 +40,15 @@ extend Backend:
             while param_probe < param_span_count |param_types, param_llvms, param_declined, param_probe, param_span_start, structs, ctx|:
                 one_param: ValueType = copied_type(structs.fn_pool_params[param_span_start + param_probe])
                 param_declined <- true if one_param.kind == TypeKind.Unmodeled
+                # Lifted closures still use the first-class LLVM aggregate ABI. Until their
+                # generated entry point can copy indirect parameters and write an sret result,
+                # decline this closure shape instead of emitting a raw-function ABI mismatch.
+                param_declined <- true if value_type_uses_indirect_aggregate(one_param, structs, ctx)
                 param_types.push(one_param)
                 param_llvms.push(llvm_type_of(one_param, structs, ctx))
                 param_probe <- param_probe + 1
             null return if param_declined
+            null return if not lambda_is_error and value_type_uses_sret(return_type, structs, ctx)
             # Capture every VALUE local in scope, BY VALUE (load it now, in the caller block).
             #
             # Scalars, plus the plain value AGGREGATES: a struct and an sview are LLVM
@@ -245,8 +250,9 @@ extend Backend:
             is_error_result: bool = result_type.kind == TypeKind.ErrorUnion
             error_payload_type: ValueType = error_union_payload_of(result_type, structs) if is_error_result else unmodeled_type()
             null return if is_error_result and error_payload_type.kind == TypeKind.Unmodeled
+            sret_return: bool = not is_error_result and not is_void_result and value_type_uses_sret(result_type, structs, ctx)
             error_status_llvm: LLVMTypeRef = error_set_llvm_type(structs, error_union_family_of(result_type, structs), ctx) if is_error_result and error_set_has_payload(structs, error_union_family_of(result_type, structs)) else LLVMInt32TypeInContext(ctx)
-            return_llvm: LLVMTypeRef = error_status_llvm if is_error_result else LLVMVoidTypeInContext(ctx) if is_void_result else llvm_type_of(result_type, structs, ctx)
+            return_llvm: LLVMTypeRef = error_status_llvm if is_error_result else LLVMVoidTypeInContext(ctx) if is_void_result or sret_return else llvm_type_of(result_type, structs, ctx)
             fn_pointer_opt: LLVMValueRef? = emit_expression(callee, ValueType{kind: TypeKind.Fn, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
             # A valid null function pointer is the failure-path sentinel; the
             # `null return if not got_fn_pointer` below prevents its use.
@@ -279,6 +285,15 @@ extend Backend:
                 call_argument_type: ValueType = signature_arg_type if signature_arg_type.kind != TypeKind.Unmodeled else inferred_arg_type
                 if call_argument_type.kind == TypeKind.Unmodeled:
                     arg_declined <- true
+                elif value_type_uses_indirect_aggregate(call_argument_type, structs, ctx):
+                    if (indirect_aggregate_argument_address(call_argument, call_argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is argument_address:
+                        argument_values.push(argument_address)
+                        argument_llvm_types.push(pointer_type)
+                    elif (emit_expression(call_argument, call_argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is indirect_value:
+                        argument_values.push(materialize_indirect_aggregate_argument(indirect_value, call_argument_type, structs, ctx, builder))
+                        argument_llvm_types.push(pointer_type)
+                    else:
+                        arg_declined <- true
                 elif (emit_expression(call_argument, call_argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is call_argument_value:
                     argument_values.push(call_argument_value)
                     argument_llvm_types.push(llvm_type_of(call_argument_type, structs, ctx))
@@ -313,6 +328,8 @@ extend Backend:
             LLVMPositionBuilderAtEnd(builder, raw_block)
             raw_call_types: mutable darray[LLVMTypeRef] = []
             raw_call_values: mutable darray[LLVMValueRef] = []
+            raw_call_types.push(pointer_type) if sret_return
+            raw_call_values.push(result_slot) if sret_return
             raw_call_types.push(pointer_type) if is_error_result
             raw_call_values.push(error_payload_slot) if is_error_result
             raw_call_types.extend(argument_llvm_types)
@@ -323,6 +340,9 @@ extend Backend:
             raw_args_pointer: void& = (&raw_call_values[0]).cast[void&] can Unsafe.PointerCast if raw_count > 0 else (&raw_dummy_value[0]).cast[void&] can Unsafe.PointerCast
             if is_void_result:
                 _ = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, raw_count.u32(), "")
+            elif sret_return:
+                raw_sret_call: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, raw_count.u32(), "")
+                add_call_type_attribute(raw_sret_call, 1, "sret", llvm_type_of(result_type, structs, ctx), ctx)
             else:
                 raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, raw_count.u32(), "fnval.raw.call")
                 if is_error_result:
@@ -350,6 +370,9 @@ extend Backend:
             if is_error_result:
                 closure_arg_types <- [pointer_type, pointer_type]
                 closure_arg_values <- [error_payload_slot, env_pointer]
+            elif sret_return:
+                closure_arg_types <- [pointer_type, pointer_type]
+                closure_arg_values <- [result_slot, env_pointer]
             closure_arg_types.extend(argument_llvm_types)
             closure_arg_values.extend(argument_values)
             closure_types_pointer: void& = (&closure_arg_types[0]).cast[void&] can Unsafe.PointerCast
@@ -358,6 +381,9 @@ extend Backend:
             closure_args_pointer: void& = (&closure_arg_values[0]).cast[void&] can Unsafe.PointerCast
             if is_void_result:
                 _ = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, closure_count.u32(), "")
+            elif sret_return:
+                closure_sret_call: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, closure_count.u32(), "")
+                add_call_type_attribute(closure_sret_call, 1, "sret", llvm_type_of(result_type, structs, ctx), ctx)
             else:
                 closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, closure_count.u32(), "fnval.closure.call")
                 if is_error_result:

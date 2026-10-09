@@ -199,6 +199,9 @@ run_case struct_return    'struct Point:\n    x: i64\n    y: i64\n\ndef make(a: 
 run_case struct_roundtrip 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef make(a: i64, b: i64) -> Point:\n    return Point{x: a, y: b}\n\ndef main() -> i64:\n    return total(make(40, 2))\n'  42
 # 40 bytes: past the register-passing threshold, so this is the indirect/sret path.
 run_case struct_large_abi 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef sum(g: Big) -> i64:\n    return g.a + g.b + g.c + g.d + g.e\n\ndef main() -> i64:\n    g: Big = Big{a: 10, b: 10, c: 10, d: 10, e: 2}\n    return sum(g)\n'  42
+# Function values must use the same indirect-aggregate ABI as named calls. A 1024-byte
+# argument and return exercise both the callback's by-value parameter and its sret result.
+run_case fn_value_large_aggregate 'struct Big:\n    padding: u8[1016]\n    marker: mutable i64\n\ndef identity(value: Big) -> Big:\n    return value\n\ndef invoke(callback: fn(Big) -> Big, value: Big) -> Big:\n    return callback(value)\n\ndef main() -> i64:\n    value: mutable Big = zeroed\n    value.marker <- 42\n    result: Big = invoke(identity, value)\n    return result.marker\n' 42
 # A mixed int/float layout is the case a hand-rolled ABI most easily gets wrong.
 run_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'  42
 run_case struct_two_args  'struct P:\n    x: i64\n    y: i64\n\ndef add(a: P, b: P) -> P:\n    return P{x: a.x + b.x, y: a.y + b.y}\n\ndef main() -> i64:\n    r: P = add(P{x: 30, y: 1}, P{x: 10, y: 1})\n    return r.x + r.y\n'  42
