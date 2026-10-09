@@ -331,29 +331,35 @@ extend Parser:
                         return nested_scope_decl
             return null
 
-        # Search nested module/impl declaration bodies while registering one installation.
-        # Handler clones remain file-scope ordinary functions, which keeps their generated
-        # names independent of the source module and lets a qualified call redirect to the
-        # same direct ABI symbol.
-        def effect_register_clone_in_declarations(parser: lmut Parser, declarations: darray[Ast::Decl]&, effect_ref: sview, handler_name: sview, source_owner: sview) -> void:
-            for declaration in declarations |parser, effect_ref, handler_name|:
+        # Freeze the marked source declarations once, in declaration traversal order.
+        # The sparse marker list excludes installation/handler/clone metadata. Both lists
+        # stay local to this transaction, so clone registration cannot invalidate them.
+        def effect_collect_template_declarations(declarations: darray[Ast::Decl]&, markers: darray[Ast::EnumAnnotation]&, source_owner: sview, templates: mutable darray[Ast::Decl]&, owners: mutable darray[sview]&) -> void:
+            for declaration in declarations |templates, owners, markers, source_owner|:
                 if declaration is Decl.Func(source_name, source_params, source_return, source_body, source_effects, source_decorators, source_line):
-                    continue if not (any template_annotation in parser.enum_annotations where template_annotation.owner == "__effect_template" and template_annotation.name == source_name and template_annotation.line == source_line.line)
+                    if any marker in markers where marker.name == source_name and marker.line == source_line.line:
+                        templates.push(declaration) can Memory.Allocate
+                        owners.push(source_owner) can Memory.Allocate
+                elif declaration is Decl.Module(module_name, module_body, module_pos):
+                    effect_collect_template_declarations(module_body, markers, module_name, templates, owners) can Global{Read,Write}
+                elif declaration is Decl.Scoped(scoped_body, scoped_pos):
+                    effect_collect_template_declarations(scoped_body, markers, source_owner, templates, owners) can Global{Read,Write}
+
+        def effect_register_clone_templates(parser: lmut Parser, templates: darray[Ast::Decl]&, owners: darray[sview]&, effect_ref: sview, handler_name: sview) -> void:
+            for template_index in 0..<templates.count |parser, templates, owners, effect_ref, handler_name|:
+                declaration: Ast::Decl = templates[template_index] can Abort.Panic
+                if declaration is Decl.Func(source_name, source_params, source_return, source_body, source_effects, source_decorators, source_line):
                     environment_complete: mutable bool = true
                     for required_effect in source_effects |parser, environment_complete|:
                         environment_complete <- false if parser.effect_template_row_is_abstract(required_effect) and not parser.effect_environment_may_cover(required_effect, parser.effect_active_install, source_line.line)
                     continue if not environment_complete
-                    for template_effect in source_effects |parser, source_name, source_line, handler_name, effect_ref, source_params|:
+                    for template_effect in source_effects |parser, source_name, source_line, handler_name, effect_ref, source_params, owners, template_index|:
                         if parser.effect_template_row_is_abstract(template_effect):
                             required_count: mutable usize = source_params.count
                             while required_count > 0.usize() and source_params[required_count - 1.usize()].has_default |required_count, source_params|:
                                 required_count <- required_count - 1.usize()
-                            parser <- parser.effect_register_clone(source_name, source_line.line, handler_name, effect_ref, source_params.count, source_owner, required_count) can Global{Read,Write}
+                            parser <- parser.effect_register_clone(source_name, source_line.line, handler_name, effect_ref, source_params.count, owners[template_index], required_count) can Global{Read,Write}, Abort.Panic
                             break
-                elif declaration is Decl.Module(module_name, module_body, module_pos):
-                    parser <- parser.effect_register_clone_in_declarations(module_body, effect_ref, handler_name, module_name) can Global{Read,Write}
-                elif declaration is Decl.Scoped(scoped_body, scoped_pos):
-                    parser <- parser.effect_register_clone_in_declarations(scoped_body, effect_ref, handler_name, source_owner) can Global{Read,Write}
 
         def effect_register_clone(parser: lmut Parser, source_name: sview, source_line: u32, handler_name: sview, effect_ref: sview, parameter_count: usize, source_owner: sview, required_count: usize) -> void:
             for clone_index in 0..<parser.effect_clone_names.count |parser, source_name, source_line, handler_name, effect_ref, parameter_count|:
@@ -369,7 +375,7 @@ extend Parser:
             parser.effect_clone_param_counts <- parser.effect_clone_param_counts.push(parameter_count)
             parser.effect_clone_required_counts <- parser.effect_clone_required_counts.push(required_count)
             parser.effect_clone_install_lines <- parser.effect_clone_install_lines.push(parser.effect_active_install)
-            parser.effect_clone_owners <- parser.effect_clone_owners.push(source_owner)
+            parser.effect_clone_owners <- parser.effect_clone_owners.push(source_owner) can Memory.Allocate
             # Semantic validation may skip the abstract source body only when at least one
             # concrete clone exists. Without this marker an uninstalled helper would be
             # skipped as a template and fail later as an opaque backend decline.
@@ -383,17 +389,27 @@ extend Parser:
         # That makes helper-to-helper calls inside a clone resolve in the same pass, including
         # recursive helpers, without a runtime dispatch fallback.
         def effect_register_clones(parser: lmut Parser, declarations: darray[Ast::Decl]&) -> void:
+            markers: mutable darray[Ast::EnumAnnotation] = []
+            for annotation in parser.enum_annotations |markers|:
+                markers.push(annotation) can Memory.Allocate if annotation.owner == "__effect_template"
+            # Most installations perform operations directly and need no helper clones.
+            if markers.count == 0:
+                parser.effect_active_install <- 0
+                return
+            templates: mutable darray[Ast::Decl] = []
+            owners: mutable darray[sview] = []
+            effect_collect_template_declarations(declarations, markers, "", templates, owners) can Global{Read,Write}
             # Walk only the annotations present on entry: effect_register_clone pushes clone
             # markers onto parser.enum_annotations, so iterating the field itself would walk a
             # buffer the callee relocates or overwrites.
-            for install_index in 0..<parser.enum_annotations.count |install_index, parser, declarations|:
+            for install_index in 0..<parser.enum_annotations.count |install_index, parser, templates, owners|:
                 install_annotation: Ast::EnumAnnotation = parser.enum_annotations[install_index]
                 continue if install_annotation.owner != "__effect_install"
                 effect_ref: sview = parser.effect_install_effect_at(install_annotation.line)
                 continue if effect_ref == ""
                 handler_name: sview = install_annotation.name
                 parser.effect_active_install <- install_annotation.line
-                parser <- parser.effect_register_clone_in_declarations(declarations, effect_ref, handler_name, "") can Global{Read,Write}
+                parser <- parser.effect_register_clone_templates(templates, owners, effect_ref, handler_name) can Global{Read,Write}
             parser.effect_active_install <- 0
 
         # Build the explicit capture ABI of a clone. The captures are new formal parameters;
