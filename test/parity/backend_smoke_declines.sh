@@ -30,7 +30,9 @@ stripped_case() {
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         pass=$((pass + 1)); return   # invalid IR rejected loudly: fine
     fi
-    if clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
+    local -a stripped_link_flags=()
+    if [ "$ELISA_HOST_OS" = Linux ]; then stripped_link_flags=(-no-pie); fi
+    if clang -o "$exe" "$obj" "$RUNTIME_OBJ" "${stripped_link_flags[@]}" 2>/dev/null; then
         echo "  FAIL stripped_$name: linked a binary despite the unmodeled helper"; return
     fi
     pass=$((pass + 1))
@@ -316,7 +318,7 @@ run_case get_bare_absent 'def find(x: i64) -> i64?:\n    return x if x > 0 else 
 # it the struct is passed by value and the mutation is lost (or its bytes read as a pointer →
 # crash). This is what the real-std IndexMap's `arena_dict_put(a, map.by_key, …)` relies on.
 run_case field_arg_autoref 'struct Inner:\n    v: mutable i64\nstruct Outer:\n    inner: mutable Inner\ndef bump(p: mutable Inner&) -> void:\n    p.v <- p.v + 42\ndef main() -> i64:\n    o: mutable Outer = zeroed\n    bump(o.inner)\n    return o.inner.v\n' 42
-diff_case variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    _ = printf("%d %f\\n", 7, 1.5)\n    return 42\n' 42
+diff_case variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    can Unsafe.RawExtern:\n        _ = printf("%d %f\\n", 7, 1.5)\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
@@ -336,9 +338,10 @@ run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i fo
 run_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n' 42
 # MULTIPLE clauses chain, and the predicate may read parameters as well as `result`.
 run_case contract_ensure_multi 'def maxi(a: i64, b: i64) -> i64:\n    ensure result >= a\n    ensure result >= b\n    return a if a > b else b\n\ndef main() -> i64:\n    return maxi(9, 33) + maxi(7, 2)\n' 40
-# A `-> void` fn has no `result` to bind: it must DECLINE rather than drop the check --
-# an unenforced contract is worse than an unsupported one.
-stripped_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n    return\n\ndef main() -> i64:\n    touch(1)\n    return 42\n'
+# A `-> void` function enforces parameter-only postconditions without a `result` value.
+# On Linux the runtime contract panic terminates with SIGABRT (shell status 134); any other
+# nonzero status could be an unrelated backend crash and must fail this check.
+run_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n    return\n\ndef main() -> i64:\n    touch(0)\n    return 42\n' 134
 # WAS a decline case. stage1 has since gained real `dict` support and stage0 compiles
 # this too, so demanding a decline demanded a DIVERGENCE from the reference. Now pins the
 # behaviour instead: an empty dict declaration compiles, links and runs.

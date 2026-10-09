@@ -22,14 +22,14 @@ diff_object_case() {
         echo "  FAIL diff_$name: stage1 declined to emit"; return
     fi
     "$LLC" -filetype=obj "$ll" -o "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: llc rejected stage1 IR"; return; }
-    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
+    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" $ELISA_LINK_EXE_FLAGS 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
     RUN "$BUILD/diff_${name}_s1"; local got1=$?
 
     printf '%b' "$src" > "$BUILD/diff_$name.elisa"
     if ! "$ELISACORE_BIN" -emit obj -o "$BUILD/diff_${name}_s0.o" "$BUILD/diff_$name.elisa" 2>/dev/null; then
         echo "  FAIL diff_$name: stage0 rejected standalone object program"; return
     fi
-    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.o" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
+    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.o" $ELISA_LINK_EXE_FLAGS 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
     RUN "$BUILD/diff_${name}_s0"; local got0=$?
 
     if [ "$got1" -eq 124 ] || [ "$got0" -eq 124 ]; then
@@ -55,7 +55,7 @@ diff_case() {
         echo "  FAIL diff_$name: stage1 declined to emit"; return
     fi
     "$LLC" -filetype=obj "$ll" -o "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: llc rejected stage1 IR"; return; }
-    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" "$RUNTIME_OBJ" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
+    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" "$RUNTIME_OBJ" $ELISA_LINK_EXE_FLAGS 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
     RUN "$BUILD/diff_${name}_s1"; local got1=$?
 
     # The stage0 reference is built with -emit c-archive, NOT -emit obj: a program that
@@ -69,7 +69,7 @@ diff_case() {
         cat "$BUILD/diff_${name}_s0.err" >&2
         return
     fi
-    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.a" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
+    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.a" $ELISA_LINK_EXE_FLAGS 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
     RUN "$BUILD/diff_${name}_s0"; local got0=$?
 
     if [ "$got1" -eq 124 ] || [ "$got0" -eq 124 ]; then
@@ -118,7 +118,7 @@ diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n  
 diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return (xs[0] can Unsafe.UncheckedIndex).i64() - (xs[1] can Unsafe.UncheckedIndex).i64() - 58\n'
 # stage0's c-archive unsafe audit labels these reads; grant it so the case is compared, not SKIPped.
 diff_case darray_ref_elem_arith  'def main() -> i64:\n    x: i64 = 40\n    out: mutable darray[i64&] = []\n    out.push(&x)\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        return out[0] + 2\n'
-# Fuzz repro crash_ref_darray_index_arith: an empty darray[i64&] read traps in both (rc 133).
+# Fuzz repro crash_ref_darray_index_arith: an empty darray[i64&] read traps in both (SIGILL; shell rc 132).
 diff_case darray_ref_elem_oob  'def main() -> i64:\n    out: mutable darray[i64&] = []\n    s: i64 = 3\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        return out[0] + s - s\n'
 # A `T&` struct field read twice in value position (fuzz: 21+ hits; was invalid IR).
 diff_case struct_ref_field_arith  'struct HB:\n    items: mutable darray[i64]\n\nstruct Cr:\n    f: i64&\n\ndef main() -> i64:\n    can Unsafe.UncheckedIndex, Unsafe.PointerArithmetic:\n        h: mutable HB = HB{items: [41, 41]}\n        c: Cr = Cr{f: &h.items[0]}\n        first: i64 = c.f\n        return first + c.f\n'
@@ -177,9 +177,9 @@ diff_case const_u8 'const B: u8 = 200\n\ndef main() -> i64:\n    return B.i64() 
 # A LOCAL shadows a global const of the same name.
 diff_case const_shadowed_by_local 'const V: i64 = 1\n\ndef main() -> i64:\n    V: i64 = 42\n    return V\n'
 diff_case const_in_arithmetic 'const A: i64 = 40\nconst B: i64 = 2\n\ndef main() -> i64:\n    return A + B\n'
-diff_object_case global_mutable_negative_float 'global mutable weight: f64 = -1.5\n\ndef main() -> i64:\n    return 42 if weight == -1.5 else 0\n'
-diff_object_case global_mutable_float_arithmetic 'global mutable weight: f64 = 1.5 + 2.5\n\ndef main() -> i64:\n    return 42 if weight == 4.0 else 0\n'
-diff_object_case global_mutable_f32_arithmetic 'global mutable weight: f32 = 0.1 + 0.2\n\ndef main() -> i64:\n    return 42 if weight > 0.29 and weight < 0.31 else 0\n'
+diff_object_case global_mutable_negative_float 'global mutable weight: f64 = -1.5\n\ndef main() -> i64:\n    can Global.Read:\n        return 42 if weight == -1.5 else 0\n'
+diff_object_case global_mutable_float_arithmetic 'global mutable weight: f64 = 1.5 + 2.5\n\ndef main() -> i64:\n    can Global.Read:\n        return 42 if weight == 4.0 else 0\n'
+diff_object_case global_mutable_f32_arithmetic 'global mutable weight: f32 = 0.1 + 0.2\n\ndef main() -> i64:\n    can Global.Read:\n        return 42 if weight > 0.29 and weight < 0.31 else 0\n'
 diff_case aggregate_global_refs 'struct Pair:\n    left: i32\n    right: i32\n\nstruct Holder:\n    pair: Pair\n\nglobal base: Pair = Pair{left: 1, right: 2}\nglobal table: Pair[2] = [base, Pair{left: 3, right: 4}]\nglobal picked: Pair = table[1]\nglobal wrapped: Holder = Holder{pair: table[0]}\nglobal first_left: i32 = table[0].left\n\ndef main() -> i64:\n    return picked.left.i64() + wrapped.pair.right.i64() + first_left.i64()\n'
 # `const A: mutable i64 = 42` is accepted by stage0, so `is_mutable` must not decline.
 diff_case const_mutable_global 'const A: mutable i64 = 42\n\ndef main() -> i64:\n    return A\n'
@@ -206,7 +206,7 @@ diff_case cstr_param 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> 
 diff_case cstr_two_literals 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    a: cstr = "one"\n    b: cstr = "two"\n    return take(a) - take(b) + 42\n'
 diff_case cstr_empty 'def main() -> i64:\n    s: cstr = ""\n    return 42\n'
 # `@link_name` changes only the emitted symbol spelling; source calls still use `c_strlen`.
-diff_case extern_link_name '@link_name(strlen)\nextern c_strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return c_strlen("hello").i64()\n'
+diff_case extern_link_name '@link_name(strlen)\nextern c_strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    can Unsafe.RawExtern:\n        return c_strlen("hello").i64()\n'
 diff_case cstr_reassign 'def main() -> i64:\n    s: mutable cstr = "a"\n    s <- "b"\n    return 42\n'
 # CROSS-FN REGION THREADING — the first real piece of region polymorphism. A function
 # taking a GROWABLE container by reference gets an implicit trailing `ptr` arena parameter
@@ -228,7 +228,7 @@ diff_case region_count_via_ref 'def size(xs: darray[i64]&) -> i64:\n    return x
 # not a signature `can[Unsafe.UncheckedIndex]` -- the bracketed form still fails the audit.
 # The checked spelling `get xs[0] else 0` also passes stage0, but stage1 cannot parse it yet:
 # `get` is an ungated contextual keyword there (task_66494fc2).
-diff_case region_index_via_ref 'def first(xs: darray[i64]&) -> i64:\n    return xs[0] can Unsafe.UncheckedIndex\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(42)\n    return first(ys)\n'
+diff_case region_index_via_ref 'def first(xs: darray[i64]&) -> i64:\n    return xs[0] can Unsafe.UncheckedIndex\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(42)\n    can Unsafe.UncheckedIndex:\n        return first(ys)\n'
 # Two levels: main's arena is threaded through outer into inner.
 diff_case region_two_levels 'def inner(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef outer(out: mutable darray[i64]&) -> void:\n    inner(out)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    outer(xs)\n    return (xs[0] can Unsafe.UncheckedIndex)\n'
 # A threaded callee may construct an aggregate temporary before adopting it into the
@@ -322,15 +322,15 @@ diff_case arena_in_scope 'def fill(owner: Arena, out: mutable darray[i64]&) -> v
 # These are also the FIRST cstr fixtures whose EXIT CODE observes a string's CONTENTS --
 # `strlen("hello") + 37 == 42`. Until now that was unobservable, which is why cstr leaned on
 # ir_case (assert the same IR line) instead of behavior.
-diff_case extern_strlen 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    s: cstr = "hello"\n    return strlen(s).i64() + 37\n'
-diff_case extern_strlen_literal 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return strlen("0123456789").i64() + 32\n'
-diff_case extern_strlen_empty 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return strlen("").i64() + 42\n'
+diff_case extern_strlen 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    s: cstr = "hello"\n    can Unsafe.RawExtern:\n        return strlen(s).i64() + 37\n'
+diff_case extern_strlen_literal 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    can Unsafe.RawExtern:\n        return strlen("0123456789").i64() + 32\n'
+diff_case extern_strlen_empty 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    can Unsafe.RawExtern:\n        return strlen("").i64() + 42\n'
 # Two args, and a return type that is not the i64 default.
-diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\ndef main() -> i64:\n    return strncmp("abc", "abc", 3).i64() + 42\n'
+diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\ndef main() -> i64:\n    can Unsafe.RawExtern:\n        return strncmp("abc", "abc", 3).i64() + 42\n'
 # Mutable globals must be real writable storage in both backends, while plain `global`
 # declarations used by the runtime remain folded/linked according to stage0's existing ABI.
-diff_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    can Unsafe.MutableGlobal:\n        seed <- 42\n        return seed\n'
-diff_case global_mutable_array 'global mutable xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    can Unsafe.MutableGlobal, Unsafe.UncheckedIndex:\n        xs[1] <- 42\n        return xs[1]\n'
+diff_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    can Unsafe.MutableGlobal:\n        can Global.Write:\n            seed <- 42\n        can Global.Read:\n            return seed\n'
+diff_case global_mutable_array 'global mutable xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    can Unsafe{MutableGlobal,UncheckedIndex}:\n        can Global.Write:\n            xs[1] <- 42\n        can Global.Read:\n            return xs[1]\n'
 # NAMED-FIELD construction: `Shape.Circle(r: 42)`, which stage0 accepts alongside the
 # positional form. The label is checked against the payload field's DECLARED name -- a label
 # naming something else is a different program. This is the last of the four prerequisites
@@ -503,4 +503,4 @@ diff_case match_chain 'def classify(n: i64) -> i64:\n    return match n:\n      
 # (outer-source view rebinding, a store-free mutual-recursion cycle) must still run right.
 diff_case region_view_store_in_auto_inner 'def main() -> i32:\n    can Memory.Allocate:\n        total: mutable i64 = 0\n        in auto:\n            xs: mutable darray[i64] = [1, 2, 3]\n            v: mutable view[i64] = xs[0:0]\n            v <- xs[1:3]\n            total <- (v[0] can Unsafe.UncheckedIndex) + (v[1] can Unsafe.UncheckedIndex)\n        return (total - 5).i32()\n'
 diff_case region_view_store_tuple_outer 'def pick(xs: darray[i64]&) -> (known: bool, v: view[i64]):\n    return (true, xs[0:2])\n\ndef main() -> i32:\n    can Memory.Allocate:\n        base: mutable darray[i64] = [4, 7, 9]\n        v: mutable view[i64] = base[0:0]\n        region scratch(4096):\n            xs: mutable darray[i64] = [1, 2, 3]\n            w: view[i64] = pick(&xs).v\n            v <- pick(&base).v if (w[1] can Unsafe.UncheckedIndex) == 2 else base[0:1]\n        return (v[1] can Unsafe.UncheckedIndex).i32() - 7\n'
-diff_case call_store_through_cycle_pos 'def eb(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        return ea(out, r, n - 1)\n    return 0\n\ndef ea(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        return r + eb(out, r, n - 1) can Unsafe.PointerArithmetic\n    return out.count.i64()\n\ndef fill(out: mutable darray[i64&]&) -> i64:\n    x: i64 = 7\n    return eb(out, &x, 3)\n\ndef main() -> i64:\n    out: mutable darray[i64&] = []\n    return fill(&out) - 7\n'
+diff_case call_store_through_cycle_pos 'def eb(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        can Unsafe.PointerArithmetic:\n            return ea(out, r, n - 1)\n    return 0\n\ndef ea(out: mutable darray[i64&]&, r: i64&, n: i64) -> i64:\n    if n > 0:\n        can Unsafe.PointerArithmetic:\n            return r + eb(out, r, n - 1)\n    return out.count.i64()\n\ndef fill(out: mutable darray[i64&]&) -> i64:\n    x: i64 = 7\n    can Unsafe.PointerArithmetic:\n        return eb(out, &x, 3)\n\ndef main() -> i64:\n    out: mutable darray[i64&] = []\n    can Unsafe.PointerArithmetic:\n        return fill(&out) - 7\n'
