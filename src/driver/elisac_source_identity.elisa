@@ -1,0 +1,286 @@
+include "../lexer/tokens.elisa"
+include "../lexer/source_view.elisa"
+
+# Owned include-graph identity for one driver invocation. No source contents, line numbers,
+# hashes, AST handles, or borrowed views are persisted here. Capture is off in cold wrappers.
+# Paths come from the EXISTING expander's ProjectSystem::absolute_path: lexical Go-style
+# Clean, not filesystem realpath. Visits include deduplicated includes so every graph edge
+# survives; expanded records distinguish actual first expansions from deduplicated attempts.
+module SourceIdentity:
+    public:
+        const NONE: usize = 4294967295
+        const MAX_BYTES: usize = 67108864
+        const MAX_VISITS: usize = 1000000
+        struct PathRecord:
+            start: usize
+            length: usize
+            expanded: bool
+        struct Edge:
+            parent: usize
+            child: usize
+        struct Capture:
+            enabled: bool
+            valid: mutable bool
+            complete: mutable bool
+            root: mutable usize
+            bytes: mutable darray[u8]
+            paths: mutable darray[PathRecord]
+            edges: mutable darray[Edge]
+
+        # The caller owns this struct and every growth region throughout traversal.
+        def empty(enabled: bool) -> Capture:
+            can Memory.Allocate:
+                return Capture{enabled: enabled, valid: false, complete: false, root: NONE, bytes: [], paths: [], edges: []}
+
+        def begin(capture: mutable Capture&) -> void:
+            can Abort.Panic:
+                capture.bytes.truncate(0)
+                capture.paths.truncate(0)
+                capture.edges.truncate(0)
+                capture.root <- NONE
+                capture.valid <- capture.enabled
+                capture.complete <- false
+
+        # canonical_path is already cleaned by the expander. No second path walker.
+        def record(canonical_path: darray[u8]&, parent: usize, capture: mutable Capture&) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                return NONE if not capture.enabled or not capture.valid
+                if capture.bytes.count > MAX_BYTES or canonical_path.count == 0 or canonical_path.count > MAX_BYTES - capture.bytes.count or capture.paths.count >= MAX_VISITS:
+                    capture.valid <- false
+                    return NONE
+                if canonical_path[0] != 47 or (parent != NONE and parent >= capture.paths.count):
+                    capture.valid <- false
+                    return NONE
+                for byte in canonical_path |capture|:
+                    if byte == 0:
+                        capture.valid <- false
+                        return NONE
+                if parent == NONE and capture.paths.count != 0:
+                    capture.valid <- false
+                    return NONE
+                start: usize = capture.bytes.count
+                index: usize = capture.paths.count
+                if canonical_path.items is source_ptr:
+                    if Lexer::make_source_view(source_ptr, canonical_path.count, 0, canonical_path.count) is path_view:
+                        capture.bytes.extend(path_view)
+                    else:
+                        capture.valid <- false
+                        return NONE
+                else:
+                    capture.valid <- false
+                    return NONE
+                capture.paths.push(PathRecord{start: start, length: canonical_path.count, expanded: false})
+                if parent == NONE:
+                    capture.root <- index
+                else:
+                    capture.edges.push(Edge{parent: parent, child: index})
+                return index
+
+        def mark_expanded(index: usize, capture: mutable Capture&) -> void:
+            can Abort.Panic:
+                return if not capture.enabled or not capture.valid or index >= capture.paths.count
+                old: PathRecord = capture.paths[index]
+                capture.paths[index] <- PathRecord{start: old.start, length: old.length, expanded: true}
+
+        def usable(capture: Capture&) -> bool:
+            can Abort.Panic:
+                return false if not capture.valid or not capture.complete
+                return false if capture.root != 0 or capture.paths.count == 0 or capture.paths.count > MAX_VISITS or capture.bytes.count > MAX_BYTES
+                return false if capture.edges.count != capture.paths.count - 1 or not capture.paths[0].expanded
+                cursor: mutable usize = 0
+                for path in capture.paths |cursor|:
+                    return false if path.start != cursor or path.length == 0 or cursor > capture.bytes.count or path.length > capture.bytes.count - cursor
+                    return false if capture.bytes[cursor] != 47
+                    for offset in 0..<path.length:
+                        return false if capture.bytes[cursor + offset] == 0
+                    cursor <- cursor + path.length
+                return false if cursor != capture.bytes.count
+                for index in 0..<capture.edges.count:
+                    edge: Edge = capture.edges[index]
+                    return false if edge.child != index + 1 or edge.parent >= edge.child or not capture.paths[edge.parent].expanded
+                return true
+
+        def finish(success: bool, capture: mutable Capture&) -> void:
+            can Abort.Panic:
+                capture.complete <- capture.enabled and capture.valid and success
+                capture.valid <- false if not success
+                if capture.complete and not usable(capture):
+                    capture.valid <- false
+                    capture.complete <- false
+
+        def equal(left: Capture&, right: Capture&) -> bool:
+            can Abort.Panic:
+                return false if not usable(left) or not usable(right)
+                return false if left.root != right.root or left.bytes.count != right.bytes.count or left.paths.count != right.paths.count or left.edges.count != right.edges.count
+                for index in 0..<left.bytes.count:
+                    return false if left.bytes[index] != right.bytes[index]
+                for index in 0..<left.paths.count:
+                    a: PathRecord = left.paths[index]
+                    b: PathRecord = right.paths[index]
+                    return false if a.start != b.start or a.length != b.length or a.expanded != b.expanded
+                for index in 0..<left.edges.count:
+                    a: Edge = left.edges[index]
+                    b: Edge = right.edges[index]
+                    return false if a.parent != b.parent or a.child != b.child
+                return true
+
+        # Invocation-only attribution. None of these fields enters equal() or persistence.
+        struct AttributionEntry:
+            flat_line: u32
+            original_line: u32
+            path_start: usize
+            path_length: usize
+        struct Attribution:
+            enabled: bool
+            valid: mutable bool
+            bytes: mutable darray[u8]
+            entries: mutable darray[AttributionEntry]
+        struct InvocationContext:
+            identity: mutable Capture
+            attribution: mutable Attribution
+        struct PathResult:
+            valid: bool
+            path_start: usize
+            path_length: usize
+            original_line: u32
+
+        def empty_attribution(enabled: bool) -> Attribution:
+            return Attribution{enabled: enabled, valid: false, bytes: [], entries: []} can Memory.Allocate
+
+        def empty_context(enabled: bool) -> InvocationContext:
+            identity: Capture = empty(enabled) can Memory.Allocate
+            attribution: Attribution = empty_attribution(enabled) can Memory.Allocate
+            return InvocationContext{identity: identity, attribution: attribution}
+
+        def begin_attribution(attribution: mutable Attribution&) -> void:
+            can Abort.Panic:
+                attribution.valid <- false
+                attribution.bytes.truncate(0)
+                attribution.entries.truncate(0)
+
+        # Explicitly call after any source rewrite until that rewrite provides a matching map.
+        def invalidate_attribution(context: mutable InvocationContext&) -> void:
+            context.attribution.valid <- false
+
+        def path_hash(bytes: darray[u8]&, start: usize, length: usize) -> u64:
+            can Abort.Panic:
+                value: mutable u64 = 1469598103934665603
+                for offset in 0..<length |value|:
+                    value <- (value ^ bytes[start + offset].u64()) * 1099511628211
+                return value
+
+        def path_equal(left: darray[u8]&, left_start: usize, right: darray[u8]&, right_start: usize, length: usize) -> bool:
+            can Abort.Panic:
+                for offset in 0..<length:
+                    return false if left[left_start + offset] != right[right_start + offset]
+                return true
+
+        # Retain and parse once, inside the request caller's lifetime. The existing expander
+        # is the only source of these bytes. Missing/malformed attribution only disables reuse.
+        def retain_line_map(line_map: darray[u8]&, identity: Capture&, attribution: mutable Attribution&) -> void:
+            begin_attribution(attribution) can Abort.Panic
+            return if not attribution.enabled
+            graph_valid: bool = usable(identity) can Abort.Panic
+            return if not graph_valid
+            return if line_map.count == 0 or line_map.count > MAX_BYTES
+            can Memory.Allocate, Abort.Panic:
+                if line_map.items is source_ptr:
+                    if Lexer::make_source_view(source_ptr, line_map.count, 0, line_map.count) is map_view:
+                        attribution.bytes.extend(map_view)
+                    else:
+                        return
+                else:
+                    return
+                # Local scratch, never returned or persisted. Hashes accelerate exact checks.
+                slot_count: mutable usize = 2
+                while slot_count < identity.paths.count * 2 |slot_count|:
+                    slot_count <- slot_count * 2
+                slots: mutable darray[usize] = []
+                slots.reserve(slot_count)
+                slots.count <- slot_count
+                for index in 0..<slot_count |slots|:
+                    slots[index] <- NONE
+                work: mutable usize = 0
+                for index in 0..<identity.paths.count |slots, work|:
+                    path: PathRecord = identity.paths[index]
+                    slot: mutable usize = (path_hash(identity.bytes, path.start, path.length) % slot_count.u64()).usize()
+                    while slots[slot] != NONE |slot, slots, work|:
+                        work <- work + 1 + path.length
+                        return if work > MAX_BYTES * 4
+                        prior: PathRecord = identity.paths[slots[slot]]
+                        break if prior.length == path.length and path_equal(identity.bytes, prior.start, identity.bytes, path.start, path.length)
+                        slot <- (slot + 1) % slot_count
+                    slots[slot] <- index
+                cursor: mutable usize = 0
+                previous_flat: mutable u32 = 0
+                while cursor < attribution.bytes.count |cursor, previous_flat, attribution, slots, work|:
+                    return if attribution.entries.count >= MAX_VISITS
+                    flat: mutable u32 = 0
+                    original: mutable u32 = 0
+                    digits: mutable usize = 0
+                    while cursor < attribution.bytes.count |cursor, flat, digits|:
+                        byte: u8 = attribution.bytes[cursor]
+                        break if byte == 58
+                        return if byte < 48 or byte > 57 or digits >= 10
+                        digit: u32 = (byte - 48).u32()
+                        return if flat > (4294967295 - digit) / 10
+                        flat <- flat * 10 + digit
+                        digits <- digits + 1
+                        cursor <- cursor + 1
+                    return if digits == 0 or flat == 0 or flat < previous_flat or cursor >= attribution.bytes.count
+                    cursor <- cursor + 1
+                    digits <- 0
+                    while cursor < attribution.bytes.count |cursor, original, digits|:
+                        byte: u8 = attribution.bytes[cursor]
+                        break if byte == 58
+                        return if byte < 48 or byte > 57 or digits >= 10
+                        digit: u32 = (byte - 48).u32()
+                        return if original > (4294967295 - digit) / 10
+                        original <- original * 10 + digit
+                        digits <- digits + 1
+                        cursor <- cursor + 1
+                    return if digits == 0 or original == 0 or cursor >= attribution.bytes.count
+                    cursor <- cursor + 1
+                    start: usize = cursor
+                    while cursor < attribution.bytes.count |cursor|:
+                        byte: u8 = attribution.bytes[cursor]
+                        break if byte == 10
+                        return if byte == 0
+                        cursor <- cursor + 1
+                    return if cursor == start or cursor >= attribution.bytes.count or attribution.bytes[start] != 47
+                    length: usize = cursor - start
+                    slot: mutable usize = (path_hash(attribution.bytes, start, length) % slot_count.u64()).usize()
+                    found: mutable bool = false
+                    while slots[slot] != NONE |slot, found, work|:
+                        work <- work + 1 + length
+                        return if work > MAX_BYTES * 4
+                        path: PathRecord = identity.paths[slots[slot]]
+                        if path.length == length and path_equal(identity.bytes, path.start, attribution.bytes, start, length):
+                            found <- true
+                            break
+                        slot <- (slot + 1) % slot_count
+                    return if not found
+                    attribution.entries.push(AttributionEntry{flat_line: flat, original_line: original, path_start: start, path_length: length})
+                    previous_flat <- flat
+                    cursor <- cursor + 1
+                attribution.valid <- attribution.entries.count > 0
+
+        # Upper-bound search: when several resumes share a flat line the LAST entry wins,
+        # matching existing diagnostic attribution. A line before the first entry is a miss.
+        def path_for_line(flat_line: u32, attribution: Attribution&) -> PathResult:
+            miss: PathResult = PathResult{valid: false, path_start: 0, path_length: 0, original_line: 0}
+            return miss if not attribution.valid or flat_line == 0
+            can Abort.Panic:
+                low: mutable usize = 0
+                high: mutable usize = attribution.entries.count
+                while low < high |low, high|:
+                    middle: usize = low + (high - low) / 2
+                    if attribution.entries[middle].flat_line <= flat_line:
+                        low <- middle + 1
+                    else:
+                        high <- middle
+                return miss if low == 0
+                entry: AttributionEntry = attribution.entries[low - 1]
+                delta: u32 = flat_line - entry.flat_line
+                return miss if entry.original_line > 4294967295 - delta
+                return PathResult{valid: true, path_start: entry.path_start, path_length: entry.path_length, original_line: entry.original_line + delta}

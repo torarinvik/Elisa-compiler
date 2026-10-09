@@ -1,0 +1,281 @@
+# Bounded portable semantic snapshot codec. No disk I/O or checker replay.
+# Corruption is a cache miss. The checksum is only an accidental-corruption check;
+# independent structural validation remains mandatory and cache files are not trusted input.
+extend Semantic:
+    public:
+        const INCREMENTAL_SNAPSHOT_CODEC_VERSION: u64 = 1
+        const INCREMENTAL_SNAPSHOT_CODEC_LIMIT: usize = 67108864
+        struct IncrementalSnapshotEncodeResult:
+            valid: bool
+            bytes: darray[u8]
+        struct IncrementalSnapshotDecodeResult:
+            valid: bool
+            snapshot: IncrementalSemanticSnapshot
+
+    private:
+        struct IncrementalSnapshotReader:
+            cursor: mutable usize
+            valid: mutable bool
+
+        def isc_base(schema: u32, semantic: u64, options: u64) -> IncrementalSemanticSnapshot:
+            can Memory.Allocate:
+                return IncrementalSemanticSnapshot{schema_version: schema, semantic_fingerprint: semantic, options_fingerprint: options, bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: 0, functions: [], current_anchors: [], direct_facts: [], active_grants: [], bodies_visited: 0, bodies_reused: 0, bodies_rejected: 0, surface_compatible: false}
+
+        def isc_empty() -> IncrementalSemanticSnapshot:
+            can Memory.Allocate:
+                return isc_base(0, 0, 0)
+
+        def isc_span(start: usize, length: usize, count: usize) -> bool:
+            return start <= count and length <= count - start
+
+        def isc_put(bytes: mutable darray[u8]&, value: u64) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for shift in 0..<8 |bytes|:
+                    bytes.push(((value >> (shift * 8)) & 255).u8())
+
+        def isc_get(bytes: darray[u8]&, reader: mutable IncrementalSnapshotReader&) -> u64:
+            can Abort.Panic:
+                if not reader.valid or not isc_span(reader.cursor, 8, bytes.count):
+                    reader.valid <- false
+                    return 0
+                value: mutable u64 = 0
+                for shift in 0..<8 |value|:
+                    value <- value | (bytes[reader.cursor + shift].u64() << (shift * 8))
+                reader.cursor <- reader.cursor + 8
+                return value
+
+        def isc_u32(bytes: darray[u8]&, start: usize) -> u32:
+            can Abort.Panic:
+                value: mutable u32 = 0
+                for shift in 0..<4 |value|:
+                    value <- value | (bytes[start + shift].u32() << (shift * 8))
+                return value
+
+        # Return count+1, or zero for an invalid token stream. Empty streams are valid.
+        def isc_token_count(bytes: darray[u8]&, start: usize, length: usize) -> usize:
+            can Abort.Panic:
+                return 0 if not isc_span(start, length, bytes.count)
+                cursor: mutable usize = start
+                end: usize = start + length
+                count: mutable usize = 0
+                while cursor < end |cursor, count|:
+                    return 0 if not isc_span(cursor, 8, end)
+                    return 0 if isc_u32(bytes, cursor) > TokenKind.Label.u32()
+                    text_length: usize = isc_u32(bytes, cursor + 4).usize()
+                    cursor <- cursor + 8
+                    return 0 if not isc_span(cursor, text_length, end)
+                    cursor <- cursor + text_length
+                    count <- count + 1
+                return count + 1
+
+        def isc_key(bytes: darray[u8]&, start: usize, length: usize) -> bool:
+            can Abort.Panic:
+                return false if not isc_span(start, length, bytes.count) or length < 8
+                path_length: usize = isc_u32(bytes, start).usize()
+                return false if path_length == 0 or path_length > length - 8
+                name_length: usize = isc_u32(bytes, start + 4 + path_length).usize()
+                return name_length > 0 and name_length == length - 8 - path_length
+
+        # The initial portable subset admits ordinary ASCII effect paths only.
+        # Other source spellings remain a conservative cold-cache miss.
+        def isc_effect_name(bytes: darray[u8]&, start: usize, length: usize) -> bool:
+            can Abort.Panic:
+                return false if length == 0 or not isc_span(start, length, bytes.count)
+                segment_start: mutable bool = true
+                for offset in 0..<length |segment_start|:
+                    byte: u8 = bytes[start + offset]
+                    if byte == 46:
+                        return false if segment_start
+                        segment_start <- true
+                    else:
+                        letter: bool = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95
+                        digit: bool = byte >= 48 and byte <= 57
+                        return false if not letter and (segment_start or not digit)
+                        segment_start <- false
+                return not segment_start
+
+        def isc_validate(snapshot: IncrementalSemanticSnapshot&) -> bool:
+            can Abort.Panic:
+                return false if snapshot.schema_version != INCREMENTAL_FUNCTION_FACTS_SCHEMA
+                return false if snapshot.bytes.count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT
+                return false if snapshot.functions.count > 1000000 or snapshot.direct_facts.count > 1000000 or snapshot.active_grants.count > 1000000
+                return false if not isc_span(snapshot.source_path_start, snapshot.source_path_length, snapshot.bytes.count) or snapshot.source_path_length == 0
+                return false if isc_token_count(snapshot.bytes, snapshot.declaration_surface_start, snapshot.declaration_surface_length) == 0
+                return false if snapshot.declaration_surface_hash != ifc_hash(snapshot.bytes, snapshot.declaration_surface_start, snapshot.declaration_surface_length)
+                body_budget: mutable usize = snapshot.bytes.count
+                key_budget: mutable usize = snapshot.bytes.count
+                for index in 0..<snapshot.functions.count |body_budget, key_budget|:
+                    record: IncrementalFunctionFactRecord = snapshot.functions[index]
+                    return false if record.body_length > body_budget or record.key_length > key_budget
+                    body_budget <- body_budget - record.body_length
+                    key_budget <- key_budget - record.key_length
+                    return false if not isc_key(snapshot.bytes, record.key_start, record.key_length)
+                    key_path_length: usize = isc_u32(snapshot.bytes, record.key_start).usize()
+                    return false if not ifc_equal(snapshot.bytes, record.key_start + 4, key_path_length, snapshot.bytes, snapshot.source_path_start, snapshot.source_path_length)
+                    return false if not isc_span(record.body_start, record.body_length, snapshot.bytes.count)
+                    return false if record.body_hash != ifc_hash(snapshot.bytes, record.body_start, record.body_length)
+                    return false if record.reject_reason.u8() > IncrementalRejectReason.UnsupportedSignature.u8()
+                    return false if record.cacheable and record.reject_reason != IncrementalRejectReason.None
+                    return false if not record.cacheable and record.direct_fact_count != 0
+                    return false if not isc_span(record.direct_fact_start, record.direct_fact_count, snapshot.direct_facts.count)
+                    token_count: usize = isc_token_count(snapshot.bytes, record.body_start, record.body_length)
+                    return false if token_count == 0
+                    return false if record.cacheable and token_count <= 1
+                    for relative in 0..<record.direct_fact_count:
+                        fact: IncrementalDirectFact = snapshot.direct_facts[record.direct_fact_start + relative]
+                        return false if fact.owner != index or fact.anchor_token.usize() >= token_count - 1
+                for index in 0..<snapshot.direct_facts.count |key_budget|:
+                    fact: IncrementalDirectFact = snapshot.direct_facts[index]
+                    return false if fact.owner >= snapshot.functions.count or fact.kind.u8() > IncrementalFactKind.PanicSite.u8()
+                    owner: IncrementalFunctionFactRecord = snapshot.functions[fact.owner]
+                    return false if index < owner.direct_fact_start or index - owner.direct_fact_start >= owner.direct_fact_count
+                    return false if not isc_span(fact.subject_start, fact.subject_length, snapshot.bytes.count) or fact.subject_length == 0
+                    if fact.kind == IncrementalFactKind.DirectCall or fact.kind == IncrementalFactKind.GlobalRead or fact.kind == IncrementalFactKind.GlobalWrite:
+                        return false if fact.subject_length > key_budget
+                        key_budget <- key_budget - fact.subject_length
+                        return false if not isc_key(snapshot.bytes, fact.subject_start, fact.subject_length)
+                        subject_path_length: usize = isc_u32(snapshot.bytes, fact.subject_start).usize()
+                        return false if not ifc_equal(snapshot.bytes, fact.subject_start + 4, subject_path_length, snapshot.bytes, snapshot.source_path_start, snapshot.source_path_length)
+                    else:
+                        return false if fact.subject_length > key_budget
+                        key_budget <- key_budget - fact.subject_length
+                        return false if not isc_effect_name(snapshot.bytes, fact.subject_start, fact.subject_length)
+                    return false if not isc_span(fact.active_grant_start, fact.active_grant_count, snapshot.active_grants.count)
+                grant_budget: mutable usize = snapshot.bytes.count
+                for grant in snapshot.active_grants |grant_budget|:
+                    return false if grant.kind.u8() > IncrementalGrantKind.Trusted.u8()
+                    return false if grant.name_length > grant_budget
+                    grant_budget <- grant_budget - grant.name_length
+                    return false if not isc_effect_name(snapshot.bytes, grant.name_start, grant.name_length)
+                return true
+
+    public:
+        def incremental_encode_snapshot(snapshot: IncrementalSemanticSnapshot&) -> IncrementalSnapshotEncodeResult:
+            can Memory.Allocate, Abort.Panic:
+                return IncrementalSnapshotEncodeResult{valid: false, bytes: []} if not isc_validate(snapshot)
+                encoded_size: u64 = 120 + snapshot.bytes.count.u64() + snapshot.functions.count.u64() * 72 + snapshot.direct_facts.count.u64() * 56 + snapshot.active_grants.count.u64() * 24
+                return IncrementalSnapshotEncodeResult{valid: false, bytes: []} if encoded_size > INCREMENTAL_SNAPSHOT_CODEC_LIMIT.u64()
+                bytes: mutable darray[u8] = []
+                isc_put(bytes, 5786933367658005321)
+                isc_put(bytes, INCREMENTAL_SNAPSHOT_CODEC_VERSION)
+                isc_put(bytes, snapshot.schema_version.u64())
+                isc_put(bytes, snapshot.semantic_fingerprint)
+                isc_put(bytes, snapshot.options_fingerprint)
+                isc_put(bytes, snapshot.bytes.count.u64())
+                isc_put(bytes, snapshot.functions.count.u64())
+                isc_put(bytes, snapshot.direct_facts.count.u64())
+                isc_put(bytes, snapshot.active_grants.count.u64())
+                isc_put(bytes, snapshot.source_path_start.u64())
+                isc_put(bytes, snapshot.source_path_length.u64())
+                isc_put(bytes, snapshot.declaration_surface_start.u64())
+                isc_put(bytes, snapshot.declaration_surface_length.u64())
+                isc_put(bytes, snapshot.declaration_surface_hash)
+                for byte in snapshot.bytes |bytes|:
+                    bytes.push(byte)
+                for record in snapshot.functions |bytes|:
+                    isc_put(bytes, record.key_start.u64())
+                    isc_put(bytes, record.key_length.u64())
+                    isc_put(bytes, record.body_start.u64())
+                    isc_put(bytes, record.body_length.u64())
+                    isc_put(bytes, record.body_hash.u64())
+                    isc_put(bytes, record.direct_fact_start.u64())
+                    isc_put(bytes, record.direct_fact_count.u64())
+                    isc_put(bytes, 1 if record.cacheable else 0)
+                    isc_put(bytes, record.reject_reason.u64())
+                for record in snapshot.direct_facts |bytes|:
+                    isc_put(bytes, record.owner.u64())
+                    isc_put(bytes, record.kind.u64())
+                    isc_put(bytes, record.subject_start.u64())
+                    isc_put(bytes, record.subject_length.u64())
+                    isc_put(bytes, record.anchor_token.u64())
+                    isc_put(bytes, record.active_grant_start.u64())
+                    isc_put(bytes, record.active_grant_count.u64())
+                for record in snapshot.active_grants |bytes|:
+                    isc_put(bytes, record.kind.u64())
+                    isc_put(bytes, record.name_start.u64())
+                    isc_put(bytes, record.name_length.u64())
+                return IncrementalSnapshotEncodeResult{valid: false, bytes: []} if bytes.count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT - 8
+                checksum: u64 = ifc_hash(bytes, 0, bytes.count)
+                isc_put(bytes, checksum)
+                return IncrementalSnapshotEncodeResult{valid: true, bytes: bytes}
+
+        def incremental_decode_snapshot(bytes: darray[u8]&, semantic_fingerprint: u64, options_fingerprint: u64) -> IncrementalSnapshotDecodeResult:
+            can Memory.Allocate, Abort.Panic:
+                miss: IncrementalSnapshotDecodeResult = IncrementalSnapshotDecodeResult{valid: false, snapshot: isc_empty()}
+                return miss if bytes.count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT or bytes.count < 120
+                reader: mutable IncrementalSnapshotReader = IncrementalSnapshotReader{cursor: 0, valid: true}
+                magic: u64 = isc_get(bytes, reader)
+                version: u64 = isc_get(bytes, reader)
+                schema: u64 = isc_get(bytes, reader)
+                semantic: u64 = isc_get(bytes, reader)
+                options: u64 = isc_get(bytes, reader)
+                byte_count: u64 = isc_get(bytes, reader)
+                function_count: u64 = isc_get(bytes, reader)
+                fact_count: u64 = isc_get(bytes, reader)
+                grant_count: u64 = isc_get(bytes, reader)
+                path_start: u64 = isc_get(bytes, reader)
+                path_length: u64 = isc_get(bytes, reader)
+                surface_start: u64 = isc_get(bytes, reader)
+                surface_length: u64 = isc_get(bytes, reader)
+                surface_hash: u64 = isc_get(bytes, reader)
+                return miss if not reader.valid or magic != 5786933367658005321 or version != INCREMENTAL_SNAPSHOT_CODEC_VERSION
+                return miss if schema != INCREMENTAL_FUNCTION_FACTS_SCHEMA.u64() or semantic != semantic_fingerprint or options != options_fingerprint
+                return miss if byte_count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT.u64() or function_count > 1000000 or fact_count > 1000000 or grant_count > 1000000
+                expected: u64 = 120 + byte_count + function_count * 72 + fact_count * 56 + grant_count * 24
+                return miss if expected != bytes.count.u64()
+                checksum_reader: mutable IncrementalSnapshotReader = IncrementalSnapshotReader{cursor: bytes.count - 8, valid: true}
+                checksum: u64 = isc_get(bytes, checksum_reader)
+                return miss if checksum != ifc_hash(bytes, 0, bytes.count - 8)
+                snapshot: mutable IncrementalSemanticSnapshot = isc_base(schema.u32(), semantic, options)
+                snapshot.source_path_start <- path_start.usize()
+                snapshot.source_path_length <- path_length.usize()
+                snapshot.declaration_surface_start <- surface_start.usize()
+                snapshot.declaration_surface_length <- surface_length.usize()
+                snapshot.declaration_surface_hash <- surface_hash
+                for index in 0..<byte_count.usize() |snapshot|:
+                    snapshot.bytes.push(bytes[reader.cursor + index])
+                reader.cursor <- reader.cursor + byte_count.usize()
+                for index in 0..<function_count.usize() |snapshot, reader|:
+                    key_start: u64 = isc_get(bytes, reader)
+                    key_length: u64 = isc_get(bytes, reader)
+                    body_start: u64 = isc_get(bytes, reader)
+                    body_length: u64 = isc_get(bytes, reader)
+                    body_hash: u64 = isc_get(bytes, reader)
+                    direct_fact_start: u64 = isc_get(bytes, reader)
+                    direct_fact_count: u64 = isc_get(bytes, reader)
+                    cacheable: u64 = isc_get(bytes, reader)
+                    reject_reason: u64 = isc_get(bytes, reader)
+                    return miss if cacheable > 1 or reject_reason > 7
+                    reason: mutable IncrementalRejectReason = IncrementalRejectReason.None
+                    reason <- IncrementalRejectReason.MissingStablePath if reject_reason == 1
+                    reason <- IncrementalRejectReason.NonUniqueOrGenericFunction if reject_reason == 2
+                    reason <- IncrementalRejectReason.MissingBlockBody if reject_reason == 3
+                    reason <- IncrementalRejectReason.UnsupportedBodySyntax if reject_reason == 4
+                    reason <- IncrementalRejectReason.MissingSourceAnchor if reject_reason == 5
+                    reason <- IncrementalRejectReason.InvalidTokenSpan if reject_reason == 6
+                    reason <- IncrementalRejectReason.UnsupportedSignature if reject_reason == 7
+                    snapshot.functions.push(IncrementalFunctionFactRecord{key_start: key_start.usize(), key_length: key_length.usize(), body_start: body_start.usize(), body_length: body_length.usize(), body_hash: body_hash, direct_fact_start: direct_fact_start.usize(), direct_fact_count: direct_fact_count.usize(), cacheable: cacheable == 1, reject_reason: reason, reused: false})
+                for index in 0..<fact_count.usize() |snapshot, reader|:
+                    owner: u64 = isc_get(bytes, reader)
+                    kind: u64 = isc_get(bytes, reader)
+                    subject_start: u64 = isc_get(bytes, reader)
+                    subject_length: u64 = isc_get(bytes, reader)
+                    anchor_token: u64 = isc_get(bytes, reader)
+                    active_grant_start: u64 = isc_get(bytes, reader)
+                    active_grant_count: u64 = isc_get(bytes, reader)
+                    return miss if kind > 5 or anchor_token > 4294967295
+                    fact_kind: mutable IncrementalFactKind = IncrementalFactKind.DirectCall
+                    fact_kind <- IncrementalFactKind.GlobalRead if kind == 1
+                    fact_kind <- IncrementalFactKind.GlobalWrite if kind == 2
+                    fact_kind <- IncrementalFactKind.CanGrant if kind == 3
+                    fact_kind <- IncrementalFactKind.TrustedGrant if kind == 4
+                    fact_kind <- IncrementalFactKind.PanicSite if kind == 5
+                    snapshot.direct_facts.push(IncrementalDirectFact{owner: owner.usize(), kind: fact_kind, subject_start: subject_start.usize(), subject_length: subject_length.usize(), anchor_token: anchor_token.u32(), active_grant_start: active_grant_start.usize(), active_grant_count: active_grant_count.usize()})
+                for index in 0..<grant_count.usize() |snapshot, reader|:
+                    kind: u64 = isc_get(bytes, reader)
+                    name_start: u64 = isc_get(bytes, reader)
+                    name_length: u64 = isc_get(bytes, reader)
+                    return miss if kind > 1
+                    snapshot.active_grants.push(IncrementalActiveGrant{kind: IncrementalGrantKind.Can if kind == 0 else IncrementalGrantKind.Trusted, name_start: name_start.usize(), name_length: name_length.usize()})
+                return miss if not reader.valid or reader.cursor != bytes.count - 8 or not isc_validate(snapshot)
+                return IncrementalSnapshotDecodeResult{valid: true, snapshot: snapshot}
