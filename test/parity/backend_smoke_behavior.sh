@@ -25,9 +25,9 @@ run_case() {
     # when this check went red only inside a loaded gate (2026-09-06, twice).
     # One retry: this check went red only inside loaded gates (passed=400/511 twice, 511/511
     # alone), and a host linker that fails under memory pressure is not a compiler verdict.
-    if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>"$exe.linkerr"; then
+    if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" $ELISA_LINK_EXE_FLAGS 2>"$exe.linkerr"; then
         sleep 1
-        if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>"$exe.linkerr"; then
+        if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" $ELISA_LINK_EXE_FLAGS 2>"$exe.linkerr"; then
             echo "  FAIL $name: link failed: $(head -3 "$exe.linkerr" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"; return
         fi
     fi

@@ -7,6 +7,7 @@
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     exec bash "$(cd -- "$(dirname -- "$0")" && pwd)/backend_native_smoke.sh" "$@"
 fi
+ELISA_NATIVE_ARCH="${ELISA_NATIVE_ARCH:-$("$LLVM_CONFIG" --host-target | cut -d- -f1)}"
 
 # --- IR-shape check against stage0 ---------------------------------------------------
 # For values whose EXIT CODE cannot observe the difference (a string literal's contents,
@@ -168,7 +169,7 @@ stage1_ir_absent_case extern_optional_ptr_not_tagged 'extern malloc(n: usize) ->
 # test, with no `store i1 true` anywhere. The old assertion demanded that constant tag.
 stage1_ir_case optional_plain_ref_niche_alloca 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' '%r = alloca ptr'
 stage1_ir_absent_case optional_plain_ref_not_tagged 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' 'store i1 true'
-stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' '^target triple = "arm64'
+stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' "^target triple = \"$ELISA_NATIVE_ARCH"
 
 # Address-taking a view element must lower through the view's `{data, len}` header
 # rather than decline the enclosing function or GEP through the header itself. This
