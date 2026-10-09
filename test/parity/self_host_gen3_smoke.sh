@@ -112,8 +112,15 @@ terminate_guarded_pid() {
 # scripts/elisac_stage1.sh. This is an operational safety boundary, not a semantic fallback:
 # crossing it fails the smoke and leaves the compiler bug visible instead of freezing the host.
 run_guarded_request() {
-    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}" deadline
-    "$binary" <"$request" >"$output" 2>&1 &
+    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}" deadline mode=strict
+    if (( $# > 3 )); then mode="$4"; fi
+    if [[ "$mode" == compiler-source ]]; then
+        # The compiler source is still migrating to explicit local Global grants. Match
+        # self_host_gen2.sh for this full-source bootstrap compile; Stage A stays strict.
+        ELISA_STAGE1_PERMISSIVE=1 "$binary" <"$request" >"$output" 2>&1 &
+    else
+        "$binary" <"$request" >"$output" 2>&1 &
+    fi
     pid=$!
     # A WALL-CLOCK deadline. This used to count polls (a fixed 12000 x the poll sleep), which
     # ignored SELF_HOST_PROBE_TIMEOUT_SECONDS entirely and overshot it by the `ps` fork each
@@ -193,6 +200,8 @@ guard when_string_columns \
 echo "self_host_gen3_smoke stage A OK: $a_pass/$a_total (fixed blockers still fixed)"
 
 # ---- Stage B: gen2 compiles the compiler itself ----
+# The compiler source has not completed its local Global-grant migration yet. Compile this
+# input permissively, matching self_host_gen2.sh; ordinary user-code probes in Stage A remain strict.
 # Flattened the same way scripts/elisac_stage1.sh does, so this is exactly the gen3 input.
 python3 - "$ROOT/src/driver/elisac.elisa" >"$WORK/flat.elisa" <<'PY' || fail "could not flatten the driver"
 import re, pathlib, sys
@@ -212,7 +221,7 @@ PY
 
 { printf '%s\n' "$WORK/gen3.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen3.request"
 rc=0
-run_guarded_request "$GEN2" "$WORK/gen3.request" "$WORK/gen3.log" || rc=$?
+run_guarded_request "$GEN2" "$WORK/gen3.request" "$WORK/gen3.log" compiler-source || rc=$?
 
 [ "$rc" -eq "$BASELINE_GEN3_RC" ] \
   || fail "stage B exit $rc, baseline $BASELINE_GEN3_RC — bootstrap closure BROKE. Re-diagnose (lldb bt on the gen3 input); do not just re-baseline."
@@ -238,7 +247,7 @@ clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/elisac-stage1-gen3" "
 
 { printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen4.request"
 rc4=0
-run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.log" || rc4=$?
+run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.log" compiler-source || rc4=$?
 [ "$rc4" -eq 0 ] || fail "gen3 could not compile the compiler (exit $rc4) — gen2 and gen3 disagree"
 # A mismatch here has TWO very different causes and the old message named only one.
 # Either gen2 and gen3 genuinely disagree (a miscompile -- what this gate exists to
@@ -250,9 +259,9 @@ run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.
 if ! cmp -s "$WORK/gen3.o" "$WORK/gen4.o"; then
     echo "self_host_gen3_smoke: gen3.o != gen4.o; re-running both generations to see which one is unstable" >&2
     { printf '%s\n' "$WORK/gen3.again.o"; cat "$WORK/flat.elisa"; } >"$WORK/again.request"
-    run_guarded_request "$GEN2" "$WORK/again.request" "$WORK/gen3.again.log" || true
+    run_guarded_request "$GEN2" "$WORK/again.request" "$WORK/gen3.again.log" compiler-source || true
     { printf '%s\n' "$WORK/gen4.again.o"; cat "$WORK/flat.elisa"; } >"$WORK/again4.request"
-    run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/again4.request" "$WORK/gen4.again.log" || true
+    run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/again4.request" "$WORK/gen4.again.log" compiler-source || true
     describe() { if [ -s "$1" ]; then printf '%s bytes' "$(wc -c <"$1" | tr -d ' ')"; else printf 'MISSING'; fi; }
     echo "  gen2 -> gen3.o        $(describe "$WORK/gen3.o")" >&2
     echo "  gen2 -> gen3.again.o  $(describe "$WORK/gen3.again.o")   (differs from gen3.o => gen2 is not reproducible)" >&2

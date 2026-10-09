@@ -179,8 +179,14 @@ def main() -> None:
 
     identity = analyze_case(reporter, "same_type_mutable_identity", SAFE_IDENTITY_CAST, strict=True)
     identity_output = identity.stdout + identity.stderr
-    assert identity.returncode == 0 and "D 0" in identity_output, (identity.returncode, identity_output[-5000:])
-    print("same-type mutable reference: accepted PASS", flush=True)
+    redundant = "redundant " + chr(96) + ".cast[mutable T&]" + chr(96)
+    assert (
+        identity.returncode == 0
+        and "D 1" in identity_output
+        and redundant in identity_output
+        and "pointer cast requires can[Unsafe]" not in identity_output
+    ), (identity.returncode, identity_output[-5000:])
+    print("same-type mutable reference: accepted with redundant-cast advisory PASS", flush=True)
 
     for name, source in GRANTED_CASTS.items():
         granted = analyze_case(reporter, f"granted_{name.replace(' ', '_')}", source, strict=True)
