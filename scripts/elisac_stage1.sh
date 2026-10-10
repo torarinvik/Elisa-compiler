@@ -313,14 +313,14 @@ stage1_cache_prepare() {
   stage1_cache_key="$(
     {
       printf 'elisac-stage1-object-cache v2\n'
-      shasum -a 256 "$BIN" | cut -d' ' -f1
+      shasum -a 256 "$BIN" | cut -d' ' -f1 || exit 1
       printf '%s\0' "${normalized[@]}"
       printf '\n'
-      stage1_cache_environment
-      tr '\n' '\0' <"$deps_file" | xargs -0 shasum -a 256
-      (cd "$ROOT" && find elisacore_std -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256)
+      stage1_cache_environment || true
+      tr '\n' '\0' <"$deps_file" | xargs -0 shasum -a 256 || exit 1
+      (cd "$ROOT" && find elisacore_std -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256) || exit 1
     } | shasum -a 256 | cut -d' ' -f1
-  )"
+  )" || { rm -f "$deps_file"; return 1; }
   rm -f "$deps_file"
   [[ -n "$stage1_cache_key" ]]
 }

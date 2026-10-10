@@ -53,6 +53,20 @@ class CacheIntegrityTest(unittest.TestCase):
                 self.assertEqual(Path(str(entry) + ".json").exists(), admitted)
                 self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
 
+    def test_unreadable_dependency_refuses_cache_identity(self):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        compiler = self.source.parent / "fake-compiler"
+        compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$MISSING_DEPENDENCY" > "$4"\n')
+        compiler.chmod(0o755)
+        script = 'set -uo pipefail\ndriver_args=(source.elisa -o output.o)\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nif stage1_cache_prepare; then exit 9; fi\n'
+        env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", MISSING_DEPENDENCY=str(self.source.parent / "missing.elisa"))
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(b"missing.elisa", result.stderr)
+
     def test_contract_override_participates_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent
         wrapper = (root / "scripts/elisac_stage1.sh").read_text()
