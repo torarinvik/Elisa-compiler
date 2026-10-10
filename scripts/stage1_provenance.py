@@ -12,6 +12,7 @@ SCHEMA = "elisa-stage1-provenance-v1"
 SOURCE_DIRS = ("src", "elisacore_std")
 BUILD_RECIPES = (
     "scripts/elisac_stage1.sh",
+    "scripts/stage1_object_cache.py",
     "scripts/elisac_stage1_seed.sh",
     "scripts/assert_stage0_fresh.sh",
     "scripts/process_rss.sh",

@@ -271,8 +271,9 @@ driver_args=("$@")
 # object is a function of: the product binary, the argument vector with OUT
 # normalised, every ELISA_* variable, every file of the source's include graph
 # (`-emit deps`), and the standard library tree the driver may pull in implicitly.
-# A hit copies the cached object to OUT (warnings of the original compile are not
-# replayed); a miss compiles and then stores it.
+# A hit restores the object and replays both diagnostic streams; a miss compiles
+# and stores the object plus diagnostics. Integrity metadata is mandatory;
+# legacy, partial, or corrupted entries take the ordinary compile path.
 stage1_cache_key=""
 stage1_cache_out=""
 stage1_cache_prepare() {
@@ -308,7 +309,7 @@ stage1_cache_prepare() {
   fi
   stage1_cache_key="$(
     {
-      printf 'elisac-stage1-object-cache v1\n'
+      printf 'elisac-stage1-object-cache v2\n'
       shasum -a 256 "$BIN" | cut -d' ' -f1
       printf '%s\0' "${normalized[@]}"
       printf '\n'
@@ -323,16 +324,18 @@ stage1_cache_prepare() {
 if stage1_cache_prepare; then
   stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
   stage1_cache_entry="$stage1_cache_dir/$stage1_cache_key.o"
-  if [[ -f "$stage1_cache_entry" ]]; then
-    mkdir -p "$(dirname -- "$stage1_cache_out")"
-    cp "$stage1_cache_entry" "$stage1_cache_out.tmp.$$" && mv -f "$stage1_cache_out.tmp.$$" "$stage1_cache_out"
-    exit 0
-  fi
+  stage1_cache_restore_rc=0
+  python3 "$ROOT/scripts/stage1_object_cache.py" restore "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" || stage1_cache_restore_rc=$?
+  [[ "$stage1_cache_restore_rc" == 0 ]] && exit 0
+  [[ "$stage1_cache_restore_rc" == 1 ]] || exit "$stage1_cache_restore_rc"
+  stage1_cache_logs="$(mktemp -d "${TMPDIR:-/tmp}/elisac-stage1-cache-logs.XXXXXX")"
+  trap 'rm -rf "$stage1_cache_logs"' EXIT
   stage1_cache_rc=0
-  run_stage1_driver_guarded || stage1_cache_rc=$?
+  run_stage1_driver_guarded >"$stage1_cache_logs/stdout" 2>"$stage1_cache_logs/stderr" || stage1_cache_rc=$?
+  cat "$stage1_cache_logs/stderr" >&2
+  cat "$stage1_cache_logs/stdout"
   if [[ "$stage1_cache_rc" -eq 0 && -f "$stage1_cache_out" ]]; then
-    mkdir -p "$stage1_cache_dir"
-    cp "$stage1_cache_out" "$stage1_cache_entry.tmp.$$" && mv -f "$stage1_cache_entry.tmp.$$" "$stage1_cache_entry" || rm -f "$stage1_cache_entry.tmp.$$"
+    python3 "$ROOT/scripts/stage1_object_cache.py" publish "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" "$stage1_cache_logs/stdout" "$stage1_cache_logs/stderr" || true
   fi
   exit "$stage1_cache_rc"
 fi
