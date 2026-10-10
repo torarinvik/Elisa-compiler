@@ -11,7 +11,14 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 printf 'def main() -> i64:\n    return 42\n' > "$WORK/fixture.elisa"
 export ELISA_STAGE1_BIN="$BIN" ELISA_STAGE1_CACHE=1 ELISA_STAGE1_CACHE_DIR="$WORK/cache"
 bash "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/cold.o" "$WORK/fixture.elisa"
-bash "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/hit.o" "$WORK/fixture.elisa"
+bash -x "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/hit.o" "$WORK/fixture.elisa" 2>"$WORK/hit.trace"
+# Equal objects alone do not prove reuse: an ordinary recompile can match too.
+# Trace the real wrapper and require admission to skip its compilation function.
+if grep -Eq '^\++ run_stage1_driver_guarded$' "$WORK/hit.trace"; then
+  echo 'warm cache request unexpectedly invoked compilation' >&2
+  exit 1
+fi
+grep -Eq '^\++ exit 0$' "$WORK/hit.trace"
 cmp "$WORK/cold.o" "$WORK/hit.o"
 entries=("$WORK/cache/"*.o)
 [[ ${#entries[@]} == 1 && -s "${entries[0]}" && -s "${entries[0]}.json" ]]
