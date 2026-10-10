@@ -53,6 +53,19 @@ class CacheIntegrityTest(unittest.TestCase):
                 self.assertEqual(Path(str(entry) + ".json").exists(), admitted)
                 self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
 
+    def test_contract_override_participates_in_cache_identity(self):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_environment\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        values = []
+        for forced in ("0", "1"):
+            env = {"PATH": os.environ["PATH"], "ELISACORE_FORCE_CONTRACTS": forced, "ELISA_STAGE1_CACHE_DIR": "/ignored/cache", "ELISA_STAGE1_CACHE": "1"}
+            result = subprocess.run(["bash", "-c", function.group() + "\nstage1_cache_environment\n"], env=env, check=True, capture_output=True)
+            self.assertEqual(result.stdout, f"ELISACORE_FORCE_CONTRACTS={forced}\n".encode())
+            values.append(result.stdout)
+        self.assertNotEqual(*values)
+
     def test_corruption_and_truncation(self):
         for payload in (b"corrupt", b"", b"x" * self.source.stat().st_size):
             with self.subTest(payload_size=len(payload)):

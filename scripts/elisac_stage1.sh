@@ -276,6 +276,9 @@ driver_args=("$@")
 # legacy, partial, or corrupted entries take the ordinary compile path.
 stage1_cache_key=""
 stage1_cache_out=""
+stage1_cache_environment() {
+  env | LC_ALL=C grep -E '^(ELISA_|ELISACORE_FORCE_CONTRACTS=)' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
+}
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
   local index=0 count=${#driver_args[@]} arg emit="obj" source=""
@@ -313,7 +316,7 @@ stage1_cache_prepare() {
       shasum -a 256 "$BIN" | cut -d' ' -f1
       printf '%s\0' "${normalized[@]}"
       printf '\n'
-      env | LC_ALL=C grep '^ELISA_' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
+      stage1_cache_environment
       tr '\n' '\0' <"$deps_file" | xargs -0 shasum -a 256
       (cd "$ROOT" && find elisacore_std -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256)
     } | shasum -a 256 | cut -d' ' -f1
