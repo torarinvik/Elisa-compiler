@@ -89,6 +89,60 @@ expect_stage1_row() {
     fi
 }
 
+# A reversed 256-function call chain checks that Global rows still propagate through
+# a deep call graph in both compiler implementations.
+printf 'global mutable hot: i32 = 0\n' > "$WORK/deep_global_chain.elisa"
+for ((function_index = 0; function_index < 256; function_index++)); do
+    printf 'def chain_%d() -> void:\n' "$function_index" >> "$WORK/deep_global_chain.elisa"
+    if ((function_index == 255)); then
+        printf '    can Global{Read, Write}:\n        hot <- hot + 1\n\n' >> "$WORK/deep_global_chain.elisa"
+    else
+        printf '    can Global{Read, Write}:\n        chain_%d()\n\n' "$((function_index + 1))" >> "$WORK/deep_global_chain.elisa"
+    fi
+done
+printf 'def main() -> i64:\n    can Global{Read, Write}:\n        chain_0()\n    return 0\n' >> "$WORK/deep_global_chain.elisa"
+expect_agree "deep reversed call chain" "$WORK/deep_global_chain.elisa"
+expect_stage1_row "deep chain propagates read" "$WORK/deep_global_chain.elisa" "chain_0 Global.Read"
+expect_stage1_row "deep chain propagates write" "$WORK/deep_global_chain.elisa" "chain_0 Global.Write"
+printf 'PASS deep reversed call chain\n'
+
+# Cycles and fan-in must reach the same least fixed point; this graph checks mutual
+# recursion and shared-callee rows in both compiler implementations.
+cat > "$WORK/cycle_and_fan_in.elisa" <<'EOF'
+global mutable hot: i32 = 0
+
+def main() -> i64:
+    can Global{Read, Write}:
+        fan_left()
+        fan_right()
+    return 0
+
+def fan_left() -> void:
+    can Global{Read, Write}:
+        cycle_left()
+
+def fan_right() -> void:
+    can Global{Read, Write}:
+        cycle_left()
+
+def cycle_left() -> void:
+    can Global{Read, Write}:
+        cycle_middle()
+
+def cycle_middle() -> void:
+    can Global{Read, Write}:
+        cycle_right()
+
+def cycle_right() -> void:
+    can Global{Read, Write}:
+        cycle_left()
+        hot <- hot + 1
+EOF
+expect_agree "cycle and fan-in propagation" "$WORK/cycle_and_fan_in.elisa"
+expect_stage1_row "cycle propagates read" "$WORK/cycle_and_fan_in.elisa" "cycle_left Global.Read"
+expect_stage1_row "fan-in propagates write" "$WORK/cycle_and_fan_in.elisa" "main Global.Write"
+printf 'PASS cycle and fan-in propagation\n'
+
 # --- agreeing corpus -----------------------------------------------------------------
 
 # A reader needs Global.Read alone, a compound store needs both, a caller inherits what its
