@@ -338,8 +338,10 @@ run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i fo
 run_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n' 42
 # MULTIPLE clauses chain, and the predicate may read parameters as well as `result`.
 run_case contract_ensure_multi 'def maxi(a: i64, b: i64) -> i64:\n    ensure result >= a\n    ensure result >= b\n    return a if a > b else b\n\ndef main() -> i64:\n    return maxi(9, 33) + maxi(7, 2)\n' 40
-# A `-> void` function can enforce a parameter-only postcondition without a `result` value.
-run_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n    return\n\ndef main() -> i64:\n    touch(1)\n    return 42\n' 42
+# A `-> void` function enforces parameter-only postconditions without a `result` value.
+# On Linux the runtime contract panic terminates with SIGABRT (shell status 134); any other
+# nonzero status could be an unrelated backend crash and must fail this check.
+run_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n    return\n\ndef main() -> i64:\n    touch(0)\n    return 42\n' 134
 # WAS a decline case. stage1 has since gained real `dict` support and stage0 compiles
 # this too, so demanding a decline demanded a DIVERGENCE from the reference. Now pins the
 # behaviour instead: an empty dict declaration compiles, links and runs.

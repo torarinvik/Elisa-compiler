@@ -1,0 +1,601 @@
+# Portable, in-memory direct semantic facts for a translation-unit function body.
+# Unsupported syntax remains on the cold checker path. Reusable records contain only owned
+# byte spans, stable source names, direct facts, and body-relative token anchors.
+extend Semantic:
+    public:
+        const INCREMENTAL_FUNCTION_FACTS_SCHEMA: u32 = 1
+        const INCREMENTAL_FACT_HASH_OFFSET: u64 = 14695981039346656037
+        const INCREMENTAL_NO_ANCHOR: u32 = 4294967295
+        const INCREMENTAL_FACT_HASH_PRIME: u64 = 1099511628211
+
+        const enum IncrementalFactKind of u8:
+            DirectCall
+            GlobalRead
+            GlobalWrite
+            CanGrant
+            TrustedGrant
+            PanicSite
+
+        const enum IncrementalGrantKind of u8:
+            Can
+            Trusted
+
+        const enum IncrementalRejectReason of u8:
+            None
+            MissingStablePath
+            NonUniqueOrGenericFunction
+            MissingBlockBody
+            UnsupportedBodySyntax
+            MissingSourceAnchor
+            InvalidTokenSpan
+            UnsupportedSignature
+
+        # These spans address the snapshot-owned byte pool, not source buffers or intern tables.
+        struct IncrementalFunctionFactRecord:
+            key_start: usize
+            key_length: usize
+            body_start: usize
+            body_length: usize
+            body_hash: u64
+            direct_fact_start: mutable usize
+            direct_fact_count: mutable usize
+            cacheable: mutable bool
+            reused: mutable bool
+            reject_reason: mutable IncrementalRejectReason
+
+        # Subject is a stable path/name key for calls and globals, or an effect name for panic.
+        # The anchor is a token ordinal relative to the owning function body.
+        # Invocation-local source positions, keyed by the function-record owner slot. These
+        # are rebuilt on every collection and are never part of the portable persisted facts.
+        struct IncrementalFunctionSourceAnchor:
+            definition_offset: u32
+            body_token_start: usize
+            body_token_end: usize
+
+        struct IncrementalDirectFact:
+            owner: usize
+            kind: IncrementalFactKind
+            subject_start: usize
+            subject_length: usize
+            anchor_token: u32
+            active_grant_start: usize
+            active_grant_count: usize
+
+        struct IncrementalActiveGrant:
+            kind: IncrementalGrantKind
+            name_start: usize
+            name_length: usize
+
+        # Declaration-surface v0 is an exact token stream with supported function bodies
+        # removed. Any unsupported body stays in the surface and conservatively invalidates
+        # all records when edited.
+        struct IncrementalSemanticSnapshot:
+            schema_version: u32
+            semantic_fingerprint: u64
+            options_fingerprint: u64
+            bytes: mutable darray[u8]
+            source_path_start: mutable usize
+            source_path_length: mutable usize
+            declaration_surface_start: mutable usize
+            declaration_surface_length: mutable usize
+            declaration_surface_hash: mutable u64
+            functions: mutable darray[IncrementalFunctionFactRecord]
+            current_anchors: mutable darray[IncrementalFunctionSourceAnchor]
+            direct_facts: mutable darray[IncrementalDirectFact]
+            active_grants: mutable darray[IncrementalActiveGrant]
+            bodies_visited: mutable u32
+            bodies_reused: mutable u32
+            bodies_rejected: mutable u32
+            surface_compatible: mutable bool
+
+        private struct IncrementalFactCandidate:
+            name: sview
+            parameters: darray[Ast::ParamDecl]
+            return_type: Ast::Expr?
+            body: darray[Ast::Stmt]
+            definition_offset: u32
+            definition_token: usize
+            generic_header: bool
+            span_ordered: bool
+            body_token_start: usize
+            body_token_end: usize
+            skip_start: usize
+            skip_end: usize
+            owner: usize
+            header_supported: mutable bool
+            tentatively_reusable: mutable bool
+            scanned: mutable bool
+
+        private struct IncrementalFactTokenSpan:
+            found: bool
+            body_start: usize
+            body_end: usize
+            skip_start: usize
+            skip_end: usize
+            definition_token: usize
+
+        private struct IncrementalFactWalkGrant:
+            kind: IncrementalGrantKind
+            name: sview
+
+    private:
+        def ifc_append_u32(snapshot: mutable IncrementalSemanticSnapshot&, value: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                encoded: u8[4]
+                encoded[0] <- (value & 255).u8()
+                encoded[1] <- ((value >> 8) & 255).u8()
+                encoded[2] <- ((value >> 16) & 255).u8()
+                encoded[3] <- ((value >> 24) & 255).u8()
+                if Lexer::make_source_view(&encoded[0], 4, 0, 4) is view:
+                    snapshot.bytes.extend(view)
+
+        def ifc_append_view(snapshot: mutable IncrementalSemanticSnapshot&, value: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                snapshot.bytes.extend(value)
+
+        def ifc_append_name(snapshot: mutable IncrementalSemanticSnapshot&, path: sview, name: sview) -> (start: usize, length: usize):
+            can Memory.Allocate, Abort.Panic:
+                start: usize = snapshot.bytes.count
+                ifc_append_u32(snapshot, sview_len(path).u32())
+                ifc_append_view(snapshot, path)
+                ifc_append_u32(snapshot, sview_len(name).u32())
+                ifc_append_view(snapshot, name)
+                return (start, snapshot.bytes.count - start)
+
+        def ifc_append_token(snapshot: mutable IncrementalSemanticSnapshot&, source: u8&, source_length: usize, token: Lexer::Token) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                token_start: usize = token.start.usize()
+                text_length: usize = token.length.usize() + token.suffix_length.usize()
+                false return if token_start > source_length or text_length > source_length - token_start
+                ifc_append_u32(snapshot, token.kind.u32())
+                ifc_append_u32(snapshot, text_length.u32())
+                if text_length != 0:
+                    if Lexer::make_source_view(source, source_length, token_start, token_start + text_length) is text:
+                        snapshot.bytes.extend(text)
+                    else:
+                        return false
+                return true
+
+        def ifc_append_tokens(snapshot: mutable IncrementalSemanticSnapshot&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, start: usize, end: usize) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if start > end or end > tokens.count
+                for index in start..<end |snapshot|:
+                    return false if not ifc_append_token(snapshot, source, source_length, tokens[index])
+                return true
+
+        def ifc_hash(bytes: darray[u8]&, start: usize, length: usize) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = INCREMENTAL_FACT_HASH_OFFSET
+                for index in start..<start + length |hash|:
+                    hash <- (hash ^ bytes[index].u64()) * INCREMENTAL_FACT_HASH_PRIME
+                return hash
+
+        def ifc_equal(left: darray[u8]&, left_start: usize, left_length: usize, right: darray[u8]&, right_start: usize, right_length: usize) -> bool:
+            can Abort.Panic:
+                false return if left_length != right_length
+                false return if left_start > left.count or left_length > left.count - left_start
+                false return if right_start > right.count or right_length > right.count - right_start
+                for offset in 0..<left_length:
+                    false return if left[left_start + offset] != right[right_start + offset]
+                return true
+
+        def ifc_token_span(tokens: darray[Lexer::Token]&, definition: usize) -> IncrementalFactTokenSpan:
+            can Abort.Panic:
+                if definition >= tokens.count or tokens[definition].kind != TokenKind.Def:
+                    return IncrementalFactTokenSpan{found: false, body_start: 0, body_end: 0, skip_start: 0, skip_end: 0, definition_token: tokens.count}
+                indent: mutable usize = tokens.count
+                scan: mutable usize = definition + 1
+                while scan < tokens.count:
+                    kind: TokenKind = tokens[scan].kind
+                    if kind == TokenKind.Indent:
+                        indent <- scan
+                        break
+                    if kind == TokenKind.Def or kind == TokenKind.Dedent or kind == TokenKind.Eof:
+                        break
+                    scan <- scan + 1
+                if indent >= tokens.count:
+                    return IncrementalFactTokenSpan{found: false, body_start: 0, body_end: 0, skip_start: 0, skip_end: 0, definition_token: definition}
+                depth: mutable u32 = 1
+                scan <- indent + 1
+                while scan < tokens.count:
+                    if tokens[scan].kind == TokenKind.Indent:
+                        depth <- depth + 1
+                    elif tokens[scan].kind == TokenKind.Dedent:
+                        depth <- depth - 1
+                        if depth == 0:
+                            return IncrementalFactTokenSpan{found: true, body_start: indent + 1, body_end: scan, skip_start: indent, skip_end: scan + 1, definition_token: definition}
+                    scan <- scan + 1
+                return IncrementalFactTokenSpan{found: false, body_start: 0, body_end: 0, skip_start: 0, skip_end: 0, definition_token: definition}
+
+        def ifc_generic_header(tokens: darray[Lexer::Token]&, definition: usize) -> bool:
+            can Abort.Panic:
+                name_token: mutable usize = definition + 1
+                while name_token < tokens.count and tokens[name_token].kind != TokenKind.Ident:
+                    name_token <- name_token + 1
+                return false if name_token + 1 >= tokens.count
+                return tokens[name_token + 1].kind == TokenKind.LBracket
+
+        def ifc_contains(names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                for item in names:
+                    true return if item == name
+                return false
+
+        def ifc_name_count(candidates: darray[IncrementalFactCandidate]&, name: sview) -> usize:
+            can Abort.Panic:
+                count: mutable usize = 0
+                for candidate in candidates:
+                    count <- count + 1 if candidate.name == name
+                return count
+
+        def ifc_prior_index(previous: IncrementalSemanticSnapshot&, bytes: darray[u8]&, key_start: usize, key_length: usize) -> usize:
+            can Abort.Panic:
+                for index in 0..<previous.functions.count:
+                    prior: IncrementalFunctionFactRecord = previous.functions[index]
+                    return index if ifc_equal(bytes, key_start, key_length, previous.bytes, prior.key_start, prior.key_length)
+                return previous.functions.count
+
+        def ifc_safe_return_type(expression: Ast::Expr, aliases: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        false return if ifc_contains(aliases, name)
+                        return name == "void" or name == "bool" or name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "usize" or name == "isize" or name == "int" or name == "float" or name == "f32" or name == "f64" or name == "char" or name == "str" or name == "cstr"
+                    _:
+                        return false
+
+        def ifc_signature_supported(parameters: darray[Ast::ParamDecl], return_type: Ast::Expr?, aliases: darray[sview]&) -> bool:
+            can Abort.Panic:
+                if return_type is declared_return:
+                    false return if not ifc_safe_return_type(declared_return, aliases)
+                else:
+                    return false
+                for parameter in parameters:
+                    false return if parameter.has_default
+                return true
+
+        def ifc_call_target(candidates: darray[IncrementalFactCandidate]&, name: sview) -> bool:
+            can Abort.Panic:
+                matches: mutable usize = 0
+                for candidate in candidates:
+                    continue if candidate.name != name
+                    matches <- matches + 1
+                    false return if not candidate.header_supported or candidate.parameters.count != 0
+                return matches == 1
+
+        def ifc_anchor(tokens: darray[Lexer::Token]&, body_start: usize, body_end: usize, offset: u32) -> u32:
+            can Abort.Panic:
+                return INCREMENTAL_NO_ANCHOR if offset == 0
+                for index in body_start..<body_end:
+                    token: Lexer::Token = tokens[index]
+                    end: u32 = token.start + token.length + token.suffix_length.u32()
+                    return (index - body_start).u32() if token.start <= offset and offset < end
+                    return (index - body_start).u32() if offset < token.start
+                return INCREMENTAL_NO_ANCHOR
+
+        def ifc_has_inline_grant(annotations: darray[Ast::EnumAnnotation]&, tokens: darray[Lexer::Token]&, body_start: usize, body_end: usize) -> bool:
+            can Abort.Panic:
+                false return if body_start >= body_end or body_end > tokens.count
+                first_offset: u32 = tokens[body_start].start
+                last_token: Lexer::Token = tokens[body_end - 1]
+                last_offset: u32 = last_token.start + last_token.length + last_token.suffix_length.u32()
+                for annotation in annotations:
+                    continue if annotation.owner != "__inline_expression_grant"
+                    true return if annotation.pos.offset >= first_offset and annotation.pos.offset < last_offset
+                return false
+
+        def ifc_push_fact(snapshot: mutable IncrementalSemanticSnapshot&, owner: usize, kind: IncrementalFactKind, subject: sview, path: sview, anchor: u32, active: darray[IncrementalFactWalkGrant]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                subject_span: mutable (start: usize, length: usize) = (snapshot.bytes.count, sview_len(subject))
+                if kind == IncrementalFactKind.DirectCall or kind == IncrementalFactKind.GlobalRead or kind == IncrementalFactKind.GlobalWrite:
+                    subject_span <- ifc_append_name(snapshot, path, subject)
+                else:
+                    ifc_append_view(snapshot, subject)
+                active_start: usize = snapshot.active_grants.count
+                for grant in active:
+                    name_start: usize = snapshot.bytes.count
+                    ifc_append_view(snapshot, grant.name)
+                    snapshot.active_grants.push(IncrementalActiveGrant{kind: grant.kind, name_start: name_start, name_length: sview_len(grant.name)})
+                snapshot.direct_facts.push(IncrementalDirectFact{owner: owner, kind: kind, subject_start: subject_span.start, subject_length: subject_span.length, anchor_token: anchor, active_grant_start: active_start, active_grant_count: snapshot.active_grants.count - active_start})
+
+        def ifc_walk_expr(expression: Ast::Expr, owner: usize, path: sview, body_start: usize, body_end: usize, tokens: darray[Lexer::Token]&, locals: darray[sview]&, all_globals: darray[sview]&, mutable_globals: darray[sview]&, candidates: darray[IncrementalFactCandidate]&, active: mutable darray[IncrementalFactWalkGrant]&, snapshot: mutable IncrementalSemanticSnapshot&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
+                        return true
+                    Expr.Ident(name, position):
+                        # Locals and parameters may be mutable aliases or callback
+                        # values. v0 records only literal initializers and direct globals.
+                        false return if ifc_contains(locals, name)
+                        if ifc_contains(mutable_globals, name):
+                            anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                            if anchor != INCREMENTAL_NO_ANCHOR:
+                                ifc_push_fact(snapshot, owner, IncrementalFactKind.GlobalRead, name, path, anchor, active)
+                                return true
+                            return false
+                        # Readonly globals still produce inferred Global.Read rows in
+                        # the authority checker. Until that fact has its own kind, fail
+                        # closed instead of treating a name as a pure value.
+                        return false
+                    Expr.Paren(inner, _):
+                        return ifc_walk_expr(inner, owner, path, body_start, body_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                    Expr.Call(callee, arguments, labels, position):
+                        false return if arguments.count != 0 or labels.count != 0
+                        if callee is Ast::Expr.Ident(name, _):
+                            # `panic` is reserved by the lexer, so source cannot bind a local of that name.
+                            # A local function value shadows the translation-unit declaration
+                            # and builtins; never cache a call selected by name alone.
+                            false return if ifc_contains(locals, name) or ifc_contains(all_globals, name)
+                            anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                            if anchor != INCREMENTAL_NO_ANCHOR:
+                                if ifc_call_target(candidates, name):
+                                    ifc_push_fact(snapshot, owner, IncrementalFactKind.DirectCall, name, path, anchor, active)
+                                    return true
+                                if name == "panic":
+                                    ifc_push_fact(snapshot, owner, IncrementalFactKind.PanicSite, "Abort.Panic", path, anchor, active)
+                                    return true
+                        return false
+                    _:
+                        return false
+
+        def ifc_walk_body(statements: darray[Ast::Stmt], owner: usize, path: sview, body_start: usize, body_end: usize, tokens: darray[Lexer::Token]&, locals: mutable darray[sview]&, all_globals: darray[sview]&, mutable_globals: darray[sview]&, candidates: darray[IncrementalFactCandidate]&, active: mutable darray[IncrementalFactWalkGrant]&, snapshot: mutable IncrementalSemanticSnapshot&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |locals, active, snapshot|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            return false if not ifc_walk_expr(expression, owner, path, body_start, body_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                        Stmt.Return(value, _):
+                            if value is result:
+                                return false if not ifc_walk_expr(result, owner, path, body_start, body_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                        Stmt.VarDecl(name, type_expression, value, _):
+                            return false if ifc_contains(locals, name)
+                            # A typed/mutable place or an identifier initializer can
+                            # make ga_write_place infer a Global.Write row. Keep v0 local
+                            # declarations to untyped literal bindings only.
+                            false return if not (type_expression is Expr.Absent or type_expression is Expr.Invalid)
+                            false return if not (value is Expr.IntLit or value is Expr.FloatLit or value is Expr.StringLit or value is Expr.CharLit or value is Expr.BoolLit)
+                            locals.push(name)
+                        Stmt.Assign(target, operator, value, _):
+                            if operator == TokenKind.Assign:
+                                # GA treats this spelling as a new local binding; only
+                                # literal RHS values are cacheable because they cannot
+                                # carry global reads, callback origins, or writable places.
+                                if target is Ast::Expr.Ident(name, _):
+                                    false return if not (value is Expr.IntLit or value is Expr.FloatLit or value is Expr.StringLit or value is Expr.CharLit or value is Expr.BoolLit)
+                                    return false if not ifc_walk_expr(value, owner, path, body_start, body_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                                    locals.push(name)
+                                else:
+                                    return false
+                            else:
+                                return false if operator != TokenKind.LArrow
+                                return false if not ifc_walk_expr(value, owner, path, body_start, body_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                                if target is Ast::Expr.Ident(name, position):
+                                    if ifc_contains(locals, name):
+                                        pass
+                                    elif ifc_contains(mutable_globals, name):
+                                        anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                                        if anchor != INCREMENTAL_NO_ANCHOR:
+                                            ifc_push_fact(snapshot, owner, IncrementalFactKind.GlobalWrite, name, path, anchor, active)
+                                        else:
+                                            return false
+                                    else:
+                                        return false
+                                else:
+                                    return false
+                        Stmt.Block(kind, clause, _, body, position):
+                            false return if kind != "can" and kind != "trusted"
+                            active_mark: usize = active.count
+                            local_mark: usize = locals.count
+                            grant_kind: IncrementalGrantKind = IncrementalGrantKind.Can if kind == "can" else IncrementalGrantKind.Trusted
+                            scope_anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                            return false if scope_anchor == INCREMENTAL_NO_ANCHOR
+                            for name in clause |active, snapshot|:
+                                if scope_anchor != INCREMENTAL_NO_ANCHOR:
+                                    fact_kind: IncrementalFactKind = IncrementalFactKind.CanGrant if grant_kind == IncrementalGrantKind.Can else IncrementalFactKind.TrustedGrant
+                                    ifc_push_fact(snapshot, owner, fact_kind, name, path, scope_anchor, active)
+                                else:
+                                    return false
+                                active.push(IncrementalFactWalkGrant{kind: grant_kind, name: name})
+                            return false if not ifc_walk_body(body, owner, path, body_start, body_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                            active.truncate(active_mark)
+                            locals.truncate(local_mark)
+                        _:
+                            return false
+                return true
+
+        def ifc_scan_candidate(index: usize, candidates: mutable darray[IncrementalFactCandidate]&, path: sview, tokens: darray[Lexer::Token]&, all_globals: darray[sview]&, mutable_globals: darray[sview]&, snapshot: mutable IncrementalSemanticSnapshot&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                candidate: IncrementalFactCandidate = candidates[index]
+                owner: usize = candidate.owner
+                fact_start: usize = snapshot.direct_facts.count
+                locals: mutable darray[sview] = []
+                active: mutable darray[IncrementalFactWalkGrant] = []
+                grant_start: usize = snapshot.active_grants.count
+                bytes_start: usize = snapshot.bytes.count
+                for parameter in candidate.parameters |locals|:
+                    locals.push(parameter.name)
+                supported: mutable bool = candidate.header_supported and candidate.body_token_start < candidate.body_token_end
+                if supported:
+                    supported <- ifc_walk_body(candidate.body, owner, path, candidate.body_token_start, candidate.body_token_end, tokens, locals, all_globals, mutable_globals, candidates, active, snapshot)
+                snapshot.bodies_visited <- snapshot.bodies_visited + 1
+                if not supported:
+                    snapshot.direct_facts.truncate(fact_start)
+                    snapshot.active_grants.truncate(grant_start)
+                    snapshot.bytes.truncate(bytes_start)
+                snapshot.functions[owner].direct_fact_start <- fact_start
+                snapshot.functions[owner].direct_fact_count <- snapshot.direct_facts.count - fact_start
+                snapshot.functions[owner].cacheable <- supported
+                snapshot.functions[owner].reused <- false
+                if candidate.header_supported:
+                    snapshot.functions[owner].reject_reason <- IncrementalRejectReason.None if supported else IncrementalRejectReason.UnsupportedBodySyntax
+                snapshot.bodies_rejected <- snapshot.bodies_rejected + 1 if not supported
+                candidates[index].scanned <- true
+
+        def ifc_copy_prior(previous: IncrementalSemanticSnapshot&, prior_index: usize, owner: usize, snapshot: mutable IncrementalSemanticSnapshot&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                prior: IncrementalFunctionFactRecord = previous.functions[prior_index]
+                fact_start: usize = snapshot.direct_facts.count
+                for relative_fact in 0..<prior.direct_fact_count |snapshot|:
+                    old_fact: IncrementalDirectFact = previous.direct_facts[prior.direct_fact_start + relative_fact]
+                    subject_start: usize = snapshot.bytes.count
+                    for offset in 0..<old_fact.subject_length:
+                        snapshot.bytes.push(previous.bytes[old_fact.subject_start + offset])
+                    grant_start: usize = snapshot.active_grants.count
+                    for relative_grant in 0..<old_fact.active_grant_count |snapshot|:
+                        old_grant: IncrementalActiveGrant = previous.active_grants[old_fact.active_grant_start + relative_grant]
+                        name_start: usize = snapshot.bytes.count
+                        for offset in 0..<old_grant.name_length:
+                            snapshot.bytes.push(previous.bytes[old_grant.name_start + offset])
+                        snapshot.active_grants.push(IncrementalActiveGrant{kind: old_grant.kind, name_start: name_start, name_length: old_grant.name_length})
+                    snapshot.direct_facts.push(IncrementalDirectFact{owner: owner, kind: old_fact.kind, subject_start: subject_start, subject_length: old_fact.subject_length, anchor_token: old_fact.anchor_token, active_grant_start: grant_start, active_grant_count: snapshot.active_grants.count - grant_start})
+                snapshot.functions[owner].direct_fact_start <- fact_start
+                snapshot.functions[owner].direct_fact_count <- snapshot.direct_facts.count - fact_start
+                snapshot.functions[owner].cacheable <- true
+                snapshot.functions[owner].reused <- true
+                snapshot.functions[owner].reject_reason <- IncrementalRejectReason.None
+                snapshot.bodies_reused <- snapshot.bodies_reused + 1
+
+        def ifc_surface_equal(previous: IncrementalSemanticSnapshot&, current: IncrementalSemanticSnapshot) -> bool:
+            can Abort.Panic:
+                false return if previous.schema_version != current.schema_version
+                false return if previous.semantic_fingerprint != current.semantic_fingerprint
+                false return if previous.options_fingerprint != current.options_fingerprint
+                false return if not ifc_equal(previous.bytes, previous.source_path_start, previous.source_path_length, current.bytes, current.source_path_start, current.source_path_length)
+                return ifc_equal(previous.bytes, previous.declaration_surface_start, previous.declaration_surface_length, current.bytes, current.declaration_surface_start, current.declaration_surface_length)
+
+    public:
+        # Supported functions are unique, top-level, nongeneric defs with ordinary block
+        # bodies and scalar builtin return types. Calls must be direct, zero-argument, and
+        # unambiguous. Locals are untyped literals; local identifier reads stay cold because
+        # they can hide mutable places or callback values. Every unsupported construct misses.
+        def incremental_collect_function_facts(file: Ast::File&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, previous: IncrementalSemanticSnapshot&, has_previous: bool) -> IncrementalSemanticSnapshot:
+            can Memory.Allocate, Abort.Panic:
+                snapshot: mutable IncrementalSemanticSnapshot = IncrementalSemanticSnapshot{schema_version: INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: semantic_fingerprint, options_fingerprint: options_fingerprint, bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], bodies_visited: 0, bodies_reused: 0, bodies_rejected: 0, surface_compatible: false}
+                snapshot.source_path_start <- snapshot.bytes.count
+                snapshot.source_path_length <- sview_len(source_path)
+                ifc_append_view(snapshot, source_path)
+
+                candidates: mutable darray[IncrementalFactCandidate] = []
+                all_globals: mutable darray[sview] = []
+                mutable_globals: mutable darray[sview] = []
+                all_aliases: mutable darray[sview] = []
+                for declaration in file.top_decls |all_aliases|:
+                    match declaration:
+                        Decl.Alias(name, _, _):
+                            all_aliases.push(name)
+                        _:
+                            pass
+                definition_cursor: mutable usize = 0
+                previous_span_end: mutable usize = 0
+                all_spans_ordered: mutable bool = true
+                for declaration in file.top_decls |candidates, all_globals, mutable_globals, tokens, snapshot, source, source_length|:
+                    match declaration:
+                        Decl.Const(name, _, _, is_global, _):
+                            all_globals.push(name) if is_global
+                        Decl.Func(name, parameters, return_type, body, _, _, position):
+                            while definition_cursor < tokens.count and (tokens[definition_cursor].kind != TokenKind.Def or tokens[definition_cursor].start != position.offset):
+                                definition_cursor <- definition_cursor + 1
+                            span: IncrementalFactTokenSpan = ifc_token_span(tokens, definition_cursor)
+                            if span.found:
+                                definition_cursor <- span.skip_end
+                            elif definition_cursor < tokens.count:
+                                definition_cursor <- definition_cursor + 1
+                            span_ordered: bool = not span.found or span.skip_start >= previous_span_end
+                            if span.found:
+                                all_spans_ordered <- false if not span_ordered
+                                previous_span_end <- span.skip_end if span.skip_end > previous_span_end
+                            generic_header: bool = span.found and ifc_generic_header(tokens, span.definition_token)
+                            inline_grant: bool = span.found and ifc_has_inline_grant(file.enum_annotations, tokens, span.body_start, span.body_end)
+                            signature_supported: bool = ifc_signature_supported(parameters, return_type, all_aliases)
+                            key_span: (start: usize, length: usize) = ifc_append_name(snapshot, source_path, name)
+                            body_start: usize = snapshot.bytes.count
+                            body_valid: bool = span.found and ifc_append_tokens(snapshot, source, source_length, tokens, span.body_start, span.body_end)
+                            body_length: usize = snapshot.bytes.count - body_start if body_valid else 0
+                            owner: usize = snapshot.functions.count
+                            snapshot.functions.push(IncrementalFunctionFactRecord{key_start: key_span.start, key_length: key_span.length, body_start: body_start, body_length: body_length, body_hash: ifc_hash(snapshot.bytes, body_start, body_length), direct_fact_start: 0, direct_fact_count: 0, cacheable: false, reused: false, reject_reason: IncrementalRejectReason.MissingBlockBody if not span.found else IncrementalRejectReason.None})
+                            snapshot.current_anchors.push(IncrementalFunctionSourceAnchor{definition_offset: position.offset, body_token_start: span.body_start, body_token_end: span.body_end})
+                            candidates.push(IncrementalFactCandidate{name: name, parameters: parameters, return_type: return_type, body: body, definition_offset: position.offset, definition_token: span.definition_token, generic_header: generic_header, span_ordered: span_ordered, body_token_start: span.body_start, body_token_end: span.body_end, skip_start: span.skip_start, skip_end: span.skip_end, owner: owner, header_supported: span.found and body_valid and source_path != "" and not generic_header and not inline_grant and span_ordered and signature_supported, tentatively_reusable: false, scanned: false})
+                            snapshot.functions[owner].reject_reason <- IncrementalRejectReason.MissingStablePath if source_path == ""
+                            snapshot.functions[owner].reject_reason <- IncrementalRejectReason.InvalidTokenSpan if span.found and not body_valid
+                            snapshot.functions[owner].reject_reason <- IncrementalRejectReason.UnsupportedBodySyntax if inline_grant
+                            snapshot.functions[owner].reject_reason <- IncrementalRejectReason.UnsupportedSignature if not signature_supported
+                        _:
+                            pass
+
+                if not all_spans_ordered:
+                    for candidate_index in 0..<candidates.count |candidates, snapshot|:
+                        candidates[candidate_index].header_supported <- false
+                        snapshot.functions[candidates[candidate_index].owner].reject_reason <- IncrementalRejectReason.InvalidTokenSpan
+
+                # Decl.Const distinguishes globals from consts; mutability lives in the
+                # parser's __global_mutable annotation side table.
+                for annotation in file.enum_annotations:
+                    if annotation.name == "__global_mutable" and annotation.module == "" and ifc_contains(all_globals, annotation.owner):
+                        mutable_globals.push(annotation.owner)
+
+                for index in 0..<candidates.count |candidates, snapshot, previous|:
+                    unique: bool = ifc_name_count(candidates, candidates[index].name) == 1
+                    generic: bool = candidates[index].generic_header
+                    candidates[index].header_supported <- candidates[index].header_supported and unique
+                    if not unique or generic:
+                        snapshot.functions[candidates[index].owner].reject_reason <- IncrementalRejectReason.NonUniqueOrGenericFunction
+                    elif not candidates[index].span_ordered:
+                        snapshot.functions[candidates[index].owner].reject_reason <- IncrementalRejectReason.InvalidTokenSpan
+                    if candidates[index].header_supported and has_previous and previous.schema_version == INCREMENTAL_FUNCTION_FACTS_SCHEMA:
+                        current: IncrementalFunctionFactRecord = snapshot.functions[candidates[index].owner]
+                        old_index: usize = ifc_prior_index(previous, snapshot.bytes, current.key_start, current.key_length)
+                        if old_index < previous.functions.count:
+                            old: IncrementalFunctionFactRecord = previous.functions[old_index]
+                            same_body: bool = ifc_equal(snapshot.bytes, current.body_start, current.body_length, previous.bytes, old.body_start, old.body_length)
+                            if same_body and old.cacheable:
+                                candidates[index].tentatively_reusable <- true
+                                snapshot.functions[candidates[index].owner].cacheable <- true
+
+                for index in 0..<candidates.count |candidates, snapshot|:
+                    continue if candidates[index].tentatively_reusable
+                    ifc_scan_candidate(index, candidates, source_path, tokens, all_globals, mutable_globals, snapshot)
+
+                snapshot.declaration_surface_start <- snapshot.bytes.count
+                surface_valid: mutable bool = true
+                token_index: mutable usize = 0
+                candidate_index: mutable usize = 0
+                while token_index < tokens.count |candidates, snapshot, token_index, candidate_index, surface_valid|:
+                    while candidate_index < candidates.count and candidates[candidate_index].skip_start < token_index:
+                        candidate_index <- candidate_index + 1
+                    if candidate_index < candidates.count:
+                        candidate: IncrementalFactCandidate = candidates[candidate_index]
+                        if candidate.skip_start == token_index and candidate.header_supported and snapshot.functions[candidate.owner].cacheable:
+                            token_index <- candidate.skip_end
+                            candidate_index <- candidate_index + 1
+                            continue
+                    surface_valid <- ifc_append_token(snapshot, source, source_length, tokens[token_index]) and surface_valid
+                    token_index <- token_index + 1
+                snapshot.declaration_surface_length <- snapshot.bytes.count - snapshot.declaration_surface_start
+                snapshot.declaration_surface_hash <- ifc_hash(snapshot.bytes, snapshot.declaration_surface_start, snapshot.declaration_surface_length)
+                snapshot.surface_compatible <- has_previous and surface_valid and all_spans_ordered and ifc_surface_equal(previous, snapshot)
+                if not surface_valid:
+                    snapshot.direct_facts.truncate(0)
+                    snapshot.active_grants.truncate(0)
+                    for record_index in 0..<snapshot.functions.count |snapshot, record_index|:
+                        snapshot.functions[record_index].cacheable <- false
+                        snapshot.functions[record_index].reused <- false
+                        snapshot.functions[record_index].direct_fact_start <- 0
+                        snapshot.functions[record_index].direct_fact_count <- 0
+                        snapshot.functions[record_index].reject_reason <- IncrementalRejectReason.InvalidTokenSpan
+                    return snapshot
+
+                if snapshot.surface_compatible:
+                    for index in 0..<candidates.count |candidates, snapshot, previous|:
+                        continue if not candidates[index].tentatively_reusable
+                        current: IncrementalFunctionFactRecord = snapshot.functions[candidates[index].owner]
+                        old_index: usize = ifc_prior_index(previous, snapshot.bytes, current.key_start, current.key_length)
+                        continue if old_index >= previous.functions.count
+                        ifc_copy_prior(previous, old_index, candidates[index].owner, snapshot)
+                else:
+                    # A change to any declaration, import, global, overload set, or unsupported
+                    # body invalidates this coarse surface. Re-scan provisionally skipped bodies.
+                    for index in 0..<candidates.count |candidates, snapshot|:
+                        continue if not candidates[index].tentatively_reusable
+                        ifc_scan_candidate(index, candidates, source_path, tokens, all_globals, mutable_globals, snapshot)
+
+                return snapshot

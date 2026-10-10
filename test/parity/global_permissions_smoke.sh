@@ -25,6 +25,8 @@ esac
 bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit obj -O2 -permissive \
     -o "$ROW_REPORT_OBJ" "$REPO_ROOT/test/parity/mutable_global_authority_report.elisa"
 clang -O2 "${ROW_REPORT_LD_FLAGS[@]}" "$ROW_REPORT_OBJ" "$RUNTIME_OBJ" "$REPO_ROOT/test/parity/profile_hooks.c" -o "$ROW_REPORT"
+# Keep mandatory local Global.Read/Global.Write enforcement in the same fast gate as row inference.
+python3 "$REPO_ROOT/test/parity/mutable_global_grants_smoke.py" "$ROW_REPORT"
 
 stage0_globals() {
     "$ELISACORE_BIN" -emit semantic "$1" \

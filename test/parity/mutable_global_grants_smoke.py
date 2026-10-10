@@ -36,6 +36,8 @@ cases = [
     ("constant", "const count: i64 = 7\ndef read_count() -> i64:\n    return count\n", set()),
     ("parameter shadows", "global mutable count: i64 = 0\ndef read_count(count: i64) -> i64:\n    return count\n", set()),
     ("index target reads", "global mutable cursor: usize = 0\nglobal mutable slots: i64[4] = zeroed\ndef store() -> void:\n    slots[cursor] <- 1\n", {"Global.Read", "Global.Write"}),
+    ("mutable reference write requires Global.Write", "global mutable counter: i64 = 0\ndef set_one(value: mutable i64&) -> void:\n    value <- 1\ndef main() -> void:\n    can Global.Read:\n        reference: mutable i64& = &counter\n        set_one(reference)\n", {"Global.Write"}),
+    ("mutable reference write with both grants", "global mutable counter: i64 = 0\ndef set_one(value: mutable i64&) -> void:\n    value <- 1\ndef main() -> void:\n    can Global{Read, Write}:\n        reference: mutable i64& = &counter\n        set_one(reference)\n", set()),
 ]
 # Signature rows describe caller contracts; they never authorize body access.
 # Give transitive/callback fixtures their own immediate body grants so each test

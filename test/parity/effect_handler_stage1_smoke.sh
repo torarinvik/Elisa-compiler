@@ -115,6 +115,14 @@ run_native_result() {
     }
 }
 
+run_native_contract() {
+    local fixture="$1"
+    local stem="$(basename "$fixture" .elisa)"
+    "$ROOT/scripts/elisac_stage1.sh" -emit exe -O0 -o "$WORK/$stem-contract" \
+        "$ROOT/test/fixtures/effects/$fixture" >"$WORK/$stem-contract.log" 2>&1
+    "$WORK/$stem-contract"
+}
+
 run_direct_equivalence() {
     local llvm_diff="${ELISA_LLVM_DIFF:-$ELISA_LLVM_BIN_DIR/llvm-diff}"
     # Off Homebrew, use the LLVM the harness was pointed at (silently skipped before).
@@ -212,6 +220,8 @@ run_positive "helper_sibling_capture.elisa"
 run_positive "helper_multiple_effects.elisa"
 run_positive "helper_module_install.elisa"
 run_positive "helper_nested_capture.elisa"
+run_positive "helper_mutual_recursive.elisa"
+run_native_contract "helper_mutual_recursive.elisa"
 run_native_result "helper_namespace.elisa" 22
 run_native_result "helper_explicit_chain.elisa" 31
 run_native_result "helper_qualified_chain.elisa" 47

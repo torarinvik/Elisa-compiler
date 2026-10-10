@@ -130,7 +130,12 @@ extend Semantic:
         def ga_close_rows(state: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
                 changed: mutable bool = true
-                while changed |changed, state|:
+                progress_rounds: mutable u64 = 0
+                while changed |changed, state, progress_rounds|:
+                    progress_rounds <- progress_rounds + 1 if state.progress_enabled
+                    if state.progress_enabled and progress_rounds % 256 == 0:
+                        PhaseTimer::counter("authority:effect_row_rounds_progress", progress_rounds) can Global{Read,Write}
+                        PhaseTimer::counter("authority:effect_row_edge_visits_progress", (progress_rounds - 1) * state.row_edge_from.count.u64()) can Global{Read,Write}
                     changed <- false
                     for edge in 0..<state.row_edge_from.count |changed, state|:
                         caller: usize = state.row_edge_from[edge]
@@ -198,6 +203,55 @@ extend Semantic:
                         row <- state.effect_row_next[row]
                     table.effect_canonical_function_row_count <- table.effect_canonical_function_row_count.push(table.effect_canonical_row_function.count - start)
 
+        # Cache the unchanged file-wide predicate once per unique canonical effect ref.
+        # state.annotations is this invocation's File annotation slice and stays immutable
+        # from preparation through the report walk. The count guard detects mismatched
+        # snapshots within that lifetime; it is not a checksum for same-count mutation.
+        # This replaces an annotation-table scan on every call-row report while keeping
+        # the old exact scanner available whenever the snapshot is incomplete or stale.
+        def ga_prepare_permission_param_ref_flags(state: mutable GlobalAuthority&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                state.permission_param_ref_flags_ready <- false
+                state.permission_param_ref_flags <- state.permission_param_ref_flags.clear()
+                state.permission_param_ref_names <- state.permission_param_ref_names.clear()
+                state.permission_param_ref_lengths <- state.permission_param_ref_lengths.clear()
+                state.permission_param_ref_count <- 0
+                state.permission_param_annotation_count <- 0
+                ref_count: usize = table.effect_canonical_refs.count
+                return if state.effect_refs.count != ref_count
+                for ref_index in 0..<ref_count |state|:
+                    ref: sview = table.effect_canonical_refs[ref_index]
+                    return if state.effect_refs[ref_index] != ref
+                    family: sview = effect_ref_family(ref)
+                    state.permission_param_ref_flags.push(cov_is_permission_param(state.annotations, family))
+                    state.permission_param_ref_names.push(ref)
+                    state.permission_param_ref_lengths.push(sview_len(ref))
+                state.permission_param_ref_count <- ref_count
+                state.permission_param_annotation_count <- state.annotations.count
+                state.permission_param_ref_flags_ready <- state.permission_param_ref_flags.count == ref_count and state.permission_param_ref_names.count == ref_count and state.permission_param_ref_lengths.count == ref_count
+
+        # 0/1 are valid cached false/true values; the sentinel means callers must use
+        # cov_is_permission_param directly. Exact name checks prevent a same-sized ref
+        # replacement from reusing another row's classification.
+        def ga_permission_param_ref_cache_value(ref_index: usize, ref: sview, state: GlobalAuthority&, table: SymbolTable&) -> u8:
+            can Abort.Panic:
+                return GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS if not state.permission_param_ref_flags_ready
+                return GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS if state.permission_param_annotation_count != state.annotations.count
+                ref_count: usize = table.effect_canonical_refs.count
+                return GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS if state.permission_param_ref_count != ref_count or state.permission_param_ref_flags.count != ref_count or state.permission_param_ref_names.count != ref_count or state.permission_param_ref_lengths.count != ref_count
+                return GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS if state.effect_refs.count != ref_count or ref_index >= ref_count
+                current: sview = table.effect_canonical_refs[ref_index]
+                cached_name: sview = state.permission_param_ref_names[ref_index]
+                return GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS if state.permission_param_ref_lengths[ref_index] != sview_len(current) or cached_name != current or current != ref or state.effect_refs[ref_index] != current
+                return 1 if state.permission_param_ref_flags[ref_index]
+                return 0
+
+        def ga_permission_param_ref_is_param(ref_index: usize, ref: sview, state: GlobalAuthority&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                cached: u8 = ga_permission_param_ref_cache_value(ref_index, ref, state, table)
+                return cached == 1 if cached != GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS
+                return cov_is_permission_param(state.annotations, effect_ref_family(ref))
+
         def canonical_effect_module(parent_scope: usize, path: sview, table: SymbolTable&) -> usize:
             can Abort.Panic:
                 qualified: mutable bool = false
@@ -256,17 +310,23 @@ extend Semantic:
                     return ga_resolve(head[last_scope + 2:sview_len(head)], parent, true, names, scopes, state)
                 return ga_resolve(head, lexical_scope, false, names, scopes, state)
 
-        def ga_generic_call_rows(slot: usize, callee: Ast::Expr, state: GlobalAuthority&, table: lmut SymbolTable) -> void:
+        def ga_generic_call_rows_at(slot: usize, at: Ast::Pos, state: GlobalAuthority&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if slot >= table.effect_canonical_function_row_start.count
                 start: usize = table.effect_canonical_function_row_start[slot]
                 end: usize = start + table.effect_canonical_function_row_count[slot]
-                at: Ast::Pos = Ast::expr_pos(callee)
                 for row in start..<end |table| -> table:
-                    ref: sview = table.effect_canonical_refs[table.effect_canonical_row_ref[row]]
+                    ref_index: usize = table.effect_canonical_row_ref[row]
+                    ref: sview = table.effect_canonical_refs[ref_index]
                     family: sview = effect_ref_family(ref)
                     continue if family == "Global" or (family == "Unsafe" and not state.strict_unsafe)
-                    continue if cov_is_permission_param(state.annotations, family)
+                    continue if ga_permission_param_ref_is_param(ref_index, ref, state, table)
                     if not ga_granted(ref, at, state, table.effect_canonical_row_scope[row]):
                         name: sview = table.effect_canonical_function_name[slot]
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: name, expected: ref, actual: family, detail: "canonical-unsafe" if family == "Unsafe" and state.strict_unsafe else "canonical-row", line: at.line, pos: ga_position_value(at.line, at.column, at.offset, at.end_line, at.end_column, at.end_offset)})
+
+        # Keep the AST-facing entry point for existing callers; replay can pass an
+        # exact current-source position without manufacturing a callee expression.
+        def ga_generic_call_rows(slot: usize, callee: Ast::Expr, state: GlobalAuthority&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- ga_generic_call_rows_at(slot, Ast::expr_pos(callee), state, table) can Global{Read,Write}

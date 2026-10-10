@@ -5,6 +5,7 @@
 extend Semantic:
     private:
         const GLOBAL_AUTHORITY_NONE: usize = 4294967295
+        const GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS: u8 = 2
 
         struct GlobalAuthority:
             parents: mutable darray[usize] = []
@@ -32,6 +33,7 @@ extend Semantic:
             callback_origin_heads: mutable dict[usize, usize] = {}
             callback_origin_tails: mutable dict[usize, usize] = {}
             callback_origin_next: mutable darray[usize] = []
+            callback_origin_indexed: mutable bool = false
             callback_join_slots: mutable darray[usize] = []
             callback_join_owners: mutable darray[usize] = []
             callback_join_offsets: mutable darray[u32] = []
@@ -75,6 +77,14 @@ extend Semantic:
             effect_refs: mutable darray[sview] = []
             effect_ref_heads: mutable dict[u64, usize] = {}
             effect_ref_next: mutable darray[usize] = []
+            # File-local exact permission-parameter classification, prepared only after
+            # canonical refs are published and consumed by the Global row report walk.
+            permission_param_ref_flags: mutable darray[bool] = []
+            permission_param_ref_names: mutable darray[sview] = []
+            permission_param_ref_lengths: mutable darray[usize] = []
+            permission_param_ref_count: mutable usize = 0
+            permission_param_annotation_count: mutable usize = 0
+            permission_param_ref_flags_ready: mutable bool = false
             effect_row_heads: mutable darray[usize] = []
             effect_row_refs: mutable darray[usize] = []
             effect_row_next: mutable darray[usize] = []
@@ -117,6 +127,8 @@ extend Semantic:
             function: mutable usize = 0
             report: mutable bool = false
             strict_unsafe: mutable bool = false
+            progress_enabled: mutable bool = false
+            progress_functions: mutable u64 = 0
 
         def ga_import_visible(module: sview, state: GlobalAuthority&, lexical_scope: usize = GLOBAL_AUTHORITY_NONE) -> bool:
             can Abort.Panic:
@@ -465,8 +477,7 @@ extend Semantic:
                         state.reads[state.function] <- true
                 if state.report and not ga_granted(required, at, state):
                     diagnostic_bytes: mutable darray[u8] = []
-                    for index in 0..<sview_len(state.globals[global_slot]) |diagnostic_bytes|:
-                        diagnostic_bytes.push(sview_at(state.globals[global_slot], index))
+                    diagnostic_bytes.extend(state.globals[global_slot])
                     stable_global: sview = Parser::persist_name_bytes(&diagnostic_bytes, 0) can Global{Read,Write}
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableGlobalPermissionUngranted, name: "write" if write else "read", expected: required, actual: stable_global, line: at.line, pos: ga_position_value(at.line, at.column, at.offset, at.end_line, at.end_column, at.end_offset)})
 
@@ -798,6 +809,33 @@ extend Semantic:
                 state.firewalls.push(ref)
                 state.firewall_scopes.push(origin)
 
+        # Apply the operation for one already-selected callee. This takes the
+        # source position by value so cold AST traversal and future fact replay share
+        # the same row/edge behavior without constructing an AST expression.
+        def ga_resolved_call_candidate(candidate: usize, at: Ast::Pos, need_read: mutable bool&, need_write: mutable bool&, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                need_read <- need_read or state.reads[candidate]
+                need_write <- need_write or state.writes[candidate]
+                if state.report:
+                    table <- ga_generic_call_rows_at(candidate, at, state, table) can Global{Read,Write}
+                else:
+                    ga_edge_rows(state.function, candidate, state) can Global{Read,Write}
+                    state.edge_from.push(state.function)
+                    state.edge_to.push(candidate)
+                    state.edge_reads.push(not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Read", 0, state))
+                    state.edge_writes.push(not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Write", 0, state))
+
+        def ga_report_call_global_requirements(name: sview, at: Ast::Pos, need_read: bool, need_write: bool, state: GlobalAuthority&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                missing_read: bool = need_read and not ga_granted("Global.Read", at, state)
+                missing_write: bool = need_write and not ga_granted("Global.Write", at, state)
+                if missing_read or missing_write:
+                    required: sview = "Global{Read,Write}" if missing_read and missing_write else ("Global.Write" if missing_write else "Global.Read")
+                    diagnostic_bytes: mutable darray[u8] = []
+                    diagnostic_bytes.extend(name)
+                    stable_name: sview = Parser::persist_name_bytes(&diagnostic_bytes, 0) can Global{Read,Write}
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableGlobalCallUngranted, name: stable_name, expected: required, actual: "Global", line: at.line, pos: ga_position_value(at.line, at.column, at.offset, at.end_line, at.end_column, at.end_offset)})
+
         def ga_call(callee: Ast::Expr, arguments: darray[Ast::Expr], argument_names: darray[sview], state: mutable GlobalAuthority&, table: lmut SymbolTable, postfix_conversion: bool = false) -> void:
             can Memory.Allocate, Abort.Panic:
                 callee_head: usize = ga_callee_slot(callee, state, 0, postfix_conversion) can Global{Read,Write}
@@ -805,6 +843,7 @@ extend Semantic:
                 name: sview = match callee:
                     Expr.Ident(ident, _) | Expr.Scope(_, ident, _) | Expr.Field(_, ident, _): ident
                     _: "lambda"
+                at: Ast::Pos = Ast::expr_pos(callee)
                 need_read: mutable bool = false
                 need_write: mutable bool = false
                 if ga_annotation(callee, state, 0) is callee_type:
@@ -818,28 +857,10 @@ extend Semantic:
                     candidate: usize = next_candidate
                     next_candidate <- state.function_next[candidate]
                     continue if not ga_candidate_selected(candidate, slot, arguments, argument_names, state, ga_callable_core(callee) is Expr.Field)
-                    table <- ga_defaults(candidate, Ast::expr_pos(callee), arguments, argument_names, state, table) can Global{Read,Write}
-                    need_read <- need_read or state.reads[candidate]
-                    need_write <- need_write or state.writes[candidate]
-                    if state.report:
-                        table <- ga_generic_call_rows(candidate, callee, state, table) can Global{Read,Write}
-                    if not state.report:
-                        ga_edge_rows(state.function, candidate, state) can Global{Read,Write}
-                        state.edge_from.push(state.function)
-                        state.edge_to.push(candidate)
-                        state.edge_reads.push(not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Read", 0, state))
-                        state.edge_writes.push(not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Write", 0, state))
+                    table <- ga_defaults(candidate, at, arguments, argument_names, state, table) can Global{Read,Write}
+                    table <- ga_resolved_call_candidate(candidate, at, need_read, need_write, state, table) can Global{Read,Write}
                 if state.report:
-                    missing_read: bool = need_read and not ga_granted("Global.Read", Ast::expr_pos(callee), state)
-                    missing_write: bool = need_write and not ga_granted("Global.Write", Ast::expr_pos(callee), state)
-                    if missing_read or missing_write:
-                        required: sview = "Global{Read,Write}" if missing_read and missing_write else ("Global.Write" if missing_write else "Global.Read")
-                        at: Ast::Pos = Ast::expr_pos(callee)
-                        diagnostic_bytes: mutable darray[u8] = []
-                        for index in 0..<sview_len(name) |diagnostic_bytes|:
-                            diagnostic_bytes.push(sview_at(name, index))
-                        stable_name: sview = Parser::persist_name_bytes(&diagnostic_bytes, 0) can Global{Read,Write}
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableGlobalCallUngranted, name: stable_name, expected: required, actual: "Global", line: at.line, pos: ga_position_value(at.line, at.column, at.offset, at.end_line, at.end_column, at.end_offset)})
+                    table <- ga_report_call_global_requirements(name, at, need_read, need_write, state, table) can Global{Read,Write}
 
         def ga_callback_handoff(callee: Ast::Expr, value: Ast::Expr, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -855,16 +876,7 @@ extend Semantic:
                     next_candidate <- state.function_next[candidate]
                     selected: bool = candidate == callback if state.functions[callback] == "" else state.functions[candidate] == state.functions[callback] and state.function_scopes[candidate] == state.function_scopes[callback]
                     continue if not selected
-                    need_read <- need_read or state.reads[candidate]
-                    need_write <- need_write or state.writes[candidate]
-                    if state.report:
-                        table <- ga_generic_call_rows(candidate, callee, state, table) can Global{Read,Write}
-                    if not state.report:
-                        ga_edge_rows(state.function, candidate, state) can Global{Read,Write}
-                        state.edge_from.push(state.function)
-                        state.edge_to.push(candidate)
-                        state.edge_reads.push(not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Read", 0, state))
-                        state.edge_writes.push(not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Write", 0, state))
+                    table <- ga_resolved_call_candidate(candidate, Ast::expr_pos(callee), need_read, need_write, state, table) can Global{Read,Write}
                 if state.report:
                     missing_read: bool = need_read and not ga_granted("Global.Read", Ast::expr_pos(value), state)
                     missing_write: bool = need_write and not ga_granted("Global.Write", Ast::expr_pos(value), state)
@@ -1093,7 +1105,7 @@ extend Semantic:
         # Origin edges retain callable shape facts separately from propagated rows.
         def ga_callback_origin_index_ready(state: GlobalAuthority&) -> bool:
             can Abort.Panic:
-                return state.callback_origin_next.count == state.callback_origin_from.count and state.callback_origin_to.count == state.callback_origin_from.count
+                return state.callback_origin_indexed and state.callback_origin_next.count == state.callback_origin_from.count and state.callback_origin_to.count == state.callback_origin_from.count
 
         def ga_callback_origin_head(parent: usize, state: GlobalAuthority&) -> usize:
             can Abort.Panic:
@@ -1104,24 +1116,26 @@ extend Semantic:
         # ga_callback_origin; readers retain a linear fallback for incomplete states.
         def ga_index_callback_origins(state: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
+                state.callback_origin_indexed <- false
                 return if state.callback_origin_from.count != state.callback_origin_to.count
                 state.callback_origin_heads <- {}
                 state.callback_origin_tails <- {}
                 state.callback_origin_next <- []
                 for edge in 0..<state.callback_origin_from.count |edge, state|:
                     parent: usize = state.callback_origin_from[edge]
-                    last_edge: usize = tail_value if state.callback_origin_tails.get(parent) is tail_value else GLOBAL_AUTHORITY_NONE
+                    last_edge: usize = previous_edge_value if state.callback_origin_tails.get(parent) is previous_edge_value else GLOBAL_AUTHORITY_NONE
                     state.callback_origin_next.push(GLOBAL_AUTHORITY_NONE)
                     if last_edge < edge:
                         state.callback_origin_next[last_edge] <- edge
                     else:
-                        state.callback_origin_heads <- state.callback_origin_heads.put(parent, edge)
-                    state.callback_origin_tails <- state.callback_origin_tails.put(parent, edge)
+                        state.callback_origin_heads <- state.callback_origin_heads.put(parent, edge) can Global{Read,Write}
+                    state.callback_origin_tails <- state.callback_origin_tails.put(parent, edge) can Global{Read,Write}
+                state.callback_origin_indexed <- true
 
         def ga_callback_origin(parent: usize, child: usize, state: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if parent >= state.functions.count or child >= state.functions.count or parent == child
-                ga_index_callback_origins(state) if not ga_callback_origin_index_ready(state)
+                ga_index_callback_origins(state) can Global{Read,Write} if not ga_callback_origin_index_ready(state)
                 if ga_callback_origin_index_ready(state):
                     edge: mutable usize = ga_callback_origin_head(parent, state)
                     while edge < state.callback_origin_from.count |edge, parent, child, state|:
@@ -1136,12 +1150,12 @@ extend Semantic:
                 state.callback_origin_to.push(child)
                 if index_new_edge:
                     state.callback_origin_next.push(GLOBAL_AUTHORITY_NONE)
-                    last_edge: usize = tail_value if state.callback_origin_tails.get(parent) is tail_value else GLOBAL_AUTHORITY_NONE
+                    last_edge: usize = previous_edge_value if state.callback_origin_tails.get(parent) is previous_edge_value else GLOBAL_AUTHORITY_NONE
                     if last_edge < edge:
                         state.callback_origin_next[last_edge] <- edge
                     else:
-                        state.callback_origin_heads <- state.callback_origin_heads.put(parent, edge)
-                    state.callback_origin_tails <- state.callback_origin_tails.put(parent, edge)
+                        state.callback_origin_heads <- state.callback_origin_heads.put(parent, edge) can Global{Read,Write}
+                    state.callback_origin_tails <- state.callback_origin_tails.put(parent, edge) can Global{Read,Write}
                 ga_edge_rows(parent, child, state, false) can Global{Read,Write}
                 state.edge_from.push(parent)
                 state.edge_to.push(child)
@@ -1437,6 +1451,10 @@ extend Semantic:
                                 state.local_callees.push(GLOBAL_AUTHORITY_NONE)
                             # Signature effects declare the exported row, not local authority.
                             table <- ga_body(body, state, table) can Global{Read,Write}
+                            if state.progress_enabled:
+                                state.progress_functions <- state.progress_functions + 1
+                                if state.progress_functions % 1024 == 0:
+                                    PhaseTimer::counter("authority:report_functions_progress" if state.report else "authority:inference_functions_progress", state.progress_functions) can Global{Read,Write}
                             state.locals.clear()
                             state.local_types.clear()
                             state.local_callees.clear()
@@ -1468,10 +1486,11 @@ extend Semantic:
         def check_mutable_global_authority(file: Ast::File&, table: lmut SymbolTable, strict_unsafe: bool = false, enforce_global_grants: bool = true) -> void:
             can Memory.Allocate, Abort.Panic:
                 setup_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
-                state: mutable GlobalAuthority = GlobalAuthority{parents: [0], modules: [""], module_starts: [0], module_lengths: [0], globals: [], global_scopes: [], global_types: [], writable: [], functions: [], function_heads: {}, function_next: [], function_scopes: [], function_offsets: [], function_lines: [], function_variadic: [], function_return_types: [], callback_origin_heads: {}, callback_origin_tails: {}, callback_origin_next: [], parameter_starts: [], parameter_counts: [], parameter_minimum: [], enum_names: [], enum_scopes: [], struct_names: [], struct_scopes: [], field_owners: [], field_scopes: [], field_names: [], field_types: [], alias_names: [], alias_scopes: [], alias_types: [], parameter_functions: [], parameter_names: [], parameter_types: [], parameter_defaults: [], default_depth: 0, reads: [], writes: [], edge_from: [], edge_to: [], edge_reads: [], edge_writes: [], local_floor: 0, local_limit: GLOBAL_AUTHORITY_NONE, locals: [], local_types: [], local_callees: [], return_type: null, lambda_depth: 0, inline_refs: [], inline_spans: [], inline_prefix_ends: [], global_mutable_heads: {}, global_mutable_owners: [], global_mutable_offsets: [], global_mutable_lines: [], global_mutable_modules: [], global_mutable_next: [], import_annotations: [], grants: [], firewalls: [], annotations: file.enum_annotations, generic_lines: file.generic_param_lines, generic_names: file.generic_param_names, module_scope: 0, function: 0, report: false, strict_unsafe: false}
+                state: mutable GlobalAuthority = GlobalAuthority{parents: [0], modules: [""], module_starts: [0], module_lengths: [0], globals: [], global_scopes: [], global_types: [], writable: [], functions: [], function_heads: {}, function_next: [], function_scopes: [], function_offsets: [], function_lines: [], function_variadic: [], function_return_types: [], callback_origin_heads: {}, callback_origin_tails: {}, callback_origin_next: [], callback_origin_indexed: false, parameter_starts: [], parameter_counts: [], parameter_minimum: [], enum_names: [], enum_scopes: [], struct_names: [], struct_scopes: [], field_owners: [], field_scopes: [], field_names: [], field_types: [], alias_names: [], alias_scopes: [], alias_types: [], parameter_functions: [], parameter_names: [], parameter_types: [], parameter_defaults: [], default_depth: 0, reads: [], writes: [], edge_from: [], edge_to: [], edge_reads: [], edge_writes: [], local_floor: 0, local_limit: GLOBAL_AUTHORITY_NONE, locals: [], local_types: [], local_callees: [], return_type: null, lambda_depth: 0, inline_refs: [], inline_spans: [], inline_prefix_ends: [], global_mutable_heads: {}, global_mutable_owners: [], global_mutable_offsets: [], global_mutable_lines: [], global_mutable_modules: [], global_mutable_next: [], import_annotations: [], grants: [], firewalls: [], annotations: file.enum_annotations, generic_lines: file.generic_param_lines, generic_names: file.generic_param_names, module_scope: 0, function: 0, report: false, strict_unsafe: false}
                 ga_index_import_annotations(&state)
                 ga_index_mutable_annotations(&state) can Global{Read,Write}
                 state.strict_unsafe <- strict_unsafe
+                state.progress_enabled <- setup_span.active
                 ga_collect(file.top_decls, 0, &state) can Global{Read,Write}
                 for annotation in state.annotations:
                     if annotation.owner == "__protocol_decl":
@@ -1503,8 +1522,10 @@ extend Semantic:
                 ga_resolve_callback_results(&state) can Global{Read,Write}
                 PhaseTimer::end_span("authority:callback_results", callback_results_span)
                 readwrite_closure_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
+                readwrite_rounds: mutable u64 = 0
                 changed: mutable bool = true
-                while changed |state, changed|:
+                while changed |state, changed, readwrite_rounds|:
+                    readwrite_rounds <- readwrite_rounds + 1
                     changed <- false
                     while edge < state.edge_from.count |edge: usize = 0, state, changed|:
                         caller: usize = state.edge_from[edge]
@@ -1516,7 +1537,14 @@ extend Semantic:
                             state.writes[caller] <- true
                             changed <- true
                         edge <- edge + 1
+                    if readwrite_closure_span.active and readwrite_rounds % 256 == 0:
+                        PhaseTimer::counter("authority:readwrite_rounds_progress", readwrite_rounds) can Global{Read,Write}
+                        PhaseTimer::counter("authority:readwrite_edge_visits_progress", readwrite_rounds * state.edge_from.count.u64()) can Global{Read,Write}
                 PhaseTimer::end_span("authority:readwrite_closure", readwrite_closure_span)
+                if readwrite_closure_span.active:
+                    PhaseTimer::counter("authority:readwrite_rounds", readwrite_rounds) can Global{Read,Write}
+                    PhaseTimer::counter("authority:readwrite_edges", state.edge_from.count.u64()) can Global{Read,Write}
+                    PhaseTimer::counter("authority:readwrite_edge_visits", readwrite_rounds * state.edge_from.count.u64()) can Global{Read,Write}
                 effect_closure_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                 ga_close_rows(&state) can Global{Read,Write}
                 PhaseTimer::end_span("authority:effect_row_closure", effect_closure_span)
@@ -1524,8 +1552,12 @@ extend Semantic:
                 table <- ga_publish_rows(&state, table) can Global{Read,Write}
                 PhaseTimer::end_span("authority:publish_rows", publish_span)
                 if enforce_global_grants:
+                    permission_param_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
+                    ga_prepare_permission_param_ref_flags(&state, table) can Global{Read,Write}
+                    PhaseTimer::end_span("authority:permission_param_cache", permission_param_span)
                     report_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                     state.report <- true
+                    state.progress_functions <- 0
                     table <- ga_functions(file.top_decls, 0, &state, table) can Global{Read,Write}
                     PhaseTimer::end_span("authority:report_walk", report_span)
                 # Export facts after the generic checker has run; this checker owns
