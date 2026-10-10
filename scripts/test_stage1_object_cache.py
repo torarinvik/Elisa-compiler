@@ -80,6 +80,9 @@ class CacheIntegrityTest(unittest.TestCase):
         profile = self.source.parent / "profile.elisa"
         script = 'set -uo pipefail\ndriver_args=("$SOURCE_INPUT" -o output.o -fprofile-use "$PROFILE_INPUT")\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
         env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", SOURCE_INPUT=str(source), PROFILE_INPUT=str(profile))
+        ordinary_script = script.replace(' -fprofile-use "$PROFILE_INPUT"', '')
+        ordinary = subprocess.run(["bash", "-c", ordinary_script], env=env, check=True, capture_output=True)
+        self.assertRegex(ordinary.stdout.decode(), r"^[0-9a-f]{64}$")
         keys = []
         for data in (b"ELISA_PGO_V1\n", b"ELISA_PGO_V1\nhot main\n"):
             profile.write_bytes(data)
