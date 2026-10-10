@@ -6,7 +6,7 @@
 # Sourced by elisac_stage1.sh, which owns ROOT/BIN and the toolchain variables this reads.
 
 seed_build() {
-  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind seed_runtime_sha256_expected seed_runtime_sha256_actual
   local seed_hook_mode
   local -a seed_link_flags seed_link_objects
   # A newly-created Git worktree has no ignored build directory yet. Create the
@@ -220,10 +220,11 @@ seed_build() {
     bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   fi
   # A Stage1 bootstrap may be built from compiler sources that import helpers from
-  # native_runtime_support. The caller supplies a provenance-checked matching runtime
+  # native_runtime_support. The caller supplies a matching, SHA-256-pinned runtime
   # for this one link; the new product still rebuilds its runtime below.
   seed_link_objects=("$seed_object")
   seed_runtime_obj="${ELISA_STAGE1_SEED_RUNTIME_OBJ:-}"
+  seed_runtime_sha256_expected="${ELISA_STAGE1_SEED_RUNTIME_SHA256:-}"
   if [[ -n "$seed_runtime_obj" ]]; then
     [[ "$seed_bootstrap_kind" == stage1 ]] || {
       echo "seed: a bootstrap runtime object is only valid with an elisac-stage1 bootstrap" >&2
@@ -237,10 +238,35 @@ seed_build() {
       echo "seed: requested bootstrap runtime has no freshness stamp: $seed_runtime_obj" >&2
       exit 2
     }
+    [[ "${#seed_runtime_sha256_expected}" -eq 64 ]] || {
+      echo "seed: ELISA_STAGE1_SEED_RUNTIME_SHA256 must pin the bootstrap runtime object's SHA-256" >&2
+      exit 2
+    }
+    case "$seed_runtime_sha256_expected" in
+      *[!0-9a-f]*)
+        echo "seed: bootstrap runtime SHA-256 must be lowercase hexadecimal" >&2
+        exit 2
+        ;;
+    esac
+    seed_runtime_sha256_actual="$(elisa_sha256 "$seed_runtime_obj" | awk '{print $1}')"
+    [[ "$seed_runtime_sha256_actual" == "$seed_runtime_sha256_expected" ]] || {
+      echo "seed: bootstrap runtime SHA-256 mismatch for $seed_runtime_obj" >&2
+      exit 2
+    }
     echo "seed: linking bootstrap runtime $seed_runtime_obj" >&2
     seed_link_objects+=("$seed_runtime_obj")
+  elif [[ -n "$seed_runtime_sha256_expected" ]]; then
+    echo "seed: bootstrap runtime SHA-256 supplied without an object path" >&2
+    exit 2
   fi
   "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "${seed_link_objects[@]}" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
+  if [[ -n "$seed_runtime_obj" ]]; then
+    seed_runtime_sha256_actual="$(elisa_sha256 "$seed_runtime_obj" | awk '{print $1}')"
+    [[ "$seed_runtime_sha256_actual" == "$seed_runtime_sha256_expected" ]] || {
+      echo "seed: bootstrap runtime changed during link; refusing to publish $seed_output" >&2
+      exit 2
+    }
+  fi
   if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
     "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" || {
       echo "seed: refusing to publish a product built while its source inputs were changing" >&2
