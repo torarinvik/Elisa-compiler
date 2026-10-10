@@ -50,6 +50,19 @@ if cmp -s "$WORK/dependency-before.o" "$WORK/dependency-after.o"; then
 fi
 dependency_entries=("$WORK/dependency-cache/"*.o)
 [[ ${#dependency_entries[@]} == 2 ]]
+# Profile contents are an auxiliary input, even when the path stays unchanged.
+export ELISA_STAGE1_CACHE_DIR="$WORK/profile-cache"
+printf 'ELISA_PGO_V1\n' > "$WORK/optimization.profile"
+bash "$ROOT/scripts/elisac_stage1.sh" -O2 -fprofile-use "$WORK/optimization.profile" -o "$WORK/profile-before.o" "$WORK/fixture.elisa"
+printf 'ELISA_PGO_V1\nhot main\n' > "$WORK/optimization.profile"
+bash "$ROOT/scripts/elisac_stage1.sh" -O2 -fprofile-use "$WORK/optimization.profile" -o "$WORK/profile-after.o" "$WORK/fixture.elisa"
+profile_entries=("$WORK/profile-cache/"*.o)
+[[ ${#profile_entries[@]} == 2 ]]
+printf 'invalid profile\n' > "$WORK/optimization.profile"
+if bash "$ROOT/scripts/elisac_stage1.sh" -O2 -fprofile-use "$WORK/optimization.profile" -o "$WORK/profile-invalid.o" "$WORK/fixture.elisa" >"$WORK/profile.stdout" 2>"$WORK/profile.stderr"; then
+  echo 'invalid edited profile incorrectly reused a cached object' >&2
+  exit 1
+fi
 # Warnings are part of a successful compile's observable result.
 export ELISA_STAGE1_CACHE_DIR="$WORK/warning-cache"
 warning_fixture="$WORK/warning.elisa"

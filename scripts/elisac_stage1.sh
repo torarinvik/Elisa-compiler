@@ -282,13 +282,20 @@ stage1_cache_environment() {
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
   local index=0 count=${#driver_args[@]} arg emit="obj" source=""
-  local -a normalized=() deps_args=()
+  local -a normalized=() auxiliary_inputs=()
   while (( index < count )); do
     arg="${driver_args[index]}"
     case "$arg" in
       -o)
         stage1_cache_out="${driver_args[index + 1]:-}"
         normalized+=("-o" "@OUT@")
+        index=$((index + 2))
+        continue
+        ;;
+      -fprofile-use)
+        [[ -n "${driver_args[index + 1]:-}" ]] || return 1
+        auxiliary_inputs+=("${driver_args[index + 1]}")
+        normalized+=("$arg" "${driver_args[index + 1]}")
         index=$((index + 2))
         continue
         ;;
@@ -300,7 +307,6 @@ stage1_cache_prepare() {
         ;;
     esac
     normalized+=("$arg")
-    deps_args+=("$arg")
     index=$((index + 1))
   done
   [[ "$emit" == obj && -n "$stage1_cache_out" && -n "$source" ]] || return 1
@@ -317,6 +323,9 @@ stage1_cache_prepare() {
       printf '%s\0' "${normalized[@]}"
       printf '\n'
       stage1_cache_environment || true
+      if (( ${#auxiliary_inputs[@]} > 0 )); then
+        shasum -a 256 "${auxiliary_inputs[@]}" || exit 1
+      fi
       tr '\n' '\0' <"$deps_file" | xargs -0 shasum -a 256 || exit 1
       (cd "$ROOT" && find elisacore_std -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256) || exit 1
     } | shasum -a 256 | cut -d' ' -f1

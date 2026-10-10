@@ -67,6 +67,28 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertIn(b"missing.elisa", result.stderr)
 
+    def test_profile_content_participates_in_cache_identity(self):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        compiler = self.source.parent / "fake-compiler"
+        compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$SOURCE_INPUT" > "$4"\n')
+        compiler.chmod(0o755)
+        source = self.source.parent / "source.elisa"
+        source.write_bytes(b"def main() -> i64: return 42\n")
+        profile = self.source.parent / "profile.elisa"
+        script = 'set -uo pipefail\ndriver_args=("$SOURCE_INPUT" -o output.o -fprofile-use "$PROFILE_INPUT")\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
+        env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", SOURCE_INPUT=str(source), PROFILE_INPUT=str(profile))
+        keys = []
+        for data in (b"ELISA_PGO_V1\n", b"ELISA_PGO_V1\nhot main\n"):
+            profile.write_bytes(data)
+            result = subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
+            keys.append(result.stdout)
+        self.assertNotEqual(*keys)
+        profile.unlink()
+        self.assertEqual(subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode, 7)
+
     def test_contract_override_participates_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent
         wrapper = (root / "scripts/elisac_stage1.sh").read_text()
