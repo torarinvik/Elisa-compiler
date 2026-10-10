@@ -113,6 +113,26 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), out.read_bytes())
         self.assertEqual(stderr.getvalue(), err.read_bytes())
 
+    def test_admitted_replay_io_failure_is_not_a_cache_miss(self):
+        class FailingStream(io.BytesIO):
+            def write(self, data):
+                raise OSError("diagnostic sink failed")
+
+        out, err = self.source.parent / "stdout", self.source.parent / "stderr"
+        out.write_bytes(b"compile result\n")
+        err.write_bytes(b"compile warning\n")
+        for failing in ("stderr", "stdout"):
+            with self.subTest(failing=failing):
+                self.assertTrue(cache.publish(self.entry, self.source, "key", out, err))
+                stdout = FailingStream() if failing == "stdout" else io.BytesIO()
+                stderr = FailingStream() if failing == "stderr" else io.BytesIO()
+                with self.assertRaisesRegex(OSError, "diagnostic sink failed"):
+                    cache.restore(self.entry, self.output, "key", stdout=stdout, stderr=stderr)
+                self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
+                self.assertEqual(stderr.getvalue(), err.read_bytes() if failing == "stdout" else b"")
+                self.assertEqual(stdout.getvalue(), b"")
+                self.assertFalse(list(self.output.parent.glob("*.incoming.*")))
+
     def test_bad_diagnostics_never_publish_or_replay(self):
         for name in ("stdout", "stderr"):
             for missing in (False, True):
