@@ -6,9 +6,9 @@
 # Sourced by elisac_stage1.sh, which owns ROOT/BIN and the toolchain variables this reads.
 
 seed_build() {
-  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind
   local seed_hook_mode
-  local -a seed_link_flags
+  local -a seed_link_flags seed_link_objects
   # A newly-created Git worktree has no ignored build directory yet. Create the
   # local output roots before taking the per-worktree lock; otherwise `mkdir`
   # cannot create the nested lock path and every first seed fails as if a stale
@@ -122,7 +122,9 @@ seed_build() {
     echo "seed: no z3 on PATH; stage0 needs an SMT solver to prove the compiler's contracts (install z3 >= 5, e.g. \`pip install z3-solver\`)" >&2
     exit 2
   fi
-  echo "seed: building product with stage0 $STAGE0_BIN" >&2
+  seed_bootstrap_kind=stage0
+  if [[ "$(basename "$STAGE0_BIN")" == "elisac-stage1" ]]; then seed_bootstrap_kind=stage1; fi
+  echo "seed: building product with $seed_bootstrap_kind $STAGE0_BIN" >&2
   # The compiler itself is a large input. A duplicated seed can consume the whole
   # workstation before either invocation reports an error, so bound one seed by default.
   # The 5.5 GiB freeze came from two worktrees seeding at once; the host-wide global seed lock
@@ -217,7 +219,28 @@ seed_build() {
   else
     bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   fi
-  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
+  # A Stage1 bootstrap may be built from compiler sources that import helpers from
+  # native_runtime_support. The caller supplies a provenance-checked matching runtime
+  # for this one link; the new product still rebuilds its runtime below.
+  seed_link_objects=("$seed_object")
+  seed_runtime_obj="${ELISA_STAGE1_SEED_RUNTIME_OBJ:-}"
+  if [[ -n "$seed_runtime_obj" ]]; then
+    [[ "$seed_bootstrap_kind" == stage1 ]] || {
+      echo "seed: a bootstrap runtime object is only valid with an elisac-stage1 bootstrap" >&2
+      exit 2
+    }
+    [[ -s "$seed_runtime_obj" ]] || {
+      echo "seed: requested bootstrap runtime object is missing or empty: $seed_runtime_obj" >&2
+      exit 2
+    }
+    [[ -s "$seed_runtime_obj.inputs.sha256" ]] || {
+      echo "seed: requested bootstrap runtime has no freshness stamp: $seed_runtime_obj" >&2
+      exit 2
+    }
+    echo "seed: linking bootstrap runtime $seed_runtime_obj" >&2
+    seed_link_objects+=("$seed_runtime_obj")
+  fi
+  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "${seed_link_objects[@]}" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
   if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
     "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" || {
       echo "seed: refusing to publish a product built while its source inputs were changing" >&2
