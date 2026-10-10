@@ -23,6 +23,26 @@ rm "${entries[0]}.json"
 printf 'legacy corrupt fixture\n' > "${entries[0]}"
 bash "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/legacy-recovered.o" "$WORK/fixture.elisa"
 cmp "$WORK/cold.o" "$WORK/legacy-recovered.o"
+# Contract policy is part of object identity even when this small fixture has
+# no contract sites and therefore happens to emit the same machine code.
+export ELISA_STAGE1_CACHE_DIR="$WORK/contract-cache"
+env -u ELISACORE_FORCE_CONTRACTS bash "$ROOT/scripts/elisac_stage1.sh" -O2 -o "$WORK/contracts-default.o" "$WORK/fixture.elisa"
+ELISACORE_FORCE_CONTRACTS=1 bash "$ROOT/scripts/elisac_stage1.sh" -O2 -o "$WORK/contracts-forced.o" "$WORK/fixture.elisa"
+contract_entries=("$WORK/contract-cache/"*.o)
+[[ ${#contract_entries[@]} == 2 ]]
+# A transitive body edit must miss while the entry source and options stay fixed.
+export ELISA_STAGE1_CACHE_DIR="$WORK/dependency-cache"
+printf 'def leaf() -> i64:\n    return 42\n' > "$WORK/dependency.elisa"
+printf 'include "dependency.elisa"\ndef main() -> i64:\n    return leaf()\n' > "$WORK/dependent.elisa"
+bash "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/dependency-before.o" "$WORK/dependent.elisa"
+printf 'def leaf() -> i64:\n    return 43\n' > "$WORK/dependency.elisa"
+bash "$ROOT/scripts/elisac_stage1.sh" -o "$WORK/dependency-after.o" "$WORK/dependent.elisa"
+if cmp -s "$WORK/dependency-before.o" "$WORK/dependency-after.o"; then
+  echo 'edited dependency incorrectly reused the old object' >&2
+  exit 1
+fi
+dependency_entries=("$WORK/dependency-cache/"*.o)
+[[ ${#dependency_entries[@]} == 2 ]]
 # Warnings are part of a successful compile's observable result.
 export ELISA_STAGE1_CACHE_DIR="$WORK/warning-cache"
 warning_fixture="$WORK/warning.elisa"
