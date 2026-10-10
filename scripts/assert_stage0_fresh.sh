@@ -17,6 +17,28 @@ BIN="${1:-${ELISACORE_BIN:-}}"
 [ "${ELISA_ALLOW_STALE_STAGE0:-0}" = 1 ] && exit 0
 [ -n "$BIN" ] || exit 0
 
+# A verified Stage1 product can bootstrap the next Stage1 build when an older Go
+# Stage0 does not understand language features used by the compiler sources. Its
+# provenance manifest fingerprints the exact Elisa sources and build recipes, so
+# validate it with the checker from the product's own checkout before accepting it.
+if [ "$(basename "$BIN")" = "elisac-stage1" ]; then
+    STAGE1_ROOT="$(cd "$(dirname "$BIN")/.." 2>/dev/null && pwd || true)"
+    STAGE1_PROVENANCE="${STAGE1_ROOT:+$STAGE1_ROOT/scripts/stage1_provenance.py}"
+    if [ -z "$STAGE1_ROOT" ] || [ ! -f "$STAGE1_PROVENANCE" ]; then
+        echo "cannot verify Stage1 bootstrap provenance for $BIN" >&2
+        exit 2
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "cannot verify Stage1 bootstrap provenance: python3 is unavailable (binary: $BIN)" >&2
+        exit 2
+    fi
+    python3 "$STAGE1_PROVENANCE" check "$STAGE1_ROOT" "$BIN" || {
+        echo "Stage1 bootstrap product is stale or unverifiable: $BIN" >&2
+        exit 2
+    }
+    exit 0
+fi
+
 # ELISACORE_BIN may be the oracle MEMO (tools/s0cache), which keys on the real binary's
 # content hash and so is never itself stale -- check what it wraps.
 case "$(basename "$BIN")" in
