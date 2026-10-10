@@ -2,7 +2,10 @@
 """Cache admission must never publish partial, corrupt, or mismatched bytes."""
 import io
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -30,6 +33,25 @@ class CacheIntegrityTest(unittest.TestCase):
         self.publish()
         self.assertTrue(cache.restore(self.entry, self.output, "key"))
         self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
+
+    def test_wrapper_publication_requires_unchanged_inputs(self):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_publish_if_unchanged\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        logs = self.source.parent / "logs"
+        logs.mkdir()
+        (logs / "stdout").write_bytes(b"compile result\n")
+        (logs / "stderr").write_bytes(b"compile warning\n")
+        script = function.group() + '\nstage1_cache_prepare() { stage1_cache_key="$TEST_NEXT_KEY"; return "$TEST_PREPARE_RC"; }\nstage1_cache_publish_if_unchanged\n'
+        for index, (next_key, prepare_rc, admitted) in enumerate((("key", 0, True), ("edited", 0, False), ("key", 1, False))):
+            with self.subTest(next_key=next_key, prepare_rc=prepare_rc):
+                entry = self.entry.with_name(f"publication-{index}.o")
+                env = dict(os.environ, ROOT=str(root), stage1_cache_key="key", stage1_cache_entry=str(entry), stage1_cache_out=str(self.source), stage1_cache_logs=str(logs), TEST_NEXT_KEY=next_key, TEST_PREPARE_RC=str(prepare_rc))
+                subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
+                self.assertEqual(entry.exists(), admitted)
+                self.assertEqual(Path(str(entry) + ".json").exists(), admitted)
+                self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
 
     def test_corruption_and_truncation(self):
         for payload in (b"corrupt", b"", b"x" * self.source.stat().st_size):

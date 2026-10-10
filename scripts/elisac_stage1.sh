@@ -321,6 +321,14 @@ stage1_cache_prepare() {
   rm -f "$deps_file"
   [[ -n "$stage1_cache_key" ]]
 }
+stage1_cache_publish_if_unchanged() {
+  local compiled_key="$stage1_cache_key"
+  # A successful compile can overlap an editor save or dependency regeneration.
+  # Keep its output, but publish only under the exact inputs observed at admission.
+  stage1_cache_prepare || return 0
+  [[ "$stage1_cache_key" == "$compiled_key" ]] || return 0
+  python3 "$ROOT/scripts/stage1_object_cache.py" publish "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" "$stage1_cache_logs/stdout" "$stage1_cache_logs/stderr" || true
+}
 if stage1_cache_prepare; then
   stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
   stage1_cache_entry="$stage1_cache_dir/$stage1_cache_key.o"
@@ -335,7 +343,7 @@ if stage1_cache_prepare; then
   cat "$stage1_cache_logs/stderr" >&2
   cat "$stage1_cache_logs/stdout"
   if [[ "$stage1_cache_rc" -eq 0 && -f "$stage1_cache_out" ]]; then
-    python3 "$ROOT/scripts/stage1_object_cache.py" publish "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" "$stage1_cache_logs/stdout" "$stage1_cache_logs/stderr" || true
+    stage1_cache_publish_if_unchanged
   fi
   exit "$stage1_cache_rc"
 fi
