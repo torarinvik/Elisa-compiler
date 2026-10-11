@@ -29,6 +29,22 @@ def second_read() -> i64:
     can Global.Read:
         return counter
 
+def write_counter() -> void:
+    can Global.Write:
+        counter <- 11
+
+def grant_only() -> i64:
+    can Global.Read:
+        return 9
+
+def trusted_only() -> i64:
+    trusted Global.Read:
+        return 10
+
+def panic_only() -> void:
+    trusted Abort.Panic:
+        panic()
+
 def main() -> i64:
     can Global.Read:
         return read_counter()
@@ -88,11 +104,11 @@ compare_without_cache_report() {
 run_check cold "$WORK/check.elisa" cold
 run_check enabled "$WORK/check.elisa" first
 compare_without_cache_report cold first
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=4 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/first.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/first.err"
 
 run_check enabled "$WORK/check.elisa" warm
 compare_without_cache_report cold warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=4 visited=4 rejected=0 ga_walks_skipped=2 published=yes' "$WORK/warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 visited=8 rejected=0 ga_walks_skipped=6 published=yes' "$WORK/warm.err"
 
 python3 - "$WORK/check.elisa" <<'PY'
 from pathlib import Path
@@ -105,15 +121,15 @@ PY
 run_check cold "$WORK/check.elisa" edited-cold
 run_check enabled "$WORK/check.elisa" edited-warm
 compare_without_cache_report edited-cold edited-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=3 visited=4 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/edited-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=7 visited=8 rejected=0 ga_walks_skipped=4 published=yes' "$WORK/edited-warm.err"
 
 run_check cold "$WORK/check.elisa" options-cold permissive
 run_check enabled "$WORK/check.elisa" options-warm permissive
 compare_without_cache_report options-cold options-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=4 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/options-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/options-warm.err"
 run_check enabled "$WORK/check.elisa" options-confirm-warm permissive
 compare_without_cache_report options-cold options-confirm-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=4 visited=4 rejected=0 ga_walks_skipped=1 published=yes' "$WORK/options-confirm-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 visited=8 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/options-confirm-warm.err"
 
 cache_file="$(find "$CACHE" -type f -name '*.elisa-semantic' -print -quit)"
 [[ -n "$cache_file" ]]
@@ -164,7 +180,7 @@ PY
 run_check cold "$WORK/check.elisa" forged-cold permissive
 run_check enabled "$WORK/check.elisa" forged-warm permissive
 compare_without_cache_report forged-cold forged-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=4 visited=4 rejected=0 ga_walks_skipped=1 published=yes' "$WORK/forged-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 visited=8 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/forged-warm.err"
 python3 - "$cache_file" <<'PY'
 from pathlib import Path
 import struct
@@ -191,7 +207,7 @@ printf 'corrupt' >"$cache_file"
 run_check cold "$WORK/check.elisa" corrupt-cold permissive
 run_check enabled "$WORK/check.elisa" corrupt-warm permissive
 compare_without_cache_report corrupt-cold corrupt-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=4 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/corrupt-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/corrupt-warm.err"
 
 CACHE="$WORK/generated-cache"
 mkdir -p "$CACHE"
@@ -215,4 +231,4 @@ run_check enabled "$WORK/generated.elisa" generated-warm
 compare_without_cache_report generated-cold generated-warm
 grep -Eq 'incremental-ga-cache: input=generated prior=valid matched=2 visited=2 rejected=0 ga_walks_skipped=2 published=yes' "$WORK/generated-warm.err"
 
-echo "incremental GA cache control OK: cold/warm parity, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"
+echo "incremental GA cache control OK: cold/warm parity, grant-only skip boundaries, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"
