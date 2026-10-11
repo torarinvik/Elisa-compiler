@@ -116,7 +116,7 @@ seed_build() {
   trap cleanup_seed_lock EXIT INT TERM HUP
   libdir="$("$LLVM_CONFIG" --libdir)"
   if [[ ! -x "$STAGE0_BIN" ]]; then
-    echo "seed requires stage0 elisac at ELISACORE_BIN=$STAGE0_BIN" >&2
+    echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$STAGE0_BIN" >&2
     exit 2
   fi
   # stage0 discharges the compiler's own contracts with an external z3. Without one on PATH
@@ -224,9 +224,9 @@ seed_build() {
   set -e
   if [[ "$seed_status" -ne 0 ]]; then
     if [[ "$seed_status" -gt 128 ]]; then
-      echo "seed: stage0 compiler terminated with status $seed_status (signal $((seed_status - 128)))" >&2
+      echo "seed: $seed_bootstrap_kind bootstrap compiler $STAGE0_BIN terminated with status $seed_status (signal $((seed_status - 128)))" >&2
     else
-      echo "seed: stage0 compiler failed with status $seed_status" >&2
+      echo "seed: $seed_bootstrap_kind bootstrap compiler $STAGE0_BIN failed with status $seed_status" >&2
     fi
     exit "$seed_status"
   fi

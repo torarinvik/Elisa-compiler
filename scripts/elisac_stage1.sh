@@ -7,7 +7,7 @@
 # Python extension pipeline are its own. What is left here is the two jobs that are
 # genuinely the host's:
 #
-#   * the SEED build (`--seed` / `--emit-driver`), which needs stage0, and the refusal to
+#   * the SEED build (`--seed` / `--emit-driver`), which needs a bootstrap compiler, and the refusal to
 #     run a product older than the sources it was built from;
 #   * running the compiler as a watched child so a runaway compile is killed with a message
 #     rather than by the OS — the one thing `exec` cannot do.
@@ -19,7 +19,7 @@
 # Usage:
 #   elisac_stage1.sh -o out.o source.elisa
 #   elisac_stage1.sh -emit wasm -o demo.wasm source.elisa
-#   elisac_stage1.sh --seed          # one-time seed build using stage0
+#   elisac_stage1.sh --seed          # seed build using the selected bootstrap compiler
 #   elisac_stage1.sh --emit-driver   # only build the product binary (needs seed elisac)
 set -euo pipefail
 
