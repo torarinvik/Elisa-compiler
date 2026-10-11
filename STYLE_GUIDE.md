@@ -62,6 +62,20 @@ sink(seed)
 The never-leak finding kind **plain** is the compiler's pointer to exactly these sites: a
 local whose last use is a statement with no value to bind.
 
+When consecutive statements update fields of the same record, group them with the
+record update syntax. Name the record once and use field names relative to it:
+
+```elisa
+state.bindings with {
+    names <- [],
+    slots <- [],
+    types <- []
+}
+```
+
+Keep the update at the scope where those changes occur; use `state.bindings` as the
+base when updating its fields, rather than mixing paths from different records.
+
 ## 2. Block expressions
 
 A binding whose initializer is an indented block; the last line is the value, and locals
