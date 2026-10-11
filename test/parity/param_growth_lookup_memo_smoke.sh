@@ -32,4 +32,4 @@ for opt in 0 2; do
         -Wl,-rpath,"$ELISA_LLVM_LIBDIR" $ELISA_LD_STACK_512M -o "$WORK/control-$opt"
     "$WORK/control-$opt"
 done
-echo "parameter-growth memo control OK at O0/O2: full accumulator result, exact keys, cached misses"
+echo "parameter-growth memo control OK at O0/O2: accumulator order/dedup, exact-key chain, cached misses"
