@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run stage1 gates on a remote Linux host against COMMITTED trees.
 #
-#   tools/remote/remote_gate.sh --host vast4 [options] <s1-rev> <gate|alias>...
-#   tools/remote/remote_gate.sh --host vast4 --attach <run-id>      # re-attach after a drop
+#   tools/remote/remote_gate.sh --host linux-gate [options] <s1-rev> <gate|alias>...
+#   tools/remote/remote_gate.sh --host linux-gate --attach <run-id>      # re-attach after a drop
 #
 # Options:
 #   --s1-repo PATH   repo/worktree holding <s1-rev> (default: this repo)

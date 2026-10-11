@@ -1,3 +1,8 @@
+# Current compute policy
+
+Use local compute; retired Vast endpoints and remote job paths in this historical
+plan are not prerequisites. Coordinate compiler seeds with other active agents.
+
 # Elisa — Memory Safety, Correctness, and Language Completion Plan
 
 ## Active execution priority — compiler throughput and iteration speed (2026-10-05)

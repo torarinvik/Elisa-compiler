@@ -3,10 +3,10 @@
 # nice does not protect the gates, so the fuzzer is small (4 jobs, inside our cpu-cap) and every
 # worker PAUSES while any remote_gate run holds /root/elisa/locks/active.lock.
 #
-#   tools/fuzz/launch.sh --host vast4 [--s1 REV] [--s0 REV] [--opt -O3] [--jobs 4]
+#   tools/fuzz/launch.sh --host linux-gate [--s1 REV] [--s0 REV] [--opt -O3] [--jobs 4]
 #                        [--extra-seeds REV:PATH]...   # e.g. FETCH_HEAD:test/fuzz_findings
-#   tools/fuzz/launch.sh --host vast4 --status NAME    # triage summary
-#   tools/fuzz/launch.sh --host vast4 --stop NAME
+#   tools/fuzz/launch.sh --host linux-gate --status NAME    # triage summary
+#   tools/fuzz/launch.sh --host linux-gate --stop NAME
 #
 # Uses the stage0 build and stage1 seed that tools/remote/remote_gate.sh caches for the same
 # (s1, s0, opt); run a gate for that rev first. Seeds: the .neg/.pos fixtures of the s1 tree

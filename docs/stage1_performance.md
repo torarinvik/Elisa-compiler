@@ -1,5 +1,11 @@
 # stage1 compile-speed tracking
 
+Current execution policy: use local compute. All rented Vast instances and their
+SSH endpoints below are historical evidence, not available infrastructure. Do not
+wait for or reconnect to them. Serialize local seeds and coordinate CPU use.
+Mac paired measurements are exploratory only; qualified speed claims require a
+controlled host and recorded toolchain.
+
 Targets (stage1 compiling itself, `src/driver/elisac.elisa`, ~253k lines after includes):
 
 | workload | target |
@@ -14,8 +20,8 @@ Generated-code quality is never traded for compile speed.
 
 ## Method
 
-- Machine: the 64-core Linux gate box (x86_64, LLVM 21); load average recorded per run.
-  Never time on the Mac (it is shared and overloaded).
+- Historical measurements used the 64-core Linux gate box (x86_64, LLVM 21).
+  That host is retired. Record the actual local host and contention for new runs.
 - `ELISA_STAGE1_TIMINGS=1` prints `stage1-timing: PHASE wall_ms=W cpu_ms=C` rows on stderr:
   read/includes, lex, parse, static-generate, each semantic pass that took >= 20 ms (the
   rest summed as "short passes"), LLVM IR generation, verify, optimise, object emission,

@@ -1,11 +1,12 @@
 # Remote gate hosts
 
-Run stage1 gates on rented Linux boxes from the Mac. Everything a box needs is in this
-directory, so a lost scratchpad or a dead box costs one command to rebuild.
+Local compute is the default. No Vast instance is required or assumed available.
+Use the local Stage1 wrapper and parity gates, coordinating seeds with other agents.
+These optional remote tools require an explicitly configured, currently verified host.
 
     cp tools/remote/hosts.local.sample tools/remote/hosts.local   # then edit: alias port user@host
-    tools/remote/setup_host.sh vast4                              # toolchain, idempotent (~1 min)
-    tools/remote/remote_gate.sh --host vast4 <rev> gen3 diag internal escape backend
+    tools/remote/setup_host.sh linux-gate                              # toolchain, idempotent (~1 min)
+    tools/remote/remote_gate.sh --host linux-gate <rev> gen3 diag internal escape backend
     tools/remote/hosts_status.sh                                  # load / disk / runs per host
 
 | file | role |
