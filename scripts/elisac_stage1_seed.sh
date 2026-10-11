@@ -28,6 +28,10 @@ seed_build() {
     if [[ -f "$seed_lock/pid" ]]; then
       seed_lock_pid="$(<"$seed_lock/pid")"
     fi
+    if [[ -z "$seed_lock_pid" ]]; then
+      echo "seed: lock owner is not yet recorded; refusing to reclaim $seed_lock" >&2
+      exit 2
+    fi
     if [[ -n "$seed_lock_pid" ]] && kill -0 "$seed_lock_pid" 2>/dev/null; then
       echo "seed: another stage1 seed is already running (pid $seed_lock_pid); refusing a concurrent high-memory build" >&2
       exit 2
@@ -57,6 +61,11 @@ seed_build() {
     global_seed_lock_pid=""
     if [[ -f "$global_seed_lock/pid" ]]; then
       global_seed_lock_pid="$(<"$global_seed_lock/pid")"
+    fi
+    if [[ -z "$global_seed_lock_pid" ]]; then
+      rmdir "$seed_lock" 2>/dev/null || true
+      echo "seed: global lock owner is not yet recorded; refusing to reclaim $global_seed_lock" >&2
+      exit 2
     fi
     if [[ -n "$global_seed_lock_pid" ]] && kill -0 "$global_seed_lock_pid" 2>/dev/null; then
       rm -f "$seed_lock/pid"
