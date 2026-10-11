@@ -336,6 +336,10 @@ run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i fo
 # the returned value, then branches per clause). A holding predicate costs nothing after the
 # optimizer, so the success path stays bit-comparable.
 run_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n' 42
+# The plural keyword is the same postcondition in the parser; it must reach the same
+# runtime guard instead of leaving the whole function unemittable.
+run_case contract_ensures_alias 'def inc(n: i64) -> i64:\n    ensures result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n' 42
+run_case contract_ensures_alias_false 'def bad(n: i64) -> i64:\n    ensures result > n\n    return n\n\ndef main() -> i64:\n    return bad(41)\n' 134
 # MULTIPLE clauses chain, and the predicate may read parameters as well as `result`.
 run_case contract_ensure_multi 'def maxi(a: i64, b: i64) -> i64:\n    ensure result >= a\n    ensure result >= b\n    return a if a > b else b\n\ndef main() -> i64:\n    return maxi(9, 33) + maxi(7, 2)\n' 40
 # A `-> void` function enforces parameter-only postconditions without a `result` value.
