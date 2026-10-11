@@ -63,7 +63,7 @@ for index, (name, source, expected) in enumerate(cases):
     cases[index] = name, source, expected
 
 for name, source, expected in cases:
-    result = subprocess.run([args.reporter], input=source, text=True, capture_output=True, check=True)
+    result = subprocess.run([args.reporter], input="# severity\n" + source, text=True, capture_output=True, check=True)
     assert result.stdout.startswith("P 0\n"), (name, result.stdout, result.stderr)
     messages = []
     severity = None
