@@ -1,5 +1,5 @@
 . "$(dirname "${BASH_SOURCE[0]}")/platform.sh"  # host flags/paths: scripts/platform.sh
-# The one-time SEED build: compile the stage1 product with stage0, under a per-worktree and a
+# The one-time SEED build: compile the stage1 product with the selected bootstrap compiler, under a per-worktree and a
 # global lock so two checkouts cannot fight over the same LLVM installation, and with an RSS
 # ceiling so a runaway compile is killed with a message rather than by the OS.
 #
@@ -44,7 +44,7 @@ seed_build() {
       exit 2
     }
   fi
-  # Worktrees have distinct local locks, but a stage0 seed is a host-wide high-memory
+  # Worktrees have distinct local locks, but a seed build is a host-wide high-memory
   # operation. Serialize all Elisa self-host seeds on this machine so independent Codex
   # worktrees cannot reproduce the multi-gigabyte contention that previously froze the host.
   # GUI tasks can receive distinct TMPDIR values, which defeats a purportedly
@@ -168,7 +168,10 @@ seed_build() {
     echo "seed: bootstrap runtime SHA-256 supplied without an object path" >&2
     exit 2
   fi
-  echo "seed: building product with $seed_bootstrap_kind $STAGE0_BIN" >&2
+  # A filename is not compiler provenance: copied products may be renamed.
+  # Identify the exact executable without guessing its implementation stage.
+  echo "seed: building Stage1 product with bootstrap compiler $STAGE0_BIN" >&2
+  echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$STAGE0_BIN" | awk '{print $1}')" >&2
   # The compiler itself is a large input. A duplicated seed can consume the whole
   # workstation before either invocation reports an error, so bound one seed by default.
   # The 5.5 GiB freeze came from two worktrees seeding at once; the host-wide global seed lock
@@ -189,7 +192,7 @@ seed_build() {
   seed_pid=$!
   seed_peak_rss_kb=0
   while kill -0 "$seed_pid" 2>/dev/null; do
-    # `kill -0` also succeeds for a zombie on macOS. A completed stage0 child
+    # `kill -0` also succeeds for a zombie on macOS. A completed bootstrap child
     # can therefore leave this loop spinning forever instead of reaching the
     # explicit `wait` below. Treat an absent or zombie process as terminal;
     # `wait` still collects the authoritative exit status.
@@ -224,9 +227,9 @@ seed_build() {
   set -e
   if [[ "$seed_status" -ne 0 ]]; then
     if [[ "$seed_status" -gt 128 ]]; then
-      echo "seed: $seed_bootstrap_kind bootstrap compiler $STAGE0_BIN terminated with status $seed_status (signal $((seed_status - 128)))" >&2
+      echo "seed: bootstrap compiler $STAGE0_BIN terminated with status $seed_status (signal $((seed_status - 128)))" >&2
     else
-      echo "seed: $seed_bootstrap_kind bootstrap compiler $STAGE0_BIN failed with status $seed_status" >&2
+      echo "seed: bootstrap compiler $STAGE0_BIN failed with status $seed_status" >&2
     fi
     exit "$seed_status"
   fi
