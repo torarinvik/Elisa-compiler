@@ -25,8 +25,11 @@ positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 helper_text = HELPER.read_text()
 parser_text = PARSER.read_text()
-parser_body = parser_text.split("def easm_parse_i64(text: sview) -> i64:", 1)[1].split(
-    "def easm_type_width(", 1
+parser_signature = "def easm_parse_i64_checked(text: sview) -> (valid: bool, value: i64):"
+if parser_signature not in parser_text:
+    raise SystemExit("production checked decimal parser is missing")
+parser_body = parser_text.split(parser_signature, 1)[1].split(
+    "\n        def easm_parse_i64(text: sview) -> i64:", 1
 )[0]
 if 'include "../../src/backend/easm_checked_decimal.elisa"' not in positive_text:
     raise SystemExit("sequence proof no longer includes the production checked-digit helper")
@@ -34,7 +37,7 @@ for helper in ("append_positive_digit", "append_negative_digit"):
     if f"def {helper}(" not in helper_text or f"EasmCheckedDecimal::{helper}(value, digit)" not in positive_text:
         raise SystemExit(f"sequence fold no longer uses the production {helper} helper")
 loop_start = parser_body.find("while position < sview_len(text)")
-loop_end = parser_body.find("return value", loop_start)
+loop_end = parser_body.find("return (true, value)", loop_start)
 if loop_start < 0 or loop_end < 0:
     raise SystemExit("signed decimal parser no longer has a bounded digit loop")
 loop_body = parser_body[loop_start:loop_end]
@@ -44,7 +47,7 @@ if "EasmCheckedDecimal::append_negative_digit(value, digit)" not in loop_body:
     raise SystemExit("negative parser path no longer uses the proved checked-digit helper")
 for fragment in (
     "byte: u8 = sview_at(text, position)",
-    "return 0 if byte < EasmCheckedDecimal::ASCII_DIGIT_ZERO or byte > EasmCheckedDecimal::ASCII_DIGIT_NINE",
+    "return (false, 0) if byte < EasmCheckedDecimal::ASCII_DIGIT_ZERO or byte > EasmCheckedDecimal::ASCII_DIGIT_NINE",
     "digit: i64 = (byte - EasmCheckedDecimal::ASCII_DIGIT_ZERO).i64()",
 ):
     if fragment not in loop_body:
@@ -52,26 +55,47 @@ for fragment in (
 for helper in ("append_positive_digit", "append_negative_digit"):
     call = f"EasmCheckedDecimal::{helper}(value, digit)"
     call_at = loop_body.index(call)
-    reject_at = loop_body.index("return 0 if not step.valid", call_at)
+    reject_at = loop_body.index("return (false, 0) if not step.valid", call_at)
     update_at = loop_body.index("value <- step.value", reject_at)
     advance_at = loop_body.index("position <- position + 1", update_at)
     if not call_at < reject_at < update_at < advance_at:
         raise SystemExit(f"parser does not reject failed {helper} steps before updating its accumulator")
 
 positive_names = {
+    "positive_decimal_fold_spec",
+    "negative_decimal_fold_spec",
     "fold_positive_decimal_digits",
     "fold_negative_decimal_digits",
     "positive_decimal_fold_accepts_exact_i64_max",
     "negative_decimal_fold_accepts_exact_i64_min",
     "positive_decimal_fold_rejects_one_past_i64_max",
     "negative_decimal_fold_rejects_one_below_i64_min",
+    "positive_decimal_fold_rejects_digit_above_nine",
+    "negative_decimal_fold_rejects_negative_digit",
 }
 for name in positive_names:
     if f"def {name}(" not in positive_text:
         raise SystemExit(f"positive theorem missing: {name}")
+
+positive_spec = positive_text.split("def positive_decimal_fold_spec(", 1)[1].split("\ndef ", 1)[0]
+negative_spec = positive_text.split("def negative_decimal_fold_spec(", 1)[1].split("\ndef ", 1)[0]
+for spec_name, spec_body in (("positive", positive_spec), ("negative", negative_spec)):
+    if "EasmCheckedDecimal::append_" in spec_body:
+        raise SystemExit(f"{spec_name} decimal reference spec delegates to the production helper")
+    if "decreases digits.count - position" not in spec_body or "digit: i64 = digits[position]" not in spec_body:
+        raise SystemExit(f"{spec_name} decimal reference spec lost its recursive digit step")
+positive_fold = positive_text.split("def fold_positive_decimal_digits(", 1)[1].split("\ndef ", 1)[0]
+negative_fold = positive_text.split("def fold_negative_decimal_digits(", 1)[1].split("\ndef ", 1)[0]
+for sign, fold_body in (("positive", positive_fold), ("negative", negative_fold)):
+    if f"ensure result.valid == {sign}_decimal_fold_spec(digits, position, value).valid" not in fold_body:
+        raise SystemExit(f"{sign} production fold no longer proves specification validity equivalence")
+    if f"ensure result.value == {sign}_decimal_fold_spec(digits, position, value).value" not in fold_body:
+        raise SystemExit(f"{sign} production fold no longer proves specification value equivalence")
 negative_names = {
     "positive_decimal_fold_accepts_one_past_i64_max",
     "negative_decimal_fold_accepts_one_below_i64_min",
+    "positive_decimal_fold_accepts_digit_above_nine",
+    "negative_decimal_fold_accepts_negative_digit",
 }
 for name in negative_names:
     if f"def {name}(" not in negative_text:
@@ -137,7 +161,7 @@ assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest(
 assert require_current_product(BIN, PROVER) == product_manifest
 print(json.dumps({
     "admitted": True,
-    "scope": "arbitrary repeated decimal accumulation stays within exact signed i64 bounds",
+    "scope": "production decimal folds refine independent signed-i64 decimal specifications and stay within exact bounds",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_revision": product_manifest["proof"].get("head"),

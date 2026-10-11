@@ -56,6 +56,94 @@ expected_return = (
 )
 if expected_return not in compact(function_body):
     raise SystemExit("production predicate no longer checks the exact named byte set")
+def function_body(name: str, signature: str) -> str:
+    if signature not in project_text:
+        raise SystemExit(f"production project helper is missing: {name}")
+    return project_text.split(signature, 1)[1].split("\n    def ", 1)[0]
+
+
+trim_start_body = function_body(
+    "bytes_trim_start", "def bytes_trim_start(value: darray[u8]&) -> usize:"
+)
+trim_end_body = function_body(
+    "bytes_trim_end", "def bytes_trim_end(value: darray[u8]&) -> usize:"
+)
+blank_body = function_body(
+    "bytes_is_blank", "def bytes_is_blank(value: darray[u8]&) -> bool:"
+)
+trimmed_body = function_body(
+    "bytes_trimmed", "def bytes_trimmed(value: darray[u8]&) -> darray[u8]:"
+)
+extend_span_body = function_body(
+    "bytes_extend_span",
+    "def bytes_extend_span(target: mutable darray[u8]&, source: darray[u8]&, start: usize, length: usize) -> void:",
+)
+extend_view_body = function_body(
+    "bytes_extend_view", "def bytes_extend_view(target: mutable darray[u8]&, text: sview) -> void:"
+)
+equal_view_body = function_body(
+    "bytes_equal_view", "def bytes_equal_view(value: darray[u8]&, text: sview) -> bool:"
+)
+default_body = function_body(
+    "bytes_or_default",
+    "def bytes_or_default(value: darray[u8]&, fallback: sview) -> darray[u8]:",
+)
+for fragment in (
+    "while first < value.count",
+    "break if not bytes_is_space(value[first])",
+    "first <- first + 1.usize()",
+    "return first",
+):
+    if compact(fragment) not in compact(trim_start_body):
+        raise SystemExit(f"production leading trim no longer has its bounded first-nonspace scan: {fragment}")
+for fragment in (
+    "first: usize = bytes_trim_start(value)",
+    "while last > first",
+    "break if not bytes_is_space(value[last - 1.usize()])",
+    "last <- last - 1.usize()",
+    "return last",
+):
+    if compact(fragment) not in compact(trim_end_body):
+        raise SystemExit(f"production trailing trim no longer preserves the nonspace interval: {fragment}")
+if compact("return bytes_trim_start(value) == value.count") not in compact(blank_body):
+    raise SystemExit("production blank predicate no longer uses the leading trim boundary")
+for fragment in (
+    "start: usize = bytes_trim_start(value)",
+    "end: usize = bytes_trim_end(value)",
+    "bytes_extend_span(&out, value, start, end - start)",
+    "return out",
+):
+    if compact(fragment) not in compact(trimmed_body):
+        raise SystemExit(f"production byte trimming no longer copies its computed interval: {fragment}")
+for fragment in (
+    "for index in 0..<length |target, source, start|",
+    "target.push(source[start + index])",
+):
+    if compact(fragment) not in compact(extend_span_body):
+        raise SystemExit(f"production span copy no longer preserves each selected byte: {fragment}")
+for fragment in (
+    "if bytes_is_blank(value):",
+    "bytes_extend_view(&out, fallback)",
+    "return out",
+    "bytes_extend(&out, value)",
+):
+    if compact(fragment) not in compact(default_body):
+        raise SystemExit(f"production project default no longer selects the blank fallback: {fragment}")
+for fragment in (
+    "length: i64 = sview_len(text).i64()",
+    "for index in 0..<length |target, text|",
+    "target.push(sview_at(text, index))",
+):
+    if compact(fragment) not in compact(extend_view_body):
+        raise SystemExit(f"production view copy no longer preserves fallback bytes: {fragment}")
+for fragment in (
+    "false return if value.count.i64() != sview_len(text).i64()",
+    "for index in 0..<value.count |value, text|",
+    "false return if value[index] != sview_at(text, index.i64())",
+    "return true",
+):
+    if compact(fragment) not in compact(equal_view_body):
+        raise SystemExit(f"production view equality no longer checks the exact byte sequence: {fragment}")
 for name, value in EXPECTED_VALUES.items():
     if not re.search(rf"\b{name}: u8 = {value}\b", project_text):
         raise SystemExit(f"missing or changed named byte constant: {name} = {value}")
@@ -137,6 +225,11 @@ assert {
     "production_predicate_matches_its_exact_byte_set",
     "all_project_whitespace_bytes_are_recognized",
     "nearby_ascii_controls_are_not_project_whitespace",
+    "non_space_singleton_is_preserved_by_project_trimming",
+    "whitespace_singleton_trims_to_blank",
+    "surrounding_project_whitespace_preserves_the_middle_byte",
+    "blank_project_value_uses_the_fallback",
+    "nonblank_project_value_is_preserved",
 } <= verified
 
 code, negative = run(NEGATIVE)
@@ -145,6 +238,8 @@ assert [(row["kind"], row["name"]) for row in negative["findings"]] == [
     ("ensure-unproven", "vertical_tab_is_project_whitespace"),
     ("ensure-unproven", "form_feed_is_project_whitespace"),
     ("ensure-unproven", "exclamation_mark_is_project_whitespace"),
+    ("ensure-unproven", "a_non_space_singleton_can_be_blank"),
+    ("ensure-unproven", "blank_project_value_can_ignore_fallback"),
 ]
 assert require_current_product(BIN, PROVER) == manifest, "proof product changed during replay"
 assert subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -153,7 +248,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "exact source-linked project whitespace byte predicate",
+    "scope": "project whitespace predicate, trim boundaries, and blank-value defaults",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": [row["name"] for row in negative["findings"]],
     "proof_revision": manifest["proof"].get("head"),

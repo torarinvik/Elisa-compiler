@@ -17,7 +17,7 @@ proves that from the source, conservatively:
   * an AST write is any AST node construction (a variant of Expr/Stmt/Decl/Pattern/Node used
     as a value): it grows the shared AST store.
 
-Passes run in `check_full_into` (semantic_api.elisa) as `table <- pass(ARGS) [if COND]`. A
+Passes run in `check_full_into_pipeline` (semantic_api.elisa) as `table <- pass(ARGS) [if COND]`. A
 maximal run of consecutive append-only passes whose ARGS/COND use only `file`, `loop_view`,
 `table` and the function's scalar flags becomes one `par_pass_run` call; the passes go into
 semantic_parallel_passes.elisa by id, in pipeline order (the splice order).
@@ -25,7 +25,7 @@ semantic_parallel_passes.elisa by id, in pipeline order (the splice order).
   semantic_parallel_gen.py --check      verify every pass in semantic_parallel_passes.elisa
                                         (exit 1 naming each one that is not append-only)
   semantic_parallel_gen.py --write      rewrite semantic_api.elisa runs + the passes file
-                                        (input: the sequential pipeline; idempotent on it)
+                                        (input: sequential or already generated pipeline)
   semantic_parallel_gen.py --report     list every pipeline pass and its classification
 """
 import collections
@@ -37,13 +37,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
 API = os.path.join(SRC, "semantic", "semantic_api.elisa")
 PASSES = os.path.join(SRC, "semantic", "semantic_parallel_passes.elisa")
-PIPELINE = "check_full_into"
+PIPELINE = "check_full_into_pipeline"
+PIPELINE_CONTEXT = {"file", "table", "shared_pool", "snapshot", "incremental_skip_count", "enforce_mutable_global_grants"}
 MIN_RUN = 2
 MUTATORS = r"push|extend|pop|clear|insert|remove|truncate|reserve|resize|set|swap|sort|append"
 DEF_RE = re.compile(r"^(\s*)def (\w+)(?:\[[^\]]*\])?\((.*?)\)\s*(?:->|:)")
 TABLE_DECL_RE = re.compile(r"\b(\w+)\s*:\s*(?:lmut\s+|mutable\s+|heap\s+)*SymbolTable\b")
 GLOBAL_RE = re.compile(r"^\s*global\s+mutable\s+(\w+)")
 CALL_RE = re.compile(r"\b(\w+)\s*(?:\[[^\]\n]*\])?\(")
+PAR_RUN_RE = re.compile(
+    r"^([ \t]*table <- par_pass_run\(file, &loop_view, flags, table, )"
+    r"(shared_pool, )?(\d+), (\d+)\)([ \t]+can[ \t]+[^\n]+)?[ \t]*$"
+)
+PAR_RUN_ANY_RE = re.compile(r"\bpar_pass_run\s*\(")
+PAR_PASS_ARM_RE = re.compile(r"^([ \t]*)(if|elif) pass_id == (\d+):[ \t]*$")
+PAR_PASS_ARM_ANY_RE = re.compile(r"\bpass_id\s*==")
 
 
 def elisa_files():
@@ -101,6 +109,88 @@ def strip_comments(text):
             i += 1
         out.append(line[:cut])
     return "\n".join(out)
+
+
+def par_run_calls(lines, offset=0):
+    """Parse every par_pass_run call in a line sequence, rejecting partial matches."""
+    calls, errors = [], []
+    for index, line in enumerate(lines):
+        code = strip_comments(line)
+        if not PAR_RUN_ANY_RE.search(code):
+            continue
+        match = PAR_RUN_RE.fullmatch(code)
+        if match is None:
+            errors.append(offset + index + 1)
+            continue
+        calls.append({"line": offset + index, "match": match,
+                      "start": int(match.group(3)), "count": int(match.group(4))})
+    return calls, errors
+
+
+def normalized_par_run_line(line, match):
+    """Add the pool parameter to a valid generated call, preserving effects and indentation."""
+    return (match.group(1) + "shared_pool, " + match.group(3) + ", " + match.group(4) + ")"
+            + (match.group(5) or ""))
+
+
+def parse_parallel_dispatch(source):
+    """Return dispatcher arms as (id, pass name, args, condition), plus structural errors."""
+    lines = source.splitlines()
+    definition = next((i for i, line in enumerate(lines)
+                       if re.match(r"^[ \t]*def par_pass_call\(", line)), None)
+    if definition is None:
+        return [], ["semantic_parallel_passes.elisa: missing par_pass_call dispatcher"]
+
+    def_indent = len(lines[definition]) - len(lines[definition].lstrip())
+    end = definition + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= def_indent:
+            break
+        end += 1
+
+    arms, errors = [], []
+    for index in range(definition + 1, end):
+        code = strip_comments(lines[index]).strip()
+        if not PAR_PASS_ARM_ANY_RE.search(code):
+            continue
+        match = PAR_PASS_ARM_RE.fullmatch(lines[index])
+        if match is None:
+            errors.append("semantic_parallel_passes.elisa:%d: malformed pass_id arm" % (index + 1))
+            continue
+        arms.append((index, len(match.group(1)), match.group(2), int(match.group(3))))
+
+    records = []
+    for arm_index, (line_index, arm_indent, arm_kind, pass_id) in enumerate(arms):
+        expected_kind = "if" if arm_index == 0 else "elif"
+        if arm_kind != expected_kind:
+            errors.append("semantic_parallel_passes.elisa:%d: expected %s for pass_id %d" %
+                          (line_index + 1, expected_kind, pass_id))
+        stop = arms[arm_index + 1][0] if arm_index + 1 < len(arms) else end
+        body = []
+        for index in range(line_index + 1, stop):
+            code = strip_comments(lines[index]).strip()
+            if code:
+                body.append((index, len(lines[index]) - len(lines[index].lstrip()), code))
+        if len(body) != 1 or body[0][1] <= arm_indent:
+            errors.append("semantic_parallel_passes.elisa:%d: pass_id %d must have exactly one body statement" %
+                          (line_index + 1, pass_id))
+            continue
+        body_index, _indent, statement = body[0]
+        parsed = parse_table_call_statement(statement)
+        if parsed is None:
+            errors.append("semantic_parallel_passes.elisa:%d: unrecognized dispatcher call for pass_id %d" %
+                          (body_index + 1, pass_id))
+            continue
+        records.append({"id": pass_id, "name": parsed["name"], "args": parsed["args"],
+                        "condition": parsed["cond"]})
+
+    table_calls = [line for line in lines[definition:end]
+                   if re.match(r"^[ \t]*table <- \w+\(", strip_comments(line))]
+    if len(table_calls) != len(records):
+        errors.append("semantic_parallel_passes.elisa: dispatcher table calls do not map one-to-one to pass_id arms")
+
+    return records, errors
 
 
 AST_VARIANT_RE = re.compile(r"(?<![\w.:])(?:Ast::)?(Expr|Stmt|Decl|Pattern|Node)\.([A-Z]\w*)\b")
@@ -216,7 +306,7 @@ def append_only(info, name):
 
 def pipeline_statements():
     """(line index, indent, pass name, args, cond) for each `table <- pass(...)` statement in
-    check_full_into, plus the function's parameter names."""
+    check_full_into_pipeline, plus the function's parameter names."""
     lines = open(API, encoding="utf-8").read().split("\n")
     start = next(i for i, l in enumerate(lines) if re.match(r"\s*def " + PIPELINE + r"\(", l))
     params = [p.split(":")[0].strip() for p in DEF_RE.match(lines[start]).group(3).split(",")]
@@ -227,8 +317,97 @@ def pipeline_statements():
     return lines, start, end, params
 
 
-STMT_RE = re.compile(r"^(\s*)table <- (\w+)\((.*)\)(?: if (.+))?$")
+TABLE_CALL_PREFIX_RE = re.compile(r"^([ \t]*)table <- (\w+)\(")
 TIMER_RE = re.compile(r'^\s*PhaseTimer::minor\("[^"]*"\)$')
+
+
+def parse_table_call_statement(line):
+    """Parse one table-rebinding call, including balanced args and trailing `if`/`can` clauses."""
+    code = strip_comments(line)
+    prefix = TABLE_CALL_PREFIX_RE.match(code)
+    if prefix is None:
+        return None
+
+    open_paren = prefix.end() - 1
+    depth = 0
+    quote = None
+    escaped = False
+    close_paren = None
+    for index in range(open_paren, len(code)):
+        char = code[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = index
+                break
+    if close_paren is None:
+        return None
+
+    suffix = code[close_paren + 1:].strip()
+    markers = []
+    paren_depth = bracket_depth = brace_depth = 0
+    quote = None
+    escaped = False
+    for index, char in enumerate(suffix):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            continue
+        if paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+            if (index == 0 or suffix[index - 1].isspace()) and suffix.startswith("if ", index):
+                markers.append((index, "if", 3))
+            elif (index == 0 or suffix[index - 1].isspace()) and suffix.startswith("can ", index):
+                markers.append((index, "can", 4))
+        if char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth -= 1
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth -= 1
+        elif char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth -= 1
+
+    if suffix and (not markers or markers[0][0] != 0 or len({kind for _, kind, _ in markers}) != len(markers)):
+        return None
+    condition = None
+    for marker_index, kind, token_len in markers:
+        next_index = next((other_index for other_index, _, _ in markers if other_index > marker_index), len(suffix))
+        value = suffix[marker_index + token_len:next_index].strip()
+        if not value:
+            return None
+        if kind == "if":
+            condition = value
+
+    return {
+        "indent": prefix.group(1),
+        "name": prefix.group(2),
+        "args": code[open_paren + 1:close_paren],
+        "cond": condition,
+        "suffix": suffix,
+    }
 
 
 def eligible_args(args, cond, flags):
@@ -244,16 +423,17 @@ def eligible_args(args, cond, flags):
 
 def plan_runs(info):
     lines, start, end, params = pipeline_statements()
-    flags = [p for p in params if p not in ("file", "table")]
+    flags = [p for p in params if p not in PIPELINE_CONTEXT]
     stmts = []
     i = start + 1
     while i < end:
-        m = STMT_RE.match(lines[i])
-        if m:
-            name, args, cond = m.group(2), m.group(3), m.group(4)
+        parsed = parse_table_call_statement(lines[i])
+        if parsed:
+            name, args, cond = parsed["name"], parsed["args"], parsed["cond"]
             ok, _, _ = append_only(info, name)
             timer = i + 1 < end and TIMER_RE.match(lines[i + 1])
-            stmts.append({"line": i, "indent": m.group(1), "name": name, "args": args, "cond": cond,
+            stmts.append({"line": i, "indent": parsed["indent"], "name": name, "args": args,
+                          "cond": cond, "suffix": parsed["suffix"],
                           "ok": ok and eligible_args(args, cond, flags) and bool(timer), "timer": bool(timer)})
         i += 1
     runs, current = [], []
@@ -269,9 +449,35 @@ def plan_runs(info):
     return lines, flags, stmts, runs
 
 
+def has_mixed_generated_and_sequential_runs(lines, start, end, runs):
+    return bool(runs) and any(PAR_RUN_ANY_RE.search(strip_comments(line)) for line in lines[start:end])
+
+
 def emit(info):
     lines, flags, _stmts, runs = plan_runs(info)
     _lines, start, end, _params = pipeline_statements()
+    all_generated_calls, malformed_lines = par_run_calls(lines)
+    if malformed_lines:
+        locations = ", ".join(str(line) for line in malformed_lines)
+        raise ValueError("par_pass_run call does not match the generated call shape at semantic_api.elisa line(s) " + locations)
+    generated_calls = [call for call in all_generated_calls if start <= call["line"] < end]
+    if len(generated_calls) != len(all_generated_calls):
+        raise ValueError("par_pass_run call found outside check_full_into_pipeline")
+    has_generated_runs = bool(generated_calls)
+    if has_mixed_generated_and_sequential_runs(lines, start, end, runs):
+        raise ValueError("mixed generated par_pass_run calls and sequential eligible runs; restore a fully sequential pipeline before regenerating")
+    # The checked-in API is already generated. Keep --write idempotent on that form too:
+    # refresh its call and flag shapes, but retain the audited pass dispatcher below.
+    if has_generated_runs:
+        out = list(lines)
+        for call in generated_calls:
+            out[call["line"]] = normalized_par_run_line(out[call["line"]], call["match"])
+        initializer = "flags: ParPassFlags = ParPassFlags{%s}" % ", ".join("%s: %s" % (flag, flag) for flag in flags)
+        for i, line in enumerate(out):
+            if re.match(r"\s*flags: ParPassFlags\s*=\s*ParPassFlags\{", line):
+                indent = line[:len(line) - len(line.lstrip())]
+                out[i] = indent + initializer
+        return out, flags, [], []
     out = list(lines)
     calls = []
     pass_id = 0
@@ -282,7 +488,7 @@ def emit(info):
             pass_id += 1
         head = run[0]
         new = [head["indent"] + "# Append-only passes %d..%d, run concurrently (semantic_parallel.elisa)." % (first, pass_id - 1),
-               head["indent"] + "table <- par_pass_run(file, &loop_view, flags, table, %d, %d)" % (first, len(run)),
+               head["indent"] + "table <- par_pass_run(file, &loop_view, flags, table, shared_pool, %d, %d)" % (first, len(run)),
                head["indent"] + 'PhaseTimer::minor("sem:par_run_%d")' % k]
         for s in run:
             out[s["line"]] = None
@@ -301,10 +507,10 @@ def emit(info):
     return flat, flags, calls, runs
 
 
-def passes_source(flags, calls):
+def passes_source(flags, calls, max_batch):
     head = """# Stage1 semantic layer — the passes semantic_parallel.elisa may run concurrently, by id.
 # GENERATED by scripts/semantic_parallel_gen.py --write from the sequential pipeline in
-# semantic_api.elisa (check_full_into); `--check` proves every pass below append-only.
+# semantic_api.elisa (check_full_into_pipeline); `--check` proves every pass below append-only.
 # Ids follow pipeline order, which is the order par_pass_run splices diagnostics in.
 #
 # Continues semantic_api.elisa.
@@ -314,7 +520,10 @@ extend Semantic:
 """
     _lines, start, _end, _params = pipeline_statements()
     types = dict((p.split(":", 1)[0].strip(), p.split(":", 1)[1].strip()) for p in DEF_RE.match(_lines[start]).group(3).split(","))
-    body = ["        # check_full_into's flags, for the passes' arguments and conditions.",
+    body = ["        # Largest generated batch; the shared semantic pool is capped to this size.",
+            "        const PAR_PASS_MAX_BATCH: usize = %d" % max_batch,
+            "",
+            "        # check_full_into_pipeline's flags, for the passes' arguments and conditions.",
             "        struct ParPassFlags:"]
     body += ["            %s: %s" % (f, types[f]) for f in flags]
     body += ["",
@@ -322,13 +531,116 @@ extend Semantic:
             "            can Memory.Allocate, Abort.Panic:"]
     for n, (pid, s) in enumerate(calls):
         args = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", s["args"]) if flags else s["args"]
-        cond = s["cond"]
-        if cond:
-            cond = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", cond)
+        suffix = s.get("suffix", "")
+        if suffix and flags:
+            suffix = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", suffix)
         kw = "if" if n == 0 else "elif"
         body.append("                %s pass_id == %d:" % (kw, pid))
-        body.append("                    table <- %s(%s)%s" % (s["name"], args, (" if " + cond) if cond else ""))
+        body.append("                    table <- %s(%s)%s" % (s["name"], args, (" " + suffix) if suffix else ""))
     return head + "\n".join(body) + "\n"
+
+
+def refresh_max_batch(source, max_batch):
+    """Update only the generated pool bound while preserving an existing pass dispatcher."""
+    line = "        const PAR_PASS_MAX_BATCH: usize = %d" % max_batch
+    pattern = re.compile(r"^[ \t]*const PAR_PASS_MAX_BATCH: usize = \d+[ \t]*$")
+    lines = source.splitlines()
+    for index, existing in enumerate(lines):
+        if pattern.fullmatch(existing):
+            lines[index] = line
+            next_line = index + 1
+            while next_line < len(lines) and not lines[next_line].strip():
+                next_line += 1
+            lines[index + 1:next_line] = [""]
+            return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+    private = next((i for i, existing in enumerate(lines) if re.fullmatch(r"[ \t]*private:[ \t]*", existing)), None)
+    if private is None:
+        raise ValueError("cannot find private section in generated semantic pass file")
+    lines[private + 1:private + 1] = [line, ""]
+    return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+
+def refresh_pass_flags(source, flags):
+    """Refresh the flag record shape without regenerating its audited dispatch body."""
+    _lines, start, _end, _params = pipeline_statements()
+    types = dict((p.split(":", 1)[0].strip(), p.split(":", 1)[1].strip())
+                 for p in DEF_RE.match(_lines[start]).group(3).split(","))
+    fields = "\n".join("            %s: %s" % (flag, types[flag]) for flag in flags)
+    pattern = re.compile(r"(^        struct ParPassFlags:\n)(?:^[ \t]+\w+: [^\n]*\n)*", re.M)
+    updated, count = pattern.subn(lambda m: m.group(1) + fields + "\n", source, count=1)
+    if count != 1:
+        raise ValueError("cannot find ParPassFlags in generated semantic pass file")
+    return updated
+
+
+def generated_parallel_errors(info):
+    """Validate generated pipeline ranges against the dispatcher's ordered pass IDs."""
+    api = open(API, encoding="utf-8").read()
+    passes = open(PASSES, encoding="utf-8").read()
+    parallel = open(os.path.join(SRC, "semantic", "semantic_parallel.elisa"), encoding="utf-8").read()
+    errors = []
+    api_lines = api.splitlines()
+    all_calls, malformed_lines = par_run_calls(api_lines)
+    for line_number in malformed_lines:
+        errors.append("semantic_api.elisa:%d: par_pass_run call does not match the generated call shape" % line_number)
+    lines, start, end, _params = pipeline_statements()
+    _lines, _flags, _stmts, sequential_runs = plan_runs(info)
+    pipeline_calls, _pipeline_malformed = par_run_calls(lines[start:end], start)
+    if has_mixed_generated_and_sequential_runs(lines, start, end, sequential_runs):
+        errors.append("semantic_api.elisa: mixed generated batches and sequential eligible runs; regenerate from a fully sequential pipeline")
+    pipeline_line_numbers = set(range(start, end))
+    outside_calls = [call for call in all_calls if call["line"] not in pipeline_line_numbers]
+    if outside_calls:
+        errors.append("semantic_api.elisa: par_pass_run call found outside check_full_into_pipeline")
+    if not pipeline_calls:
+        errors.append("semantic_api.elisa: no generated par_pass_run calls found")
+    if any(call["match"].group(2) is None for call in pipeline_calls):
+        errors.append("semantic_api.elisa: generated par_pass_run call is missing shared_pool")
+    counts = [call["count"] for call in pipeline_calls]
+    max_batch = max(counts, default=1)
+    bound = re.search(r"^\s*const PAR_PASS_MAX_BATCH: usize = (\d+)\s*$", passes, re.M)
+    if bound is None:
+        errors.append("semantic_parallel_passes.elisa: missing PAR_PASS_MAX_BATCH")
+    elif int(bound.group(1)) != max_batch:
+        errors.append("semantic_parallel_passes.elisa: PAR_PASS_MAX_BATCH does not match the largest run")
+
+    pipeline_ids = []
+    for call in pipeline_calls:
+        if call["count"] <= 0:
+            errors.append("semantic_api.elisa:%d: generated par_pass_run count must be positive" % (call["line"] + 1))
+            continue
+        if call["start"] < 0:
+            errors.append("semantic_api.elisa:%d: generated par_pass_run start must not be negative" % (call["line"] + 1))
+        pipeline_ids.extend(range(call["start"], call["start"] + call["count"]))
+    if pipeline_ids != list(range(len(pipeline_ids))):
+        errors.append("semantic_api.elisa: generated pass ranges must cover IDs once, in pipeline order, starting at 0")
+
+    dispatch, dispatch_errors = parse_parallel_dispatch(passes)
+    errors.extend(dispatch_errors)
+    dispatch_ids = [record["id"] for record in dispatch]
+    if dispatch_ids != pipeline_ids:
+        errors.append("semantic_parallel_passes.elisa: dispatcher pass IDs/order do not match semantic_api.elisa ranges")
+    if len({record["id"] for record in dispatch}) != len(dispatch):
+        errors.append("semantic_parallel_passes.elisa: duplicate dispatcher pass ID")
+    # Names, arguments, and conditions are parsed as one record per ID. The generated pipeline
+    # retains only batch ranges, so only IDs and their order can be independently compared here.
+    for record in dispatch:
+        if not record["name"] or not record["args"].strip():
+            errors.append("semantic_parallel_passes.elisa: incomplete dispatcher mapping for pass_id %d" % record["id"])
+
+    _lines, _start, _end, params = pipeline_statements()
+    expected_flags = [p for p in params if p not in PIPELINE_CONTEXT]
+    flag_struct = re.search(r"struct ParPassFlags:\n((?:\s{12}\w+: [^\n]+\n)+)", passes)
+    actual_flags = re.findall(r"^\s{12}(\w+):", flag_struct.group(1), re.M) if flag_struct else []
+    if actual_flags != expected_flags:
+        errors.append("semantic_parallel_passes.elisa: ParPassFlags does not match pipeline scalar flags")
+    flag_init = re.search(r"^\s*flags: ParPassFlags\s*=\s*ParPassFlags\{([^}]+)\}", api, re.M)
+    initialized_flags = re.findall(r"\b(\w+):", flag_init.group(1)) if flag_init else []
+    if initialized_flags != expected_flags:
+        errors.append("semantic_api.elisa: ParPassFlags initializer does not match pipeline scalar flags")
+    if not re.search(r"def par_pass_run\([^\n]*shared_pool: mutable ThreadPool&", parallel):
+        errors.append("semantic_parallel.elisa: par_pass_run does not accept the shared pool")
+    return errors
 
 
 def listed_passes():
@@ -343,6 +655,7 @@ def main(argv):
     info = analyze(defs, globals_)
     if mode == "--check":
         bad = []
+        bad.extend(generated_parallel_errors(info))
         for name in listed_passes():
             ok, writes, reads = append_only(info, name)
             if not ok:
@@ -370,9 +683,21 @@ def main(argv):
         print("runs", len(runs), "passes in runs", sum(len(r) for r in runs), "of", len(stmts))
         return 0
     if mode == "--write":
-        flat, flags, calls, runs = emit(info)
+        try:
+            flat, flags, calls, runs = emit(info)
+        except ValueError as error:
+            print("semantic_parallel_gen: refusing --write: " + str(error))
+            return 1
         open(API, "w", encoding="utf-8").write("\n".join(flat))
-        open(PASSES, "w", encoding="utf-8").write(passes_source(flags, calls))
+        generated_counts = [int(m.group(4)) for line in flat for m in [PAR_RUN_RE.search(line)] if m]
+        if calls or not generated_counts:
+            max_batch = max((len(run) for run in runs), default=1)
+            open(PASSES, "w", encoding="utf-8").write(passes_source(flags, calls, max_batch))
+        else:
+            max_batch = max(generated_counts)
+            current = open(PASSES, encoding="utf-8").read()
+            current = refresh_max_batch(current, max_batch)
+            open(PASSES, "w", encoding="utf-8").write(refresh_pass_flags(current, flags))
         print("semantic_parallel_gen: %d runs, %d passes; flags %s" % (len(runs), len(calls), flags))
         return 0
     print(__doc__)

@@ -4,6 +4,51 @@ from pathlib import Path
 import re
 
 
+def diagnostic_literal(section: str) -> str:
+    """Return a Diagnostic initializer body, respecting nested effect-set braces."""
+    marker = section.find("Diagnostic{")
+    assert marker >= 0, "missing Diagnostic initializer"
+    opening = marker + len("Diagnostic")
+    depth = 0
+    in_string = False
+    escaped = False
+    in_comment = False
+    for index in range(opening, len(section)):
+        char = section[index]
+        if in_comment:
+            if char == "\n":
+                in_comment = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == "#":
+            in_comment = True
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return section[opening + 1:index]
+    raise AssertionError("unterminated Diagnostic initializer")
+
+
+def normalized_expression(expression: str) -> str:
+    """Ignore harmless grouping and explicit effect rows around an initializer call."""
+    value = expression.rstrip(",").strip()
+    if value.startswith("(") and value.endswith(")"):
+        value = value[1:-1].strip()
+    value = re.sub(r"\s+can Global\{Read,Write\}$", "", value)
+    return value
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     types = (root / "src/semantic/semantic_types.elisa").read_text()
@@ -18,7 +63,7 @@ def main() -> None:
     assert len(copies) == len(set(copies)), "duplicate parent text copy"
     assert set(copies) == set(texts), "parent backing copies do not cover exactly the sview fields"
     for label, section in [("parent", parent), ("worker", worker)]:
-        literal = section.split("Diagnostic{", 1)[1].split("}", 1)[0]
+        literal = diagnostic_literal(section)
         assignments = re.findall(r"^\s*(\w+): ([^\n]+?)(?:,)?$", literal, re.M)
         assert len(assignments) == len(fields), f"{label}: missing or duplicate Diagnostic fields"
         values = dict(assignments)
@@ -30,13 +75,13 @@ def main() -> None:
                 expected = f"par_pass_job_text(&job.arena, source.{name})"
             else:
                 expected = f"par_pass_parent_view(table, first + {copies.index(name)})"
-            assert values[name].rstrip(",") == expected, f"{label}: incorrect copy of {name}"
+            assert normalized_expression(values[name]) == expected, f"{label}: incorrect copy of {name}"
     api = (root / "src/semantic/semantic_api.elisa").read_text()
     exported = api.split("        def diagnostic_export[@r]", 1)[1].split("        # Driver-facing", 1)[0]
     export_copies = re.findall(r"(\w+)_bits: uintptr = diagnostic_export_text\(source\.(\w+), diagnostics\)", exported)
     assert len(export_copies) == len(texts), "export text copies changed"
     assert dict(export_copies) == {name: name for name in texts}, "export text mapping changed"
-    literal = exported.split("Diagnostic{", 1)[1].split("}", 1)[0]
+    literal = diagnostic_literal(exported)
     assignments = re.findall(r"^\s*(\w+): ([^\n]+?)(?:,)?$", literal, re.M)
     assert len(assignments) == len(fields), "export Diagnostic field coverage changed"
     values = dict(assignments)
@@ -44,7 +89,7 @@ def main() -> None:
     for name in fields:
         expected = (f"unsafe_sview_bounded_bytes({name}_bits.cast[u8&], source.{name}.len.usize())"
                     if name in texts else f"source.{name}")
-        assert values[name].rstrip(",") == expected, f"export: incorrect copy of {name}"
+        assert normalized_expression(values[name]) == expected, f"export: incorrect copy of {name}"
     print(f"parallel Diagnostic ownership audit: {len(fields)} fields, {len(texts)} text payloads covered")
 
 

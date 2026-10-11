@@ -138,12 +138,24 @@ if not all(fragment in enforcement_text for fragment in required_driver_controls
 positive_names = {
     "positive_digit_step_obeys_its_exact_i64_boundary",
     "negative_digit_step_obeys_its_exact_i64_boundary",
+    "positive_digit_step_preserves_the_i64_range",
+    "negative_digit_step_preserves_the_i64_range",
+    "positive_ascii_digit_byte_step_preserves_the_i64_range",
+    "negative_ascii_digit_byte_step_preserves_the_i64_range",
     "positive_i64_max_is_reached_without_overflow",
     "negative_i64_min_is_reached_without_overflow",
 }
 for name in positive_names:
     if f"def {name}(" not in POSITIVE.read_text():
         raise SystemExit(f"positive theorem missing: {name}")
+positive_text = POSITIVE.read_text()
+for sign in ("positive", "negative"):
+    name = f"{sign}_ascii_digit_byte_step_preserves_the_i64_range"
+    body = positive_text.split(f"def {name}(", 1)[1].split("\ndef ", 1)[0]
+    if "byte - EasmCheckedDecimal::ASCII_DIGIT_ZERO" not in body:
+        raise SystemExit(f"{name} no longer proves the production ASCII-byte-to-digit mapping")
+    if f"EasmCheckedDecimal::append_{sign}_digit(value, digit)" not in body:
+        raise SystemExit(f"{name} no longer applies the production checked-digit helper")
 
 try:
     product_manifest = require_current_product(BIN, PROVER)
@@ -208,7 +220,7 @@ assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest(
 assert require_current_product(BIN, PROVER) == product_manifest, "proof-product provenance changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "signed decimal digit accumulation rejects positive overflow and negative underflow",
+    "scope": "signed decimal digit steps preserve i64 range and reject positive overflow and negative underflow",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": [finding["name"] for finding in negative["findings"]],
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),

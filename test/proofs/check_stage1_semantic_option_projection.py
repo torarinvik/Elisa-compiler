@@ -20,6 +20,8 @@ OPTIONS = ROOT / "src/semantic/incremental_semantic_options.elisa"
 OPTIONS_TYPES = ROOT / "src/semantic/incremental_semantic_options_types.elisa"
 TOKENS = ROOT / "src/lexer/tokens.elisa"
 SOURCE_VIEW = ROOT / "src/lexer/source_view.elisa"
+SOURCE_PROBES = ROOT / "src/driver/elisac_source_probes.elisa"
+DRIVER = ROOT / "src/driver/elisac.elisa"
 POSITIVE = HERE / "stage1_semantic_option_projection.elisa"
 NEGATIVE = HERE / "stage1_semantic_option_projection_rejected.elisa"
 
@@ -122,13 +124,15 @@ expected_arguments = (
     "strict_header", "false", "runtime_std_detected", "false",
     "smt_environment_enabled or smt_header", "false", "false",
     "strict_externs_environment_enabled or strict_externs_header", "unsafe_header",
-    "proofhole_header", "64", "globals_header", "not permissive_environment_enabled",
+    "proofhole_header", "STAGE1_REGION_STACK_CAP", "globals_header", "not permissive_environment_enabled",
     "carrier_surface_enabled",
 )
 projection_body = function_region(projection_text, "stage1_semantic_options_from_observations")
 compact_projection = compact(projection_body)
 if 'include"../semantic/incremental_semantic_options.elisa"' not in compact(projection_text):
     raise SystemExit("policy projection no longer imports the production semantic options type and constructor")
+if not re.search(r"\bconst STAGE1_REGION_STACK_CAP: i64 = 64\b", projection_text):
+    raise SystemExit("Stage1 region stack cap must be defined once by its named policy constant")
 if call_arguments(projection_body, "Semantic::incremental_semantic_options_from_values") != tuple(
         compact(argument) for argument in expected_arguments):
     raise SystemExit("stage1 policy projection no longer maps observations to the expected constructor fields")
@@ -145,6 +149,32 @@ if 'include"./stage1_semantic_option_projection.elisa"' not in compact(negative_
     raise SystemExit("negative controls no longer import the positive policy proof")
 if not all(f"options.{field}==" in compact(positive_text) for field in fields):
     raise SystemExit("positive theorem no longer checks each projected option field")
+
+source_probes_text = SOURCE_PROBES.read_text()
+driver_text = DRIVER.read_text()
+if 'include "./stage1_semantic_option_projection.elisa"' not in source_probes_text:
+    raise SystemExit("Stage1 source probes no longer import the proved option projection")
+if 'include "./elisac_source_probes.elisa"' not in driver_text:
+    raise SystemExit("compiler driver no longer includes the source probes that supply policy observations")
+stage1_body = compact(function_region(source_probes_text, "stage1_semantic_options"))
+expected_policy_call = (
+    "returnstage1_semantic_options_from_observations("
+    "source_has_strict_header(src_ptr,source_len),"
+    "runtime_std_enabled(src_ptr,source_len),"
+    'env_flag_enabled("ELISA_STAGE1_SMT"),'
+    "source_has_smt_header(src_ptr,source_len),"
+    'env_flag_enabled("ELISA_STAGE1_STRICT_EXTERNS"),'
+    'source_has_header(src_ptr,source_len,"strict-externs"),'
+    "source_has_unsafe_header(src_ptr,source_len),"
+    "source_has_proofhole_header(src_ptr,source_len),"
+    "source_has_global_header(src_ptr,source_len),"
+    'env_flag_enabled("ELISA_STAGE1_PERMISSIVE"),'
+    "carrier_surface_applies())"
+)
+if expected_policy_call not in stage1_body:
+    raise SystemExit("Stage1 production observations no longer flow to the proved projection in order")
+if "Semantic::incremental_semantic_options_from_values(" in stage1_body:
+    raise SystemExit("Stage1 production bypasses the proved option projection")
 
 try:
     product_manifest = require_current_product(BIN, PROVER)
@@ -180,7 +210,7 @@ inputs = [
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
     *include_closure([POSITIVE, NEGATIVE, PROJECTION]),
-    OPTIONS, OPTIONS_TYPES, TOKENS, SOURCE_VIEW,
+    OPTIONS, OPTIONS_TYPES, TOKENS, SOURCE_VIEW, SOURCE_PROBES, DRIVER,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

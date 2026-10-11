@@ -47,7 +47,11 @@ seed_build() {
   # Worktrees have distinct local locks, but a stage0 seed is a host-wide high-memory
   # operation. Serialize all Elisa self-host seeds on this machine so independent Codex
   # worktrees cannot reproduce the multi-gigabyte contention that previously froze the host.
-  ELISA_SEED_GLOBAL_LOCK_DIR="${ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR:-${TMPDIR:-/tmp}/elisac-stage1-global-seed.lock}"
+  # GUI tasks can receive distinct TMPDIR values, which defeats a purportedly
+  # host-wide lock and lets independent worktrees start memory-heavy seeds together.
+  # Keep the default under the shared system temp root; retain an explicit override
+  # for hosts that need a different shared filesystem.
+  ELISA_SEED_GLOBAL_LOCK_DIR="${ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR:-/tmp/elisac-stage1-global-seed.lock}"
   global_seed_lock="$ELISA_SEED_GLOBAL_LOCK_DIR"
   if ! mkdir "$global_seed_lock" 2>/dev/null; then
     global_seed_lock_pid=""
