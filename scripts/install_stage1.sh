@@ -44,6 +44,7 @@ fi
 
 [[ -x "$ROOT/bin/elisac-stage1" ]] || { echo "no product at $ROOT/bin/elisac-stage1 -- run scripts/elisac_stage1.sh --seed first" >&2; exit 2; }
 [[ -f "$ROOT/build/runtime/elisacore_runtime.o" ]] || { echo "no runtime object at $ROOT/build/runtime/elisacore_runtime.o" >&2; exit 2; }
+[[ -s "$ROOT/build/runtime/elisacore_runtime.o.inputs.sha256" ]] || { echo "no runtime freshness stamp at $ROOT/build/runtime/elisacore_runtime.o.inputs.sha256" >&2; exit 2; }
 [[ -f "$ROOT/bin/elisac-stage1.provenance.json" ]] || { echo "no product provenance at $ROOT/bin/elisac-stage1.provenance.json -- run scripts/elisac_stage1.sh --seed first" >&2; exit 2; }
 
 STAGING="$PREFIX/.stage1.incoming.$$"
@@ -56,6 +57,7 @@ cp -R "$ROOT/src" "$STAGING/src"
 cp -R "$ROOT/elisacore_std" "$STAGING/elisacore_std"
 cp -R "$ROOT/scripts" "$STAGING/scripts"
 cp "$ROOT/build/runtime/elisacore_runtime.o" "$STAGING/build/runtime/elisacore_runtime.o"
+cp "$ROOT/build/runtime/elisacore_runtime.o.inputs.sha256" "$STAGING/build/runtime/elisacore_runtime.o.inputs.sha256"
 cp "$ROOT/bin/elisac-stage1" "$STAGING/bin/elisac-stage1"
 cp "$ROOT/bin/elisac-stage1.provenance.json" "$STAGING/bin/elisac-stage1.provenance.json"
 touch "$STAGING/bin/elisac-stage1"
@@ -88,6 +90,7 @@ chmod +x "$PREFIX/elisac-stage1"
 # references the Elisa runtime, and every consumer otherwise has to go hunting
 # for it inside a worktree.
 cp "$PREFIX/stage1/build/runtime/elisacore_runtime.o" "$PREFIX/elisacore_runtime.o"
+cp "$PREFIX/stage1/build/runtime/elisacore_runtime.o.inputs.sha256" "$PREFIX/elisacore_runtime.o.inputs.sha256"
 
 echo "installed elisac-stage1 -> SNAPSHOT ${PREFIX}/stage1 (${REVISION})"
 echo "runtime object          -> ${PREFIX}/elisacore_runtime.o"
