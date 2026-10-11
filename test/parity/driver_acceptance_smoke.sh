@@ -42,11 +42,14 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 
+ACCEPT_TIMEOUT="${ELISA_ACCEPT_TIMEOUT:-300}"
+[[ "$ACCEPT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo "ELISA_ACCEPT_TIMEOUT must be positive" >&2; exit 2; }
+
 # The stage0 selector belongs only to the oracle invocation. Keep it out of the stage1
 # wrapper's environment so this test cannot accidentally compile with the installed/default
 # compiler or let an oracle-specific path affect the self-hosted product.
 stage1_compile() {
-    env -u ELISACORE_BIN -u ELISA_CORE -u REPO_ROOT \
+    timeout "$ACCEPT_TIMEOUT" env -u ELISACORE_BIN -u ELISA_CORE -u REPO_ROOT \
         ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}" \
         ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}" \
         bash "$REPO_ROOT/scripts/elisac_stage1.sh" "$@"
@@ -59,21 +62,23 @@ stage1_compile() {
 if [[ "${1:-}" == "--one" ]]; then
     mode="$2"; resdir="$3"; src="$4"
     exec </dev/null
-    w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT INT TERM HUP
+    w="$(mktemp -d "$resdir/case.XXXXXX")"
     probe="$src"
     if [ "$mode" = withstd ]; then
         probe="$w/probe.elisa"
         { printf 'include "%s/elisacore_std/elisacore_runtime.elisa"\n\n' "$REPO_ROOT"; cat "$src"; } > "$probe"
     fi
-    "$ELISACORE_BIN" -emit obj -o "$w/s0.o" "$probe" >/dev/null 2>&1; r0=$?
-    stage1_compile -emit obj -o "$w/s1.o" "$probe" >/dev/null 2>&1; r1=$?
+    timeout "$ACCEPT_TIMEOUT" "$ELISACORE_BIN" -emit obj -o "$w/s0.o" "$probe" >"$w/stage0.compile.log" 2>&1; r0=$?
+    stage1_compile -emit obj -o "$w/s1.o" "$probe" >"$w/stage1.compile.log" 2>&1; r1=$?
     a0=$([ "$r0" -eq 0 ] && echo accept || echo reject)
     a1=$([ "$r1" -eq 0 ] && echo accept || echo reject)
     verdict=same
-    if [ "$a0" != "$a1" ]; then
+    if [[ "$r0" -ge 124 || "$r1" -ge 124 ]]; then
+        verdict=INCONCLUSIVE
+    elif [ "$a0" != "$a1" ]; then
         [ "$a0" = reject ] && verdict=ACCEPT-GAP || verdict=REJECT-GAP
     fi
-    printf '%s\t%s\t%s\n' "$verdict" "$(basename "$src")" "$r1" > "$resdir/$(basename "$src").res"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$verdict" "$(basename "$src")" "$r1" "$r0" "$w" > "$resdir/$(basename "$src").res"
     exit 0
 fi
 
@@ -81,7 +86,17 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 export ELISACORE_BIN
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+cleanup_acceptance() {
+    local exit_status=$?
+    if [[ "$exit_status" -eq 0 ]]; then
+        rm -rf "$WORK"
+    else
+        echo "driver acceptance: failure evidence retained at $WORK" >&2
+    fi
+}
+trap cleanup_acceptance EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 source "$REPO_ROOT/test/parity/host_jobs.sh"
 # A long pole: it starts first and sets the gate's makespan, so it takes the wider
 # allowance (ELISA_HEAVY_JOBS, exported by run_all) rather than the fair share.
@@ -90,7 +105,7 @@ JOBS="${ELISA_ACCEPT_JOBS:-${ELISA_HEAVY_JOBS:-$(elisa_host_jobs)}}"
 # Compare both drivers over every fixture. $1 is "bare" or "withstd"; echoes the
 # disagreement count and prints one line per disagreement (sorted, so gate logs diff).
 compare_all() {
-    local mode="$1" disagree=0 accept_gap=0 reject_gap=0 resdir="$WORK/$1" verdict name r1
+    local mode="$1" disagree=0 accept_gap=0 reject_gap=0 inconclusive=0 resdir="$WORK/$1" verdict name r1 r0 logs
     mkdir -p "$resdir"
     # A fixture carrying `# corpus: deliberate-decline` is a program stage0 accepts and stage1
     # rejects ON PURPOSE (a stage0 unsoundness stage1 closes, e.g. a view of a frame-local
@@ -99,29 +114,38 @@ compare_all() {
         grep -q '^# corpus: deliberate-decline' "$fixture" || printf '%s\0' "$fixture"
     done < <(find "$REPO_ROOT/test/fixtures/diagnostics" -maxdepth 1 -name '*.elisa' -print0) \
         | xargs -0 -P "$JOBS" -n 1 bash "${BASH_SOURCE[0]}" --one "$mode" "$resdir"
-    while IFS=$'\t' read -r verdict name r1; do
+    while IFS=$'\t' read -r verdict name r1 r0 logs; do
         [ "$verdict" = same ] && continue
+        if [[ "$verdict" = INCONCLUSIVE ]]; then
+            inconclusive=$((inconclusive + 1))
+            echo "  [$mode] INCONCLUSIVE $name (stage0=$r0 stage1=$r1; logs=$logs)" >&2
+            continue
+        fi
         disagree=$((disagree + 1))
         if [ "$verdict" = ACCEPT-GAP ]; then
             accept_gap=$((accept_gap + 1))
-            echo "  [$mode] ACCEPT-GAP $name (stage0 rejects, stage1 accepts)" >&2
+            echo "  [$mode] ACCEPT-GAP $name (stage0 exits $r0, stage1 accepts; logs=$logs)" >&2
         else
             reject_gap=$((reject_gap + 1))
-            echo "  [$mode] REJECT-GAP $name (stage0 accepts, stage1 exits $r1)" >&2
+            echo "  [$mode] REJECT-GAP $name (stage0 accepts, stage1 exits $r1; logs=$logs)" >&2
         fi
     done < <(cat "$resdir"/*.res 2>/dev/null | sort -t $'\t' -k2)
-    echo "$disagree $accept_gap $reject_gap"
+    echo "$disagree $accept_gap $reject_gap $inconclusive"
 }
 
 status=0
 for mode in bare withstd; do
     baseline_file="$REPO_ROOT/test/fixtures/driver_acceptance_${mode}.baseline"
     baseline="$(tr -d '[:space:]' < "$baseline_file")"
-    read -r disagree accept_gap reject_gap <<< "$(compare_all "$mode")"
+    read -r disagree accept_gap reject_gap inconclusive <<< "$(compare_all "$mode")"
+    if [[ "$inconclusive" -gt 0 ]]; then
+        echo "driver acceptance [$mode] INCONCLUSIVE: $inconclusive timeout/signal/infrastructure exits" >&2
+        status=1
+    fi
     if [ "$disagree" -gt "$baseline" ]; then
         echo "driver acceptance [$mode] FAILED: $disagree disagreements, ratchet allows <= $baseline" >&2
         status=1
-    else
+    elif [[ "$inconclusive" -eq 0 ]]; then
         echo "driver acceptance [$mode] OK: $disagree disagreements (ratchet $baseline) — $accept_gap accept-gap, $reject_gap reject-gap"
     fi
 done
