@@ -83,13 +83,17 @@ extend Easm:
             return easm_trim(type_name[open + 1.usize():close])
 
         def easm_memory_displacement(operand: sview) -> i64:
+            parsed: (valid: bool, value: i64) = easm_memory_displacement_checked(operand)
+            return parsed.value if parsed.valid else 0
+
+        def easm_memory_displacement_checked(operand: sview) -> (valid: bool, value: i64):
             open: usize = easm_find(operand, "(")
             if open >= sview_len(operand):
-                return 0
+                return (true, 0)
             prefix: sview = easm_trim(operand[0:open])
             if sview_len(prefix) == 0:
-                return 0
-            return easm_parse_i64(prefix)
+                return (true, 0)
+            return easm_parse_i64_checked(prefix)
 
         def easm_size_guard_lower_bound(facts: darray[sview]) -> i64:
             greatest: mutable i64 = 0
@@ -97,32 +101,24 @@ extend Easm:
                 marker: usize = easm_find(fact, "size >=")
                 continue if marker >= sview_len(fact)
                 value: i64 = easm_parse_i64(easm_trim(fact[marker + 7.usize():sview_len(fact)]))
-                greatest <- value if value > greatest
+                greatest <- EasmMemStateDomain::greatest_bound(greatest, value)
             return greatest
 
-        # Coq EASM-TAL's memory-state correspondence.  A refinement raises the known
-        # minimum size, while a control-flow join keeps only the weaker (minimum) bound.
-        # These small pure operations are also useful to validation clients: they make the
-        # proof-side lattice explicit instead of duplicating its arithmetic in a test harness.
+        # Scalar memory-size domain: predecessor states combine by their weaker minimum bound,
+        # same-path conjunctive facts combine by their strongest maximum bound, and a read is
+        # well typed when its required size is covered by the known lower bound. The overlay
+        # verifier applies the read predicate to the bound extracted from the function's facts.
         def easm_memstate_join_min(left: i64, right: i64) -> i64:
-            return left if left < right else right
+            return EasmMemStateDomain::join_min(left, right)
 
         def easm_memstate_read_well_typed(need: i64, known_min: i64) -> bool:
-            return need <= known_min
+            return EasmMemStateDomain::read_well_typed(need, known_min)
 
         def easm_memstate_guard_join(left: i64, right: i64, need: i64) -> bool:
-            return easm_memstate_read_well_typed(need, easm_memstate_join_min(left, right))
+            return EasmMemStateDomain::guard_join(left, right, need)
 
         def easm_access_width(op: sview) -> i64:
-            if easm_starts(op, "movb") or easm_equal(op, "xchgb"):
-                return 1
-            if easm_starts(op, "movw") or easm_equal(op, "xchgw"):
-                return 2
-            if easm_starts(op, "movl") or easm_equal(op, "xchgl"):
-                return 4
-            if easm_starts(op, "movq") or easm_equal(op, "xchgq"):
-                return 8
-            return 0
+            return EasmAccessWidth::access_width(op)
 
         def easm_input_type_for_register(fn: Function, register: sview) -> sview:
             for input in fn.inputs:
@@ -246,14 +242,18 @@ extend Easm:
                         for layout in layouts:
                             if not easm_equal(layout.name, layout_name):
                                 continue
-                            field: LayoutField = easm_layout_field_at(layout, easm_memory_displacement(operand))
+                            displacement: (valid: bool, value: i64) = easm_memory_displacement_checked(operand)
+                            if not displacement.valid:
+                                issues.push(Issue{severity: Severity.Error, code: "invalid-memory-displacement", line: instruction.line, message: "layout memory displacement must be a valid signed 64-bit decimal integer"})
+                                continue
+                            field: LayoutField = easm_layout_field_at(layout, displacement.value)
                             if field.offset < 0:
                                 issues.push(Issue{severity: Severity.Error, code: "layout-unknown-field", line: instruction.line, message: "memory displacement is not a declared field in the carrier layout"})
                                 continue
                             width: i64 = easm_access_width(instruction.op)
                             if width > 0 and field.width > 0 and width != field.width:
                                 issues.push(Issue{severity: Severity.Error, code: "layout-field-width-mismatch", line: instruction.line, message: "memory access width does not match the declared layout field width"})
-                            if field.requires_size_at_least > 0 and easm_size_guard_lower_bound(fn.facts) < field.requires_size_at_least:
+                            if field.requires_size_at_least > 0 and not easm_memstate_read_well_typed(field.requires_size_at_least, easm_size_guard_lower_bound(fn.facts)):
                                 issues.push(Issue{severity: Severity.Error, code: "overlay-field-needs-size-guard", line: instruction.line, message: "layout field requires a dominating runtime size guard at least as strong as its declared lower bound"})
                 easm_update_memory_provenance(states, instruction)
             easm_verify_provenance_merges(fn, issues)
@@ -434,26 +434,33 @@ extend Easm:
             implicit_reads: i64 = easm_implicit_read_mask(op)
             implicit_writes: mutable i64 = easm_implicit_write_mask(op)
             if easm_equal(op, "call") or easm_equal(op, "callq"):
-                implicit_writes <- 1 | 2 | 4 | 16 | 32 | 256 | 512 | 1024 | 2048
+                implicit_writes <- EasmRegisterMasks::call_clobber_mask()
             return OperationEffect{known: known, capability: capability, clobbers_flags: flags, implicit_cc: easm_equal(op, "call") or easm_equal(op, "callq"), implicit_reads: implicit_reads, implicit_writes: implicit_writes, result_defines: easm_equal(op, "cpuid") or easm_equal(op, "rdtsc")}
 
         def easm_implicit_read_mask(op: sview) -> i64:
             if easm_equal(op, "cpuid"):
-                return 1 | 2
+                return EasmRegisterMasks::cpuid_read_mask()
             return 0
 
         def easm_implicit_write_mask(op: sview) -> i64:
             if easm_equal(op, "cpuid"):
-                return 1 | 8 | 2 | 4
+                return EasmRegisterMasks::cpuid_write_mask()
             if easm_equal(op, "rdtsc"):
-                return 1 | 4
+                return EasmRegisterMasks::rdtsc_write_mask()
             return 0
 
+        def easm_immediate_after_dollar_checked(text: sview) -> (valid: bool, value: i64):
+            operand: sview = easm_first_operand(text)
+            dollar: usize = easm_find(operand, "$")
+            if dollar >= sview_len(operand):
+                return (false, 0)
+            parsed: (valid: bool, value: i64) = easm_parse_i64_checked(easm_trim(operand[dollar + 1.usize():sview_len(operand)]))
+            return (false, 0) if not parsed.valid or parsed.value < -2147483648 or parsed.value > 2147483647
+            return parsed
+
         def easm_immediate_after_dollar(text: sview) -> i64:
-            dollar: usize = easm_find(text, "$")
-            if dollar >= sview_len(text):
-                return 0
-            return easm_parse_i64(easm_trim(text[dollar + 1.usize():sview_len(text)]))
+            parsed: (valid: bool, value: i64) = easm_immediate_after_dollar_checked(text)
+            return parsed.value if parsed.valid else 0
 
 
         # Lockstep bodies are independently executable implementations.  Stage0 verifies the
@@ -476,11 +483,19 @@ extend Easm:
         def verify_module_layouts(module: Module, issues: mutable darray[Issue]&):
             issues.reserve(issues.count + module.layouts.count)
             for layout in module.layouts:
-                total: i64 = layout_size(layout)
+                total: (valid: bool, value: i64) = layout_size_checked(layout)
                 for field in layout.fields:
                     if field.offset < 0:
                         issues.push(Issue{severity: Severity.Error, code: "layout-negative-offset", line: field.line, message: "layout field offset must be non-negative"})
-                    if field.width > 0 and total > 0 and field.offset + field.width > total:
+                        continue
+                    if field.width < 0:
+                        issues.push(Issue{severity: Severity.Error, code: "layout-negative-width", line: field.line, message: "layout field width must be non-negative"})
+                        continue
+                    extent: (valid: bool, value: i64) = EasmLayoutArithmetic::field_extent_checked(field.offset, field.width)
+                    if not extent.valid:
+                        issues.push(Issue{severity: Severity.Error, code: "layout-field-extent-overflow", line: field.line, message: "layout field extent is not representable as a nonnegative signed 64-bit value"})
+                        continue
+                    if field.width > 0 and total.valid and total.value > 0 and extent.value > total.value:
                         issues.push(Issue{severity: Severity.Error, code: "layout-field-out-of-bounds", line: field.line, message: "layout field extends past the declared layout size"})
 
 

@@ -4,16 +4,22 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from proof_product_gate import require_current_product
 
 root = Path(__file__).resolve().parents[2]
-prover = root.parent / "wasmbrowser-proof"
-binary = Path(os.environ.get("ELISA_PROOF_BIN", str(prover / "build/elisa-proof-ownership-flow")))
+prover = root.parent / "elisa-proof"
+binary = Path(os.environ.get("ELISA_PROOF_BIN", str(prover / "build/elisa-proof"))).resolve(strict=True)
 if not __debug__:
     raise SystemExit("run without Python -O")
-if any(p.stat().st_mtime_ns > binary.stat().st_mtime_ns for p in (prover / "src").rglob("*.elisa")):
-    raise SystemExit("rebuild the stale proof executable")
+try:
+    product_manifest = require_current_product(binary, prover)
+except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+    raise SystemExit(f"proof product provenance check failed: {error}") from error
 here = Path(__file__).resolve().parent
-inputs = [binary, Path(__file__), root / "src/semantic/binding_identity_types.elisa",
+manifest = binary.with_name(binary.name + ".manifest.json")
+manifest_checksum = manifest.with_name(manifest.name + ".sha256")
+inputs = [binary, manifest, manifest_checksum, prover / "ELISA_COMPILER_REV",
+          here / "proof_product_gate.py", Path(__file__), root / "src/semantic/binding_identity_types.elisa",
           root / "src/semantic/ownership_binding_flow.elisa", root / "src/semantic/ownership_flow_domain.elisa",
           here / "ownership_binding_identity.elisa", here / "ownership_binding_identity_rejected.elisa",
           here / "ownership_identity_replay_probe.elisa", here / "ownership_binding_separation.elisa",
@@ -65,6 +71,7 @@ assert {f["name"] for f in rejected["findings"]} == false_names
 assert all(f["kind"] == "ensure-unproven" for f in rejected["findings"])
 assert not false_names & {d["name"] for d in rejected["declaration_details"] if d.get("verified")}
 assert hashes == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
+assert require_current_product(binary, prover) == product_manifest, "proof product or source tree changed during replay"
 print(json.dumps({"admitted": True, "scope": "BindingId identity laws only, not ownership flow",
                   "producer_proven": 23, "independently_replayed": 23,
                   "separation_report_replayed": 23,

@@ -4,16 +4,22 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from proof_product_gate import require_current_product
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-PROVER = ROOT.parent / "wasmbrowser-proof"
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", str(PROVER / "build/elisa-proof-ownership-flow"))).resolve(strict=True)
+PROVER = ROOT.parent / "elisa-proof"
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", str(PROVER / "build/elisa-proof"))).resolve(strict=True)
 if not __debug__:
     raise SystemExit("run without Python -O")
-if any(path.stat().st_mtime_ns > BIN.stat().st_mtime_ns for path in (PROVER / "src").rglob("*.elisa")):
-    raise SystemExit("proof executable is older than prover source; rebuild it")
-inputs = [BIN, Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa",
+try:
+    product_manifest = require_current_product(BIN, PROVER)
+except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+    raise SystemExit(f"proof product provenance check failed: {error}") from error
+MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
+MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
+inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
+          HERE / "proof_product_gate.py", Path(__file__), ROOT / "src/semantic/ownership_flow_domain.elisa",
           HERE / "ownership_flow_domain.elisa", HERE / "ownership_flow_domain_rejected.elisa",
           HERE / "ownership_reachable_join.elisa", HERE / "ownership_loop_head.elisa",
           HERE / "ownership_loop_head_rejected.elisa", HERE / "ownership_for_head.elisa",
@@ -239,6 +245,7 @@ assert code == 1 and source_for_rejected["status"] == "failed"
 assert {finding["name"] for finding in source_for_rejected["findings"]} == {"proven_nonempty_retains_zero_entry", "unknown_count_can_drop_entry"}
 assert all(finding["kind"] == "ensure-unproven" for finding in source_for_rejected["findings"])
 assert hashes == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+assert require_current_product(BIN, PROVER) == product_manifest, "proof product or source tree changed during replay"
 print(json.dumps({"admitted": True, "scope": "imported Boolean ownership-domain laws only",
                   "proved": 36, "obligations": 36, "replayed": 36,
                   "reachable_join_report_proved": 16,

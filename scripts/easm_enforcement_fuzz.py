@@ -143,6 +143,15 @@ def verify(driver: pathlib.Path, easm_source: str) -> tuple[str, list[str]]:
     raise RuntimeError(f"unexpected verifier output (rc={proc.returncode}): {text!r} {proc.stderr.decode(errors='replace')!r}")
 
 
+def required_size_source(value: str) -> str:
+    return (
+        "module malformed_layout_requirement\n"
+        "target x86_64\n"
+        "layout Header size 16:\n"
+        f"    0 value: u64 requires size >= {value}\n"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", type=int, default=40)
@@ -158,6 +167,21 @@ def main() -> int:
     except Exception as exc:
         print(f"easm_enforcement_fuzz FAILED: {exc}", file=sys.stderr)
         return 2
+
+    # parse_module carries parse-time errors in Module.issues. Exercise the
+    # actual stdin driver so malformed/overflowing declaration integers cannot
+    # disappear when a caller subsequently verifies only the parsed model.
+    for label, required_size in (
+        ("malformed", "8junk"),
+        ("overflow", "9223372036854775808"),
+    ):
+        status, codes = verify(driver, required_size_source(required_size))
+        if status != "reject" or "invalid-layout-required-size" not in codes:
+            print(
+                f"{label} required-size decimal was not rejected with its parse diagnostic: {codes}",
+                file=sys.stderr,
+            )
+            return 1
 
     rng = random.Random(args.seed)
     accepted_complete = 0
