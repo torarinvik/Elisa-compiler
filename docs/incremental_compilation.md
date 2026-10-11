@@ -166,27 +166,40 @@ Start codegen reuse with `-O0`, without debug/profiling/coverage metadata, and w
 
 ## Implementation stages and acceptance
 
-1. **Instrument the baseline.** On the exact compiler seed and VAST box, record phase wall/CPU time for `check_ungranted_panic`, `check_mutable_global_authority`, their combined interval, number of function bodies visited, number of resolved calls/edges, and current diagnostics/effect-row report. Do not infer the 993-second cost from unrelated historical self-host timings.
-2. **Extract a deterministic collector.** Add stable key/dependency/fact types and make one body traversal produce the direct facts consumed by the current panic and authority checkers. Keep full semantic execution and compare its result against the pre-change behavior. This validates facts before introducing persistence.
-3. **Persist body records and reuse on body edits.** Add a versioned sidecar cache, atomic writes, fail-closed misses, and counters for hit/miss/rejection reasons. On a changed body, collect only that function's facts, rebuild closure, and replay affected diagnostics.
+1. **Instrument the baseline.** On the exact local compiler seed and host in a quiet window, record phase wall/CPU time for `check_ungranted_panic`, `check_mutable_global_authority`, their combined interval, number of function bodies visited, number of resolved calls/edges, and current diagnostics/effect-row report. Do not infer the 993-second cost from unrelated historical self-host timings.
+2. **Integrate the collector as a shadow pass.** The in-memory collector, snapshot codec, and option-key prototype now exist, but production semantic checking does not call them. Pass the exact source bytes and token stream that produced each AST, plus a stable source identity, into an opt-in shadow collector. Preserve the distinction between the expanded AST/source context and original-source policy headers, including `static generate` and early `pymodule` paths. Keep all current checkers authoritative. On a narrow eligible corpus, compare collected direct observations against cold checker rows and diagnostics, and report cacheable/rejected body counts and reasons. This step must not claim saved checker work.
+3. **Persist records, then consume only proven facts.** Add versioned sidecar reads/writes with atomic publication, fail-closed misses, and hit/miss/rejection counters. Persistence alone is not an incremental speedup: after a record is proven equivalent to cold analysis, teach the relevant checker to replay that record and skip its body walk while rebuilding call/effect closure and affected diagnostics. Measure body visits and end-to-end warm body-edit time against the cold path.
 4. **Prove invalidation.** Compare warm incremental output byte-for-byte with cold output for: unchanged build; a body-only edit with unchanged API; a callee body edit that adds/removes `Global.Read` or `Global.Write`; a callee effect-contract change; adding an overload after a previous lookup; changing an import or alias that resolves a previous miss; changing a global from immutable to mutable or changing its type/layout; changing a protocol method contract/conformance; changing strict/global options; and corrupting or versioning out the cache.
 5. **Add body codegen fragments.** Cache and restore eligible `-O0` LLVM function bodies in a newly created module, then test link validity, object/executable parity, and invalidation for function API, type/global layout, callee ABI, target, and codegen flags.
 6. **Expand eligibility and optimization.** Add callback/generic/debug support only with explicit fingerprints and controls. Consider cross-function optimized reuse only with an import/summary model and runtime parity evidence.
 
 The semantic MVP passes only when warm and cold diagnostics, canonical effect rows, exit status, and source locations match exactly; a body-only edit demonstrably visits only changed/unsupported bodies in the paired passes; and edits to a dependency cause all required affected call checks to rerun. The codegen MVP additionally requires equivalent executable behavior and a valid verifier result after cached fragments are restored.
 
-## First code patch boundary
+## First production integration boundary
 
-The collector belongs at the current `collect_effect_sources` point in `check_full_into`: declaration, name, type, import, capability, and effect indexes have been built, while the resulting effect-source rows are still needed by `check_global_permissions`. It should replace that body scan and retain the snapshot for `check_ungranted_panic` and `check_mutable_global_authority`. This makes the first reusable artifact available before all three later consumers without moving global permission enforcement out of its current order.
+The production semantic API still receives an AST and policy options, but not the exact
+source/token pair that produced the AST. Add an explicit source context from the driver and
+pass it to an opt-in shadow collector. Do not insert a second body walk after one of the
+existing checkers and describe it as shared collection; that would increase cold-build cost
+without enabling reuse. The driver must pair an expanded AST with its expanded source and
+tokens, while continuing to derive policy headers from the original source. Early `pymodule`
+gates must use the same AST/source pairing as ordinary compilation.
 
-The first implementation patch should stop after a deterministic in-memory collector exists; it should not add persistence or LLVM fragment loading in that patch. Suggested ownership:
+The prototypes in `src/semantic/incremental_function_facts.elisa` and
+`src/semantic/incremental_snapshot_codec.elisa` are intentionally narrower than the stable
+key and dependency contract above. The standalone codec control proves deterministic
+encoding, fail-closed decoding, and warm reuse inside the collector; it does not prove that a
+semantic checker consumed a cached record or skipped work. Keep the cold checkers
+authoritative while shadow facts are compared against actual checker rows and diagnostics.
+The opt-in source-identity shadow path disables local line-map retention: include expansion
+still publishes its ordinary line map, while this collector does not need a second parsed copy.
 
-- Add `src/semantic/incremental_function_facts.elisa` for `StableFunctionKey`, `Dependency`, `FunctionBodyObservations`, body anchors, and complete/cacheable status. Keep this schema independent of `GlobalAuthority` arrays and parser identity types.
-- Add one collector entry point, conceptually `collect_incremental_function_facts(file, table, options, previous_snapshot?) -> IncrementalSemanticSnapshot`, called from `check_full_into` where `collect_effect_sources` currently runs. Initially `previous_snapshot` is absent and the collector traverses every body.
-- Refactor the current authority AST visitor (`ga_expression`/`ga_statements`/`ga_functions`) to emit direct observations through that collector while preserving the existing row/diagnostic behavior. Feed its effect-source facts into `SymbolTable` before `check_global_permissions`; then teach panic/effect and mutable-global analysis to consume the same observations rather than rescanning bodies.
-- Add a focused parity fixture/report test around `test/parity/global_permissions_smoke.sh` plus panic/trusted-filter cases. Compare the existing full checker result with rows/diagnostics produced by consuming the collected facts. Add the persistence cache only after this in-memory contract is stable.
-
-Before enabling reuse for every function, record unsupported constructs and select a small, representative cacheable subset. Each later patch should expand the collector's supported syntax without weakening its fail-closed behavior.
+The initial production-integration patch should establish that source-context and parity
+contract before writing cache files or skipping checker work. Retain the complete full-path
+checker on every unsupported, ambiguous, or mismatched body. After parity, add persistent
+records and make one checker consume only the facts whose cold equivalence has been proven.
+Then measure both checker body visits and end-to-end warm body-edit time before expanding
+the supported syntax. LLVM fragment loading remains a separate later stage.
 
 ### Driver source context boundary
 
