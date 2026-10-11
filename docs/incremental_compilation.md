@@ -47,6 +47,25 @@ No timing claim is made from these parity controls. Small cross-language
 frontend/object timings do not prove incremental performance or professional
 compiler efficiency across representative projects.
 
+Prior-snapshot function-key lookup is indexed on `main` (integrated at
+`93cc402c`). Seven paired shared-Mac warm-cache runs showed a median paired
+speedup of about 5.0x for the dense 4,096-helper case, with identical prior
+snapshot bytes, diagnostics and reuse counts. Small and low-query cases were
+near parity. These are exploratory opt-in warm-cache results, not qualified
+Linux results or evidence of default cold-compilation speed.
+
+Current-function name uniqueness now also uses an index. Its exact-name hash buckets retain byte
+comparison and reject a name immediately after the second exact match. In seven
+shared-Mac pairs, a 4,097-function collector workload with mostly unsupported
+generic bodies had a 3.046x median paired speedup; full canonical encoded
+snapshot bytes matched in every pair. This span excludes parsing, object
+emission and linking. The full self-host compiler seed and incremental correctness gate passed,
+including uniqueness and prior-key controls at O0/O2, exact legacy encoding,
+warm/cold diagnostic and effect-row parity, source revalidation of forged
+sidecars, body/option invalidation, generated input and corruption misses.
+These correctness checks support integration; the timing result remains scoped
+to this collector workload rather than general compiler speed.
+
 Cache preparation also needs its own cost accounting. The current snapshot helper
 verifies the parent, builds owners, clones the complete module, strips foreign
 bodies, verifies the clone, and serializes bitcode for each shard. A production
