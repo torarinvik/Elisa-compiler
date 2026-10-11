@@ -1432,9 +1432,9 @@ extend Semantic:
                 state.local_types.truncate(mark)
                 state.local_callees.truncate(mark)
 
-        def ga_functions(declarations: darray[Ast::Decl], module_scope: usize, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
+        def ga_functions(declarations: darray[Ast::Decl], module_scope: usize, state: mutable GlobalAuthority&, table: lmut SymbolTable, reusable_empty_offsets: mutable dict[u64, u8]&, incremental_skip_count: mutable u64&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |state, table| -> table:
+                for declaration in declarations |state, table, reusable_empty_offsets, incremental_skip_count| -> table:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, _, _, at):
                             state.module_scope <- module_scope
@@ -1450,7 +1450,14 @@ extend Semantic:
                                 state.local_types.push(parameter.type_expression)
                                 state.local_callees.push(GLOBAL_AUTHORITY_NONE)
                             # Signature effects declare the exported row, not local authority.
-                            table <- ga_body(body, state, table) can Global{Read,Write}
+                            # A body can avoid both GA walks only when the current collector
+                            # rescanned it as cacheable with zero direct facts, and this exact
+                            # body matched a compatible prior snapshot at this source offset.
+                            # Persisted fact counts never authorize a skip.
+                            if reusable_empty_offsets.get(at.offset.u64()) is reusable_marker:
+                                incremental_skip_count <- incremental_skip_count + 1
+                            else:
+                                table <- ga_body(body, state, table) can Global{Read,Write}
                             if state.progress_enabled:
                                 state.progress_functions <- state.progress_functions + 1
                                 if state.progress_functions % 1024 == 0:
@@ -1459,9 +1466,9 @@ extend Semantic:
                             state.local_types.clear()
                             state.local_callees.clear()
                         Decl.Module(name, body, _):
-                            table <- ga_functions(body, ga_module_path(module_scope, name, state), state, table) can Global{Read,Write}
+                            table <- ga_functions(body, ga_module_path(module_scope, name, state), state, table, reusable_empty_offsets, incremental_skip_count) can Global{Read,Write}
                         Decl.Scoped(body, _):
-                            table <- ga_functions(body, module_scope, state, table) can Global{Read,Write}
+                            table <- ga_functions(body, module_scope, state, table, reusable_empty_offsets, incremental_skip_count) can Global{Read,Write}
                         _:
                             pass
 
@@ -1483,7 +1490,7 @@ extend Semantic:
                         _:
                             pass
 
-        def check_mutable_global_authority(file: Ast::File&, table: lmut SymbolTable, strict_unsafe: bool = false, enforce_global_grants: bool = true) -> void:
+        def check_mutable_global_authority_incremental(file: Ast::File&, table: lmut SymbolTable, strict_unsafe: bool, enforce_global_grants: bool, snapshot: IncrementalSemanticSnapshot&, incremental_skip_count: mutable u64&) -> void:
             can Memory.Allocate, Abort.Panic:
                 setup_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                 state: mutable GlobalAuthority = GlobalAuthority{parents: [0], modules: [""], module_starts: [0], module_lengths: [0], globals: [], global_scopes: [], global_types: [], writable: [], functions: [], function_heads: {}, function_next: [], function_scopes: [], function_offsets: [], function_lines: [], function_variadic: [], function_return_types: [], callback_origin_heads: {}, callback_origin_tails: {}, callback_origin_next: [], callback_origin_indexed: false, parameter_starts: [], parameter_counts: [], parameter_minimum: [], enum_names: [], enum_scopes: [], struct_names: [], struct_scopes: [], field_owners: [], field_scopes: [], field_names: [], field_types: [], alias_names: [], alias_scopes: [], alias_types: [], parameter_functions: [], parameter_names: [], parameter_types: [], parameter_defaults: [], default_depth: 0, reads: [], writes: [], edge_from: [], edge_to: [], edge_reads: [], edge_writes: [], local_floor: 0, local_limit: GLOBAL_AUTHORITY_NONE, locals: [], local_types: [], local_callees: [], return_type: null, lambda_depth: 0, inline_refs: [], inline_spans: [], inline_prefix_ends: [], global_mutable_heads: {}, global_mutable_owners: [], global_mutable_offsets: [], global_mutable_lines: [], global_mutable_modules: [], global_mutable_next: [], import_annotations: [], grants: [], firewalls: [], annotations: file.enum_annotations, generic_lines: file.generic_param_lines, generic_names: file.generic_param_names, module_scope: 0, function: 0, report: false, strict_unsafe: false}
@@ -1514,9 +1521,16 @@ extend Semantic:
                 ga_index_inline_grants(&state)
                 ga_allocate_return_rows(&state)
                 ga_unknown_callback(&state) can Global{Read,Write}
+                reusable_empty_offsets: mutable dict[u64, u8] = {}
+                if snapshot.surface_compatible and snapshot.current_anchors.count == snapshot.functions.count:
+                    for record_index in 0..<snapshot.functions.count |reusable_empty_offsets, snapshot|:
+                        record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                        continue if not record.cacheable or not record.matched_previous or record.direct_fact_count != 0
+                        offset: u64 = snapshot.current_anchors[record_index].definition_offset.u64()
+                        reusable_empty_offsets <- reusable_empty_offsets.put(offset, 1) can Global{Read,Write}
                 PhaseTimer::end_span("authority:collect_setup", setup_span)
                 inference_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
-                table <- ga_functions(file.top_decls, 0, &state, table) can Global{Read,Write}
+                table <- ga_functions(file.top_decls, 0, &state, table, &reusable_empty_offsets, incremental_skip_count) can Global{Read,Write}
                 PhaseTimer::end_span("authority:inference_walk", inference_span)
                 callback_results_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                 ga_resolve_callback_results(&state) can Global{Read,Write}
@@ -1624,7 +1638,7 @@ extend Semantic:
                     report_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                     state.report <- true
                     state.progress_functions <- 0
-                    table <- ga_functions(file.top_decls, 0, &state, table) can Global{Read,Write}
+                    table <- ga_functions(file.top_decls, 0, &state, table, &reusable_empty_offsets, incremental_skip_count) can Global{Read,Write}
                     PhaseTimer::end_span("authority:report_walk", report_span)
                 # Export facts after the generic checker has run; this checker owns
                 # mandatory Global call authority with lexical declaration identities.

@@ -4,6 +4,10 @@
 extend Semantic:
     public:
         const INCREMENTAL_FUNCTION_FACTS_SCHEMA: u32 = 1
+        # Bump whenever a semantic change can alter the meaning of facts consumed by
+        # checker replay. This is deliberately separate from the wire schema: a cache
+        # can decode correctly yet describe different checker semantics.
+        const INCREMENTAL_SEMANTIC_ENGINE_VERSION: u64 = 1
         const INCREMENTAL_FACT_HASH_OFFSET: u64 = 14695981039346656037
         const INCREMENTAL_NO_ANCHOR: u32 = 4294967295
         const INCREMENTAL_FACT_HASH_PRIME: u64 = 1099511628211
@@ -40,7 +44,7 @@ extend Semantic:
             direct_fact_start: mutable usize
             direct_fact_count: mutable usize
             cacheable: mutable bool
-            reused: mutable bool
+            matched_previous: mutable bool
             reject_reason: mutable IncrementalRejectReason
 
         # Subject is a stable path/name key for calls and globals, or an effect name for panic.
@@ -84,9 +88,13 @@ extend Semantic:
             direct_facts: mutable darray[IncrementalDirectFact]
             active_grants: mutable darray[IncrementalActiveGrant]
             bodies_visited: mutable u32
-            bodies_reused: mutable u32
+            bodies_matched: mutable u32
             bodies_rejected: mutable u32
             surface_compatible: mutable bool
+
+        def incremental_empty_snapshot() -> IncrementalSemanticSnapshot:
+            can Memory.Allocate:
+                return IncrementalSemanticSnapshot{schema_version: 0, semantic_fingerprint: 0, options_fingerprint: 0, bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: 0, functions: [], current_anchors: [], direct_facts: [], active_grants: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, surface_compatible: false}
 
         private struct IncrementalFactCandidate:
             name: sview
@@ -103,7 +111,7 @@ extend Semantic:
             skip_end: usize
             owner: usize
             header_supported: mutable bool
-            tentatively_reusable: mutable bool
+            prior_body_matches: mutable bool
             scanned: mutable bool
 
         private struct IncrementalFactTokenSpan:
@@ -425,38 +433,14 @@ extend Semantic:
                 snapshot.functions[owner].direct_fact_start <- fact_start
                 snapshot.functions[owner].direct_fact_count <- snapshot.direct_facts.count - fact_start
                 snapshot.functions[owner].cacheable <- supported
-                snapshot.functions[owner].reused <- false
+                snapshot.functions[owner].matched_previous <- false
                 if candidate.header_supported:
                     snapshot.functions[owner].reject_reason <- IncrementalRejectReason.None if supported else IncrementalRejectReason.UnsupportedBodySyntax
                 snapshot.bodies_rejected <- snapshot.bodies_rejected + 1 if not supported
                 candidates[index].scanned <- true
 
-        def ifc_copy_prior(previous: IncrementalSemanticSnapshot&, prior_index: usize, owner: usize, snapshot: mutable IncrementalSemanticSnapshot&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                prior: IncrementalFunctionFactRecord = previous.functions[prior_index]
-                fact_start: usize = snapshot.direct_facts.count
-                for relative_fact in 0..<prior.direct_fact_count |snapshot|:
-                    old_fact: IncrementalDirectFact = previous.direct_facts[prior.direct_fact_start + relative_fact]
-                    subject_start: usize = snapshot.bytes.count
-                    for offset in 0..<old_fact.subject_length:
-                        snapshot.bytes.push(previous.bytes[old_fact.subject_start + offset])
-                    grant_start: usize = snapshot.active_grants.count
-                    for relative_grant in 0..<old_fact.active_grant_count |snapshot|:
-                        old_grant: IncrementalActiveGrant = previous.active_grants[old_fact.active_grant_start + relative_grant]
-                        name_start: usize = snapshot.bytes.count
-                        for offset in 0..<old_grant.name_length:
-                            snapshot.bytes.push(previous.bytes[old_grant.name_start + offset])
-                        snapshot.active_grants.push(IncrementalActiveGrant{kind: old_grant.kind, name_start: name_start, name_length: old_grant.name_length})
-                    snapshot.direct_facts.push(IncrementalDirectFact{owner: owner, kind: old_fact.kind, subject_start: subject_start, subject_length: old_fact.subject_length, anchor_token: old_fact.anchor_token, active_grant_start: grant_start, active_grant_count: snapshot.active_grants.count - grant_start})
-                snapshot.functions[owner].direct_fact_start <- fact_start
-                snapshot.functions[owner].direct_fact_count <- snapshot.direct_facts.count - fact_start
-                snapshot.functions[owner].cacheable <- true
-                snapshot.functions[owner].reused <- true
-                snapshot.functions[owner].reject_reason <- IncrementalRejectReason.None
-                snapshot.bodies_reused <- snapshot.bodies_reused + 1
-
-        # Cold scans and reused bodies append in different orders. Persist one layout
-        # independent of that scheduling, including mixed reused/rescanned functions.
+        # Persist one canonical layout so records do not depend on the order in which
+        # their owned key, body, and freshly scanned fact spans were appended.
         def ifc_canonical_layout(snapshot: IncrementalSemanticSnapshot) -> IncrementalSemanticSnapshot:
             can Memory.Allocate, Abort.Panic:
                 ordered: mutable IncrementalSemanticSnapshot = snapshot
@@ -481,7 +465,7 @@ extend Semantic:
                     ordered.bytes.resize(ordered.bytes.count + record.body_length)
                     for copy_offset_2 in 0..<record.body_length:
                         ordered.bytes[body_start + copy_offset_2] <- snapshot.bytes[record.body_start + copy_offset_2]
-                    ordered.functions.push(IncrementalFunctionFactRecord{key_start: key_start, key_length: record.key_length, body_start: body_start, body_length: record.body_length, body_hash: record.body_hash, direct_fact_start: 0, direct_fact_count: 0, cacheable: record.cacheable, reused: record.reused, reject_reason: record.reject_reason})
+                    ordered.functions.push(IncrementalFunctionFactRecord{key_start: key_start, key_length: record.key_length, body_start: body_start, body_length: record.body_length, body_hash: record.body_hash, direct_fact_start: 0, direct_fact_count: 0, cacheable: record.cacheable, matched_previous: record.matched_previous, reject_reason: record.reject_reason})
                 for owner in 0..<snapshot.functions.count |ordered|:
                     record: IncrementalFunctionFactRecord = snapshot.functions[owner]
                     fact_start: usize = ordered.direct_facts.count
@@ -523,7 +507,7 @@ extend Semantic:
         # they can hide mutable places or callback values. Every unsupported construct misses.
         def incremental_collect_function_facts(file: Ast::File&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, previous: IncrementalSemanticSnapshot&, has_previous: bool) -> IncrementalSemanticSnapshot:
             can Memory.Allocate, Abort.Panic:
-                snapshot: mutable IncrementalSemanticSnapshot = IncrementalSemanticSnapshot{schema_version: INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: semantic_fingerprint, options_fingerprint: options_fingerprint, bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], bodies_visited: 0, bodies_reused: 0, bodies_rejected: 0, surface_compatible: false}
+                snapshot: mutable IncrementalSemanticSnapshot = IncrementalSemanticSnapshot{schema_version: INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: semantic_fingerprint, options_fingerprint: options_fingerprint, bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, surface_compatible: false}
                 snapshot.source_path_start <- snapshot.bytes.count
                 snapshot.source_path_length <- sview_len(source_path)
                 ifc_append_view(snapshot, source_path)
@@ -565,9 +549,9 @@ extend Semantic:
                             body_valid: bool = span.found and ifc_append_tokens(snapshot, source, source_length, tokens, span.body_start, span.body_end)
                             body_length: usize = snapshot.bytes.count - body_start if body_valid else 0
                             owner: usize = snapshot.functions.count
-                            snapshot.functions.push(IncrementalFunctionFactRecord{key_start: key_span.start, key_length: key_span.length, body_start: body_start, body_length: body_length, body_hash: ifc_hash(snapshot.bytes, body_start, body_length), direct_fact_start: 0, direct_fact_count: 0, cacheable: false, reused: false, reject_reason: IncrementalRejectReason.MissingBlockBody if not span.found else IncrementalRejectReason.None})
+                            snapshot.functions.push(IncrementalFunctionFactRecord{key_start: key_span.start, key_length: key_span.length, body_start: body_start, body_length: body_length, body_hash: ifc_hash(snapshot.bytes, body_start, body_length), direct_fact_start: 0, direct_fact_count: 0, cacheable: false, matched_previous: false, reject_reason: IncrementalRejectReason.MissingBlockBody if not span.found else IncrementalRejectReason.None})
                             snapshot.current_anchors.push(IncrementalFunctionSourceAnchor{definition_offset: position.offset, body_token_start: span.body_start, body_token_end: span.body_end})
-                            candidates.push(IncrementalFactCandidate{name: name, parameters: parameters, return_type: return_type, body: body, definition_offset: position.offset, definition_token: span.definition_token, generic_header: generic_header, span_ordered: span_ordered, body_token_start: span.body_start, body_token_end: span.body_end, skip_start: span.skip_start, skip_end: span.skip_end, owner: owner, header_supported: span.found and body_valid and source_path != "" and not generic_header and not inline_grant and span_ordered and signature_supported, tentatively_reusable: false, scanned: false})
+                            candidates.push(IncrementalFactCandidate{name: name, parameters: parameters, return_type: return_type, body: body, definition_offset: position.offset, definition_token: span.definition_token, generic_header: generic_header, span_ordered: span_ordered, body_token_start: span.body_start, body_token_end: span.body_end, skip_start: span.skip_start, skip_end: span.skip_end, owner: owner, header_supported: span.found and body_valid and source_path != "" and not generic_header and not inline_grant and span_ordered and signature_supported, prior_body_matches: false, scanned: false})
                             snapshot.functions[owner].reject_reason <- IncrementalRejectReason.MissingStablePath if source_path == ""
                             snapshot.functions[owner].reject_reason <- IncrementalRejectReason.InvalidTokenSpan if span.found and not body_valid
                             snapshot.functions[owner].reject_reason <- IncrementalRejectReason.UnsupportedBodySyntax if inline_grant
@@ -600,12 +584,12 @@ extend Semantic:
                         if old_index < previous.functions.count:
                             old: IncrementalFunctionFactRecord = previous.functions[old_index]
                             same_body: bool = ifc_equal(snapshot.bytes, current.body_start, current.body_length, previous.bytes, old.body_start, old.body_length)
-                            if same_body and old.cacheable:
-                                candidates[index].tentatively_reusable <- true
-                                snapshot.functions[candidates[index].owner].cacheable <- true
+                            # The sidecar is untrusted. Prior flags and fact counts are
+                            # hints only; the current body must be scanned below before
+                            # it can become eligible for checker work to be skipped.
+                            candidates[index].prior_body_matches <- same_body
 
                 for index in 0..<candidates.count |candidates, snapshot|:
-                    continue if candidates[index].tentatively_reusable
                     ifc_scan_candidate(index, candidates, source_path, tokens, all_globals, mutable_globals, snapshot)
 
                 snapshot.declaration_surface_start <- snapshot.bytes.count
@@ -631,24 +615,21 @@ extend Semantic:
                     snapshot.active_grants.truncate(0)
                     for record_index in 0..<snapshot.functions.count |snapshot, record_index|:
                         snapshot.functions[record_index].cacheable <- false
-                        snapshot.functions[record_index].reused <- false
+                        snapshot.functions[record_index].matched_previous <- false
                         snapshot.functions[record_index].direct_fact_start <- 0
                         snapshot.functions[record_index].direct_fact_count <- 0
                         snapshot.functions[record_index].reject_reason <- IncrementalRejectReason.InvalidTokenSpan
                     return snapshot
 
                 if snapshot.surface_compatible:
-                    for index in 0..<candidates.count |candidates, snapshot, previous|:
-                        continue if not candidates[index].tentatively_reusable
-                        current: IncrementalFunctionFactRecord = snapshot.functions[candidates[index].owner]
-                        old_index: usize = ifc_prior_index(previous, snapshot.bytes, current.key_start, current.key_length)
-                        continue if old_index >= previous.functions.count
-                        ifc_copy_prior(previous, old_index, candidates[index].owner, snapshot)
-                else:
-                    # A change to any declaration, import, global, overload set, or unsupported
-                    # body invalidates this coarse surface. Re-scan provisionally skipped bodies.
                     for index in 0..<candidates.count |candidates, snapshot|:
-                        continue if not candidates[index].tentatively_reusable
-                        ifc_scan_candidate(index, candidates, source_path, tokens, all_globals, mutable_globals, snapshot)
+                        continue if not candidates[index].prior_body_matches
+                        current: IncrementalFunctionFactRecord = snapshot.functions[candidates[index].owner]
+                        # `cacheable` and fact counts here came from the current source
+                        # walk above, never from the sidecar. A prior match is only a
+                        # reuse counter and an extra admission condition for GA skipping.
+                        if current.cacheable:
+                            snapshot.functions[candidates[index].owner].matched_previous <- true
+                            snapshot.bodies_matched <- snapshot.bodies_matched + 1
 
                 return ifc_canonical_layout(snapshot)

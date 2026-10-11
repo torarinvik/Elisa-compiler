@@ -1,10 +1,13 @@
 # Incremental compilation design
 
-## Local implementation status (2026-10-10)
+## Local implementation status (2026-10-11)
 
-The design below describes the intended persistent semantic cache. That cache is
-not enabled yet. Historical VAST timings are motivation, not the current local
-baseline; qualification now uses local compute and pinned compiler/runtime tuples.
+Historical VAST timings are motivation, not the current local baseline;
+qualification uses local compute and pinned compiler/runtime tuples. The current
+`main` worktree has an opt-in persistent-cache implementation for one narrow
+Global-authority case. A fresh self-host build and focused parity controls pass,
+but it is not the general semantic cache described below and has no performance
+qualification yet.
 
 Current-invocation authority event reuse has passed native diagnostic and ordered
 effect-array parity tests in isolated candidates. It reuses observations during
@@ -22,19 +25,27 @@ publication, and scheduling only cache misses remain to be implemented and teste
 Producer and loaded LLVM identities must be verified against actual artifacts;
 environment paths or supplied digest strings alone cannot authorize a hit.
 
-The existing function-fact collector and snapshot codec are included as prototype
-APIs, but `semantic_api.elisa` does not call the collector. The portable authority
-trace is independent of the production include path. Connecting either prototype
-must replace authoritative work rather than add another body walk. The current
-invocation event indices and AST positions need checked conversion to stable
-declaration keys and body-relative anchors, followed by rebinding against the next
-invocation's declarations before any persistent reuse can be admitted.
+The function-fact collector and snapshot codec are now connected to an explicit
+`ELISA_STAGE1_INCREMENTAL_CACHE_DIR` opt-in. The driver reloads a bounded,
+versioned snapshot, recollects facts against the exact current AST/source/token
+tuple, and only offers a prior body match when the declaration surface matches.
+Every candidate body is rescanned from the current AST before admission; the
+sidecar's cacheable bit and fact counts never authorize a skip. The only checker
+work skipped is the two Global-authority body walks for a current-source-verified,
+cacheable body with zero direct facts and an exact prior body match. Other bodies,
+checkers, closure construction, and report publication stay on the cold path. The
+snapshot stores portable facts; invocation-local body anchors are rebuilt and
+rebound on each parse. This is a narrow work-avoidance experiment, not yet a
+qualified incremental-compilation speedup.
 
-The next acceptance workloads must include unchanged rebuilds and edits to the
-compiler itself, with cold/warm diagnostic, effect, and executable parity. Small
-cross-language frontend/object timings do not prove incremental performance or
-professional compiler efficiency across representative projects. Qualified gains
-must be measured and integrated into main before they count as installed behavior.
+The current acceptance controls pass cold, first-cache, warm, body-edited,
+option-changed, structurally valid forged-sidecar, and corrupted-cache runs for diagnostics and exit status, and
+compare canonical effect rows in a direct checker control at O0 and O2. Existing
+Global-permission, static-generation, and source-identity shadow gates also pass.
+Further invalidation workloads must cover dependencies before eligibility expands.
+No timing claim is made from these parity controls. Small cross-language
+frontend/object timings do not prove incremental performance or professional
+compiler efficiency across representative projects.
 
 Cache preparation also needs its own cost accounting. The current snapshot helper
 verifies the parent, builds owners, clones the complete module, strips foreign
@@ -65,7 +76,7 @@ Cache reuse is valid only when it produces the same diagnostics, inferred effect
 
 In `src/semantic/semantic_api.elisa`, `collect_effect_sources` runs before `check_ungranted_panic`, and `check_mutable_global_authority` follows it. The panic checker and authority checker currently perform separate body walks. `check_mutable_global_authority` creates a fresh `GlobalAuthority`, collects declarations and lexical indexes, analyzes bodies through `ga_functions`, closes call/effect rows, publishes rows to `SymbolTable`, and walks bodies again to issue enforced diagnostics. Its numeric function slots, lexical scope numbers, AST nodes, offsets, and interned references are invocation-local and cannot be written to disk as identities.
 
-The compiler has content-addressed caches for a complete unchanged stage1 object build in `scripts/elisac_stage1.sh`, plus build/runtime object provenance helpers. Those caches do not help when one function changes because the object key covers the complete compile invocation. There is no persistent semantic-fact format today.
+The compiler has content-addressed caches for a complete unchanged stage1 object build in `scripts/elisac_stage1.sh`, plus build/runtime object provenance helpers. Those caches do not help when one function changes because the object key covers the complete compile invocation. The semantic sidecar is an opt-in prototype; it currently saves only narrowly eligible Global-authority body walks and does not cache codegen or the other semantic passes.
 
 The backend has a useful body boundary: `src/backend/codegen_module.elisa` declares module entities before `emit_module_bodies`, and `src/backend/codegen_declare.elisa` contains `emit_function_body`. It currently emits into one shared LLVM module. `src/backend/llvm_c.elisa` binds bitcode writing, but not bitcode parsing or module linking. Reusing a body therefore needs an explicit fragment restore path; skipping `emit_function_body` alone would leave the new module without that body.
 
@@ -167,50 +178,47 @@ Start codegen reuse with `-O0`, without debug/profiling/coverage metadata, and w
 ## Implementation stages and acceptance
 
 1. **Instrument the baseline.** On the exact local compiler seed and host in a quiet window, record phase wall/CPU time for `check_ungranted_panic`, `check_mutable_global_authority`, their combined interval, number of function bodies visited, number of resolved calls/edges, and current diagnostics/effect-row report. Do not infer the 993-second cost from unrelated historical self-host timings.
-2. **Integrate the collector as a shadow pass.** The in-memory collector, snapshot codec, and option-key prototype now exist, but production semantic checking does not call them. Pass the exact source bytes and token stream that produced each AST, plus a stable source identity, into an opt-in shadow collector. Preserve the distinction between the expanded AST/source context and original-source policy headers, including `static generate` and early `pymodule` paths. Keep all current checkers authoritative. On a narrow eligible corpus, compare collected direct observations against cold checker rows and diagnostics, and report cacheable/rejected body counts and reasons. This step must not claim saved checker work.
-3. **Persist records, then consume only proven facts.** Add versioned sidecar reads/writes with atomic publication, fail-closed misses, and hit/miss/rejection counters. Persistence alone is not an incremental speedup: after a record is proven equivalent to cold analysis, teach the relevant checker to replay that record and skip its body walk while rebuilding call/effect closure and affected diagnostics. Measure body visits and end-to-end warm body-edit time against the cold path.
+2. **Collect and bind facts.** The opt-in driver path now passes the exact analyzed source and tokens alongside the AST, while policy options still come from the original source. Ordinary, expanded `static generate`, and early `pymodule` gates use the paired frontend inputs. The collector remains deliberately narrow; unsupported bodies stay cold. The separate shadow observer remains observational and must not be confused with checker reuse.
+3. **Persist and consume one proven case.** An opt-in sidecar uses bounded reads, schema/semantic/options validation, recollection against current source, and temporary-file-plus-rename publication. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker skips only current-source-verified, prior-matched zero-direct-fact bodies in both Global-authority walks, then rebuilds indexes, call/effect closure, rows, and diagnostics as usual. The direct control checks diagnostic and canonical-row parity; the CLI control checks cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and exact counters. These controls pass against the fresh self-hosted product; this narrow checker-work reduction is not an end-to-end performance result.
 4. **Prove invalidation.** Compare warm incremental output byte-for-byte with cold output for: unchanged build; a body-only edit with unchanged API; a callee body edit that adds/removes `Global.Read` or `Global.Write`; a callee effect-contract change; adding an overload after a previous lookup; changing an import or alias that resolves a previous miss; changing a global from immutable to mutable or changing its type/layout; changing a protocol method contract/conformance; changing strict/global options; and corrupting or versioning out the cache.
 5. **Add body codegen fragments.** Cache and restore eligible `-O0` LLVM function bodies in a newly created module, then test link validity, object/executable parity, and invalidation for function API, type/global layout, callee ABI, target, and codegen flags.
 6. **Expand eligibility and optimization.** Add callback/generic/debug support only with explicit fingerprints and controls. Consider cross-function optimized reuse only with an import/summary model and runtime parity evidence.
 
 The semantic MVP passes only when warm and cold diagnostics, canonical effect rows, exit status, and source locations match exactly; a body-only edit demonstrably visits only changed/unsupported bodies in the paired passes; and edits to a dependency cause all required affected call checks to rerun. The codegen MVP additionally requires equivalent executable behavior and a valid verifier result after cached fragments are restored.
 
-## First production integration boundary
+## Current production integration boundary
 
-The production semantic API still receives an AST and policy options, but not the exact
-source/token pair that produced the AST. Add an explicit source context from the driver and
-pass it to an opt-in shadow collector. Do not insert a second body walk after one of the
-existing checkers and describe it as shared collection; that would increase cold-build cost
-without enabling reuse. The driver must pair an expanded AST with its expanded source and
-tokens, while continuing to derive policy headers from the original source. Early `pymodule`
-gates must use the same AST/source pairing as ordinary compilation.
+The driver supplies the exact source bytes and token stream that produced each AST,
+plus a stable source-unit identity. For expanded `static generate` input, the AST,
+source, and tokens come from the expanded frontend result; policy headers continue
+to come from the original source. Early `pymodule` gates use the same pairing.
+Without stable identity, or when the cache directory is unset, the driver runs the
+ordinary cold semantic gate.
 
-The prototypes in `src/semantic/incremental_function_facts.elisa` and
-`src/semantic/incremental_snapshot_codec.elisa` are intentionally narrower than the stable
-key and dependency contract above. The standalone codec control proves deterministic
-encoding, fail-closed decoding, and warm reuse inside the collector; it does not prove that a
-semantic checker consumed a cached record or skipped work. Keep the cold checkers
-authoritative while shadow facts are compared against actual checker rows and diagnostics.
-The opt-in source-identity shadow path disables local line-map retention: include expansion
-still publishes its ordinary line map, while this collector does not need a second parsed copy.
+The current replay seam does not consume stored facts as authority effects. It
+rescans each supported body from the current AST, rebuilds current anchors, and
+validates exact body and declaration-surface matching. A prior record's cacheable
+bit and direct-fact count cannot authorize a skip. The checker skips only a
+current-source-verified, unchanged body with zero direct facts, keeping every body
+that could contribute a Global fact on the full path. The current serialized
+controls cover body edits, semantic-option changes, a valid-checksum forged
+sidecar, and corrupt cache data. Dependency-change invalidation remains to be
+added before eligibility expands. The manual
+`INCREMENTAL_SEMANTIC_ENGINE_VERSION` must be bumped whenever changes can alter
+collector eligibility or the meaning of facts consumed by replay.
 
-The initial production-integration patch should establish that source-context and parity
-contract before writing cache files or skipping checker work. Retain the complete full-path
-checker on every unsupported, ambiguous, or mismatched body. After parity, add persistent
-records and make one checker consume only the facts whose cold equivalence has been proven.
-Then measure both checker body visits and end-to-end warm body-edit time before expanding
-the supported syntax. LLVM fragment loading remains a separate later stage.
+This experiment does not yet skip `collect_effect_sources`, `check_ungranted_panic`,
+authority indexing/closure, code generation, or linking. LLVM fragment loading
+remains a separate later stage.
 
 ### Driver source context boundary
 
-The persistent semantic consumer must receive the source bytes, token stream, AST,
-and explicit source-unit identity from the same frontend result. In the current
-driver, `static generate` may replace all three analyzed inputs. The existing
+For each gate, `static generate` may replace the analyzed inputs. The existing
 `report_src_ptr`, `report_tokens`, and `report_source_len` track that expanded unit;
 the original input remains the source of header-based checking options. These are
 two distinct inputs to cache validation: expanded program identity and original
 policy configuration. Passing the original token stream beside an expanded AST is
-not a valid reuse context. Early pymodule semantic gates must observe the same rule.
+not a valid reuse context. Early pymodule semantic gates use the same rule.
 An environment path alone does not attest either source buffer.
 
 A bound record must also prove exact current body-token equality and current

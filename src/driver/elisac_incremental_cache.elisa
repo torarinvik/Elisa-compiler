@@ -1,0 +1,162 @@
+# Opt-in portable semantic cache admission. The stored values are only collector facts;
+# invocation-local AST anchors are rebuilt from the exact parse before any checker skips.
+struct IncrementalCacheRead:
+    valid: bool
+    bytes: darray[u8]
+
+
+def igc_cache_path(cache_directory: darray[u8]&, source_path: sview) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    path: mutable darray[u8] = []
+    for index in 0..<cache_directory.count |path, cache_directory|:
+        path.push(cache_directory[index])
+    while path.count > 0 and path[path.count - 1] == 47 |path|:
+        path <- path.truncate(path.count - 1)
+    path.push(47)
+    hash: mutable u64 = 14695981039346656037
+    for index in 0..<sview_len(source_path) |hash, source_path|:
+        hash <- (hash ^ sview_at(source_path, index).u64()) * 1099511628211
+    for index in 0..<16 |path, hash|:
+        shift: u32 = ((15 - index) * 4).u32()
+        digit: u8 = ((hash >> shift) & 15).u8()
+        path.push((48 + digit).u8() if digit < 10 else (87 + digit).u8())
+    path.extend(".elisa-semantic")
+    return path
+
+
+def igc_mkdir(cache_directory: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    return if cache_directory.count == 0
+    path: mutable darray[u8] = []
+    for index in 0..<cache_directory.count |path, cache_directory|:
+        path.push(cache_directory[index])
+    path.push(0)
+    path_cstr: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+    _ = mkdir(path_cstr, 448.u16())
+    return
+
+
+def igc_read_cache(path: darray[u8]&) -> IncrementalCacheRead can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    for index in 0..<path.count |path_c, path|:
+        path_c.push(path[index])
+    path_c.push(0)
+    path_cstr: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    descriptor: i64 = open(path_cstr, 0, 0)
+    return IncrementalCacheRead{valid: false, bytes: []} if descriptor < 0
+    bytes: mutable darray[u8] = []
+    read_valid: mutable bool = true
+    at_eof: mutable bool = false
+    limit: usize = Semantic::INCREMENTAL_SNAPSHOT_CODEC_LIMIT
+    while not at_eof and read_valid |bytes, descriptor, read_valid, at_eof, limit|:
+        available: usize = limit + 1 - bytes.count
+        chunk: usize = 65536 if available > 65536 else available
+        filled: usize = bytes.count
+        bytes.reserve(filled + chunk)
+        bytes.count <- filled + chunk
+        amount: isize = read(descriptor, &bytes[filled], chunk)
+        if amount < 0:
+            bytes.count <- filled
+            read_valid <- false
+        elif amount == 0:
+            bytes.count <- filled
+            at_eof <- true
+        else:
+            bytes.count <- filled + amount.usize()
+            read_valid <- false if bytes.count > limit
+    _ = close(descriptor)
+    return IncrementalCacheRead{valid: false, bytes: []} if not read_valid or not at_eof
+    return IncrementalCacheRead{valid: true, bytes: bytes}
+
+
+def igc_write_atomic(path: darray[u8]&, bytes: darray[u8]&, semantic_fingerprint: u64, options_fingerprint: u64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    temporary: mutable darray[u8] = []
+    temporary.extend(path)
+    temporary.extend(".tmp.")
+    append_decimal(temporary, elisa_stage1_getpid().u32())
+    destination_c: mutable darray[u8] = []
+    temporary_c: mutable darray[u8] = []
+    destination_c.extend(path)
+    temporary_c.extend(temporary)
+    destination_c.push(0)
+    temporary_c.push(0)
+    destination_cstr: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
+    temporary_cstr: cstr = (&temporary_c[0]).cast[cstr] can Unsafe.PointerCast
+    descriptor: i64 = open(temporary_cstr, ELISA_OPEN_WRITE_CREATE_TRUNC, 384)
+    return false if descriptor < 0
+    offset: mutable usize = 0
+    write_valid: mutable bool = true
+    while offset < bytes.count and write_valid |offset, write_valid, bytes, descriptor|:
+        raw: void& = (&bytes[offset]).cast[void&] can Unsafe.PointerCast
+        written: isize = write(descriptor, raw, bytes.count - offset)
+        if written <= 0:
+            write_valid <- false
+        else:
+            offset <- offset + written.usize()
+    close_status: i32 = close(descriptor)
+    write_valid <- false if close_status != 0
+    decoded: Semantic::IncrementalSnapshotDecodeResult = Semantic::incremental_decode_snapshot(bytes, semantic_fingerprint, options_fingerprint)
+    write_valid <- false if not decoded.valid
+    if write_valid:
+        renamed: i32 = rename(temporary_cstr, destination_cstr)
+        write_valid <- false if renamed != 0
+    if not write_valid:
+        _ = unlink(temporary_cstr)
+    return write_valid
+
+
+def run_semantic_gate_incremental(file: Ast::File&, policy_source: u8&, policy_length: usize, analyzed_source: u8&, analyzed_length: usize, tokens: darray[Lexer::Token]&, identity: SourceIdentity::Capture&, cache_directory: darray[u8]&, report_cache: bool, generated_input: bool) -> i64 can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+    options: Semantic::IncrementalSemanticOptions = stage1_semantic_options(policy_source, policy_length)
+    semantic_fingerprint: u64 = Semantic::INCREMENTAL_SEMANTIC_ENGINE_VERSION
+    options_fingerprint: mutable u64 = 0
+    if cache_directory.count > 0:
+        options_fingerprint <- Semantic::incremental_semantic_options_fingerprint(options)
+    snapshot: mutable Semantic::IncrementalSemanticSnapshot = Semantic::incremental_empty_snapshot()
+    cache_path: mutable darray[u8] = []
+    cache_admitted: mutable bool = false
+    cache_loaded: mutable bool = false
+    if cache_directory.count > 0 and options_fingerprint != 0 and SourceIdentity::usable(identity) and identity.root < identity.paths.count:
+        root: SourceIdentity::PathRecord = identity.paths[identity.root]
+        source_path: sview = bytes_view_range_ref(identity.bytes, root.start, root.length)
+        if sview_len(source_path) > 0:
+            igc_mkdir(cache_directory)
+            cache_path <- igc_cache_path(cache_directory, source_path)
+            stored: IncrementalCacheRead = igc_read_cache(cache_path)
+            previous: mutable Semantic::IncrementalSemanticSnapshot = Semantic::incremental_empty_snapshot()
+            has_previous: mutable bool = false
+            if stored.valid:
+                decoded: Semantic::IncrementalSnapshotDecodeResult = Semantic::incremental_decode_snapshot(stored.bytes, semantic_fingerprint, options_fingerprint)
+                if decoded.valid:
+                    previous <- decoded.snapshot
+                    has_previous <- true
+                    cache_loaded <- true
+            snapshot <- Semantic::incremental_collect_function_facts(file, analyzed_source, analyzed_length, tokens, source_path, semantic_fingerprint, options_fingerprint, previous, has_previous)
+            cache_admitted <- true
+
+    incremental_skip_count: mutable u64 = 0
+    semantic_errors: i64 = run_semantic_gate_with_snapshot(file, policy_source, policy_length, options, snapshot, &incremental_skip_count) can Global{Read,Write}
+    cache_published: mutable bool = false
+    if cache_admitted and semantic_errors == 0:
+        encoded: Semantic::IncrementalSnapshotEncodeResult = Semantic::incremental_encode_snapshot(snapshot)
+        if encoded.valid:
+            cache_published <- igc_write_atomic(cache_path, encoded.bytes, semantic_fingerprint, options_fingerprint)
+
+    if report_cache:
+        report: mutable darray[u8] = []
+        report.extend("incremental-ga-cache: input=")
+        report.extend("generated" if generated_input else "ordinary")
+        report.extend(" prior=")
+        report.extend("valid" if cache_loaded else "miss")
+        report.extend(" matched=")
+        append_decimal(&report, snapshot.bodies_matched)
+        report.extend(" visited=")
+        append_decimal(&report, snapshot.bodies_visited)
+        report.extend(" rejected=")
+        append_decimal(&report, snapshot.bodies_rejected)
+        report.extend(" ga_walks_skipped=")
+        append_decimal(&report, incremental_skip_count.u32())
+        report.extend(" published=")
+        report.extend("yes" if cache_published else "no")
+        if not cache_admitted:
+            report.extend(" reason=unstable-source-or-options")
+        report.push(10)
+        write_stderr(report)
+    return semantic_errors
