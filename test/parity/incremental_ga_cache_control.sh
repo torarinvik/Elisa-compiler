@@ -127,8 +127,9 @@ grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 visited=8 r
 
 cache_file="$(find "$CACHE" -type f -name '*.elisa-semantic' -print -quit)"
 [[ -n "$cache_file" ]]
-python3 - "$cache_file" <<'PY'
+python3 - "$cache_file" "$ROOT/src/semantic/incremental_semantic_options.elisa" <<'PY'
 from pathlib import Path
+import re
 import struct
 import sys
 
@@ -139,9 +140,12 @@ put = lambda offset, value: struct.pack_into("<Q", data, offset, value)
 byte_count = u64(5 * 8)
 function_count = u64(6 * 8)
 fact_count = u64(7 * 8)
-functions_at = 14 * 8 + byte_count
+options_source = Path(sys.argv[2]).read_text()
+key_length = int(re.search(r"INCREMENTAL_SEMANTIC_OPTIONS_KEY_LENGTH: usize = (\d+)", options_source).group(1))
+pool_start = 14 * 8 + key_length
+functions_at = pool_start + byte_count
 facts_at = functions_at + function_count * 72
-pool = data[14 * 8 : 14 * 8 + byte_count]
+pool = data[pool_start : pool_start + byte_count]
 target = None
 for index in range(function_count):
     start = functions_at + index * 72
@@ -175,8 +179,9 @@ run_check cold "$WORK/check.elisa" forged-cold permissive
 run_check enabled "$WORK/check.elisa" forged-warm permissive
 compare_without_cache_report forged-cold forged-warm
 grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 visited=8 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/forged-warm.err"
-python3 - "$cache_file" <<'PY'
+python3 - "$cache_file" "$ROOT/src/semantic/incremental_semantic_options.elisa" <<'PY'
 from pathlib import Path
+import re
 import struct
 import sys
 
@@ -184,8 +189,11 @@ data = Path(sys.argv[1]).read_bytes()
 u64 = lambda offset: struct.unpack_from("<Q", data, offset)[0]
 byte_count = u64(5 * 8)
 function_count = u64(6 * 8)
-functions_at = 14 * 8 + byte_count
-pool = data[14 * 8 : 14 * 8 + byte_count]
+options_source = Path(sys.argv[2]).read_text()
+key_length = int(re.search(r"INCREMENTAL_SEMANTIC_OPTIONS_KEY_LENGTH: usize = (\d+)", options_source).group(1))
+pool_start = 14 * 8 + key_length
+functions_at = pool_start + byte_count
+pool = data[pool_start : pool_start + byte_count]
 matches = []
 for index in range(function_count):
     start = functions_at + index * 72
