@@ -55,6 +55,13 @@ stage1_compile() {
         bash "$REPO_ROOT/scripts/elisac_stage1.sh" "$@"
 }
 
+compiler_log_has_crash() {
+    # Go runtime crashes use exit 2, just like some ordinary compiler declines.
+    # Require both a crash heading and stack evidence, not the exit code alone.
+    grep -Eq '^(fatal error: |panic: )' "$1" &&
+        grep -Eq '^(runtime stack:|goroutine [0-9]+ )' "$1"
+}
+
 # WORKER: `--one <mode> <resdir> <src>` compares both drivers on ONE fixture in a private
 # temp dir and writes a single result line (`same|ACCEPT-GAP|REJECT-GAP <tab> name <tab> r1`).
 # Phase T: the fixture loop was serial (~3 min on the Mac, 45+ min on a loaded 32-core
@@ -74,6 +81,9 @@ if [[ "${1:-}" == "--one" ]]; then
     a1=$([ "$r1" -eq 0 ] && echo accept || echo reject)
     verdict=same
     if [[ "$r0" -ge 124 || "$r1" -ge 124 ]]; then
+        verdict=INCONCLUSIVE
+    elif { [[ "$r0" -ne 0 ]] && compiler_log_has_crash "$w/stage0.compile.log"; } ||
+         { [[ "$r1" -ne 0 ]] && compiler_log_has_crash "$w/stage1.compile.log"; }; then
         verdict=INCONCLUSIVE
     elif [ "$a0" != "$a1" ]; then
         [ "$a0" = reject ] && verdict=ACCEPT-GAP || verdict=REJECT-GAP
