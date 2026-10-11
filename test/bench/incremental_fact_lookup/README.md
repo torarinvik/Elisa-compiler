@@ -8,6 +8,13 @@ Generate the source-only corpus:
 python3 test/bench/incremental_fact_lookup/generate.py /absolute/corpus --low-query
 ```
 
+Add `--dense-calls` to include chains with one direct call per helper after the
+leaf, plus a call from `main` to the last helper. These cases expose call-target
+lookup costs that the ordinary corpus, with only one direct call, cannot show.
+The edit changes only the leaf's returned literal. Unchanged callers contain
+direct facts and therefore remain on the cold Global-authority body-walk path;
+do not report their matched records as skipped checker work.
+
 Run only after the candidate passes `test/parity/incremental_prior_key_index_gate.sh` and the compiler lane is available:
 
 ```sh
