@@ -11,6 +11,9 @@ extern memset(dest: mutable void&, val: i32, n: usize) -> mutable void&
 # pressure and the amount of live memory touched by recursive AST construction.
 const ARENA_DA_INIT_CAP: usize = 8
 const DICT_INIT_CAP: usize = 8
+const COLLECTION_BUCKET_EMPTY: u8 = 0
+const COLLECTION_BUCKET_OCCUPIED: u8 = 1
+const COLLECTION_BUCKET_TOMBSTONE: u8 = 2
 
 struct DynArray[T]:
     items: mutable T&?
@@ -24,8 +27,8 @@ struct DynArrayView:
 def view_from_parts[T](data: void&?, len: usize) -> view[T]:
     return DynArrayView{data: data, len: len}
 
-# Open-addressing slot: `state` is 0=empty, 1=occupied, 2=tombstone (deleted, but probing
-# must continue past it). A zeroed bucket is therefore an empty slot.
+# Open-addressing slot: `state` is empty, occupied, or tombstone (deleted, but probing must
+# continue past it). A zeroed bucket is therefore an empty slot.
 struct DictBucket[K, T]:
     key: mutable K
     value: mutable T
@@ -898,11 +901,11 @@ def arena_dict_find_cstr_view_index[T](m: dict[cstr, T]&, key: sview) -> DictPro
     remaining: mutable usize = capacity
     while remaining > 0:
         decreases remaining
-        if items[slot].state == 0:
+        if items[slot].state == COLLECTION_BUCKET_EMPTY:
             final_slot: usize = slot if insert_slot == capacity else insert_slot
             return DictProbeResult{index: final_slot, found: false}
-        DictProbeResult{index: slot, found: true} return if items[slot].state == 1 and ctx_cstr_eq_sview(items[slot].key, key)
-        insert_slot <- slot if items[slot].state == 2 and insert_slot == capacity else insert_slot
+        DictProbeResult{index: slot, found: true} return if items[slot].state == COLLECTION_BUCKET_OCCUPIED and ctx_cstr_eq_sview(items[slot].key, key)
+        insert_slot <- slot if items[slot].state == COLLECTION_BUCKET_TOMBSTONE and insert_slot == capacity else insert_slot
         slot <- (slot + 1) & mask
         remaining <- remaining - 1
     DictProbeResult{index: insert_slot, found: false} return if insert_slot != capacity
@@ -916,7 +919,7 @@ def arena_dict_place_fresh[K, T](m: mutable dict[K, T]&, key: K, value: T) -> vo
     probe: DictProbeResult = arena_dict_find_index(m, key)
     items[probe.index].key <- key
     items[probe.index].value <- value
-    items[probe.index].state <- 1
+    items[probe.index].state <- COLLECTION_BUCKET_OCCUPIED
     m.count <- m.count + 1.usize()
     m.used <- m.used + 1.usize()
 
@@ -983,7 +986,7 @@ def arena_dict_reserve[K, T](a: mutable Arena&, m: mutable dict[K, T]&, min_capa
         if old_items_opt != null and old_capacity > 0:
             old_items: mutable DictBucket[K, T]& = old_items_opt
             for i in 0..<old_capacity:
-                arena_dict_place_fresh(rehash, old_items[i].key, old_items[i].value) if old_items[i].state == 1
+                arena_dict_place_fresh(rehash, old_items[i].key, old_items[i].value) if old_items[i].state == COLLECTION_BUCKET_OCCUPIED
 
         m.items as & <- rehash.items
         (collection_stack_profile_release(owner, live_table) can Global{Read,Write})
@@ -1055,6 +1058,17 @@ def arena_dict_put[K, T](a: mutable Arena&, m: mutable dict[K, T]&, key: K, valu
                 growth_items: mutable DictBucket[K, T]& = m.items
                 growth_items[growth_probe.index].value <- value
                 return &growth_items[growth_probe.index].value
+            # Reusing a tombstone does not increase `used`, so the table remains at
+            # its current non-empty load. Avoid a rehash when this key's probe path
+            # already found a reusable deleted slot.
+            if m.items != null and growth_probe.index < m.capacity:
+                tombstone_items: mutable DictBucket[K, T]& = m.items
+                if tombstone_items[growth_probe.index].state == COLLECTION_BUCKET_TOMBSTONE:
+                    tombstone_items[growth_probe.index].key <- key
+                    tombstone_items[growth_probe.index].value <- value
+                    tombstone_items[growth_probe.index].state <- COLLECTION_BUCKET_OCCUPIED
+                    m.count <- m.count + 1.usize()
+                    return &tombstone_items[growth_probe.index].value
             target_capacity: usize = arena_checked_mul_usize(m.capacity, 2) can Abort.Panic
             try (arena_dict_reserve(owner, m, target_capacity) can Global{Read,Write})
 
@@ -1067,10 +1081,10 @@ def arena_dict_put[K, T](a: mutable Arena&, m: mutable dict[K, T]&, key: K, valu
             items[probe.index].value <- value
             return &items[probe.index].value
 
-        reused_tombstone: bool = items[probe.index].state == 2
+        reused_tombstone: bool = items[probe.index].state == COLLECTION_BUCKET_TOMBSTONE
         items[probe.index].key <- key
         items[probe.index].value <- value
-        items[probe.index].state <- 1
+        items[probe.index].state <- COLLECTION_BUCKET_OCCUPIED
         m.count <- m.count + 1.usize()
         m.used <- m.used + 1.usize() if not reused_tombstone
         return &items[probe.index].value
@@ -1149,7 +1163,7 @@ def arena_dict_remove[K, T](m: mutable dict[K, T]&, key: K) -> bool:
     trusted Unsafe.PointerCast:
         # The tombstone state prevents readers from observing this inactive payload.
         items[probe.index] <- zeroed
-    items[probe.index].state <- 2
+    items[probe.index].state <- COLLECTION_BUCKET_TOMBSTONE
     m.count <- m.count - 1.usize()
     return true
 
@@ -1228,7 +1242,7 @@ def arena_set_place_fresh[T](s: mutable set[T]&, key: T) -> void:
     items: mutable SetBucket[T]& = s.items
     probe: DictProbeResult = arena_set_find_index(s, key)
     items[probe.index].key <- key
-    items[probe.index].state <- 1
+    items[probe.index].state <- COLLECTION_BUCKET_OCCUPIED
     s.count <- s.count + 1.usize()
     s.used <- s.used + 1.usize()
 
@@ -1289,7 +1303,7 @@ def arena_set_reserve[T](a: mutable Arena&, s: mutable set[T]&, min_capacity: us
         if old_items_opt != null and old_capacity > 0:
             old_items: mutable SetBucket[T]& = old_items_opt
             for i in 0..<old_capacity:
-                arena_set_place_fresh(rehash, old_items[i].key) if old_items[i].state == 1
+                arena_set_place_fresh(rehash, old_items[i].key) if old_items[i].state == COLLECTION_BUCKET_OCCUPIED
 
         s.items as & <- rehash.items
         (collection_stack_profile_release(owner, live_table) can Global{Read,Write})
@@ -1312,6 +1326,15 @@ def arena_set_add[T](a: mutable Arena&, s: mutable set[T]&, key: T) -> bool erro
         elif s.used >= s.capacity - s.capacity / 4.usize():
             growth_probe: DictProbeResult = arena_set_find_index(s, key)
             false return if growth_probe.found
+            # A tombstone is already included in `used`; replacing it leaves that
+            # load unchanged and does not need a larger table or a rehash.
+            if s.items != null and growth_probe.index < s.capacity:
+                tombstone_items: mutable SetBucket[T]& = s.items
+                if tombstone_items[growth_probe.index].state == COLLECTION_BUCKET_TOMBSTONE:
+                    tombstone_items[growth_probe.index].key <- key
+                    tombstone_items[growth_probe.index].state <- COLLECTION_BUCKET_OCCUPIED
+                    s.count <- s.count + 1.usize()
+                    return true
             target_capacity: usize = arena_checked_mul_usize(s.capacity, 2) can Abort.Panic
             try (arena_set_reserve(owner, s, target_capacity) can Global{Read,Write})
 
@@ -1322,9 +1345,9 @@ def arena_set_add[T](a: mutable Arena&, s: mutable set[T]&, key: T) -> bool erro
         probe: DictProbeResult = arena_set_find_index(s, key)
         false return if probe.found
 
-        reused_tombstone: bool = items[probe.index].state == 2
+        reused_tombstone: bool = items[probe.index].state == COLLECTION_BUCKET_TOMBSTONE
         items[probe.index].key <- key
-        items[probe.index].state <- 1
+        items[probe.index].state <- COLLECTION_BUCKET_OCCUPIED
         s.count <- s.count + 1.usize()
         s.used <- s.used + 1.usize() if not reused_tombstone
         return true
@@ -1367,7 +1390,7 @@ def arena_set_remove[T](s: mutable set[T]&, key: T) -> bool:
     trusted Unsafe.PointerCast:
         # The tombstone state prevents readers from observing this inactive payload.
         items[probe.index] <- zeroed
-    items[probe.index].state <- 2
+    items[probe.index].state <- COLLECTION_BUCKET_TOMBSTONE
     s.count <- s.count - 1.usize()
     return true
 
