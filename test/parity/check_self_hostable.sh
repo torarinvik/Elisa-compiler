@@ -117,6 +117,10 @@ sed -nE 's/^def ([A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\(.*\)( -> .*)?):$/extern \1/
 # types whose bodies are not part of this measurement.
 sed -nE 's/^def (alloc_perm\(.*\)( -> .*)?):$/extern \1/p' \
 	"$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" >> "$RUNTIME_STRINGS_IFACE"
+# Runtime functions used by semantic_parallel are declared from their source.
+sed -nE '/^extern memcmp\(/p' "$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" >> "$RUNTIME_STRINGS_IFACE"
+sed -nE 's/^[[:space:]]*def (perf_cores\(\) -> i64):$/extern \1/p' \
+    "$REPO_ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" | sort -u >> "$RUNTIME_STRINGS_IFACE"
 FRONTEND_FILES=()
 for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa \
          "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \
