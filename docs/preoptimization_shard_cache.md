@@ -77,3 +77,14 @@ pins. A mismatch before finalization discards private staged hits/publications
 and does not replace final object or diagnostic outputs. Controls cover malformed
 pins, admission mismatch, mapped files replaced after hit/miss staging, mixed
 hit/miss publication, all-hit publication, and dropping original pins.
+
+Within a batch, each canonical restricted snapshot path is independently hashed
+once at admission and once at final attestation before any cache or output
+publication. Repeated validators still check the complete ticket, key, recipe,
+shared pins, mapped image pins, and admitted snapshot identity. An admitted key
+cannot be reused with a differing ticket or snapshot path, even if identical
+bytes produce the same content key. The invocation stores exact canonical ticket
+bytes independently of caller-owned dictionaries. Final snapshot hashing uses
+actual bytes rather than stat metadata. Instrumented cold publication and warm
+restore controls assert two snapshot reads per snapshot despite repeated
+validators; changed snapshots still abort before final output publication.

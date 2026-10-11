@@ -290,6 +290,8 @@ class BatchInvocation:
             shutil.rmtree(self.work, ignore_errors=True)
             self.closed = True
             raise
+        self.admitted_snapshots = {}
+        self.admitted_tickets = {}
         self.prepared = []
         self.outputs = []
         self.publications = []
@@ -318,20 +320,30 @@ class BatchInvocation:
         self.metrics["snapshot_reads"] += 1
         return fingerprint(path)
 
+    def _admit_snapshot(self, path):
+        path = str(Path(path).resolve(strict=True))
+        if path not in self.admitted_snapshots:
+            self.admitted_snapshots[path] = self._snapshot(path)
+        return dict(self.admitted_snapshots[path])
+
     def prepare(self, snapshot, options):
         self._open()
         validate_options(options)
         if options["pgo_policy"] == "use" and not self.profile_paths:
             raise ValueError("PGO use requires actual profile artifacts")
         ticket = {"schema": SCHEMA, "pins": self.pins, "recipe": {"options": dict(options), "artifacts": self.artifacts},
-                  "snapshot": {"path": str(Path(snapshot).resolve(strict=True)), "identity": self._snapshot(snapshot)}}
+                  "snapshot": {"path": str(Path(snapshot).resolve(strict=True)), "identity": self._admit_snapshot(snapshot)}}
         if self.mapped_image_digests is not None:
             ticket["mapped_image_digests"] = dict(self.mapped_image_digests)
         ticket["key"] = ticket_key(ticket)
+        self.validate(ticket)
         self.prepared.append(ticket)
         return ticket
 
     def validate(self, ticket):
+        self._open()
+        if not isinstance(ticket, dict):
+            raise ValueError("invalid batch shard ticket")
         if ticket.get("mapped_image_digests") != self.mapped_image_digests:
             raise ValueError("ticket mapped image attestation mismatch")
         if not isinstance(ticket, dict) or ticket.get("schema") != SCHEMA or ticket.get("key") != ticket_key(ticket):
@@ -339,8 +351,15 @@ class BatchInvocation:
         validate_options(ticket["recipe"]["options"])
         if ticket["pins"] != self.pins or ticket["recipe"]["artifacts"] != self.artifacts:
             raise ValueError("batch shared artifact identity mismatch")
-        if self._snapshot(ticket["snapshot"]["path"]) != ticket["snapshot"]["identity"]:
-            raise ValueError("batch restricted snapshot changed")
+        snapshot = ticket["snapshot"]
+        path = str(Path(snapshot["path"]).resolve(strict=True))
+        if path != snapshot["path"] or self._admit_snapshot(path) != snapshot["identity"]:
+            raise ValueError("batch restricted snapshot admission mismatch")
+        exact = canonical(ticket)
+        previous = self.admitted_tickets.get(ticket["key"])
+        if previous is not None and previous != exact:
+            raise ValueError("differing ticket reuses admitted key")
+        self.admitted_tickets[ticket["key"]] = exact
 
     def restore(self, ticket, output, stdout, stderr):
         self._open()
@@ -377,6 +396,9 @@ class BatchInvocation:
                     raise ValueError("private restored hit changed before finalization")
         for ticket in self.publications:
             self.validate(ticket)
+        for path, expected in self.admitted_snapshots.items():
+            if self._snapshot(path) != expected:
+                raise ValueError("batch restricted snapshot changed before finalization")
         current_pins, current_artifacts = self._read_shared()
         if current_pins != self.pins or current_artifacts != self.artifacts:
             raise ValueError("shared artifacts changed during batch")

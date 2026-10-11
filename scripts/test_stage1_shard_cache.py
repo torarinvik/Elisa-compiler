@@ -405,6 +405,38 @@ class ShardCacheTests(unittest.TestCase):
         publication[-1] = str(result)
         self.assertEqual(subprocess.run(publication, capture_output=True).returncode, 2)
 
+    def test_batch_snapshot_reads_once_each_boundary(self):
+        args = (self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"])
+        for warm in (False, True):
+            with shard.BatchInvocation(*args) as batch:
+                ticket = batch.prepare(self.files["snapshot"], self.options)
+                hit = batch.restore(ticket, self.output, self.out, self.err)
+                self.assertEqual(hit, warm)
+                for _ in range(8):
+                    batch.validate(ticket)
+                if not hit:
+                    batch.publish(ticket, self.files["object"], self.files["stdout"], self.files["stderr"])
+                self.assertEqual(batch.metrics["snapshot_reads"], 1)
+                self.assertEqual(batch.finish()["snapshot_reads"], 2)
+        other = self.root / "identical-snapshot"
+        other.write_bytes(self.files["snapshot"].read_bytes())
+        with shard.BatchInvocation(*args) as batch:
+            ticket = batch.prepare(self.files["snapshot"], self.options)
+            malicious = copy.deepcopy(ticket)
+            malicious["snapshot"]["path"] = str(other)
+            self.assertEqual(shard.ticket_key(malicious), ticket["key"])
+            with self.assertRaises(ValueError):
+                batch.validate(malicious)
+        for path in (self.output, self.out, self.err):
+            path.unlink()
+        with shard.BatchInvocation(*args) as batch:
+            ticket = batch.prepare(self.files["snapshot"], self.options)
+            self.assertTrue(batch.restore(ticket, self.output, self.out, self.err))
+            self.files["snapshot"].write_bytes(b"changed after hit")
+            with self.assertRaises(ValueError):
+                batch.finish()
+        self.assertTrue(all(not path.exists() for path in (self.output, self.out, self.err)))
+
     def test_mapped_image_pins_admission_and_finalization(self):
         pins = {"producer": shard.fingerprint(self.files["producer"])["sha256"],
                 "loaded_llvm": shard.fingerprint(self.files["llvm"])["sha256"]}
