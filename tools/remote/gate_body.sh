@@ -47,8 +47,8 @@ t=$(stamp)
       ELISA_STAGE1_BIN="$SEED/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$SEED/build/runtime/elisacore_runtime.o" \
       ELISA_STAGE1_SEED_OPT_LEVEL="$OPT" ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR="$W/locks/seed-global-$KEY" \
       TMPDIR="$SEED/build/tmp" ELISA_STAGE1_SEED_MAX_RSS_KB="${ELISA_STAGE1_SEED_MAX_RSS_KB:-33554432}"
-    # stage0 on Linux peaks above the Mac-sized 4 GB seed guard (stopped at 4.0 GB on
-    # vast4); these hosts have >200 GB, so the guard is 32 GB here.
+    # Linux seeds can exceed the Mac-sized 4 GB guard. Configure this limit for
+    # the verified host's available memory; the remote default is 32 GB.
     mkdir -p bin build/runtime build/tmp
     bash scripts/elisac_stage1.sh --seed && [[ -x bin/elisac-stage1 && -f build/runtime/elisacore_runtime.o ]] && touch .seeded
   fi
@@ -59,9 +59,8 @@ fi
 echo "seed $KEY: $(( $(stamp) - t ))s"
 
 # --- gates, in parallel ------------------------------------------------------------------
-# CPU CAP. vast4's 80 "cores" sit under a 38.4-CPU cgroup-v1 quota
-# (/sys/fs/cgroup/cpu/cpu.cfs_quota_us) shared by every session; nice does not help under a
-# quota, so the cap is a hard job count: JOBS = this host's share (hosts.local column 4).
+# Container quotas can be lower than the visible CPU count and shared by sessions.
+# The cap is a hard job count: JOBS = this host's agreed share (hosts.local column 4).
 # The gate phase of every run on the host is serialized on one lock, so concurrent runs from
 # several agents queue instead of each taking the whole share.
 budget=$JOBS; [[ "$budget" -gt 0 ]] 2>/dev/null || budget=8

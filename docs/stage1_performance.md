@@ -380,9 +380,8 @@ Next:
 - Bigger lever: remove the `Expr.Absent` sentinel constructions. 62 passes are blocked only by
   these.
 
-Box (ssh -p 53652 root@38.49.42.120): /root/work/r8-core (stage0), r8-s1 (stage1 tree),
-r8-probe (seed.sh, gen2.sh, gates.sh, det.sh, run.sh), r8-main, r8-g2*, r8-chk.*, r8-core-test,
-r8-core-main.
+Historical round-8 artifacts lived on a retired remote host; its endpoint is no longer configured.
+
 ## Round 7 (claude/perf-r7-pos)
 
 ### Profile after sized records (cachegrind, `-emit check`, 7ec9def9)
