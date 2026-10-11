@@ -4,11 +4,13 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+CLANG="${ELISA_CLANG:-$(command -v clang || true)}"
 FIXTURE="$ROOT/test/parity/fixtures/darray_sview_empty_backing.elisa"
 
 fail() { echo "darray sview backing smoke FAIL: $1" >&2; exit 1; }
 [[ -x "$STAGE0" ]] || fail "missing Stage0 compiler: $STAGE0"
 [[ -x "$STAGE1" ]] || fail "missing Stage1 compiler: $STAGE1"
+[[ -x "$CLANG" ]] || fail "missing clang: $CLANG"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 
@@ -26,7 +28,7 @@ for stage in stage0 stage1; do
         object="$WORK/$stage.o"
         "$compiler" -emit obj -O0 -o "$object" "$FIXTURE" >"$log" 2>&1 \
             || fail "$stage rejected borrowed or empty sview construction: $(tail -n 12 "$log")"
-        clang -o "$executable" "$object" "$ROOT/test/parity/support/arena_free_noop.c" >>"$log" 2>&1 \
+        "$CLANG" -o "$executable" "$object" "$ROOT/test/parity/support/arena_free_noop.c" >>"$log" 2>&1 \
             || fail "$stage object did not link: $(tail -n 12 "$log")"
     else
         "$compiler" -emit exe -O0 -o "$executable" "$FIXTURE" >"$log" 2>&1 \
