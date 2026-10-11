@@ -177,8 +177,8 @@ def synced_copy(source, target, limit=MAX_BYTES):
         os.fsync(dst.fileno())
 
 
-def publish(cache, ticket, obj, stdout, stderr):
-    validate_ticket(ticket)
+def publish(cache, ticket, obj, stdout, stderr, *, _validator=validate_ticket):
+    _validator(ticket)
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".incoming-", dir=cache))
@@ -197,7 +197,7 @@ def publish(cache, ticket, obj, stdout, stderr):
             stream.flush()
             os.fsync(stream.fileno())
         sync_directory(stage)
-        validate_ticket(ticket)  # Publication never changes the compiled tuple.
+        _validator(ticket)  # Publication never changes the compiled tuple.
         with locked(cache, ticket["key"], True) as entry:
             if verify_bundle(entry, ticket):
                 return True  # Immutable first valid publication wins.
@@ -214,8 +214,8 @@ def publish(cache, ticket, obj, stdout, stderr):
             shutil.rmtree(retired, ignore_errors=True)
 
 
-def restore(cache, ticket, output, stdout, stderr):
-    validate_ticket(ticket)
+def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket, _receipt=None):
+    _validator(ticket)
     if len({str(Path(path).resolve()) for path in (output, stdout, stderr)}) != 3:
         raise ValueError("restore output paths must be distinct")
     staged = []
@@ -235,22 +235,212 @@ def restore(cache, ticket, output, stdout, stderr):
                 synced_copy(entry / name, temporary, limit)
                 if fingerprint(temporary, allow_empty=name != "object", limit=limit) != manifest[name]:
                     return False
-            validate_ticket(ticket)
+            _validator(ticket)
             # Object commits last; publication errors are fatal, never a cold retry
             # following partially published diagnostics.
             for index in (1, 2, 0):
                 os.replace(*staged[index])
+            if _receipt is not None:
+                _receipt.update({name: dict(manifest[name]) for name in ("object", "stdout", "stderr")})
             return True
     finally:
         for source, _ in staged:
             source.unlink(missing_ok=True)
 
 
+
+class BatchInvocation:
+    """One-process shared artifact attestation; no external supplied digest cache.
+
+    Stage all hits/publications privately. finish() rehashes shared artifacts
+    once, then commits. Context exit without finish discards staged work.
+    """
+    def __init__(self, cache, producer, loaded_llvm, runtime, profiles=()):
+        self.cache = Path(cache)
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix=".batch-", dir=self.cache))
+        self.metrics = {"shared_artifact_reads": 0, "snapshot_reads": 0, "hits": 0, "misses": 0}
+        self.paths = {"producer": producer, "loaded_llvm": loaded_llvm, "runtime": runtime}
+        self.profile_paths = tuple(profiles)
+        self.closed = False
+        try:
+            self.pins, self.artifacts = self._read_shared()
+        except BaseException:
+            shutil.rmtree(self.work, ignore_errors=True)
+            self.closed = True
+            raise
+        self.prepared = []
+        self.outputs = []
+        self.publications = []
+        self.finished = False
+
+    def _open(self):
+        if self.closed or self.finished:
+            raise ValueError("batch invocation is closed or finalized")
+
+    def _shared(self, path):
+        self.metrics["shared_artifact_reads"] += 1
+        return {"path": str(Path(path).resolve(strict=True)), "identity": fingerprint(path)}
+
+    def _read_shared(self):
+        pins = {name: self._shared(path) for name, path in self.paths.items()}
+        pins["profiles"] = [self._shared(path) for path in self.profile_paths]
+        artifacts = {name: pins[name]["identity"] for name in self.paths}
+        artifacts["profiles"] = [pin["identity"] for pin in pins["profiles"]]
+        return pins, artifacts
+
+    def _snapshot(self, path):
+        self.metrics["snapshot_reads"] += 1
+        return fingerprint(path)
+
+    def prepare(self, snapshot, options):
+        self._open()
+        validate_options(options)
+        if options["pgo_policy"] == "use" and not self.profile_paths:
+            raise ValueError("PGO use requires actual profile artifacts")
+        ticket = {"schema": SCHEMA, "pins": self.pins, "recipe": {"options": dict(options), "artifacts": self.artifacts},
+                  "snapshot": {"path": str(Path(snapshot).resolve(strict=True)), "identity": self._snapshot(snapshot)}}
+        ticket["key"] = ticket_key(ticket)
+        self.prepared.append(ticket)
+        return ticket
+
+    def validate(self, ticket):
+        if not isinstance(ticket, dict) or ticket.get("schema") != SCHEMA or ticket.get("key") != ticket_key(ticket):
+            raise ValueError("invalid batch shard ticket")
+        validate_options(ticket["recipe"]["options"])
+        if ticket["pins"] != self.pins or ticket["recipe"]["artifacts"] != self.artifacts:
+            raise ValueError("batch shared artifact identity mismatch")
+        if self._snapshot(ticket["snapshot"]["path"]) != ticket["snapshot"]["identity"]:
+            raise ValueError("batch restricted snapshot changed")
+
+    def restore(self, ticket, output, stdout, stderr):
+        self._open()
+        index = len(self.outputs)
+        staged = [self.work / f"hit-{index}-{name}" for name in ("object", "stdout", "stderr")]
+        expected = {}
+        hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected)
+        if hit:
+            targets = [Path(path) for path in (output, stdout, stderr)]
+            if len({str(path.resolve()) for path in targets}) != 3:
+                raise ValueError("batch output paths must be distinct")
+            previous = {str(path.resolve()) for _, _, paths, _ in self.outputs for path in paths}
+            if previous.intersection(str(path.resolve()) for path in targets):
+                raise ValueError("batch shards share output paths")
+            self.outputs.append((ticket, staged, targets, expected))
+        self.metrics["hits" if hit else "misses"] += 1
+        return hit
+
+    def publish(self, ticket, obj, stdout, stderr):
+        self._open()
+        # Prepare a complete verified bundle under the private invocation cache.
+        publish(self.work / "publication", ticket, obj, stdout, stderr, _validator=self.validate)
+        self.publications.append(ticket)
+
+    def finish(self):
+        self._open()
+        # Snapshot admission can change independently of shared artifacts too.
+        for ticket in self.prepared:
+            self.validate(ticket)
+        for ticket, staged, _, expected in self.outputs:
+            self.validate(ticket)
+            for name, source in zip(("object", "stdout", "stderr"), staged):
+                if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
+                    raise ValueError("private restored hit changed before finalization")
+        for ticket in self.publications:
+            self.validate(ticket)
+        current_pins, current_artifacts = self._read_shared()
+        if current_pins != self.pins or current_artifacts != self.artifacts:
+            raise ValueError("shared artifacts changed during batch")
+        for ticket in self.publications:
+            staged = self.work / "publication" / ticket["key"]
+            retired = None
+            with locked(self.cache, ticket["key"], True) as entry:
+                if verify_bundle(entry, ticket):
+                    continue
+                if not verify_bundle(staged, ticket):
+                    raise ValueError("private batch bundle corrupted")
+                if entry.exists():
+                    retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=self.cache))
+                    retired.rmdir()
+                    os.replace(entry, retired)
+                os.replace(staged, entry)
+                sync_directory(self.cache)
+            if retired:
+                shutil.rmtree(retired, ignore_errors=True)
+        for _, staged, targets, expected in self.outputs:
+            # Copy across filesystems into output-local temporary files, verify
+            # copied bytes, and preserve fatal diagnostic publication semantics.
+            copies = []
+            try:
+                for name, source, target in zip(("object", "stdout", "stderr"), staged, targets):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    fd, tmp = tempfile.mkstemp(prefix=target.name + ".incoming-", dir=target.parent)
+                    os.close(fd)
+                    Path(tmp).unlink()
+                    copies.append((Path(tmp), target))
+                    limit = MAX_BYTES if name == "object" else MAX_STREAM
+                    synced_copy(source, tmp, limit)
+                    if fingerprint(tmp, allow_empty=name != "object", limit=limit) != expected[name]:
+                        raise ValueError("batch restored copy corrupted")
+                for index in (1, 2, 0):
+                    os.replace(*copies[index])
+            finally:
+                for temporary, _ in copies:
+                    temporary.unlink(missing_ok=True)
+        self.finished = True
+        return dict(self.metrics)
+
+    def close(self):
+        self.closed = True
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def batch_request(operation, request):
+    fields = {"cache", "producer", "loaded_llvm", "runtime", "profiles", "shards"}
+    if not isinstance(request, dict) or set(request) != fields or not isinstance(request["shards"], list) or len(request["shards"]) > 64:
+        raise ValueError("invalid bounded batch request")
+    outputs = []
+    with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"]) as batch:
+        for item in request["shards"]:
+            if operation == "batch-restore":
+                if set(item) != {"snapshot", "options", "object", "stdout", "stderr"}:
+                    raise ValueError("invalid batch restore shard")
+                ticket = batch.prepare(item["snapshot"], item["options"])
+                hit = batch.restore(ticket, item["object"], item["stdout"], item["stderr"])
+                outputs.append({"ticket": ticket, "hit": hit})
+            else:
+                if set(item) != {"ticket", "object", "stdout", "stderr"}:
+                    raise ValueError("invalid batch publication shard")
+                batch.publish(item["ticket"], item["object"], item["stdout"], item["stderr"])
+        metrics = batch.finish()
+    return {"schema": SCHEMA, "shards": outputs, "metrics": metrics}
+
+
+def write_json_atomic(output, value):
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=output.name + ".incoming-", dir=output.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(canonical(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("prepare", "restore", "publish"))
-    parser.add_argument("--ticket", required=True)
+    parser.add_argument("operation", choices=("prepare", "restore", "publish", "batch-restore", "batch-publish"))
+    parser.add_argument("--ticket")
+    parser.add_argument("--result")
     parser.add_argument("--request")
     parser.add_argument("--cache")
     parser.add_argument("--object")
@@ -258,6 +448,18 @@ def main():
     parser.add_argument("--stderr")
     args = parser.parse_args()
     try:
+        if args.operation.startswith("batch-"):
+            if not args.request or not args.result:
+                parser.error("batch operations require --request --result")
+            with open(args.request, "rb") as stream:
+                raw = stream.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise ValueError("oversized batch request")
+            result = batch_request(args.operation, json.loads(raw))
+            write_json_atomic(args.result, result)
+            return 1 if args.operation == "batch-restore" and result["metrics"]["misses"] else 0
+        if not args.ticket:
+            parser.error("single-shard operations require --ticket")
         if args.operation == "prepare":
             if not args.request:
                 parser.error("prepare requires --request")

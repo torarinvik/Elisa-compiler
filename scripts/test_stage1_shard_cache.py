@@ -246,6 +246,88 @@ class ShardCacheTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             shard.validate_ticket([])
 
+    def test_batch_shared_reads_independent_of_shard_count(self):
+        for count in (1, 64):
+            with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+                for index in range(count):
+                    ticket = batch.prepare(self.files["snapshot"], dict(self.options, logical_shards=count, logical_shard=index))
+                    batch.publish(ticket, self.files["object"], self.files["stdout"], self.files["stderr"])
+                metrics = batch.finish()
+            self.assertEqual(metrics["shared_artifact_reads"], 8)
+            with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+                for index in range(count):
+                    ticket = batch.prepare(self.files["snapshot"], dict(self.options, logical_shards=count, logical_shard=index))
+                    output = self.root / f"batch-{count}-{index}.o"
+                    self.assertTrue(batch.restore(ticket, output, str(output) + ".out", str(output) + ".err"))
+                    self.assertFalse(output.exists())  # No pre-attestation output publication.
+                metrics = batch.finish()
+            self.assertEqual(metrics["shared_artifact_reads"], 8)
+            self.assertEqual(metrics["hits"], count)
+
+    def test_batch_changed_shared_identity_discards_hits_and_publications(self):
+        self.publish()
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
+            fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
+            batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
+            self.files["llvm"].write_bytes(b"changed during batch")
+            with self.assertRaises(ValueError):
+                batch.finish()
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.cache / fresh["key"]).exists())
+        self.assertFalse(list(self.cache.glob(".batch-*")))
+
+    def test_batch_cli_miss_publish_hit_and_fatal(self):
+        helper = Path(shard.__file__)
+        request = self.root / "batch-request.json"
+        result = self.root / "batch-result.json"
+        common = dict(cache=str(self.cache), producer=str(self.files["producer"]), loaded_llvm=str(self.files["llvm"]),
+                      runtime=str(self.files["runtime"]), profiles=[str(self.files["profile"])])
+        record = dict(snapshot=str(self.files["snapshot"]), options=self.options, object=str(self.output), stdout=str(self.out), stderr=str(self.err))
+        request.write_text(json.dumps(dict(common, shards=[record])))
+        command = [sys.executable, str(helper), "batch-restore", "--request", str(request), "--result", str(result)]
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 1)
+        ticket = json.loads(result.read_text())["shards"][0]["ticket"]
+        publication = dict(ticket=ticket, object=str(self.files["object"]), stdout=str(self.files["stdout"]), stderr=str(self.files["stderr"]))
+        request.write_text(json.dumps(dict(common, shards=[publication])))
+        self.assertEqual(subprocess.run([sys.executable, str(helper), "batch-publish", "--request", str(request), "--result", str(result)], capture_output=True).returncode, 0)
+        request.write_text(json.dumps(dict(common, shards=[record])))
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        self.assertEqual(json.loads(result.read_text())["metrics"]["shared_artifact_reads"], 8)
+        self.assertEqual(self.output.read_bytes(), self.files["object"].read_bytes())
+        publication["ticket"]["key"] = "0" * 64
+        request.write_text(json.dumps(dict(common, shards=[publication])))
+        self.assertEqual(subprocess.run([sys.executable, str(helper), "batch-publish", "--request", str(request), "--result", str(result)], capture_output=True).returncode, 2)
+
+    def test_batch_staged_hit_mutation_fails_before_any_publication(self):
+        self.publish()
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
+            fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
+            batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
+            (batch.work / "hit-0-object").write_bytes(b"corrupted after restore")
+            with self.assertRaises(ValueError):
+                batch.finish()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.out.exists())
+        self.assertFalse(self.err.exists())
+        self.assertFalse((self.cache / fresh["key"]).exists())
+
+    def test_batch_lifecycle_and_failed_admission_cleanup(self):
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            batch.finish()
+            with self.assertRaises(ValueError):
+                batch.prepare(self.files["snapshot"], self.options)
+            with self.assertRaises(ValueError):
+                batch.restore(self.ticket, self.output, self.out, self.err)
+            with self.assertRaises(ValueError):
+                batch.publish(self.ticket, self.files["object"], self.files["stdout"], self.files["stderr"])
+        with self.assertRaises(ValueError):
+            batch.finish()
+        with self.assertRaises(OSError):
+            shard.BatchInvocation(self.cache, self.root / "absent", self.files["llvm"], self.files["runtime"])
+        self.assertFalse(list(self.cache.glob(".batch-*")))
+
     def test_empty_object_and_empty_recipe_rejected(self):
         self.files["object"].write_bytes(b"")
         with self.assertRaises(ValueError):
