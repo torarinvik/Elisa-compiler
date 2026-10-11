@@ -49,13 +49,13 @@ expected_contract = compact("ensure result == ( " + " or ".join(
 ) + " )")
 if expected_contract not in compact(function_body):
     raise SystemExit("production predicate contract does not state its exact named byte set")
-expected_match = (
-    "return when byte: "
-    + " | ".join(f"ProjectSystemWhitespaceByte::{name}" for name in EXPECTED_NAMES)
-    + " -> true _ -> false"
+expected_return = (
+    "return ( "
+    + " or ".join(f"byte == ProjectSystemWhitespaceByte::{name}" for name in EXPECTED_NAMES)
+    + " )"
 )
-if expected_match not in compact(function_body):
-    raise SystemExit("production predicate no longer pattern-matches the named byte set")
+if expected_return not in compact(function_body):
+    raise SystemExit("production predicate no longer checks the exact named byte set")
 for name, value in EXPECTED_VALUES.items():
     if not re.search(rf"\b{name}: u8 = {value}\b", project_text):
         raise SystemExit(f"missing or changed named byte constant: {name} = {value}")
