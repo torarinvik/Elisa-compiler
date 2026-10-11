@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPILER="$ROOT/scripts/elisac_stage1.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-incremental-shadow.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+source "$ROOT/test/parity/control_artifacts.sh"
+elisa_control_artifacts "$WORK"
 
 cat >"$WORK/ordinary_ok.elisa" <<'ELISA'
 def main() -> i64:

@@ -4,14 +4,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-incremental-ga-cache.XXXXXX")"
-cleanup() {
-    if [[ "${ELISA_KEEP_INCREMENTAL_CACHE_CONTROL:-0}" == 1 ]]; then
-        echo "incremental GA cache control artifacts: $WORK" >&2
-    else
-        rm -rf "$WORK"
-    fi
-}
-trap cleanup EXIT
+source "$ROOT/test/parity/control_artifacts.sh"
+elisa_control_artifacts "$WORK"
 CACHE="$WORK/cache"
 mkdir -p "$CACHE"
 

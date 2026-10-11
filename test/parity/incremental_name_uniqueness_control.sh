@@ -5,7 +5,8 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 source "$ROOT/test/parity/run_timeout.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-incremental-name-unique.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+source "$ROOT/test/parity/control_artifacts.sh"
+elisa_control_artifacts "$WORK"
 for level in O0 O2; do
     if ! elisa_run_timeout 300 "$STAGE1" -emit exe "-$level" -o "$WORK/control-$level" "$ROOT/test/parity/incremental_name_uniqueness_control.elisa" >"$WORK/build-$level.log" 2>&1; then
         cat "$WORK/build-$level.log" >&2
