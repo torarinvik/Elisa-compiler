@@ -28,7 +28,18 @@ fail() { printf 'value threading codegen smoke FAILED: %s\n' "$1" >&2; exit 1; }
 command -v objdump >/dev/null 2>&1 || { echo "value threading codegen smoke: objdump is required" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-value-threading.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+cleanup() {
+    status=$?
+    if [[ "$status" -eq 0 ]]; then
+        rm -rf "$WORK"
+    else
+        printf 'value threading diagnostics retained: %s\n' "$WORK" >&2
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 ulimit -c 0 || true
 
 # The disassembly without the file name line, which names the object.
