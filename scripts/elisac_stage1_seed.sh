@@ -86,7 +86,7 @@ seed_build() {
   # to the final path and publish it with one same-filesystem rename after the complete image is
   # ready.
   seed_output="${BIN}.tmp.$$"
-  # The stage0 compiler also writes a large object. Publish that object atomically too:
+  # The bootstrap compiler also writes a large object. Publish that object atomically too:
   # a concurrent stage1 invocation must never observe a truncated object while the guarded
   # seed is still running. Keeping the temporary name private also makes an RSS-guarded
   # termination recoverable without leaving a misleading apparently-valid artifact.
@@ -119,11 +119,11 @@ seed_build() {
     echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$STAGE0_BIN" >&2
     exit 2
   fi
-  # stage0 discharges the compiler's own contracts with an external z3. Without one on PATH
+  # The bootstrap compiler discharges the compiler's own contracts with an external z3. Without one on PATH
   # it does not say so: it reports the std's min/max/clamp ensures as unprovable and fails
   # minutes into the seed. Refuse up front with the actual cause.
   if ! command -v z3 >/dev/null 2>&1; then
-    echo "seed: no z3 on PATH; stage0 needs an SMT solver to prove the compiler's contracts (install z3 >= 5, e.g. \`pip install z3-solver\`)" >&2
+    echo "seed: no z3 on PATH; bootstrap compiler $STAGE0_BIN needs an SMT solver to prove the compiler's contracts (install z3 >= 5, e.g. \`pip install z3-solver\`)" >&2
     exit 2
   fi
   seed_bootstrap_kind=stage0
