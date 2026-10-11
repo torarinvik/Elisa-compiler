@@ -283,7 +283,7 @@ class ShardCacheTests(unittest.TestCase):
         result = self.root / "batch-result.json"
         common = dict(cache=str(self.cache), producer=str(self.files["producer"]), loaded_llvm=str(self.files["llvm"]),
                       runtime=str(self.files["runtime"]), profiles=[str(self.files["profile"])])
-        record = dict(snapshot=str(self.files["snapshot"]), options=self.options, object=str(self.output), stdout=str(self.out), stderr=str(self.err))
+        record = dict(snapshot=str(self.files["snapshot"]), options=dict(self.options, logical_shard=0, logical_shards=1), object=str(self.output), stdout=str(self.out), stderr=str(self.err))
         request.write_text(json.dumps(dict(common, shards=[record])))
         command = [sys.executable, str(helper), "batch-restore", "--request", str(request), "--result", str(result)]
         self.assertEqual(subprocess.run(command, capture_output=True).returncode, 1)
@@ -327,6 +327,83 @@ class ShardCacheTests(unittest.TestCase):
         with self.assertRaises(OSError):
             shard.BatchInvocation(self.cache, self.root / "absent", self.files["llvm"], self.files["runtime"])
         self.assertFalse(list(self.cache.glob(".batch-*")))
+
+    def test_native_status_manifest_and_original_result_publication(self):
+        common = dict(cache=str(self.cache), producer=str(self.files["producer"]), loaded_llvm=str(self.files["llvm"]),
+                      runtime=str(self.files["runtime"]), profiles=[str(self.files["profile"])])
+        records = []
+        for index in range(2):
+            records.append(dict(snapshot=str(self.files["snapshot"]), options=dict(self.options, logical_shard=index, logical_shards=2),
+                                object=str(self.root / f"native-{index}.o"), stdout=str(self.root / f"native-{index}.out"), stderr=str(self.root / f"native-{index}.err")))
+        first = self.prepare(records[0]["options"])
+        shard.publish(self.cache, first, self.files["object"], self.files["stdout"], self.files["stderr"])
+        request = dict(common, shards=records)
+        result = shard.batch_request("batch-restore", request)
+        self.assertEqual(shard.status_text(result), "ELISA_PREOPT_SHARD_STATUS_V1\n2\nHM\n")
+        # Actual native consumer emits only M; helper uses unchanged full ticket.
+        for field, name in (("object", "object"), ("stdout", "stdout"), ("stderr", "stderr")):
+            Path(records[1][field]).write_bytes(self.files[name].read_bytes())
+        receipt = shard.publish_restore_result(request, result)
+        self.assertEqual(receipt["published_misses"], 1)
+        warm = shard.batch_request("batch-restore", request)
+        self.assertEqual(shard.status_text(warm), "ELISA_PREOPT_SHARD_STATUS_V1\n2\nHH\n")
+        malformed = copy.deepcopy(request)
+        malformed["shards"][1]["options"]["logical_shard"] = 0
+        with self.assertRaises(ValueError):
+            shard.complete_restore_request(malformed)
+        malformed = copy.deepcopy(request)
+        malformed["shards"].reverse()
+        with self.assertRaises(ValueError):
+            shard.complete_restore_request(malformed)
+        malformed = copy.deepcopy(request)
+        malformed["shards"].pop()
+        with self.assertRaises(ValueError):
+            shard.complete_restore_request(malformed)
+        malformed = copy.deepcopy(request)
+        malformed["shards"][1]["options"]["cpu"] = "different"
+        with self.assertRaises(ValueError):
+            shard.complete_restore_request(malformed)
+        for change in ("schema", "hit", "key"):
+            malformed = copy.deepcopy(result)
+            if change == "schema":
+                malformed["schema"] = "unknown"
+            elif change == "hit":
+                malformed["shards"][0]["hit"] = 1
+            else:
+                malformed["shards"][0]["ticket"]["key"] = "0" * 64
+            with self.assertRaises(ValueError):
+                shard.status_text(malformed)
+        changed = copy.deepcopy(request)
+        changed["shards"][0]["options"]["cpu"] = "changed"
+        changed["shards"][1]["options"]["cpu"] = "changed"
+        with self.assertRaises(ValueError):
+            shard.publish_restore_result(changed, result)
+
+    def test_native_status_cli_and_immutable_publication_result(self):
+        helper = Path(shard.__file__)
+        request = self.root / "native-request.json"
+        result = self.root / "native-restore.json"
+        status = self.root / "native-status.txt"
+        receipt = self.root / "native-publish.json"
+        item = dict(snapshot=str(self.files["snapshot"]), options=dict(self.options, logical_shard=0, logical_shards=1),
+                    object=str(self.output), stdout=str(self.out), stderr=str(self.err))
+        request.write_text(json.dumps(dict(cache=str(self.cache), producer=str(self.files["producer"]), loaded_llvm=str(self.files["llvm"]),
+                                          runtime=str(self.files["runtime"]), profiles=[str(self.files["profile"])], shards=[item])))
+        command = [sys.executable, str(helper), "batch-restore", "--request", str(request), "--result", str(result), "--status", str(status)]
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 1)
+        self.assertEqual(status.read_text(), "ELISA_PREOPT_SHARD_STATUS_V1\n1\nM\n")
+        original = result.read_bytes()
+        self.output.write_bytes(self.files["object"].read_bytes())
+        self.out.write_bytes(b"")
+        self.err.write_bytes(b"")
+        publication = [sys.executable, str(helper), "batch-publish-result", "--request", str(request), "--restore-result", str(result), "--result", str(receipt)]
+        self.assertEqual(subprocess.run(publication, capture_output=True).returncode, 0)
+        self.assertEqual(result.read_bytes(), original)
+        self.assertEqual(json.loads(receipt.read_text())["published_misses"], 1)
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        self.assertEqual(status.read_text(), "ELISA_PREOPT_SHARD_STATUS_V1\n1\nH\n")
+        publication[-1] = str(result)
+        self.assertEqual(subprocess.run(publication, capture_output=True).returncode, 2)
 
     def test_empty_object_and_empty_recipe_rejected(self):
         self.files["object"].write_bytes(b"")

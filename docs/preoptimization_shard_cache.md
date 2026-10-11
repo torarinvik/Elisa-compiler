@@ -43,3 +43,19 @@ A bounded batch request has exactly `cache`, `producer`, `loaded_llvm`, `runtime
 Hits are copied into private staging first, with their original cache manifest identities saved. Finalization validates every staged hit against these saved identities before any cache or output commit; output-local copies must match the same saved identities. Publication bundles are similarly prepared privately, then committed after final shared identity validation. Changed shared inputs discard staged hits and publication bundles. A batch cannot prepare, restore or publish after finish/close. Admission failures and abandoned contexts clean private staging.
 
 Controls prove shared artifact read count is exactly eight with one profile (four artifacts read twice) for both one shard and 64 shards, including batch publication and restoration. CLI mixed-miss/publication/hit/fatal statuses, post-restore private hit corruption, changed identity, constructor cleanup and lifecycle rejection are covered. These counters establish helper I/O scaling only; actual backend scheduler and compiler throughput remain unqualified.
+
+## Compact native consumer protocol
+
+For an Elisa caller that does not parse generic JSON, `batch-restore --request original.json --result restore-result.json --status status.txt` writes a bounded ASCII manifest only after full input and copied-output attestation:
+
+```text
+ELISA_PREOPT_SHARD_STATUS_V1
+2
+HM
+```
+
+The logical count is 1..64. Rows must cover exact contiguous ordered logical shard ids `0..count-1` with one common output recipe, distinct output/log paths and an H/M string of exactly that count. Missing, duplicate, reordered, boolean-index and inconsistent-recipe records are rejected; status results cannot claim guessed hits. The native caller must strictly check header/count/bit length and accept status 0/1 only after the helper terminates. Use fresh unique invocation files, not stale status/output paths.
+
+After emitting only M shards, invoke `batch-publish-result --request original.json --restore-result restore-result.json --result publish-receipt.json`. The helper reads full original immutable tickets itself and compares snapshot paths and exact options to original admission. It rehashes actual artifacts and publishes only recorded misses. The native caller never reconstructs supplied hashes or tickets from compact status. Admission JSON, restore JSON, status and receipt paths must be distinct; publication cannot overwrite admission. The producer/LLVM discovery contract remains mandatory.
+
+Include catalog `identity_policy` in the pinned restriction-version domain (for example distinct strict-manifest versus exact-generated-symbol recipe versions); do not reuse keys across admission/restriction policy changes. The existing `ownership_version` pins fixed full-symbol FNV ownership and logical count; the restriction version must also pin foreign-body stripping and readonly/private constant duplication. Actual snapshot bytes remain the primary content identity.

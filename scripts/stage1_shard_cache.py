@@ -401,10 +401,83 @@ class BatchInvocation:
         self.close()
 
 
+
+def complete_restore_request(request):
+    fields = {"cache", "producer", "loaded_llvm", "runtime", "profiles", "shards"}
+    if not isinstance(request, dict) or set(request) != fields or not isinstance(request["shards"], list):
+        raise ValueError("invalid batch request")
+    count = len(request["shards"])
+    if not 1 <= count <= 64:
+        raise ValueError("invalid complete logical shard inventory")
+    destinations = set()
+    common_options = None
+    for index, item in enumerate(request["shards"]):
+        if set(item) != {"snapshot", "options", "object", "stdout", "stderr"}:
+            raise ValueError("invalid batch restore shard")
+        validate_options(item["options"])
+        resolved_common = {key: value for key, value in item["options"].items() if key != "logical_shard"}
+        if common_options is None:
+            common_options = resolved_common
+        elif common_options != resolved_common:
+            raise ValueError("batch shards have inconsistent output recipes")
+        if item["options"]["logical_shards"] != count or item["options"]["logical_shard"] != index:
+            raise ValueError("shard inventory must be complete, contiguous and ordered")
+        for field in ("object", "stdout", "stderr"):
+            path = str(Path(item[field]).resolve())
+            if path in destinations:
+                raise ValueError("shards share output targets")
+            destinations.add(path)
+    return count
+
+
+def status_text(result):
+    if not isinstance(result, dict) or set(result) != {"schema", "shards", "metrics"} or result["schema"] != SCHEMA:
+        raise ValueError("invalid restore result schema")
+    records = result["shards"]
+    if not isinstance(records, list) or not 1 <= len(records) <= 64:
+        raise ValueError("invalid restore status count")
+    bits = []
+    for index, record in enumerate(records):
+        if set(record) != {"ticket", "hit"} or type(record["hit"]) is not bool:
+            raise ValueError("invalid restore status record")
+        ticket = record["ticket"]
+        if not isinstance(ticket, dict) or ticket.get("schema") != SCHEMA or ticket.get("key") != ticket_key(ticket):
+            raise ValueError("invalid restore status ticket")
+        options = ticket["recipe"]["options"]
+        validate_options(options)
+        if options["logical_shard"] != index or options["logical_shards"] != len(records):
+            raise ValueError("invalid restore status order")
+        bits.append("H" if record["hit"] else "M")
+    return f"ELISA_PREOPT_SHARD_STATUS_V1\n{len(records)}\n{''.join(bits)}\n"
+
+
+def publish_restore_result(request, result):
+    complete_restore_request(request)
+    status_text(result)
+    if len(result["shards"]) != len(request["shards"]):
+        raise ValueError("restore result inventory mismatch")
+    publications = []
+    for item, record in zip(request["shards"], result["shards"]):
+        ticket = record["ticket"]
+        if ticket["recipe"]["options"] != item["options"] or ticket["snapshot"]["path"] != str(Path(item["snapshot"]).resolve(strict=True)):
+            raise ValueError("restore result differs from original admitted request")
+        if not record["hit"]:
+            publications.append({"ticket": ticket, "object": item["object"], "stdout": item["stdout"], "stderr": item["stderr"]})
+    # The original pins, not freshly guessed keys, authorize emitted misses.
+    with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"]) as batch:
+        for record in result["shards"]:
+            batch.validate(record["ticket"])
+        for item in publications:
+            batch.publish(item["ticket"], item["object"], item["stdout"], item["stderr"])
+        metrics = batch.finish()
+    return {"schema": SCHEMA, "published_misses": len(publications), "metrics": metrics}
+
 def batch_request(operation, request):
     fields = {"cache", "producer", "loaded_llvm", "runtime", "profiles", "shards"}
     if not isinstance(request, dict) or set(request) != fields or not isinstance(request["shards"], list) or len(request["shards"]) > 64:
         raise ValueError("invalid bounded batch request")
+    if operation == "batch-restore":
+        complete_restore_request(request)
     outputs = []
     with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"]) as batch:
         for item in request["shards"]:
@@ -435,12 +508,28 @@ def write_json_atomic(output, value):
     finally:
         Path(temporary).unlink(missing_ok=True)
 
+
+def write_text_atomic(output, text):
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=output.name + ".incoming-", dir=output.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("prepare", "restore", "publish", "batch-restore", "batch-publish"))
+    parser.add_argument("operation", choices=("prepare", "restore", "publish", "batch-restore", "batch-publish", "batch-publish-result"))
     parser.add_argument("--ticket")
     parser.add_argument("--result")
+    parser.add_argument("--restore-result")
+    parser.add_argument("--status")
     parser.add_argument("--request")
     parser.add_argument("--cache")
     parser.add_argument("--object")
@@ -449,14 +538,37 @@ def main():
     args = parser.parse_args()
     try:
         if args.operation.startswith("batch-"):
+            if args.status and args.operation != "batch-restore":
+                raise ValueError("status manifest is only for batch restoration")
             if not args.request or not args.result:
                 parser.error("batch operations require --request --result")
+            paths = [args.request, args.result]
+            if args.status:
+                paths.append(args.status)
+            if args.restore_result:
+                paths.append(args.restore_result)
+            if len({str(Path(path).resolve()) for path in paths}) != len(paths):
+                raise ValueError("batch admission and result paths must be distinct")
             with open(args.request, "rb") as stream:
                 raw = stream.read(1024 * 1024 + 1)
             if len(raw) > 1024 * 1024:
                 raise ValueError("oversized batch request")
-            result = batch_request(args.operation, json.loads(raw))
+            request = json.loads(raw)
+            if args.operation == "batch-publish-result":
+                if not args.restore_result or Path(args.restore_result).resolve() == Path(args.result).resolve():
+                    raise ValueError("publication needs a distinct immutable restore result")
+                with open(args.restore_result, "rb") as stream:
+                    raw = stream.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise ValueError("oversized restore result")
+                result = publish_restore_result(request, json.loads(raw))
+            else:
+                result = batch_request(args.operation, request)
             write_json_atomic(args.result, result)
+            if args.status:
+                if args.operation != "batch-restore":
+                    raise ValueError("status manifest is only for batch restoration")
+                write_text_atomic(args.status, status_text(result))
             return 1 if args.operation == "batch-restore" and result["metrics"]["misses"] else 0
         if not args.ticket:
             parser.error("single-shard operations require --ticket")
