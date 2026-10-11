@@ -12,6 +12,13 @@ host_ssh_args() {  # sets SSH_ARGS=(...) for alias $1
   line="$(awk -v a="$1" '$1==a {print; exit}' "$HOSTS_FILE" 2>/dev/null)"
   [[ -n "$line" ]] || { echo "hosts.sh: unknown host '$1' (add it to $HOSTS_FILE)" >&2; return 2; }
   read -r _a port target cap <<<"$line"
+  # Retired project instances must never become an implicit build dependency.
+  case "${target##*@}" in
+    38.49.42.120|141.195.21.72)
+      echo "hosts.sh: retired project host '$target'; use local compute or configure a new verified host" >&2
+      return 2
+      ;;
+  esac
   HOST_CPU_CAP="${cap:-8}"
   SSH_ARGS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -p "$port" "$target")
 }
