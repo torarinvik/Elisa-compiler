@@ -59,3 +59,21 @@ The logical count is 1..64. Rows must cover exact contiguous ordered logical sha
 After emitting only M shards, invoke `batch-publish-result --request original.json --restore-result restore-result.json --result publish-receipt.json`. The helper reads full original immutable tickets itself and compares snapshot paths and exact options to original admission. It rehashes actual artifacts and publishes only recorded misses. The native caller never reconstructs supplied hashes or tickets from compact status. Admission JSON, restore JSON, status and receipt paths must be distinct; publication cannot overwrite admission. The producer/LLVM discovery contract remains mandatory.
 
 Include catalog `identity_policy` in the pinned restriction-version domain (for example distinct strict-manifest versus exact-generated-symbol recipe versions); do not reuse keys across admission/restriction policy changes. The existing `ownership_version` pins fixed full-symbol FNV ownership and logical count; the restriction version must also pin foreign-body stripping and readonly/private constant duplication. Actual snapshot bytes remain the primary content identity.
+
+Batch requests may include `mapped_image_digests`, an exact map with `producer`
+and `loaded_llvm` keys and lowercase 64-character SHA256 values. These values
+must come from native verification of the actual mapped images (on Darwin:
+mapped CodeDirectory signed pages, entire mapped signature tail, and mapped
+vnode identity), rather than hashes of requested paths. The helper still hashes
+the actual files itself, compares both digests at admission, and repeats both
+comparisons during final shared-artifact reattestation. Supplied digests never
+replace file reads or populate the content identity directly. Omission preserves
+the prior portable caller contract; explicit null, partial maps, and malformed
+hex are rejected.
+
+Restore tickets retain this optional attestation map. Publication from a restore
+result requires the original request's exact map, including rejecting removal of
+pins. A mismatch before finalization discards private staged hits/publications
+and does not replace final object or diagnostic outputs. Controls cover malformed
+pins, admission mismatch, mapped files replaced after hit/miss staging, mixed
+hit/miss publication, all-hit publication, and dropping original pins.

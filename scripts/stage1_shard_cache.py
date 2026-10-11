@@ -249,13 +249,34 @@ def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket
 
 
 
+def mapped_image_pins(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"producer", "loaded_llvm"}:
+        raise ValueError("invalid mapped image digest fields")
+    for digest_hex in value.values():
+        if not isinstance(digest_hex, str) or len(digest_hex) != 64 or any(c not in "0123456789abcdef" for c in digest_hex):
+            raise ValueError("invalid mapped image SHA256")
+    return dict(value)
+
+
+def batch_fields(request):
+    fields = {"cache", "producer", "loaded_llvm", "runtime", "profiles", "shards"}
+    if not isinstance(request, dict) or set(request) not in (fields, fields | {"mapped_image_digests"}):
+        raise ValueError("invalid batch request fields")
+    if "mapped_image_digests" in request and request["mapped_image_digests"] is None:
+        raise ValueError("mapped image digests must be a complete map")
+    return mapped_image_pins(request.get("mapped_image_digests"))
+
+
 class BatchInvocation:
     """One-process shared artifact attestation; no external supplied digest cache.
 
     Stage all hits/publications privately. finish() rehashes shared artifacts
     once, then commits. Context exit without finish discards staged work.
     """
-    def __init__(self, cache, producer, loaded_llvm, runtime, profiles=()):
+    def __init__(self, cache, producer, loaded_llvm, runtime, profiles=(), mapped_image_digests=None):
+        self.mapped_image_digests = mapped_image_pins(mapped_image_digests)
         self.cache = Path(cache)
         self.cache.mkdir(parents=True, exist_ok=True)
         self.work = Path(tempfile.mkdtemp(prefix=".batch-", dir=self.cache))
@@ -287,6 +308,10 @@ class BatchInvocation:
         pins["profiles"] = [self._shared(path) for path in self.profile_paths]
         artifacts = {name: pins[name]["identity"] for name in self.paths}
         artifacts["profiles"] = [pin["identity"] for pin in pins["profiles"]]
+        if self.mapped_image_digests is not None:
+            for name, expected in self.mapped_image_digests.items():
+                if artifacts[name]["sha256"] != expected:
+                    raise ValueError("actual file differs from verified mapped image: " + name)
         return pins, artifacts
 
     def _snapshot(self, path):
@@ -300,11 +325,15 @@ class BatchInvocation:
             raise ValueError("PGO use requires actual profile artifacts")
         ticket = {"schema": SCHEMA, "pins": self.pins, "recipe": {"options": dict(options), "artifacts": self.artifacts},
                   "snapshot": {"path": str(Path(snapshot).resolve(strict=True)), "identity": self._snapshot(snapshot)}}
+        if self.mapped_image_digests is not None:
+            ticket["mapped_image_digests"] = dict(self.mapped_image_digests)
         ticket["key"] = ticket_key(ticket)
         self.prepared.append(ticket)
         return ticket
 
     def validate(self, ticket):
+        if ticket.get("mapped_image_digests") != self.mapped_image_digests:
+            raise ValueError("ticket mapped image attestation mismatch")
         if not isinstance(ticket, dict) or ticket.get("schema") != SCHEMA or ticket.get("key") != ticket_key(ticket):
             raise ValueError("invalid batch shard ticket")
         validate_options(ticket["recipe"]["options"])
@@ -403,8 +432,8 @@ class BatchInvocation:
 
 
 def complete_restore_request(request):
-    fields = {"cache", "producer", "loaded_llvm", "runtime", "profiles", "shards"}
-    if not isinstance(request, dict) or set(request) != fields or not isinstance(request["shards"], list):
+    batch_fields(request)
+    if not isinstance(request["shards"], list):
         raise ValueError("invalid batch request")
     count = len(request["shards"])
     if not 1 <= count <= 64:
@@ -459,12 +488,14 @@ def publish_restore_result(request, result):
     publications = []
     for item, record in zip(request["shards"], result["shards"]):
         ticket = record["ticket"]
+        if ticket.get("mapped_image_digests") != request.get("mapped_image_digests"):
+            raise ValueError("restore result mapped image pins differ from original request")
         if ticket["recipe"]["options"] != item["options"] or ticket["snapshot"]["path"] != str(Path(item["snapshot"]).resolve(strict=True)):
             raise ValueError("restore result differs from original admitted request")
         if not record["hit"]:
             publications.append({"ticket": ticket, "object": item["object"], "stdout": item["stdout"], "stderr": item["stderr"]})
     # The original pins, not freshly guessed keys, authorize emitted misses.
-    with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"]) as batch:
+    with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"], request.get("mapped_image_digests")) as batch:
         for record in result["shards"]:
             batch.validate(record["ticket"])
         for item in publications:
@@ -473,13 +504,13 @@ def publish_restore_result(request, result):
     return {"schema": SCHEMA, "published_misses": len(publications), "metrics": metrics}
 
 def batch_request(operation, request):
-    fields = {"cache", "producer", "loaded_llvm", "runtime", "profiles", "shards"}
-    if not isinstance(request, dict) or set(request) != fields or not isinstance(request["shards"], list) or len(request["shards"]) > 64:
+    batch_fields(request)
+    if not isinstance(request["shards"], list) or len(request["shards"]) > 64:
         raise ValueError("invalid bounded batch request")
     if operation == "batch-restore":
         complete_restore_request(request)
     outputs = []
-    with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"]) as batch:
+    with BatchInvocation(request["cache"], request["producer"], request["loaded_llvm"], request["runtime"], request["profiles"], request.get("mapped_image_digests")) as batch:
         for item in request["shards"]:
             if operation == "batch-restore":
                 if set(item) != {"snapshot", "options", "object", "stdout", "stderr"}:
