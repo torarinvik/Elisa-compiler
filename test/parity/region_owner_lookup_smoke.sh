@@ -16,8 +16,19 @@ fi
 FIXTURE="$ROOT/test/parity/region_owner_lookup_smoke.elisa"
 CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 LIBDIR="$ELISA_LLVM_LIBDIR"
+RUNTIME_OBJECTS=()
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-region-owner.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+if [[ -n "${ELISA_STAGE1_BIN:-}" ]]; then
+    RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+    ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" bash "$ROOT/scripts/build_runtime_object.sh" >"$WORK/runtime.log" 2>&1 || {
+        cat "$WORK/runtime.log" >&2
+        echo "region owner lookup smoke FAIL: Stage1 runtime" >&2
+        exit 1
+    }
+    RUNTIME_OBJECTS=("$RUNTIME_OBJ")
+fi
 
 [[ -x "$CLANG" ]] || { echo "region owner lookup smoke: missing clang: $CLANG" >&2; exit 2; }
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
@@ -33,6 +44,7 @@ elisa_native_optional_hook_objects "$WORK" "$ROOT"
 }
 "$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/region_owner_lookup" \
     "$WORK/region_owner_lookup.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" \
+    "${RUNTIME_OBJECTS[@]}" \
     -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS \
     -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
 "$WORK/region_owner_lookup"
