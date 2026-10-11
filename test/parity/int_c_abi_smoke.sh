@@ -30,7 +30,9 @@ extern ffi_right() -> u8&
 def ffi_check() -> i32:
     a: u8& = ffi_left()
     b: u8& = ffi_right()
-    comparison: int = strcmp(a, b)
+    left_cstr: cstr = a.cast[cstr] can Unsafe.PointerCast
+    right_cstr: cstr = b.cast[cstr] can Unsafe.PointerCast
+    comparison: int = strcmp(left_cstr, right_cstr)
     return 1 if comparison >= 0
     left_bytes: void& = a.cast[void&] can Unsafe.PointerCast
     right_bytes: void& = b.cast[void&] can Unsafe.PointerCast
