@@ -51,7 +51,17 @@ if [[ "${1:-}" == "--one" ]]; then
     WORK="$2"
 else
     WORK="$(mktemp -d)"
-    trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+    cleanup_corpus() {
+        local status=$?
+        if [[ "$status" -eq 0 ]]; then
+            rm -rf "$WORK"
+        else
+            echo "differential corpus: failure evidence retained at $WORK" >&2
+        fi
+    }
+    trap cleanup_corpus EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
 fi
 
 # Objects that include the Elisa runtime may call the optional profiler hooks even when
@@ -102,10 +112,10 @@ COMPILE_TIMEOUT=$((60 * CORPUS_TIMEOUT_SCALE))
 # compile was filed as a language gap (5 spurious declines against a baseline of 0 in one
 # run; the same corpus on a quiet host declined only the known `lmut_threading_value`).
 COMPILE() {
-    timeout "$COMPILE_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null
+    timeout "$COMPILE_TIMEOUT" "$@" >"${COMPILE_LOG:-/dev/null}" 2>&1 </dev/null
     local status=$?
     if [ "$status" -eq 124 ]; then
-        timeout "$LONG_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null; status=$?
+        timeout "$LONG_TIMEOUT" "$@" >>"${COMPILE_LOG:-/dev/null}" 2>&1 </dev/null; status=$?
     fi
     return $status
 }
@@ -233,8 +243,17 @@ one_program() {
     work="$(mktemp -d "$WORK/p.XXXXXX")"
     # ---- stage0 is the ORACLE. If IT cannot produce a running program, this file is not
     # a parity signal (a fixture meant to fail to compile, a driver needing stdin, ...).
-    if ! COMPILE "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src"; then
-        printf 'SKIP\t%s\t\n' "$name"; return 0
+    local COMPILE_LOG="$work/stage0.compile.log" compile_status
+    if COMPILE "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src"; then
+        :
+    else
+        compile_status=$?
+        if [[ "$compile_status" -eq 124 ]]; then
+            printf 'TIMEOUT\t%s\tstage0 compile; log=%s\n' "$name" "$COMPILE_LOG"
+        else
+            printf 'SKIP\t%s\tstage0 compile exit=%s; log=%s\n' "$name" "$compile_status" "$COMPILE_LOG"
+        fi
+        return 0
     fi
     if ! link_program "$work/s0" "$work/s0.o"; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
     RUN "$work/s0"; local s0_rc=$?
@@ -242,9 +261,18 @@ one_program() {
     if [ "$s0_rc" -eq 124 ]; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
     # ---- stage1. A compile or link failure is the ACCEPTANCE gap, not a wrong answer:
     # a declined function is dropped, so the link fails with an undefined symbol.
-    if ! COMPILE env ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" \
+    COMPILE_LOG="$work/stage1.compile.log"
+    if COMPILE env ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" \
             -o "$work/s1.o" "$src"; then
-        printf 'DECLINED\t%s\t(compile)\n' "$name"; return 0
+        :
+    else
+        compile_status=$?
+        if [[ "$compile_status" -eq 124 ]]; then
+            printf 'TIMEOUT\t%s\tstage1 compile; log=%s\n' "$name" "$COMPILE_LOG"
+        else
+            printf 'DECLINED\t%s\t(compile exit=%s; log=%s)\n' "$name" "$compile_status" "$COMPILE_LOG"
+        fi
+        return 0
     fi
     if ! link_program "$work/s1" "$work/s1.o"; then
         printf 'DECLINED\t%s\t(link: a declined function was dropped)\n' "$name"; return 0
@@ -316,7 +344,8 @@ awk -F'\t' '$1=="DECLINED"{print $2" "$3}' "$WORK/results.txt" > "$WORK/declines
 awk -F'\t' '$1=="FLAKY"{print $2" "$3}' "$WORK/results.txt" > "$WORK/flaky.txt"
 awk -F'\t' '$1=="INTERMITTENT"{print $2" "$3}' "$WORK/results.txt" > "$WORK/intermittent.txt"
 
-total=$((match + mismatch + declined + skipped + intermittent))
+timed_out="$(count_kind TIMEOUT)"
+total=$((match + mismatch + declined + skipped + intermittent + timed_out))
 echo "differential corpus: $total programs — $match match, $mismatch MISMATCH, $declined declined, $skipped skipped (stage0 could not arbitrate)" >&2
 
 if [ "$mismatch" -gt 0 ]; then
@@ -354,6 +383,11 @@ allowed_declines=0
 [ -f "$BASELINE" ] && allowed_declines="$(tr -d '[:space:]' < "$BASELINE")"
 
 rc=0
+if [ "$timed_out" -gt 0 ]; then
+    echo "differential corpus INCONCLUSIVE: $timed_out compiler timeouts; no parity qualification" >&2
+    awk -F'\t' '$1=="TIMEOUT"{print $2" "$3}' "$WORK/results.txt" >&2
+    rc=1
+fi
 if [ "$mismatch" -gt 0 ]; then
     echo "differential corpus FAILED: $mismatch program(s) produce a DIFFERENT ANSWER under stage1" >&2
     rc=1
