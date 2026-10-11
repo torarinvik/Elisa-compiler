@@ -38,6 +38,10 @@ cases = [
     ("index target reads", "global mutable cursor: usize = 0\nglobal mutable slots: i64[4] = zeroed\ndef store() -> void:\n    slots[cursor] <- 1\n", {"Global.Read", "Global.Write"}),
     ("mutable reference write requires Global.Write", "global mutable counter: i64 = 0\ndef set_one(value: mutable i64&) -> void:\n    value <- 1\ndef main() -> void:\n    can Global.Read:\n        reference: mutable i64& = &counter\n        set_one(reference)\n", {"Global.Write"}),
     ("mutable reference write with both grants", "global mutable counter: i64 = 0\ndef set_one(value: mutable i64&) -> void:\n    value <- 1\ndef main() -> void:\n    can Global{Read, Write}:\n        reference: mutable i64& = &counter\n        set_one(reference)\n", set()),
+    ("mutable record field read grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef read_record() -> i64:\n    can Global.Read:\n        return record.value\n", set()),
+    ("mutable record field write grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef write_record() -> void:\n    can Global.Write:\n        record.value <- 1\n", set()),
+    ("mutable record field read missing grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef read_record() -> i64:\n    return record.value\n", {"Global.Read"}),
+    ("mutable record field write wrong grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef write_record() -> void:\n    can Global.Read:\n        record.value <- 1\n", {"Global.Write"}),
 ]
 # Signature rows describe caller contracts; they never authorize body access.
 # Give transitive/callback fixtures their own immediate body grants so each test
