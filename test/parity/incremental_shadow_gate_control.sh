@@ -136,6 +136,16 @@ compare_pymodule_cold_and_shadow() {
     local source="$1" stem="$2"
     run_pymodule cold "$source" "$stem"
     run_pymodule shadow "$source" "$stem"
+    # Matching failures are not evidence that successful emission is unchanged.
+    local mode emission_status
+    for mode in cold shadow; do
+        emission_status="$(cat "$WORK/$stem.$mode.status")"
+        if [[ "$emission_status" != 0 || ! -s "$WORK/$stem.$mode.json" ]]; then
+            cat "$WORK/$stem.$mode.out" "$WORK/$stem.$mode.err" >&2
+            echo "incremental shadow pymodule emission FAILED: $stem $mode (status=$emission_status; expected nonempty JSON)" >&2
+            return 1
+        fi
+    done
     diff -u "$WORK/$stem.cold.status" "$WORK/$stem.shadow.status"
     diff -u "$WORK/$stem.cold.out" "$WORK/$stem.shadow.out"
     diff -u "$WORK/$stem.cold.err" "$WORK/$stem.shadow.err"
