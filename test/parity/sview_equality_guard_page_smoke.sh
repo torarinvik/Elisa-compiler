@@ -8,7 +8,8 @@ CLANG="${ELISA_CLANG:-$(command -v clang || true)}"
 FIXTURE="$ROOT/test/bench/codegen_perf/sview_guard_page.elisa"
 C_SOURCE="$ROOT/test/bench/codegen_perf/sview_guard_page.c"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-guard.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+source "$ROOT/test/parity/control_artifacts.sh"
+elisa_control_artifacts "$WORK"
 
 [[ -x "$BASELINE" ]] || { echo "missing baseline compiler: $BASELINE" >&2; exit 2; }
 [[ -x "$CANDIDATE" ]] || { echo "missing candidate compiler: $CANDIDATE" >&2; exit 2; }

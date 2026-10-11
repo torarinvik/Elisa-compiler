@@ -13,7 +13,8 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-sview-backing.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+source "$ROOT/test/parity/control_artifacts.sh"
+elisa_control_artifacts "$WORK"
 ulimit -c 0 || true
 
 for stage in stage0 stage1; do
