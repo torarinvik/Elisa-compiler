@@ -21,6 +21,7 @@
 extend Semantic:
     private:
         const STS_NO_ROW: u32 = 4294967295
+        const STS_CLASS_HASH_THRESHOLD: usize = 8
 
         struct StoreThroughSummary:
             # Function names carrying summary rows. Repeated function names are
@@ -224,8 +225,11 @@ extend Semantic:
                         for argument in arguments |out|:
                             sts_collect_names(argument, out)
                     Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
-                        for child in Ast::effect_runtime_children(candidates, arguments) |out|:
-                            sts_collect_names(child, out)
+                        for candidate in candidates |out|:
+                            for capture in candidate.captures |out|:
+                                sts_collect_names(capture, out)
+                        for argument in arguments |out|:
+                            sts_collect_names(argument, out)
                     Expr.Field(object, _, _):
                         sts_collect_names(object, out)
                     Expr.Scope(_, _, _):
@@ -307,68 +311,103 @@ extend Semantic:
                         sts_collect_statement_names(statements, out)
                         sts_collect_names(value, out)
 
+        struct StoreThroughClasses:
+            # NameSet keeps insertion order and a hash index; parents uses the same
+            # zero-based name rows with 1-based parent labels.
+            names: mutable NameSet
+            parents: mutable darray[usize]
+            ranks: mutable darray[u8]
+
+        def sts_classes_empty() -> StoreThroughClasses:
+            can Memory.Allocate, Abort.Panic:
+                return StoreThroughClasses{names: empty_name_set(), parents: [], ranks: []}
+
         # The class of NAME (registering it as its own class). Classes are a union-find
-        # forest: classes[row] is the 1-based row of the parent, a root points at itself.
+        # forest: parents[row] is the 1-based row of the parent, a root points at itself.
         # Callers only ever compare two classes for equality, so the partition -- which
         # does not depend on the order of the unions -- is the whole answer; relabelling
-        # every row per union made each function quadratic in the names it mentions.
-        def sts_class_of(names: mutable darray[sview]&, classes: mutable darray[usize]&, name: sview) -> usize:
+        # every row per union made each function quadratic in the names it mentions. The
+        # hash-backed NameSet avoids a linear name search for larger functions, while
+        # union-by-rank bounds tree
+        # height before path compression.
+        def sts_class_of(classes: mutable StoreThroughClasses&, name: sview) -> usize:
             can Memory.Allocate, Abort.Panic:
-                row: mutable usize = 0
-                while row < names.count |row|:
-                    return sts_class_root(classes, row + 1) if names[row] == name
-                    row <- row + 1
-                names.push(name)
-                classes.push(names.count)
-                return names.count
+                row: mutable i64 = -1
+                if classes.names.slots.count == 0:
+                    candidate: mutable usize = 0
+                    while candidate < classes.names.names.count |candidate, classes|:
+                        if classes.names.names[candidate] == name:
+                            row <- candidate.i64()
+                            break
+                        candidate <- candidate + 1
+                else:
+                    row <- name_set_index(classes.names, name)
+                return sts_class_root(classes, row.usize() + 1) if row >= 0
+                label: usize = classes.parents.count + 1
+                if classes.names.slots.count == 0 and classes.names.names.count < STS_CLASS_HASH_THRESHOLD:
+                    classes.names.names.push(name)
+                else:
+                    name_set_grow(classes.names) if classes.names.slots.count == 0
+                    name_set_add(classes.names, name)
+                classes.parents.push(label)
+                classes.ranks.push(0)
+                return label
 
-        def sts_class_root(classes: mutable darray[usize]&, label: usize) -> usize:
+        def sts_class_root(classes: mutable StoreThroughClasses&, label: usize) -> usize:
             can Memory.Allocate, Abort.Panic:
                 root: mutable usize = label
-                while classes[root - 1] != root |root, classes|:
-                    root <- classes[root - 1]
+                while classes.parents[root - 1] != root |root, classes|:
+                    root <- classes.parents[root - 1]
                 # Path compression.
                 walk: mutable usize = label
-                while classes[walk - 1] != root |walk, classes, root|:
-                    parent: usize = classes[walk - 1]
-                    classes[walk - 1] <- root
+                while classes.parents[walk - 1] != root |walk, classes, root|:
+                    parent: usize = classes.parents[walk - 1]
+                    classes.parents[walk - 1] <- root
                     walk <- parent
                 return root
 
-        def sts_unify(names: mutable darray[sview]&, classes: mutable darray[usize]&, first: sview, second: sview) -> void:
+        def sts_unify(classes: mutable StoreThroughClasses&, first: sview, second: sview) -> void:
             can Memory.Allocate, Abort.Panic:
-                kept: usize = sts_class_of(names, classes, first)
-                merged: usize = sts_class_of(names, classes, second)
+                kept: usize = sts_class_of(classes, first)
+                merged: usize = sts_class_of(classes, second)
                 return if kept == merged
-                classes[merged - 1] <- kept
+                kept_rank: u8 = classes.ranks[kept - 1]
+                merged_rank: u8 = classes.ranks[merged - 1]
+                if kept_rank < merged_rank:
+                    classes.parents[kept - 1] <- merged
+                elif kept_rank > merged_rank:
+                    classes.parents[merged - 1] <- kept
+                else:
+                    classes.parents[merged - 1] <- kept
+                    classes.ranks[kept - 1] <- kept_rank + 1
 
-        def sts_unify_all(names: mutable darray[sview]&, classes: mutable darray[usize]&, mentioned: darray[sview]&) -> void:
+        def sts_unify_all(classes: mutable StoreThroughClasses&, mentioned: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if mentioned.count < 2
-                for other in mentioned |names, classes|:
-                    sts_unify(names, classes, mentioned[0], other)
+                for other in mentioned |classes|:
+                    sts_unify(classes, mentioned[0], other)
 
         # Calls anywhere inside EXPRESSION: a summarised callee unifies its stored argument
         # pairs, a method call or any other call unifies everything it was handed.
-        def sts_unify_calls(expression: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, names: mutable darray[sview]&, classes: mutable darray[usize]&) -> void:
+        def sts_unify_calls(expression: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, classes: mutable StoreThroughClasses&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, _):
-                        sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                        for argument in arguments |names, classes, reference_sites|:
-                            sts_unify_calls(argument, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        for argument in arguments |classes, reference_sites|:
+                            sts_unify_calls(argument, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         match callee:
                             Expr.Ident(callee_name, callee_position):
                                 shadowed: bool = borrow_reference_site_is_local(reference_sites, function_owner, callee_position, table) or has_unreadable_binder
                                 if sts_is_declared(summary, callee_name) and not shadowed and not (any argument_name in argument_names where argument_name != ""):
                                     pair_row: mutable u32 = sts_pair_first(summary, callee_name)
-                                    while pair_row != STS_NO_ROW |pair_row, names, classes|:
+                                    while pair_row != STS_NO_ROW |pair_row, classes|:
                                         row: usize = pair_row.usize()
                                         if summary.pair_function[row] == callee_name and summary.pair_target[row] < arguments.count and summary.pair_source[row] < arguments.count:
                                             pair_names: mutable darray[sview] = []
                                             sts_collect_names(arguments[summary.pair_target[row]], pair_names)
                                             sts_collect_names(arguments[summary.pair_source[row]], pair_names)
-                                            sts_unify_all(names, classes, pair_names)
+                                            sts_unify_all(classes, pair_names)
                                         pair_row <- sts_pair_after(summary, pair_row)
                                     return
                             _:
@@ -383,82 +422,82 @@ extend Semantic:
                                 pass
                         for argument in arguments |call_names|:
                             sts_collect_names(argument, call_names)
-                        sts_unify_all(names, classes, call_names)
+                        sts_unify_all(classes, call_names)
                     Expr.Field(object, _, _):
-                        sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     Expr.Index(object, index, _):
-                        sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                        sts_unify_calls(index, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(index, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     Expr.Binary(left, _, right, _):
-                        sts_unify_calls(left, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                        sts_unify_calls(right, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(left, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(right, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     Expr.Unary(_, operand, _):
-                        sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     Expr.Move(operand, _):
-                        sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     Expr.Paren(inner, _):
-                        sts_unify_calls(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     Expr.If(condition, then_value, else_value, _):
-                        sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                        sts_unify_calls(then_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                        sts_unify_calls(else_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                        sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(then_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(else_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                     _:
                         # Anything this walk does not open (a lambda, a block or match value)
                         # may store anything it mentions anywhere.
                         hidden_names: mutable darray[sview] = []
                         sts_collect_names(expression, hidden_names)
-                        sts_unify_all(names, classes, hidden_names)
+                        sts_unify_all(classes, hidden_names)
 
-        def sts_unify_bound(name: sview, value: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, names: mutable darray[sview]&, classes: mutable darray[usize]&) -> void:
+        def sts_unify_bound(name: sview, value: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, classes: mutable StoreThroughClasses&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 bound_names: mutable darray[sview] = []
                 bound_names.push(name) if name != ""
                 sts_collect_names(value, bound_names)
-                sts_unify_all(names, classes, bound_names)
-                sts_unify_calls(value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                sts_unify_all(classes, bound_names)
+                sts_unify_calls(value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
 
-        def sts_statements(statements: darray[Ast::Stmt], summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, names: mutable darray[sview]&, classes: mutable darray[usize]&) -> void:
+        def sts_statements(statements: darray[Ast::Stmt], summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, classes: mutable StoreThroughClasses&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
-                for statement in statements |names, classes, reference_sites|:
+                for statement in statements |classes, reference_sites|:
                     match statement:
                         Stmt.VarDecl(declared_name, _, declared_value, _):
-                            sts_unify_bound(declared_name, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_bound(declared_name, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.Assign(assign_target, _, assign_value, _):
                             assign_names: mutable darray[sview] = []
                             sts_collect_names(assign_target, assign_names)
                             sts_collect_names(assign_value, assign_names)
-                            sts_unify_all(names, classes, assign_names)
-                            sts_unify_calls(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            sts_unify_calls(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_all(classes, assign_names)
+                            sts_unify_calls(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            sts_unify_calls(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.Expr(statement_value, _):
-                            sts_unify_calls(statement_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_calls(statement_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.Return(returned, _):
                             if returned is returned_value:
-                                sts_unify_calls(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                                sts_unify_calls(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.If(condition, then_body, else_body, _):
-                            sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            sts_statements(then_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            sts_statements(else_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            sts_statements(then_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            sts_statements(else_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.While(condition, loop_body, _):
-                            sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.For(_, loop_variables, iterable, loop_body, _):
-                            for loop_variable in loop_variables |names, classes, reference_sites|:
-                                sts_unify_bound(loop_variable, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            sts_unify_calls(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            for loop_variable in loop_variables |classes, reference_sites|:
+                                sts_unify_bound(loop_variable, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            sts_unify_calls(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.Block(_, _, _, block_body, _):
-                            sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.Match(scrutinee, arms, _):
                             # Arm binders are not read here: they join the scrutinee through
                             # any later statement that mentions both, and a binder stored into a
                             # parameter is unified with that parameter by the store itself.
-                            sts_unify_calls(scrutinee, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                            for arm in arms |names, classes, reference_sites|:
-                                sts_unify_calls(arm.guard, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
-                                sts_statements(arm.body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_calls(scrutinee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                            for arm in arms |classes, reference_sites|:
+                                sts_unify_calls(arm.guard, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                                sts_statements(arm.body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         Stmt.Contract(_, expression, _):
-                            sts_unify_calls(expression, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                            sts_unify_calls(expression, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                         _:
                             pass
 
@@ -478,17 +517,16 @@ extend Semantic:
         # The rows one function adds under SUMMARY; true when any row is new.
         def sts_summarise_function(function_name: sview, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt], has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, summary: mutable StoreThroughSummary&) -> bool:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
-                names: mutable darray[sview] = []
-                classes: mutable darray[usize] = []
-                sts_statements(body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)
+                classes: mutable StoreThroughClasses = sts_classes_empty()
+                sts_statements(body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
                 added: mutable bool = false
                 target: mutable usize = 0
-                while target < parameters.count |target, names, classes, added, summary|:
+                while target < parameters.count |target, classes, added, summary|:
                     if sts_is_writable(summary, function_name, target):
-                        target_class: usize = sts_class_of(names, classes, parameters[target].name)
+                        target_class: usize = sts_class_of(classes, parameters[target].name)
                         source: mutable usize = 0
-                        while source < parameters.count |source, names, classes, added, summary|:
-                            if source != target and sts_class_of(names, classes, parameters[source].name) == target_class and not sts_has_pair(summary, function_name, target, source):
+                        while source < parameters.count |source, classes, added, summary|:
+                            if source != target and sts_class_of(classes, parameters[source].name) == target_class and not sts_has_pair(summary, function_name, target, source):
                                 sts_add_pair(summary, function_name, target, source) can Global{Read,Write}
                                 added <- true
                             source <- source + 1

@@ -189,8 +189,11 @@ EXPRESSION_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |out|:"),
     ("for argument in arguments |out|:", "sts_collect_names(argument, out)", 0),
     ("for argument in arguments |out|:", "sts_collect_names(argument, out)", 1),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, _, _):", "for child in Ast::effect_runtime_children(candidates, arguments) |out|:"),
-    ("for child in Ast::effect_runtime_children(candidates, arguments) |out|:", "sts_collect_names(child, out)"),
+    ("Expr.StaticEffectCall(_, _, candidates, arguments, _, _):", "for candidate in candidates |out|:"),
+    ("for candidate in candidates |out|:", "for capture in candidate.captures |out|:"),
+    ("for capture in candidate.captures |out|:", "sts_collect_names(capture, out)"),
+    ("Expr.StaticEffectCall(_, _, candidates, arguments, _, _):", "for argument in arguments |out|:"),
+    ("for argument in arguments |out|:", "sts_collect_names(argument, out)", 2),
     ("Expr.Field(object, _, _):", "sts_collect_names(object, out)"),
     ("Expr.Index(object, index, _):", "sts_collect_names(object, out)"),
     ("Expr.Index(object, index, _):", "sts_collect_names(index, out)"),
@@ -266,49 +269,49 @@ STATEMENT_COLLECTOR_EDGES = (
 )
 
 STATEMENT_UNIFIER_EDGES = (
-    ("Stmt.VarDecl(declared_name, _, declared_value, _):", "sts_unify_bound(declared_name, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
+    ("Stmt.VarDecl(declared_name, _, declared_value, _):", "sts_unify_bound(declared_name, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_collect_names(assign_target, assign_names)"),
     ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_collect_names(assign_value, assign_names)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_all(names, classes, assign_names)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_calls(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_calls(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.Expr(statement_value, _):", "sts_unify_calls(statement_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
+    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_all(classes, assign_names)"),
+    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_calls(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_calls(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Expr(statement_value, _):", "sts_unify_calls(statement_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Return(returned, _):", "if returned is returned_value:"),
-    ("if returned is returned_value:", "sts_unify_calls(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.If(condition, then_body, else_body, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.If(condition, then_body, else_body, _):", "sts_statements(then_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.If(condition, then_body, else_body, _):", "sts_statements(else_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.While(condition, loop_body, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.While(condition, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "for loop_variable in loop_variables |names, classes, reference_sites|:"),
-    ("for loop_variable in loop_variables |names, classes, reference_sites|:", "sts_unify_bound(loop_variable, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_unify_calls(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.Block(_, _, _, block_body, _):", "sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.Match(scrutinee, arms, _):", "sts_unify_calls(scrutinee, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |names, classes, reference_sites|:"),
-    ("for arm in arms |names, classes, reference_sites|:", "sts_unify_calls(arm.guard, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("for arm in arms |names, classes, reference_sites|:", "sts_statements(arm.body, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Stmt.Contract(_, expression, _):", "sts_unify_calls(expression, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
+    ("if returned is returned_value:", "sts_unify_calls(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.If(condition, then_body, else_body, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.If(condition, then_body, else_body, _):", "sts_statements(then_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.If(condition, then_body, else_body, _):", "sts_statements(else_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.While(condition, loop_body, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.While(condition, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "for loop_variable in loop_variables |classes, reference_sites|:"),
+    ("for loop_variable in loop_variables |classes, reference_sites|:", "sts_unify_bound(loop_variable, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_unify_calls(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Block(_, _, _, block_body, _):", "sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Match(scrutinee, arms, _):", "sts_unify_calls(scrutinee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |classes, reference_sites|:"),
+    ("for arm in arms |classes, reference_sites|:", "sts_unify_calls(arm.guard, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("for arm in arms |classes, reference_sites|:", "sts_statements(arm.body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Contract(_, expression, _):", "sts_unify_calls(expression, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
 )
 
 EXPRESSION_UNIFIER_EDGES = (
-    ("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Call(callee, arguments, argument_names, _):", "for argument in arguments |names, classes, reference_sites|:"),
-    ("for argument in arguments |names, classes, reference_sites|:", "sts_unify_calls(argument, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
+    ("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Call(callee, arguments, argument_names, _):", "for argument in arguments |classes, reference_sites|:"),
+    ("for argument in arguments |classes, reference_sites|:", "sts_unify_calls(argument, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Expr.Ident(callee_name, callee_position):", "shadowed: bool = borrow_reference_site_is_local(reference_sites, function_owner, callee_position, table) or has_unreadable_binder"),
     ("Expr.Ident(callee_name, callee_position):", "if sts_is_declared(summary, callee_name) and not shadowed and not (any argument_name in argument_names where argument_name != \"\"):", 0),
-    ("Expr.Field(object, _, _):", "sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Index(object, index, _):", "sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Index(object, index, _):", "sts_unify_calls(index, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Binary(left, _, right, _):", "sts_unify_calls(left, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Binary(left, _, right, _):", "sts_unify_calls(right, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Unary(_, operand, _):", "sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Move(operand, _):", "sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Paren(inner, _):", "sts_unify_calls(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.If(condition, then_value, else_value, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.If(condition, then_value, else_value, _):", "sts_unify_calls(then_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.If(condition, then_value, else_value, _):", "sts_unify_calls(else_value, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
+    ("Expr.Field(object, _, _):", "sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Index(object, index, _):", "sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Index(object, index, _):", "sts_unify_calls(index, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Binary(left, _, right, _):", "sts_unify_calls(left, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Binary(left, _, right, _):", "sts_unify_calls(right, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Unary(_, operand, _):", "sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Move(operand, _):", "sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Paren(inner, _):", "sts_unify_calls(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.If(condition, then_value, else_value, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.If(condition, then_value, else_value, _):", "sts_unify_calls(then_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.If(condition, then_value, else_value, _):", "sts_unify_calls(else_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
 )
 
 HOLDER_SCAN_STATEMENT_EDGES = (
@@ -675,14 +678,14 @@ NAMED_CALL_EDGES = (
 )
 
 NAMED_ARGUMENT_UNIFIER_EDGES = (
-    ("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),
-    ("Expr.Call(callee, arguments, argument_names, _):", "for argument in arguments |names, classes, reference_sites|:"),
+    ("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Expr.Call(callee, arguments, argument_names, _):", "for argument in arguments |classes, reference_sites|:"),
     ("Expr.Ident(callee_name, callee_position):", 'shadowed: bool = borrow_reference_site_is_local(reference_sites, function_owner, callee_position, table) or has_unreadable_binder'),
     ("Expr.Ident(callee_name, callee_position):", 'if sts_is_declared(summary, callee_name) and not shadowed and not (any argument_name in argument_names where argument_name != ""):') ,
     ('if sts_is_declared(summary, callee_name) and not shadowed and not (any argument_name in argument_names where argument_name != ""):', "pair_row: mutable u32 = sts_pair_first(summary, callee_name)"),
     ('if sts_is_declared(summary, callee_name) and not shadowed and not (any argument_name in argument_names where argument_name != ""):', "return"),
     ("_:", "sts_collect_names(expression, hidden_names)", 2),
-    ("_:", "sts_unify_all(names, classes, hidden_names)", 2),
+    ("_:", "sts_unify_all(classes, hidden_names)", 2),
 )
 
 NAMED_ARGUMENT_STATIC_EFFECT_EDGES = (
@@ -699,7 +702,7 @@ UNKNOWN_CALL_EDGES = (
 
 UNIFIER_FALLBACK_EDGES = (
     ("_:", "sts_collect_names(expression, hidden_names)", 2),
-    ("_:", "sts_unify_all(names, classes, hidden_names)", 2),
+    ("_:", "sts_unify_all(classes, hidden_names)", 2),
 )
 
 
@@ -815,7 +818,7 @@ if len(re.findall(r"(?m)^\s*_:\s*$", unifier_source)) != 3:
     raise SystemExit("store-through unifier must retain exactly one conservative fallback")
 expected_fallback = compact_code("""hidden_names: mutable darray[sview] = []
 sts_collect_names(expression, hidden_names)
-sts_unify_all(names, classes, hidden_names)""")
+sts_unify_all(classes, hidden_names)""")
 fallback_block = match_arm_body(unifier_source, "match expression:", "_:")
 if fallback_block is None or compact_code(fallback_block) != expected_fallback:
     raise SystemExit("store-through unifier fallback no longer unifies every collected hidden name")
@@ -824,7 +827,7 @@ validate_edge_set(collect_source, EXPRESSION_EDGES, "expression name collector")
 validate_edge_set(statement_collect_source, STATEMENT_COLLECTOR_EDGES, "nested statement name collector")
 validate_edge_set(unifier_source, EXPRESSION_UNIFIER_EDGES, "expression call unifier")
 validate_edge_set(statements_source, STATEMENT_UNIFIER_EDGES, "statement call unifier")
-for fallback_child in ("sts_collect_names(expression, hidden_names)", "sts_unify_all(names, classes, hidden_names)"):
+for fallback_child in ("sts_collect_names(expression, hidden_names)", "sts_unify_all(classes, hidden_names)"):
     if not direct_child(unifier_source, "_:", fallback_child, 2):
         raise SystemExit(f"store-through wildcard fallback is missing {fallback_child}")
     mutated = wrap_direct_child_block(unifier_source, "_:", fallback_child, 2)
@@ -873,10 +876,10 @@ theorem_routes = {
         "expression": (("Stmt.Contract(_, expression, _):", "sts_collect_names(expression, out)"),),
     },
     "proof_sts_hidden_names_are_unified": {
-        "names_found": (("_:", "sts_unify_all(names, classes, hidden_names)", 2),),
+        "names_found": (("_:", "sts_unify_all(classes, hidden_names)", 2),),
     },
     "proof_sts_nested_callee_calls_reach_unifier": {
-        "callee_call": (("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, names, classes)"),),
+        "callee_call": (("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),),
     },
     "proof_chv_static_effect_candidates_check_captures_and_arguments": {
         "captures_checked": (("for candidate in candidates |table| -> table:", "candidate_arguments.extend(candidate.captures)"),),
