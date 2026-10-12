@@ -18,7 +18,12 @@ ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/build_runtime_object.sh"
 PRODUCT="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+RUNTIME_OVERFLOW="${ELISA_RUNTIME_OVERFLOW:-default}"
 ELISA_CLANG_TOOL="${ELISA_CLANG:-$(command -v clang || true)}"
+case "$RUNTIME_OVERFLOW" in
+  default|wrap|trap) ;;
+  *) echo "ELISA_RUNTIME_OVERFLOW must be default, wrap or trap (got $RUNTIME_OVERFLOW)" >&2; exit 2 ;;
+esac
 # Host predicates, exactly as scripts/elisac_stage1.sh exports them. This script calls the RAW
 # product, which reads its `ELISA_TARGET_OS_*` / `ARCH_*` consts from these flags and defaults
 # to macOS/arm64 without them. Called directly on a Linux x86-64 host (a gate check, a smoke),
@@ -63,6 +68,8 @@ runtime_input_digest() {
     "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$PRODUCT" "$ELISA_CLANG_TOOL" || return
     # So is the optimisation level: an -O0 and an -O2 object are different products.
     printf 'opt-level %s\n' "$RUNTIME_OPT_LEVEL"
+    # And the arithmetic mode, which matters for a checked benchmark profile.
+    printf 'overflow-mode %s\n' "$RUNTIME_OVERFLOW"
     # And the target: an object stamped under other host flags must not count as fresh.
     printf 'host-flags linux=%s windows=%s x86_64=%s\n' "${ELISA_HOST_LINUX:-}" "${ELISA_HOST_WINDOWS:-}" "${ELISA_HOST_X86_64:-}"
   } | LC_ALL=C sort | "${HASH_COMMAND[@]}" | awk '{print $1}'
@@ -104,7 +111,13 @@ trap cleanup_runtime_build EXIT
 # This entrypoint intentionally compiles the trusted bundled runtime as a standalone unit.
 # The product driver normally infers runtime status from flattened compiler sources, but
 # direct product invocations do not always preserve include-origin markers.
-ELISA_STAGE1_RUNTIME_STD=1 ELISACORE_FORCE_CONTRACTS=1 "$PRODUCT" -emit obj "$RUNTIME_OPT_LEVEL" -o "$RUNTIME_TMP" "$SRC"
+if [[ "$RUNTIME_OVERFLOW" == default ]]; then
+  ELISA_STAGE1_RUNTIME_STD=1 ELISACORE_FORCE_CONTRACTS=1 "$PRODUCT" -emit obj "$RUNTIME_OPT_LEVEL" \
+    -o "$RUNTIME_TMP" "$SRC"
+else
+  ELISA_STAGE1_RUNTIME_STD=1 ELISACORE_FORCE_CONTRACTS=1 "$PRODUCT" -emit obj "$RUNTIME_OPT_LEVEL" \
+    "-foverflow=$RUNTIME_OVERFLOW" -o "$RUNTIME_TMP" "$SRC"
+fi
 # --host-callbacks: the object must link STANDALONE (`clang prog.o elisacore_runtime.o`),
 # not only through the driver, which adds its own weak callback shims and -dead_strip.
 bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" --host-callbacks >"$HOOK_SOURCE"

@@ -7,7 +7,8 @@
 #
 #   ELISA_HOST_OS            Darwin | Linux | ...
 #   ELISA_LLVM_BIN_DIR       llvm-config --bindir   (clang, opt, llc, llvm-mc, wasm-ld ...)
-#   LLVM_CONFIG              $LLVM_CONFIG, else llvm-config on PATH, else Homebrew's (Darwin)
+#   LLVM_CONFIG              explicit $LLVM_CONFIG, else newest installed Homebrew LLVM on
+#                            Darwin (required), else llvm-config on PATH/versioned fallback
 #   ELISA_LLVM_LIBDIR        llvm-config --libdir
 #   ELISA_LLVM_LIBS          what replaces `-lLLVM`: -lLLVM when libLLVM.{so,dylib} exists,
 #                            else -lLLVM-<major>, else the static archives in one link group
@@ -37,11 +38,27 @@ else
 fi
 
 if [[ -z "${LLVM_CONFIG:-}" ]]; then
-    LLVM_CONFIG="$(command -v llvm-config 2>/dev/null || true)"
-    if [[ -z "$LLVM_CONFIG" && -x /opt/homebrew/opt/llvm/bin/llvm-config ]]; then
-        LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config
+    if [[ "$ELISA_HOST_OS" == Darwin ]]; then
+        # Homebrew's llvm formula tracks the newest installed release. Prefer it to an
+        # older llvm-config that happens to appear earlier on PATH, and never trigger an
+        # automatic formula update while resolving the toolchain.
+        export HOMEBREW_NO_AUTO_UPDATE=1
+        _ep_brew="$(command -v brew 2>/dev/null || true)"
+        if [[ -z "$_ep_brew" ]]; then
+            echo "Homebrew is required to select the newest LLVM on macOS; set LLVM_CONFIG explicitly to override" >&2
+            return 2
+        fi
+        _ep_llvm_prefix="$("$_ep_brew" --prefix llvm 2>/dev/null || true)"
+        if [[ ! -x "$_ep_llvm_prefix/bin/llvm-config" ]]; then
+            echo "Homebrew LLVM is not installed; install it or set LLVM_CONFIG explicitly" >&2
+            return 2
+        fi
+        LLVM_CONFIG="$_ep_llvm_prefix/bin/llvm-config"
+    else
+        LLVM_CONFIG="$(command -v llvm-config 2>/dev/null || true)"
+        [[ -n "$LLVM_CONFIG" ]] || LLVM_CONFIG="$(command -v llvm-config-21 2>/dev/null || echo llvm-config)"
     fi
-    [[ -n "$LLVM_CONFIG" ]] || LLVM_CONFIG="$(command -v llvm-config-21 2>/dev/null || echo llvm-config)"
+    unset _ep_brew _ep_llvm_prefix
 fi
 export LLVM_CONFIG
 # Prefer llvm-config's own directory when it is the toolchain bin dir (Homebrew's stable
