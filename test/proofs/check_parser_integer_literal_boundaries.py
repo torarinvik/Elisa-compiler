@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,12 +31,35 @@ positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 if "def parse_int_literal_value(text: sview) -> i64:" not in source:
     raise AssertionError("production integer-literal decoder changed")
+reference_from = source.split("ghost def parse_int_literal_reference_from(", 1)[1].split("ghost def parse_int_literal_reference(", 1)[0]
+reference = source.split("ghost def parse_int_literal_reference(", 1)[1].split("def parse_int_literal_value(", 1)[0]
+decoder = source.split("def parse_int_literal_value(", 1)[1]
+for fragment in (
+        "requires index <= sview_len(text)",
+        "decreases sview_len(text) - index",
+        "return 0 if not ((byte >= 48 and byte <= 57) or (is_hex and byte >= 97 and byte <= 102) or (is_hex and byte >= 65 and byte <= 70))",
+        "next_value: u64 = maximum if value > (maximum - digit.u64()) / base else value * base + digit.u64()",
+):
+    if fragment not in reference_from:
+        raise AssertionError(f"recursive literal reference lost its proof-checked fold step: {fragment}")
+if "return parse_int_literal_reference_from(text, start_index, is_hex, 0).i64()" not in reference:
+    raise AssertionError("recursive literal reference no longer starts from the production radix prefix")
+for fragment in (
+        "ensure result == parse_int_literal_reference(text)",
+        "while index < n |index, result, text, is_hex, n, start_index|:",
+        "invariant index <= n",
+        "invariant parse_int_literal_reference_from(text, index, is_hex, result) == parse_int_literal_reference_from(text, start_index, is_hex, 0)",
+):
+    if fragment not in decoder:
+        raise AssertionError(f"production integer parser lost its source-level refinement: {fragment}")
 if 'include "../../src/parser/parser_integer_literal.elisa"' not in positive_text:
     raise AssertionError("positive proof no longer includes the production decoder")
 if 'include "../../src/parser/parser_integer_literal.elisa"' not in negative_text:
     raise AssertionError("negative proof no longer includes the production decoder")
 if "return parse_int_literal_value(text)" not in positive_text + negative_text:
     raise AssertionError("proof projection no longer delegates to the production decoder")
+if "return parse_int_literal_reference(text)" not in positive_text:
+    raise AssertionError("universal proof no longer exposes the recursive reference fold")
 if 'include "./parser_integer_literal.elisa"' not in parser_source:
     raise AssertionError("production parser no longer includes the decoder")
 if ("result * base + digit.u64()" not in source or
@@ -44,15 +67,16 @@ if ("result * base + digit.u64()" not in source or
         "base: u64 = 16 if is_hex else 10" not in source):
     raise AssertionError("production decoder accumulation or overflow guard changed")
 for fragment in (
-    "(is_hex and sview_at(text, index) >= 97 and sview_at(text, index) <= 102)",
-    "(is_hex and sview_at(text, index) >= 65 and sview_at(text, index) <= 70)",
-    "(sview_at(text, index) - 97 + 10).i64()",
-    "(sview_at(text, index) - 65 + 10).i64()",
+    "(is_hex and byte >= 97 and byte <= 102)",
+    "(is_hex and byte >= 65 and byte <= 70)",
+    "(byte - 97 + 10).i64()",
+    "(byte - 65 + 10).i64()",
 ):
-    if fragment not in source:
+    if fragment not in reference_from or fragment not in decoder:
         raise AssertionError(f"production hexadecimal decoder lost a digit class or mapping: {fragment}")
 
 theorems = {
+    "production_integer_decoder_matches_recursive_reference_for_every_text",
     "decimal_i64_max_is_preserved",
     "decimal_above_i64_max_reinterprets_as_i64_min",
     "hexadecimal_u64_max_reinterprets_as_i64_minus_one",
@@ -60,6 +84,7 @@ theorems = {
     "hexadecimal_separators_preserve_the_value",
     "every_single_ascii_decimal_digit_decodes_exactly",
     "every_two_ascii_decimal_digits_decode_exactly",
+    "every_three_ascii_decimal_digits_decode_exactly",
     "every_two_ascii_hex_digits_decode_exactly",
     "every_hex_decimal_digit_decodes_exactly",
     "every_lowercase_hex_letter_decodes_exactly",
@@ -106,7 +131,7 @@ if product_manifest.get("compile_mode") != "strict":
 
 stage1_product = Path(product_manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
-INPUTS = [BIN, MANIFEST, MANIFEST_CHECKSUM, COMPILER_PIN, stage1_product,
+INPUTS = [*source_include_closure([POSITIVE, NEGATIVE]), BIN, MANIFEST, MANIFEST_CHECKSUM, COMPILER_PIN, stage1_product,
           stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
           POSITIVE, NEGATIVE, IMPLEMENTATION, PARSER]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in INPUTS}
@@ -130,16 +155,18 @@ assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "proof report changed across identical runs"
 verified = {row["name"] for row in positive["declaration_details"] if row.get("verified")}
 assert theorems <= verified
+assert "parse_int_literal_value" in verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
-assert negative["summary"]["proven"] + 6 == negative["summary"]["obligations"]
+assert negative["summary"]["proven"] + 7 == negative["summary"]["obligations"]
 assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
     ("ensure-unproven", "hexadecimal_u64_max_is_signed_i64_max"),
     ("ensure-unproven", "decimal_above_i64_max_remains_i64_max"),
     ("ensure-unproven", "ascii_zero_decodes_as_one"),
     ("ensure-unproven", "hexadecimal_lowercase_a_decodes_as_eleven"),
     ("ensure-unproven", "decimal_zero_pair_decodes_as_one"),
+    ("ensure-unproven", "decimal_zero_triplet_decodes_as_one"),
     ("ensure-unproven", "hexadecimal_zero_pair_decodes_as_one"),
 ]
 hex_false_claim = negative_text.split("def hexadecimal_zero_pair_decodes_as_one(", 1)[1].split("\ndef ", 1)[0]
@@ -148,13 +175,14 @@ if "ensure Parser::proof_decode_integer_literal_boundary(text) == 1" not in hex_
 
 assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in INPUTS}
 assert require_current_product(BIN, PROVER) == product_manifest, "proof product provenance changed during replay"
-print(json.dumps({"admitted": True, "scope": "universal one- and two-digit decimal and hexadecimal decoding, signed boundaries, and saturation",
+print(json.dumps({"admitted": True, "scope": "all-input production-loop refinement to a recursive saturating fold, universal one-, two-, and three-digit decimal decoding, two-digit hexadecimal decoding, signed boundaries, and saturation",
                   "positive_obligations": positive["summary"]["proven"],
                   "false_claims_rejected": ["hexadecimal_u64_max_is_signed_i64_max",
                                             "decimal_above_i64_max_remains_i64_max",
                                             "ascii_zero_decodes_as_one",
                                             "hexadecimal_lowercase_a_decodes_as_eleven",
                                             "decimal_zero_pair_decodes_as_one",
+                                            "decimal_zero_triplet_decodes_as_one",
                                             "hexadecimal_zero_pair_decodes_as_one"],
                   "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
                   "proof_revision": product_manifest["proof"].get("head"),

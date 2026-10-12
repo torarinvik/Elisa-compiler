@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 root = Path(__file__).resolve().parents[2]
 prover = root.parent / "elisa-proof"
@@ -29,6 +29,8 @@ inputs = [binary, manifest, manifest_checksum, prover / "ELISA_COMPILER_REV",
           root / "src/parser/parser_integer_literal.elisa",
           here / "parser_integer_literal.elisa",
           here / "parser_integer_literal_rejected.elisa"]
+inputs.extend(source_include_closure([here / "parser_integer_literal.elisa",
+                                     here / "parser_integer_literal_rejected.elisa"]))
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 source_text = (root / "src/parser/parser_integer_literal.elisa").read_text()
 proof_text = (here / "parser_integer_literal.elisa").read_text()
