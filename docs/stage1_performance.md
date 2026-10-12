@@ -74,6 +74,40 @@ Box timings are noisy (other agents share it): the same `-emit ast` run measured
   scans of the whole enum-annotation table, now one set of sorted/filtered views
   (`src/driver/elisac_emit_ast_marks.elisa`).
 
+### Compile-time index scorecard (unmeasured)
+
+Record these costs with the next controlled stage1 compile-speed run before changing the
+static cutoffs or making the source-AST owner index lazy:
+
+| index | current build policy | cost to record | follow-up decision |
+|---|---|---|---|
+| Type-alias name chains | built per pass when there are at least 8 aliases | pass CPU/wall time and peak RSS on small and self-hosting inputs | keep the cutoff only if the lookup savings cover map/chain construction and memory |
+| Zeroed bare-alias resolution | reuse the symbol-name chain and binary-search `TypeAliasDeclaration` rows by stable declaration ID | pass CPU/wall time, bare-alias query count, average same-hash chain length, and AST fallback count | retain the lookup if declaration-walk savings outweigh the binary searches; do not add another index until measured |
+| Callback-name slots | built on the first callback-result lookup, and only for at least 8 callbacks | pass CPU/wall time and peak RSS with no result lookup, then with repeated result lookups | preserve the lazy path if unused callback indexing has no measurable cost |
+| Source-AST aggregate owner chains | one row per named struct/enum declaration; function-local synthetic payloads remain per-expression rows | pass CPU/wall time, peak RSS, and declaration/expression row counts on small and self-hosting inputs | retain declaration handles if reducing repeated member rows offsets AST matching cost; consider lazy owner materialization if unused declarations still make setup expensive |
+| Qualified module-scope paths | deduplicated and hash-indexed on the first qualified-scope lookup | pass CPU/wall time, peak RSS, unique module-path count, and qualified-scope lookup count | retain the index only if repeated path scans saved more time than index construction costs |
+| Symbol-name bucket counts | maintained while building the general symbol-name chains | full self-host compile CPU/wall time and peak RSS | retain the completeness check if its table-build and memory cost is reasonable |
+| Active enum payload discovery | lazily builds exact `(owner, name)` hash chains on the first zeroed aggregate type query; rows contain only the first (zero-tag) variant's payload expressions | pass CPU/wall time, index-build cost, payload-row count, and active-payload queries on enum-heavy inputs and inputs without an invalid zeroed/omitted initializer | preserve declaration order across duplicate enum fragments, module/scope lookup, and first-variant-only semantics; compare eager scan and lazy index before keeping |
+| Backend submit-presence scans | lazily open-addressed per-function memo for nested statement lists | codegen CPU/wall time and memo allocations on nested-submit inputs, plus flat functions in files that contain submit annotations | keep only if saved subtree walks outweigh hashing and table growth costs |
+| Region-forwarding named-call mapping | compute source-argument positions and the callee fact row once per named call | callgrind/helper counts and temporary allocations for named, positional, duplicate, unknown, and receiver calls; stage1 IR-generation CPU | keep only if repeated mapping work saved exceeds per-call map construction; preserve partial mappings before an invalid argument |
+| Mutable-global name chains | build after 32 rows, then extend on each append; small registries keep the linear path | codegen CPU/wall time, mutable-global lookup counts, peak RSS, and bucket allocations on small and self-hosting inputs | keep the cutoff/index only if lookup savings cover the fixed bucket allocation; preserve owner priority and declaration-order fallback |
+| Packed-enum name chains | build after 32 rows, then extend on each placeholder/final-row append; smaller registries keep the linear path | codegen CPU/wall time, packed-enum lookup counts, candidate rows visited, peak RSS, and bucket allocations on self-hosting and enum-heavy inputs | keep only if owner and qualified-scope scan savings cover index costs; preserve owner precedence, ambiguity rules, scope ranking, and source-order ties |
+| Packed owner-membership cache | classify each enum declaration and payload row once after building packed-name metadata; reuse flags for placeholder reservation and payload-registration rounds | IR-generation CPU/wall time, `packed_listed_for_owner` calls, annotation rows scanned, and flag-table memory on self-hosting and enum-heavy inputs | keep only if repeated metadata scans saved exceed one-time classification and flag-table costs; preserve module ownership and interface-only fallback |
+| Packed variant-path lookup | hash the final enum-name slice, compute the maximum matching scope rank in one candidate pass, then visit tied rows in source order | codegen CPU/wall time, path queries, same-name candidates, and bytes hashed on nested-module and enum-heavy inputs | keep only if narrower candidate walks offset path-slice hashing; preserve qualified owner matching, lexical precedence, variant order, and rank ties |
+| Payload-enum name chains | build after payload finalization when there are at least 32 live rows; registration and smaller tables keep the linear path | codegen CPU/wall time, qualified enum lookup counts, peak RSS, and bucket allocations on enum-heavy and self-hosting inputs | keep only if saved owner/rank scans exceed index construction and memory; preserve owner precedence, alias fallback, and declaration-order ties |
+| Enum scope ranking | compute the owner/enclosing common prefix once and walk namespace separators backward | codegen CPU/wall time, `enum_scope_path_rank` calls, and bytes examined on nested-module inputs | keep if it reduces repeated prefix scans while preserving nearest-scope rank and first-row ties |
+| Const-enum member resolution | resolve dotted paths through the existing enum-name chain and owner ranking; scan the selected variant span once, then read its explicit value from the parallel pool | codegen CPU and variant rows visited on enum-heavy and self-hosting inputs; const-enum field-read, `is`, and path-pattern query counts | preserve module ownership, the distinction between declaration ordinal and explicit member value, and `-1` as a valid value rather than a membership sentinel |
+| Annotation alias fallback | skip the legacy global resolver when owner or top-level alias lookup already found a row | codegen CPU/wall time, legacy alias resolver calls, and annotation count on alias-heavy and self-hosting inputs | keep if skipping duplicate lexical scans helps without changing unresolved-alias precedence |
+| Function declaration lookup | reuse the source-ordered function-name chain for overload counts and prior extern matching | IR-generation CPU and candidate rows visited versus total function rows on self-hosting and extern-heavy inputs | preserve owner/signature filters and first compatible extern selection; retain if the narrower scans reduce declaration cost |
+| Generic declaration body selection | keep the linear membership path below 32 rows, then build collision-safe line chains for generic and errorset declaration lines | codegen CPU, membership query count, indexed row count, and bucket allocation cost on small and self-hosting inputs | preserve the `< GENERIC_BOUND_ROW_START` filter, errorset inclusion, and exact line equality; keep the cutoff only if lookup savings cover chain construction |
+| DArray LLVM header | cached per `StructTable`, LLVM context, and target pointer width | codegen CPU/wall time and temporary allocation count on container-heavy inputs | keep if repeated header construction savings exceed the one-time cache and table-field cost |
+| String equality callee | cache the native `__elisa_sview_eq` handle in the module's `StructTable`; component modules keep the runtime entry point | IR-generation CPU and helper-name lookup count on string-heavy and self-hosting inputs | preserve `memcmp` linkage fallback and module ownership; keep only if avoided LLVM lookups exceed cache-field overhead |
+| Module environment flags | snapshot linkage, noalias-metadata, component-mode, and C ABI target flags once per module, then reuse them in function, access, and export classification | codegen CPU/wall time, environment-read count, and temporary allocation count on function-heavy, darray-heavy, component, and aggregate-export inputs | preserve per-module sampling and WASM → x86-64 → default priority; compare output linkage, alias metadata, and export ABI against the prior policy |
+
+These are open measurement items, not performance claims. The stage1 timing output gives
+per-pass CPU and wall time; collect peak RSS on the same host and record input size and
+declaration counts alongside it. Do not infer a net win from fewer lookup probes alone.
+
 ### Parallel semantic checking (measured, not committed)
 
 A fork-based scheduler was built and verified on the self unit (diagnostics byte-identical
@@ -154,6 +188,60 @@ invalid backend IR in an object build prints numbered values instead of names.
   support`, `--gc-sections`; on the box `-l:libzstd.so.1` since there is no libzstd.a)
   measured 0.014-0.017 s for the same compile, link 4 s, binary 94 MB unstripped. That is
   a build-script change (seed and gen2 link lines) left for a decision.
+
+### Unmeasured source changes
+
+- The reclaimed-block fallback in `arena_alloc` is attempted only when the current bump region
+  is absent, claimed, or full. A normal bump allocation avoids the atomic owner-tag load and
+  cache lock entirely. On a fallback lookup, empty or mismatched hints skip the lock, while
+  matching owners still lock and validate the region pointer. The tag stays outside the public
+  `Arena` layout and is advisory. A miss can forgo reuse on growable arenas; fixed and
+  reserve-commit arenas exhaustively scan their free blocks only after bump
+  overflow, so a displaced hint cannot hide reusable capacity and cause a spurious overflow
+  panic. The next controlled run should compare self-host check/object CPU and instructions,
+  record fast-miss versus hit counts, and use workloads with realistic DArray growth/reclaim
+  frequency plus concurrent reclaim, arena free, and address reuse. No speedup is claimed for
+  all allocations or yet overall.
+- Qualified struct lookup in `struct_index_of` now hashes the final type-name slice into the
+  existing struct-name chain, then compares only same-named candidates against the module-path
+  prefix. This removes its all-struct scan without allocating a joined path. Include nested
+  `A::B::Item`, same-leaf declarations under different owners, and an unindexed registry tail
+  in the next controlled backend run; no runtime or compile-time gain is claimed yet.
+- Function overload counting and prior-extern matching now traverse the source-ordered
+  function-name chain instead of rescanning all earlier declarations; owner, signature, and
+  first-compatible-extern rules are unchanged. Compare candidate rows visited and declaration
+  CPU on self-hosting and extern-heavy inputs; no compile-time gain is measured yet.
+- Packed variant path resolution now hashes the final enum-name slice before the variant dot,
+  computes the highest matching scope rank in one candidate pass, then processes tied rows in
+  registry order. The existing full path matcher still chooses the lexical or qualified owner.
+  Compare path query CPU, name-slice hashing, and candidate rows on nested-module and enum-heavy
+  inputs; no compile-time gain is measured yet.
+- Const-enum member reads and `is` comparisons now scan the enum's variant span once for the
+  ordinal, then use that ordinal to read its explicit value from the parallel pool. Membership
+  checks use the ordinal so an explicit value of `-1` remains valid. Compare codegen CPU and
+  variant rows visited on enum-heavy and self-hosting inputs; no gain is measured yet.
+- Loop back-edge storage diagnostics reuse their probe and result arrays across invalidated
+  names. Compare allocation counts and semantic CPU on loop-heavy inputs; no gain is measured
+  yet.
+- Zeroed aggregate checks now lazily index active enum payload expressions by exact owner and
+  name, keeping declaration order and the first variant selected by the zero tag. This avoids
+  rescanning the declaration tree and allocating a temporary field array at each repeated type
+  query. Record index-build cost and query counts on enum-heavy inputs, and verify that files
+  without invalid zeroed or omitted initializers pay no build cost; this change has not been built or
+  measured.
+- Thread shareability now stores one source `Decl` row per named struct or enum instead of
+  duplicating its owner/module/line metadata for every member expression. A queried declaration
+  walks its original members in order, while synthetic function-local enum fields remain
+  expression rows. Record index size, pass CPU, and peak RSS before making a net-win claim; this
+  change has not been built or measured.
+- Mode-2 AoS record reads bypass the generic `ctx_aos_store_record` call when the active store
+  and ABI are known. Sized AST stores load the per-record address slot; optimized fixed-row
+  stores use the stored stride, avoiding the generic reader's sized/fixed dispatch. Both paths
+  retain the chunk-count trap and require the supported 64-bit pointer/word alignment plus
+  pointer/i64 operands. Unknown layouts and operands fall back to the runtime reader, as do
+  fixed-row reads in unoptimized builds. Compare optimized self-host object runtime and
+  instructions, plus compile-time codegen cost and parity for compiler AST and fixed-store
+  workloads; these direct-reader changes have not been built or measured.
 
 ## Round 4 (claude/s1-perf-r4: 0cdb5c72, bd9fdb13, 341f72ba, ddbc803d)
 
@@ -363,17 +451,16 @@ Done:
   sequential semantic_api.elisa).
 - The seed builds. Serial `-emit check` of the self-host unit works (~18.5 s).
 
-Open bug: a parallel `-emit check` segfaults in par_pass_run's splice loop because a job's
-diagnostics live in memory that has been unmapped. The worker's local table sits in the worker
-frame's auto region, so the lmut pass writes allocate there and are freed at return. Neither
-`in arena:` on the job's heap Arena& nor a local Arena that is moved into the job fixes it.
-Stage0 cannot infer an lmut region for a table declared in an `in` block or reached through a
-heap ref (probe: r8-probe/p7.elisa). Ways forward:
-- Have the worker deep-copy its diagnostics into job-owned heap memory before it returns.
-- Teach region inference to bind a heap ref to a region.
+Historical blocker: the first parallel `-emit check` segfaulted in `par_pass_run`'s splice loop
+because a worker's diagnostics pointed into its frame's auto region after that region had been
+unmapped. The current worktree includes a deep-copy path: workers copy diagnostic records and
+all text fields into a job-owned arena, then the parent copies them into its own stable storage
+before freeing each job arena. This matches the lifetime failure's proposed fix, but parallel
+execution and output parity have not been verified; the serial `-emit check` result below does
+not establish that the parallel path works.
 
 Next:
-- Fix the bug above.
+- Verify the diagnostic-ownership mitigation and append-only pass audit.
 - Run gen2, det.sh, gates.sh (fast gates, the smokes, self_host_gen3), the corpus diff and the
   QUIET timing, then write the round-8 table.
 - Land stage0, then stage1.
