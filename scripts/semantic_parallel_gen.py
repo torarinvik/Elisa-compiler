@@ -310,6 +310,11 @@ def mask_string_literals(text):
                 index = mask_code(index + 1, stop_at_interp=True)
                 if index < len(chars) and chars[index] == "}":
                     index += 1
+                # `index` now points just after the closing brace. Continue directly so
+                # the first literal character after the interpolation (which may be the
+                # opening brace of an adjacent interpolation) is processed on the next
+                # iteration instead of being skipped by the loop's increment below.
+                continue
             elif char != "\n":
                 chars[index] = " "
             index += 1
@@ -868,6 +873,9 @@ def type_is_copy_value(type_expression, aliases, structs, seen=frozenset()):
             memo[name] = False
             active.remove(name)
             frames.pop()
+            if frames:
+                # This child is one of the parent's required fields/alias targets.
+                frames[-1][3] = False
             continue
         if index >= len(children):
             memo[name] = True
@@ -887,7 +895,12 @@ def type_is_copy_value(type_expression, aliases, structs, seen=frozenset()):
             if not memo[child]:
                 frames[-1][3] = False
         else:
+            parent_frame = frames[-1]
             push(child)
+            # Unknown names are memoized as non-copy values without adding a frame.
+            # Propagate that result now; framed children propagate it when they pop.
+            if child in memo and not memo[child]:
+                parent_frame[3] = False
 
     return memo.get(root, False)
 

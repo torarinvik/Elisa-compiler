@@ -194,6 +194,18 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
         self.assertTrue(audit.append_only(info, "root")[0])
 
+    def test_copy_value_type_resolution_fails_closed_on_unknown_descendants(self):
+        self.assertFalse(audit.type_is_copy_value(
+            "AliasRoot",
+            {"AliasRoot": ["AliasLeaf"], "AliasLeaf": ["UnknownType"]},
+            {},
+        ))
+        self.assertFalse(audit.type_is_copy_value(
+            "StructRoot",
+            {},
+            {"StructRoot": [{"field": "UnknownType"}]},
+        ))
+
     def test_known_source_helper_mutating_table_field_is_rejected(self):
         info = analyze({
             "mutate_table": [definition(
