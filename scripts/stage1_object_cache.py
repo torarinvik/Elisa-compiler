@@ -5,10 +5,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
 
-SCHEMA = "elisac-stage1-object-integrity-v2"
+SCHEMA = "elisac-stage1-object-integrity-v3"
 MAX_OBJECT_BYTES = 2 * 1024**3
 MAX_DIAGNOSTIC_BYTES = 64 * 1024**2
 
@@ -48,8 +49,16 @@ def restore(entry, output, key, *, stdout=None, stderr=None):
             return False
         obj = temporary(output)
         staged.append(obj)
-        if copy_digest(entry, obj) != metadata.get("object"):
+        expected_object = metadata.get("object")
+        if not isinstance(expected_object, dict):
             return False
+        mode = expected_object.get("mode")
+        if type(mode) is not int or mode < 0 or mode > 0o777:
+            return False
+        copied_object = copy_digest(entry, obj)
+        if copied_object != {key: expected_object.get(key) for key in ("size", "sha256")}:
+            return False
+        os.chmod(obj, mode)
         streams = {}
         for name in ("stdout", "stderr"):
             target = temporary(output)
@@ -84,8 +93,12 @@ def publish(entry, output, key, stdout=None, stderr=None):
     try:
         obj = temporary(entry)
         staged.append(obj)
+        mode = stat.S_IMODE(os.stat(output).st_mode) & 0o777
+        object_digest = copy_digest(output, obj)
+        if (stat.S_IMODE(os.stat(output).st_mode) & 0o777) != mode:
+            return False
         metadata = {"schema": SCHEMA, "key": key,
-                    "object": copy_digest(output, obj), "streams": {}}
+                    "object": {**object_digest, "mode": mode}, "streams": {}}
         payloads = [(obj, entry)]
         for name, source in (("stdout", stdout), ("stderr", stderr)):
             target = temporary(entry)

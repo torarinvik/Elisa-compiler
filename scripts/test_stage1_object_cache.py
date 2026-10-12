@@ -34,6 +34,21 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertTrue(cache.restore(self.entry, self.output, "key"))
         self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
 
+    def test_restore_preserves_cached_object_permissions(self):
+        self.source.chmod(0o751)
+        self.publish()
+        self.output.chmod(0o600)
+        self.assertTrue(cache.restore(self.entry, self.output, "key"))
+        self.assertEqual(self.output.stat().st_mode & 0o777, 0o751)
+
+    def test_invalid_cached_permissions_preserve_previous_output(self):
+        self.publish()
+        stamp = Path(str(self.entry) + ".json")
+        metadata = json.loads(stamp.read_text())
+        metadata["object"]["mode"] = 0o7777
+        stamp.write_text(json.dumps(metadata))
+        self.refused()
+
     def test_wrapper_publication_requires_unchanged_inputs(self):
         root = Path(__file__).resolve().parent.parent
         wrapper = (root / "scripts/elisac_stage1.sh").read_text()
