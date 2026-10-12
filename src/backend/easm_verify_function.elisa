@@ -3,7 +3,7 @@
 
 extend Easm:
     public:
-        def verify_function_instructions(fn: Function, issues: mutable darray[Issue]&, stack_delta: mutable i64&, stack_touched: mutable bool&, uses_call: mutable bool&, writes_segment_any: mutable bool&):
+        def verify_function_instructions(fn: Function, issues: mutable darray[Issue]&, stack_delta: mutable i64&, stack_touched: mutable bool&, stack_known: mutable bool&, uses_call: mutable bool&, writes_segment_any: mutable bool&):
             live_registers: mutable darray[sview] = []
             for input in fn.inputs:
                 equals: usize = easm_find(input, "=")
@@ -18,6 +18,55 @@ extend Easm:
             for inst in fn.instructions:
                 if sview_len(inst.op) == 0 or not easm_known_op(inst.op):
                     issues.push(Issue{severity: Severity.Error, code: "unknown-op", line: inst.line, message: "instruction mnemonic is not in the EASM operation set"})
+                source_operand: mutable sview = ""
+                destination_operand: mutable sview = ""
+                # Parser pseudo-ops (`compose`, `state`, labels, and similar metadata) do
+                # not use the machine-instruction operand grammar. Keep arity enforcement
+                # scoped to executable instructions so commas in metadata are not rejected.
+                if inst.pseudo:
+                    source_operand <- easm_substitute_operand(easm_first_operand(inst.text), inst)
+                    destination_operand <- easm_substitute_operand(easm_last_operand(inst.text), inst)
+                else:
+                    operand_scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(inst.text)
+                    if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT:
+                        source_end: usize = operand_scan.first_separator if operand_scan.first_separator < sview_len(inst.text) else sview_len(inst.text)
+                        source_operand <- easm_substitute_operand(easm_trim(inst.text[operand_scan.start:source_end]), inst)
+                        destination_start: usize = operand_scan.last_separator + 1.usize() if operand_scan.last_separator < sview_len(inst.text) else operand_scan.start
+                        destination_operand <- easm_substitute_operand(easm_trim(inst.text[destination_start:sview_len(inst.text)]), inst)
+                    unsupported_operands: mutable bool = not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)
+                    if not unsupported_operands and easm_known_op(inst.op):
+                        unsupported_operands <- not EasmOperandScan::operand_arity_supported(inst.op, operand_scan.count)
+                        unsupported_operands <- not easm_instruction_operand_roles_supported(inst.op, operand_scan.count, source_operand, destination_operand) if not unsupported_operands
+                    if unsupported_operands:
+                        issues.push(Issue{severity: Severity.Error, code: "unsupported-operands", line: inst.line, message: "instruction operand shape is outside the verified EASM model"})
+                        continue
+                    unmodeled_operand: mutable bool = false
+                    source_memory_operand: bool = easm_memory_operand(source_operand)
+                    destination_memory_operand: bool = easm_memory_operand(destination_operand)
+                    # The modeled x86 instructions have at most one explicit memory
+                    # operand. `lea` additionally requires an address source and a direct
+                    # register destination; accepting other shapes only defers rejection to
+                    # the assembler after the verifier has claimed the body is modeled.
+                    unmodeled_operand <- true if operand_scan.count == 2 and source_memory_operand and destination_memory_operand
+                    is_lea: bool = inst.op == "lea" or inst.op == "leaq"
+                    lea_destination_register: sview = easm_register_operand(destination_operand)
+                    lea_destination_is_direct_register: bool = sview_len(destination_operand) > 0 and sview_at(destination_operand, 0) == EasmOperandScan::ASCII_PERCENT and EasmOperandScan::exact_register_form(destination_operand, lea_destination_register)
+                    unmodeled_operand <- true if is_lea and (operand_scan.count != 2 or not source_memory_operand or not lea_destination_is_direct_register)
+                    for operand_index in 0..<operand_scan.count |operand_index, inst, operand_scan, unmodeled_operand|:
+                        operand: sview = source_operand if operand_index == 0 else destination_operand
+                        continue if sview_len(operand) == 0
+                        memory_address: bool = easm_memory_operand(operand)
+                        parsed_register: sview = easm_register_operand(operand)
+                        register_operand: bool = EasmOperandScan::exact_register_form(operand, parsed_register)
+                        immediate_operand: bool = sview_at(operand, 0) == EasmOperandScan::ASCII_DOLLAR
+                        is_final_operand: bool = operand_index == 1 or operand_scan.count == 1
+                        direct_target: bool = EasmOperandScan::is_direct_control_target(inst.op, operand, is_final_operand)
+                        unmodeled_operand <- true if EasmOperandScan::rejects_unmodeled_operand_form(
+                            true, memory_address, register_operand, immediate_operand, direct_target
+                        ) or EasmOperandScan::rejects_return_immediate(inst.op, immediate_operand)
+                    if unmodeled_operand:
+                        issues.push(Issue{severity: Severity.Error, code: "unsupported-operand-form", line: inst.line, message: "operand form is outside the verified EASM register, immediate, and address model"})
+                        continue
                 capability: sview = easm_required_capability(inst.op)
                 if sview_len(capability) > 0 and not easm_contract_has_word(fn.requires, capability):
                     issues.push(Issue{severity: Severity.Error, code: "missing-capability", line: inst.line, message: "instruction requires a capability in the requires contract"})
@@ -41,38 +90,45 @@ extend Easm:
                     live_registers.push("rcx") if (implicit_writes & 2) != 0
                     live_registers.push("rdx") if (implicit_writes & 4) != 0
                     live_registers.push("rbx") if (implicit_writes & 8) != 0
-                read_register: sview = easm_register_operand(easm_first_operand(inst.text))
-                if sview_len(read_register) > 0 and not easm_self_zeroing(inst) and not easm_live_has(live_registers, read_register) and not easm_contract_has_register(fn.preserves, read_register):
+                read_register: mutable sview = easm_register_operand(source_operand)
+                read_register <- "" if easm_starts(inst.op, "pop")
+                if sview_len(read_register) > 0 and easm_register_bit(read_register) != EasmRegisterMasks::RSP and not easm_self_zeroing(inst) and not easm_live_has(live_registers, read_register) and not easm_contract_has_register(fn.preserves, read_register):
                     issues.push(Issue{severity: Severity.Error, code: "register-read-uninitialized", line: inst.line, message: "instruction reads a register that is not declared as an input or preserved"})
-                destination_read_register: sview = easm_register_operand(easm_last_operand(inst.text))
-                if easm_reads_destination(inst) and destination_read_register != read_register and not easm_live_has(live_registers, destination_read_register) and not easm_contract_has_register(fn.preserves, destination_read_register):
+                destination_read_register: sview = easm_register_operand(destination_operand)
+                if easm_reads_destination(inst) and destination_read_register != read_register and easm_register_bit(destination_read_register) != EasmRegisterMasks::RSP and not easm_live_has(live_registers, destination_read_register) and not easm_contract_has_register(fn.preserves, destination_read_register):
                     issues.push(Issue{severity: Severity.Error, code: "register-read-uninitialized", line: inst.line, message: "read-modify-write instruction reads a destination register that is not declared as an input or preserved"})
-                source_memory_base: sview = easm_memory_base_register(easm_first_operand(inst.text))
+                source_memory_base: sview = easm_memory_base_register(source_operand)
                 if source_memory_base != "" and source_memory_base != "rsp" and source_memory_base != "rip" and not easm_live_has(live_registers, source_memory_base) and not easm_contract_has_register(fn.preserves, source_memory_base):
                     issues.push(Issue{severity: Severity.Error, code: "register-read-uninitialized", line: inst.line, message: "memory address reads a base register that is not declared as an input or preserved"})
-                destination_memory_base: sview = easm_memory_base_register(easm_last_operand(inst.text))
+                destination_memory_base: sview = easm_memory_base_register(destination_operand)
                 if destination_memory_base != "" and destination_memory_base != "rsp" and destination_memory_base != "rip" and not easm_live_has(live_registers, destination_memory_base) and not easm_contract_has_register(fn.preserves, destination_memory_base) and destination_memory_base != source_memory_base:
                     issues.push(Issue{severity: Severity.Error, code: "register-read-uninitialized", line: inst.line, message: "memory address reads a base register that is not declared as an input or preserved"})
-                source_memory_index: sview = easm_memory_index_register(easm_first_operand(inst.text))
+                source_memory_index: sview = easm_memory_index_register(source_operand)
                 if source_memory_index != "" and source_memory_index != "rsp" and source_memory_index != "rip" and not easm_live_has(live_registers, source_memory_index) and not easm_contract_has_register(fn.preserves, source_memory_index) and source_memory_index != source_memory_base and source_memory_index != destination_memory_base:
                     issues.push(Issue{severity: Severity.Error, code: "register-read-uninitialized", line: inst.line, message: "memory address reads an index register that is not declared as an input or preserved"})
-                destination_memory_index: sview = easm_memory_index_register(easm_last_operand(inst.text))
+                destination_memory_index: sview = easm_memory_index_register(destination_operand)
                 if destination_memory_index != "" and destination_memory_index != "rsp" and destination_memory_index != "rip" and not easm_live_has(live_registers, destination_memory_index) and not easm_contract_has_register(fn.preserves, destination_memory_index) and destination_memory_index != source_memory_base and destination_memory_index != destination_memory_base and destination_memory_index != source_memory_index:
                     issues.push(Issue{severity: Severity.Error, code: "register-read-uninitialized", line: inst.line, message: "memory address reads an index register that is not declared as an input or preserved"})
-                write_register: sview = easm_register_operand(easm_last_operand(inst.text))
+                write_register: mutable sview = easm_register_operand(destination_operand)
+                write_register <- "" if easm_starts(inst.op, "push") or easm_starts(inst.op, "call") or easm_starts(inst.op, "jmp") or easm_starts(inst.op, "ret") or easm_starts(inst.op, "cmp") or easm_starts(inst.op, "test")
                 if sview_len(write_register) > 0 and not easm_contract_has_register(fn.outputs, write_register) and not easm_contract_has_register(fn.clobbers, write_register):
                     issues.push(Issue{severity: Severity.Error, code: "register-write-without-clobber", line: inst.line, message: "instruction writes a register that is not declared as an output or clobber"})
                 if sview_len(write_register) > 0 and not easm_live_has(live_registers, write_register):
                     live_registers.push(write_register)
-                source_operand: sview = easm_first_operand(inst.text)
-                destination_operand: sview = easm_last_operand(inst.text)
+                if inst.op == "xchg" or inst.op == "xchgl" or inst.op == "xchgq":
+                    source_write_register: sview = easm_register_operand(source_operand)
+                    if source_write_register != "" and source_write_register != write_register:
+                        if not easm_contract_has_register(fn.outputs, source_write_register) and not easm_contract_has_register(fn.clobbers, source_write_register):
+                            issues.push(Issue{severity: Severity.Error, code: "register-write-without-clobber", line: inst.line, message: "instruction writes a register that is not declared as an output or clobber"})
+                        if not easm_live_has(live_registers, source_write_register):
+                            live_registers.push(source_write_register)
                 if easm_memory_reads(inst) and not easm_contract_has_exact(fn.clobbers, "memory") and not easm_contract_has_exact(fn.clobbers, "memory.read"):
                     issues.push(Issue{severity: Severity.Error, code: "memory-read-without-clobber", line: inst.line, message: "memory read requires a memory or memory.read clobber"})
                 if easm_memory_writes(inst) and not easm_contract_has_exact(fn.clobbers, "memory") and not easm_contract_has_exact(fn.clobbers, "memory.write"):
                     issues.push(Issue{severity: Severity.Error, code: "memory-write-without-clobber", line: inst.line, message: "memory write requires a memory or memory.write clobber"})
-                if (easm_find(inst.text, "%fs") < sview_len(inst.text) or easm_find(inst.text, "%gs") < sview_len(inst.text)) and not easm_contract_has_word(fn.requires, "x86_64.segment"):
+                if (easm_find(source_operand, "%fs") < sview_len(source_operand) or easm_find(source_operand, "%gs") < sview_len(source_operand) or easm_find(destination_operand, "%fs") < sview_len(destination_operand) or easm_find(destination_operand, "%gs") < sview_len(destination_operand)) and not easm_contract_has_word(fn.requires, "x86_64.segment"):
                     issues.push(Issue{severity: Severity.Error, code: "segment-register-intent-missing", line: inst.line, message: "fs/gs use requires an x86_64.segment capability"})
-                last_operand: sview = easm_trim(easm_last_operand(inst.text))
+                last_operand: sview = easm_trim(destination_operand)
                 writes_segment: bool = last_operand == "%fs" or last_operand == "%gs"
                 writes_segment_any <- true if writes_segment
                 uses_call <- true if easm_starts(inst.op, "call")
@@ -85,26 +141,61 @@ extend Easm:
                 if easm_starts(inst.op, "push"):
                     stack_delta <- stack_delta - 8
                     stack_touched <- true
+                stack_write_handled: mutable bool = false
                 if easm_starts(inst.op, "pop"):
-                    stack_delta <- stack_delta + 8
                     stack_touched <- true
-                if (easm_starts(inst.op, "add") or easm_starts(inst.op, "sub")) and easm_find(inst.text, "%rsp") < sview_len(inst.text):
-                    immediate: (valid: bool, value: i64) = easm_immediate_after_dollar_checked(inst.text)
-                    if not immediate.valid:
-                        issues.push(Issue{severity: Severity.Error, code: "invalid-stack-adjustment", line: inst.line, message: "stack-pointer adjustment requires a valid signed 32-bit immediate"})
+                    stack_write_handled <- true
+                    pop_destination: sview = easm_register_operand(destination_operand)
+                    if easm_register_bit(pop_destination) == EasmRegisterMasks::RSP:
+                        issues.push(Issue{severity: Severity.Error, code: "pop-stack-pointer", line: inst.line, message: "pop may not write the stack pointer or one of its aliases"})
+                        stack_known <- false
                     else:
-                        if easm_starts(inst.op, "add"):
-                            stack_delta <- stack_delta + immediate.value
-                        else:
-                            stack_delta <- stack_delta - immediate.value
+                        stack_delta <- stack_delta + 8
+                stack_adjust_destination: sview = easm_register_operand(destination_operand)
+                if easm_starts(inst.op, "add") or easm_starts(inst.op, "sub"):
+                    if easm_register_bit(stack_adjust_destination) == EasmRegisterMasks::RSP:
                         stack_touched <- true
-                if easm_starts(inst.op, "call") and (8 + stack_delta) % 16 != 0 and not easm_contract_has_word(fn.requires, "stack.call_alignment.unchecked"):
-                    issues.push(Issue{severity: Severity.Error, code: "call-stack-misaligned", line: inst.line, message: "call executes with stack pointer not aligned to 16 bytes"})
+                        stack_write_handled <- true
+                        if stack_adjust_destination != "rsp":
+                            issues.push(Issue{severity: Severity.Error, code: "unsupported-stack-pointer-width", line: inst.line, message: "stack-pointer arithmetic must write the 64-bit %rsp register; narrower aliases are unsupported"})
+                            stack_known <- false
+                        else:
+                            immediate: (valid: bool, value: i64) = easm_immediate_operand_after_dollar_checked(source_operand)
+                            if not immediate.valid:
+                                issues.push(Issue{severity: Severity.Error, code: "invalid-stack-adjustment", line: inst.line, message: "stack-pointer adjustment requires a valid signed 32-bit immediate"})
+                                stack_known <- false
+                            else:
+                                if easm_starts(inst.op, "add"):
+                                    stack_delta <- stack_delta + immediate.value
+                                else:
+                                    stack_delta <- stack_delta - immediate.value
+                stack_write_register: sview = easm_stack_pointer_write_register(inst)
+                if stack_write_register != "" and not stack_write_handled:
+                    stack_touched <- true
+                    stack_known <- false
+                    if stack_write_register != "rsp":
+                        issues.push(Issue{severity: Severity.Error, code: "unsupported-stack-pointer-width", line: inst.line, message: "direct stack-pointer writes must use the 64-bit %rsp register; narrower aliases are unsupported"})
+                    elif not easm_contract_has_word(fn.requires, "stack.balance.unchecked"):
+                        issues.push(Issue{severity: Severity.Error, code: "unsupported-stack-pointer-write", line: inst.line, message: "direct stack-pointer writes outside modeled push/pop and immediate add/sub are unsupported without stack.balance.unchecked"})
+                if easm_starts(inst.op, "call"):
+                    if not stack_known and not easm_contract_has_word(fn.requires, "stack.call_alignment.unchecked"):
+                        issues.push(Issue{severity: Severity.Error, code: "call-stack-alignment-unknown", line: inst.line, message: "call stack alignment is unknown after an unmodeled stack-pointer write"})
+                    elif stack_known and (8 + stack_delta) % 16 != 0 and not easm_contract_has_word(fn.requires, "stack.call_alignment.unchecked"):
+                        issues.push(Issue{severity: Severity.Error, code: "call-stack-misaligned", line: inst.line, message: "call executes with stack pointer not aligned to 16 bytes"})
                 if easm_starts(inst.op, "call"):
                     live_registers <- []
-                if easm_starts(inst.op, "jmp"):
-                    target: sview = easm_last_operand(inst.text)
-                    if sview_len(target) > 0 and sview_at(target, 0) != 37:
+                control_target: sview = easm_trim(destination_operand)
+                indirect_control_target: bool = easm_find(control_target, "*") < sview_len(control_target) or easm_memory_operand(control_target) or (sview_len(control_target) > 0 and sview_at(control_target, 0) == 37)
+                target_is_local: bool = easm_label_index(fn.instructions, control_target) >= 0
+                if EasmOperandScan::rejects_unresolved_conditional_target(
+                    easm_is_conditional_jump(inst.op), target_is_local,
+                    easm_contract_has_word(fn.requires, "control.direct"),
+                    easm_contract_has_word(fn.requires, "relocation.symbol")
+                ):
+                    issues.push(Issue{severity: Severity.Error, code: "unknown-label", line: inst.line, message: "conditional jump target is not a declared local label"})
+                if easm_starts(inst.op, "jmp") and not indirect_control_target:
+                    target: sview = control_target
+                    if sview_len(target) > 0:
                         known_label: mutable bool = false
                         for label in fn.labels:
                             known_label <- true if easm_equal(label.name, target)
@@ -114,8 +205,8 @@ extend Easm:
                         if not known_label and not easm_contract_has_word(fn.requires, "control.direct") and not easm_contract_has_word(fn.requires, "relocation.symbol"):
                             issues.push(Issue{severity: Severity.Error, code: "unknown-label", line: inst.line, message: "direct jump target is not a declared label"})
                 if easm_starts(inst.op, "call") or easm_starts(inst.op, "jmp"):
-                    target_operand: sview = easm_trim(easm_last_operand(inst.text))
-                    indirect: bool = easm_find(target_operand, "*") < sview_len(target_operand) or easm_memory_operand(target_operand) or (sview_len(target_operand) > 0 and sview_at(target_operand, 0) == 37)
+                    target_operand: sview = control_target
+                    indirect: bool = indirect_control_target
                     if indirect and not easm_contract_has_word(fn.requires, "control.indirect"):
                         issues.push(Issue{severity: Severity.Error, code: "indirect-control-intent-missing", line: inst.line, message: "indirect call/jmp requires control.indirect intent"})
                     if not indirect and not easm_contract_has_word(fn.requires, "control.direct") and not easm_contract_has_word(fn.requires, "relocation.symbol"):
@@ -124,6 +215,133 @@ extend Easm:
                             local_label <- true if easm_equal(label.name, target_operand)
                         if not local_label:
                             issues.push(Issue{severity: Severity.Error, code: "direct-control-intent-missing", line: inst.line, message: "direct symbolic call/jmp requires control.direct or relocation.symbol intent"})
+
+        def easm_operand_is_direct_register(operand: sview) -> bool:
+            register: sview = easm_register_operand(operand)
+            return sview_len(operand) > 0 and sview_at(operand, 0) == EasmOperandScan::ASCII_PERCENT and EasmOperandScan::exact_register_form(operand, register) and easm_register_bit(register) != 0
+
+        def easm_operand_is_segment_register(operand: sview) -> bool:
+            return operand == "%fs" or operand == "%gs"
+
+        def easm_memory_address_tuple_supported(operand: sview) -> bool:
+            false return if not easm_memory_operand(operand)
+            false return if easm_find(operand, "[") < sview_len(operand)
+            open: usize = easm_find(operand, "(")
+            false return if open >= sview_len(operand)
+            false return if easm_find(operand[0:open], ")") < open
+            close_relative: usize = easm_find(operand[open:sview_len(operand)], ")")
+            false return if close_relative >= sview_len(operand[open:sview_len(operand)])
+            close: usize = open + close_relative
+            false return if sview_len(easm_trim(operand[close + 1.usize():sview_len(operand)])) != 0
+            inside: sview = operand[open + 1.usize():close]
+            false return if easm_find(inside, "(") < sview_len(inside) or easm_find(inside, ")") < sview_len(inside)
+            first_comma: usize = easm_find(inside, ",")
+            if first_comma >= sview_len(inside):
+                base: sview = easm_trim(inside)
+                return base == "%rip" or easm_operand_is_direct_register(base)
+            base_field: sview = easm_trim(inside[0:first_comma])
+            false return if base_field == "" or (base_field != "%rip" and not easm_operand_is_direct_register(base_field))
+            false return if base_field == "%rip"
+            remainder: sview = inside[first_comma + 1.usize():sview_len(inside)]
+            second_comma: usize = easm_find(remainder, ",")
+            if second_comma >= sview_len(remainder):
+                index_field: sview = easm_trim(remainder)
+                return true if index_field == ""
+                return easm_operand_is_direct_register(index_field) and easm_register_bit(easm_register_operand(index_field)) != EasmRegisterMasks::RSP
+            index_field: sview = easm_trim(remainder[0:second_comma])
+            scale_field: sview = easm_trim(remainder[second_comma + 1.usize():sview_len(remainder)])
+            false return if index_field == "" or not easm_operand_is_direct_register(index_field)
+            false return if easm_register_bit(easm_register_operand(index_field)) == EasmRegisterMasks::RSP
+            false return if easm_find(scale_field, ",") < sview_len(scale_field)
+            return scale_field == "1" or scale_field == "2" or scale_field == "4" or scale_field == "8"
+
+        def easm_operand_is_supported_memory(operand: sview) -> bool:
+            false return if not easm_memory_address_tuple_supported(operand)
+            base: sview = easm_memory_base_register(operand)
+            index: sview = easm_memory_index_register(operand)
+            base_supported: bool = base == "" or base == "rip" or easm_register_bit(base) != 0
+            index_supported: bool = index == "" or (easm_register_bit(index) != 0 and easm_register_bit(index) != EasmRegisterMasks::RSP)
+            return base_supported and index_supported
+
+        def easm_operand_is_immediate(operand: sview) -> bool:
+            return sview_len(operand) > 0 and sview_at(operand, 0) == EasmOperandScan::ASCII_DOLLAR
+
+        def easm_operand_is_data_source(operand: sview) -> bool:
+            return easm_operand_is_direct_register(operand) or easm_operand_is_supported_memory(operand) or easm_operand_is_immediate(operand)
+
+        def easm_operand_is_writable(operand: sview) -> bool:
+            return easm_operand_is_direct_register(operand) or easm_operand_is_supported_memory(operand)
+
+        def easm_is_move_operation(op: sview) -> bool:
+            return op == "mov" or op == "movq" or op == "movb" or op == "movw" or op == "movl"
+
+        def easm_move_operand_roles_supported(source: sview, destination: sview) -> bool:
+            source_segment: bool = easm_operand_is_segment_register(source)
+            destination_segment: bool = easm_operand_is_segment_register(destination)
+            false return if source_segment and destination_segment
+            if source_segment:
+                return easm_operand_is_writable(destination)
+            if destination_segment:
+                return (easm_operand_is_direct_register(source) or easm_operand_is_supported_memory(source)) and not easm_operand_is_immediate(source)
+            return easm_operand_is_data_source(source) and easm_operand_is_writable(destination)
+
+        def easm_is_extension_move(op: sview) -> bool:
+            return (
+                op == "movsx" or op == "movsxd" or op == "movsbw" or op == "movsbl" or op == "movsbq" or
+                op == "movswl" or op == "movswq" or op == "movslq" or op == "movzx" or
+                op == "movzbw" or op == "movzbl" or op == "movzbq" or op == "movzwl" or op == "movzwq"
+            )
+
+        def easm_is_shift_operation(op: sview) -> bool:
+            return easm_starts(op, "shl") or easm_starts(op, "sal") or easm_starts(op, "shr") or easm_starts(op, "sar")
+
+        def easm_is_call_or_unconditional_jump(op: sview) -> bool:
+            return op == "call" or op == "callq" or op == "jmp" or op == "jmpq"
+
+        def easm_operand_is_control_target(op: sview, operand: sview) -> bool:
+            true return if EasmOperandScan::is_direct_control_target(op, operand, true) and not easm_memory_operand(operand)
+            false return if not easm_is_call_or_unconditional_jump(op)
+            false return if sview_len(operand) < EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH or sview_at(operand, 0) != EasmOperandScan::ASCII_STAR
+            indirect_operand: sview = easm_trim(operand[1:sview_len(operand)])
+            return easm_operand_is_direct_register(indirect_operand) or easm_operand_is_supported_memory(indirect_operand)
+
+        def easm_instruction_operand_roles_supported(op: sview, count: usize, source: sview, destination: sview) -> bool:
+            false return if not EasmOperandScan::operand_arity_supported(op, count)
+            true return if count == 0
+            if op == "mrs":
+                return false
+            if op == "call" or op == "callq" or op == "jmp" or op == "jmpq":
+                return easm_operand_is_control_target(op, destination)
+            if (op == "je" or op == "jz" or op == "jne" or op == "jnz" or op == "jl" or op == "jle" or
+                op == "jg" or op == "jge" or op == "jb" or op == "jbe" or op == "ja" or op == "jae"):
+                return EasmOperandScan::is_direct_control_target(op, destination, true)
+            if op == "push" or op == "pushq":
+                return easm_operand_is_data_source(source) or easm_operand_is_segment_register(source)
+            if op == "pop" or op == "popq":
+                return easm_operand_is_writable(destination) or easm_operand_is_segment_register(destination)
+            if (op == "inc" or op == "incq" or op == "dec" or op == "decq" or
+                op == "neg" or op == "negq" or op == "not" or op == "notq"):
+                return easm_operand_is_writable(destination)
+            if op == "fldcw" or op == "ldmxcsr":
+                return easm_operand_is_supported_memory(source)
+            if op == "fnstcw" or op == "stmxcsr":
+                return easm_operand_is_supported_memory(destination)
+            if op == "lea" or op == "leaq":
+                return easm_operand_is_supported_memory(source) and easm_operand_is_direct_register(destination)
+            if easm_is_shift_operation(op):
+                if count == 1:
+                    return easm_operand_is_writable(destination)
+                shift_count_is_valid: bool = easm_operand_is_immediate(source) or (easm_operand_is_direct_register(source) and easm_register_operand(source) == "cl")
+                return shift_count_is_valid and easm_operand_is_writable(destination)
+            if op == "xchg" or op == "xchgl" or op == "xchgq":
+                return easm_operand_is_writable(source) and easm_operand_is_writable(destination) and not (easm_memory_operand(source) and easm_memory_operand(destination))
+            if easm_is_move_operation(op):
+                return easm_move_operand_roles_supported(source, destination)
+            if easm_is_extension_move(op):
+                return (not easm_operand_is_immediate(source)) and easm_operand_is_direct_register(destination) and easm_operand_is_data_source(source)
+            if EasmOperandScan::is_two_operand_instruction(op):
+                return easm_operand_is_data_source(source) and easm_operand_is_writable(destination)
+            return false
 
 
 
@@ -152,8 +370,8 @@ extend Easm:
                     if easm_equal(method.name, fn.name) and method.arity != fn.params.count.i64():
                         issues.push(Issue{severity: Severity.Error, code: "protocol-arity-mismatch", line: fn.line, message: "platform implementation does not match protocol method arity"})
 
-        def verify_function_post(module: Module, fn: Function, stack_delta: i64, stack_touched: bool, uses_call: bool, writes_segment_any: bool, issues: mutable darray[Issue]&):
-            if stack_touched and stack_delta != 0 and not easm_contract_has_word(fn.requires, "stack.balance.unchecked"):
+        def verify_function_post(module: Module, fn: Function, stack_delta: i64, stack_touched: bool, stack_known: bool, uses_call: bool, writes_segment_any: bool, issues: mutable darray[Issue]&):
+            if stack_touched and stack_known and stack_delta != 0 and not easm_contract_has_word(fn.requires, "stack.balance.unchecked"):
                 issues.push(Issue{severity: Severity.Error, code: "stack-unbalanced", line: fn.line, message: "stack pointer delta is not restored before function exit"})
             if uses_call and fn.stack_facts.count == 0 and not easm_contract_has_word(fn.requires, "stack.call_alignment.unchecked"):
                 issues.push(Issue{severity: Severity.Error, code: "call-without-stack-contract", line: fn.line, message: "call requires an explicit stack contract"})
@@ -196,10 +414,11 @@ extend Easm:
             verify_function_header(module, outer_index, fn, issues)
             stack_delta: mutable i64 = 0
             stack_touched: mutable bool = false
+            stack_known: mutable bool = true
             uses_call: mutable bool = false
             writes_segment_any: mutable bool = false
-            verify_function_instructions(fn, issues, stack_delta, stack_touched, uses_call, writes_segment_any)
-            verify_function_post(module, fn, stack_delta, stack_touched, uses_call, writes_segment_any, issues)
+            verify_function_instructions(fn, issues, stack_delta, stack_touched, stack_known, uses_call, writes_segment_any)
+            verify_function_post(module, fn, stack_delta, stack_touched, stack_known, uses_call, writes_segment_any, issues)
 
 
         def verify_module_functions(module: Module, issues: mutable darray[Issue]&):
@@ -316,12 +535,7 @@ extend Easm:
                 _: 0
 
         def easm_find(text: sview, needle: sview) -> usize:
-            if sview_len(needle) == 0 or sview_len(text) < sview_len(needle):
-                return sview_len(text)
-            for index in 0..<(sview_len(text) - sview_len(needle) + 1.usize()) |text, needle|:
-                if text[index:index + sview_len(needle)] == needle:
-                    return index
-            return sview_len(text)
+            return EasmTextScan::find(text, needle)
 
         def easm_parse_params(text: sview) -> darray[Param]:
             out: mutable darray[Param] = []
