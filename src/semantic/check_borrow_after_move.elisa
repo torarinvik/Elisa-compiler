@@ -42,6 +42,15 @@ extend Semantic:
             continue_details: mutable darray[sview] = []
             continue_seen: mutable bool = false
 
+        struct BorrowLarrowEntry:
+            target: Ast::Expr
+            value: Ast::Expr
+            owners: mutable darray[sview] = []
+            move_owner: sview = ""
+            field_names: mutable darray[sview] = []
+            field_fields: mutable darray[sview] = []
+            field_owners: mutable darray[sview] = []
+
         struct BorrowStateSnapshot:
             slots: mutable darray[usize] = []
             names: mutable darray[sview] = []
@@ -491,6 +500,18 @@ extend Semantic:
                 bam_collect_borrow_keys(borrow_names, borrow_fields, name, field_names, field_keys)
                 bam_clear_borrow_field_keys(name, field_keys, borrow_names, borrow_fields, borrow_owners)
 
+        # A write through a reference to an aggregate replaces its pointee's nested facts, but
+        # the reference slot itself still names the same owner. Preserve the direct `""` row.
+        def bam_clear_borrow_nested_fields(name: sview, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                field_names: mutable darray[sview] = []
+                field_keys: mutable darray[sview] = []
+                nested_fields: mutable darray[sview] = []
+                bam_collect_borrow_keys(borrow_names, borrow_fields, name, field_names, field_keys)
+                for field in field_keys |nested_fields|:
+                    nested_fields.push(field) if field != ""
+                bam_clear_borrow_field_keys(name, nested_fields, borrow_names, borrow_fields, borrow_owners)
+
         # Replace a holder's current field provenance with one path's state.
         def bam_replace_borrow_state(borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, source_names: darray[sview]&, source_fields: darray[sview]&, source_owners: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -728,6 +749,28 @@ extend Semantic:
                         bam_nested_value_owners(else_value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
                     Expr.Block(_, block_value, _, _):
                         bam_nested_value_owners(block_value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+                    Expr.Match(_, arms, _) | Expr.Catch(_, arms, _):
+                        for arm in arms |owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table|:
+                            if arm.body.count > 0:
+                                match arm.body[arm.body.count - 1]:
+                                    Stmt.Expr(arm_value, _):
+                                        bam_nested_value_owners(arm_value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+                                    Stmt.Return(arm_return_option, _):
+                                        if arm_return_option is arm_return_value:
+                                            bam_nested_value_owners(arm_return_value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+                                    _:
+                                        pass
+                    Expr.GetElse(guarded, recovery, _):
+                        bam_nested_value_owners(guarded, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+                        if recovery.count > 0:
+                            match recovery[recovery.count - 1]:
+                                Stmt.Expr(recovery_value, _):
+                                    bam_nested_value_owners(recovery_value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+                                Stmt.Return(recovery_return_option, _):
+                                    if recovery_return_option is recovery_return_value:
+                                        bam_nested_value_owners(recovery_return_value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+                                _:
+                                    pass
                     Expr.Call(_, _, _, _):
                         bam_lend_owners(value, owners, lend_names, lend_positions, lend_parameter_names, borrow_names, borrow_fields, borrow_owners, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
                     _:
@@ -780,6 +823,138 @@ extend Semantic:
                                 bam_push_borrow(out_names, out_fields, out_owners, destination, wildcard_path, nested_owner)
                     _:
                         pass
+
+        # Stage the leaves of a positional `<-` before applying any destination. This keeps
+        # nested swaps parallel and gives each leaf its own reference-binding effect. Identifier
+        # destinations also retain aggregate field paths instead of flattening every nested
+        # borrow into the holder's direct slot.
+        def bam_expression_larrow_rhs(value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, kinds: mutable darray[u32]&, details: mutable darray[sview]&, flow: mutable darray[bool]&, loop_exits: mutable BorrowLoopExitState&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                source_value: mutable Ast::Expr = value
+                while source_value is Expr.Paren(inner_value, _) |source_value|:
+                    source_value <- inner_value
+                match source_value:
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements |owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, loop_exits, table|:
+                            continue if flow[0]
+                            move_owner: sview = bam_moved_owner(element, owners)
+                            if move_owner != "":
+                                bam_set_consumed(owners, kinds, details, move_owner, 3, "")
+                            else:
+                                table <- bam_expression_larrow_rhs(element, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, loop_exits, table)
+                    Expr.Block(block_statements, block_value, _, _):
+                        # Evaluate block statements once with the full move/use checker. Keep
+                        # borrow aliases scoped for the yielded expression; staged provenance
+                        # replay later uses bam_scope_borrow_statements and does not consume
+                        # moves or emit diagnostics a second time.
+                        scoped_names: mutable darray[sview] = []
+                        scoped_fields: mutable darray[sview] = []
+                        scoped_owners: mutable darray[sview] = []
+                        scoped_names.extend(borrow_names)
+                        scoped_fields.extend(borrow_fields)
+                        scoped_owners.extend(borrow_owners)
+                        table <- bam_statements(block_statements, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, kinds, details, flow, loop_exits, table)
+                        table <- bam_expression_larrow_rhs(block_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, kinds, details, flow, loop_exits, table) if not flow[0]
+                    _:
+                        move_owner: sview = bam_moved_owner(source_value, owners)
+                        if move_owner != "":
+                            bam_set_consumed(owners, kinds, details, move_owner, 3, "")
+                        else:
+                            table <- bam_expression(source_value, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+
+        def bam_stage_larrow_pair(target: Ast::Expr, value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, entries: mutable darray[BorrowLarrowEntry], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                source_value: mutable Ast::Expr = value
+                while source_value is Expr.Paren(inner_value, _) |source_value|:
+                    source_value <- inner_value
+                match source_value:
+                    Expr.Block(block_statements, block_value, _, _):
+                        scoped_names: mutable darray[sview] = []
+                        scoped_fields: mutable darray[sview] = []
+                        scoped_owners: mutable darray[sview] = []
+                        scoped_names.extend(borrow_names)
+                        scoped_fields.extend(borrow_fields)
+                        scoped_owners.extend(borrow_owners)
+                        table <- bam_scope_borrow_statements(block_statements, block_statements.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                        table <- bam_stage_larrow_pair(target, block_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, entries, table)
+                        return
+                    _:
+                        pass
+                match target:
+                    Expr.Paren(inner_target, _):
+                        table <- bam_stage_larrow_pair(inner_target, source_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, entries, table)
+                    Expr.Array(targets, _):
+                        matched_values: mutable darray[Ast::Expr] = []
+                        match source_value:
+                            Expr.Array(values, _) | Expr.Tuple(values, _):
+                                if values.count == targets.count:
+                                    matched_values.extend(values)
+                            _:
+                                pass
+                        if matched_values.count == targets.count:
+                            for index in 0..<targets.count |targets, matched_values, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, entries, table|:
+                                table <- bam_stage_larrow_pair(targets[index], matched_values[index], owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, entries, table)
+                        else:
+                            fallback_owners: mutable darray[sview] = []
+                            bam_nested_value_owners_scoped(source_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, fallback_owners, table)
+                            for target_item in targets |fallback_owners, entries, table|:
+                                table <- bam_stage_larrow_fallback(target_item, fallback_owners, entries, table)
+                    _:
+                        entry: mutable BorrowLarrowEntry = BorrowLarrowEntry{target: target, value: source_value}
+                        match target:
+                            Expr.Ident(_, _):
+                                bam_nested_value_owners_scoped(source_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, entry.owners, table)
+                                bam_bind_value_fields(ident_name_of(target), "", source_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, borrow_names, borrow_fields, borrow_owners, entry.field_names, entry.field_fields, entry.field_owners, table)
+                                if entry.field_fields.count == 0:
+                                    needs_wildcard: mutable bool = false
+                                    match source_value:
+                                        Expr.Array(_, _) | Expr.Tuple(_, _) | Expr.SetLit(_, _) | Expr.DictLit(_, _) | Expr.If(_, _, _, _) | Expr.Block(_, _, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.GetElse(_, _, _) | Expr.Call(_, _, _, _):
+                                            needs_wildcard <- true
+                                        _:
+                                            pass
+                                    if needs_wildcard:
+                                        nested_owners: mutable darray[sview] = []
+                                        bam_nested_value_owners_scoped(source_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, nested_owners, table)
+                                        destination_name: sview = ident_name_of(target)
+                                        old_key_names: mutable darray[sview] = []
+                                        old_key_fields: mutable darray[sview] = []
+                                        bam_collect_borrow_keys(borrow_names, borrow_fields, destination_name, old_key_names, old_key_fields)
+                                        for nested_owner in nested_owners |entry, destination_name, nested_owner, old_key_names, old_key_fields|:
+                                            entry.field_names.push(destination_name)
+                                            entry.field_fields.push("*")
+                                            entry.field_owners.push(nested_owner)
+                                            for old_field in old_key_fields |entry, destination_name, nested_owner|:
+                                                continue if old_field == "" or old_field == "*"
+                                                entry.field_names.push(destination_name)
+                                                entry.field_fields.push(old_field)
+                                                entry.field_owners.push(nested_owner)
+                            _:
+                                bam_nested_value_owners_scoped(source_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, entry.owners, table)
+                        entry.move_owner <- bam_moved_owner(source_value, owners)
+                        entries.push(entry)
+
+        # A shape mismatch has no trustworthy positional mapping. Apply its aggregate owner
+        # union to each leaf, while retaining independent per-leaf assignment effect lookups.
+        def bam_stage_larrow_fallback(target: Ast::Expr, rebound_owners: darray[sview]&, entries: mutable darray[BorrowLarrowEntry], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Paren(inner_target, _):
+                        table <- bam_stage_larrow_fallback(inner_target, rebound_owners, entries, table)
+                    Expr.Array(targets, _):
+                        for target_item in targets |rebound_owners, entries, table|:
+                            table <- bam_stage_larrow_fallback(target_item, rebound_owners, entries, table)
+                    _:
+                        entry: mutable BorrowLarrowEntry = BorrowLarrowEntry{target: target, value: Ast::Expr.Invalid}
+                        entry.owners.extend(rebound_owners)
+                        match target:
+                            Expr.Ident(target_name, _):
+                                for rebound_owner in rebound_owners |entry, target_name|:
+                                    entry.field_names.push(target_name)
+                                    entry.field_fields.push("*")
+                                    entry.field_owners.push(rebound_owner)
+                            _:
+                                pass
+                        entries.push(entry)
 
         # The owner a `move o` names, else "".
         def bam_moved_owner(value: Ast::Expr, owners: darray[sview]&) -> sview:
@@ -1023,8 +1198,77 @@ extend Semantic:
                             table <- bam_expression(index, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
                     Expr.Paren(inner, _):
                         table <- bam_expression_place_target(inner, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+                    Expr.Array(targets, _):
+                        for target_item in targets |owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table| -> table:
+                            table <- bam_expression_place_target(target_item, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
                     _:
                         table <- bam_expression(target, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+
+        # Apply the ownership transfer for one `<-` destination. Multi-target assignments call
+        # this once per destination after evaluating the RHS, preserving positional provenance.
+        def bam_apply_larrow_target(target: Ast::Expr, rebound_owners: darray[sview]&, assignment_effect: u32, owners: darray[sview]&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, kinds: mutable darray[u32]&, details: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(target_name, target_pos):
+                        if binders_bound_once(binders, target_name):
+                            unknown_with_live_borrow: bool = assignment_effect == RBM_ASSIGN_EFFECT_UNKNOWN and bam_borrow_slot_live(borrow_names, borrow_fields, borrow_owners, target_name, "")
+                            writes_through: bool = assignment_effect == RBM_ASSIGN_EFFECT_WRITE_THROUGH or unknown_with_live_borrow
+                            if writes_through:
+                                _ = bam_report_slot_use(target_name, "", true, target_pos, owners, borrow_names, borrow_fields, kinds, details, table)
+                                if unknown_with_live_borrow:
+                                    # Inferred reference bindings are opaque to rule-R. Keep a
+                                    # may-union until their slot mode is resolved.
+                                    for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners|:
+                                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, "", rebound_owner)
+                            else:
+                                bam_clear_borrow_fields(target_name, borrow_names, borrow_fields, borrow_owners)
+                                for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners|:
+                                    bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, "", rebound_owner)
+                    Expr.Paren(inner, _):
+                        table <- bam_apply_larrow_target(inner, rebound_owners, assignment_effect, owners, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+                    Expr.Array(targets, _):
+                        for target_item in targets |rebound_owners, assignment_effect, owners, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, table| -> table:
+                            table <- bam_apply_larrow_target(target_item, rebound_owners, assignment_effect, owners, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+                    _:
+                        target_name, target_field = bam_expression_field_path(target, borrow_fields, table)
+                        if target_name != "" and target_field != "":
+                            if binders_bound_once(binders, target_name):
+                                bam_clear_borrow_path(target_name, target_field, borrow_names, borrow_fields, borrow_owners, table)
+                                bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, target_name, target_field)
+                                for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners|:
+                                    bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, target_field, rebound_owner)
+                        else:
+                            target_root: sview = bam_place_root(target)
+                            if target_root != "":
+                                # Preserve sibling provenance when the target's place shape is
+                                # not represented by an exact field path.
+                                root_owners: mutable darray[sview] = []
+                                bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, target_root, "", root_owners)
+                                bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, target_root, "*", root_owners)
+                                root_key_names: mutable darray[sview] = []
+                                root_key_fields: mutable darray[sview] = []
+                                bam_collect_borrow_keys(borrow_names, borrow_fields, target_root, root_key_names, root_key_fields)
+                                for root_field in root_key_fields |root_key_names, target_root, borrow_names, borrow_fields, borrow_owners, root_owners|:
+                                    continue if root_field == "" or root_field == "*"
+                                    bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, target_root, root_field, root_owners)
+                                for rebound_owner in rebound_owners |root_owners|:
+                                    bam_append_unique_owner(root_owners, rebound_owner)
+                                bam_drop_borrow(borrow_names, borrow_fields, borrow_owners, target_root)
+                                if binders_bound_once(binders, target_root) and root_owners.count > 0:
+                                    bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, target_root, "*")
+                                    for root_owner in root_owners |borrow_names, borrow_fields, borrow_owners|:
+                                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_root, "*", root_owner)
+
+        def bam_larrow_effect_for_target(target: Ast::Expr, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                match target:
+                    Expr.Ident(_, target_pos):
+                        assignment_site: u64 = rbm_assignment_site_key(target_pos)
+                        return known_effect if table.ref_assignment_modes.get(assignment_site) is known_effect
+                    Expr.Paren(inner, _):
+                        return bam_larrow_effect_for_target(inner, table)
+                    _:
+                        return RBM_ASSIGN_EFFECT_UNKNOWN
 
         # `r = &o`, `s = r`, `s = h.r`, `h = Holder{r: &o}` and `r = lend(&o)` all borrow `o`.
         # An annotation that is not a reference (`y: K = r`) copies the pointee instead, and
@@ -1082,6 +1326,346 @@ extend Semantic:
                         bam_push_borrow(borrow_names, borrow_fields, borrow_owners, name, new_field, new_field_owner)
                     key_index <- key_index + 1
 
+        def bam_scope_unknown_loop_binders(variables: darray[sview], owners: darray[sview]&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for variable in variables |owners, binders, borrow_names, borrow_fields, borrow_owners|:
+                    continue if not binders_bound_once(binders, variable)
+                    bam_clear_borrow_fields(variable, borrow_names, borrow_fields, borrow_owners)
+                    for possible_owner in owners |borrow_names, borrow_fields, borrow_owners, variable|:
+                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, variable, "", possible_owner)
+
+        # Bind arm names to the value selected by their pattern. Literal tuple/constructor
+        # projections keep exact provenance; when the source shape is opaque, each introduced
+        # name receives the scrutinee's possible owner set so the scoped walk cannot erase a
+        # live borrow merely because it cannot recover that projection.
+        def bam_bind_pattern_fallback(pattern: Ast::Pattern, possible_owners: darray[sview]&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pattern_names: mutable darray[sview] = []
+                bam_collect_local_pattern(pattern, binders, pattern_names)
+                for pattern_name in pattern_names |possible_owners, borrow_names, borrow_fields, borrow_owners|:
+                    bam_clear_borrow_fields(pattern_name, borrow_names, borrow_fields, borrow_owners)
+                    for possible_owner in possible_owners |borrow_names, borrow_fields, borrow_owners, pattern_name|:
+                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, pattern_name, "", possible_owner)
+
+        def bam_pattern_field_value(source: Ast::Expr, selector: sview) -> Ast::Expr:
+            can Abort.Panic:
+                projected: mutable Ast::Expr = Ast::Expr.Field(source, selector, Ast::expr_pos(source))
+                match source:
+                    Expr.Construct(_, fields, _):
+                        for field in fields |projected, selector|:
+                            projected <- field.value if field.name == selector
+                    Expr.RecordUpdate(base, fields, _):
+                        field_index: mutable usize = fields.count
+                        found_field: mutable bool = false
+                        while field_index > 0 |field_index, fields, projected, selector, found_field|:
+                            field_index <- field_index - 1
+                            if fields[field_index].name == selector:
+                                projected <- fields[field_index].value
+                                found_field <- true
+                                break
+                        projected <- Ast::Expr.Field(base, selector, Ast::expr_pos(source)) if not found_field
+                    _:
+                        pass
+                return projected
+
+        def bam_bind_pattern_borrow_value(pattern: Ast::Pattern, source: Ast::Expr, possible_owners: darray[sview]&, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.TypeBind(_, name):
+                        table <- bam_bind(name, true, source, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                    Pattern.As(name, inner):
+                        table <- bam_bind(name, true, source, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                        for child in inner |possible_owners, source, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table|:
+                            table <- bam_bind_pattern_borrow_value(child, source, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                    Pattern.Rest(name):
+                        bam_bind_pattern_fallback(pattern, possible_owners, binders, borrow_names, borrow_fields, borrow_owners)
+                    Pattern.Field(selector, inner):
+                        projected: Ast::Expr = bam_pattern_field_value(source, selector)
+                        for child in inner |projected, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table|:
+                            table <- bam_bind_pattern_borrow_value(child, projected, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                    Pattern.Tuple(children):
+                        if source is Expr.Tuple(values, _) and values.count == children.count:
+                            for index in 0..<children.count |index, children, values, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table|:
+                                table <- bam_bind_pattern_borrow_value(children[index], values[index], possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                        else:
+                            bam_bind_pattern_fallback(pattern, possible_owners, binders, borrow_names, borrow_fields, borrow_owners)
+                    Pattern.Variant(_, children):
+                        if source is Expr.Construct(_, fields, _) and fields.count == children.count:
+                            for index in 0..<children.count |index, children, fields, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table|:
+                                table <- bam_bind_pattern_borrow_value(children[index], fields[index].value, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                        else:
+                            bam_bind_pattern_fallback(pattern, possible_owners, binders, borrow_names, borrow_fields, borrow_owners)
+                    Pattern.Struct(_, children):
+                        for child in children |source, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table|:
+                            match child:
+                                Pattern.Binding(name):
+                                    field_source: Ast::Expr = bam_pattern_field_value(source, name)
+                                    table <- bam_bind_pattern_borrow_value(child, field_source, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                                _:
+                                    table <- bam_bind_pattern_borrow_value(child, source, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                    Pattern.Or(options):
+                        base_names: mutable darray[sview] = []
+                        base_fields: mutable darray[sview] = []
+                        base_owners: mutable darray[sview] = []
+                        merged_names: mutable darray[sview] = []
+                        merged_fields: mutable darray[sview] = []
+                        merged_owners: mutable darray[sview] = []
+                        base_names.extend(borrow_names)
+                        base_fields.extend(borrow_fields)
+                        base_owners.extend(borrow_owners)
+                        merged_names.extend(base_names)
+                        merged_fields.extend(base_fields)
+                        merged_owners.extend(base_owners)
+                        for option in options |source, possible_owners, base_names, base_fields, base_owners, merged_names, merged_fields, merged_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, table|:
+                            option_names: mutable darray[sview] = []
+                            option_fields: mutable darray[sview] = []
+                            option_owners: mutable darray[sview] = []
+                            option_names.extend(base_names)
+                            option_fields.extend(base_fields)
+                            option_owners.extend(base_owners)
+                            table <- bam_bind_pattern_borrow_value(option, source, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, option_names, option_fields, option_owners, table)
+                            bam_merge_borrow_state(merged_names, merged_fields, merged_owners, option_names, option_fields, option_owners)
+                        bam_replace_borrow_state(borrow_names, borrow_fields, borrow_owners, merged_names, merged_fields, merged_owners)
+                    _:
+                        pass
+
+        def bam_seed_pattern_borrow_state(pattern: Ast::Pattern, source: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                possible_owners: mutable darray[sview] = []
+                bam_nested_value_owners(source, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, possible_owners, table)
+                table <- bam_bind_pattern_borrow_value(pattern, source, possible_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+
+        # Join zero-or-more loop iterations to a fixed point. Opaque iterables bind each
+        # loop variable to the owner may-set; literal single-variable iterables retain the
+        # more precise element analysis already used by the outer statement walker.
+        def bam_scope_loop_statements(body: darray[Ast::Stmt], variables: darray[sview], iterable: Ast::Expr, is_for: bool, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                base_names: mutable darray[sview] = []
+                base_fields: mutable darray[sview] = []
+                base_owners: mutable darray[sview] = []
+                loop_names: mutable darray[sview] = []
+                loop_fields: mutable darray[sview] = []
+                loop_owners: mutable darray[sview] = []
+                base_names.extend(borrow_names)
+                base_fields.extend(borrow_fields)
+                base_owners.extend(borrow_owners)
+                loop_names.extend(borrow_names)
+                loop_fields.extend(borrow_fields)
+                loop_owners.extend(borrow_owners)
+                loop_grew: mutable bool = true
+                while loop_grew |loop_grew, base_names, base_fields, base_owners, loop_names, loop_fields, loop_owners, body, variables, iterable, is_for, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, table|:
+                    next_names: mutable darray[sview] = []
+                    next_fields: mutable darray[sview] = []
+                    next_owners: mutable darray[sview] = []
+                    next_names.extend(loop_names)
+                    next_fields.extend(loop_fields)
+                    next_owners.extend(loop_owners)
+                    if is_for:
+                        literal_iterable: mutable bool = false
+                        match iterable:
+                            Expr.Array(_, _) | Expr.Tuple(_, _) | Expr.SetLit(_, _):
+                                literal_iterable <- true
+                            _:
+                                pass
+                        if literal_iterable and variables.count == 1:
+                            bam_bind_loop_literal(variables[0], iterable, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, next_names, next_fields, next_owners, table)
+                        else:
+                            bam_scope_unknown_loop_binders(variables, owners, binders, next_names, next_fields, next_owners)
+                    table <- bam_scope_borrow_statements(body, body.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, next_names, next_fields, next_owners, table)
+                    bam_merge_borrow_state(next_names, next_fields, next_owners, base_names, base_fields, base_owners)
+                    loop_grew <- not bam_borrow_state_equal(loop_names, loop_fields, loop_owners, next_names, next_fields, next_owners)
+                    if loop_grew:
+                        loop_names.truncate(0)
+                        loop_fields.truncate(0)
+                        loop_owners.truncate(0)
+                        loop_names.extend(next_names)
+                        loop_fields.extend(next_fields)
+                        loop_owners.extend(next_owners)
+                bam_replace_borrow_state(borrow_names, borrow_fields, borrow_owners, loop_names, loop_fields, loop_owners)
+
+        # Evaluate only the borrow bindings that can affect a block's yielded value. The
+        # arrays are scoped copies, so block locals never leak into the surrounding function.
+        def bam_scope_borrow_statements(statements: darray[Ast::Stmt], count: usize, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                statement_index: mutable usize = 0
+                while statement_index < count and statement_index < statements.count |statement_index, statements, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table| -> table:
+                    match statements[statement_index]:
+                        Stmt.VarDecl(name, annotation, value, _):
+                            table <- bam_bind(name, rvc_is_absent(annotation) or affine_annotation_is_ref(annotation), value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                        Stmt.Assign(target, operator, value, _):
+                            target_place: Ast::Expr = bam_strip_paren(target)
+                            target_name: sview = ident_name_of(target_place)
+                            if target_name != "" and operator != TokenKind.LArrow:
+                                table <- bam_bind(target_name, true, value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                            elif target_name != "" and binders_bound_once(binders, target_name):
+                                rebound_owners: mutable darray[sview] = []
+                                bam_value_owners(value, owners, borrow_names, borrow_fields, borrow_owners, rebound_owners, table)
+                                bam_lend_owners(value, owners, lend_names, lend_positions, lend_parameter_names, borrow_names, borrow_fields, borrow_owners, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, rebound_owners, table) if rebound_owners.count == 0
+                                effect: u32 = bam_larrow_effect_for_target(target, table)
+                                preserve_existing: bool = effect == RBM_ASSIGN_EFFECT_WRITE_THROUGH or (effect == RBM_ASSIGN_EFFECT_UNKNOWN and bam_borrow_slot_live(borrow_names, borrow_fields, borrow_owners, target_name, ""))
+                                if effect == RBM_ASSIGN_EFFECT_WRITE_THROUGH:
+                                    staged_entries: mutable darray[BorrowLarrowEntry] = []
+                                    table <- bam_stage_larrow_pair(target_place, value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, staged_entries, table)
+                                    bam_clear_borrow_nested_fields(target_name, borrow_names, borrow_fields, borrow_owners)
+                                    for entry in staged_entries |target_name, borrow_names, borrow_fields, borrow_owners, table|:
+                                        for field_index in 0..<entry.field_fields.count |entry, target_name, borrow_names, borrow_fields, borrow_owners, field_index|:
+                                            field_name: sview = entry.field_names[field_index] if field_index < entry.field_names.count else ""
+                                            field_name <- target_name if field_name == ""
+                                            field_path: sview = entry.field_fields[field_index]
+                                            field_owner: sview = entry.field_owners[field_index] if field_index < entry.field_owners.count else ""
+                                            if field_owner == "":
+                                                bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, field_name, field_path)
+                                            else:
+                                                bam_push_borrow(borrow_names, borrow_fields, borrow_owners, field_name, field_path, field_owner)
+                                else:
+                                    if not preserve_existing:
+                                        bam_clear_borrow_fields(target_name, borrow_names, borrow_fields, borrow_owners)
+                                    for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners, target_name|:
+                                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, "", rebound_owner)
+                        Stmt.If(_, then_body, else_body, _):
+                            then_names: mutable darray[sview] = []
+                            then_fields: mutable darray[sview] = []
+                            then_owners: mutable darray[sview] = []
+                            else_names: mutable darray[sview] = []
+                            else_fields: mutable darray[sview] = []
+                            else_owners: mutable darray[sview] = []
+                            then_names.extend(borrow_names)
+                            then_fields.extend(borrow_fields)
+                            then_owners.extend(borrow_owners)
+                            else_names.extend(borrow_names)
+                            else_fields.extend(borrow_fields)
+                            else_owners.extend(borrow_owners)
+                            table <- bam_scope_borrow_statements(then_body, then_body.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, then_names, then_fields, then_owners, table)
+                            table <- bam_scope_borrow_statements(else_body, else_body.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, else_names, else_fields, else_owners, table)
+                            bam_replace_borrow_state(borrow_names, borrow_fields, borrow_owners, then_names, then_fields, then_owners)
+                            bam_merge_borrow_state(borrow_names, borrow_fields, borrow_owners, else_names, else_fields, else_owners)
+                        Stmt.While(_, body, _):
+                            table <- bam_scope_loop_statements(body, [], Ast::Expr.Invalid, false, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                        Stmt.For(_, variables, iterable, body, _):
+                            table <- bam_scope_loop_statements(body, variables, iterable, true, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
+                        Stmt.Match(scrutinee, arms, _):
+                            branch_base_names: mutable darray[sview] = []
+                            branch_base_fields: mutable darray[sview] = []
+                            branch_base_owners: mutable darray[sview] = []
+                            merged_names: mutable darray[sview] = []
+                            merged_fields: mutable darray[sview] = []
+                            merged_owners: mutable darray[sview] = []
+                            branch_base_names.extend(borrow_names)
+                            branch_base_fields.extend(borrow_fields)
+                            branch_base_owners.extend(borrow_owners)
+                            merged_names.extend(borrow_names)
+                            merged_fields.extend(borrow_fields)
+                            merged_owners.extend(borrow_owners)
+                            for arm in arms |branch_base_names, branch_base_fields, branch_base_owners, merged_names, merged_fields, merged_owners, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, table|:
+                                arm_names: mutable darray[sview] = []
+                                arm_fields: mutable darray[sview] = []
+                                arm_owners: mutable darray[sview] = []
+                                arm_names.extend(branch_base_names)
+                                arm_fields.extend(branch_base_fields)
+                                arm_owners.extend(branch_base_owners)
+                                table <- bam_seed_pattern_borrow_state(arm.pattern, scrutinee, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, arm_names, arm_fields, arm_owners, table)
+                                table <- bam_scope_borrow_statements(arm.body, arm.body.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, arm_names, arm_fields, arm_owners, table)
+                                bam_merge_borrow_state(merged_names, merged_fields, merged_owners, arm_names, arm_fields, arm_owners)
+                            bam_replace_borrow_state(borrow_names, borrow_fields, borrow_owners, merged_names, merged_fields, merged_owners)
+                        Stmt.Block(_, _, _, body, _):
+                            nested_names: mutable darray[sview] = []
+                            nested_fields: mutable darray[sview] = []
+                            nested_owners: mutable darray[sview] = []
+                            nested_names.extend(borrow_names)
+                            nested_fields.extend(borrow_fields)
+                            nested_owners.extend(borrow_owners)
+                            table <- bam_scope_borrow_statements(body, body.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, nested_names, nested_fields, nested_owners, table)
+                            bam_replace_borrow_state(borrow_names, borrow_fields, borrow_owners, nested_names, nested_fields, nested_owners)
+                        _:
+                            pass
+                    statement_index <- statement_index + 1
+
+        # Resolve yields under block and arm-local aliases. Unmatched shapes keep the
+        # analyzer's conservative owner union, while each possible control-flow result is
+        # inspected against its own scoped borrow state.
+        def bam_nested_value_owners_scoped(value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: darray[sview]&, borrow_fields: darray[sview]&, borrow_owners: darray[sview]&, out: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Block(statements, block_value, _, _):
+                        scoped_names: mutable darray[sview] = []
+                        scoped_fields: mutable darray[sview] = []
+                        scoped_owners: mutable darray[sview] = []
+                        scoped_names.extend(borrow_names)
+                        scoped_fields.extend(borrow_fields)
+                        scoped_owners.extend(borrow_owners)
+                        table <- bam_scope_borrow_statements(statements, statements.count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                        bam_nested_value_owners_scoped(block_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, out, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        for arm in arms |owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table|:
+                            scoped_names: mutable darray[sview] = []
+                            scoped_fields: mutable darray[sview] = []
+                            scoped_owners: mutable darray[sview] = []
+                            scoped_names.extend(borrow_names)
+                            scoped_fields.extend(borrow_fields)
+                            scoped_owners.extend(borrow_owners)
+                            table <- bam_seed_pattern_borrow_state(arm.pattern, scrutinee, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                            tail_count: mutable usize = arm.body.count
+                            if arm.body.count > 0:
+                                match arm.body[arm.body.count - 1]:
+                                    Stmt.Expr(arm_value, _):
+                                        tail_count <- tail_count - 1
+                                        table <- bam_scope_borrow_statements(arm.body, tail_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                                        bam_nested_value_owners_scoped(arm_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, out, table)
+                                    Stmt.Return(arm_return_option, _):
+                                        if arm_return_option is arm_return_value:
+                                            tail_count <- tail_count - 1
+                                            table <- bam_scope_borrow_statements(arm.body, tail_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                                            bam_nested_value_owners_scoped(arm_return_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, out, table)
+                                        else:
+                                            table <- bam_scope_borrow_statements(arm.body, tail_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                                    _:
+                                        table <- bam_scope_borrow_statements(arm.body, tail_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, scoped_names, scoped_fields, scoped_owners, table)
+                    Expr.GetElse(guarded, recovery, _):
+                        bam_nested_value_owners_scoped(guarded, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                        recovery_names: mutable darray[sview] = []
+                        recovery_fields: mutable darray[sview] = []
+                        recovery_owners: mutable darray[sview] = []
+                        recovery_names.extend(borrow_names)
+                        recovery_fields.extend(borrow_fields)
+                        recovery_owners.extend(borrow_owners)
+                        recovery_count: mutable usize = recovery.count
+                        if recovery.count > 0:
+                            match recovery[recovery.count - 1]:
+                                Stmt.Expr(recovery_value, _):
+                                    recovery_count <- recovery_count - 1
+                                    table <- bam_scope_borrow_statements(recovery, recovery_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, recovery_names, recovery_fields, recovery_owners, table)
+                                    bam_nested_value_owners_scoped(recovery_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, recovery_names, recovery_fields, recovery_owners, out, table)
+                                Stmt.Return(recovery_return_option, _):
+                                    if recovery_return_option is recovery_return_value:
+                                        recovery_count <- recovery_count - 1
+                                        table <- bam_scope_borrow_statements(recovery, recovery_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, recovery_names, recovery_fields, recovery_owners, table)
+                                        bam_nested_value_owners_scoped(recovery_return_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, recovery_names, recovery_fields, recovery_owners, out, table)
+                                    else:
+                                        table <- bam_scope_borrow_statements(recovery, recovery_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, recovery_names, recovery_fields, recovery_owners, table)
+                                _:
+                                    table <- bam_scope_borrow_statements(recovery, recovery_count, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, recovery_names, recovery_fields, recovery_owners, table)
+                    Expr.If(_, then_value, else_value, _):
+                        bam_nested_value_owners_scoped(then_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                        bam_nested_value_owners_scoped(else_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table|:
+                            bam_nested_value_owners_scoped(element, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table|:
+                            bam_nested_value_owners_scoped(field.value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        bam_nested_value_owners_scoped(base, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                        for field in fields |owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table|:
+                            bam_nested_value_owners_scoped(field.value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        bam_nested_value_owners_scoped(inner, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table|:
+                            bam_nested_value_owners_scoped(entry.key, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                            bam_nested_value_owners_scoped(entry.value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, out, table)
+                    _:
+                        bam_nested_value_owners(value, owners, borrow_names, borrow_fields, borrow_owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, out, table)
+
         # For a literal iterable, bind a single loop variable to the union of its possible
         # elements. This preserves exact owners for `for r in [&owner]` without guessing that an
         # opaque iterator can yield every owner in scope.
@@ -1135,67 +1719,48 @@ extend Semantic:
                             else:
                                 table <- bam_expression(assign_target, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table) if assign_name == ""
                             assign_move: sview = bam_moved_owner(assign_value, owners)
-                            table <- bam_expression(assign_value, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table) if assign_move == ""
+                            if assign_operator == TokenKind.LArrow and assign_target is Expr.Array(_, _):
+                                table <- bam_expression_larrow_rhs(assign_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, loop_exits, table)
+                            else:
+                                table <- bam_expression(assign_value, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table) if assign_move == ""
                             if assign_operator == TokenKind.LArrow:
-                                bam_set_consumed(owners, kinds, details, assign_move, 3, "")
-                                # Capture before clearing so self-rebinding (`r <- r`) keeps
-                                # its current owner set. A complex place uses a wildcard when
-                                # its exact field path is not represented here.
-                                rebound_owners: mutable darray[sview] = []
-                                bam_value_owners(assign_value, owners, borrow_names, borrow_fields, borrow_owners, rebound_owners, table)
-                                bam_lend_owners(assign_value, owners, lend_names, lend_positions, lend_parameter_names, borrow_names, borrow_fields, borrow_owners, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, rebound_owners, table) if rebound_owners.count == 0
-                                assign_target_pos: Ast::Pos = Ast::expr_pos(assign_target)
-                                assignment_site: u64 = rbm_assignment_site_key(assign_target_pos)
-                                assignment_effect: u32 = known_effect if table.ref_assignment_modes.get(assignment_site) is known_effect else RBM_ASSIGN_EFFECT_UNKNOWN
-                                match assign_target:
-                                    Expr.Ident(target_name, target_pos):
-                                        if binders_bound_once(binders, target_name):
-                                            unknown_with_live_borrow: bool = assignment_effect == RBM_ASSIGN_EFFECT_UNKNOWN and bam_borrow_slot_live(borrow_names, borrow_fields, borrow_owners, target_name, "")
-                                            writes_through: bool = assignment_effect == RBM_ASSIGN_EFFECT_WRITE_THROUGH or unknown_with_live_borrow
-                                            if writes_through:
-                                                _ = bam_report_slot_use(target_name, "", true, target_pos, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
-                                                if unknown_with_live_borrow:
-                                                    # Inferred reference bindings are opaque to the
-                                                    # rule-R pass. Keep a may-union until their slot
-                                                    # mode is resolved instead of erasing a possible
-                                                    # live pointee borrow.
-                                                    for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners|:
-                                                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, "", rebound_owner)
-                                            else:
-                                                bam_clear_borrow_fields(target_name, borrow_names, borrow_fields, borrow_owners)
-                                                for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners|:
-                                                    bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, "", rebound_owner)
-                                    _:
-                                        target_name, target_field = bam_expression_field_path(assign_target, borrow_fields, table)
-                                        if target_name != "" and target_field != "":
-                                            if binders_bound_once(binders, target_name):
-                                                bam_clear_borrow_path(target_name, target_field, borrow_names, borrow_fields, borrow_owners, table)
-                                                bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, target_name, target_field)
-                                                for rebound_owner in rebound_owners |borrow_names, borrow_fields, borrow_owners|:
-                                                    bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_name, target_field, rebound_owner)
-                                        else:
-                                            target_root: sview = bam_place_root(assign_target)
-                                            if target_root != "":
-                                                # Preserve sibling provenance when the target has
-                                                # a place shape this state model cannot encode.
-                                                root_owners: mutable darray[sview] = []
-                                                bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, target_root, "", root_owners)
-                                                bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, target_root, "*", root_owners)
-                                                root_key_names: mutable darray[sview] = []
-                                                root_key_fields: mutable darray[sview] = []
-                                                bam_collect_borrow_keys(borrow_names, borrow_fields, target_root, root_key_names, root_key_fields)
-                                                for root_field in root_key_fields |root_key_names, target_root, borrow_names, borrow_fields, borrow_owners, root_owners|:
-                                                    continue if root_field == "" or root_field == "*"
-                                                    bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, target_root, root_field, root_owners)
-                                                for rebound_owner in rebound_owners |root_owners|:
-                                                    bam_append_unique_owner(root_owners, rebound_owner)
-                                                bam_drop_borrow(borrow_names, borrow_fields, borrow_owners, target_root)
-                                                if binders_bound_once(binders, target_root) and root_owners.count > 0:
-                                                    bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, target_root, "*")
-                                                    for root_owner in root_owners |borrow_names, borrow_fields, borrow_owners|:
-                                                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, target_root, "*", root_owner)
-                                # `o <- value` re-initialises the owner: its borrows are live again.
-                                bam_set_consumed(owners, kinds, details, assign_name, 0, "") if assign_name != assign_move
+                                # Array RHS move leaves were consumed in source order by
+                                # bam_expression_larrow_rhs. Other LArrow forms still consume
+                                # their direct moved owner here.
+                                bam_set_consumed(owners, kinds, details, assign_move, 3, "") if not flow[0] and not (assign_target is Expr.Array(_, _))
+                                if not flow[0]:
+                                    match assign_target:
+                                        Expr.Array(targets, _):
+                                            staged_entries: mutable darray[BorrowLarrowEntry] = []
+                                            table <- bam_stage_larrow_pair(assign_target, assign_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, staged_entries, table)
+                                            for entry in staged_entries |owners, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, table|:
+                                                entry_effect: u32 = bam_larrow_effect_for_target(entry.target, table)
+                                                table <- bam_apply_larrow_target(entry.target, entry.owners, entry_effect, owners, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+                                                target_name: sview = ident_name_of(entry.target)
+                                                bam_clear_borrow_nested_fields(target_name, borrow_names, borrow_fields, borrow_owners) if target_name != "" and binders_bound_once(binders, target_name) and entry_effect == RBM_ASSIGN_EFFECT_WRITE_THROUGH
+                                                if target_name != "" and binders_bound_once(binders, target_name):
+                                                    for field_index in 0..<entry.field_fields.count |entry, target_name, borrow_names, borrow_fields, borrow_owners, field_index|:
+                                                        field_name: sview = entry.field_names[field_index] if field_index < entry.field_names.count else ""
+                                                        field_name <- target_name if field_name == ""
+                                                        field_path: sview = entry.field_fields[field_index]
+                                                        field_owner: sview = entry.field_owners[field_index] if field_index < entry.field_owners.count else ""
+                                                        if field_owner == "":
+                                                            bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, field_name, field_path)
+                                                        else:
+                                                            bam_push_borrow(borrow_names, borrow_fields, borrow_owners, field_name, field_path, field_owner)
+                                                bam_set_consumed(owners, kinds, details, target_name, 0, "") if target_name != "" and target_name != entry.move_owner
+                                        _:
+                                            # Capture before clearing so self-rebinding (`r <- r`)
+                                            # keeps its current owner set.
+                                            rebound_owners: mutable darray[sview] = []
+                                            bam_value_owners(assign_value, owners, borrow_names, borrow_fields, borrow_owners, rebound_owners, table)
+                                            bam_lend_owners(assign_value, owners, lend_names, lend_positions, lend_parameter_names, borrow_names, borrow_fields, borrow_owners, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, rebound_owners, table) if rebound_owners.count == 0
+                                            assign_target_pos: Ast::Pos = Ast::expr_pos(assign_target)
+                                            assignment_site: u64 = rbm_assignment_site_key(assign_target_pos)
+                                            assignment_effect: u32 = known_effect if table.ref_assignment_modes.get(assignment_site) is known_effect else RBM_ASSIGN_EFFECT_UNKNOWN
+                                            table <- bam_apply_larrow_target(assign_target, rebound_owners, assignment_effect, owners, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
+                                    # `o <- value` re-initialises the owner: its borrows are live again.
+                                    bam_set_consumed(owners, kinds, details, assign_name, 0, "") if assign_name != assign_move
                             else:
                                 bam_set_consumed(owners, kinds, details, assign_move, 2, assign_name)
                                 bam_bind(assign_name, true, assign_value, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, table)
@@ -1422,6 +1987,8 @@ extend Semantic:
                                 arm_borrow_names.extend(pre_borrow_names)
                                 arm_borrow_fields.extend(pre_borrow_fields)
                                 arm_borrow_owners.extend(pre_borrow_owners)
+                                table <- bam_seed_pattern_borrow_state(match_arm.pattern, match_scrutinee, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, arm_borrow_names, arm_borrow_fields, arm_borrow_owners, table)
+                                table <- bam_expression(match_arm.guard, owners, arm_borrow_names, arm_borrow_fields, arm_borrow_owners, arm_kinds, arm_details, table)
                                 table <- bam_statements(match_arm.body, owners, lend_names, lend_positions, lend_parameter_names, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, arm_borrow_names, arm_borrow_fields, arm_borrow_owners, arm_kinds, arm_details, arm_flow, loop_exits, table)
                                 if not arm_flow[0]:
                                     bam_merge(kinds, details, arm_kinds, arm_details)
@@ -4123,20 +4690,43 @@ extend Semantic:
 
         # A single variable over a literal iterable can hold any callable element. Join each
         # candidate binding from the same pre-loop state so one element cannot overwrite facts
-        # from another.
+        # from another. Plain multi-binder loops over literal tuple items get the same treatment
+        # component by component; opaque or mismatched iterable shapes remain unknown.
         def bam_remember_loop_literal_callable(variables: darray[sview]&, iterable: Ast::Expr, for_pos: Ast::Pos, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, global_names: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
-                return if variables.count != 1
+                return if variables.count == 0
                 match iterable:
                     Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
-                        binder_pos: Ast::Pos = source_binder_position(table, variables[0], for_pos.line, 0, "__for_binder")
-                        return if binder_pos.line == 0
+                        if variables.count == 1:
+                            binder_pos: Ast::Pos = source_binder_position(table, variables[0], for_pos.line, 0, "__for_binder")
+                            return if binder_pos.line == 0
+                            base: darray[BorrowLocalCallable] = borrow_snapshot_local_callables(reference_sites)
+                            joined: mutable darray[BorrowLocalCallable] = []
+                            joined.extend(base)
+                            for element in elements |base, joined, binder_pos, owner, reference_sites, table, lend_names, lend_positions, global_names|:
+                                borrow_restore_local_callables(reference_sites, base)
+                                bam_remember_local_callable(binder_pos, element, owner, reference_sites, table, lend_names, lend_positions, global_names)
+                                candidate: darray[BorrowLocalCallable] = borrow_snapshot_local_callables(reference_sites)
+                                joined <- borrow_join_local_callable_states(joined, candidate)
+                            borrow_restore_local_callables(reference_sites, joined)
+                            return
+                        return if not bam_store_local_alias_literal_tuple_iterable_matches(iterable, variables.count)
+                        binder_positions: mutable darray[Ast::Pos] = []
+                        for binder_index in 0..<variables.count |binder_index, variables, for_pos, table, binder_positions|:
+                            binder_positions.push(source_binder_position(table, variables[binder_index], for_pos.line, binder_index, "__for_binder"))
                         base: darray[BorrowLocalCallable] = borrow_snapshot_local_callables(reference_sites)
                         joined: mutable darray[BorrowLocalCallable] = []
                         joined.extend(base)
-                        for element in elements |base, joined, binder_pos, owner, reference_sites, table, lend_names, lend_positions, global_names|:
+                        for element in elements |base, joined, variables, binder_positions, owner, reference_sites, table, lend_names, lend_positions, global_names|:
                             borrow_restore_local_callables(reference_sites, base)
-                            bam_remember_local_callable(binder_pos, element, owner, reference_sites, table, lend_names, lend_positions, global_names)
+                            match element:
+                                Expr.Tuple(values, _) if values.count == variables.count:
+                                    for binder_index in 0..<variables.count |binder_index, values, binder_positions, owner, reference_sites, table, lend_names, lend_positions, global_names|:
+                                        binder_pos: Ast::Pos = binder_positions[binder_index]
+                                        if binder_pos.line > 0:
+                                            bam_remember_local_callable(binder_pos, values[binder_index], owner, reference_sites, table, lend_names, lend_positions, global_names)
+                                _:
+                                    pass
                             candidate: darray[BorrowLocalCallable] = borrow_snapshot_local_callables(reference_sites)
                             joined <- borrow_join_local_callable_states(joined, candidate)
                         borrow_restore_local_callables(reference_sites, joined)
@@ -4362,6 +4952,7 @@ extend Semantic:
                             table <- bam_store_loop(loop_body, locals, ref_params, writable_ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, loop_condition, true, summary, table)
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
                             table <- bam_store_call_expression(for_iterable, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
+                            bam_remember_loop_literal_callable(for_variables, for_iterable, for_pos, function_owner, reference_sites, table, lend_names, lend_positions, summary.globals)
                             table <- bam_store_loop(for_body, locals, ref_params, writable_ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, Expr.Absent, false, summary, table)
                         Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
                             table <- bam_store_statements(block_body, locals, ref_params, writable_ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, table)

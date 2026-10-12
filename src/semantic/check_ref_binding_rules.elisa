@@ -6,6 +6,11 @@
 # note, and last the augmented-assignment finding.
 extend Semantic:
     private:
+        struct RefAssignmentFacts:
+            mutable effect: u32
+            mutable target_fit: u32
+            mutable through_fit: u32
+
         # A local declaration's binding. An explicit `mutable x:` makes the slot rebindable and
         # an explicit `const x:` fixes it; only the TYPE's `mutable` writes through. The legacy
         # form `x: mutable T& = init` writes through only when `init` does.
@@ -40,6 +45,26 @@ extend Semantic:
                 value_mode: u32 = RBM_MODE_VALUE_MUTABLE if local_binding_is_mutable(name, pos.line, pos.offset, type_expression, table) else RBM_MODE_VALUE
                 value_elem: sview = "" if (spelled.flags & RBM_NULLABLE) != 0 else spelled.elem
                 return RefBinding{mode: value_mode, kind: RBM_KIND_LOCAL, elem: value_elem, bare: bare, declared: 0, current: 0, proven: false, depth: rbm_darray_depth(type_expression)}
+
+
+        # Cheap shape gate for the inferred-reference classifier below. These are the only
+        # expression forms rbm_spell_value can classify as references; skipping scalar-only
+        # trees avoids recursively spelling arithmetic RHSs already walked for readonly calls.
+        def rbm_may_spell_reference(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.StringLit(_, _) | Expr.Ident(_, _) | Expr.Call(_, _, _, _) | Expr.Field(_, _, _):
+                        return true
+                    Expr.Unary(operator, _, _):
+                        return operator == TokenKind.Ampersand
+                    Expr.Paren(inner, _):
+                        return rbm_may_spell_reference(inner)
+                    Expr.Index(object, _, _):
+                        if object is Ast::Expr.Field(_, cast_field, _):
+                            return cast_field == "cast"
+                    _:
+                        pass
+                return false
 
 
         # A simple `name = value` declaration may infer a reference type. Preserve its
@@ -270,49 +295,108 @@ extend Semantic:
 
 
         # `x <- v` through a writable reference with a fixed slot (W): a write-through store.
-        def rbm_check_write_through(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, value: Ast::Expr, table: lmut SymbolTable) -> void:
+        def rbm_check_write_through(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, value: Ast::Expr, facts: RefAssignmentFacts, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 # A literal carries a compiler-established terminator; arbitrary byte
                 # references do not. Keep only this narrow safe implicit conversion.
                 return if binding.elem == "cstr" and value is Ast::Expr.StringLit(_, _)
                 byte_pointer: bool = binding.elem == "u8" and (source.flags & RBM_PRESENT) != 0 and ((source.elem == "u8" and (source.flags & RBM_REF) != 0) or (source.elem == "cstr" and (source.flags & RBM_REF) == 0))
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.BytePointerStore, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, actual_count: source.flags | RBM_PRESENT}) if byte_pointer
-                target: RefSpelling = RefSpelling{elem: binding.elem, flags: RBM_PRESENT}
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: RBM_PRESENT, actual_count: source.flags | RBM_PRESENT}) if rbm_assignable(target, source, table) == RBM_NO
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: RBM_PRESENT, actual_count: source.flags | RBM_PRESENT}) if facts.through_fit == RBM_NO
 
 
         # `x <- v` on a rebindable-only binding (RB/RL): `v` must be a reference of the
         # binding's CURRENT type. A value that would have been a valid write-through gets the
         # note that `mutable` on the binding does not make it writable.
-        def rbm_check_rebind(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, table: lmut SymbolTable) -> void:
+        def rbm_check_rebind(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, facts: RefAssignmentFacts, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                target: RefSpelling = RefSpelling{elem: binding.elem, flags: binding.current}
-                return if rbm_assignable(target, source, table) != RBM_NO
+                return if facts.target_fit != RBM_NO
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: binding.current, actual_count: source.flags | RBM_PRESENT})
-                through: RefSpelling = RefSpelling{elem: binding.elem, flags: RBM_PRESENT}
                 state: u32 = 1 if binding.mode == RBM_MODE_RL else 0
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RebindableRefNote, name: name, pos: pos, line: line, expected: binding.elem, actual: "", expected_count: binding.declared, state_code: state}) if (source.flags & RBM_REF) == 0 and rbm_assignable(through, source, table) == RBM_YES
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RebindableRefNote, name: name, pos: pos, line: line, expected: binding.elem, actual: "", expected_count: binding.declared, state_code: state}) if (source.flags & RBM_REF) == 0 and facts.through_fit == RBM_YES
 
 
         # `x <- v` on a writable, rebindable binding (WR): a scalar value writes through, any
         # other value must be a reference of the binding's type.
-        def rbm_check_writable_rebind(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, table: lmut SymbolTable) -> void:
+        def rbm_check_writable_rebind(name: sview, pos: Ast::Pos, line: u32, binding: RefBinding, source: RefSpelling, facts: RefAssignmentFacts, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                return if rbm_assignment_writes_through(binding, source, table)
-                target: RefSpelling = RefSpelling{elem: binding.elem, flags: binding.current}
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: binding.current, actual_count: source.flags | RBM_PRESENT}) if rbm_assignable(target, source, table) == RBM_NO
+                return if facts.effect == RBM_ASSIGN_EFFECT_WRITE_THROUGH
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefAssignMismatch, name: name, pos: pos, line: line, expected: binding.elem, actual: source.elem, expected_count: binding.current, actual_count: source.flags | RBM_PRESENT}) if facts.target_fit == RBM_NO
 
 
         # Mirror the backend's assignment decision for a writable, rebindable reference.
         # This fact is also consumed by borrow analysis to determine whether `x <- v` reads
         # through the old pointer or replaces the pointer slot.
-        def rbm_assignment_writes_through(binding: RefBinding, source: RefSpelling, table: SymbolTable&) -> bool:
+        # Classify the transfer and cache compatibility facts for diagnostics. This keeps
+        # rule-R and borrow analysis on the same decision without repeating type lookups.
+        def rbm_assignment_facts(binding: RefBinding, source: RefSpelling, table: SymbolTable&) -> RefAssignmentFacts:
             can Abort.Panic:
-                return true if binding.mode == RBM_MODE_W
-                return false if binding.mode != RBM_MODE_WR
+                facts: mutable RefAssignmentFacts = RefAssignmentFacts{effect: RBM_ASSIGN_EFFECT_UNKNOWN, target_fit: RBM_NO, through_fit: RBM_NO}
+                target: RefSpelling = RefSpelling{elem: binding.elem, flags: binding.current}
                 through: RefSpelling = RefSpelling{elem: binding.elem, flags: RBM_PRESENT}
-                scalar: bool = rbm_numeric(binding.elem) or binding.elem == "bool"
-                return scalar and (source.flags & RBM_REF) == 0 and rbm_assignable(through, source, table) == RBM_YES
+                if binding.mode == RBM_MODE_W:
+                    facts.effect <- RBM_ASSIGN_EFFECT_WRITE_THROUGH
+                    facts.through_fit <- rbm_assignable(through, source, table)
+                    return facts
+                return facts if binding.mode != RBM_MODE_WR and binding.mode != RBM_MODE_RB and binding.mode != RBM_MODE_RL
+                scalar_write: bool = binding.mode == RBM_MODE_WR and (rbm_numeric(binding.elem) or binding.elem == "bool") and (source.flags & RBM_REF) == 0
+                if scalar_write:
+                    facts.through_fit <- rbm_assignable(through, source, table)
+                    if facts.through_fit == RBM_YES:
+                        facts.effect <- RBM_ASSIGN_EFFECT_WRITE_THROUGH
+                        return facts
+                facts.target_fit <- rbm_assignable(target, source, table)
+                if facts.target_fit == RBM_YES:
+                    facts.effect <- RBM_ASSIGN_EFFECT_REBIND
+                elif facts.target_fit == RBM_NO and (binding.mode == RBM_MODE_RB or binding.mode == RBM_MODE_RL):
+                    facts.through_fit <- rbm_assignable(through, source, table) if (source.flags & RBM_REF) == 0
+                return facts
+
+
+        # Record only effects this pass can prove. Backend type resolution sees aliases and
+        # contextual branch/call results that rule-R may leave UNKNOWN; calling those REBIND
+        # would erase a live borrow when lowering actually stores through the reference.
+        def rbm_assignment_effect(binding: RefBinding, source: RefSpelling, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                facts: RefAssignmentFacts = rbm_assignment_facts(binding, source, table)
+                return facts.effect
+
+
+        # Record effects for multi-target `<-` without rerunning rule-R diagnostics. Literal
+        # tuple/array RHSs pair exactly; control-flow, call, and shape-mismatched RHSs remain
+        # UNKNOWN for each reference target so BAM takes its conservative path.
+        def rbm_record_assignment_effects(target: Ast::Expr, value: Ast::Expr, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match target:
+                    Expr.Ident(name, ident_pos):
+                        binding: RefBinding = rbm_lookup(bindings, name, table)
+                        return if not rbm_is_ref_mode(binding.mode)
+                        assignment_site: u64 = rbm_assignment_site_key(ident_pos)
+                        return if assignment_site == 0
+                        source: RefSpelling = rbm_decline()
+                        numeric_write: bool = binding.mode == RBM_MODE_WR and (rbm_numeric(binding.elem) or binding.elem == "bool")
+                        if value is not Ast::Expr.Invalid and (numeric_write or rbm_may_spell_reference(value)):
+                            source <- rbm_spell_value(value, bindings, callee_names, callee_owners, positions, lookup, table)
+                        effect: u32 = RBM_ASSIGN_EFFECT_WRITE_THROUGH if binding.mode == RBM_MODE_W else rbm_assignment_effect(binding, source, table)
+                        table.ref_assignment_modes <- table.ref_assignment_modes.put(assignment_site, effect) can Global{Read,Write}
+                    Expr.Paren(inner_target, _):
+                        table <- rbm_record_assignment_effects(inner_target, value, bindings, callee_names, callee_owners, positions, lookup, table)
+                    Expr.Array(targets, _):
+                        if value is Ast::Expr.Paren(inner_value, _):
+                            table <- rbm_record_assignment_effects(target, inner_value, bindings, callee_names, callee_owners, positions, lookup, table)
+                            return
+                        match value:
+                            Expr.Array(values, _) | Expr.Tuple(values, _):
+                                if targets.count == values.count:
+                                    for index in 0..<targets.count |table, target, value, bindings, callee_names, callee_owners, positions, lookup, targets, values|:
+                                        table <- rbm_record_assignment_effects(targets[index], values[index], bindings, callee_names, callee_owners, positions, lookup, table)
+                                    return
+                            _:
+                                pass
+                        for target_item in targets |table, bindings, callee_names, callee_owners, positions, lookup|:
+                            table <- rbm_record_assignment_effects(target_item, Ast::Expr.Invalid, bindings, callee_names, callee_owners, positions, lookup, table)
+                    _:
+                        pass
 
 
         # A `global mutable`-style global declared with a writable reference type must be
@@ -419,17 +503,16 @@ extend Semantic:
                             table.diagnostics <- table.diagnostics.push(augmented) if binding.mode != RBM_MODE_W
                             return
                         source: RefSpelling = rbm_spell_value(value, bindings, callee_names, callee_owners, positions, lookup, table)
-                        assignment_effect: mutable u32 = RBM_ASSIGN_EFFECT_REBIND
-                        assignment_effect <- RBM_ASSIGN_EFFECT_WRITE_THROUGH if rbm_assignment_writes_through(binding, source, table)
+                        assignment_facts: RefAssignmentFacts = rbm_assignment_facts(binding, source, table)
                         if binding.mode == RBM_MODE_W:
-                            table <- rbm_check_write_through(name, ident_pos, pos.line, binding, source, value, table)
+                            table <- rbm_check_write_through(name, ident_pos, pos.line, binding, source, value, assignment_facts, table)
                         elif binding.mode == RBM_MODE_WR:
-                            table <- rbm_check_writable_rebind(name, ident_pos, pos.line, binding, source, table)
+                            table <- rbm_check_writable_rebind(name, ident_pos, pos.line, binding, source, assignment_facts, table)
                         else:
-                            table <- rbm_check_rebind(name, ident_pos, pos.line, binding, source, table)
+                            table <- rbm_check_rebind(name, ident_pos, pos.line, binding, source, assignment_facts, table)
                         assignment_site: u64 = rbm_assignment_site_key(ident_pos)
                         if assignment_site != 0:
-                            table.ref_assignment_modes <- table.ref_assignment_modes.put(assignment_site, assignment_effect) can Global{Read,Write}
+                            table.ref_assignment_modes <- table.ref_assignment_modes.put(assignment_site, assignment_facts.effect) can Global{Read,Write}
                     Expr.Index(object, index, index_pos):
                         object_name: sview = rbm_name_of(object)
                         object_binding: RefBinding = rbm_lookup(bindings, object_name, table) if object_name != "" else rbm_opaque_binding()
