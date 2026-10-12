@@ -367,6 +367,15 @@ class ShardCacheTests(unittest.TestCase):
         self.assertFalse(output.parent.parent.exists())
         self.assertFalse(list(self.root.glob("*.incoming-*")))
 
+    def test_batch_abandoned_hit_removes_new_destination_directories(self):
+        self.publish()
+        output = self.root / "abandoned-output" / "nested" / "object.o"
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            self.assertTrue(batch.restore(self.ticket, output, str(output) + ".out", str(output) + ".err"))
+            self.assertTrue(output.parent.exists())
+        self.assertFalse(output.parent.parent.exists())
+        self.assertFalse(list(self.root.glob("*.incoming-*")))
+
     def test_batch_staging_is_rechecked_after_cache_publication(self):
         self.publish()
         fresh = None

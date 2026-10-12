@@ -417,7 +417,7 @@ class BatchInvocation:
         targets = [Path(path) for path in (output, stdout, stderr)]
         if len({str(path.resolve()) for path in targets}) != 3:
             raise ValueError("batch output paths must be distinct")
-        previous = {str(path.resolve()) for _, _, paths, _ in self.outputs for path in paths}
+        previous = {str(path.resolve()) for _, _, paths, _, _ in self.outputs for path in paths}
         if previous.intersection(str(path.resolve()) for path in targets):
             raise ValueError("batch shards share output paths")
         staged = []
@@ -449,7 +449,7 @@ class BatchInvocation:
             expected = {}
             hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected, _verify_copies=False)
             if hit:
-                self.outputs.append((ticket, staged, targets, expected))
+                self.outputs.append((ticket, staged, targets, expected, created_directories))
                 retained = True
             self.metrics["hits" if hit else "misses"] += 1
             return hit
@@ -474,7 +474,7 @@ class BatchInvocation:
         # Snapshot admission can change independently of shared artifacts too.
         for ticket in self.prepared:
             self.validate(ticket)
-        for ticket, staged, _, expected in self.outputs:
+        for ticket, staged, _, expected, _ in self.outputs:
             self.validate(ticket)
             for name, source in zip(("object", "stdout", "stderr"), staged):
                 if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
@@ -508,11 +508,11 @@ class BatchInvocation:
         # Cache publication may take long enough for another process to tamper
         # with an output-local staging path; attest again immediately before
         # the atomic renames.
-        for _, staged, _, expected in self.outputs:
+        for _, staged, _, expected, _ in self.outputs:
             for name, source in zip(("object", "stdout", "stderr"), staged):
                 if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
                     raise ValueError("private restored hit changed before destination commit")
-        for _, staged, targets, _ in self.outputs:
+        for _, staged, targets, _, _ in self.outputs:
             for index in (1, 2, 0):
                 os.replace(staged[index], targets[index])
         self.finished = True
@@ -520,9 +520,14 @@ class BatchInvocation:
 
     def close(self):
         self.closed = True
-        for _, staged, _, _ in self.outputs:
+        for _, staged, _, _, created_directories in self.outputs:
             for path in staged:
                 path.unlink(missing_ok=True)
+            for directory in reversed(created_directories):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
         shutil.rmtree(self.work, ignore_errors=True)
 
     def __enter__(self):
