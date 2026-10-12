@@ -29,7 +29,10 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
 [ -x "$ELISACORE_BIN" ] || { echo "cli_includes_smoke FAIL: no elisac at $ELISACORE_BIN" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 pass=0; total=0
 ok()   { pass=$((pass + 1)); }
