@@ -102,6 +102,21 @@ def bam_borrow_wildcard_matches(candidate: sview, field: sview, prefix_end: usiz
 """
 if compact(function_section(BORROW_CHECK.read_text(), "bam_borrow_wildcard_matches")) != compact(expected_wrapper):
     raise SystemExit("borrow flow no longer delegates wildcard matching to the proved policy")
+borrow_text = BORROW_CHECK.read_text()
+for caller in ("bam_borrow_wildcard_row", "bam_borrow_snapshot_owners"):
+    caller_body = compact(function_section(borrow_text, caller))
+    if "SemanticBorrowFieldPath::ASCII_FIELD_SEPARATOR" not in caller_body:
+        raise SystemExit(f"{caller} must use the proved field-separator constant")
+key_hash = compact(function_section(borrow_text, "bam_borrow_wildcard_key_hash"))
+for hash_byte in (
+    "BORROW_WILDCARD_KEY_HASH_NAME_SEPARATOR.u64()",
+    "SemanticBorrowFieldPath::ASCII_FIELD_SEPARATOR.u64()",
+    "SemanticBorrowFieldPath::ASCII_WILDCARD.u64()",
+):
+    if hash_byte not in key_hash:
+        raise SystemExit(f"wildcard key hashing must use named byte constants: {hash_byte}")
+if compact("const BORROW_WILDCARD_KEY_HASH_NAME_SEPARATOR: u8 = 255") not in compact(borrow_text):
+    raise SystemExit("wildcard key hash name separator must remain an explicit domain byte")
 
 positive_names = {
     "wildcard_matches_its_exact_byte_path_spec",
