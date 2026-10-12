@@ -51,11 +51,14 @@ if 'include "./lexer_type_suffix.elisa"' not in core_text or \
         compact("return LexerTypeSuffix::is_valid_type_suffix(view)") not in compact(valid_suffix):
     raise SystemExit("lexer suffix wrapper no longer delegates to the shared exact grammar")
 suffix_grammar = function_section(type_suffix_text, "is_valid_type_suffix")
-expected_suffixes = (
-    '"u" | "u8" | "u16" | "u32" | "u64" | "usize" | '
-    '"i8" | "i16" | "i32" | "i64" | "isize" | "f32" | "f64" -> true'
+suffix_spellings = (
+    "u", "u8", "u16", "u32", "u64", "usize",
+    "i8", "i16", "i32", "i64", "isize", "f32", "f64",
 )
-if compact(expected_suffixes) not in compact(suffix_grammar):
+suffix_predicate = " or ".join(f'suffix == "{spelling}"' for spelling in suffix_spellings)
+if compact(f"ensure result == ({suffix_predicate})") not in compact(suffix_grammar):
+    raise SystemExit("lexer suffix contract changed; revisit the suffix-width bound")
+if compact(f"return ({suffix_predicate})") not in compact(suffix_grammar):
     raise SystemExit("lexer suffix whitelist changed; revisit the suffix-width bound")
 
 suffix_wrapper = function_section(core_text, "read_type_suffix")
