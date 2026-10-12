@@ -5,6 +5,142 @@
 extend Backend:
     private:
 
+        const PENUM_FIELD_INDEX_THRESHOLD: usize = 32
+        # Keep deterministic-hash collision clusters bounded; excessive clusters use the
+        # exact projection scan below instead of spending quadratic time building the cache.
+        const PENUM_FIELD_INDEX_MAX_PROBES: usize = 64
+        const PENUM_FIELD_INDEX_HASH_OFFSET: u64 = 14695981039346656037
+        const PENUM_FIELD_INDEX_HASH_PRIME: u64 = 1099511628211
+
+        def payload_enum_field_index_hash(name: sview) -> u64 can[Abort.Panic]:
+            hash: mutable u64 = PENUM_FIELD_INDEX_HASH_OFFSET
+            for index in 0..<sview_len(name) |hash, name|:
+                hash <- (hash ^ sview_at(name, index).u64()) * PENUM_FIELD_INDEX_HASH_PRIME
+            return hash
+
+        # Build a compact, enum-local open-addressed index only after the registration pools
+        # are complete. Small enums keep the linear path; large enums pay one build cost and
+        # then resolve each field projection in expected constant time.
+        def ensure_payload_enum_field_index(enum_index: usize, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            enum_count: usize = structs.payload_enums.penum_names.count
+            return if enum_index >= enum_count
+            while structs.payload_enums.penum_field_index_ready.count < enum_count |structs|:
+                structs.payload_enums.penum_field_index_ready <- structs.payload_enums.penum_field_index_ready.push(false)
+            while structs.payload_enums.penum_field_index_bucket_start.count < enum_count |structs|:
+                structs.payload_enums.penum_field_index_bucket_start <- structs.payload_enums.penum_field_index_bucket_start.push(0)
+            while structs.payload_enums.penum_field_index_bucket_count.count < enum_count |structs|:
+                structs.payload_enums.penum_field_index_bucket_count <- structs.payload_enums.penum_field_index_bucket_count.push(0)
+            return if structs.payload_enums.penum_field_index_ready.count != enum_count or structs.payload_enums.penum_field_index_bucket_start.count != enum_count or structs.payload_enums.penum_field_index_bucket_count.count != enum_count
+            return if structs.payload_enums.penum_field_index_ready[enum_index]
+
+            variant_start: usize = structs.payload_enums.penum_variant_start[enum_index]
+            variant_count: usize = structs.payload_enums.penum_variant_count[enum_index]
+            field_count: mutable usize = 0
+            for variant_offset in 0..<variant_count |field_count, variant_start, structs|:
+                variant_slot: usize = variant_start + variant_offset
+                return if variant_slot >= structs.payload_enums.penum_field_type_count.count
+                field_count <- field_count + structs.payload_enums.penum_field_type_count[variant_slot]
+            if field_count < PENUM_FIELD_INDEX_THRESHOLD:
+                structs.payload_enums.penum_field_index_ready[enum_index] <- true
+                return
+
+            # Keep the load factor at or below one half. The indexed rows are stored as
+            # one-based offsets so zero remains the empty-bucket sentinel.
+            bucket_count: usize = field_count + field_count
+            return if bucket_count < field_count
+            bucket_start: usize = structs.payload_enums.penum_field_index_buckets.count
+            for _ in 0..<bucket_count |structs|:
+                structs.payload_enums.penum_field_index_buckets <- structs.payload_enums.penum_field_index_buckets.push(0)
+
+            insertion_failed: mutable bool = false
+            for variant_offset in 0..<variant_count |insertion_failed, variant_start, bucket_start, bucket_count, structs|:
+                variant_slot: usize = variant_start + variant_offset
+                field_start: usize = structs.payload_enums.penum_field_type_start[variant_slot]
+                field_count_in_variant: usize = structs.payload_enums.penum_field_type_count[variant_slot]
+                for field_offset in 0..<field_count_in_variant |insertion_failed, field_start, variant_slot, bucket_start, bucket_count, structs|:
+                    field_name: sview = structs.payload_enums.penum_field_flat_names[field_start + field_offset]
+                    bucket: usize = (payload_enum_field_index_hash(field_name) % bucket_count.u64()).usize()
+                    probes: mutable usize = 0
+                    inserted: mutable bool = false
+                    while probes < bucket_count and probes < PENUM_FIELD_INDEX_MAX_PROBES and not inserted |probes, inserted, insertion_failed, bucket, bucket_start, bucket_count, field_name, variant_slot, field_offset, structs|:
+                        bucket_row: usize = bucket_start + bucket
+                        entry_plus_one: usize = structs.payload_enums.penum_field_index_buckets[bucket_row]
+                        if entry_plus_one == 0:
+                            entry: usize = structs.payload_enums.penum_field_index_names.count
+                            structs.payload_enums.penum_field_index_names <- structs.payload_enums.penum_field_index_names.push(field_name)
+                            structs.payload_enums.penum_field_index_slots <- structs.payload_enums.penum_field_index_slots.push(variant_slot)
+                            structs.payload_enums.penum_field_index_offsets <- structs.payload_enums.penum_field_index_offsets.push(field_offset)
+                            structs.payload_enums.penum_field_index_match_counts <- structs.payload_enums.penum_field_index_match_counts.push(1)
+                            structs.payload_enums.penum_field_index_buckets[bucket_row] <- entry + 1
+                            inserted <- true
+                        else:
+                            entry: usize = entry_plus_one - 1
+                            if entry < structs.payload_enums.penum_field_index_names.count and structs.payload_enums.penum_field_index_names[entry] == field_name:
+                                if entry < structs.payload_enums.penum_field_index_match_counts.count:
+                                    structs.payload_enums.penum_field_index_match_counts[entry] <- 2
+                                inserted <- true
+                            else:
+                                bucket <- bucket + 1
+                                bucket <- 0 if bucket == bucket_count
+                        probes <- probes + 1
+                    insertion_failed <- true if not inserted
+            if insertion_failed:
+                # A pathological hash cluster can exceed the bounded probe budget. Leave the
+                # cache in prepared linear-fallback state so later lookups do not rebuild the
+                # same partial table.
+                structs.payload_enums.penum_field_index_bucket_start[enum_index] <- bucket_start
+                structs.payload_enums.penum_field_index_bucket_count[enum_index] <- 0
+                structs.payload_enums.penum_field_index_ready[enum_index] <- true
+                return
+            structs.payload_enums.penum_field_index_bucket_start[enum_index] <- bucket_start
+            structs.payload_enums.penum_field_index_bucket_count[enum_index] <- bucket_count
+            structs.payload_enums.penum_field_index_ready[enum_index] <- true
+
+
+        def payload_enum_field_projection_scan(enum_index: usize, field: sview, structs: StructTable&, out_slot: mutable usize&, out_offset: mutable usize&) -> bool can[Abort.Panic]:
+            return false if enum_index >= structs.payload_enums.penum_variant_count.count or enum_index >= structs.payload_enums.penum_variant_start.count
+            variant_start: usize = structs.payload_enums.penum_variant_start[enum_index]
+            variant_count: usize = structs.payload_enums.penum_variant_count[enum_index]
+            matches: mutable usize = 0
+            for variant_offset in 0..<variant_count |matches, variant_start, field, out_slot, out_offset, structs|:
+                variant_slot: usize = variant_start + variant_offset
+                field_start: usize = structs.payload_enums.penum_field_type_start[variant_slot]
+                for field_offset in 0..<structs.payload_enums.penum_field_type_count[variant_slot] |matches, field_start, field, out_slot, out_offset, variant_slot, structs|:
+                    if structs.payload_enums.penum_field_flat_names[field_start + field_offset] == field:
+                        matches <- matches + 1
+                        out_slot <- variant_slot
+                        out_offset <- field_offset
+                        return false if matches > 1
+            return matches == 1
+
+
+        # Projection is valid only when a field name occurs exactly once across every
+        # variant, matching the previous full scan's ambiguity rule.
+        def payload_enum_unique_field_projection(enum_index: usize, field: sview, structs: mutable StructTable&, out_slot: mutable usize&, out_offset: mutable usize&) -> bool can[Abort.Panic, Memory.Allocate]:
+            ensure_payload_enum_field_index(enum_index, structs)
+            return payload_enum_field_projection_scan(enum_index, field, structs, out_slot, out_offset) if enum_index >= structs.payload_enums.penum_field_index_ready.count or not structs.payload_enums.penum_field_index_ready[enum_index]
+            bucket_count: usize = structs.payload_enums.penum_field_index_bucket_count[enum_index]
+            return payload_enum_field_projection_scan(enum_index, field, structs, out_slot, out_offset) if bucket_count == 0
+            bucket_start: usize = structs.payload_enums.penum_field_index_bucket_start[enum_index]
+            return payload_enum_field_projection_scan(enum_index, field, structs, out_slot, out_offset) if bucket_start > structs.payload_enums.penum_field_index_buckets.count or bucket_count > structs.payload_enums.penum_field_index_buckets.count - bucket_start
+            bucket: usize = (payload_enum_field_index_hash(field) % bucket_count.u64()).usize()
+            probes: mutable usize = 0
+            while probes < bucket_count and probes < PENUM_FIELD_INDEX_MAX_PROBES |probes, bucket, bucket_count, bucket_start, field, out_slot, out_offset, structs|:
+                entry_plus_one: usize = structs.payload_enums.penum_field_index_buckets[bucket_start + bucket]
+                return false if entry_plus_one == 0
+                entry: usize = entry_plus_one - 1
+                if entry >= structs.payload_enums.penum_field_index_names.count or entry >= structs.payload_enums.penum_field_index_slots.count or entry >= structs.payload_enums.penum_field_index_offsets.count or entry >= structs.payload_enums.penum_field_index_match_counts.count:
+                    return payload_enum_field_projection_scan(enum_index, field, structs, out_slot, out_offset)
+                if structs.payload_enums.penum_field_index_names[entry] == field:
+                    return false if structs.payload_enums.penum_field_index_match_counts[entry] != 1
+                    out_slot <- structs.payload_enums.penum_field_index_slots[entry]
+                    out_offset <- structs.payload_enums.penum_field_index_offsets[entry]
+                    return true
+                bucket <- bucket + 1
+                bucket <- 0 if bucket == bucket_count
+                probes <- probes + 1
+            return payload_enum_field_projection_scan(enum_index, field, structs, out_slot, out_offset)
+
 
         # Copy the frontend's (error-function line -> declared set name) rows into the struct
         # table, so every backend site can ask which set a function's `error[...]` names
@@ -243,13 +379,15 @@ extend Backend:
             # the conservative blob rules below; declared error sets additionally accept
             # multi-field scalar/text/object variants because their error ABI is the explicit
             # concatenated native-field struct emitted by `error_set_llvm_type`.
-        def register_payload_enum(declaration: Decl, packed_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            can Abort.Panic, Memory.Allocate:
-                match declaration:
-                    Decl.Enum(enum_name, variants, is_const, storage_type, enum_line):
-                        register_payload_enum_decl(enum_name, variants, is_const, packed_names, "", structs)
-                    _:
-                        pass
+        # The C-header path still walks top-level declarations directly. Resolve the packed
+        # status against the same owner-qualified payload metadata row used by the module path;
+        # a packed enum with the same bare name in another module must not suppress this row.
+        def payload_enum_metadata_row_for_owner(file: Ast::File&, name: sview, owner: sview) -> i64 can[Abort.Panic]:
+            for enum_index in 0..<file.payload_enum_names.count |file, name, owner|:
+                continue if file.payload_enum_names[enum_index] != name
+                enum_owner: sview = file.payload_enum_owners[enum_index] if enum_index < file.payload_enum_owners.count else ""
+                return enum_index.i64() if enum_owner == owner
+            return -1
 
 
 
@@ -343,7 +481,7 @@ extend Backend:
             # which declined Holder outright. Each round registers whatever became resolvable in
             # the previous one, so declaration order stops mattering. A chain is at most as long
             # as the enum count, and the loop stops the first round that registers nothing.
-        def register_payload_enums_from_metadata(file: Ast::File&, packed_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+        def register_payload_enums_from_metadata(file: Ast::File&, packed_names: darray[sview]&, membership: PackedOwnerMembership&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 # INLINE hierarchies first, driven by the ENUM DECLARATIONS rather than by
                 # the payload metadata: a hierarchy whose members all lack payloads (an
@@ -351,29 +489,30 @@ extend Backend:
                 # from that table alone left it unregistered and every use declined.
                 for decl_index in 0..<file.enum_decl_names.count |file, structs|:
                     decl_name: sview = file.enum_decl_names[decl_index]
+                    decl_module: sview = file.enum_decl_owners[decl_index] if decl_index < file.enum_decl_owners.count else ""
                     continue if file.enum_decl_is_const[decl_index]
-                    continue if hierarchy_parent_in_file(file, decl_name) == "" and not hierarchy_has_children_in_file(file, decl_name)
-                    continue if hierarchy_is_store_backed(file, decl_name)
-                    register_inline_hierarchy(file, hierarchy_root_in_file(file, decl_name), structs)
+                    continue if hierarchy_parent_in_file(file, decl_name, decl_module) == "" and not hierarchy_has_children_in_file(file, decl_name, decl_module)
+                    continue if hierarchy_is_store_backed(file, decl_name, decl_module)
+                    register_inline_hierarchy(file, hierarchy_root_in_file(file, decl_name, decl_module), decl_module, structs)
                 round_index: mutable usize = 0
                 registered: mutable usize = 0
                 progressed: mutable bool = true
                 no_packed_names: darray[sview] = []
-                while progressed and round_index <= file.payload_enum_names.count |round_index, registered, progressed, file, packed_names, no_packed_names, structs|:
+                while progressed and round_index <= file.payload_enum_names.count |round_index, registered, progressed, file, packed_names, no_packed_names, membership, structs|:
                     round_index <- round_index + 1
-                    for enum_index in 0..<file.payload_enum_names.count |file, packed_names, no_packed_names, structs|:
+                    for enum_index in 0..<file.payload_enum_names.count |file, packed_names, no_packed_names, membership, structs|:
                         payload_owner: sview = file.payload_enum_owners[enum_index] if enum_index < file.payload_enum_owners.count else ""
                         continue if penum_index_of_owned(structs, payload_owner, file.payload_enum_names[enum_index]) >= 0
                         member_name: sview = file.payload_enum_names[enum_index]
                         # An INLINE hierarchy registers ONCE, from its root; a refinement
                         # is an alias of the root and never a payload enum of its own.
-                        in_hierarchy: bool = hierarchy_parent_in_file(file, member_name) != "" or hierarchy_has_children_in_file(file, member_name)
-                        if in_hierarchy and not hierarchy_is_store_backed(file, member_name):
-                            register_inline_hierarchy(file, hierarchy_root_in_file(file, member_name), structs)
+                        in_hierarchy: bool = hierarchy_parent_in_file(file, member_name, payload_owner) != "" or hierarchy_has_children_in_file(file, member_name, payload_owner)
+                        if in_hierarchy and not hierarchy_is_store_backed(file, member_name, payload_owner):
+                            register_inline_hierarchy(file, hierarchy_root_in_file(file, member_name, payload_owner), payload_owner, structs)
                             continue
                         # The packed list is keyed by BARE name: a plain enum sharing its name
                         # with a packed one in another module is still a payload enum here.
-                        if packed_listed_for_owner(file, packed_names, member_name, payload_owner):
+                        if enum_index < membership.payload_enums.count and membership.payload_enums[enum_index]:
                             register_payload_enum_decl_flat(member_name, file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], packed_names, payload_owner, structs)
                         else:
                             register_payload_enum_decl_flat(member_name, file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], no_packed_names, payload_owner, structs)
@@ -466,14 +605,12 @@ extend Backend:
 
             # Register fieldless enums from parser side tables. Payload-bearing enums are handled
             # by the packed/payload passes; this pass only needs their scalar backing and ordinals.
-        def register_enums_from_metadata(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            enums_packed_or_ast: mutable darray[sview] = []
-            packed_or_ast_enum_names(file, &enums_packed_or_ast)
-            for enum_index in 0..<file.enum_decl_names.count |enum_index, file, enums_packed_or_ast, structs|:
+        def register_enums_from_metadata(file: Ast::File&, membership: PackedOwnerMembership&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for enum_index in 0..<file.enum_decl_names.count |enum_index, file, membership, structs|:
                 enum_name: sview = file.enum_decl_names[enum_index]
                 enum_owner: sview = "" if enum_index >= file.enum_decl_owners.count else file.enum_decl_owners[enum_index]
                 continue if enum_index_of_owned(structs, enum_owner, enum_name) >= 0
-                continue if packed_listed_for_owner(file, enums_packed_or_ast, enum_name, enum_owner)
+                continue if enum_index < membership.enum_declarations.count and membership.enum_declarations[enum_index]
                 # A member of an INLINE hierarchy is never a plain ordinal enum, even when
                 # its own variants carry no payload: the whole tree is ONE tagged union
                 # sized for its widest leaf, registered by register_inline_hierarchy. A
@@ -482,7 +619,7 @@ extend Backend:
                 # Const enums cannot be hierarchy members; a foreign hierarchy
                 # with the same leaf name must not suppress their registration.
                 if not file.enum_decl_is_const[enum_index]:
-                    continue if hierarchy_parent_in_file(file, enum_name) != "" or hierarchy_has_children_in_file(file, enum_name)
+                    continue if hierarchy_parent_in_file(file, enum_name, enum_owner) != "" or hierarchy_has_children_in_file(file, enum_name, enum_owner)
                 backing: mutable ValueType = ValueType{kind: TypeKind.Signed, bits: 32}
                 if file.enum_decl_is_const[enum_index]:
                     backing <- resolve_type_head(file.enum_decl_storage_heads[enum_index], structs)

@@ -347,6 +347,38 @@ extend Backend:
                 # missing somewhere (a match arm ran its defer AFTER the statement following the
                 # match: stage0 2,1,4 and stage1 2,4,1).
                 defer_mark: usize = local_scope.deferred.count
+                group_names_mark: usize = local_scope.group_names.count
+                group_slots_mark: usize = local_scope.group_slots.count
+                group_manual_mark: usize = local_scope.group_manual_add.count
+                group_region_mark: usize = local_scope.group_region_frame_depths.count
+                has_manual_group_api: mutable bool = false
+                if structs.annotations.submit_offsets.count > 0.usize():
+                    has_manual_group_api <- submit_group_statement_list_mentions_manual_api(body)
+                manual_group_window: mutable SubmitGroupWindow = submit_group_empty_window()
+                if has_manual_group_api:
+                    manual_group_window <- submit_group_window(body, local_scope, structs, fns, generics) can Global{Read,Write}
+                # A valid manual window has already proven that it contains a bare submit site.
+                # Avoid recursively scanning its whole subtree a second time; nested statement
+                # lists otherwise make this redundant walk grow with nesting depth.
+                if not manual_group_window.valid:
+                    has_group_context: mutable bool = group_names_mark > 0 or has_manual_group_api
+                    # Find a submit structurally before asking for initializer types. Most
+                    # statement lists have no submit; running expression_type on every VarDecl
+                    # just to discover that would turn this rare TaskGroup guard into routine
+                    # recursive inference work.
+                    has_submit_site: mutable bool = false
+                    if structs.annotations.submit_offsets.count > 0.usize():
+                        has_submit_site <- submit_group_statement_list_has_submit(body, local_scope, structs)
+                    if not has_group_context and has_submit_site:
+                        has_group_context <- true if submit_group_statement_list_declares_task_group(body, local_scope, fns, structs, generics)
+                    # Most invalid windows are ordinary statement lists. They have no group
+                    # proof to protect, so a recursive submit search would be wasted work.
+                    # Keep that search for active/manual group contexts, including nested
+                    # submits inside a window whose lexical proof failed.
+                    if has_group_context and has_submit_site:
+                        has_untrusted_call: bool = submit_group_statement_list_has_untrusted_call(body, local_scope, structs, fns, generics) can Global{Read,Write}
+                        EmitStatus.Declined return if has_untrusted_call or has_manual_group_api
+                manual_group_pushed: mutable bool = false
                 status: mutable EmitStatus = EmitStatus.Open
                 # `store: Expr.Store[Local] = Expr.Store(owner)` ACTIVATES that store for the
                 # rest of the statement list, exactly as `in store:` does for its block —
@@ -370,6 +402,7 @@ extend Backend:
                     # treating the dead tail as a backend decline incorrectly stripped otherwise
                     # valid functions such as packed-store AST helpers.
                     continue if status != EmitStatus.Open
+                    current_statement_row: usize = statement_row
                     helper_status: i64 = memory_emit_helper(statement, return_type, local_scope, loops, regions, fns, structs, generics, statements_runtime, m, ctx, builder) can Global{Read,Write}
                     buffer_status: mutable i64 = 0
                     if helper_status == 0:
@@ -379,6 +412,22 @@ extend Backend:
                         status <- EmitStatus.Declined
                     elif helper_status == 0 and buffer_status == 0:
                         status <- emit_statement(statement, return_type, local_scope, loops, regions, fns, structs, generics, statements_runtime, m, ctx, builder) can Global{Read,Write}
+                    if status == EmitStatus.Open and manual_group_window.valid and current_statement_row == manual_group_window.declaration_row:
+                        if submit_group_binding_is_task_group(manual_group_window.group_name, local_scope, structs):
+                            if lookup_slot(local_scope, manual_group_window.group_name) is manual_group_slot:
+                                local_scope.group_names.push(manual_group_window.group_name)
+                                local_scope.group_slots.push(manual_group_slot)
+                                local_scope.group_manual_add.push(true)
+                                local_scope.group_region_frame_depths.push(local_scope.region_frame_starts.count)
+                                manual_group_pushed <- true
+                            else:
+                                status <- EmitStatus.Declined
+                    if status == EmitStatus.Open and manual_group_pushed and current_statement_row == manual_group_window.join_row:
+                        local_scope.group_names <- local_scope.group_names.truncate(group_names_mark)
+                        local_scope.group_slots <- local_scope.group_slots.truncate(group_slots_mark)
+                        local_scope.group_manual_add <- local_scope.group_manual_add.truncate(group_manual_mark)
+                        local_scope.group_region_frame_depths <- local_scope.group_region_frame_depths.truncate(group_region_mark)
+                        manual_group_pushed <- false
                     if status == EmitStatus.Declined and dbg_decline_enabled():
                         _ = dbg_decline(statements_runtime.disjoint_function_name, statement)
                     # Read the slot back AFTER the declaration has emitted, so the load sees the
@@ -390,6 +439,17 @@ extend Backend:
                                 statements_runtime.active_store <- LLVMBuildLoad2(builder, llvm_type_of(store_decl_type, structs, ctx), store_decl_slot, "store.active")
                                 statements_runtime.active_store_enum <- store_decl_type.bits.i64()
                                 statements_runtime.active_store_is_block <- true
+                # A failed lowering can leave the compile-time group stack before its proven
+                # join row. Restore both parallel arrays so a later statement cannot attach work
+                # to a group whose join was never emitted.
+                if local_scope.group_names.count > group_names_mark:
+                    local_scope.group_names <- local_scope.group_names.truncate(group_names_mark)
+                if local_scope.group_slots.count > group_slots_mark:
+                    local_scope.group_slots <- local_scope.group_slots.truncate(group_slots_mark)
+                if local_scope.group_manual_add.count > group_manual_mark:
+                    local_scope.group_manual_add <- local_scope.group_manual_add.truncate(group_manual_mark)
+                if local_scope.group_region_frame_depths.count > group_region_mark:
+                    local_scope.group_region_frame_depths <- local_scope.group_region_frame_depths.truncate(group_region_mark)
                 if status == EmitStatus.Open and not (value_expression is Expr.Invalid):
                     if tail_type.kind == TypeKind.Unmodeled:
                         tail_type <- expression_type(value_expression, local_scope, fns, structs, generics)
@@ -480,7 +540,7 @@ extend Backend:
         def emit_panic_report(arguments: darray[Expr]&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 message_storage: mutable darray[u8] = []
-                emit_panic_report_text(panic_message_cstr(arguments, message_storage), "panic.message", (Lexer::source_original_line(line) can Global{Read,Write}).u64(), panic_column_for_line(structs, line).u64(), m, ctx, builder)
+                emit_panic_report_text(panic_message_cstr(arguments, message_storage), "panic.message", (Lexer::source_original_line(line) can Global{Read,Write}).u64(), panic_column_for_line(structs, line).u64(), structs.target.wasm_component_types_enabled, m, ctx, builder)
 
 
         # The panic REPORT itself, for a message that is already a C string and a position
@@ -489,11 +549,11 @@ extend Backend:
         # message is a fixed label and whose position is the predicate's own (docs/127 D8 and
         # the assert/requires/ensure family — stage0 routes all of them through
         # emitPanicWithBacktrace the same way).
-        def emit_panic_report_text(message: cstr, message_symbol: cstr, report_line: u64, report_column: u64, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_panic_report_text(message: cstr, message_symbol: cstr, report_line: u64, report_column: u64, wasm_component: bool, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 # Component guests are freestanding: a printf/backtrace report would add
                 # libc imports that are not part of the WIT world. Their panic path traps.
-                return if wasm_component_codegen_enabled()
+                return if wasm_component
                 source_length: mutable usize = 0
                 source_path: cstr = LLVMGetSourceFileName(m, &source_length)
                 return if source_length == 0

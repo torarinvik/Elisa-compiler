@@ -10,88 +10,1694 @@
 #     def __submit_store_thunk(bits: uintptr) -> R:
 #         {arg, store} = load bits; free(bits); return worker(arg, store)
 #
-# The store is shared with the worker thread, which may only read it (both compilers' semantic
-# layers reject a worker that builds nodes); the capture block belongs to the task and is freed
-# by its thunk before the worker runs. Part of `module Backend` (see codegen.elisa).
+# The store is borrowed by the worker and must stay alive and read-only until its pool or nursery
+# group joins. This lowering declines submissions without a provable structured join or when the
+# active region outlives the join. The capture block is freed by its thunk before the worker runs.
+# Part of `module Backend` (see codegen.elisa).
 
 extend Backend:
     private:
-        # The FnTable row a `submit` worker named by a bare identifier resolves to: the
-        # enclosing module's member first, then a top-level function. -1 when neither exists.
-        def submit_worker_index(name: sview, fns: FnTable&, structs: StructTable&) -> i64 can[Abort.Panic]:
-            if structs.visibility.current_owner != "":
-                owned: i64 = function_index_of(fns, structs.visibility.current_owner, name)
-                owned return if owned >= 0
-            return function_index_of(fns, "", name)
+        struct SubmitGroupWindow:
+            group_name: mutable sview
+            declaration_row: mutable usize
+            join_row: mutable usize
+            valid: mutable bool
 
-        # True when the worker row takes the AST store and nothing else hidden, so
-        # emit_store_capturing_submit can call it as `worker(arg, store)`.
-        def submit_worker_captures_store(index: i64, fns: FnTable&) -> bool can[Abort.Panic]:
-            false return if index < 0
+
+        struct SubmitGroupNameSet:
+            first: sview
+            second: sview
+            third: sview
+            fail_closed_nested_scopes: bool
+
+
+        def submit_group_empty_window() -> SubmitGroupWindow:
+            return SubmitGroupWindow{group_name: "", declaration_row: 0.usize(), join_row: 0.usize(), valid: false}
+
+
+        def submit_group_name_in_names(name: sview, names: darray[sview]) -> bool:
+            for candidate in names:
+                return true if candidate == name
+            return false
+
+
+        def submit_group_name_in_set(name: sview, names: SubmitGroupNameSet) -> bool:
+            return name == names.first or name == names.second or name == names.third
+
+
+        def submit_group_name_set_intersects(names: SubmitGroupNameSet, candidates: darray[sview]) -> bool:
+            for candidate in candidates:
+                true return if submit_group_name_in_set(candidate, names)
+            return false
+
+
+        def submit_group_ascii_identifier_char(text: sview, offset: usize) -> bool:
+            return false if offset >= sview_len(text)
+            character: u8 = sview_at(text, offset)
+            return character == 95 or character == 36 or character in 48..57 or character in 65..90 or character in 97..122
+
+
+        def submit_group_raw_text_mentions_name(text: sview, name: sview) -> bool can[Abort.Panic]:
+            # Pool/nursery capacity clauses are raw spans, not parsed expressions. Search
+            # identifier tokens so `workers(i + 1)` retains `i` just like `workers(i)`.
+            # The backend's byte scan deliberately fails closed for non-ASCII text: the
+            # lexer accepts Unicode identifiers, so byte-level boundary guesses are unsafe.
+            return false if name == ""
+            text_length: usize = sview_len(text)
+            name_length: usize = sview_len(name)
+            for offset in 0..<text_length:
+                return true if sview_at(text, offset) >= 128
+            for offset in 0..<name_length:
+                return true if sview_at(name, offset) >= 128
+            for offset in 0..<text_length:
+                if name_length <= text_length - offset:
+                    end: usize = offset + name_length
+                    if sview_matches_prefix(text, name, offset.i64(), end.i64()):
+                        starts_token: mutable bool = offset == 0
+                        starts_token <- not submit_group_ascii_identifier_char(text, offset - 1.usize()) if offset > 0
+                        ends_token: bool = end == text_length or not submit_group_ascii_identifier_char(text, end)
+                        return true if starts_token and ends_token
+            return false
+
+
+        def submit_group_manual_api_name_set() -> SubmitGroupNameSet:
+            return SubmitGroupNameSet{first: "task_group_new", second: "task_group_add", third: "task_group_wait_all", fail_closed_nested_scopes: false}
+
+
+        # Name-only recognition is not enough: a user overload or module member could make
+        # the constructor/wait spelling call a different function. Require one top-level,
+        # non-generic declaration for each non-generic entry point and the unique top-level
+        # generic task_group_add that emit_task_group_add_value instantiates.
+        def submit_group_unique_function_index(name: sview, arity: usize, fns: FnTable&, generics: GenericTable&) -> i64 can[Abort.Panic]:
+            matches: mutable usize = 0
+            candidate: mutable i64 = -1
+            index: mutable i64 = first_function_named(fns, name)
+            while index >= 0 |index, matches, candidate, fns, name|:
+                return -1 if index.usize() >= fns.owners.count or index.usize() >= fns.param_count.count or index.usize() >= fns.is_extern.count or index.usize() >= fns.needs_store.count or index.usize() >= fns.needs_arena.count or index.usize() >= fns.arena_counts.count
+                matches <- matches + 1.usize()
+                candidate <- index
+                index <- next_function_named(fns, name, index)
+            generic_index: i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, name)
+            return -1 if generic_index >= 0
+            return -1 if matches != 1.usize() or candidate < 0
+            candidate_index: usize = candidate.usize()
+            return -1 if fns.owners[candidate_index] != "" or fns.param_count[candidate_index] != arity or fns.is_extern[candidate_index] or fns.needs_store[candidate_index] or fns.needs_arena[candidate_index] or fns.arena_counts[candidate_index] != 0.usize()
+            return candidate
+
+
+        def submit_group_unique_generic_index(name: sview, generics: GenericTable&) -> i64 can[Abort.Panic]:
+            matches: mutable usize = 0
+            candidate: mutable i64 = -1
+            index: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, name)
+            while index >= 0 |index, matches, candidate, generics, name|:
+                return -1 if index.usize() >= generics.owners.count or index.usize() >= generics.param_count.count
+                matches <- matches + 1.usize()
+                candidate <- index
+                index <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, name, index)
+            return -1 if matches != 1.usize() or candidate < 0
+            candidate_index: usize = candidate.usize()
+            return -1 if generics.owners[candidate_index] != "" or generics.param_count[candidate_index] != 1.usize()
+            return candidate
+
+
+        def submit_group_runtime_api_marker_matches(name: sview, line: u32, structs: StructTable&) -> bool can[Abort.Panic]:
+            false return if structs.annotations.task_group_runtime_api_names.count != structs.annotations.task_group_runtime_api_lines.count
+            for index in 0..<structs.annotations.task_group_runtime_api_names.count:
+                return true if structs.annotations.task_group_runtime_api_names[index] == name and structs.annotations.task_group_runtime_api_lines[index] == line
+            return false
+
+
+        def submit_group_runtime_apis_are_unique(fns: FnTable&, generics: GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            constructor_index: i64 = submit_group_unique_function_index("task_group_new", 0.usize(), fns, generics)
+            wait_index: i64 = submit_group_unique_function_index("task_group_wait_all", 1.usize(), fns, generics)
+            raw_constructor_index: i64 = submit_group_unique_function_index("task_group_new_raw", 0.usize(), fns, generics)
+            raw_add_index: i64 = submit_group_unique_function_index("task_group_add_raw", 2.usize(), fns, generics)
+            raw_wait_index: i64 = submit_group_unique_function_index("task_group_wait_all_raw", 1.usize(), fns, generics)
+            push_state_index: i64 = submit_group_unique_function_index("ctx_task_group_push_state", 2.usize(), fns, generics)
+            release_state_index: i64 = submit_group_unique_function_index("ctx_task_group_release_all", 1.usize(), fns, generics)
+            wait_record_index: i64 = submit_group_unique_function_index("ctx_pool_wait_record", 1.usize(), fns, generics)
+            add_index: i64 = submit_group_unique_generic_index("task_group_add", generics)
+            false return if constructor_index < 0 or wait_index < 0 or raw_constructor_index < 0 or raw_add_index < 0 or raw_wait_index < 0 or push_state_index < 0 or release_state_index < 0 or wait_record_index < 0 or add_index < 0
+            false return if add_index.usize() >= generics.decls.count
+            constructor_row: usize = constructor_index.usize()
+            wait_row: usize = wait_index.usize()
+            raw_constructor_row: usize = raw_constructor_index.usize()
+            raw_add_row: usize = raw_add_index.usize()
+            raw_wait_row: usize = raw_wait_index.usize()
+            push_state_row: usize = push_state_index.usize()
+            release_state_row: usize = release_state_index.usize()
+            wait_record_row: usize = wait_record_index.usize()
+            add_row: usize = add_index.usize()
+            false return if constructor_row >= fns.lines.count or wait_row >= fns.lines.count or constructor_row >= fns.returns.count or wait_row >= fns.returns.count or wait_row >= fns.param_start.count or wait_row >= fns.param_count.count
+            false return if raw_constructor_row >= fns.lines.count or raw_add_row >= fns.lines.count or raw_wait_row >= fns.lines.count or push_state_row >= fns.lines.count or release_state_row >= fns.lines.count or wait_record_row >= fns.lines.count
+            false return if not submit_group_runtime_api_marker_matches("task_group_new", fns.lines[constructor_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("task_group_wait_all", fns.lines[wait_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("task_group_new_raw", fns.lines[raw_constructor_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("task_group_add_raw", fns.lines[raw_add_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("task_group_wait_all_raw", fns.lines[raw_wait_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("ctx_task_group_push_state", fns.lines[push_state_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("ctx_task_group_release_all", fns.lines[release_state_row], structs)
+            false return if not submit_group_runtime_api_marker_matches("ctx_pool_wait_record", fns.lines[wait_record_row], structs)
+            constructor_type: ValueType = fns.returns[constructor_row]
+            false return if constructor_type.kind != TypeKind.Struct or constructor_type.bits.usize() >= structs.records.names.count or structs.records.names[constructor_type.bits.usize()] != "TaskGroup"
+            false return if fns.returns[wait_row].kind != TypeKind.Void
+            param_index: usize = fns.param_start[wait_row]
+            false return if param_index >= fns.param_types.count
+            wait_parameter: ValueType = fns.param_types[param_index]
+            false return if wait_parameter.kind != TypeKind.Ref
+            group_parameter: ValueType = ref_target_of(wait_parameter, structs)
+            false return if group_parameter.kind != TypeKind.Struct or group_parameter.bits.usize() >= structs.records.names.count or structs.records.names[group_parameter.bits.usize()] != "TaskGroup"
+            false return if first_function_named(fns, "task_group_add") >= 0
+            match generics.decls[add_row]:
+                Decl.Func(_, params, _, _, _, decorators, function_pos):
+                    false return if not any decorator in decorators where decorator.name == "internal"
+                    false return if not submit_group_runtime_api_marker_matches("task_group_add", function_pos.line, structs)
+                    return params.count == 2.usize()
+                _:
+                    return false
+
+
+        def submit_group_argument_name(expression: Expr) -> sview can[Abort.Panic]:
+            match expression:
+                Expr.Ident(name, _):
+                    return name
+                Expr.Unary(TokenKind.Ampersand, operand, _) | Expr.Paren(operand, _):
+                    return submit_group_argument_name(operand)
+                _:
+                    return ""
+
+
+        def submit_group_api_callee_matches(callee: Expr, wanted: sview, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, generics: GenericTable&) -> bool can[Abort.Panic]:
+            match callee:
+                Expr.Ident(name, _):
+                    # A local function value can be rebound after its declaration, while
+                    # local_fn_origin records only the initializer. Trust only the direct
+                    # runtime spelling when no local binding shadows it.
+                    false return if name != wanted or lookup_slot(local_scope, name) is local_shadow
+                    owner: sview = structs.visibility.current_owner
+                    if owner != "":
+                        false return if fns.owners.count != fns.names.count or generics.owners.count != generics.names.count
+                        function_index: mutable i64 = first_function_named(fns, wanted)
+                        while function_index >= 0 |function_index, fns, wanted, owner|:
+                            false return if fns.owners[function_index.usize()] == owner
+                            function_index <- next_function_named(fns, wanted, function_index)
+                        generic_index: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, wanted)
+                        while generic_index >= 0 |generic_index, generics, wanted, owner|:
+                            false return if generics.owners[generic_index.usize()] == owner
+                            generic_index <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, wanted, generic_index)
+                    return true
+                _:
+                    return false
+
+
+        # Atomic `load`/`store` calls are common around a structured join and do not manipulate
+        # TaskGroup state. Trust only their unique bundled generic declarations; a same-named
+        # local alias, ordinary overload, or user generic remains an unknown helper call.
+        def submit_group_call_is_trusted_atomic(callee: Expr, argument_count: usize, local_scope: mutable Scope&, fns: FnTable&, generics: GenericTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                match callee:
+                    Expr.Ident(name, _):
+                        false return if name != "load" and name != "store"
+                        false return if lookup_slot(local_scope, name) is local_shadow
+                        function_index: mutable i64 = first_function_named(fns, name)
+                        false return if function_index >= 0
+                        expected_arity: usize = 2.usize() if name == "load" else 3.usize()
+                        false return if argument_count != expected_arity
+                        generic_index: i64 = submit_group_unique_generic_index(name, generics)
+                        false return if generic_index < 0 or generic_index.usize() >= generics.decls.count
+                        match generics.decls[generic_index.usize()]:
+                            Decl.Func(_, params, _, _, _, _, function_pos):
+                                false return if params.count != expected_arity
+                                return Lexer::source_line_is_runtime_std(function_pos.line) can Global{Read,Write}
+                            _:
+                                return false
+                    _:
+                        return false
+
+
+        def submit_group_constructor_name(statement: Stmt, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, generics: GenericTable&) -> sview can[Abort.Panic]:
+            match statement:
+                Stmt.VarDecl(name, _, Expr.Call(callee, arguments, _, _), _):
+                    return name if arguments.count == 0 and submit_group_api_callee_matches(callee, "task_group_new", local_scope, fns, structs, generics)
+                _:
+                    pass
+            return ""
+
+
+        def submit_group_wait_matches(statement: Stmt, group_name: sview, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, generics: GenericTable&) -> bool can[Abort.Panic]:
+            false return if group_name == ""
+            match statement:
+                Stmt.Expr(Expr.Call(callee, arguments, _, _), _):
+                    return arguments.count == 1.usize() and submit_group_api_callee_matches(callee, "task_group_wait_all", local_scope, fns, structs, generics) and submit_group_argument_name(arguments[0]) == group_name
+                _:
+                    return false
+
+
+        # A value-bound submit is owned by a manual group only when its immediately
+        # following statement transfers that exact local Task into the same group.
+        # Requiring the parser's submit marker, a direct worker call, and `move task`
+        # keeps aliases, retained Tasks, and merely nearby adds outside this proof.
+        def submit_group_submit_add_pair_matches(submit_statement: Stmt, add_statement: Stmt, group_name: sview, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, generics: GenericTable&) -> bool can[Abort.Panic]:
+            match submit_statement:
+                Stmt.VarDecl(task_name, _, Expr.Block(submit_statements, Expr.Call(submit_callee, submit_arguments, _, _), _, submit_pos), _):
+                    false return if task_name == "" or task_name == "_" or submit_statements.count != 0.usize() or submit_arguments.count != 1.usize()
+                    false return if not submit_marker_at(submit_pos.offset, structs)
+                    false return if not (submit_callee is Expr.Ident(_, _))
+                    match add_statement:
+                        Stmt.Expr(Expr.Call(add_callee, add_arguments, _, _), _):
+                            false return if add_arguments.count != 2.usize()
+                            false return if not submit_group_api_callee_matches(add_callee, "task_group_add", local_scope, fns, structs, generics)
+                            false return if submit_group_argument_name(add_arguments[0]) != group_name
+                            match add_arguments[1]:
+                                Expr.Move(Expr.Ident(added_task_name, _), _):
+                                    return added_task_name == task_name
+                                _:
+                                    return false
+                        _:
+                            return false
+                _:
+                    return false
+
+
+        # The registration stack currently stores a source name, not a resolved local slot.
+        # Keep its meaning stable from the inferred constructor to the exact wait: any read,
+        # write, alias, or shadow of that name in between makes name-based registration unsafe.
+        # Unknown syntax fails closed so adding an AST node cannot silently weaken this proof.
+        def submit_group_pattern_mentions_names(pattern: Pattern, names: SubmitGroupNameSet) -> bool can[Abort.Panic]:
+            match pattern:
+                Pattern.Wildcard | Pattern.Literal(_):
+                    return false
+                Pattern.Binding(binding) | Pattern.Pin(binding) | Pattern.Rest(binding):
+                    return submit_group_name_in_set(binding, names)
+                Pattern.Variant(path, fields) | Pattern.Struct(path, fields):
+                    true return if submit_group_name_in_set(path, names)
+                    for field in fields:
+                        true return if submit_group_pattern_mentions_names(field, names)
+                    return false
+                Pattern.Field(_, inner):
+                    for field in inner:
+                        true return if submit_group_pattern_mentions_names(field, names)
+                    return false
+                Pattern.Tuple(elements) | Pattern.Or(elements):
+                    for element in elements:
+                        true return if submit_group_pattern_mentions_names(element, names)
+                    return false
+                Pattern.TypeBind(type_name, binder):
+                    return submit_group_name_in_set(type_name, names) or submit_group_name_in_set(binder, names)
+                Pattern.As(binding, inner):
+                    true return if submit_group_name_in_set(binding, names)
+                    for field in inner:
+                        true return if submit_group_pattern_mentions_names(field, names)
+                    return false
+                Pattern.Other(_):
+                    return true
+                _:
+                    return true
+
+
+        def submit_group_pattern_mentions_manual_api(pattern: Pattern) -> bool can[Abort.Panic]:
+            return submit_group_pattern_mentions_names(pattern, submit_group_manual_api_name_set())
+
+
+        def submit_group_expression_mentions_names(expression: Expr, names: SubmitGroupNameSet, descend_statement_lists: bool) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.Ident(identifier, _):
+                    return submit_group_name_in_set(identifier, names)
+                Expr.Call(callee, arguments, _, _):
+                    if callee is Expr.Ident(add_name, _) and add_name == "task_group_add" and arguments.count == 2.usize() and submit_group_argument_name(arguments[0]) == names.first:
+                        return submit_group_expression_mentions_names(arguments[1], names, descend_statement_lists)
+                    true return if submit_group_expression_mentions_names(callee, names, descend_statement_lists)
+                    for argument in arguments:
+                        true return if submit_group_expression_mentions_names(argument, names, descend_statement_lists)
+                    return false
+                Expr.StaticEffectCall(effect_type, _, _, arguments, _, _):
+                    true return if submit_group_expression_mentions_names(effect_type, names, descend_statement_lists)
+                    for argument in arguments:
+                        true return if submit_group_expression_mentions_names(argument, names, descend_statement_lists)
+                    return false
+                Expr.Field(object, member, _) | Expr.Scope(object, member, _):
+                    return submit_group_name_in_set(member, names) or submit_group_expression_mentions_names(object, names, descend_statement_lists)
+                Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _) | Expr.Paren(object, _):
+                    return submit_group_expression_mentions_names(object, names, descend_statement_lists)
+                Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                    return submit_group_expression_mentions_names(object, names, descend_statement_lists) or submit_group_expression_mentions_names(index, names, descend_statement_lists)
+                Expr.Slice(object, low, high, _):
+                    return submit_group_expression_mentions_names(object, names, descend_statement_lists) or submit_group_expression_mentions_names(low, names, descend_statement_lists) or submit_group_expression_mentions_names(high, names, descend_statement_lists)
+                Expr.IndexN(object, indices, _):
+                    true return if submit_group_expression_mentions_names(object, names, descend_statement_lists)
+                    for index in indices:
+                        true return if submit_group_expression_mentions_names(index, names, descend_statement_lists)
+                    return false
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements:
+                        true return if submit_group_expression_mentions_names(element, names, descend_statement_lists)
+                    return false
+                Expr.DictLit(entries, _):
+                    for entry in entries:
+                        true return if submit_group_expression_mentions_names(entry.key, names, descend_statement_lists) or submit_group_expression_mentions_names(entry.value, names, descend_statement_lists)
+                    return false
+                Expr.Construct(type_expression, fields, _):
+                    true return if submit_group_expression_mentions_names(type_expression, names, descend_statement_lists)
+                    for field in fields:
+                        true return if submit_group_expression_mentions_names(field.value, names, descend_statement_lists)
+                    return false
+                Expr.RecordUpdate(base, fields, _):
+                    true return if submit_group_expression_mentions_names(base, names, descend_statement_lists)
+                    for field in fields:
+                        true return if submit_group_expression_mentions_names(field.value, names, descend_statement_lists)
+                    return false
+                Expr.If(condition, then_expression, else_expression, _):
+                    return submit_group_expression_mentions_names(condition, names, descend_statement_lists) or submit_group_expression_mentions_names(then_expression, names, descend_statement_lists) or submit_group_expression_mentions_names(else_expression, names, descend_statement_lists)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    true return if submit_group_expression_mentions_names(scrutinee, names, descend_statement_lists)
+                    for arm in arms:
+                        true return if submit_group_pattern_mentions_names(arm.pattern, names)
+                        true return if submit_group_expression_mentions_names(arm.guard, names, descend_statement_lists)
+                        if descend_statement_lists:
+                            true return if submit_group_statement_list_mentions_names(arm.body, names, descend_statement_lists)
+                        elif names.fail_closed_nested_scopes and arm.body.count > 0.usize():
+                            return true
+                    return false
+                Expr.Comprehension(variable, iterable, condition, body, _):
+                    true return if submit_group_name_in_set(variable, names)
+                    return submit_group_expression_mentions_names(iterable, names, descend_statement_lists) or submit_group_expression_mentions_names(condition, names, descend_statement_lists) or submit_group_expression_mentions_names(body, names, descend_statement_lists)
+                Expr.Refinement(base, predicate, _):
+                    return submit_group_expression_mentions_names(base, names, descend_statement_lists) or submit_group_expression_mentions_names(predicate, names, descend_statement_lists)
+                Expr.GetElse(guarded, recovery, _):
+                    true return if submit_group_expression_mentions_names(guarded, names, descend_statement_lists)
+                    if descend_statement_lists:
+                        return submit_group_statement_list_mentions_names(recovery, names, descend_statement_lists)
+                    return true if names.fail_closed_nested_scopes and recovery.count > 0.usize()
+                    return false
+                Expr.Lambda(_, _, _):
+                    # A lambda body is emitted and guarded in its own function scope. The
+                    # preliminary shallow context probe must not classify every lambda as a
+                    # manual API use; group-window queries still fail closed on lambda escape.
+                    return descend_statement_lists or names.fail_closed_nested_scopes
+                Expr.Block(statements, value, captures, _):
+                    for capture in captures:
+                        # A bare loop-header capture aliases and mutates an existing
+                        # outer local in place. It is safe for a proven TaskGroup
+                        # window; initialized captures are header declarations in
+                        # `statements` and still hit the binding check below. The
+                        # fail-closed binder probe retains captures as live uses.
+                        continue if not names.fail_closed_nested_scopes and capture == names.first
+                        true return if submit_group_name_in_set(capture, names)
+                    if descend_statement_lists:
+                        true return if submit_group_statement_list_mentions_names(statements, names, descend_statement_lists)
+                    elif names.fail_closed_nested_scopes and statements.count > 0.usize():
+                        return true
+                    return submit_group_expression_mentions_names(value, names, descend_statement_lists)
+                Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.ShorthandMember(_, _):
+                    return false
+                _:
+                    return true
+
+
+        def submit_group_statement_mentions_names(statement: Stmt, names: SubmitGroupNameSet, descend_statement_lists: bool) -> bool can[Abort.Panic]:
+            match statement:
+                Stmt.Expr(expression, _) | Stmt.Contract(_, expression, _):
+                    return submit_group_expression_mentions_names(expression, names, descend_statement_lists)
+                Stmt.Block(_, clause, binding, body, _):
+                    true return if submit_group_name_in_set(binding, names)
+                    # Block clauses are retained as raw source entries rather than Expr nodes.
+                    # Some are runtime expressions (for example a pool or nursery worker
+                    # count), so inspect identifier tokens for names tracked by this proof.
+                    for clause_name in clause:
+                        true return if submit_group_raw_text_mentions_name(clause_name, names.first) or submit_group_raw_text_mentions_name(clause_name, names.second) or submit_group_raw_text_mentions_name(clause_name, names.third)
+                    if descend_statement_lists:
+                        return submit_group_statement_list_mentions_names(body, names, descend_statement_lists)
+                    return true if names.fail_closed_nested_scopes and body.count > 0.usize()
+                    return false
+                Stmt.VarDecl(binding, type_expression, value, _):
+                    return submit_group_name_in_set(binding, names) or submit_group_expression_mentions_names(type_expression, names, descend_statement_lists) or submit_group_expression_mentions_names(value, names, descend_statement_lists)
+                Stmt.Assign(target, _, value, _):
+                    return submit_group_expression_mentions_names(target, names, descend_statement_lists) or submit_group_expression_mentions_names(value, names, descend_statement_lists)
+                Stmt.If(condition, then_body, else_body, _):
+                    true return if submit_group_expression_mentions_names(condition, names, descend_statement_lists)
+                    if descend_statement_lists:
+                        return submit_group_statement_list_mentions_names(then_body, names, descend_statement_lists) or submit_group_statement_list_mentions_names(else_body, names, descend_statement_lists)
+                    return true if names.fail_closed_nested_scopes and (then_body.count > 0.usize() or else_body.count > 0.usize())
+                    return false
+                Stmt.While(condition, body, _):
+                    true return if submit_group_expression_mentions_names(condition, names, descend_statement_lists)
+                    if descend_statement_lists:
+                        return submit_group_statement_list_mentions_names(body, names, descend_statement_lists)
+                    return true if names.fail_closed_nested_scopes and body.count > 0.usize()
+                    return false
+                Stmt.For(_, variables, iterable, body, _):
+                    true return if submit_group_name_set_intersects(names, variables)
+                    true return if submit_group_expression_mentions_names(iterable, names, descend_statement_lists)
+                    if descend_statement_lists:
+                        return submit_group_statement_list_mentions_names(body, names, descend_statement_lists)
+                    return true if names.fail_closed_nested_scopes and body.count > 0.usize()
+                    return false
+                Stmt.Return(value, _):
+                    if value is return_value:
+                        return submit_group_expression_mentions_names(return_value, names, descend_statement_lists)
+                    return false
+                Stmt.Break(_, _) | Stmt.Continue(_, _):
+                    return false
+                Stmt.Match(scrutinee, arms, _):
+                    true return if submit_group_expression_mentions_names(scrutinee, names, descend_statement_lists)
+                    for arm in arms:
+                        true return if submit_group_pattern_mentions_names(arm.pattern, names)
+                        true return if submit_group_expression_mentions_names(arm.guard, names, descend_statement_lists)
+                        if descend_statement_lists:
+                            true return if submit_group_statement_list_mentions_names(arm.body, names, descend_statement_lists)
+                        elif names.fail_closed_nested_scopes and arm.body.count > 0.usize():
+                            return true
+                    return false
+                Stmt.Invalid:
+                    return true
+                _:
+                    return true
+
+
+        def submit_group_statement_list_mentions_names(statements: darray[Stmt], names: SubmitGroupNameSet, descend_statement_lists: bool) -> bool can[Abort.Panic]:
+            for statement in statements:
+                true return if submit_group_statement_mentions_names(statement, names, descend_statement_lists)
+            return false
+
+
+        def submit_group_expression_calls_name(expression: Expr, wanted: sview) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.Call(callee, arguments, _, _):
+                    true return if callee is Expr.Ident(wanted, _)
+                    true return if callee is Expr.Scope(_, scoped_name, _) and scoped_name == wanted
+                    true return if callee is Expr.Field(_, field_name, _) and field_name == wanted
+                    true return if submit_group_expression_calls_name(callee, wanted)
+                    for argument in arguments:
+                        true return if submit_group_expression_calls_name(argument, wanted)
+                    return false
+                Expr.StaticEffectCall(effect_type, _, _, arguments, _, _):
+                    true return if submit_group_expression_calls_name(effect_type, wanted)
+                    for argument in arguments:
+                        true return if submit_group_expression_calls_name(argument, wanted)
+                    return false
+                Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _) | Expr.Paren(object, _):
+                    return submit_group_expression_calls_name(object, wanted)
+                Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                    return submit_group_expression_calls_name(object, wanted) or submit_group_expression_calls_name(index, wanted)
+                Expr.Slice(object, low, high, _):
+                    return submit_group_expression_calls_name(object, wanted) or submit_group_expression_calls_name(low, wanted) or submit_group_expression_calls_name(high, wanted)
+                Expr.IndexN(object, indices, _):
+                    true return if submit_group_expression_calls_name(object, wanted)
+                    for index in indices:
+                        true return if submit_group_expression_calls_name(index, wanted)
+                    return false
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements:
+                        true return if submit_group_expression_calls_name(element, wanted)
+                    return false
+                Expr.DictLit(entries, _):
+                    for entry in entries:
+                        true return if submit_group_expression_calls_name(entry.key, wanted) or submit_group_expression_calls_name(entry.value, wanted)
+                    return false
+                Expr.Construct(type_expression, fields, _):
+                    true return if submit_group_expression_calls_name(type_expression, wanted)
+                    for field in fields:
+                        true return if submit_group_expression_calls_name(field.value, wanted)
+                    return false
+                Expr.RecordUpdate(base, fields, _):
+                    true return if submit_group_expression_calls_name(base, wanted)
+                    for field in fields:
+                        true return if submit_group_expression_calls_name(field.value, wanted)
+                    return false
+                Expr.If(condition, then_expression, else_expression, _):
+                    return submit_group_expression_calls_name(condition, wanted) or submit_group_expression_calls_name(then_expression, wanted) or submit_group_expression_calls_name(else_expression, wanted)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    true return if submit_group_expression_calls_name(scrutinee, wanted)
+                    for arm in arms:
+                        true return if submit_group_expression_calls_name(arm.guard, wanted) or submit_group_statement_list_calls_name(arm.body, wanted)
+                    return false
+                Expr.Comprehension(_, iterable, condition, body, _):
+                    return submit_group_expression_calls_name(iterable, wanted) or submit_group_expression_calls_name(condition, wanted) or submit_group_expression_calls_name(body, wanted)
+                Expr.Refinement(base, predicate, _):
+                    return submit_group_expression_calls_name(base, wanted) or submit_group_expression_calls_name(predicate, wanted)
+                Expr.GetElse(guarded, recovery, _):
+                    return submit_group_expression_calls_name(guarded, wanted) or submit_group_statement_list_calls_name(recovery, wanted)
+                Expr.Block(statements, value, _, _):
+                    return submit_group_statement_list_calls_name(statements, wanted) or submit_group_expression_calls_name(value, wanted)
+                Expr.Lambda(_, _, _) | Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _):
+                    return false
+                _:
+                    return false
+
+
+        def submit_group_statement_calls_name(statement: Stmt, wanted: sview) -> bool can[Abort.Panic]:
+            match statement:
+                Stmt.Expr(expression, _) | Stmt.Contract(_, expression, _):
+                    return submit_group_expression_calls_name(expression, wanted)
+                Stmt.Block(_, _, _, body, _):
+                    return submit_group_statement_list_calls_name(body, wanted)
+                Stmt.VarDecl(_, type_expression, value, _):
+                    return submit_group_expression_calls_name(type_expression, wanted) or submit_group_expression_calls_name(value, wanted)
+                Stmt.Assign(target, _, value, _):
+                    return submit_group_expression_calls_name(target, wanted) or submit_group_expression_calls_name(value, wanted)
+                Stmt.If(condition, then_body, else_body, _):
+                    return submit_group_expression_calls_name(condition, wanted) or submit_group_statement_list_calls_name(then_body, wanted) or submit_group_statement_list_calls_name(else_body, wanted)
+                Stmt.While(condition, body, _):
+                    return submit_group_expression_calls_name(condition, wanted) or submit_group_statement_list_calls_name(body, wanted)
+                Stmt.For(_, _, iterable, body, _):
+                    return submit_group_expression_calls_name(iterable, wanted) or submit_group_statement_list_calls_name(body, wanted)
+                Stmt.Return(value, _):
+                    if value is return_value:
+                        return submit_group_expression_calls_name(return_value, wanted)
+                    return false
+                Stmt.Match(scrutinee, arms, _):
+                    true return if submit_group_expression_calls_name(scrutinee, wanted)
+                    for arm in arms:
+                        true return if submit_group_expression_calls_name(arm.guard, wanted) or submit_group_statement_list_calls_name(arm.body, wanted)
+                    return false
+                Stmt.Invalid | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                    return false
+                _:
+                    return false
+
+
+        def submit_group_statement_list_calls_name(statements: darray[Stmt], wanted: sview) -> bool can[Abort.Panic]:
+            for statement in statements:
+                true return if submit_group_statement_calls_name(statement, wanted)
+            return false
+
+
+        def submit_group_runtime_api_declaration_name(declaration: Decl) -> sview can[Abort.Panic]:
+            match declaration:
+                Decl.Func(name, _, _, body, _, decorators, _):
+                    "" return if not any decorator in decorators where decorator.name == "internal"
+                    if name == "task_group_new":
+                        return name if submit_group_statement_list_calls_name(body, "task_group_new_raw")
+                    if name == "task_group_wait_all":
+                        return name if submit_group_statement_list_calls_name(body, "task_group_wait_all_raw") and submit_group_statement_list_calls_name(body, "ctx_task_group_release_all")
+                    if name == "task_group_add":
+                        return name if submit_group_statement_list_calls_name(body, "task_group_add_raw") and submit_group_statement_list_calls_name(body, "ctx_task_group_push_state")
+                    if name == "task_group_new_raw":
+                        return name
+                    if name == "task_group_add_raw":
+                        return name if submit_group_statement_list_calls_name(body, "ctx_concurrency_alloc")
+                    if name == "task_group_wait_all_raw":
+                        return name if submit_group_statement_list_calls_name(body, "ctx_pool_wait_record")
+                    if name == "ctx_task_group_push_state":
+                        return name if submit_group_statement_list_calls_name(body, "ctx_concurrency_alloc")
+                    if name == "ctx_task_group_release_all":
+                        return name if submit_group_statement_list_calls_name(body, "ctx_concurrency_work1_release")
+                    if name == "ctx_pool_wait_record":
+                        return name if submit_group_statement_list_calls_name(body, "ctx_pool_wait")
+                    return ""
+                _:
+                    return ""
+
+
+        def submit_group_early_exit_expression(expression: Expr) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.GetElse(_, _, _):
+                    return true
+                Expr.Lambda(_, _, _):
+                    return false
+                Expr.Call(callee, arguments, _, _):
+                    true return if submit_group_early_exit_expression(callee)
+                    for argument in arguments:
+                        true return if submit_group_early_exit_expression(argument)
+                    return false
+                Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                    for argument in arguments:
+                        true return if submit_group_early_exit_expression(argument)
+                    return false
+                Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _) | Expr.Paren(object, _):
+                    return submit_group_early_exit_expression(object)
+                Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                    return submit_group_early_exit_expression(object) or submit_group_early_exit_expression(index)
+                Expr.Slice(object, low, high, _):
+                    return submit_group_early_exit_expression(object) or submit_group_early_exit_expression(low) or submit_group_early_exit_expression(high)
+                Expr.IndexN(object, indices, _):
+                    true return if submit_group_early_exit_expression(object)
+                    for index in indices:
+                        true return if submit_group_early_exit_expression(index)
+                    return false
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements:
+                        true return if submit_group_early_exit_expression(element)
+                    return false
+                Expr.DictLit(entries, _):
+                    for entry in entries:
+                        true return if submit_group_early_exit_expression(entry.key) or submit_group_early_exit_expression(entry.value)
+                    return false
+                Expr.Construct(_, fields, _):
+                    for field in fields:
+                        true return if submit_group_early_exit_expression(field.value)
+                    return false
+                Expr.RecordUpdate(base, fields, _):
+                    true return if submit_group_early_exit_expression(base)
+                    for field in fields:
+                        true return if submit_group_early_exit_expression(field.value)
+                    return false
+                Expr.If(condition, then_expression, else_expression, _):
+                    return submit_group_early_exit_expression(condition) or submit_group_early_exit_expression(then_expression) or submit_group_early_exit_expression(else_expression)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    true return if submit_group_early_exit_expression(scrutinee)
+                    for arm in arms:
+                        true return if submit_group_early_exit_expression(arm.guard) or submit_group_early_exit_statements(arm.body)
+                    return false
+                Expr.Comprehension(_, iterable, condition, body, _):
+                    return submit_group_early_exit_expression(iterable) or submit_group_early_exit_expression(condition) or submit_group_early_exit_expression(body)
+                Expr.Refinement(base, predicate, _):
+                    return submit_group_early_exit_expression(base) or submit_group_early_exit_expression(predicate)
+                Expr.Block(statements, value, _, _):
+                    return submit_group_early_exit_statements(statements) or submit_group_early_exit_expression(value)
+                Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _):
+                    return false
+                _:
+                    return true
+
+
+        def submit_group_early_exit_statements(statements: darray[Stmt]) -> bool can[Abort.Panic]:
+            for statement in statements:
+                match statement:
+                    Stmt.Return(_, _) | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                        return true
+                    Stmt.Expr(expression, _):
+                        true return if submit_group_early_exit_expression(expression)
+                    Stmt.VarDecl(_, _, value, _):
+                        true return if submit_group_early_exit_expression(value)
+                    Stmt.Assign(target, _, value, _):
+                        true return if submit_group_early_exit_expression(target) or submit_group_early_exit_expression(value)
+                    Stmt.If(condition, then_body, else_body, _):
+                        true return if submit_group_early_exit_expression(condition) or submit_group_early_exit_statements(then_body) or submit_group_early_exit_statements(else_body)
+                    Stmt.While(condition, body, _):
+                        true return if submit_group_early_exit_expression(condition) or submit_group_early_exit_statements(body)
+                    Stmt.For(_, _, iterable, body, _):
+                        true return if submit_group_early_exit_expression(iterable) or submit_group_early_exit_statements(body)
+                    Stmt.Block(_, _, _, body, _):
+                        true return if submit_group_early_exit_statements(body)
+                    Stmt.Match(scrutinee, arms, _):
+                        true return if submit_group_early_exit_expression(scrutinee)
+                        for arm in arms:
+                            true return if submit_group_early_exit_expression(arm.guard) or submit_group_early_exit_statements(arm.body)
+                    Stmt.Contract(_, expression, _):
+                        true return if submit_group_early_exit_expression(expression)
+                    Stmt.Invalid:
+                        return true
+                    _:
+                        return true
+            return false
+
+
+        def submit_group_early_exit_range(statements: darray[Stmt]&, first: usize, stop: usize) -> bool can[Abort.Panic]:
+            false return if first > stop or stop > statements.count
+            for row in first..<stop:
+                true return if submit_group_early_exit_statements([statements[row]])
+            return false
+
+
+        def submit_group_scan_memo_hash(first: uintptr, count: usize) -> usize:
+            h: mutable u64 = first.u64() ^ (count.u64() * 0x9e3779b97f4a7c15)
+            h <- (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9
+            h <- (h ^ (h >> 27)) * 0x94d049bb133111eb
+            h <- h ^ (h >> 31)
+            return h.usize()
+
+
+        def submit_group_scan_memo_probe(entries: darray[SubmitListMemoEntry]&, first: uintptr, count: usize) -> usize can[Abort.Panic]:
+            assert entries.count > 0.usize() and (entries.count & (entries.count - 1.usize())) == 0.usize()
+            mask: usize = entries.count - 1.usize()
+            slot: mutable usize = submit_group_scan_memo_hash(first, count) & mask
+            probed: mutable usize = 0
+            trusted Unsafe.AssumeProgress:
+                while probed < entries.count:
+                    return slot if entries[slot].first == 0.uintptr() or (entries[slot].first == first and entries[slot].count == count)
+                    slot <- (slot + 1.usize()) & mask
+                    probed <- probed + 1.usize()
+            panic("submit scan memo table exhausted")
+
+
+        def submit_group_scan_memo_grow(local_scope: mutable Scope&) -> void can[Abort.Panic, Memory.Allocate]:
+            old_entries: darray[SubmitListMemoEntry] = local_scope.submit_scan_memo
+            new_capacity: mutable usize = 8.usize()
+            if old_entries.count > 0.usize():
+                new_capacity <- old_entries.count * 2.usize()
+                assert new_capacity > old_entries.count
+            new_entries: mutable darray[SubmitListMemoEntry] = []
+            new_entries.resize(new_capacity)
+            for row in 0..<old_entries.count:
+                entry: SubmitListMemoEntry = old_entries[row]
+                if entry.first != 0.uintptr():
+                    slot: usize = submit_group_scan_memo_probe(new_entries, entry.first, entry.count)
+                    new_entries[slot] <- entry
+            local_scope.submit_scan_memo <- new_entries
+
+
+        def submit_group_scan_memo_lookup(local_scope: mutable Scope&, first: uintptr, count: usize, found: mutable bool&) -> bool can[Abort.Panic]:
+            found <- false
+            entries: darray[SubmitListMemoEntry] = local_scope.submit_scan_memo
+            return false if entries.count == 0.usize()
+            slot: usize = submit_group_scan_memo_probe(entries, first, count)
+            return false if entries[slot].first == 0.uintptr()
+            assert entries[slot].first == first and entries[slot].count == count
+            found <- true
+            return entries[slot].has_submit
+
+
+        def submit_group_scan_memo_store(local_scope: mutable Scope&, first: uintptr, count: usize, has_submit: bool) -> void can[Abort.Panic, Memory.Allocate]:
+            if local_scope.submit_scan_memo.count == 0.usize() or local_scope.submit_scan_memo_used + 1.usize() >= local_scope.submit_scan_memo.count - local_scope.submit_scan_memo.count / 4.usize():
+                submit_group_scan_memo_grow(local_scope)
+            slot: usize = submit_group_scan_memo_probe(local_scope.submit_scan_memo, first, count)
+            if local_scope.submit_scan_memo[slot].first == 0.uintptr():
+                local_scope.submit_scan_memo_used <- local_scope.submit_scan_memo_used + 1.usize()
+            else:
+                assert local_scope.submit_scan_memo[slot].first == first and local_scope.submit_scan_memo[slot].count == count
+            local_scope.submit_scan_memo[slot] <- SubmitListMemoEntry{first: first, count: count, has_submit: has_submit}
+
+
+        def submit_group_expression_has_submit(expression: Expr, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Block(statements, value, _, pos):
+                    true return if submit_marker_at(pos.offset, structs)
+                    return submit_group_expression_has_submit(value, local_scope, structs) or submit_group_statement_list_has_submit(statements, local_scope, structs)
+                Expr.Call(callee, arguments, _, _):
+                    true return if submit_group_expression_has_submit(callee, local_scope, structs)
+                    for argument in arguments:
+                        true return if submit_group_expression_has_submit(argument, local_scope, structs)
+                    return false
+                Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                    for argument in arguments:
+                        true return if submit_group_expression_has_submit(argument, local_scope, structs)
+                    return false
+                Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _) | Expr.Paren(object, _):
+                    return submit_group_expression_has_submit(object, local_scope, structs)
+                Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                    return submit_group_expression_has_submit(object, local_scope, structs) or submit_group_expression_has_submit(index, local_scope, structs)
+                Expr.Slice(object, low, high, _):
+                    return submit_group_expression_has_submit(object, local_scope, structs) or submit_group_expression_has_submit(low, local_scope, structs) or submit_group_expression_has_submit(high, local_scope, structs)
+                Expr.IndexN(object, indices, _):
+                    true return if submit_group_expression_has_submit(object, local_scope, structs)
+                    for index in indices:
+                        true return if submit_group_expression_has_submit(index, local_scope, structs)
+                    return false
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements:
+                        true return if submit_group_expression_has_submit(element, local_scope, structs)
+                    return false
+                Expr.DictLit(entries, _):
+                    for entry in entries:
+                        true return if submit_group_expression_has_submit(entry.key, local_scope, structs) or submit_group_expression_has_submit(entry.value, local_scope, structs)
+                    return false
+                Expr.Construct(_, fields, _):
+                    for field in fields:
+                        true return if submit_group_expression_has_submit(field.value, local_scope, structs)
+                    return false
+                Expr.RecordUpdate(base, fields, _):
+                    true return if submit_group_expression_has_submit(base, local_scope, structs)
+                    for field in fields:
+                        true return if submit_group_expression_has_submit(field.value, local_scope, structs)
+                    return false
+                Expr.If(condition, then_expression, else_expression, _):
+                    return submit_group_expression_has_submit(condition, local_scope, structs) or submit_group_expression_has_submit(then_expression, local_scope, structs) or submit_group_expression_has_submit(else_expression, local_scope, structs)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    true return if submit_group_expression_has_submit(scrutinee, local_scope, structs)
+                    for arm in arms:
+                        true return if submit_group_expression_has_submit(arm.guard, local_scope, structs)
+                        true return if submit_group_statement_list_has_submit(arm.body, local_scope, structs)
+                    return false
+                Expr.Comprehension(_, iterable, condition, body, _):
+                    return submit_group_expression_has_submit(iterable, local_scope, structs) or submit_group_expression_has_submit(condition, local_scope, structs) or submit_group_expression_has_submit(body, local_scope, structs)
+                Expr.Refinement(base, predicate, _):
+                    return submit_group_expression_has_submit(base, local_scope, structs) or submit_group_expression_has_submit(predicate, local_scope, structs)
+                Expr.GetElse(guarded, recovery, _):
+                    return submit_group_expression_has_submit(guarded, local_scope, structs) or submit_group_statement_list_has_submit(recovery, local_scope, structs)
+                Expr.Lambda(_, _, _):
+                    return true
+                Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _):
+                    return false
+                _:
+                    return true
+
+
+        def submit_group_statement_has_submit(statement: Stmt, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match statement:
+                Stmt.Expr(Expr.Block(statements, value, _, pos), _):
+                    true return if submit_marker_at(pos.offset, structs)
+                    return submit_group_expression_has_submit(value, local_scope, structs) or submit_group_statement_list_has_submit(statements, local_scope, structs)
+                Stmt.Expr(expression, _) | Stmt.Contract(_, expression, _):
+                    return submit_group_expression_has_submit(expression, local_scope, structs)
+                Stmt.VarDecl(_, _, value, _):
+                    return submit_group_expression_has_submit(value, local_scope, structs)
+                Stmt.Return(value, _):
+                    if value is return_value:
+                        return submit_group_expression_has_submit(return_value, local_scope, structs)
+                    return false
+                Stmt.Assign(target, _, value, _):
+                    return submit_group_expression_has_submit(target, local_scope, structs) or submit_group_expression_has_submit(value, local_scope, structs)
+                Stmt.If(condition, then_body, else_body, _):
+                    true return if submit_group_expression_has_submit(condition, local_scope, structs)
+                    true return if submit_group_statement_list_has_submit(then_body, local_scope, structs)
+                    return submit_group_statement_list_has_submit(else_body, local_scope, structs)
+                Stmt.While(condition, body, _) | Stmt.For(_, _, condition, body, _):
+                    return submit_group_expression_has_submit(condition, local_scope, structs) or submit_group_statement_list_has_submit(body, local_scope, structs)
+                Stmt.Block(_, _, _, body, _):
+                    return submit_group_statement_list_has_submit(body, local_scope, structs)
+                Stmt.Match(scrutinee, arms, _):
+                    true return if submit_group_expression_has_submit(scrutinee, local_scope, structs)
+                    for arm in arms:
+                        true return if submit_group_expression_has_submit(arm.guard, local_scope, structs) or submit_group_statement_list_has_submit(arm.body, local_scope, structs)
+                    return false
+                Stmt.Invalid:
+                    return true
+                _:
+                    return true
+
+
+        def submit_group_statement_list_has_submit(statements: darray[Stmt]&, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if statements.count == 0.usize()
+            first: uintptr = (&statements[0]).cast[uintptr] can Unsafe.PointerCast
+            cached: mutable bool = false
+            cached_value: bool = submit_group_scan_memo_lookup(local_scope, first, statements.count, cached)
+            return cached_value if cached
+            nested_list: bool = local_scope.submit_scan_depth > 0.usize()
+            local_scope.submit_scan_depth <- local_scope.submit_scan_depth + 1.usize()
+            has_submit: mutable bool = false
+            for statement in statements:
+                if submit_group_statement_has_submit(statement, local_scope, structs):
+                    has_submit <- true
+                    break
+            local_scope.submit_scan_depth <- local_scope.submit_scan_depth - 1.usize()
+            # A flat one-list function needs no memo allocation. A nested list is likely to be
+            # queried again by its own emitter; once any nested entry exists, retain its parent
+            # result too so repeated parent checks also become constant-time.
+            submit_group_scan_memo_store(local_scope, first, statements.count, has_submit) if nested_list or local_scope.submit_scan_memo_used > 0.usize()
+            return has_submit
+
+
+        def submit_group_submit_sites_are_bare(statement: Stmt, group_name: sview, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&, found: mutable bool&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match statement:
+                Stmt.Expr(Expr.Block(statements, value, _, pos), _):
+                    if submit_marker_at(pos.offset, structs):
+                        false return if statements.count != 0
+                        false return if not (value is Expr.Call(_, _, _, _))
+                        false return if submit_group_expression_has_submit(value, local_scope, structs)
+                        found <- true
+                        return true
+                    false return if not submit_group_submit_site_list_is_bare(statements, group_name, local_scope, structs, fns, generics, found)
+                    return not submit_group_expression_has_submit(value, local_scope, structs)
+                Stmt.Expr(expression, _):
+                    return not submit_group_expression_has_submit(expression, local_scope, structs)
+                Stmt.VarDecl(_, _, value, _):
+                    return not submit_group_expression_has_submit(value, local_scope, structs)
+                Stmt.Return(value, _):
+                    if value is return_value:
+                        return not submit_group_expression_has_submit(return_value, local_scope, structs)
+                    return true
+                Stmt.Assign(target, _, value, _):
+                    return not (submit_group_expression_has_submit(target, local_scope, structs) or submit_group_expression_has_submit(value, local_scope, structs))
+                Stmt.If(condition, then_body, else_body, _):
+                    false return if submit_group_expression_has_submit(condition, local_scope, structs)
+                    false return if not submit_group_submit_site_list_is_bare(then_body, group_name, local_scope, structs, fns, generics, found)
+                    return submit_group_submit_site_list_is_bare(else_body, group_name, local_scope, structs, fns, generics, found)
+                Stmt.While(condition, body, _):
+                    false return if submit_group_expression_has_submit(condition, local_scope, structs)
+                    return submit_group_submit_site_list_is_bare(body, group_name, local_scope, structs, fns, generics, found)
+                Stmt.For(_, _, iterable, body, _):
+                    false return if submit_group_expression_has_submit(iterable, local_scope, structs)
+                    return submit_group_submit_site_list_is_bare(body, group_name, local_scope, structs, fns, generics, found)
+                Stmt.Block(_, _, _, body, _):
+                    return submit_group_submit_site_list_is_bare(body, group_name, local_scope, structs, fns, generics, found)
+                Stmt.Match(scrutinee, arms, _):
+                    false return if submit_group_expression_has_submit(scrutinee, local_scope, structs)
+                    for arm in arms:
+                        false return if submit_group_expression_has_submit(arm.guard, local_scope, structs)
+                        false return if not submit_group_submit_site_list_is_bare(arm.body, group_name, local_scope, structs, fns, generics, found)
+                    return true
+                Stmt.Contract(_, expression, _):
+                    return not submit_group_expression_has_submit(expression, local_scope, structs)
+                Stmt.Invalid:
+                    return false
+                _:
+                    return false
+
+
+        def submit_group_submit_site_list_is_bare(statements: darray[Stmt], group_name: sview, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&, found: mutable bool&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            row: mutable usize = 0
+            while row < statements.count |row, statements, group_name, local_scope, structs, fns, generics, found|:
+                if row + 1.usize() < statements.count and submit_group_submit_add_pair_matches(statements[row], statements[row + 1.usize()], group_name, local_scope, fns, structs, generics):
+                    found <- true
+                    row <- row + 2.usize()
+                    continue
+                false return if not submit_group_submit_sites_are_bare(statements[row], group_name, local_scope, structs, fns, generics, found)
+                row <- row + 1.usize()
+            return true
+
+
+        def submit_group_submit_site_range_is_bare(statements: darray[Stmt]&, first: usize, stop: usize, group_name: sview, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&, found: mutable bool&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if first > stop or stop > statements.count
+            row: mutable usize = first
+            while row < stop |row, stop, statements, group_name, local_scope, structs, fns, generics, found|:
+                if row + 1.usize() < stop and submit_group_submit_add_pair_matches(statements[row], statements[row + 1.usize()], group_name, local_scope, fns, structs, generics):
+                    found <- true
+                    row <- row + 2.usize()
+                    continue
+                false return if not submit_group_submit_sites_are_bare(statements[row], group_name, local_scope, structs, fns, generics, found)
+                row <- row + 1.usize()
+            return true
+
+
+        # Pool cleanup groups only submits whose Task result is discarded. A submit in
+        # value position stays caller-owned (for example, a local Task that is awaited
+        # before the pool exits). Expression blocks and branch expressions need their
+        # result context carried recursively; if a submit appears in a shape we cannot
+        # classify, decline the pool lowering rather than emit an untracked completion.
+        def submit_group_scan_discarded_expression(expression: Expr, result_is_discarded: bool, local_scope: mutable Scope&, structs: StructTable&, found: mutable bool&, uncertain: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Block(statements, value, _, pos):
+                    if submit_marker_at(pos.offset, structs):
+                        if statements.count != 0.usize():
+                            uncertain <- true
+                            return
+                        match value:
+                            Expr.Call(callee, arguments, _, _):
+                                found <- true if result_is_discarded
+                                if submit_group_expression_has_submit(callee, local_scope, structs):
+                                    uncertain <- true
+                                    return
+                                for argument in arguments |found, uncertain|:
+                                    # The worker call can receive or retain an inner Task; its
+                                    # completion is not consumed just because the outer result is
+                                    # discarded. Reject nested submissions at this boundary.
+                                    if submit_group_expression_has_submit(argument, local_scope, structs):
+                                        uncertain <- true
+                                        return
+                            _:
+                                uncertain <- true
+                        return
+                    submit_group_scan_discarded_statement_list(statements, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_expression(value, result_is_discarded, local_scope, structs, found, uncertain)
+                Expr.Call(callee, arguments, _, _):
+                    # An unknown call can retain, drop, or transfer a Task argument. The
+                    # scanner cannot prove that a discarded call result also consumes its
+                    # nested submission, so reject that shape. Even a same-spelled await
+                    # callee is not trusted here: local shadowing is resolved by codegen,
+                    # not by this pre-scan.
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                    return
+                Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                    return
+                Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _) | Expr.Paren(object, _):
+                    submit_group_scan_discarded_expression(object, result_is_discarded, local_scope, structs, found, uncertain)
+                Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.Slice(object, low, high, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.IndexN(object, indices, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.DictLit(entries, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.Construct(_, fields, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.RecordUpdate(base, fields, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.If(condition, then_expression, else_expression, _):
+                    submit_group_scan_discarded_expression(condition, false, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_expression(then_expression, result_is_discarded, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_expression(else_expression, result_is_discarded, local_scope, structs, found, uncertain)
+                Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                    submit_group_scan_discarded_expression(scrutinee, false, local_scope, structs, found, uncertain)
+                    for arm in arms |found, uncertain|:
+                        submit_group_scan_discarded_expression(arm.guard, false, local_scope, structs, found, uncertain)
+                        if arm_value_expression(arm.body) is arm_value:
+                            submit_group_scan_discarded_expression(arm_value, result_is_discarded, local_scope, structs, found, uncertain)
+                        elif submit_group_statement_list_has_submit(arm.body, local_scope, structs):
+                            # A multi-statement value arm can mix prefix effects with a
+                            # yielded value. Do not guess which submit result is discarded.
+                            uncertain <- true
+                Expr.Comprehension(_, iterable, condition, body, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.Refinement(base, predicate, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.GetElse(guarded, recovery, _):
+                    if submit_group_expression_has_submit(expression, local_scope, structs):
+                        uncertain <- true
+                        return
+                Expr.Lambda(_, body, _):
+                    uncertain <- true if submit_group_statement_list_has_submit(body, local_scope, structs)
+                Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _):
+                    pass
+                _:
+                    uncertain <- true if submit_group_expression_has_submit(expression, local_scope, structs)
+
+
+        def submit_group_scan_discarded_statement(statement: Stmt, local_scope: mutable Scope&, structs: StructTable&, found: mutable bool&, uncertain: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match statement:
+                Stmt.Expr(expression, _):
+                    submit_group_scan_discarded_expression(expression, true, local_scope, structs, found, uncertain)
+                Stmt.VarDecl(name, _, value, _):
+                    submit_group_scan_discarded_expression(value, name == "_", local_scope, structs, found, uncertain)
+                Stmt.Assign(target, _, value, _):
+                    submit_group_scan_discarded_expression(target, false, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_expression(value, ident_name_of(target) == "_", local_scope, structs, found, uncertain)
+                Stmt.Return(value, _):
+                    submit_group_scan_discarded_expression(value, false, local_scope, structs, found, uncertain)
+                Stmt.If(condition, then_body, else_body, _):
+                    submit_group_scan_discarded_expression(condition, false, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_statement_list(then_body, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_statement_list(else_body, local_scope, structs, found, uncertain)
+                Stmt.While(condition, body, _):
+                    submit_group_scan_discarded_expression(condition, false, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_statement_list(body, local_scope, structs, found, uncertain)
+                Stmt.For(_, _, iterable, body, _):
+                    submit_group_scan_discarded_expression(iterable, false, local_scope, structs, found, uncertain)
+                    submit_group_scan_discarded_statement_list(body, local_scope, structs, found, uncertain)
+                Stmt.Block(_, _, _, body, _):
+                    submit_group_scan_discarded_statement_list(body, local_scope, structs, found, uncertain)
+                Stmt.Match(scrutinee, arms, _):
+                    submit_group_scan_discarded_expression(scrutinee, false, local_scope, structs, found, uncertain)
+                    for arm in arms |found, uncertain|:
+                        submit_group_scan_discarded_expression(arm.guard, false, local_scope, structs, found, uncertain)
+                        submit_group_scan_discarded_statement_list(arm.body, local_scope, structs, found, uncertain)
+                Stmt.Contract(_, expression, _):
+                    uncertain <- true if submit_group_expression_has_submit(expression, local_scope, structs)
+                    submit_group_scan_discarded_expression(expression, false, local_scope, structs, found, uncertain)
+                Stmt.Invalid:
+                    uncertain <- true
+                Stmt.Break(_, _) | Stmt.Continue(_, _):
+                    pass
+                _:
+                    uncertain <- true if submit_group_statement_has_submit(statement, local_scope, structs)
+
+
+        def submit_group_scan_discarded_statement_list(statements: darray[Stmt]&, local_scope: mutable Scope&, structs: StructTable&, found: mutable bool&, uncertain: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for statement in statements |found, uncertain|:
+                submit_group_scan_discarded_statement(statement, local_scope, structs, found, uncertain)
+
+
+        def submit_group_statement_list_has_discarded_submit(statements: darray[Stmt]&, local_scope: mutable Scope&, structs: StructTable&, uncertain: mutable bool&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            found: mutable bool = false
+            submit_group_scan_discarded_statement_list(statements, local_scope, structs, found, uncertain)
+            return found
+
+
+        def submit_group_window(body: darray[Stmt]&, local_scope: mutable Scope&, structs: mutable StructTable&, fns: FnTable&, generics: GenericTable&) -> SubmitGroupWindow can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                window: mutable SubmitGroupWindow = submit_group_empty_window()
+                return window if body.count < 3.usize() or structs.annotations.submit_offsets.count == 0.usize()
+                declaration_count: mutable usize = 0
+                for row in 0..<body.count:
+                    candidate_name: sview = submit_group_constructor_name(body[row], local_scope, fns, structs, generics)
+                    if candidate_name != "":
+                        declaration_count <- declaration_count + 1.usize()
+                        window.group_name <- candidate_name
+                        window.declaration_row <- row
+                return submit_group_empty_window() if declaration_count != 1.usize()
+                join_count: mutable usize = 0
+                for row in window.declaration_row + 1.usize()..<body.count:
+                    if submit_group_wait_matches(body[row], window.group_name, local_scope, fns, structs, generics):
+                        join_count <- join_count + 1.usize()
+                        window.join_row <- row
+                return submit_group_empty_window() if join_count != 1.usize()
+                return submit_group_empty_window() if window.group_name == "task_group_new" or window.group_name == "task_group_add" or window.group_name == "task_group_wait_all"
+                return submit_group_empty_window() if submit_group_api_is_shadowed(local_scope)
+                return submit_group_empty_window() if submit_group_early_exit_range(body, window.declaration_row + 1.usize(), window.join_row)
+                return submit_group_empty_window() if submit_group_range_mentions_name(body, window.declaration_row + 1.usize(), window.join_row, window.group_name)
+                # The declaration scan starts at the statement-list head, not after the group
+                # constructor: a same-scope function value bound before this lexical window can
+                # shadow the constructor, add, or wait call when those rows are emitted.
+                return submit_group_empty_window() if submit_group_range_declares_api_binding(body, 0.usize(), window.join_row)
+                return submit_group_empty_window() if (submit_group_range_has_untrusted_call(body, window.declaration_row + 1.usize(), window.join_row, window.group_name, local_scope, structs, fns, generics) can Global{Read,Write})
+                has_submit: mutable bool = false
+                return submit_group_empty_window() if not submit_group_submit_site_range_is_bare(body, window.declaration_row + 1.usize(), window.join_row, window.group_name, local_scope, structs, fns, generics, has_submit)
+                return submit_group_empty_window() if not has_submit
+                return submit_group_empty_window() if not submit_group_runtime_apis_are_unique(fns, generics, structs)
+                window.valid <- true
+                return window
+
+
+        def submit_group_range_mentions_name(statements: darray[Stmt]&, first: usize, stop: usize, name: sview) -> bool can[Abort.Panic]:
+            true return if first > stop or stop > statements.count
+            names: SubmitGroupNameSet = SubmitGroupNameSet{first: name, second: "", third: "", fail_closed_nested_scopes: false}
+            for row in first..<stop:
+                true return if submit_group_statement_mentions_names(statements[row], names, true)
+            return false
+
+
+        # Range-binder liveness runs once for each emitted loop. Descending into nested
+        # statement lists would rescan their whole subtrees for every enclosing binder, so
+        # treat any nonempty nested body as a possible use instead. This bounds repeated
+        # analysis while preserving correctness: uncertain binders keep their stack slot.
+        def submit_group_range_binder_may_be_mentioned(statements: darray[Stmt]&, first: usize, stop: usize, name: sview) -> bool can[Abort.Panic]:
+            true return if first > stop or stop > statements.count
+            names: SubmitGroupNameSet = SubmitGroupNameSet{first: name, second: "", third: "", fail_closed_nested_scopes: true}
+            for row in first..<stop:
+                true return if submit_group_statement_mentions_names(statements[row], names, false)
+            return false
+
+
+        def submit_group_binding_is_task_group(name: sview, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic]:
+            value_type: ValueType = lookup_type(local_scope, name)
+            return value_type.kind == TypeKind.Struct and value_type.bits.usize() < structs.records.names.count and structs.records.names[value_type.bits.usize()] == "TaskGroup"
+
+
+        def submit_group_api_is_shadowed(local_scope: mutable Scope&) -> bool can[Abort.Panic]:
+            true return if lookup_slot(local_scope, "task_group_new") is constructor_shadow
+            true return if lookup_slot(local_scope, "task_group_add") is add_shadow
+            true return if lookup_slot(local_scope, "task_group_wait_all") is wait_shadow
+            return false
+
+
+        # A declaration in the same statement list can shadow an API anywhere in the
+        # candidate window, including before the constructor. Child statement lists are
+        # checked when they are emitted; this scan covers bindings whose scope reaches the join.
+        def submit_group_target_binds_api_name(target: Expr) -> bool can[Abort.Panic]:
+            match target:
+                Expr.Ident(name, _):
+                    return name == "task_group_new" or name == "task_group_add" or name == "task_group_wait_all"
+                Expr.Tuple(elements, _) | Expr.Array(elements, _):
+                    for element in elements:
+                        true return if submit_group_target_binds_api_name(element)
+                    return false
+                Expr.Paren(inner, _):
+                    return submit_group_target_binds_api_name(inner)
+                _:
+                    return false
+
+
+        def submit_group_range_declares_api_binding(statements: darray[Stmt]&, first: usize, stop: usize) -> bool can[Abort.Panic]:
+            true return if first > stop or stop > statements.count
+            for row in first..<stop:
+                match statements[row]:
+                    Stmt.VarDecl(name, _, _, _):
+                        true return if name == "task_group_new" or name == "task_group_add" or name == "task_group_wait_all"
+                    Stmt.Assign(target, _, _, _):
+                        true return if submit_group_target_binds_api_name(target)
+                    _:
+                        pass
+            return false
+
+
+        def submit_group_statement_list_mentions_manual_api(statements: darray[Stmt]) -> bool can[Abort.Panic]:
+            manual_api_names: SubmitGroupNameSet = submit_group_manual_api_name_set()
+            # Nested statement lists have their own emit_statements_value proof. Inspect this
+            # list's direct expressions and conditions, but leave child bodies to that proof.
+            return submit_group_statement_list_mentions_names(statements, manual_api_names, false)
+
+
+        # Calls to arbitrary helpers can hide an inner TaskGroup constructor or wait behind
+        # a wrapper. The source-level proof only understands the reserved constructor/wait
+        # identities and the compiler-marked submit blocks; decline other call shapes in a
+        # group interval instead of treating lexical spelling as a proof of the join.
+        def submit_group_expression_has_untrusted_call(expression: Expr, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        trusted_call: bool = submit_group_api_callee_matches(callee, "task_group_new", local_scope, fns, structs, generics) or submit_group_api_callee_matches(callee, "task_group_wait_all", local_scope, fns, structs, generics) or (submit_group_call_is_trusted_atomic(callee, arguments.count, local_scope, fns, generics) can Global{Read,Write})
+                        if trusted_call:
+                            for argument in arguments:
+                                true return if submit_group_expression_has_untrusted_call(argument, local_scope, structs, fns, generics)
+                            return false
+                        return true
+                    Expr.StaticEffectCall(_, _, _, _, _, _):
+                        return true
+                    Expr.Block(statements, value, _, pos):
+                        if submit_marker_at(pos.offset, structs):
+                            false return if statements.count != 0.usize()
+                            match value:
+                                Expr.Call(callee, arguments, _, _):
+                                    true return if submit_group_expression_has_untrusted_call(callee, local_scope, structs, fns, generics)
+                                    for argument in arguments:
+                                        true return if submit_group_expression_has_untrusted_call(argument, local_scope, structs, fns, generics)
+                                    return false
+                                _:
+                                    return true
+                        return true if submit_group_statement_list_has_untrusted_call(statements, local_scope, structs, fns, generics)
+                        return submit_group_expression_has_untrusted_call(value, local_scope, structs, fns, generics)
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _) | Expr.Paren(object, _):
+                        return submit_group_expression_has_untrusted_call(object, local_scope, structs, fns, generics)
+                    Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                        return submit_group_expression_has_untrusted_call(object, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(index, local_scope, structs, fns, generics)
+                    Expr.Slice(object, low, high, _):
+                        return submit_group_expression_has_untrusted_call(object, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(low, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(high, local_scope, structs, fns, generics)
+                    Expr.IndexN(object, indices, _):
+                        true return if submit_group_expression_has_untrusted_call(object, local_scope, structs, fns, generics)
+                        for index in indices:
+                            true return if submit_group_expression_has_untrusted_call(index, local_scope, structs, fns, generics)
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements:
+                            true return if submit_group_expression_has_untrusted_call(element, local_scope, structs, fns, generics)
+                        return false
+                    Expr.DictLit(entries, _):
+                        for entry in entries:
+                            true return if submit_group_expression_has_untrusted_call(entry.key, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(entry.value, local_scope, structs, fns, generics)
+                        return false
+                    Expr.Construct(type_expression, fields, _):
+                        true return if submit_group_expression_has_untrusted_call(type_expression, local_scope, structs, fns, generics)
+                        for field in fields:
+                            true return if submit_group_expression_has_untrusted_call(field.value, local_scope, structs, fns, generics)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        true return if submit_group_expression_has_untrusted_call(base, local_scope, structs, fns, generics)
+                        for field in fields:
+                            true return if submit_group_expression_has_untrusted_call(field.value, local_scope, structs, fns, generics)
+                        return false
+                    Expr.If(condition, then_expression, else_expression, _):
+                        return submit_group_expression_has_untrusted_call(condition, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(then_expression, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(else_expression, local_scope, structs, fns, generics)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        true return if submit_group_expression_has_untrusted_call(scrutinee, local_scope, structs, fns, generics)
+                        for arm in arms:
+                            true return if submit_group_pattern_mentions_manual_api(arm.pattern)
+                            true return if submit_group_expression_has_untrusted_call(arm.guard, local_scope, structs, fns, generics)
+                            true return if submit_group_statement_list_has_untrusted_call(arm.body, local_scope, structs, fns, generics)
+                        return false
+                    Expr.Comprehension(variable, iterable, condition, body, _):
+                        true return if variable == "task_group_new" or variable == "task_group_add" or variable == "task_group_wait_all"
+                        return submit_group_expression_has_untrusted_call(iterable, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(condition, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(body, local_scope, structs, fns, generics)
+                    Expr.Refinement(base, predicate, _):
+                        return submit_group_expression_has_untrusted_call(base, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(predicate, local_scope, structs, fns, generics)
+                    Expr.GetElse(guarded, recovery, _):
+                        true return if submit_group_expression_has_untrusted_call(guarded, local_scope, structs, fns, generics)
+                        return submit_group_statement_list_has_untrusted_call(recovery, local_scope, structs, fns, generics)
+                    Expr.Lambda(_, _, _) | Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _):
+                        return false
+                    _:
+                        return true
+
+
+        def submit_group_statement_has_untrusted_call(statement: Stmt, group_name: sview, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                match statement:
+                    Stmt.Expr(expression, _) | Stmt.Contract(_, expression, _):
+                        return submit_group_expression_has_untrusted_call(expression, local_scope, structs, fns, generics)
+                    Stmt.VarDecl(name, type_expression, value, _):
+                        true return if name == "task_group_new" or name == "task_group_add" or name == "task_group_wait_all"
+                        return submit_group_expression_has_untrusted_call(type_expression, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(value, local_scope, structs, fns, generics)
+                    Stmt.Assign(target, _, value, _):
+                        true return if submit_group_target_binds_api_name(target)
+                        return submit_group_expression_has_untrusted_call(target, local_scope, structs, fns, generics) or submit_group_expression_has_untrusted_call(value, local_scope, structs, fns, generics)
+                    Stmt.If(condition, then_body, else_body, _):
+                        true return if submit_group_expression_has_untrusted_call(condition, local_scope, structs, fns, generics)
+                        return submit_group_statement_list_has_untrusted_call_paired(then_body, group_name, local_scope, structs, fns, generics) or submit_group_statement_list_has_untrusted_call_paired(else_body, group_name, local_scope, structs, fns, generics)
+                    Stmt.While(condition, body, _):
+                        return submit_group_expression_has_untrusted_call(condition, local_scope, structs, fns, generics) or submit_group_statement_list_has_untrusted_call_paired(body, group_name, local_scope, structs, fns, generics)
+                    Stmt.For(_, variables, iterable, body, _):
+                        true return if submit_group_name_in_names("task_group_new", variables) or submit_group_name_in_names("task_group_add", variables) or submit_group_name_in_names("task_group_wait_all", variables)
+                        return submit_group_expression_has_untrusted_call(iterable, local_scope, structs, fns, generics) or submit_group_statement_list_has_untrusted_call_paired(body, group_name, local_scope, structs, fns, generics)
+                    Stmt.Block(_, _, binding, body, _):
+                        true return if binding == "task_group_new" or binding == "task_group_add" or binding == "task_group_wait_all"
+                        return submit_group_statement_list_has_untrusted_call_paired(body, group_name, local_scope, structs, fns, generics)
+                    Stmt.Match(scrutinee, arms, _):
+                        true return if submit_group_expression_has_untrusted_call(scrutinee, local_scope, structs, fns, generics)
+                        for arm in arms:
+                            true return if submit_group_pattern_mentions_manual_api(arm.pattern)
+                            true return if submit_group_expression_has_untrusted_call(arm.guard, local_scope, structs, fns, generics)
+                            true return if submit_group_statement_list_has_untrusted_call_paired(arm.body, group_name, local_scope, structs, fns, generics)
+                        return false
+                    Stmt.Return(value, _):
+                        if value is returned_value:
+                            return submit_group_expression_has_untrusted_call(returned_value, local_scope, structs, fns, generics)
+                        return false
+                    Stmt.Invalid:
+                        return true
+                    Stmt.Break(_, _) | Stmt.Continue(_, _):
+                        return false
+                    _:
+                        return true
+
+
+        def submit_group_statement_list_has_untrusted_call(statements: darray[Stmt], local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                for statement in statements:
+                    true return if submit_group_statement_has_untrusted_call(statement, "", local_scope, structs, fns, generics)
+                return false
+
+
+        def submit_group_statement_list_has_untrusted_call_paired(statements: darray[Stmt], group_name: sview, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                row: mutable usize = 0
+                while row < statements.count |row, statements, group_name, local_scope, structs, fns, generics|:
+                    if row + 1.usize() < statements.count and submit_group_submit_add_pair_matches(statements[row], statements[row + 1.usize()], group_name, local_scope, fns, structs, generics):
+                        true return if submit_group_statement_has_untrusted_call(statements[row], group_name, local_scope, structs, fns, generics)
+                        row <- row + 2.usize()
+                        continue
+                    true return if submit_group_statement_has_untrusted_call(statements[row], group_name, local_scope, structs, fns, generics)
+                    row <- row + 1.usize()
+                return false
+
+
+        def submit_group_range_has_untrusted_call(statements: darray[Stmt]&, first: usize, stop: usize, group_name: sview, local_scope: mutable Scope&, structs: StructTable&, fns: FnTable&, generics: GenericTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            can Global{Read,Write}:
+                true return if first > stop or stop > statements.count
+                row: mutable usize = first
+                while row < stop |row, stop, statements, group_name, local_scope, structs, fns, generics|:
+                    if row + 1.usize() < stop and submit_group_submit_add_pair_matches(statements[row], statements[row + 1.usize()], group_name, local_scope, fns, structs, generics):
+                        true return if submit_group_statement_has_untrusted_call(statements[row], group_name, local_scope, structs, fns, generics)
+                        row <- row + 2.usize()
+                        continue
+                    true return if submit_group_statement_has_untrusted_call(statements[row], group_name, local_scope, structs, fns, generics)
+                    row <- row + 1.usize()
+                return false
+
+
+        def submit_group_statement_list_declares_task_group(statements: darray[Stmt], local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            for statement in statements:
+                if statement is Stmt.VarDecl(_, _, value, _):
+                    # These root AST forms have a result category that cannot be TaskGroup,
+                    # so avoid recursively typing their operands just for this guard. Keep
+                    # every uncertain form on the existing fail-closed inference path.
+                    definitely_not_task_group: mutable bool = false
+                    match value:
+                        Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Slice(_, _, _, _):
+                            definitely_not_task_group <- true
+                        Expr.Unary(operator, _, _):
+                            definitely_not_task_group <- operator == TokenKind.Not or operator == TokenKind.Ampersand
+                        Expr.Binary(_, operator, _, _):
+                            definitely_not_task_group <- operator == TokenKind.Is or operator == TokenKind.In or int_predicate_of(operator) >= 0 or operator == TokenKind.And or operator == TokenKind.Or
+                        Expr.RegionNew(_, region_name, _):
+                            # Packed-store and other selectors forward their operand type;
+                            # only Arena-backed `new` is known to produce a reference.
+                            definitely_not_task_group <- lookup_type(local_scope, region_name).kind == TypeKind.Arena
+                        _:
+                            pass
+                    if not definitely_not_task_group:
+                        value_type: ValueType = expression_type(value, local_scope, fns, structs, generics)
+                        true return if value_type.kind == TypeKind.Struct and value_type.bits.usize() < structs.records.names.count and structs.records.names[value_type.bits.usize()] == "TaskGroup"
+            return false
+
+
+        # Resolve a one-argument submit like an ordinary direct call: source-order first among
+        # typed matches. A module member shadows a top-level declaration. ABI checks happen
+        # after selection, so an unsupported first match declines instead of falling through to
+        # a later overload that ordinary calls would not select.
+        def submit_worker_resolve_owner(owner: sview, name: sview, argument: Expr, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, local_scope: mutable Scope&, out_candidate_count: mutable usize&, out_selected_index: mutable i64&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                out_candidate_count <- 0.usize()
+                out_selected_index <- -1
+                argument_type_ready: mutable bool = false
+                argument_type: mutable ValueType = unmodeled_type()
+                index_cursor: mutable i64 = first_function_named(fns, name)
+                while index_cursor >= 0 and out_selected_index < 0 |index_cursor, fns, owner, name, argument, structs, generics, local_scope, out_candidate_count, out_selected_index, argument_type_ready, argument_type|:
+                    index: usize = index_cursor.usize()
+                    index_cursor <- next_function_named(fns, name, index_cursor)
+                    continue if index >= fns.names.count or index >= fns.owners.count or index >= fns.param_count.count
+                    continue if fns.names[index] != name or fns.owners[index] != owner or fns.param_count[index] != 1.usize()
+                    out_candidate_count <- out_candidate_count + 1.usize()
+                    if not argument_type_ready:
+                        argument_type <- expression_type(argument, local_scope, fns, structs, generics)
+                        argument_type_ready <- true
+                    # Direct calls choose the first source-ordered type match. Keep the
+                    # same rule for submit while caching the one argument's inferred type.
+                    out_selected_index <- index.i64() if out_selected_index < 0 and overload_candidate_matches_argument(index, 0.usize(), argument, argument_type, fns, structs)
+
+
+        def submit_worker_index(name: sview, argument: Expr, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, local_scope: mutable Scope&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            owner: sview = structs.visibility.current_owner
+            if owner != "":
+                owner_candidates: mutable usize = 0
+                selected: mutable i64 = -1
+                submit_worker_resolve_owner(owner, name, argument, fns, structs, generics, local_scope, owner_candidates, selected)
+                if owner_candidates > 0.usize():
+                    return selected if selected >= 0
+                    # Match emit_direct_call's source-order arity fallback when no exact
+                    # overload matches. The submit call site rechecks semantic identity or
+                    # performs an allowed numeric/contextual conversion before emitting the
+                    # callback ABI; LLVM type equality alone is not sufficient.
+                    return function_index_of_arity(fns, owner, name, 1.usize())
+            top_candidates: mutable usize = 0
+            selected_top: mutable i64 = -1
+            submit_worker_resolve_owner("", name, argument, fns, structs, generics, local_scope, top_candidates, selected_top)
+            return selected_top if selected_top >= 0
+            return function_index_of_arity(fns, "", name, 1.usize()) if top_candidates > 0.usize()
+            return -1
+
+        # True when this direct worker row requires the caller's packed store. This is
+        # deliberately independent of whether this backend can capture its ABI: callers must
+        # decline unsupported store-taking workers, never send them through pool_submit1 as if
+        # they had an ordinary `fn(A) -> R` signature.
+        def submit_worker_requires_store(index: i64, fns: FnTable&) -> bool can[Abort.Panic]:
+            false return if index < 0 or index.usize() >= fns.needs_store.count
             row: usize = index.usize()
-            false return if not fns.needs_store[row] or fns.arena_counts[row] != 0 or fns.is_error[row]
+            return fns.needs_store[row]
+
+
+
+
+        # A structured pool joins its work before its enclosing region is released. A nursery
+        # group also joins an expression-statement task, including one sent to an explicit pool.
+        # Regions opened after the chosen join owner are shorter-lived than that join and cannot
+        # back a captured store. VarDecl submits are not group-added, so they need a pool owner.
+        def submit_group_lifetime_is_scoped(local_scope: Scope&) -> bool can[Abort.Panic]:
+            false return if local_scope.group_names.count == 0
+            group_index: usize = local_scope.group_names.count - 1.usize()
+            false return if group_index >= local_scope.group_region_frame_depths.count
+            return local_scope.group_region_frame_depths[group_index] == local_scope.region_frame_starts.count
+
+
+        def submit_group_has_manual_add_owner(local_scope: Scope&) -> bool can[Abort.Panic]:
+            return false if local_scope.group_manual_add.count != local_scope.group_names.count or local_scope.group_names.count == 0.usize()
+            return local_scope.group_manual_add[local_scope.group_names.count - 1.usize()]
+
+
+        def submit_group_manual_add_lifetime_is_scoped(local_scope: Scope&) -> bool can[Abort.Panic]:
+            return false if local_scope.group_manual_add.count != local_scope.group_names.count
+            return false if local_scope.group_names.count == 0.usize()
+            group_index: usize = local_scope.group_names.count - 1.usize()
+            return false if not local_scope.group_manual_add[group_index] or group_index >= local_scope.group_region_frame_depths.count
+            return local_scope.group_region_frame_depths[group_index] == local_scope.region_frame_starts.count
+
+
+        def submit_store_capture_lifetime_is_scoped(pool: sview, will_group_add: bool, manual_group_add: bool, local_scope: mutable Scope&) -> bool can[Abort.Panic]:
+            if manual_group_add:
+                return will_group_add and submit_group_manual_add_lifetime_is_scoped(local_scope)
+            if will_group_add:
+                # When the task is retained by a group, that group's wait is the actual join
+                # owner. Do not let a matching pool depth hide a shorter-lived group region.
+                return submit_group_lifetime_is_scoped(local_scope)
+            index: mutable i64 = local_scope.pool_names.count.i64() - 1
+            while index >= 0 |index, pool, local_scope|:
+                if local_scope.pool_names[index.usize()] == pool:
+                    if lookup_slot(local_scope, pool) is selected_pool_slot:
+                        if index.usize() < local_scope.pool_slots.count:
+                            if local_scope.pool_slots[index.usize()] is selected_pool_slot:
+                                if index.usize() < local_scope.pool_region_frame_depths.count:
+                                    return local_scope.pool_region_frame_depths[index.usize()] == local_scope.region_frame_starts.count
+                index <- index - 1
+            return false
+
+
+
+
+        # The ordinary callback path accepts only a truly plain `fn(A) -> R`. In particular,
+        # arena, error, sret, and other hidden parameters cannot be inferred from an opaque LLVM
+        # function pointer at the pool_submit1 call site.
+        def submit_worker_is_plain(index: i64, argument_type: ValueType, return_type: ValueType, fns: FnTable&, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if index < 0 or index.usize() >= fns.needs_store.count
+            row: usize = index.usize()
+            false return if fns.needs_store[row] or fns.arena_counts[row] != 0 or fns.is_error[row]
             false return if fns.param_count[row] != 1 or fns.is_variadic[row] or fns.is_extern[row]
-            return LLVMCountParams(fns.handles[row]) == 2
+            false return if value_type_uses_sret(return_type, structs, ctx)
+            worker: LLVMValueRef = fns.handles[row]
+            false return if LLVMCountParams(worker) != 1
+            worker_type: LLVMTypeRef = LLVMGlobalGetValueType(worker)
+            false return if LLVMTypeOf(LLVMGetParam(worker, 0)) != llvm_type_of(argument_type, structs, ctx)
+            return LLVMGetReturnType(worker_type) == llvm_type_of(return_type, structs, ctx)
+
+
+
+
+        # Explicit generic callbacks are accepted only when the instantiated handle is
+        # provably the plain one-argument ABI expected by pool_submit1. Unknown, overloaded,
+        # store-taking, arena, error, sret, or body-known store users decline instead of
+        # relying on opaque-pointer function types to make an invalid callback look compatible.
+        def submit_generic_worker_is_plain(name: sview, type_args: darray[ValueType]&, argument_type: ValueType, return_type: ValueType, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            slot: i64 = generic_index_of(generics, name)
+            false return if slot < 0 or generic_slot_count(generics, name) != 1.usize()
+            false return if slot.usize() >= generics.is_error.count or generics.is_error[slot.usize()]
+            false return if value_type_uses_sret(return_type, structs, ctx)
+            match generics.decls[slot.usize()]:
+                Decl.Func(generic_name, generic_params, generic_return, generic_body, generic_effects, generic_decorators, generic_line):
+                    false return if generic_params.count != 1
+                    false return if function_needs_ast_store(generics.owners[slot.usize()], generic_name, structs)
+                    false return if statements_mention_ast_store_call(generic_body, structs)
+                    false return if instantiation_wants_store_at(slot.usize(), type_args, generics)
+                    false return if instantiation_wants_arena_at(slot.usize(), type_args, generics, structs)
+                _:
+                    return false
+            if instantiate_generic_at(slot.usize(), type_args, generics, structs, m, ctx) is target:
+                false return if LLVMCountParams(target) != 1
+                target_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                false return if LLVMTypeOf(LLVMGetParam(target, 0)) != llvm_type_of(argument_type, structs, ctx)
+                return LLVMGetReturnType(target_type) == llvm_type_of(return_type, structs, ctx)
+            return false
+
+
+
+
+        def submit_thunk_symbol(ordinal: u64) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+            symbol: mutable darray[u8] = []
+            for prefix_index in 0..<sview_len("__submit_store_thunk_") |symbol|:
+                symbol.push(sview_at("__submit_store_thunk_", prefix_index))
+            remaining: mutable u64 = ordinal
+            digits: mutable darray[u8] = []
+            if remaining == 0.u64():
+                digits.push(48)
+            while remaining > 0.u64() |digits, remaining|:
+                digits.push((48.u64() + remaining % 10.u64()).u8())
+                remaining <- remaining / 10.u64()
+            digit_index: mutable usize = digits.count
+            while digit_index > 0.usize() |digit_index, symbol, digits|:
+                digit_index <- digit_index - 1.usize()
+                symbol.push(digits[digit_index])
+            symbol.push(0)
+            return symbol
 
         # Lower `submit worker(argument)` for a store-taking worker (see the file comment).
         # Returns the submitted Task value, or null to decline.
-        def emit_store_capturing_submit(worker_index: i64, submit_pool: sview, argument: Expr, argument_type: ValueType, return_type: ValueType, line: Ast::Pos, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            null return if not submit_worker_captures_store(worker_index, fns) or runtime.active_store_enum < 0
+        def emit_store_capturing_submit(worker_index: i64, submit_pool: sview, argument: Expr, argument_type: ValueType, return_type: ValueType, line: Ast::Pos, local_scope: mutable Scope&, will_group_add: bool, manual_group_add: bool, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if not submit_worker_requires_store(worker_index, fns) or runtime.active_store_enum < 0
+            null return if backend_expression_may_contain_pool_lifetime_handle(argument, argument_type, local_scope, fns, structs, generics)
+            null return if not submit_store_capture_lifetime_is_scoped(submit_pool, will_group_add, manual_group_add, local_scope)
+            worker_row: usize = worker_index.usize()
+            null return if worker_row >= fns.arena_counts.count or worker_row >= fns.is_error.count or worker_row >= fns.param_count.count or worker_row >= fns.is_variadic.count or worker_row >= fns.is_extern.count
+            worker_arena_count: usize = fns.arena_counts[worker_row]
+            # Hidden arena slots are caller-owned. For a reference parameter, its slot can
+            # own the backing that a worker grows and publishes through the captured value.
+            # This thunk has no proof for that owner yet, so never substitute a fresh arena
+            # that would be freed as soon as the task returns.
+            null return if worker_arena_count != 0.usize() or fns.is_error[worker_row]
+            null return if fns.param_count[worker_row] != 1 or fns.is_variadic[worker_row] or fns.is_extern[worker_row]
             null return if value_type_uses_sret(return_type, structs, ctx)
-            worker: LLVMValueRef = fns.handles[worker_index.usize()]
+            worker: LLVMValueRef = fns.handles[worker_row]
+            # Validate the source and LLVM signatures before indexing any hidden parameters or
+            # emitting the thunk. The ABI order is the source argument, packed store, then
+            # hidden arena slots.
+            null return if LLVMCountParams(worker) != 2
+            expected_store_root: mutable i64 = auto_region_type_packed_store_root(argument_type, 0, structs)
+            return_store_root: i64 = auto_region_type_packed_store_root(return_type, 0, structs)
+            expected_store_root <- return_store_root if expected_store_root < 0
+            null return if expected_store_root < 0 or expected_store_root != runtime.active_store_enum
+            null return if return_store_root >= 0 and return_store_root != runtime.active_store_enum
+            null return if not auto_region_type_packed_store_roots_match(argument_type, runtime.active_store_enum, 0, structs)
+            null return if not auto_region_type_packed_store_roots_match(return_type, runtime.active_store_enum, 0, structs)
             worker_type: LLVMTypeRef = LLVMGlobalGetValueType(worker)
-            argument_llvm: LLVMTypeRef = LLVMTypeOf(LLVMGetParam(worker, 0))
-            store_llvm: LLVMTypeRef = LLVMTypeOf(LLVMGetParam(worker, 1))
-            # The argument must travel by value: a by-address aggregate would point into the
-            # submitting frame, which the task may outlive.
-            null return if LLVMGetTypeKind(argument_llvm) != LLVMGetTypeKind(llvm_type_of(argument_type, structs, ctx))
-            return_llvm: LLVMTypeRef = LLVMGetReturnType(worker_type)
+            captured_argument_llvm: LLVMTypeRef = llvm_type_of(argument_type, structs, ctx)
             pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            worker_argument_llvm: LLVMTypeRef = LLVMTypeOf(LLVMGetParam(worker, 0))
+            argument_is_indirect: bool = value_type_uses_indirect_aggregate(argument_type, structs, ctx)
+            null return if worker_argument_llvm != (pointer_type if argument_is_indirect else captured_argument_llvm)
+            store_llvm: LLVMTypeRef = LLVMTypeOf(LLVMGetParam(worker, 1))
+            null return if LLVMTypeOf(runtime.active_store) != store_llvm
+            return_llvm: LLVMTypeRef = LLVMGetReturnType(worker_type)
+            null return if return_llvm != llvm_type_of(return_type, structs, ctx)
             bits_llvm: LLVMTypeRef = LLVMIntTypeInContext(ctx, structs.target.target_pointer_bits)
-            capture_fields: mutable darray[LLVMTypeRef] = [argument_llvm, store_llvm]
+            size_llvm: LLVMTypeRef = LLVMIntTypeInContext(ctx, structs.target.target_pointer_bits)
+            capture_fields: mutable darray[LLVMTypeRef] = [captured_argument_llvm, store_llvm]
             capture_fields_pointer: void& = (&capture_fields[0]).cast[void&] can Unsafe.PointerCast
             capture_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, capture_fields_pointer, 2, 0)
-            malloc_params: mutable darray[LLVMTypeRef] = [LLVMInt64TypeInContext(ctx)]
+            malloc_params: mutable darray[LLVMTypeRef] = [size_llvm]
             malloc_params_pointer: void& = (&malloc_params[0]).cast[void&] can Unsafe.PointerCast
             malloc_type: LLVMTypeRef = LLVMFunctionType(pointer_type, malloc_params_pointer, 1, 0)
             malloc_fn: LLVMValueRef = declare_or_get_named(m, "malloc", malloc_type)
+            null return if LLVMGlobalGetValueType(malloc_fn) != malloc_type
+            null return if LLVMTypeOf(LLVMSizeOf(capture_type)) != size_llvm
             free_params: mutable darray[LLVMTypeRef] = [pointer_type]
             free_params_pointer: void& = (&free_params[0]).cast[void&] can Unsafe.PointerCast
             free_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), free_params_pointer, 1, 0)
             free_fn: LLVMValueRef = declare_or_get_named(m, "free", free_type)
+            null return if LLVMGlobalGetValueType(free_fn) != free_type
 
-            # The entry thunk: unpack the capture, release it, call the worker with the store.
+            # The entry thunk: unpack the capture, release it, and call the worker. Hidden
+            # arena slots are excluded above until their caller-owned identity can be captured.
             thunk_params: mutable darray[LLVMTypeRef] = [bits_llvm]
             thunk_params_pointer: void& = (&thunk_params[0]).cast[void&] can Unsafe.PointerCast
             thunk_type: LLVMTypeRef = LLVMFunctionType(return_llvm, thunk_params_pointer, 1, 0)
-            thunk: LLVMValueRef = LLVMAddFunction(m, "__submit_store_thunk", thunk_type)
+            thunk_symbol: mutable darray[u8] = []
+            thunk_name_available: mutable bool = false
+            while not thunk_name_available |thunk_symbol, thunk_name_available, structs|:
+                thunk_symbol <- submit_thunk_symbol(structs.annotations.submit_thunk_counter)
+                structs.annotations.submit_thunk_counter <- structs.annotations.submit_thunk_counter + 1.u64()
+                if LLVMGetNamedFunction(m, (&thunk_symbol[0]).cast[cstr]) is existing_thunk:
+                    pass
+                else:
+                    thunk_name_available <- true
+            thunk: LLVMValueRef = LLVMAddFunction(m, (&thunk_symbol[0]).cast[cstr], thunk_type)
             # 8 = InternalLinkage: one private copy per submit site.
             LLVMSetLinkage(thunk, 8)
             thunk_builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
             LLVMPositionBuilderAtEnd(thunk_builder, LLVMAppendBasicBlockInContext(ctx, thunk, "entry"))
             thunk_capture: LLVMValueRef = LLVMBuildIntToPtr(thunk_builder, LLVMGetParam(thunk, 0), pointer_type, "capture")
-            thunk_argument: LLVMValueRef = LLVMBuildLoad2(thunk_builder, argument_llvm, LLVMBuildStructGEP2(thunk_builder, capture_type, thunk_capture, 0, "capture.arg.slot"), "capture.arg")
+            thunk_argument: LLVMValueRef = LLVMBuildLoad2(thunk_builder, captured_argument_llvm, LLVMBuildStructGEP2(thunk_builder, capture_type, thunk_capture, 0, "capture.arg.slot"), "capture.arg")
             thunk_store: LLVMValueRef = LLVMBuildLoad2(thunk_builder, store_llvm, LLVMBuildStructGEP2(thunk_builder, capture_type, thunk_capture, 1, "capture.store.slot"), "capture.store")
             free_args: mutable darray[LLVMValueRef] = [thunk_capture]
             free_args_pointer: void& = (&free_args[0]).cast[void&] can Unsafe.PointerCast
             _ = LLVMBuildCall2(thunk_builder, free_type, free_fn, free_args_pointer, 1, "")
             worker_args: mutable darray[LLVMValueRef] = [thunk_argument, thunk_store]
+            worker_argument: mutable LLVMValueRef = thunk_argument
+            if argument_is_indirect:
+                worker_argument_slot: LLVMValueRef = LLVMBuildAlloca(thunk_builder, captured_argument_llvm, "submit.worker.argument")
+                _ = LLVMBuildStore(thunk_builder, thunk_argument, worker_argument_slot)
+                worker_argument <- worker_argument_slot
+                worker_args[0] <- worker_argument
             worker_args_pointer: void& = (&worker_args[0]).cast[void&] can Unsafe.PointerCast
             # 0 = LLVMVoidTypeKind: a void call must be unnamed.
             returns_void: bool = LLVMGetTypeKind(return_llvm) == 0
-            worker_result: LLVMValueRef = LLVMBuildCall2(thunk_builder, worker_type, worker, worker_args_pointer, 2, "" if returns_void else "worker")
+            worker_call: LLVMValueRef = LLVMBuildCall2(thunk_builder, worker_type, worker, worker_args_pointer, worker_args.count.u32(), "" if returns_void else "worker")
+            # The thunk uses the default convention as a pool callback, but the indirect
+            # worker call must match the worker declaration's own ABI convention.
+            LLVMSetInstructionCallConv(worker_call, LLVMGetFunctionCallConv(worker))
             if returns_void:
                 _ = LLVMBuildRetVoid(thunk_builder)
             else:
-                _ = LLVMBuildRet(thunk_builder, worker_result)
+                _ = LLVMBuildRet(thunk_builder, worker_call)
             LLVMDisposeBuilder(thunk_builder)
 
             # The submission: build the capture here, hand its address to pool_submit1[uintptr, R].
-            if (emit_expression(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is argument_value:
+            captured_argument: mutable LLVMValueRef? = null
+            if argument_is_indirect:
+                if (indirect_aggregate_argument_address(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is indirect_argument_address:
+                    captured_argument <- LLVMBuildLoad2(builder, captured_argument_llvm, indirect_argument_address, "submit.capture.arg.value")
+                elif (emit_expression_coerced(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is indirect_argument_value:
+                    captured_argument <- indirect_argument_value
+            elif (emit_expression_coerced(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is argument_value:
+                captured_argument <- argument_value
+            if captured_argument is captured_value:
+                null return if LLVMTypeOf(captured_value) != captured_argument_llvm
                 malloc_args: mutable darray[LLVMValueRef] = [LLVMSizeOf(capture_type)]
                 malloc_args_pointer: void& = (&malloc_args[0]).cast[void&] can Unsafe.PointerCast
                 capture: LLVMValueRef = LLVMBuildCall2(builder, malloc_type, malloc_fn, malloc_args_pointer, 1, "submit.capture")
-                _ = LLVMBuildStore(builder, argument_value, LLVMBuildStructGEP2(builder, capture_type, capture, 0, "submit.capture.arg"))
+                # `malloc` may fail even when the queue allocation below would succeed. Do not
+                # form a GEP from its null result: abort through the target-aware backend helper,
+                # which uses `llvm.trap` for freestanding component guests.
+                submit_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                capture_alloc_failed: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, submit_function, "submit.capture.oom")
+                capture_alloc_ready: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, submit_function, "submit.capture.ready")
+                capture_is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, capture, LLVMConstNull(pointer_type), "submit.capture.null")
+                _ = LLVMBuildCondBr(builder, capture_is_null, capture_alloc_failed, capture_alloc_ready)
+                LLVMPositionBuilderAtEnd(builder, capture_alloc_failed)
+                capture_abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+                capture_abort: LLVMValueRef = declare_or_get_abort(m, capture_abort_type, structs.target.wasm_component_types_enabled)
+                _ = LLVMBuildCall2(builder, capture_abort_type, capture_abort, null, 0, "")
+                _ = LLVMBuildUnreachable(builder)
+                LLVMPositionBuilderAtEnd(builder, capture_alloc_ready)
+                _ = LLVMBuildStore(builder, captured_value, LLVMBuildStructGEP2(builder, capture_type, capture, 0, "submit.capture.arg"))
                 _ = LLVMBuildStore(builder, runtime.active_store, LLVMBuildStructGEP2(builder, capture_type, capture, 1, "submit.capture.store"))
                 capture_bits: LLVMValueRef = LLVMBuildPtrToInt(builder, capture, bits_llvm, "submit.capture.bits")
                 submit_types: darray[ValueType] = [ValueType{kind: TypeKind.Unsigned, bits: structs.target.target_pointer_bits}, copied_type(return_type)]

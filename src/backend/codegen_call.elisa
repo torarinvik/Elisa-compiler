@@ -76,6 +76,27 @@ extend Backend:
 
 
         def emit_call(callee: Expr, arguments: darray[Expr]&, argument_names: darray[sview], local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Task/TaskGroup values retain pool completion state, and a ThreadPool is shut
+            # down by its lexical scope. Passing any of these values to an arbitrary helper
+            # could let it retain a handle beyond cleanup. Only the proven synchronous consumers
+            # (`pool_await`, `task_group_wait_all`) and the checked ownership transfer
+            # (`task_group_add`) are exempt. The source-level `await` form lowers through the
+            # dedicated Expr.Block path; ordinary calls fail closed until call effects carry
+            # pool-lifetime ownership.
+            if local_scope.pool_names.count > 0 or local_scope.group_names.count > 0:
+                if not backend_is_trusted_pool_await_call(callee, arguments, local_scope, fns, structs, generics) and not backend_is_trusted_task_group_add_call(callee, arguments, local_scope, fns, structs, generics) and not backend_is_trusted_task_group_wait_call(callee, arguments, local_scope, fns, structs, generics):
+                    # UFCS/method calls pass the expression left of `.method` as a hidden
+                    # first argument, separate from `arguments`; include it in the same
+                    # escape check so `task.method()` or `pool.method()` cannot bypass it.
+                    match callee:
+                        Expr.Field(task_escape_receiver, _, _):
+                            if backend_expression_may_contain_pool_lifetime_handle(task_escape_receiver, expression_type(task_escape_receiver, local_scope, fns, structs, generics), local_scope, fns, structs, generics):
+                                return null
+                        _:
+                            pass
+                    for task_escape_argument in arguments |local_scope, fns, structs, generics|:
+                        if backend_expression_may_contain_pool_lifetime_handle(task_escape_argument, expression_type(task_escape_argument, local_scope, fns, structs, generics), local_scope, fns, structs, generics):
+                            return null
             # `va_arg[T](storage)` is a compiler-owned typed primitive. LLVM
             # represents it as an instruction, not a linkable intrinsic or
             # runtime function, so it must be lowered before ordinary generic
@@ -139,7 +160,7 @@ extend Backend:
                         prefix_cast_source: ValueType = resolve_type(arguments[0], ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
                         if cast_hook_index(fns, prefix_cast_source, prefix_cast_target) >= 0:
                             prefix_cast_names: mutable darray[sview] = []
-                            return emit_direct_call("", "__cast__", callee, false, arguments, prefix_cast_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                            return emit_direct_call("", "__cast__", callee, false, true, arguments, prefix_cast_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
             # `node_table_fill[Expr, i32](owner, frozen, -1)` — allocate a dense side table
             # over a frozen store and fill it. stage0: read the store's node COUNT, and on a
             # non-zero count `arena_alloc(owner, count * sizeof(V))` + `arena_da_fill(view,
@@ -272,7 +293,7 @@ extend Backend:
                     for typestate_ctor_suffix_index in 0..<sview_len("_new") |typestate_ctor_storage|:
                         typestate_ctor_storage.push(sview_at("_new", typestate_ctor_suffix_index))
                     typestate_ctor_name: sview = bytes_view_range(typestate_ctor_storage, 0, typestate_ctor_storage.count)
-                    return emit_direct_call("", typestate_ctor_name, callee, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write} if function_index_of(fns, "", typestate_ctor_name) >= 0
+                    return emit_direct_call("", typestate_ctor_name, callee, false, true, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write} if function_index_of(fns, "", typestate_ctor_name) >= 0
             # `f[i64](x)` — an EXPLICIT type argument makes the callee an Index, not an
             # Ident; the bracket holds a TYPE, so it resolves as an annotation.
             if callee is Expr.Index(generic_callee, generic_argument, generic_call_line):
@@ -338,31 +359,144 @@ extend Backend:
                             return emit_darray_pop_value(pop_slot, pop_array_type, structs, m, ctx, builder)
                     return null
             return emit_call_named(callee, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
-        def emit_direct_call(callee_owner: sview, callee_name: sview, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
-            # Prefer arity-matched overload (Token 4-arg vs 5-arg constructors). Name-only
-            # lookup is only the fallback for unique names / legacy single entries.
-            # TYPE-matched overload first: several may share this arity, and taking the
-            # first was a silent wrong answer (see overload_index_for_args). Only consulted
-            # for a call with no receiver, where `arguments` IS the full argument list.
-            # A UFCS call resolves over the SAME full list, receiver first: `c.area()` with
-            # `impl Shape for Circle` and `impl Shape for Square` both declaring a one-param
-            # `area` used to skip the typed pass and take the first arity match, so every
-            # receiver dispatched to whichever impl was declared first (the differential
-            # case ufcs_overload_by_receiver). Only the protocol-through-bound-type path was
-            # typed; a value receiver is the common spelling and was not.
+
+
+        # The resolved-call helpers also have callers that bypass emit_call (destination-
+        # aware aggregate initialization and compiler conversions). Keep the pool-lifetime
+        # boundary at that shared resolution layer as well.
+        def direct_call_has_untrusted_pool_lifetime_argument(receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if local_scope.pool_names.count == 0 and local_scope.group_names.count == 0
+            return true if has_receiver and backend_expression_may_contain_pool_lifetime_handle(receiver, expression_type(receiver, local_scope, fns, structs, generics), local_scope, fns, structs, generics)
+            for task_escape_argument in arguments |local_scope, fns, structs, generics|:
+                return true if backend_expression_may_contain_pool_lifetime_handle(task_escape_argument, expression_type(task_escape_argument, local_scope, fns, structs, generics), local_scope, fns, structs, generics)
+            return false
+        # Empty means every explicit argument is positional. Otherwise each argument must
+        # have one label slot; silently replacing malformed metadata with empty labels can
+        # select a different overload, especially after adding the hidden UFCS receiver.
+        def direct_call_argument_names_are_well_formed(arguments: darray[Expr]&, argument_names: darray[sview]&) -> bool:
+            return argument_names.count == 0 or argument_names.count == arguments.count
+        # The ordinary emit_call path has already checked the same receiver and argument
+        # expressions. Keep the guard for direct-call expression paths that bypass emit_call.
+        def emit_direct_call(callee_owner: sview, callee_name: sview, receiver: Expr, has_receiver: bool, pool_guard_prechecked: bool, arguments: darray[Expr]&, argument_names: darray[sview]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if not pool_guard_prechecked and direct_call_has_untrusted_pool_lifetime_argument(receiver, has_receiver, arguments, local_scope, fns, structs, generics)
+            null return if not direct_call_argument_names_are_well_formed(arguments, argument_names)
+            # Match by type first, mapping named arguments to their formal parameters. If
+            # that finds no exact candidate, fall back only when one declaration accepts
+            # this call shape (arity, labels, defaults, and variadic tail).
             fn_index: mutable i64 = -1
             if has_receiver:
                 receiver_first: mutable darray[Expr] = [receiver]
                 for ufcs_argument in arguments |receiver_first|:
                     receiver_first.push(ufcs_argument)
-                fn_index <- overload_index_for_args(fns, callee_owner, callee_name, receiver_first, local_scope, structs, generics)
+                receiver_names: mutable darray[sview] = [""]
+                for explicit_position in 0..<arguments.count |receiver_names, explicit_position, argument_names, arguments|:
+                    receiver_names.push(argument_names[explicit_position]) if argument_names.count == arguments.count
+                    receiver_names.push("") if argument_names.count != arguments.count
+                fn_index <- overload_index_for_call_args(fns, callee_owner, callee_name, receiver_first, receiver_names, local_scope, structs, generics)
+                fn_index <- function_index_of_unique_call_shape(fns, callee_owner, callee_name, receiver_first, receiver_names) if fn_index < 0
             else:
-                fn_index <- overload_index_for_args(fns, callee_owner, callee_name, arguments, local_scope, structs, generics)
-            fn_index <- function_index_of_arity(fns, callee_owner, callee_name, total_arguments) if fn_index < 0
-            fn_index <- function_index_of(fns, callee_owner, callee_name) if fn_index < 0
+                fn_index <- overload_index_for_call_args(fns, callee_owner, callee_name, arguments, argument_names, local_scope, structs, generics)
+                fn_index <- function_index_of_unique_call_shape(fns, callee_owner, callee_name, arguments, argument_names) if fn_index < 0
             null return if fn_index < 0
             return emit_direct_call_indexed(fn_index, receiver, has_receiver, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder, null) can Global{Read,Write}
+
+
+        # Whether this call passes a reference to caller storage. The callable-alias cache
+        # records initializer facts about local slots; a callee with a Ref parameter can
+        # replace those slots or fields through an argument or receiver, so the facts must
+        # be invalidated after the call. Scan every formal because omitted defaults are
+        # emitted too, and variadic tails have no modeled formal types.
+        def direct_call_may_mutate_local_callable_aliases(fn_index: i64, has_receiver: bool, arguments: darray[Expr]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            true return if fn_index < 0 or fn_index.usize() >= fns.param_start.count or fn_index.usize() >= fns.param_count.count
+            start: usize = fns.param_start[fn_index.usize()]
+            count: usize = fns.param_count[fn_index.usize()]
+            provided: usize = arguments.count + (1 if has_receiver else 0)
+            true return if fn_index.usize() < fns.is_variadic.count and fns.is_variadic[fn_index.usize()] and provided > count
+            for position in 0..<count |start, count, fn_index, fns, structs|:
+                parameter_index: usize = start + position
+                return true if parameter_index >= fns.param_types.count
+                parameter_type: ValueType = fns.param_types[parameter_index]
+                return true if callable_argument_may_mutate_local_aliases(parameter_type, structs)
+            return false
+
+
+        # Parameter defaults are evaluated in the declaring module with parameters and
+        # caller locals out of scope. Use an empty lexical scope and temporarily restore the
+        # callee owner (plus generic bindings when present) while emitting the expression.
+        def push_struct_default_type_bindings(struct_slot: i64, structs: mutable StructTable&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            return 0 if struct_slot < 0
+            return -1 if struct_slot.usize() >= structs.records.names.count or struct_slot.usize() >= structs.records.owners.count
+            struct_name: sview = structs.records.names[struct_slot.usize()]
+            struct_owner: sview = structs.records.owners[struct_slot.usize()]
+            template_index: i64 = generic_struct_index_of_owned(structs, struct_owner, struct_name)
+            return 0 if template_index == -1
+            return -1 if template_index < 0
+            template_row: usize = template_index.usize()
+            return -1 if template_row >= structs.generics.generic_struct_param_start.count or template_row >= structs.generics.generic_struct_param_count.count
+            template_id: u32 = (template_row + 1.usize()).u32()
+            instance: mutable usize = generic_inst_first_row(structs, struct_slot.usize())
+            found_instance: mutable i64 = -1
+            while instance < structs.generics.generic_struct_inst_index.count |instance, structs, struct_slot, template_id, found_instance|:
+                if structs.generics.generic_struct_inst_index[instance] == struct_slot.usize() and generic_instance_template_id(instance, structs) == template_id:
+                    found_instance <- instance.i64()
+                    break
+                instance <- generic_inst_next_row(structs, instance)
+            return -1 if found_instance < 0
+            instance_row: usize = found_instance.usize()
+            return -1 if instance_row >= structs.generics.generic_struct_inst_arg_start.count or instance_row >= structs.generics.generic_struct_inst_arg_count.count or instance_row >= structs.generics.generic_struct_inst_ready.count
+            return -1 if not structs.generics.generic_struct_inst_ready[instance_row]
+            param_start: usize = structs.generics.generic_struct_param_start[template_row]
+            param_count: usize = structs.generics.generic_struct_param_count[template_row]
+            arg_start: usize = structs.generics.generic_struct_inst_arg_start[instance_row]
+            arg_count: usize = structs.generics.generic_struct_inst_arg_count[instance_row]
+            return -1 if arg_count != param_count or param_start > structs.generics.generic_struct_param_names.count or param_count > structs.generics.generic_struct_param_names.count - param_start
+            return -1 if arg_start > structs.generics.generic_struct_inst_args.count or arg_count > structs.generics.generic_struct_inst_args.count - arg_start
+            for position in 0..<param_count |structs, param_start, arg_start|:
+                structs.bindings.binding_names <- structs.bindings.binding_names.push(structs.generics.generic_struct_param_names[param_start + position])
+                structs.bindings.binding_types <- structs.bindings.binding_types.push(copied_type(structs.generics.generic_struct_inst_args[arg_start + position]))
+            return param_count.i64()
+
+
+        def emit_call_default_argument(expression: Expr, wanted: ValueType, owner: sview, generic_slot: i64, struct_slot: i64, type_args: darray[ValueType]&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{Read,Write}]:
+            default_scope: mutable Scope = Scope{names: [], slots: [], types: [], pool_names: [], group_names: [], deferred: []}
+            saved_struct_owner: sview = structs.visibility.current_owner
+            saved_generic_owner: sview = generics.current_owner
+            return null if generic_slot >= 0 and struct_slot >= 0
+            return null if structs.bindings.binding_names.count != structs.bindings.binding_types.count
+            saved_binding_names: mutable darray[sview] = []
+            saved_binding_types: mutable darray[ValueType] = []
+            for binding_index in 0..<structs.bindings.binding_names.count |binding_index, structs, saved_binding_names, saved_binding_types|:
+                saved_binding_names.push(structs.bindings.binding_names[binding_index])
+                saved_binding_types.push(copied_type(structs.bindings.binding_types[binding_index]))
+            structs.bindings.binding_names <- []
+            structs.bindings.binding_types <- []
+            structs.visibility.current_owner <- owner
+            generics.current_owner <- owner
+            binding_count: mutable usize = 0
+            bindings_valid: mutable bool = true
+            if generic_slot >= 0:
+                if generic_slot.usize() >= generics.names.count or generic_slot.usize() >= generics.param_start.count or generic_slot.usize() >= generics.param_count.count:
+                    bindings_valid <- false
+                else:
+                    binding_count <- push_type_bindings(generics, structs, generic_slot.usize(), type_args)
+                    bindings_valid <- binding_count == generics.param_count[generic_slot.usize()]
+            elif struct_slot >= 0:
+                struct_binding_count: i64 = push_struct_default_type_bindings(struct_slot, structs)
+                if struct_binding_count < 0:
+                    bindings_valid <- false
+                else:
+                    binding_count <- struct_binding_count.usize()
+            default_value: mutable LLVMValueRef? = null
+            if bindings_valid:
+                if (indirect_aggregate_argument_address(expression, wanted, default_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is default_address:
+                    default_value <- default_address
+                elif (emit_expression_coerced(expression, wanted, default_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is emitted_default:
+                    default_value <- materialize_indirect_aggregate_argument(emitted_default, wanted, structs, ctx, builder)
+            structs.bindings.binding_names <- saved_binding_names
+            structs.bindings.binding_types <- saved_binding_types
+            structs.visibility.current_owner <- saved_struct_owner
+            generics.current_owner <- saved_generic_owner
+            return default_value
 
 
         # Emit a call to an ALREADY-RESOLVED FnTable row.
@@ -377,6 +511,7 @@ extend Backend:
         # here). The bound type says which impl is meant, so the caller resolves the
         # row and hands it over.
         def emit_direct_call_indexed(fn_index: i64, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, sret_destination: LLVMValueRef?) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if not direct_call_argument_names_are_well_formed(arguments, argument_names)
             total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
             target: LLVMValueRef = fns.handles[fn_index.usize()]
             # LLVMCountParams counts the implicit trailing ARENA too, so the arity check
@@ -450,15 +585,27 @@ extend Backend:
                 named_position: mutable usize = 1 if has_receiver else 0
                 while named_position < fixed_arguments |argument_values, declined, named_position, argument_names, fns, fn_index, arguments, local_scope, structs, generics, runtime, m, ctx, builder|:
                     source_index: i64 = named_argument_index(argument_names, fns.param_names, fns.param_start[fn_index.usize()], fixed_arguments, named_position if has_receiver else 0, named_position)
-                    null return if source_index < 0 or source_index.usize() >= arguments.count
-                    named_argument: Expr = arguments[source_index.usize()]
                     named_type: ValueType = copied_type(fns.param_types[fns.param_start[fn_index.usize()] + named_position])
-                    if (indirect_aggregate_argument_address(named_argument, named_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is named_address:
-                        argument_values.push(named_address)
-                    elif (emit_expression_coerced(named_argument, named_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is named_value:
-                        argument_values.push(materialize_indirect_aggregate_argument(named_value, named_type, structs, ctx, builder))
+                    if source_index < 0 or source_index.usize() >= arguments.count:
+                        default_slot: usize = fns.param_start[fn_index.usize()] + named_position
+                        default_expression: Expr = fns.param_defaults[default_slot]
+                        if default_expression is Expr.Invalid:
+                            declined <- true
+                        else:
+                            empty_default_type_args: darray[ValueType] = []
+                            default_owner: sview = fns.owners[fn_index.usize()] if fn_index.usize() < fns.owners.count else ""
+                            if (emit_call_default_argument(default_expression, named_type, default_owner, -1, -1, empty_default_type_args, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is named_default_value:
+                                argument_values.push(named_default_value)
+                            else:
+                                declined <- true
                     else:
-                        declined <- true
+                        named_argument: Expr = arguments[source_index.usize()]
+                        if (indirect_aggregate_argument_address(named_argument, named_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is named_address:
+                            argument_values.push(named_address)
+                        elif (emit_expression_coerced(named_argument, named_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is named_value:
+                            argument_values.push(materialize_indirect_aggregate_argument(named_value, named_type, structs, ctx, builder))
+                        else:
+                            declined <- true
                     named_position <- named_position + 1
                 null return if declined
             else:
@@ -552,7 +699,7 @@ extend Backend:
             # Fill the omitted tail from the parameter defaults, at each parameter's declared
             # type. A parameter with no recorded default (Expr.Invalid) DECLINES rather than
             # passing a zero — that would silently invent an argument value.
-            if uses_defaults:
+            if uses_defaults and not named_call:
                 default_position: mutable usize = total_arguments
                 while default_position < fixed_arguments |argument_values, declined, default_position, fns, fn_index, local_scope, structs, generics, runtime, m, ctx, builder|:
                     default_slot: usize = fns.param_start[fn_index.usize()] + default_position
@@ -561,8 +708,10 @@ extend Backend:
                         declined <- true
                     else:
                         default_type: ValueType = copied_type(fns.param_types[default_slot])
-                        if (emit_expression_coerced(default_expression, default_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is default_value:
-                            argument_values.push(materialize_indirect_aggregate_argument(default_value, default_type, structs, ctx, builder))
+                        empty_default_type_args: darray[ValueType] = []
+                        default_owner: sview = fns.owners[fn_index.usize()] if fn_index.usize() < fns.owners.count else ""
+                        if (emit_call_default_argument(default_expression, default_type, default_owner, -1, -1, empty_default_type_args, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is default_value:
+                            argument_values.push(default_value)
                         else:
                             declined <- true
                     default_position <- default_position + 1
@@ -721,6 +870,7 @@ extend Backend:
                 else:
                     args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
                     call_result <- LLVMBuildCall2(builder, fn_type, target, args_pointer, argument_values.count.u32(), result_name)
+            clear_all_local_callable_aliases(local_scope) if direct_call_may_mutate_local_callable_aliases(fn_index, has_receiver, arguments, fns, structs)
             add_call_type_attribute(call_result, 1, "sret", llvm_type_of(call_return_type, structs, ctx), ctx) if sret_return
             # An `extern resource` came back as its bare handle: wrap it into the struct, and
             # for `Name?` into the aggregate optional from a null test (docs/127 §3.2).
@@ -786,32 +936,41 @@ extend Backend:
         # distinction matters: callers must not fall back to ordinary expression lowering after
         # side effects have already been emitted, or the source call could execute twice.
         def emit_direct_call_into_sret(callee_owner: sview, callee_name: sview, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview]&, destination: LLVMValueRef, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
+            return -1 if direct_call_has_untrusted_pool_lifetime_argument(receiver, has_receiver, arguments, local_scope, fns, structs, generics)
+            return 0 if not direct_call_argument_names_are_well_formed(arguments, argument_names)
             fn_index: mutable i64 = -1
             if has_receiver:
                 receiver_first: mutable darray[Expr] = [receiver]
                 for ufcs_argument in arguments |receiver_first|:
                     receiver_first.push(ufcs_argument)
-                fn_index <- overload_index_for_args(fns, callee_owner, callee_name, receiver_first, local_scope, structs, generics)
+                receiver_names: mutable darray[sview] = [""]
+                for explicit_position in 0..<arguments.count |receiver_names, explicit_position, argument_names, arguments|:
+                    receiver_names.push(argument_names[explicit_position]) if argument_names.count == arguments.count
+                    receiver_names.push("") if argument_names.count != arguments.count
+                fn_index <- overload_index_for_call_args(fns, callee_owner, callee_name, receiver_first, receiver_names, local_scope, structs, generics)
+                fn_index <- function_index_of_unique_call_shape(fns, callee_owner, callee_name, receiver_first, receiver_names) if fn_index < 0
             else:
-                fn_index <- overload_index_for_args(fns, callee_owner, callee_name, arguments, local_scope, structs, generics)
-            fn_index <- function_index_of_arity(fns, callee_owner, callee_name, total_arguments) if fn_index < 0
-            fn_index <- function_index_of(fns, callee_owner, callee_name) if fn_index < 0
+                fn_index <- overload_index_for_call_args(fns, callee_owner, callee_name, arguments, argument_names, local_scope, structs, generics)
+                fn_index <- function_index_of_unique_call_shape(fns, callee_owner, callee_name, arguments, argument_names) if fn_index < 0
             # Bare calls written inside a module are owned by that enclosing module even
             # though their AST callee is only an Ident. Mirror emit_call_named's lexical lookup
             # here; otherwise a large aggregate `updated <- writer_put_byte(...)` falls back to
             # a first-class sret load/store simply because the destination-aware resolver lost
             # the current owner.
-            if fn_index < 0 and callee_owner == "" and structs.visibility.current_owner != "":
+            if fn_index < 0 and callee_owner == "" and structs.visibility.current_owner != "" and function_index_of(fns, "", callee_name) < 0:
                 if has_receiver:
                     owner_receiver_first: mutable darray[Expr] = [receiver]
                     for owner_ufcs_argument in arguments |owner_receiver_first|:
                         owner_receiver_first.push(owner_ufcs_argument)
-                    fn_index <- overload_index_for_args(fns, structs.visibility.current_owner, callee_name, owner_receiver_first, local_scope, structs, generics)
+                    owner_receiver_names: mutable darray[sview] = [""]
+                    for explicit_position in 0..<arguments.count |owner_receiver_names, explicit_position, argument_names, arguments|:
+                        owner_receiver_names.push(argument_names[explicit_position]) if argument_names.count == arguments.count
+                        owner_receiver_names.push("") if argument_names.count != arguments.count
+                    fn_index <- overload_index_for_call_args(fns, structs.visibility.current_owner, callee_name, owner_receiver_first, owner_receiver_names, local_scope, structs, generics)
+                    fn_index <- function_index_of_unique_call_shape(fns, structs.visibility.current_owner, callee_name, owner_receiver_first, owner_receiver_names) if fn_index < 0
                 else:
-                    fn_index <- overload_index_for_args(fns, structs.visibility.current_owner, callee_name, arguments, local_scope, structs, generics)
-                fn_index <- function_index_of_arity(fns, structs.visibility.current_owner, callee_name, total_arguments) if fn_index < 0
-                fn_index <- function_index_of(fns, structs.visibility.current_owner, callee_name) if fn_index < 0
+                    fn_index <- overload_index_for_call_args(fns, structs.visibility.current_owner, callee_name, arguments, argument_names, local_scope, structs, generics)
+                    fn_index <- function_index_of_unique_call_shape(fns, structs.visibility.current_owner, callee_name, arguments, argument_names) if fn_index < 0
             return 0 if fn_index < 0
             return 0 if fns.is_error[fn_index.usize()]
             return 0 if not value_type_uses_sret(fns.returns[fn_index.usize()], structs, ctx)

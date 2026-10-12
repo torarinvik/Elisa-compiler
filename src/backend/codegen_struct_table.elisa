@@ -25,6 +25,13 @@ extend Backend:
             region_scan_skips_in_blocks: mutable bool = false
             memory_declarations: mutable darray[Decl] = []
             memory_stack_functions: mutable darray[LLVMValueRef] = []
+            # The speculative memory proofs share a bounded work budget across all
+            # candidates in the currently emitted function. This prevents a function
+            # with many buffers or deeply nested scratch scopes from turning codegen into
+            # repeated whole-body scans and quadratic scope copies.
+            memory_proof_function: mutable LLVMValueRef? = null
+            memory_proof_remaining: mutable usize = 0
+            memory_proof_exhausted: mutable bool = false
 
         struct BackendDiagnostics:
             # First source construct that made the current function decline.
@@ -57,6 +64,17 @@ extend Backend:
             field_types: mutable darray[ValueType] = []
             field_start: mutable darray[usize] = []
             field_count: mutable darray[usize] = []
+            # Large struct field-name indexes are prepared when a row's field span is
+            # finalized. The row stamps let field_index_of keep its read-only signature and
+            # use the linear scan for incomplete placeholders or collision-heavy indexes.
+            field_name_index_ready: mutable darray[bool] = []
+            field_name_index_field_start: mutable darray[usize] = []
+            field_name_index_field_count: mutable darray[usize] = []
+            field_name_index_bucket_start: mutable darray[usize] = []
+            field_name_index_bucket_count: mutable darray[usize] = []
+            field_name_index_buckets: mutable darray[usize] = []
+            field_name_index_names: mutable darray[sview] = []
+            field_name_index_positions: mutable darray[usize] = []
             # Memoized structural fact: 0 unknown, 1 currently visiting, 2 no darray, 3 has
             # one. Recursive records must terminate, and repeated ABI queries should reuse the
             # same result instead of allocating a traversal-local visited vector.
@@ -71,8 +89,9 @@ extend Backend:
             # array parallel to `field_names`: six sites push field rows, and only two of
             # them have a Decl to read defaults from, so a parallel array would have to be
             # kept in lockstep by all six or silently misindex every field after the gap.
-            # Keyed by (struct name, field name) and appended only where a default exists,
-            # which is a handful of rows for a whole program.
+            # Keyed by (module owner, struct name, field name) and appended only where a
+            # default exists, which is a handful of rows for a whole program.
+            field_default_modules: mutable darray[sview] = []
             field_default_owners: mutable darray[sview] = []
             field_default_fields: mutable darray[sview] = []
             field_default_values: mutable darray[Ast::Expr] = []
@@ -134,9 +153,25 @@ extend Backend:
             derived_state_owners: mutable darray[sview] = []
             derived_state_names: mutable darray[sview] = []
             derived_state_conditions: mutable darray[Expr] = []
-            # `submit[pool] f(x)` — the explicit pool selector, keyed by the `submit` line.
-            submit_pool_lines: mutable darray[i64] = []
+            # `submit[pool] f(x)` — explicit pool selectors, keyed by the `submit` token offset.
+            submit_pool_offsets: mutable darray[u32] = []
             submit_pool_names: mutable darray[sview] = []
+            # `submit` markers use the same token offsets as explicit selectors, so nested
+            # block/value lowering can distinguish multiple submits on one source line.
+            submit_offsets: mutable darray[u32] = []
+            # The offsets are normally collected in source order. Retain that fact so marker
+            # lookups can use binary search, while falling back to linear search if collection
+            # ever visits a nested annotation out of order.
+            submit_offsets_sorted: mutable bool = true
+            # Only the runtime's explicitly trusted TaskGroup entry points may authorize
+            # implicit group registration of captured-store submit expressions.
+            task_group_runtime_api_names: mutable darray[sview] = []
+            task_group_runtime_api_lines: mutable darray[u32] = []
+            # Exact bundled runtime declarations of the synchronous pool_await consumer.
+            pool_await_runtime_lines: mutable darray[u32] = []
+            # Capture thunks are LLVM functions in the module. Keep their names unique per
+            # module, including when separate source files reuse the same token offsets.
+            submit_thunk_counter: mutable u64 = 0
             aggregate_state_owners: mutable darray[sview] = []
             # Parsed classic state families, retained with their exact module owner so
             # signature lowering never erases a bracket based on a colliding bare name.
@@ -231,6 +266,11 @@ extend Backend:
             # Param names live in a FLAT pool with a per-template span, like struct fields.
             generic_struct_names: mutable darray[sview] = []
             generic_struct_owners: mutable darray[sview] = []
+            # Name chains keep owner-aware template probes proportional to same-name
+            # declarations instead of rescanning every registered template.
+            generic_struct_name_buckets: mutable darray[i64] = []
+            generic_struct_name_tails: mutable darray[i64] = []
+            generic_struct_name_next: mutable darray[i64] = []
             generic_struct_decls: mutable darray[Decl] = []
             generic_struct_param_names: mutable darray[sview] = []
             generic_struct_param_start: mutable darray[usize] = []
@@ -298,11 +338,38 @@ extend Backend:
             # Target ABI layout supplied by the driver before codegen. Large aggregate
             # classification must use this exact layout, not an unevaluated LLVMSizeOf expr.
             target_data: LLVMTargetDataRef
+            # C export classification follows the module target flags. Snapshot once so
+            # every aggregate parameter and return reuses the same ABI decision.
+            cabi_classification_target: mutable i32 = 0
             # Snapshot the target pointer width per module so hot type lookups do not
             # repeatedly probe process environment. Separate tables may target different ABIs.
             target_pointer_bits: u32
+            # Linkage options are snapshotted once for this module, before body emission.
+            # Keeping them here avoids repeated getenv calls and temporary C-string buffers
+            # for every ordinary and instantiated function.
+            prefer_private_linkage: mutable bool = false
+            bundled_runtime_build: mutable bool = false
+            # `-fnoalias` is also a module-level opt-in. Snapshot it once so per-function
+            # parameter attributes and per-access alias metadata do not re-read getenv.
+            noalias_mutable_refs: mutable bool = false
+            # Debug tracing is sampled with the rest of the module environment so hot
+            # packed-variant lookup and constructor emission do not call getenv per node.
+            debug_packed_path_enabled: mutable bool = false
+            debug_packed_constructor_enabled: mutable bool = false
+            # Component mode is fixed for an emitted module. Cache it here so string
+            # equality lowering does not probe getenv for each comparison.
+            wasm_component_types_enabled: mutable bool = false
 
         struct BackendInternedTypes:
+            # The generated native string-view equality helper is module-local. Cache the
+            # selected callee so each later string comparison avoids an LLVM name lookup.
+            sview_eq_callee: mutable LLVMValueRef? = null
+            # The target-sized `{ptr, usize, usize}` LLVM header shared by every `darray`
+            # in this module. The context and pointer width are kept as cache keys because
+            # LLVM types cannot cross contexts and wasm32 uses a different header layout.
+            darray_header_type: mutable LLVMTypeRef? = null
+            darray_header_context: mutable LLVMContextRef? = null
+            darray_header_target_bits: mutable u32 = 0
             # Fixed-array types, interned on demand: `array_elements[i]` is the element
             # type and `array_extents[i]` the length of the array whose ValueType has
             # `bits == i`. Interning (rather than a fresh entry per mention) keeps
@@ -359,6 +426,11 @@ extend Backend:
             # declaration order); a variant with NO payload still takes a slot so that a
             # variant's index within its enum IS its tag.
             penum_names: mutable darray[sview] = []
+            # Built after payload finalization, when names are stable. Small registries keep
+            # the linear lookup path instead of allocating the fixed-size name-chain buckets.
+            penum_name_buckets: mutable darray[i64] = []
+            penum_name_tails: mutable darray[i64] = []
+            penum_name_next: mutable darray[i64] = []
             # The module each payload enum was declared in, "" at file scope. Payload
             # enum names are not globally unique, so this is part of their identity.
             penum_owners: mutable darray[sview] = []
@@ -386,6 +458,17 @@ extend Backend:
             penum_field_type_count: mutable darray[usize] = []
             penum_variant_start: mutable darray[usize] = []
             penum_variant_count: mutable darray[usize] = []
+            # Lazy projection index for large payload enums. Each enum owns a bucket segment;
+            # bucket values are one-based rows in the parallel name/slot/offset/count columns.
+            # A count of two means the field name is ambiguous across variants.
+            penum_field_index_ready: mutable darray[bool] = []
+            penum_field_index_bucket_start: mutable darray[usize] = []
+            penum_field_index_bucket_count: mutable darray[usize] = []
+            penum_field_index_buckets: mutable darray[usize] = []
+            penum_field_index_names: mutable darray[sview] = []
+            penum_field_index_slots: mutable darray[usize] = []
+            penum_field_index_offsets: mutable darray[usize] = []
+            penum_field_index_match_counts: mutable darray[usize] = []
             # Payload words (i64 units) of the WIDEST variant — the `[N x i64]` extent.
             penum_payload_words: mutable darray[u32] = []
 
@@ -395,6 +478,11 @@ extend Backend:
             # row, not inline data. Kept apart so neither path can silently claim the other's
             # enums (which is exactly the bug 5403a62 fixed).
             packed_names: mutable darray[sview] = []
+            # Source-ordered name chains keep exact owner and qualified-name probes out of the
+            # full registry scan once the table is large enough to amortize them.
+            packed_name_buckets: mutable darray[i64] = []
+            packed_name_tails: mutable darray[i64] = []
+            packed_name_next: mutable darray[i64] = []
             # The module each packed enum was declared in, "" at file scope. Store type and
             # constructor resolution must not collapse two modules' same-named packed enums.
             packed_owners: mutable darray[sview] = []
@@ -522,16 +610,33 @@ extend Backend:
             # (`__ast_refinement`). Keyed on the declaration's ancestry, not on the bare
             # name, so a program's own `packed enum Expr:` is an ordinary packed enum.
             ast_refinement_names: mutable darray[sview] = []
+            ast_refinement_modules: mutable darray[sview] = []
+            # Bumped on every reset or append to ast_refinement_names. Unlike the packed
+            # layout stamp's table counts, this catches same-count refinement rebuilds.
+            ast_refinement_epoch: mutable u64 = 0
             hierarchy_child: mutable darray[sview] = []
             hierarchy_parent: mutable darray[sview] = []
+            hierarchy_modules: mutable darray[sview] = []
             # Packed enums that use the canonical AoS row ABI. This includes the compiler AST,
             # user sealed hierarchies, and plain recursive enums. It is deliberately separate
             # from ast_refinement_names: a recursive enum such as `Tree` is packed/AoS without
             # belonging to the compiler's sealed Node hierarchy.
             aos_dynamic_names: mutable darray[sview] = []
+            aos_dynamic_modules: mutable darray[sview] = []
             # Bumped by every IN-PLACE write to a table a packed row layout reads (field spans,
             # payload words, variant spans); with the tables' counts it stamps the memos below.
             layout_epoch: mutable u64 = 0
+            # Narrow epoch for the in-place variant-count writes read by the sized-hierarchy
+            # threshold. Packed-name appends are covered separately by packed_names.count.
+            packed_variant_count_epoch: mutable u64 = 0
+            # Memo for the hierarchy-wide sized-record threshold. Its key uses only the
+            # packed enum inputs and the dedicated refinement epoch; optional/array/ref
+            # intern tables grow during codegen and must not invalidate this memo.
+            packed_ast_sized_hierarchy_valid: mutable bool = false
+            packed_ast_sized_hierarchy_result: mutable bool = false
+            packed_ast_sized_hierarchy_names_count: mutable usize = 0
+            packed_ast_sized_hierarchy_variant_epoch: mutable u64 = 0
+            packed_ast_sized_hierarchy_refinement_epoch: mutable u64 = 0
             # packed_ast_row_slots / packed_dynamic_aos_row_slots answers and the layout stamp
             # each was computed under (0 = none); see packed_layout_stamp.
             packed_ast_slots_memo: mutable u32 = 0
@@ -601,6 +706,12 @@ extend Backend:
             extern_global_types: mutable darray[ValueType] = []
             extern_global_handles: mutable darray[LLVMValueRef] = []
             mutable_global_names: mutable darray[sview] = []
+            # Name chains over mutable_global_names. Built after the registry becomes large
+            # enough to amortize the fixed bucket table; appends keep an initialized index
+            # current, while name_chain_first/next preserve the linear fallback beforehand.
+            mutable_global_name_buckets: mutable darray[i64] = []
+            mutable_global_name_tails: mutable darray[i64] = []
+            mutable_global_name_next: mutable darray[i64] = []
             # The enclosing `module M:` name, "" at top level — the same key consts carry in
             # const_owners. Without it two modules' `global counter` shared ONE row and the
             # last one materialized wrote its handle over the first's (see the lookup).
@@ -692,12 +803,13 @@ extend Backend:
         struct BackendFunctionTypes:
             # `fn(…)->R` signature reconstruction. The parser drops fn-type param/return types
             # from the AST, recording only HEAD NAMES on the __lambda_return / __lambda_param
-            # annotations keyed by the fn-type's line. Populated ONCE (register_fn_signatures)
+            # annotations keyed by the fn-type token offset. Populated ONCE (register_fn_signatures)
             # from file.enum_annotations: `fn_return_lines[i]` -> `fn_return_heads[i]`. A resolved
             # Fn ValueType carries its RETURN type in the `fn_pool_returns` side-pool at `bits`,
             # so a call through a fn value knows its result type even in argument position.
             fn_return_lines: mutable darray[u32] = []
             fn_return_heads: mutable darray[sview] = []
+            fn_return_offsets: mutable darray[u32] = []
             fn_pool_returns: mutable darray[ValueType] = []
             # Whether each first-class function type returns an error union, and the
             # source family selector (`R` while a generic is being specialized). The
@@ -706,18 +818,22 @@ extend Backend:
             fn_pool_errors: mutable darray[bool] = []
             fn_pool_error_families: mutable darray[sview] = []
             fn_param_lines: mutable darray[u32] = []
+            fn_param_offsets: mutable darray[u32] = []
             fn_param_heads: mutable darray[sview] = []
             fn_pool_param_start: mutable darray[usize] = []
             fn_pool_param_count: mutable darray[usize] = []
             fn_pool_params: mutable darray[ValueType] = []
-            # Function-type error suffix metadata, keyed by the Expr.Lambda line. The
+            # Function-type error suffix metadata, keyed by the Expr.Lambda token offset. The
             # parser preserves `fn(...) -> T error[E]` here before annotation resolution.
             fn_error_lines: mutable darray[u32] = []
+            fn_error_offsets: mutable darray[u32] = []
             fn_error_families: mutable darray[sview] = []
             # Full function-value parameter type expressions copied from Ast::File. These
             # preserve generic arguments that the legacy head-only annotation rows discard.
             fn_type_param_lines: mutable darray[u32] = []
+            fn_type_param_offsets: mutable darray[u32] = []
             fn_type_return_lines: mutable darray[u32] = []
+            fn_type_return_offsets: mutable darray[u32] = []
             fn_type_return_exprs: mutable darray[Ast::Expr] = []
             fn_type_param_exprs: mutable darray[Expr] = []
 

@@ -47,11 +47,23 @@ extend Backend:
         # before declines now.
         def struct_index_of(structs: mutable StructTable&, name: sview) -> i64 can[Abort.Panic]:
             # A module-qualified path (`Pack::Item`, from a qualified struct PATTERN) names
-            # the (owner, name) row directly. Compared without building the join, so no
-            # storage is needed for the split.
+            # the (owner, name) row directly. Probe the existing leaf-name bucket and compare
+            # the owner against the path prefix without allocating a joined string or scanning
+            # every registered struct.
             if sview_contains_scope(name):
-                for qualified_index in 0..<structs.records.names.count |structs, name|:
-                    qualified_index.i64() return if qualified_owner_matches(name, struct_owner_at(structs, qualified_index), structs.records.names[qualified_index])
+                name_length: usize = sview_len(name)
+                separator: mutable usize = 0.usize()
+                has_separator: mutable bool = false
+                for offset in 0..<name_length - 1.usize() |offset, name, separator, has_separator|:
+                    if sview_at(name, offset) == 58 and sview_at(name, offset + 1.usize()) == 58:
+                        separator <- offset
+                        has_separator <- true
+                if has_separator and separator > 0.usize() and separator + 2.usize() < name_length:
+                    leaf_start: usize = separator + 2.usize()
+                    qualified_index: mutable i64 = name_chain_slice_first(structs.records.struct_name_buckets, structs.records.struct_name_next, structs.records.names, name, leaf_start, name_length)
+                    while qualified_index >= 0 |qualified_index, structs, name, separator, leaf_start, name_length|:
+                        return qualified_index if name_chain_matches_slice(struct_owner_at(structs, qualified_index.usize()), name, 0.usize(), separator)
+                        qualified_index <- name_chain_slice_next(structs.records.struct_name_buckets, structs.records.struct_name_next, structs.records.names, name, leaf_start, name_length, qualified_index)
             if structs.visibility.current_owner != "":
                 owned: i64 = struct_index_of_in(structs, structs.visibility.current_owner, name)
                 owned return if owned >= 0
@@ -62,9 +74,110 @@ extend Backend:
 
 
 
+        const STRUCT_FIELD_NAME_INDEX_THRESHOLD: usize = 32
+        # Keep deterministic-hash collision clusters bounded. If build reaches this limit,
+        # leave the cache unready and preserve the existing exact linear lookup.
+        const STRUCT_FIELD_NAME_INDEX_MAX_PROBES: usize = 64
+        const STRUCT_FIELD_NAME_INDEX_HASH_OFFSET: u64 = 14695981039346656037
+        const STRUCT_FIELD_NAME_INDEX_HASH_PRIME: u64 = 1099511628211
+
+        def struct_field_name_index_hash(name: sview) -> u64 can[Abort.Panic]:
+            hash: mutable u64 = STRUCT_FIELD_NAME_INDEX_HASH_OFFSET
+            for index in 0..<sview_len(name) |hash, name|:
+                hash <- (hash ^ sview_at(name, index).u64()) * STRUCT_FIELD_NAME_INDEX_HASH_PRIME
+            return hash
+
+        # Called as each field span is finalized. Keeping allocation in registration preserves
+        # field_index_of's read-only effect row for its many hot call sites; incomplete generic
+        # placeholders simply use the linear path until their final span is installed.
+        def prepare_struct_field_name_index(struct_index: usize, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if struct_index >= structs.records.field_start.count or struct_index >= structs.records.field_count.count
+            field_start: usize = structs.records.field_start[struct_index]
+            field_count: usize = structs.records.field_count[struct_index]
+            return if field_count < STRUCT_FIELD_NAME_INDEX_THRESHOLD
+            return if field_start > structs.records.field_names.count or field_count > structs.records.field_names.count - field_start
+
+            while structs.records.field_name_index_ready.count <= struct_index |structs|:
+                structs.records.field_name_index_ready <- structs.records.field_name_index_ready.push(false)
+                structs.records.field_name_index_field_start <- structs.records.field_name_index_field_start.push(0)
+                structs.records.field_name_index_field_count <- structs.records.field_name_index_field_count.push(0)
+                structs.records.field_name_index_bucket_start <- structs.records.field_name_index_bucket_start.push(0)
+                structs.records.field_name_index_bucket_count <- structs.records.field_name_index_bucket_count.push(0)
+            return if structs.records.field_name_index_field_start.count != structs.records.field_name_index_ready.count or structs.records.field_name_index_field_count.count != structs.records.field_name_index_ready.count or structs.records.field_name_index_bucket_start.count != structs.records.field_name_index_ready.count or structs.records.field_name_index_bucket_count.count != structs.records.field_name_index_ready.count
+            return if structs.records.field_name_index_ready[struct_index] and structs.records.field_name_index_field_start[struct_index] == field_start and structs.records.field_name_index_field_count[struct_index] == field_count
+            structs.records.field_name_index_ready[struct_index] <- false
+
+            bucket_count: usize = field_count + field_count
+            return if bucket_count < field_count
+            bucket_start: usize = structs.records.field_name_index_buckets.count
+            for _ in 0..<bucket_count |structs|:
+                structs.records.field_name_index_buckets <- structs.records.field_name_index_buckets.push(0)
+
+            insertion_failed: mutable bool = false
+            for field_offset in 0..<field_count |insertion_failed, field_start, bucket_start, bucket_count, structs|:
+                field_name: sview = structs.records.field_names[field_start + field_offset]
+                bucket: usize = (struct_field_name_index_hash(field_name) % bucket_count.u64()).usize()
+                probes: mutable usize = 0
+                inserted: mutable bool = false
+                while probes < bucket_count and probes < STRUCT_FIELD_NAME_INDEX_MAX_PROBES and not inserted |probes, inserted, bucket, bucket_start, bucket_count, field_name, field_offset, insertion_failed, structs|:
+                    bucket_row: usize = bucket_start + bucket
+                    entry_plus_one: usize = structs.records.field_name_index_buckets[bucket_row]
+                    if entry_plus_one == 0:
+                        entry: usize = structs.records.field_name_index_names.count
+                        structs.records.field_name_index_names <- structs.records.field_name_index_names.push(field_name)
+                        structs.records.field_name_index_positions <- structs.records.field_name_index_positions.push(field_offset)
+                        structs.records.field_name_index_buckets[bucket_row] <- entry + 1
+                        inserted <- true
+                    else:
+                        entry: usize = entry_plus_one - 1
+                        if entry < structs.records.field_name_index_names.count and structs.records.field_name_index_names[entry] == field_name:
+                            # Keep the first declaration-order match, as field_index_of's old
+                            # scan did when malformed or synthetic layouts repeat a name.
+                            inserted <- true
+                        else:
+                            bucket <- bucket + 1
+                            bucket <- 0 if bucket == bucket_count
+                    probes <- probes + 1
+                insertion_failed <- true if not inserted
+            if insertion_failed:
+                # Record a prepared linear-fallback state so a later finalization callback
+                # for the same span does not repeatedly allocate partial collision tables.
+                structs.records.field_name_index_field_start[struct_index] <- field_start
+                structs.records.field_name_index_field_count[struct_index] <- field_count
+                structs.records.field_name_index_bucket_start[struct_index] <- bucket_start
+                structs.records.field_name_index_bucket_count[struct_index] <- 0
+                structs.records.field_name_index_ready[struct_index] <- true
+                return
+            structs.records.field_name_index_field_start[struct_index] <- field_start
+            structs.records.field_name_index_field_count[struct_index] <- field_count
+            structs.records.field_name_index_bucket_start[struct_index] <- bucket_start
+            structs.records.field_name_index_bucket_count[struct_index] <- bucket_count
+            structs.records.field_name_index_ready[struct_index] <- true
+
+
         # The position of `field` within struct `struct_index`, or -1. This IS the LLVM
         # element index: fields are emitted in declaration order.
         def field_index_of(structs: mutable StructTable&, struct_index: usize, field: sview) -> i64 can[Abort.Panic]:
+            if struct_index < structs.records.field_name_index_ready.count and struct_index < structs.records.field_start.count and struct_index < structs.records.field_count.count:
+                if structs.records.field_name_index_ready[struct_index]:
+                    if struct_index < structs.records.field_name_index_field_start.count and struct_index < structs.records.field_name_index_field_count.count and struct_index < structs.records.field_name_index_bucket_start.count and struct_index < structs.records.field_name_index_bucket_count.count:
+                        if structs.records.field_name_index_field_start[struct_index] == structs.records.field_start[struct_index] and structs.records.field_name_index_field_count[struct_index] == structs.records.field_count[struct_index]:
+                            bucket_count: usize = structs.records.field_name_index_bucket_count[struct_index]
+                            bucket_start: usize = structs.records.field_name_index_bucket_start[struct_index]
+                            if bucket_count > 0 and bucket_start <= structs.records.field_name_index_buckets.count and bucket_count <= structs.records.field_name_index_buckets.count - bucket_start:
+                                bucket: usize = (struct_field_name_index_hash(field) % bucket_count.u64()).usize()
+                                probes: mutable usize = 0
+                                while probes < bucket_count and probes < STRUCT_FIELD_NAME_INDEX_MAX_PROBES |probes, bucket, bucket_count, bucket_start, field, structs|:
+                                    entry_plus_one: usize = structs.records.field_name_index_buckets[bucket_start + bucket]
+                                    return -1 if entry_plus_one == 0
+                                    entry: usize = entry_plus_one - 1
+                                    if entry >= structs.records.field_name_index_names.count or entry >= structs.records.field_name_index_positions.count:
+                                        break
+                                    if structs.records.field_name_index_names[entry] == field:
+                                        return structs.records.field_name_index_positions[entry].i64()
+                                    bucket <- bucket + 1
+                                    bucket <- 0 if bucket == bucket_count
+                                    probes <- probes + 1
             for offset in 0..<structs.records.field_count[struct_index] |structs, struct_index, field|:
                 offset.i64() return if structs.records.field_names[structs.records.field_start[struct_index] + offset] == field
             return -1
@@ -81,6 +194,8 @@ extend Backend:
         # first real piece of Elisa's region model in this backend — container backing
         # lives in a region, not in malloc.
         struct Runtime:
+            # Snapshot module-level alias-metadata opt-in for hot access tagging paths.
+            noalias_mutable_refs: mutable bool = false
             disjoint_param_slots: mutable darray[LLVMValueRef]
             disjoint_param_indices: mutable darray[u32]
             disjoint_element_ptrs: mutable darray[LLVMValueRef]

@@ -8,12 +8,12 @@
 # call and one copy per doubling: `for i in 0..<16: xs.push(...)` cost an arena_alloc AND an
 # arena_realloc on every call of its function.
 #
-# Capacity is a hint, never semantics, so the proof only has to bound MEMORY, not prove
-# correctness: the reserve is exactly what the loop will push when the body runs straight
-# through. To keep it from over-reserving, the body may not break, continue or return, may
-# not contain a nested loop, match, value block or lambda (any of which could hide a jump),
-# and only UNCONDITIONAL top-level pushes count (a push under an `if` is simply not counted,
-# so the reserve is a lower bound). The receiver must be a plain local darray, not the loop
+# Capacity is a hint, but it can still be read, so the body proof must reject observations
+# whose value can change when reservation grows the receiver. Only direct receiver pushes
+# may mutate it; helper calls and writes through fields/indexes are not admitted. The body may
+# not break, continue or return, may not contain a conditional, nested loop, match, value block
+# or lambda. Only unconditional pushes count; a body-level conditional makes that receiver
+# ineligible. The receiver must be a plain local darray, not the loop
 # source, not redeclared or reassigned in the body. The bound is a literal, a scalar local, or
 # `src.count`/`src.len` of a local -- re-reading it cannot have a side effect -- clamped at 0
 # and capped (PRERESERVE_CAP elements), so a loop that panics early cannot have reserved an
@@ -22,96 +22,150 @@ extend Backend:
     private:
         const PRERESERVE_CAP: u64 = 16777216
         const PRERESERVE_MAX_PUSHES: i64 = 64
+        # Keep this speculative optimization cheap on generated or adversarial ASTs. The
+        # receiver pass and each per-receiver count/proof pass spend from independent fixed
+        # budgets; over-budget or deeply nested bodies simply skip pre-reservation.
+        const PRERESERVE_MAX_RECEIVERS: usize = 8
+        const PRERESERVE_MAX_ANALYSIS_NODES: usize = 256
+        const PRERESERVE_MAX_ANALYSIS_DEPTH: usize = 32
+        const PRERESERVE_MAX_SCOPE_NAMES: usize = 256
 
-        def prereserve_expr_plain(expression: Expr) -> bool can[Abort.Panic]:
+        def prereserve_scalar_expr(expression: Expr, receiver_name: sview, local_scope: mutable Scope&, scalar_loop_names: darray[sview]&, scalar_body_names: darray[sview]&, overflow_wrap: bool, budget: mutable usize&, depth: usize = 0) -> bool can[Abort.Panic]:
+            return false if depth > PRERESERVE_MAX_ANALYSIS_DEPTH or budget == 0.usize()
+            budget <- budget - 1.usize()
             match expression:
-                Expr.Absent:
+                Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
                     return true
-                Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _):
-                    return true
-                Expr.ShorthandMember(_, _):
-                    return true
-                Expr.Call(callee, arguments, _, _):
-                    false return if not prereserve_expr_plain(callee)
-                    for argument in arguments:
-                        false return if not prereserve_expr_plain(argument)
-                    return true
-                Expr.Field(object, _, _):
-                    return prereserve_expr_plain(object)
-                Expr.Scope(base, _, _):
-                    return prereserve_expr_plain(base)
-                Expr.Index(object, index, _):
-                    return prereserve_expr_plain(object) and prereserve_expr_plain(index)
-                Expr.Slice(object, low, high, _):
-                    return prereserve_expr_plain(object) and prereserve_expr_plain(low) and prereserve_expr_plain(high)
-                Expr.IndexN(object, arguments, _):
-                    false return if not prereserve_expr_plain(object)
-                    for argument in arguments:
-                        false return if not prereserve_expr_plain(argument)
-                    return true
-                Expr.Binary(left, _, right, _):
-                    return prereserve_expr_plain(left) and prereserve_expr_plain(right)
-                Expr.Unary(_, operand, _):
-                    return prereserve_expr_plain(operand)
-                Expr.Move(operand, _):
-                    return prereserve_expr_plain(operand)
+                Expr.Ident(name, _):
+                    return false if name == receiver_name
+                    for loop_name in scalar_loop_names:
+                        true return if loop_name == name
+                    for body_name in scalar_body_names:
+                        true return if body_name == name
+                    return loop_scratch_scalar_type(lookup_type(local_scope, name))
+                Expr.Field(object, field, _):
+                    if field == "count" and object is Expr.Ident(object_name, _):
+                        for loop_name in scalar_loop_names:
+                            false return if loop_name == object_name
+                        for body_name in scalar_body_names:
+                            false return if body_name == object_name
+                        return lookup_type(local_scope, object_name).kind == TypeKind.DArray
+                    return false
+                # A builtin-looking numeric method can resolve to a visible user-defined
+                # `__cast__` hook. Without repeating direct-call owner/visibility resolution,
+                # calls are not safe to move past a potentially failing reserve.
+                Expr.Call(_, _, _, _):
+                    return false
+                Expr.Binary(left, operator, right, _):
+                    # Reservation moves a possible allocation failure ahead of the body. Keep
+                    # the proof to expressions that cannot introduce a runtime trap there:
+                    # division and invalid shift counts can fault/produce LLVM poison, while
+                    # checked signed add/sub/mul emit overflow traps. In wrap mode those three
+                    # operations are defined wrapping arithmetic and remain eligible.
+                    false return if operator == TokenKind.Slash or operator == TokenKind.Percent or operator == TokenKind.LShift or operator == TokenKind.RShift
+                    false return if not overflow_wrap and (operator == TokenKind.Plus or operator == TokenKind.Minus or operator == TokenKind.Star)
+                    return prereserve_scalar_expr(left, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize()) and prereserve_scalar_expr(right, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize())
+                Expr.Unary(operator, operand, _):
+                    return false if not (operator == TokenKind.Minus or operator == TokenKind.Plus or operator == TokenKind.Not or operator == TokenKind.Tilde)
+                    false return if not overflow_wrap and operator == TokenKind.Minus
+                    return prereserve_scalar_expr(operand, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize())
                 Expr.Paren(inner, _):
-                    return prereserve_expr_plain(inner)
-                Expr.Array(elements, _):
-                    for element in elements:
-                        false return if not prereserve_expr_plain(element)
-                    return true
-                Expr.Tuple(tuple_elements, _):
-                    for tuple_element in tuple_elements:
-                        false return if not prereserve_expr_plain(tuple_element)
-                    return true
-                Expr.Construct(type_expression, fields, _):
-                    false return if not prereserve_expr_plain(type_expression)
-                    for field in fields:
-                        false return if not prereserve_expr_plain(field.value)
-                    return true
+                    return prereserve_scalar_expr(inner, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize())
                 Expr.If(condition, yes, no, _):
-                    return prereserve_expr_plain(condition) and prereserve_expr_plain(yes) and prereserve_expr_plain(no)
+                    return prereserve_scalar_expr(condition, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize()) and prereserve_scalar_expr(yes, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize()) and prereserve_scalar_expr(no, receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize())
                 _:
                     return false
 
-        # The loop body runs straight through: no jump, nested loop, match, prefix block or
-        # value block, and `name` is neither redeclared nor reassigned.
-        def prereserve_body_ok(body: darray[Stmt]&, name: sview) -> bool can[Abort.Panic]:
-            for statement in body:
+        # The only admitted side effect is a direct, single-argument push on this receiver.
+        # Its argument is checked separately: scalar expressions and read-only DArray count
+        # reads are allowed, but the receiver itself cannot escape through the argument.
+        def prereserve_push_statement(expression: Expr, receiver_name: sview, local_scope: mutable Scope&, scalar_loop_names: darray[sview]&, scalar_body_names: darray[sview]&, overflow_wrap: bool, budget: mutable usize&, depth: usize) -> bool can[Abort.Panic]:
+            if expression is Expr.Call(callee, arguments, _, _):
+                if callee is Expr.Field(object, method, _):
+                    if object is Expr.Ident(name, _):
+                        return false if name != receiver_name or method != "push" or arguments.count != 1
+                        return false if depth > PRERESERVE_MAX_ANALYSIS_DEPTH or budget == 0.usize()
+                        budget <- budget - 1.usize()
+                        return prereserve_scalar_expr(arguments[0], receiver_name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth + 1.usize())
+            return false
+
+        # The loop body runs straight through: no jump, conditional, nested loop, match, prefix
+        # block or value block, and `name` is neither redeclared nor reassigned.
+        def prereserve_body_ok(body: darray[Stmt]&, name: sview, local_scope: mutable Scope&, scalar_loop_names: darray[sview]&, inherited_scalar_body_names: darray[sview]&, structs: mutable StructTable&, overflow_wrap: bool, budget: mutable usize&, depth: usize = 0) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > PRERESERVE_MAX_ANALYSIS_DEPTH
+            scalar_body_names: mutable darray[sview] = []
+            scalar_body_names.extend(inherited_scalar_body_names)
+            for statement in body |scalar_body_names, scalar_loop_names, budget, depth|:
+                return false if budget == 0.usize()
+                budget <- budget - 1.usize()
                 match statement:
-                    Stmt.VarDecl(declared, _, value, _):
-                        false return if declared == name or not prereserve_expr_plain(value)
-                    Stmt.Assign(target, _, value, _):
-                        false return if not prereserve_expr_plain(target) or not prereserve_expr_plain(value)
+                    Stmt.VarDecl(declared, declared_type, value, _):
+                        false return if declared == name
+                        false return if value is Expr.Absent or value is Expr.Invalid
+                        false return if not prereserve_scalar_expr(value, name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth)
+                        # An explicit annotation can widen a scalar-looking initializer to an
+                        # aggregate or optional. Later expression checks trust this set, so only
+                        # admit a declared scalar type; the AST uses Expr.Invalid for inferred
+                        # local declarations, while Expr.Absent is also used by synthetic nodes.
+                        # Both are covered by the scalar initializer proof above.
+                        if not (declared_type is Expr.Absent or declared_type is Expr.Invalid):
+                            false return if not loop_scratch_scalar_type(annotation_value_type(declared_type, structs))
+                        for loop_name in scalar_loop_names:
+                            false return if declared == loop_name
+                        scalar_body_names.push(declared)
+                    Stmt.Assign(target, operator, value, _):
+                        false return if operator == TokenKind.SlashEq or operator == TokenKind.PercentEq or operator == TokenKind.LShiftEq or operator == TokenKind.RShiftEq
+                        false return if not overflow_wrap and (operator == TokenKind.PlusEq or operator == TokenKind.MinusEq or operator == TokenKind.StarEq)
+                        false return if not prereserve_scalar_expr(value, name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth)
                         if target is Expr.Ident(assigned, _):
                             false return if assigned == name
-                    Stmt.Expr(expression, _):
-                        if expression is Expr.Block(nested, value, _, _):
-                            false return if not (value is Expr.Invalid) or not prereserve_body_ok(nested, name)
+                            for loop_name in scalar_loop_names:
+                                false return if assigned == loop_name
+                            local_target: mutable bool = loop_scratch_scalar_type(lookup_type(local_scope, assigned))
+                            for body_name in scalar_body_names |local_target, assigned|:
+                                local_target <- true if body_name == assigned
+                            false return if not local_target
                         else:
-                            false return if not prereserve_expr_plain(expression)
-                    Stmt.If(condition, yes, no, _):
-                        false return if not prereserve_expr_plain(condition) or not prereserve_body_ok(yes, name) or not prereserve_body_ok(no, name)
+                            return false
+                    Stmt.Expr(expression, _):
+                        if expression is Expr.Block(nested, value, captures, _):
+                            false return if not (value is Expr.Invalid) or captures.count != 0 or not prereserve_body_ok(nested, name, local_scope, scalar_loop_names, scalar_body_names, structs, overflow_wrap, budget, depth + 1.usize())
+                        elif prereserve_push_statement(expression, name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth):
+                            pass
+                        else:
+                            false return if not prereserve_scalar_expr(expression, name, local_scope, scalar_loop_names, scalar_body_names, overflow_wrap, budget, depth)
+                    Stmt.If(_, _, _, _):
+                        # The reserve count intentionally includes only unconditional pushes.
+                        # A conditional push therefore makes this candidate ineligible.
+                        return false
                     _:
                         return false
             return true
 
         # Unconditional top-level `name.push(x)` statements (looking through capture headers).
-        def prereserve_push_count(body: darray[Stmt]&, name: sview) -> i64 can[Abort.Panic]:
+        def prereserve_push_count(body: darray[Stmt]&, name: sview, budget: mutable usize&, depth: usize = 0) -> i64 can[Abort.Panic]:
+            return -1 if depth > PRERESERVE_MAX_ANALYSIS_DEPTH
             count: mutable i64 = 0
-            for statement in body |count|:
+            for statement in body |count, budget, depth|:
+                return -1 if budget == 0.usize()
+                budget <- budget - 1.usize()
                 if statement is Stmt.Expr(expression, _):
                     if expression is Expr.Call(callee, arguments, _, _):
                         if callee is Expr.Field(object, method, _):
                             if object is Expr.Ident(receiver, _):
                                 count <- count + 1 if receiver == name and method == "push" and arguments.count == 1
                     elif expression is Expr.Block(nested, value, _, _):
-                        count <- count + prereserve_push_count(nested, name) if value is Expr.Invalid
+                        if value is Expr.Invalid:
+                            nested_count: i64 = prereserve_push_count(nested, name, budget, depth + 1.usize())
+                            return -1 if nested_count < 0
+                            count <- count + nested_count
             return count
 
-        def prereserve_push_receivers(body: darray[Stmt]&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
-            for statement in body |names|:
+        def prereserve_push_receivers(body: darray[Stmt]&, names: mutable darray[sview]&, budget: mutable usize&, depth: usize = 0) -> bool can[Abort.Panic, Memory.Allocate]:
+            false return if depth > PRERESERVE_MAX_ANALYSIS_DEPTH
+            for statement in body |names, budget, depth|:
+                false return if budget == 0.usize()
+                budget <- budget - 1.usize()
                 if statement is Stmt.Expr(expression, _):
                     if expression is Expr.Call(callee, arguments, _, _):
                         if callee is Expr.Field(object, method, _):
@@ -120,9 +174,12 @@ extend Backend:
                                     seen: mutable bool = false
                                     for known in names |seen, receiver|:
                                         seen <- true if known == receiver
+                                    false return if not seen and names.count >= PRERESERVE_MAX_RECEIVERS
                                     names.push(receiver) if not seen
                     elif expression is Expr.Block(nested, value, _, _):
-                        prereserve_push_receivers(nested, names) if value is Expr.Invalid
+                        if value is Expr.Invalid and not prereserve_push_receivers(nested, names, budget, depth + 1.usize()):
+                            return false
+            return true
 
         def prereserve_scalar_type(kind: ValueType) -> bool:
             return (kind.kind == TypeKind.Signed or kind.kind == TypeKind.Unsigned) and kind.bits > 0 and kind.bits <= 64
@@ -155,20 +212,37 @@ extend Backend:
 
         def emit_loop_prereserve(variables: darray[sview]&, iterable: Expr, body: darray[Stmt]&, line: Ast::Pos, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return if not structs.memory.memory_speed_enabled or not structs.memory.memory_reserve_enabled
+            # Scope lookups are linear. Bound their worst-case work as well as the AST walks;
+            # this is a speculative optimization, so large scopes simply keep normal growth.
+            return if local_scope.names.count > PRERESERVE_MAX_SCOPE_NAMES or variables.count > PRERESERVE_MAX_SCOPE_NAMES
+            # Iterating a DArray borrows its backing elements. Without a recorded alias set,
+            # an outer receiver might be another local name for the same allocation; reserving
+            # it here would invalidate the loop source before the first iteration reads it.
+            return if iterable is Expr.Ident(_, _)
             if prereserve_loop_bound(iterable, local_scope) is bound:
                 receivers: mutable darray[sview] = []
-                prereserve_push_receivers(body, receivers)
-                for receiver in receivers |variables, iterable, body, line, bound, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                scalar_loop_names: mutable darray[sview] = []
+                scalar_body_names: mutable darray[sview] = []
+                if variables.count == 1:
+                    if iterable is Expr.Binary(_, operator, _, _):
+                        scalar_loop_names.push(variables[0]) if operator == TokenKind.RangeLt
+                receiver_budget: mutable usize = PRERESERVE_MAX_ANALYSIS_NODES
+                if not prereserve_push_receivers(body, receivers, receiver_budget):
+                    return
+                for receiver in receivers |variables, iterable, body, line, bound, local_scope, scalar_loop_names, scalar_body_names, fns, structs, generics, runtime, m, ctx, builder|:
                     skip: mutable bool = false
                     for variable in variables |skip, receiver|:
                         skip <- true if variable == receiver
-                    if iterable is Expr.Ident(source, _):
-                        skip <- true if source == receiver
                     receiver_type: ValueType = lookup_type(local_scope, receiver)
                     skip <- true if receiver_type.kind != TypeKind.DArray
-                    pushes: i64 = prereserve_push_count(body, receiver)
+                    # A non-scalar element could itself be a view/ref alias into this
+                    # allocation. Moving reserve before the loop would invalidate it.
+                    skip <- true if not skip and not loop_scratch_scalar_type(darray_element_of(receiver_type, structs))
+                    push_count_budget: mutable usize = PRERESERVE_MAX_ANALYSIS_NODES
+                    pushes: i64 = prereserve_push_count(body, receiver, push_count_budget)
                     skip <- true if pushes <= 0 or pushes > PRERESERVE_MAX_PUSHES
-                    skip <- true if not skip and not prereserve_body_ok(body, receiver)
+                    proof_budget: mutable usize = PRERESERVE_MAX_ANALYSIS_NODES
+                    skip <- true if not skip and not prereserve_body_ok(body, receiver, local_scope, scalar_loop_names, scalar_body_names, structs, runtime.overflow_wrap, proof_budget)
                     # An integer literal has no type of its own until a context gives it one.
                     bound_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64} if bound is Expr.IntLit(_, _) else expression_type(bound, local_scope, fns, structs, generics)
                     skip <- true if not prereserve_scalar_type(bound_type)

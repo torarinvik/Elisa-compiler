@@ -35,9 +35,67 @@ extend Backend:
             # Number of generic templates sharing `name` (1 for a unique name, >1 for an overload set).
         def generic_slot_count(generics: GenericTable&, name: sview) -> usize can[Abort.Panic]:
             count: mutable usize = 0.usize()
-            for index in 0..<generics.names.count |count, generics, name|:
-                count <- count + 1.usize() if generics.names[index] == name
+            index: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, name)
+            while index >= 0 |count, generics, name, index|:
+                count <- count + 1.usize()
+                index <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, name, index)
             return count
+
+
+
+
+        # Append one generic function instance and link its row into the owning template's
+        # source-ordered chain. If an earlier write left the index incomplete, keep `next`
+        # out of sync so all lookups use the correctness-preserving linear fallback.
+        def generic_function_inst_index_push(generics: mutable GenericTable&, slot: usize) -> void can[Abort.Panic, Memory.Allocate]:
+            in_sync: bool = generics.inst_by_slot_next.count == generics.inst_slots.count and generics.inst_by_slot_heads.count == generics.inst_by_slot_tails.count
+            row: usize = generics.inst_slots.count
+            generics.inst_slots <- generics.inst_slots.push(slot)
+            return if not in_sync
+            generics.inst_by_slot_next <- generics.inst_by_slot_next.push(-1)
+            while generics.inst_by_slot_heads.count <= slot |generics|:
+                generics.inst_by_slot_heads.push(-1)
+                generics.inst_by_slot_tails.push(-1)
+            tail_index: i64 = generics.inst_by_slot_tails[slot]
+            if tail_index >= 0:
+                generics.inst_by_slot_next[tail_index.usize()] <- row.i64()
+            else:
+                generics.inst_by_slot_heads[slot] <- row.i64()
+            generics.inst_by_slot_tails[slot] <- row.i64()
+
+
+
+
+        # Return the source-ordered row matching (slot, type args), optionally including its
+        # concrete error family. All specialization metadata queries share this chain walk;
+        # malformed index lengths use the original full scan.
+        def generic_function_inst_row(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&, error_family: sview, match_error_family: bool) -> i64 can[Abort.Panic]:
+            if generics.inst_by_slot_next.count != generics.inst_slots.count or generics.inst_by_slot_heads.count != generics.inst_by_slot_tails.count:
+                for candidate_row in 0..<generics.inst_slots.count |generics, slot, type_args, error_family, match_error_family|:
+                    continue if generics.inst_slots[candidate_row] != slot
+                    continue if generics.inst_arg_count[candidate_row] != type_args.count
+                    arg_start: usize = generics.inst_arg_start[candidate_row]
+                    candidate_match: mutable bool = true
+                    for k in 0..<type_args.count |generics, candidate_match, arg_start, type_args|:
+                        candidate_match <- false if not value_type_identity_equal(generics.inst_args[arg_start + k], type_args[k])
+                    continue if not candidate_match
+                    continue if match_error_family and (candidate_row >= generics.inst_error_families.count or generics.inst_error_families[candidate_row] != error_family)
+                    return candidate_row.i64()
+                return -1
+            return -1 if slot >= generics.inst_by_slot_heads.count
+            row: mutable i64 = generics.inst_by_slot_heads[slot]
+            while row >= 0 |generics, slot, type_args, error_family, match_error_family, row|:
+                row_index: usize = row.usize()
+                return -1 if row_index >= generics.inst_slots.count
+                if generics.inst_slots[row_index] == slot and generics.inst_arg_count[row_index] == type_args.count:
+                    arg_start: usize = generics.inst_arg_start[row_index]
+                    matched: mutable bool = true
+                    for k in 0..<type_args.count |generics, matched, arg_start, type_args|:
+                        matched <- false if not value_type_identity_equal(generics.inst_args[arg_start + k], type_args[k])
+                    if matched and (not match_error_family or (row_index < generics.inst_error_families.count and generics.inst_error_families[row_index] == error_family)):
+                        return row
+                row <- generics.inst_by_slot_next[row_index]
+            return -1
 
 
 
@@ -51,16 +109,8 @@ extend Backend:
 
 
         def instantiation_of_slot_with_error_family(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&, error_family: sview) -> LLVMValueRef? can[Abort.Panic]:
-            for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
-                continue if generics.inst_slots[index] != slot
-                continue if generics.inst_arg_count[index] != type_args.count
-                astart: usize = generics.inst_arg_start[index]
-                matched: mutable bool = true
-                for k in 0..<type_args.count |generics, matched, astart, type_args|:
-                    stored: ValueType = generics.inst_args[astart + k]
-                    matched <- false if not value_type_identity_equal(stored, type_args[k])
-                matched <- false if index >= generics.inst_error_families.count or generics.inst_error_families[index] != error_family
-                generics.inst_handles[index] return if matched
+            row: i64 = generic_function_inst_row(generics, slot, type_args, error_family, true)
+            return generics.inst_handles[row.usize()] if row >= 0 and row.usize() < generics.inst_handles.count
             return null
 
 
@@ -161,6 +211,7 @@ extend Backend:
                         fn_type <- LLVMFunctionType(llvm_return, params_pointer, full_params.count.u32(), 0)
                     handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
                     add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx) if instantiation_sret
+                    instantiation_row: usize = generics.inst_handles.count
                     inst_arg_start: usize = generics.inst_args.count
                     for argument in type_args |generics|:
                         generics.inst_args <- generics.inst_args.push(copied_type(argument))
@@ -168,7 +219,7 @@ extend Backend:
                     generics.inst_arg_start <- generics.inst_arg_start.push(inst_arg_start)
                     generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
                     generics.inst_handles <- generics.inst_handles.push(handle)
-                    generics.inst_slots <- generics.inst_slots.push(slot)
+                    generic_function_inst_index_push(generics, slot)
                     generics.inst_error_families <- generics.inst_error_families.push(error_family)
                     # The ABI fact this signature was BUILT with. Call sites read it back rather
                     # than recomputing (see GenericTable.inst_needs_arena).
@@ -186,6 +237,7 @@ extend Backend:
                     generics.pending_arg_start <- generics.pending_arg_start.push(pending_arg_start)
                     generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
                     generics.pending_handles <- generics.pending_handles.push(handle)
+                    generics.pending_inst_rows <- generics.pending_inst_rows.push(instantiation_row)
                     generics.pending_slots <- generics.pending_slots.push(slot)
                     generics.pending_error_families <- generics.pending_error_families.push(error_family)
                     return handle
@@ -257,18 +309,10 @@ extend Backend:
             # The arena flag RECORDED for the already-declared instantiation (slot, args), or -1 when
             # it has not been declared yet. Same key as instantiation_of_slot.
         def recorded_instantiation_arena(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&) -> i64 can[Abort.Panic]:
-            for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
-                continue if generics.inst_slots[index] != slot
-                continue if generics.inst_arg_count[index] != type_args.count
-                recorded_start: usize = generics.inst_arg_start[index]
-                recorded_match: mutable bool = true
-                for k in 0..<type_args.count |generics, recorded_match, recorded_start, type_args|:
-                    recorded_arg: ValueType = generics.inst_args[recorded_start + k]
-                    recorded_match <- false if not value_type_identity_equal(recorded_arg, type_args[k])
-                continue if not recorded_match
-                1 return if generics.inst_needs_arena[index]
-                return 0
-            return -1
+            row: i64 = generic_function_inst_row(generics, slot, type_args, "", false)
+            return -1 if row < 0 or row.usize() >= generics.inst_needs_arena.count
+            return 1 if generics.inst_needs_arena[row.usize()]
+            return 0
 
 
 
@@ -286,17 +330,8 @@ extend Backend:
 
         def instantiation_wants_store_at(store_slot: usize, type_args: darray[ValueType]&, generics: GenericTable&) -> bool can[Abort.Panic]:
             false return if store_slot >= generics.names.count
-            for index in 0..<generics.inst_slots.count |generics, store_slot, type_args|:
-                continue if generics.inst_slots[index] != store_slot
-                continue if generics.inst_arg_count[index] != type_args.count
-                store_start: usize = generics.inst_arg_start[index]
-                store_match: mutable bool = true
-                for k in 0..<type_args.count |generics, store_match, store_start, type_args|:
-                    store_arg: ValueType = generics.inst_args[store_start + k]
-                    store_match <- false if not value_type_identity_equal(store_arg, type_args[k])
-                continue if not store_match
-                return index < generics.inst_needs_store.count and generics.inst_needs_store[index]
-            return false
+            row: i64 = generic_function_inst_row(generics, store_slot, type_args, "", false)
+            return row >= 0 and row.usize() < generics.inst_needs_store.count and generics.inst_needs_store[row.usize()]
 
 
 
@@ -338,16 +373,7 @@ extend Backend:
 
         # The row of the already-declared instantiation (slot, args), or -1.
         def recorded_instantiation_index(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&) -> i64 can[Abort.Panic]:
-            for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
-                continue if generics.inst_slots[index] != slot
-                continue if generics.inst_arg_count[index] != type_args.count
-                row_start: usize = generics.inst_arg_start[index]
-                row_match: mutable bool = true
-                for k in 0..<type_args.count |generics, row_match, row_start, type_args|:
-                    row_match <- false if not value_type_identity_equal(generics.inst_args[row_start + k], type_args[k])
-                continue if not row_match
-                return index.i64()
-            return -1
+            return generic_function_inst_row(generics, slot, type_args, "", false)
 
 
 

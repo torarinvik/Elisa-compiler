@@ -128,11 +128,23 @@ extend Backend:
                     nested_return_status: i64 = materialize_nested_try_argument(return_value, nested_return_value, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
                     EmitStatus.Declined return if nested_return_status < 0
                     return emit_statement((Stmt.Return(nested_return_value, return_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write} if nested_return_status == 1
+                    # Task completion records and TaskGroups retain pool state, and lexical
+                    # pool cleanup shuts down its ThreadPool before this function returns.
+                    # None of those handles may cross that cleanup boundary, including when
+                    # nested in an aggregate. VarDecl submits have their own tracked path;
+                    # this return check catches every other typed handle escape.
+                    if local_scope.pool_names.count > 0 or local_scope.group_names.count > 0:
+                        EmitStatus.Declined return if backend_expression_may_contain_pool_lifetime_handle(return_value, return_type, local_scope, fns, structs, generics)
                     # `await task` may arrive here as a value-transparent block after the
                     # semantic expression walkers. Lower it directly in return position as a
                     # fallback to the ordinary expression emitter, preserving the task value
                     # and avoiding a synchronous call-through.
-                    if fn_return_head_at(return_line.line, structs) == "__await":
+                    await_return_marker: mutable bool = false
+                    if return_value is Expr.Block(_, _, _, await_return_pos):
+                        await_return_marker <- fn_return_head_at_offset(await_return_pos.offset, await_return_pos.line, structs) == "__await"
+                    if await_return_marker:
+                        if local_scope.pool_names.count > 0 or local_scope.group_names.count > 0:
+                            EmitStatus.Declined return if backend_type_is_raw_pool_handle_representation(return_type, structs)
                         await_operand: mutable Expr = return_value
                         if return_value is Expr.Block(await_block_statements, await_block_value, await_block_captures, await_block_line):
                             await_operand <- await_block_value
@@ -140,12 +152,26 @@ extend Backend:
                         await_base: mutable sview = ""
                         await_arg_start: mutable usize = 0
                         await_arg_count: mutable usize = 0
-                        if generic_struct_instantiation_of(structs, await_task_type, await_base, await_arg_start, await_arg_count) and await_base == "Task" and await_arg_count >= 1:
+                        await_is_direct_task: mutable bool = generic_struct_instantiation_of(structs, await_task_type, await_base, await_arg_start, await_arg_count) and await_base == "Task"
+                        if await_is_direct_task:
+                            if await_task_type.bits.usize() >= structs.records.names.count or await_task_type.bits.usize() >= structs.records.owners.count:
+                                await_is_direct_task <- false
+                            else:
+                                await_is_direct_task <- structs.records.names[await_task_type.bits.usize()] == "Task" and structs.records.owners[await_task_type.bits.usize()] == ""
+                        if not await_is_direct_task and await_task_type.kind == TypeKind.Struct and await_task_type.bits.usize() < structs.records.names.count and await_task_type.bits.usize() < structs.records.owners.count:
+                            await_is_direct_task <- structs.records.names[await_task_type.bits.usize()] == "Task" and structs.records.owners[await_task_type.bits.usize()] == ""
+                        # The synthesized built-in Task handle records only a marker
+                        # argument, not its result type. A declared generic Task[R, S]
+                        # records both arguments; use R only in that complete case so a
+                        # phantom built-in handle reaches the exact non-generic fallback.
+                        if await_is_direct_task and await_arg_count == 2:
+                            EmitStatus.Declined return if await_arg_start >= structs.generics.generic_struct_inst_args.count or await_arg_count > structs.generics.generic_struct_inst_args.count - await_arg_start
                             await_result_type: ValueType = copied_type(structs.generics.generic_struct_inst_args[await_arg_start])
                             await_types: mutable darray[ValueType] = [await_result_type]
                             await_arguments: mutable darray[Expr] = [await_operand]
                             if (emit_generic_call("pool_await", await_types, await_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is awaited_return_value:
                                 EmitStatus.Declined return if not (emit_ensure_checks(awaited_return_value, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                                EmitStatus.Declined return if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
                                 (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
                                 EmitStatus.Terminated return if emit_sret_return(awaited_return_value, return_type, runtime, structs, ctx, builder)
                                 if runtime.in_error_fn:
@@ -154,28 +180,42 @@ extend Backend:
                                     return EmitStatus.Terminated
                                 _ = LLVMBuildRet(builder, awaited_return_value)
                                 return EmitStatus.Terminated
+                            return EmitStatus.Declined
+                        EmitStatus.Declined return if await_is_direct_task and await_arg_count > 2
                         # A NON-generic `pool_await` — the shape stage0's own corpus declares
                         # (`extern pool_await(task: Task[i64, Pending]) -> i64`). The generic
                         # path above reads the RESULT type out of the Task instantiation's
                         # recorded arguments, which a BUILT-IN Task handle does not carry: both
                         # of its type arguments are phantom. Fall back to the ordinary call.
-                        if function_index_of(fns, "", "pool_await") >= 0:
+                        if await_is_direct_task:
                             await_direct_args: mutable darray[Expr] = [await_operand]
-                            if (emit_call((Expr.Ident("pool_await", return_line)), await_direct_args, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is await_direct_value:
-                                EmitStatus.Declined return if not (emit_ensure_checks(await_direct_value, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
-                                # The DEFERRED actions run on this exit too — an enclosing
-                                # `pool workers(N):` registers its `pool_shutdown` there, and
-                                # skipping it leaked the pool on the awaited-return path
-                                # (measured: shutdown=0 against stage0's 1).
-                                EmitStatus.Declined return if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
-                                (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
-                                EmitStatus.Terminated return if emit_sret_return(await_direct_value, return_type, runtime, structs, ctx, builder)
-                                if runtime.in_error_fn:
-                                    _ = LLVMBuildStore(builder, await_direct_value, runtime.error_out)
-                                    _ = LLVMBuildRet(builder, error_success_return_value(structs, runtime, ctx))
-                                    return EmitStatus.Terminated
-                                _ = LLVMBuildRet(builder, await_direct_value)
-                                return EmitStatus.Terminated
+                            # Resolve a unique one-argument API row by the concrete Task type,
+                            # then call that row directly. Routing this compiler-generated
+                            # await through emit_call would reject the Task argument as an
+                            # arbitrary helper escape; routing by name alone could instead
+                            # select an unrelated overload.
+                            await_api_hits: i64 = overload_match_count(fns, "", "pool_await", await_direct_args, local_scope, structs, generics)
+                            await_api_index: i64 = overload_index_for_args(fns, "", "pool_await", await_direct_args, local_scope, structs, generics)
+                            if await_api_hits == 1 and await_api_index >= 0 and await_api_index.usize() < fns.param_start.count and await_api_index.usize() < fns.param_count.count:
+                                await_api_row: usize = await_api_index.usize()
+                                if fns.param_count[await_api_row] == 1 and fns.param_start[await_api_row] < fns.param_types.count:
+                                    await_api_task_type: ValueType = copied_type(fns.param_types[fns.param_start[await_api_row]])
+                                    if value_type_identity_equal(await_api_task_type, await_task_type):
+                                        if (emit_direct_call_indexed(await_api_index, Expr.Invalid, false, await_direct_args, [], local_scope, fns, structs, generics, runtime, m, ctx, builder, null) can Global{Read,Write}) is await_direct_value:
+                                            EmitStatus.Declined return if not (emit_ensure_checks(await_direct_value, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                                            # The DEFERRED actions run on this exit too — an enclosing
+                                            # `pool workers(N):` registers its `pool_shutdown` there, and
+                                            # skipping it leaked the pool on the awaited-return path
+                                            # (measured: shutdown=0 against stage0's 1).
+                                            EmitStatus.Declined return if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                                            (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
+                                            EmitStatus.Terminated return if emit_sret_return(await_direct_value, return_type, runtime, structs, ctx, builder)
+                                            if runtime.in_error_fn:
+                                                _ = LLVMBuildStore(builder, await_direct_value, runtime.error_out)
+                                                _ = LLVMBuildRet(builder, error_success_return_value(structs, runtime, ctx))
+                                                return EmitStatus.Terminated
+                                            _ = LLVMBuildRet(builder, await_direct_value)
+                                            return EmitStatus.Terminated
                         return EmitStatus.Declined
                     # `return sb.extend([0.u8()])` — `extend` in VALUE position. It mutates the
                     # target IN PLACE and yields it, so the value is simply the target's address

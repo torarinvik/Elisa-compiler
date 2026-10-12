@@ -5,7 +5,6 @@
 extend Backend:
     private:
         const REGION_FACT_BUCKET_COUNT: usize = 1024
-        const REGION_FORWARD_MAX_POSITIONS: usize = 64
         const REGION_FACT_HASH_OFFSET: u64 = 14695981039346656037
         const REGION_FACT_HASH_PRIME: u64 = 1099511628211
 
@@ -96,25 +95,37 @@ extend Backend:
 
         def region_mark_root(root: sview, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                region_mark_root_depth(root, params, flags, structs, 0)
-
-
-
-
-        # A root that is not a parameter may be a local reference ALIAS of one (`r = p`,
-        # `r = pick(p, q)`): growth through it grows the parameter's storage, so every
-        # parameter it may alias is flagged. The bound stops alias cycles.
-        def region_mark_root_depth(root: sview, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&, depth: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                return if root == "" or root == "?" or depth >= 8
-                for parameter_index in 0..<params.count |params, flags, root, structs|:
-                    continue if params[parameter_index].name != root
-                    parameter_type: ValueType = parameter_value_type(params[parameter_index].type_expression, structs)
-                    flags[parameter_index] <- true if ref_type_can_grow(parameter_type, structs)
+                return if root == "" or root == "?"
+                has_alias: mutable bool = false
+                for alias_index in 0..<structs.regions.region_alias_names.count |has_alias, structs, root|:
+                    has_alias <- true if structs.regions.region_alias_names[alias_index] == root
+                if not has_alias:
+                    for parameter_index in 0..<params.count |params, flags, root, structs|:
+                        continue if params[parameter_index].name != root
+                        parameter_type: ValueType = parameter_value_type(params[parameter_index].type_expression, structs)
+                        flags[parameter_index] <- true if ref_type_can_grow(parameter_type, structs)
+                        return
                     return
-                for alias_index in 0..<structs.regions.region_alias_names.count |params, flags, root, structs, depth|:
-                    continue if structs.regions.region_alias_names[alias_index] != root
-                    region_mark_root_depth(structs.regions.region_alias_roots[alias_index], params, flags, structs, depth + 1)
+                pending: mutable darray[sview] = [root]
+                visited: mutable darray[sview] = []
+                cursor: mutable usize = 0
+                while cursor < pending.count |pending, visited, cursor, params, flags, structs|:
+                    current_root: sview = pending[cursor]
+                    cursor <- cursor + 1
+                    continue if current_root == "" or current_root == "?"
+                    already_visited: mutable bool = false
+                    for visited_index in 0..<visited.count |already_visited, visited, current_root|:
+                        already_visited <- true if visited[visited_index] == current_root
+                    continue if already_visited
+                    visited.push(current_root)
+                    for parameter_index in 0..<params.count |params, flags, current_root, structs|:
+                        continue if params[parameter_index].name != current_root
+                        parameter_type: ValueType = parameter_value_type(params[parameter_index].type_expression, structs)
+                        flags[parameter_index] <- true if ref_type_can_grow(parameter_type, structs)
+                        break
+                    for alias_index in 0..<structs.regions.region_alias_names.count |pending, structs, current_root|:
+                        if structs.regions.region_alias_names[alias_index] == current_root:
+                            pending.push(structs.regions.region_alias_roots[alias_index])
 
 
 
@@ -368,133 +379,177 @@ extend Backend:
         # caller arena, gave the callee its own `auto.region`, and freed the buffer's new
         # storage on return: the self-hosted compiler printed diagnostics whose first bytes
         # were zero.
-        def region_callee_owner(callee: Expr, arity: usize, structs: StructTable&) -> sview can[Abort.Panic]:
+        def region_callee_owner(callee: Expr, arity: usize, structs: StructTable&) -> (owner: sview, resolved: bool) can[Abort.Panic]:
             can Abort.Panic:
+                # Explicit generic application wraps the callee in Index/IndexN. Preserve
+                # the module owner from its head (`M::f[T](...)`) instead of resolving the
+                # extracted name as a bare call that could pick a same-named top-level row.
+                if callee is Expr.Index(region_owner_generic_head, region_owner_generic_arg, region_owner_generic_line):
+                    if region_owner_generic_head is Expr.Scope(_, _, _):
+                        return region_callee_owner(region_owner_generic_head, arity, structs)
+                if callee is Expr.IndexN(region_owner_generic_heads, region_owner_generic_args, region_owner_generic_lines):
+                    if region_owner_generic_heads is Expr.Scope(_, _, _):
+                        return region_callee_owner(region_owner_generic_heads, arity, structs)
                 if callee is Expr.Scope(region_owner_base, region_owner_name, region_owner_line):
                     if region_owner_base is Expr.Ident(region_owner_ident, region_owner_ident_line):
                         for alias_index in 0..<structs.aliases.module_alias_names.count |structs, region_owner_ident|:
-                            return structs.aliases.module_alias_targets[alias_index] if structs.aliases.module_alias_names[alias_index] == region_owner_ident
-                        return region_owner_ident
-                    return structs.visibility.current_owner
+                            return (structs.aliases.module_alias_targets[alias_index], true) if structs.aliases.module_alias_names[alias_index] == region_owner_ident
+                        return (region_owner_ident, true)
+                    return (structs.visibility.current_owner, false)
                 receiver_call: mutable bool = false
                 if callee is Expr.Field(region_owner_receiver, region_owner_method, region_owner_method_line):
                     receiver_call <- true
                 name: sview = region_callee_name(callee)
-                own_arity_hits: mutable i64 = 0
-                top_level: mutable bool = false
+                top_level_name: mutable bool = false
                 name_hits: mutable i64 = 0
                 name_owner: mutable sview = ""
-                arity_hits: mutable i64 = 0
-                arity_owner: mutable sview = ""
+                name_owner_conflict: mutable bool = false
+                own_arity_hits: mutable i64 = 0
                 indexed: bool = structs.regions.region_fact_buckets.count == REGION_FACT_BUCKET_COUNT and structs.regions.region_fact_next.count == structs.regions.region_fact_names.count
                 cursor: mutable i64 = structs.regions.region_fact_buckets[region_fact_name_bucket(name)] if indexed else 0
-                while cursor >= 0 and cursor.usize() < structs.regions.region_fact_names.count |cursor, structs, name, arity, own_arity_hits, top_level, name_hits, name_owner, arity_hits, arity_owner|:
+                while cursor >= 0 and cursor.usize() < structs.regions.region_fact_names.count |cursor, structs, name, arity, top_level_name, name_hits, name_owner, name_owner_conflict, own_arity_hits|:
                     row: usize = cursor.usize()
                     cursor <- structs.regions.region_fact_next[row] if indexed else cursor + 1
                     continue if structs.regions.region_fact_names[row] != name
                     row_owner: sview = structs.regions.region_fact_owners[row]
-                    top_level <- true if row_owner == ""
+                    top_level_name <- true if row_owner == ""
+                    name_owner_conflict <- true if name_hits > 0 and name_owner != row_owner
+                    name_owner <- row_owner if name_hits == 0
                     name_hits <- name_hits + 1
-                    name_owner <- row_owner
                     if structs.regions.region_fact_counts[row] == arity:
-                        arity_hits <- arity_hits + 1
-                        arity_owner <- row_owner
-                        own_arity_hits <- own_arity_hits + 1 if row_owner == structs.visibility.current_owner else own_arity_hits
+                        own_arity_hits <- own_arity_hits + 1 if row_owner == structs.visibility.current_owner
                 if receiver_call:
-                    "" return if top_level
-                    name_owner return if name_hits == 1 and name_owner != ""
-                    arity_owner return if arity_hits == 1 and arity_owner != ""
-                    return structs.visibility.current_owner
-                structs.visibility.current_owner return if structs.visibility.current_owner != "" and own_arity_hits == 1
-                "" return if top_level
-                arity_owner return if arity_hits == 1
-                name_owner return if name_hits == 1
-                return structs.visibility.current_owner
+                    # A receiver may select a top-level UFCS function or an owned method
+                    # after type-based dispatch. Keep a resolved owner only when every
+                    # same-name declaration belongs to it; otherwise union the candidates.
+                    (name_owner, true) return if name_hits > 0 and not name_owner_conflict
+                    return (structs.visibility.current_owner, false)
+                # emit_call_named prefers an enclosing-module declaration only when
+                # exactly one row has the supplied arity, then gives any top-level name
+                # precedence regardless of arity. The latter matters for defaulted
+                # parameters, which are selected after this name-level dispatch.
+                (structs.visibility.current_owner, true) return if structs.visibility.current_owner != "" and own_arity_hits == 1
+                ("", true) return if top_level_name
+                (name_owner, true) return if name_hits > 0 and not name_owner_conflict
+                return (structs.visibility.current_owner, false)
 
 
 
 
-        def region_fact_parameter_has_region(callee_name: sview, callee_owner: sview, parameter_position: usize, structs: StructTable&) -> bool can[Abort.Panic]:
-            fallback: mutable bool = false
-            fallback_found: mutable bool = false
-            indexed: bool = structs.regions.region_fact_buckets.count == REGION_FACT_BUCKET_COUNT and structs.regions.region_fact_next.count == structs.regions.region_fact_names.count
-            cursor: mutable i64 = structs.regions.region_fact_buckets[region_fact_name_bucket(callee_name)] if indexed else 0
-            while cursor >= 0 and cursor.usize() < structs.regions.region_fact_names.count |cursor, structs, callee_name, callee_owner, parameter_position, fallback, fallback_found|:
-                function_index: usize = cursor.usize()
-                cursor <- structs.regions.region_fact_next[function_index] if indexed else cursor + 1
-                continue if structs.regions.region_fact_names[function_index] != callee_name
-                continue if parameter_position >= structs.regions.region_fact_counts[function_index]
-                fact: bool = structs.regions.region_fact_params[structs.regions.region_fact_starts[function_index] + parameter_position]
-                return fact if structs.regions.region_fact_owners[function_index] == callee_owner
-                if callee_owner != "" and structs.regions.region_fact_owners[function_index] == "" and not fallback_found:
-                    fallback <- fact
-                    fallback_found <- true
-            return fallback
+        def region_fact_parameter_has_region(row: usize, parameter_position: usize, structs: StructTable&) -> bool can[Abort.Panic]:
+            return false if row >= structs.regions.region_fact_starts.count or row >= structs.regions.region_fact_counts.count
+            count: usize = structs.regions.region_fact_counts[row]
+            return false if parameter_position >= count
+            start: usize = structs.regions.region_fact_starts[row]
+            return false if start > structs.regions.region_fact_params.count or count > structs.regions.region_fact_params.count - start
+            return structs.regions.region_fact_params[start + parameter_position]
 
 
 
 
-        # The fact row region_fact_parameter_has_region would read for this callee:
-        # the exact owner first, else the first owner-less row.
-        def region_fact_row_for(callee_name: sview, callee_owner: sview, structs: StructTable&) -> i64 can[Abort.Panic]:
-            fallback: mutable i64 = -1
-            for function_index in 0..<structs.regions.region_fact_names.count |structs, callee_name, callee_owner, fallback|:
-                continue if structs.regions.region_fact_names[function_index] != callee_name
-                function_index.i64() return if structs.regions.region_fact_owners[function_index] == callee_owner
-                if callee_owner != "" and structs.regions.region_fact_owners[function_index] == "" and fallback < 0:
-                    fallback <- function_index.i64()
-            return fallback
-
-
-
-
-        # The callee parameter position an argument binds to. A positional call maps by
-        # index; a NAMED call (`fill(b: ys, a: zs)`) maps through the callee's parameter
-        # names exactly as emit_direct_call_indexed does, or -1 when it cannot be mapped.
-        def region_forward_argument_position(callee_name: sview, callee_owner: sview, argument_names: darray[sview]&, argument_index: usize, receiver_offset: usize, structs: StructTable&) -> i64 can[Abort.Panic, Memory.Allocate]:
+        # Map source arguments to callee parameter positions once per call. The sequential
+        # assignment rules match named_argument_index: positional entries take the next free
+        # parameter, names search only explicit parameters, and the first invalid or duplicate
+        # entry stops later assignments while keeping earlier mappings usable.
+        def region_forward_argument_positions(argument_names: darray[sview]&, receiver_offset: usize, row: i64, structs: StructTable&) -> darray[i64] can[Abort.Panic, Memory.Allocate]:
             can Abort.Panic, Memory.Allocate:
-                named_call: mutable bool = false
-                for argument_name in argument_names |named_call|:
-                    named_call <- true if argument_name != ""
-                (argument_index + receiver_offset).i64() return if not named_call
-                row: i64 = region_fact_row_for(callee_name, callee_owner, structs)
-                -1 return if row < 0 or structs.regions.region_fact_param_names.count != structs.regions.region_fact_params.count
+                positions: mutable darray[i64] = [-1 for _ in 0..<argument_names.count]
+                return positions if row < 0 or row.usize() >= structs.regions.region_fact_starts.count or row.usize() >= structs.regions.region_fact_counts.count or structs.regions.region_fact_param_names.count != structs.regions.region_fact_params.count
                 start: usize = structs.regions.region_fact_starts[row.usize()]
                 count: usize = structs.regions.region_fact_counts[row.usize()]
-                for wanted in receiver_offset..<count |argument_names, structs, start, count, receiver_offset, argument_index|:
-                    wanted.i64() return if named_argument_index(argument_names, structs.regions.region_fact_param_names, start, count, receiver_offset, wanted) == argument_index.i64()
-                return -1
+                return positions if start > structs.regions.region_fact_param_names.count or count > structs.regions.region_fact_param_names.count - start
+                assigned: mutable darray[bool] = [false for _slot in 0..<count]
+                assigned[0] <- true if receiver_offset == 1 and count > 0
+                next_position: mutable usize = receiver_offset
+                for argument_index in 0..<argument_names.count |positions, assigned, next_position, argument_names, structs, start, count, receiver_offset|:
+                    argument_name: sview = argument_names[argument_index]
+                    selected: mutable usize = count
+                    if argument_name != "":
+                        for parameter_index in receiver_offset..<count |selected, argument_name, structs, start|:
+                            if structs.regions.region_fact_param_names[start + parameter_index] == argument_name:
+                                selected <- parameter_index
+                                break
+                    else:
+                        while next_position < count and assigned[next_position] |next_position, assigned|:
+                            next_position <- next_position + 1
+                        selected <- next_position
+                        next_position <- next_position + 1 if next_position < count
+                    break if selected >= count or assigned[selected]
+                    positions[argument_index] <- selected.i64()
+                    assigned[selected] <- true
+                return positions
 
 
 
 
-        def region_mark_forwarded(root: sview, parameter_position: usize, callee_name: sview, callee_owner: sview, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def region_mark_forwarded(root: sview, parameter_position: usize, callee_fact_row: usize, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                region_mark_forwarded_depth(root, parameter_position, callee_name, callee_owner, params, structs, fact_row, changed, 0)
-
-
-
-
-        # Forwarding a local reference ALIAS of a parameter (`r = p; grow(r)`) forwards the
-        # parameter itself, as in region_mark_root_depth.
-        def region_mark_forwarded_depth(root: sview, parameter_position: usize, callee_name: sview, callee_owner: sview, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&, depth: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                return if root == "" or root == "?" or callee_name == "" or depth >= 8
-                for alias_index in 0..<structs.regions.region_alias_names.count |root, parameter_position, callee_name, callee_owner, params, structs, fact_row, changed, depth|:
-                    continue if structs.regions.region_alias_names[alias_index] != root
-                    region_mark_forwarded_depth(structs.regions.region_alias_roots[alias_index], parameter_position, callee_name, callee_owner, params, structs, fact_row, changed, depth + 1)
-                for caller_position in 0..<params.count |params, structs, fact_row, root, changed|:
-                    continue if params[caller_position].name != root
-                    slot: usize = structs.regions.region_fact_starts[fact_row] + caller_position
-                    # Forwarding only grows the caller's fact set. A local root
-                    # or an already-known fact cannot change this pass, so avoid
-                    # scanning every callee fact until a caller slot needs it.
-                    return if structs.regions.region_fact_params[slot]
-                    return if not region_fact_parameter_has_region(callee_name, callee_owner, parameter_position, structs)
-                    if not structs.regions.region_fact_params[slot]:
+                return if root == "" or root == "?"
+                has_alias: mutable bool = false
+                for alias_index in 0..<structs.regions.region_alias_names.count |has_alias, structs, root|:
+                    has_alias <- true if structs.regions.region_alias_names[alias_index] == root
+                if not has_alias:
+                    for caller_position in 0..<params.count |params, structs, fact_row, root, changed, callee_fact_row, parameter_position|:
+                        continue if params[caller_position].name != root
+                        slot: usize = structs.regions.region_fact_starts[fact_row] + caller_position
+                        return if structs.regions.region_fact_params[slot]
+                        return if not region_fact_parameter_has_region(callee_fact_row, parameter_position, structs)
                         structs.regions.region_fact_params[slot] <- true
                         changed <- true
+                        return
                     return
+                pending: mutable darray[sview] = [root]
+                visited: mutable darray[sview] = []
+                cursor: mutable usize = 0
+                while cursor < pending.count |pending, visited, cursor, parameter_position, callee_fact_row, params, structs, fact_row, changed|:
+                    current_root: sview = pending[cursor]
+                    cursor <- cursor + 1
+                    continue if current_root == "" or current_root == "?"
+                    already_visited: mutable bool = false
+                    for visited_index in 0..<visited.count |already_visited, visited, current_root|:
+                        already_visited <- true if visited[visited_index] == current_root
+                    continue if already_visited
+                    visited.push(current_root)
+                    for alias_index in 0..<structs.regions.region_alias_names.count |pending, structs, current_root|:
+                        if structs.regions.region_alias_names[alias_index] == current_root:
+                            pending.push(structs.regions.region_alias_roots[alias_index])
+                    for caller_position in 0..<params.count |params, structs, fact_row, current_root, changed, callee_fact_row, parameter_position|:
+                        continue if params[caller_position].name != current_root
+                        slot: usize = structs.regions.region_fact_starts[fact_row] + caller_position
+                        continue if structs.regions.region_fact_params[slot]
+                        continue if not region_fact_parameter_has_region(callee_fact_row, parameter_position, structs)
+                        structs.regions.region_fact_params[slot] <- true
+                        changed <- true
+                        break
+
+
+
+
+        # Apply one possible callee declaration row. Overloaded declarations are unioned
+        # below; each row gets its own labels, parameter count and forwarding facts.
+        def region_forward_call_row(row: usize, arguments: darray[Expr]&, argument_names: darray[sview]&, receiver_offset: usize, named_call: bool, minimum_position: usize, receiver_root: sview, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if row >= structs.regions.region_fact_starts.count or row >= structs.regions.region_fact_counts.count
+                start: usize = structs.regions.region_fact_starts[row]
+                count: usize = structs.regions.region_fact_counts[row]
+                return if start > structs.regions.region_fact_params.count or count > structs.regions.region_fact_params.count - start
+                return if minimum_position >= count
+                if receiver_offset == 1 and minimum_position == 0:
+                    region_mark_forwarded(receiver_root, 0.usize(), row, params, structs, fact_row, changed)
+                positions: mutable darray[i64] = []
+                if named_call:
+                    positions <- region_forward_argument_positions(argument_names, receiver_offset, row.i64(), structs)
+                for argument_index in 0..<arguments.count |arguments, receiver_offset, named_call, positions, minimum_position, count, row, params, structs, fact_row, changed|:
+                    root: sview = region_growth_root(arguments[argument_index])
+                    position: i64 = (argument_index + receiver_offset).i64()
+                    if named_call:
+                        position <- positions[argument_index] if argument_index < positions.count else -1
+                    if position >= minimum_position.i64() and position < count.i64():
+                        region_mark_forwarded(root, position.usize(), row, params, structs, fact_row, changed)
+                    elif position < 0:
+                        # An unmappable argument may occupy any compatible formal slot.
+                        for any_position in minimum_position..<count |root, row, params, structs, fact_row, changed|:
+                            region_mark_forwarded(root, any_position, row, params, structs, fact_row, changed)
 
 
 
@@ -506,19 +561,53 @@ extend Backend:
                     receiver_offset: mutable usize = 0.usize()
                     if region_forward_call_callee is Expr.Field(region_forward_arity_receiver, region_forward_arity_method, region_forward_arity_line):
                         receiver_offset <- 1.usize()
-                    callee_owner: sview = region_callee_owner(region_forward_call_callee, region_forward_call_arguments.count + receiver_offset, structs)
+                    callee_resolution: (owner: sview, resolved: bool) = region_callee_owner(region_forward_call_callee, region_forward_call_arguments.count + receiver_offset, structs)
+                    callee_owner: sview = callee_resolution.owner
+                    receiver_root: sview = ""
                     if region_forward_call_callee is Expr.Field(region_forward_receiver, region_forward_method, region_forward_field_line):
-                        region_mark_forwarded(region_growth_root(region_forward_receiver), 0.usize(), callee_name, callee_owner, params, structs, fact_row, changed)
-                    for argument_index in 0..<region_forward_call_arguments.count |region_forward_call_arguments, region_forward_call_names, receiver_offset, callee_name, callee_owner, params, structs, fact_row, changed|:
-                        root: sview = region_growth_root(region_forward_call_arguments[argument_index])
-                        position: i64 = region_forward_argument_position(callee_name, callee_owner, region_forward_call_names, argument_index, receiver_offset, structs)
-                        if position >= 0:
-                            region_mark_forwarded(root, position.usize(), callee_name, callee_owner, params, structs, fact_row, changed)
-                        else:
-                            # Unmappable named argument: forwarding to ANY growing
-                            # parameter is a sound over-approximation.
-                            for any_position in 0..<REGION_FORWARD_MAX_POSITIONS |root, callee_name, callee_owner, params, structs, fact_row, changed|:
-                                region_mark_forwarded(root, any_position, callee_name, callee_owner, params, structs, fact_row, changed)
+                        receiver_root <- region_growth_root(region_forward_receiver)
+                    # Named-versus-positional mode is call-wide; determine it once
+                    # instead of rescanning the full names array for every argument.
+                    named_call: mutable bool = false
+                    for argument_name in region_forward_call_names |named_call|:
+                        named_call <- true if argument_name != ""
+                    indexed: bool = structs.regions.region_fact_buckets.count == REGION_FACT_BUCKET_COUNT and structs.regions.region_fact_next.count == structs.regions.region_fact_names.count
+                    first_cursor: mutable i64 = structs.regions.region_fact_buckets[region_fact_name_bucket(callee_name)] if indexed else 0
+                    exact_owner_found: mutable bool = false
+                    ownerless_found: mutable bool = false
+                    exact_owner_max_count: mutable usize = 0
+                    while first_cursor >= 0 and first_cursor.usize() < structs.regions.region_fact_names.count |first_cursor, structs, callee_name, callee_owner, callee_resolution, exact_owner_found, ownerless_found, exact_owner_max_count, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, receiver_root, params, fact_row, changed, indexed|:
+                        candidate_row: usize = first_cursor.usize()
+                        first_cursor <- structs.regions.region_fact_next[candidate_row] if indexed else first_cursor + 1
+                        continue if structs.regions.region_fact_names[candidate_row] != callee_name
+                        candidate_owner: sview = structs.regions.region_fact_owners[candidate_row]
+                        if not callee_resolution.resolved:
+                            region_forward_call_row(candidate_row, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, 0.usize(), receiver_root, params, structs, fact_row, changed)
+                        elif candidate_owner == callee_owner:
+                            exact_owner_found <- true
+                            exact_owner_max_count <- structs.regions.region_fact_counts[candidate_row] if structs.regions.region_fact_counts[candidate_row] > exact_owner_max_count
+                            region_forward_call_row(candidate_row, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, 0.usize(), receiver_root, params, structs, fact_row, changed)
+                        elif callee_owner != "" and candidate_owner == "":
+                            ownerless_found <- true
+                    if callee_resolution.resolved and ownerless_found:
+                        second_cursor: mutable i64 = structs.regions.region_fact_buckets[region_fact_name_bucket(callee_name)] if indexed else 0
+                        while second_cursor >= 0 and second_cursor.usize() < structs.regions.region_fact_names.count |second_cursor, structs, callee_name, callee_owner, exact_owner_found, exact_owner_max_count, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, receiver_root, params, fact_row, changed, indexed|:
+                            candidate_row: usize = second_cursor.usize()
+                            second_cursor <- structs.regions.region_fact_next[candidate_row] if indexed else second_cursor + 1
+                            continue if structs.regions.region_fact_names[candidate_row] != callee_name or structs.regions.region_fact_owners[candidate_row] != ""
+                            # Owner-less facts are the compatibility fallback for formal
+                            # positions absent from every exact-owner declaration row.
+                            minimum_position: usize = exact_owner_max_count if exact_owner_found else 0.usize()
+                            region_forward_call_row(candidate_row, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, minimum_position, receiver_root, params, structs, fact_row, changed)
+                    elif callee_resolution.resolved and callee_owner != "" and not exact_owner_found:
+                        # If owner resolution has no matching or owner-less row, union all
+                        # same-name candidates so an ambiguous imported overload cannot hide a fact.
+                        second_cursor: mutable i64 = structs.regions.region_fact_buckets[region_fact_name_bucket(callee_name)] if indexed else 0
+                        while second_cursor >= 0 and second_cursor.usize() < structs.regions.region_fact_names.count |second_cursor, structs, callee_name, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, receiver_root, params, fact_row, changed, indexed|:
+                            candidate_row: usize = second_cursor.usize()
+                            second_cursor <- structs.regions.region_fact_next[candidate_row] if indexed else second_cursor + 1
+                            continue if structs.regions.region_fact_names[candidate_row] != callee_name
+                            region_forward_call_row(candidate_row, region_forward_call_arguments, region_forward_call_names, receiver_offset, named_call, 0.usize(), receiver_root, params, structs, fact_row, changed)
                     region_scan_forwarding_expression(region_forward_call_callee, params, structs, fact_row, changed)
                     for region_forward_argument in region_forward_call_arguments |params, structs, fact_row, changed|:
                         region_scan_forwarding_expression(region_forward_argument, params, structs, fact_row, changed)
@@ -659,8 +748,12 @@ extend Backend:
         # reference does not depend on its element type. Returns the bindings pushed (0 for
         # an ordinary function).
         def region_bind_template_placeholders(name: sview, line: u32, generics: GenericTable&, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate]:
-            for template_slot in 0..<generics.names.count |generics, structs, name, line|:
-                continue if generics.names[template_slot] != name
+            # Use the append-only name chain, preserving declaration order for duplicate
+            # templates while avoiding a scan of every generic declaration for each function.
+            template_cursor: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, name)
+            while template_cursor >= 0 |generics, structs, name, line, template_cursor|:
+                template_slot: usize = template_cursor.usize()
+                template_cursor <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, name, template_cursor)
                 template_line_matches: mutable bool = false
                 if generics.decls[template_slot] is Decl.Func(template_name, template_params, template_return, template_body, template_effects, template_decorators, template_line):
                     template_line_matches <- template_line.line == line

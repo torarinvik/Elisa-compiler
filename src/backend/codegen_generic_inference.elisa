@@ -7,6 +7,76 @@ extend Backend:
     private:
 
 
+        # Per-walk exact ValueType identity set. Tiny graphs stay in the linear `keys`
+        # vector; larger graphs promote to an open-addressed table whose slots hold
+        # one-based indices into `keys` (zero remains an unambiguous empty marker).
+        struct BackendTypeVisitSet:
+            keys: mutable darray[ValueType]
+            buckets: mutable darray[usize]
+            hashed: mutable bool
+
+
+        def backend_type_visit_hash(value_type: ValueType) -> usize:
+            h: mutable u64 = value_type.bits.u64() ^ (value_type.kind.u64() * 0x9e3779b97f4a7c15)
+            h <- (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9
+            h <- (h ^ (h >> 27)) * 0x94d049bb133111eb
+            h <- h ^ (h >> 31)
+            return h.usize()
+
+
+        def backend_type_visit_probe(keys: darray[ValueType]&, buckets: darray[usize]&, value_type: ValueType) -> usize can[Abort.Panic]:
+            assert buckets.count > 0.usize() and (buckets.count & (buckets.count - 1.usize())) == 0.usize()
+            mask: usize = buckets.count - 1.usize()
+            slot: mutable usize = backend_type_visit_hash(value_type) & mask
+            probed: mutable usize = 0
+            trusted Unsafe.AssumeProgress:
+                while probed < buckets.count:
+                    key_index_plus_one: usize = buckets[slot]
+                    if key_index_plus_one == 0.usize():
+                        return slot
+                    key_index: usize = key_index_plus_one - 1.usize()
+                    assert key_index < keys.count
+                    prior: ValueType = keys[key_index]
+                    return slot if prior.kind == value_type.kind and prior.bits == value_type.bits
+                    slot <- (slot + 1.usize()) & mask
+                    probed <- probed + 1.usize()
+            panic("backend type visit table exhausted")
+
+
+        def backend_type_visit_grow(visited: mutable BackendTypeVisitSet&, capacity: usize) -> void can[Abort.Panic, Memory.Allocate]:
+            assert capacity >= 16.usize() and (capacity & (capacity - 1.usize())) == 0.usize()
+            new_buckets: mutable darray[usize] = []
+            new_buckets.resize(capacity)
+            for key_index in 0..<visited.keys.count:
+                slot: usize = backend_type_visit_probe(visited.keys, new_buckets, visited.keys[key_index])
+                assert new_buckets[slot] == 0.usize()
+                new_buckets[slot] <- key_index + 1.usize()
+            visited.buckets <- new_buckets
+            visited.hashed <- true
+
+
+        # Returns true for a previously visited exact (kind, bits) pair.
+        def backend_type_visit_seen_or_insert(visited: mutable BackendTypeVisitSet&, value_type: ValueType) -> bool can[Abort.Panic, Memory.Allocate]:
+            if not visited.hashed:
+                for prior in visited.keys:
+                    return true if prior.kind == value_type.kind and prior.bits == value_type.bits
+                if visited.keys.count < 8.usize():
+                    visited.keys <- visited.keys.push(copied_type(value_type))
+                    return false
+                backend_type_visit_grow(visited, 16.usize())
+            slot: mutable usize = backend_type_visit_probe(visited.keys, visited.buckets, value_type)
+            if visited.buckets[slot] != 0.usize():
+                return true
+            if visited.keys.count + 1.usize() >= visited.buckets.count - visited.buckets.count / 4.usize():
+                new_capacity: usize = visited.buckets.count * 2.usize()
+                assert new_capacity > visited.buckets.count
+                backend_type_visit_grow(visited, new_capacity)
+                slot <- backend_type_visit_probe(visited.keys, visited.buckets, value_type)
+            visited.keys <- visited.keys.push(copied_type(value_type))
+            visited.buckets[slot] <- visited.keys.count
+            return false
+
+
         # Generic function TEMPLATES, and the instantiations made from them.
         #
         # The instantiation cache is keyed by (base name, type argument) — NOT by mangled
@@ -69,6 +139,13 @@ extend Backend:
             # unique, so the slot is what distinguishes the two — used to key the cache and to emit
             # the correct BODY (emit_instantiation_body must not re-derive the slot by first-name).
             inst_slots: mutable darray[usize]
+            # Instantiation rows chained by template slot (ascending insertion order). Repeated
+            # specialization lookup should compare only this template's argument tuples, not all
+            # prior generic function instances. If the chain arrays are ever out of sync with
+            # `inst_slots`, lookup falls back to the full scan.
+            inst_by_slot_heads: mutable darray[i64]
+            inst_by_slot_tails: mutable darray[i64]
+            inst_by_slot_next: mutable darray[i64]
             # Concrete error-family selector for each instantiation. Kept parallel to
             # inst_slots so two specializations with the same ordinary type arguments but
             # different error rows never share an LLVM body or symbol.
@@ -115,6 +192,10 @@ extend Backend:
             pending_arg_start: mutable darray[usize]
             pending_arg_count: mutable darray[usize]
             pending_handles: mutable darray[LLVMValueRef]
+            # The instantiation metadata row for each pending body. Carrying it through the
+            # worklist avoids searching every declared specialization by LLVM handle when
+            # the body reads its recorded hidden-arena layout.
+            pending_inst_rows: mutable darray[usize]
             # The template slot for each queued body (parallel to pending_bases). emit_instantiation_body
             # emits generics.decls[this slot] — NOT decls[generic_index_of(base)], which would pick the
             # first overload's body for an overloaded name.
@@ -124,7 +205,7 @@ extend Backend:
 
 
         def new_generic_table() -> GenericTable can[Abort.Panic, Memory.Allocate]:
-            return GenericTable{current_owner: "", names: [], decls: [], params: [], param_is_usize_value: [], param_start: [], param_count: [], is_error: [], error_params: [], owners: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], inst_slots: [], inst_error_families: [], inst_needs_arena: [], inst_needs_store: [], inst_arena_counts: [], inst_arena_param_start: [], inst_arena_param_counts: [], inst_arena_param_slots: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: [], pending_slots: [], pending_error_families: []}
+            return GenericTable{current_owner: "", names: [], decls: [], params: [], param_is_usize_value: [], param_start: [], param_count: [], is_error: [], error_params: [], owners: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], inst_slots: [], inst_by_slot_heads: [], inst_by_slot_tails: [], inst_by_slot_next: [], inst_error_families: [], inst_needs_arena: [], inst_needs_store: [], inst_arena_counts: [], inst_arena_param_start: [], inst_arena_param_counts: [], inst_arena_param_slots: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: [], pending_inst_rows: [], pending_slots: [], pending_error_families: []}
 
 
 
@@ -345,6 +426,810 @@ extend Backend:
             return false
 
 
+        # Task completion records retain a pointer to their ThreadPool, and a lexical pool
+        # shuts down its ThreadPool on scope exit. Pool-scope escape checks therefore cover
+        # Task, TaskGroup, and ThreadPool handles, including values nested in aggregates.
+        # Cycles are memoized by (kind,bits); a recursive edge is safe to skip because its
+        # first visit still scans every field. Unknown/malformed metadata fails closed, and a
+        # depth cap prevents malformed recursive layouts from unbounded work.
+        def backend_type_may_contain_pool_lifetime_handle_inner(value_type: ValueType, structs: StructTable&, visited: mutable BackendTypeVisitSet&, depth: usize) -> bool can[Abort.Panic, Memory.Allocate]:
+            true return if depth > 128.usize() or value_type.kind == TypeKind.Unmodeled
+            return false if value_type.kind == TypeKind.Void or value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned or value_type.kind == TypeKind.Bool or value_type.kind == TypeKind.Float or value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.SView or value_type.kind == TypeKind.ConstUsize
+            # A function value may be a closure whose environment captured a Task. The current
+            # ValueType does not distinguish raw function pointers from closure values, so do not
+            # allow one to cross a lexical pool boundary without richer capture provenance.
+            true return if value_type.kind == TypeKind.Fn
+            # `py::Object` is an opaque pointer and integer/pointer casts can erase its source
+            # type. It may therefore be a Task completion handle reinterpreted through the
+            # Python boundary; treat it as unknown at pool-lifetime boundaries.
+            true return if value_type.kind == TypeKind.PyObject
+
+            if value_type.kind == TypeKind.Struct:
+                true return if value_type.bits.usize() >= structs.records.names.count or value_type.bits.usize() >= structs.records.owners.count
+                # TaskGroup's opaque linked list owns raw completion handles. Its fields
+                # are void pointers, so the structural walk below cannot discover that
+                # waiting on the group after its pool shuts down dereferences stale pools.
+                true return if structs.records.names[value_type.bits.usize()] == "TaskGroup" and structs.records.owners[value_type.bits.usize()] == ""
+                true return if structs.records.names[value_type.bits.usize()] == "Task" and structs.records.owners[value_type.bits.usize()] == ""
+                true return if structs.records.names[value_type.bits.usize()] == "ThreadPool" and structs.records.owners[value_type.bits.usize()] == ""
+                # Source generic instantiations have distinct concrete Struct rows with
+                # substituted field types. Scanning every type argument would mistake
+                # phantom parameters (for example MutexGuard[Task]) for stored handles.
+                # The synthesized DynDict layout is the exception: its opaque bucket pointer
+                # hides K and V, so its recorded arguments are the only payload type facts.
+
+            # Each first visit scans every child before its caller completes. A repeated
+            # edge can therefore be skipped even when it points to an active ancestor:
+            # that ancestor resumes and scans its remaining siblings. Exact pair comparison
+            # avoids collisions between large `bits` values; malformed metadata and the depth
+            # cap below still fail closed.
+            return false if backend_type_visit_seen_or_insert(visited, value_type)
+
+            match value_type.kind:
+                TypeKind.Optional:
+                    true return if value_type.bits.usize() >= structs.interned_types.optional_targets.count
+                    return backend_type_may_contain_pool_lifetime_handle_inner(structs.interned_types.optional_targets[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.ErrorUnion:
+                    true return if value_type.bits.usize() >= structs.interned_types.error_union_values.count
+                    return backend_type_may_contain_pool_lifetime_handle_inner(structs.interned_types.error_union_values[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.Array:
+                    true return if value_type.bits.usize() >= structs.interned_types.array_elements.count
+                    return backend_type_may_contain_pool_lifetime_handle_inner(structs.interned_types.array_elements[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.DArray:
+                    true return if value_type.bits.usize() >= structs.interned_types.darray_elements.count
+                    return backend_type_may_contain_pool_lifetime_handle_inner(structs.interned_types.darray_elements[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.View:
+                    true return if value_type.bits.usize() >= structs.interned_types.view_elements.count
+                    return backend_type_may_contain_pool_lifetime_handle_inner(structs.interned_types.view_elements[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.Ref:
+                    true return if value_type.bits.usize() >= structs.interned_types.ref_targets.count
+                    return backend_type_may_contain_pool_lifetime_handle_inner(structs.interned_types.ref_targets[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.PackedStore:
+                    return backend_type_may_contain_pool_lifetime_handle_inner(ValueType{kind: TypeKind.PackedEnum, bits: value_type.bits}, structs, visited, depth + 1.usize())
+                TypeKind.Struct:
+                    struct_index: usize = value_type.bits.usize()
+                    true return if struct_index >= structs.records.field_start.count or struct_index >= structs.records.field_count.count
+                    field_start: usize = structs.records.field_start[struct_index]
+                    field_count: usize = structs.records.field_count[struct_index]
+                    true return if field_start > structs.records.field_types.count or field_count > structs.records.field_types.count - field_start
+                    contains_pool_handle: mutable bool = false
+                    inst: mutable usize = generic_inst_first_row(structs, struct_index)
+                    while inst < structs.generics.generic_struct_inst_index.count |inst, structs, struct_index|:
+                        if structs.generics.generic_struct_inst_index[inst] == struct_index:
+                            true return if structs.generics.generic_struct_inst_index.count != structs.generics.generic_struct_inst_bases.count or structs.generics.generic_struct_inst_index.count != structs.generics.generic_struct_inst_template_ids.count or structs.generics.generic_struct_inst_index.count != structs.generics.generic_struct_inst_arg_start.count or structs.generics.generic_struct_inst_index.count != structs.generics.generic_struct_inst_arg_count.count or structs.generics.generic_struct_inst_index.count != structs.generics.generic_struct_inst_ready.count
+                            true return if inst >= structs.generics.generic_struct_inst_ready.count or not structs.generics.generic_struct_inst_ready[inst]
+                            true return if inst >= structs.generics.generic_struct_inst_arg_start.count or inst >= structs.generics.generic_struct_inst_arg_count.count
+                            arg_start: usize = structs.generics.generic_struct_inst_arg_start[inst]
+                            arg_count: usize = structs.generics.generic_struct_inst_arg_count[inst]
+                            true return if arg_start > structs.generics.generic_struct_inst_args.count or arg_count > structs.generics.generic_struct_inst_args.count - arg_start
+                            # Only the synthesized DynDict representation erases its K/V
+                            # payload behind an opaque bucket pointer. It gets a template id
+                            # of zero; source generic layouts are covered by field types.
+                            if structs.generics.generic_struct_inst_bases[inst] == "DynDict" and structs.generics.generic_struct_inst_template_ids[inst] == 0:
+                                for arg_offset in 0..<arg_count |contains_pool_handle, structs, visited, depth, arg_start|:
+                                    contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.generics.generic_struct_inst_args[arg_start + arg_offset], structs, visited, depth + 1.usize())
+                            break
+                        inst <- generic_inst_next_row(structs, inst)
+                    for field_offset in 0..<field_count |contains_pool_handle, structs, visited, depth, field_start|:
+                        contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.records.field_types[field_start + field_offset], structs, visited, depth + 1.usize())
+                    return contains_pool_handle
+                TypeKind.PayloadEnum:
+                    enum_index: usize = value_type.bits.usize()
+                    true return if enum_index >= structs.payload_enums.penum_names.count or enum_index >= structs.payload_enums.penum_owners.count or enum_index >= structs.payload_enums.penum_variant_start.count or enum_index >= structs.payload_enums.penum_variant_count.count
+                    variant_start: usize = structs.payload_enums.penum_variant_start[enum_index]
+                    variant_count: usize = structs.payload_enums.penum_variant_count[enum_index]
+                    true return if structs.payload_enums.penum_has_payload.count != structs.payload_enums.penum_payloads.count or structs.payload_enums.penum_payloads.count != structs.payload_enums.penum_variants.count or structs.payload_enums.penum_variants.count != structs.payload_enums.penum_variant_owners.count or structs.payload_enums.penum_field_names.count != structs.payload_enums.penum_variants.count or structs.payload_enums.penum_field_type_start.count != structs.payload_enums.penum_field_type_count.count
+                    true return if variant_start > structs.payload_enums.penum_payloads.count or variant_count > structs.payload_enums.penum_payloads.count - variant_start
+                    true return if variant_start > structs.payload_enums.penum_field_type_start.count or variant_count > structs.payload_enums.penum_field_type_start.count - variant_start
+                    contains_pool_handle: mutable bool = false
+                    for variant_offset in 0..<variant_count |contains_pool_handle, structs, visited, depth, variant_start|:
+                        variant_row: usize = variant_start + variant_offset
+                        if variant_row < structs.payload_enums.penum_has_payload.count and structs.payload_enums.penum_has_payload[variant_row]:
+                            contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.payload_enums.penum_payloads[variant_row], structs, visited, depth + 1.usize())
+                        field_start: usize = structs.payload_enums.penum_field_type_start[variant_row]
+                        field_count: usize = structs.payload_enums.penum_field_type_count[variant_row]
+                        true return if field_start > structs.payload_enums.penum_field_types.count or field_count > structs.payload_enums.penum_field_types.count - field_start
+                        for field_offset in 0..<field_count |contains_pool_handle, structs, visited, depth, field_start|:
+                            contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.payload_enums.penum_field_types[field_start + field_offset], structs, visited, depth + 1.usize())
+                    return contains_pool_handle
+                TypeKind.PackedEnum:
+                    enum_index: usize = value_type.bits.usize()
+                    true return if enum_index >= structs.packed_enums.packed_names.count or enum_index >= structs.packed_enums.packed_owners.count or enum_index >= structs.packed_enums.packed_variant_start.count or enum_index >= structs.packed_enums.packed_variant_count.count or enum_index >= structs.packed_enums.packed_common_counts.count
+                    variant_start: usize = structs.packed_enums.packed_variant_start[enum_index]
+                    variant_count: usize = structs.packed_enums.packed_variant_count[enum_index]
+                    true return if structs.packed_enums.packed_has_payload.count != structs.packed_enums.packed_payloads.count or structs.packed_enums.packed_payloads.count != structs.packed_enums.packed_variants.count or structs.packed_enums.packed_field_names.count != structs.packed_enums.packed_variants.count or structs.packed_enums.packed_field_type_start.count != structs.packed_enums.packed_field_type_count.count
+                    true return if variant_start > structs.packed_enums.packed_payloads.count or variant_count > structs.packed_enums.packed_payloads.count - variant_start
+                    true return if variant_start > structs.packed_enums.packed_field_type_start.count or variant_count > structs.packed_enums.packed_field_type_start.count - variant_start
+                    contains_pool_handle: mutable bool = false
+                    for variant_offset in 0..<variant_count |contains_pool_handle, structs, visited, depth, variant_start|:
+                        variant_row: usize = variant_start + variant_offset
+                        if variant_row < structs.packed_enums.packed_has_payload.count and structs.packed_enums.packed_has_payload[variant_row]:
+                            contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.packed_enums.packed_payloads[variant_row], structs, visited, depth + 1.usize())
+                        field_start: usize = structs.packed_enums.packed_field_type_start[variant_row]
+                        field_count: usize = structs.packed_enums.packed_field_type_count[variant_row]
+                        true return if field_start > structs.packed_enums.packed_field_types.count or field_count > structs.packed_enums.packed_field_types.count - field_start
+                        for field_offset in 0..<field_count |contains_pool_handle, structs, visited, depth, field_start|:
+                            contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.packed_enums.packed_field_types[field_start + field_offset], structs, visited, depth + 1.usize())
+                    true return if structs.packed_enums.packed_common_owners.count != structs.packed_enums.packed_common_modules.count or structs.packed_enums.packed_common_owners.count != structs.packed_enums.packed_common_names.count or structs.packed_enums.packed_common_owners.count != structs.packed_enums.packed_common_types.count
+                    common_fields: mutable usize = 0
+                    for common_index in 0..<structs.packed_enums.packed_common_types.count |contains_pool_handle, common_fields, structs, visited, depth, enum_index|:
+                        if structs.packed_enums.packed_common_owners[common_index] == structs.packed_enums.packed_names[enum_index] and structs.packed_enums.packed_common_modules[common_index] == structs.packed_enums.packed_owners[enum_index]:
+                            common_fields <- common_fields + 1.usize()
+                            contains_pool_handle <- true if backend_type_may_contain_pool_lifetime_handle_inner(structs.packed_enums.packed_common_types[common_index], structs, visited, depth + 1.usize())
+                    true return if common_fields != structs.packed_enums.packed_common_counts[enum_index].usize()
+                    return contains_pool_handle
+                _:
+                    return false
+
+
+        def backend_type_may_contain_pool_lifetime_handle(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            visited: mutable BackendTypeVisitSet = BackendTypeVisitSet{keys: [], buckets: [], hashed: false}
+            return backend_type_may_contain_pool_lifetime_handle_inner(value_type, structs, visited, 0.usize())
+
+
+        # Raw projections erase their source record type. Treat pointer-sized scalars as
+        # possible handle representations only when the IR type is explicitly pointer-like.
+        # `usize` is also pointer-sized but is commonly an ordinary numeric result, so its
+        # provenance must come from the source expression or submit argument instead.
+        def backend_type_is_raw_pool_handle_representation(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic]:
+            return true if value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.GuestCarrier
+            if value_type.kind == TypeKind.Optional:
+                return backend_type_is_raw_pool_handle_representation(optional_payload_of(value_type, structs), structs)
+            return false
+
+
+        # Opaque calls can return aggregates whose pointer-sized scalar fields erased the
+        # source handle type. This summary is intentionally used only to decide whether a
+        # call result needs its arguments checked for provenance; ordinary values of these
+        # types remain accepted when their arguments carry no pool handle.
+        def backend_type_may_contain_erased_pool_handle_slot_inner(value_type: ValueType, structs: StructTable&, visited: mutable BackendTypeVisitSet&, depth: usize) -> bool can[Abort.Panic, Memory.Allocate]:
+            true return if depth > 128.usize() or value_type.kind == TypeKind.Unmodeled
+            if backend_type_is_raw_pool_handle_representation(value_type, structs):
+                return true
+            return true if (value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned) and value_type.bits == structs.target.target_pointer_bits
+            return false if backend_type_visit_seen_or_insert(visited, value_type)
+            match value_type.kind:
+                TypeKind.Optional:
+                    true return if value_type.bits.usize() >= structs.interned_types.optional_targets.count
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(structs.interned_types.optional_targets[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.ErrorUnion:
+                    true return if value_type.bits.usize() >= structs.interned_types.error_union_values.count
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(structs.interned_types.error_union_values[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.Array:
+                    true return if value_type.bits.usize() >= structs.interned_types.array_elements.count
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(structs.interned_types.array_elements[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.DArray:
+                    true return if value_type.bits.usize() >= structs.interned_types.darray_elements.count
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(structs.interned_types.darray_elements[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.View:
+                    true return if value_type.bits.usize() >= structs.interned_types.view_elements.count
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(structs.interned_types.view_elements[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.Ref:
+                    true return if value_type.bits.usize() >= structs.interned_types.ref_targets.count
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(structs.interned_types.ref_targets[value_type.bits.usize()], structs, visited, depth + 1.usize())
+                TypeKind.Struct:
+                    struct_index: usize = value_type.bits.usize()
+                    true return if struct_index >= structs.records.field_start.count or struct_index >= structs.records.field_count.count
+                    field_start: usize = structs.records.field_start[struct_index]
+                    field_count: usize = structs.records.field_count[struct_index]
+                    true return if field_start > structs.records.field_types.count or field_count > structs.records.field_types.count - field_start
+                    contains_erased_slot: mutable bool = false
+                    for field_offset in 0..<field_count |contains_erased_slot, structs, visited, depth, field_start|:
+                        contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.records.field_types[field_start + field_offset], structs, visited, depth + 1.usize())
+                    generic_base: mutable sview = ""
+                    generic_arg_start: mutable usize = 0
+                    generic_arg_count: mutable usize = 0
+                    if generic_struct_instantiation_of(structs, value_type, generic_base, generic_arg_start, generic_arg_count) and generic_base == "DynDict":
+                        true return if generic_arg_start > structs.generics.generic_struct_inst_args.count or generic_arg_count > structs.generics.generic_struct_inst_args.count - generic_arg_start
+                        for generic_arg_offset in 0..<generic_arg_count |contains_erased_slot, structs, visited, depth, generic_arg_start|:
+                            contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.generics.generic_struct_inst_args[generic_arg_start + generic_arg_offset], structs, visited, depth + 1.usize())
+                    return contains_erased_slot
+                TypeKind.PayloadEnum:
+                    enum_index: usize = value_type.bits.usize()
+                    true return if enum_index >= structs.payload_enums.penum_variant_start.count or enum_index >= structs.payload_enums.penum_variant_count.count
+                    variant_start: usize = structs.payload_enums.penum_variant_start[enum_index]
+                    variant_count: usize = structs.payload_enums.penum_variant_count[enum_index]
+                    true return if variant_start > structs.payload_enums.penum_field_type_start.count or variant_count > structs.payload_enums.penum_field_type_start.count - variant_start or variant_start > structs.payload_enums.penum_field_type_count.count or variant_count > structs.payload_enums.penum_field_type_count.count - variant_start
+                    true return if variant_start > structs.payload_enums.penum_payloads.count or variant_count > structs.payload_enums.penum_payloads.count - variant_start or variant_start > structs.payload_enums.penum_has_payload.count or variant_count > structs.payload_enums.penum_has_payload.count - variant_start
+                    contains_erased_slot: mutable bool = false
+                    for variant_offset in 0..<variant_count |contains_erased_slot, structs, visited, depth, variant_start|:
+                        variant_row: usize = variant_start + variant_offset
+                        if structs.payload_enums.penum_has_payload[variant_row]:
+                            contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.payload_enums.penum_payloads[variant_row], structs, visited, depth + 1.usize())
+                        field_start: usize = structs.payload_enums.penum_field_type_start[variant_row]
+                        field_count: usize = structs.payload_enums.penum_field_type_count[variant_row]
+                        true return if field_start > structs.payload_enums.penum_field_types.count or field_count > structs.payload_enums.penum_field_types.count - field_start
+                        for field_offset in 0..<field_count |contains_erased_slot, structs, visited, depth, field_start|:
+                            contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.payload_enums.penum_field_types[field_start + field_offset], structs, visited, depth + 1.usize())
+                    return contains_erased_slot
+                TypeKind.PackedStore:
+                    return backend_type_may_contain_erased_pool_handle_slot_inner(ValueType{kind: TypeKind.PackedEnum, bits: value_type.bits}, structs, visited, depth + 1.usize())
+                TypeKind.PackedEnum:
+                    enum_index: usize = value_type.bits.usize()
+                    true return if enum_index >= structs.packed_enums.packed_names.count or enum_index >= structs.packed_enums.packed_owners.count or enum_index >= structs.packed_enums.packed_variant_start.count or enum_index >= structs.packed_enums.packed_variant_count.count or enum_index >= structs.packed_enums.packed_common_counts.count
+                    variant_start: usize = structs.packed_enums.packed_variant_start[enum_index]
+                    variant_count: usize = structs.packed_enums.packed_variant_count[enum_index]
+                    true return if variant_start > structs.packed_enums.packed_field_type_start.count or variant_count > structs.packed_enums.packed_field_type_start.count - variant_start or variant_start > structs.packed_enums.packed_field_type_count.count or variant_count > structs.packed_enums.packed_field_type_count.count - variant_start
+                    true return if variant_start > structs.packed_enums.packed_payloads.count or variant_count > structs.packed_enums.packed_payloads.count - variant_start or variant_start > structs.packed_enums.packed_has_payload.count or variant_count > structs.packed_enums.packed_has_payload.count - variant_start
+                    contains_erased_slot: mutable bool = false
+                    for variant_offset in 0..<variant_count |contains_erased_slot, structs, visited, depth, variant_start|:
+                        variant_row: usize = variant_start + variant_offset
+                        if structs.packed_enums.packed_has_payload[variant_row]:
+                            contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.packed_enums.packed_payloads[variant_row], structs, visited, depth + 1.usize())
+                        field_start: usize = structs.packed_enums.packed_field_type_start[variant_row]
+                        field_count: usize = structs.packed_enums.packed_field_type_count[variant_row]
+                        true return if field_start > structs.packed_enums.packed_field_types.count or field_count > structs.packed_enums.packed_field_types.count - field_start
+                        for field_offset in 0..<field_count |contains_erased_slot, structs, visited, depth, field_start|:
+                            contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.packed_enums.packed_field_types[field_start + field_offset], structs, visited, depth + 1.usize())
+                    true return if structs.packed_enums.packed_common_owners.count != structs.packed_enums.packed_common_modules.count or structs.packed_enums.packed_common_owners.count != structs.packed_enums.packed_common_names.count or structs.packed_enums.packed_common_owners.count != structs.packed_enums.packed_common_types.count
+                    common_fields: mutable usize = 0
+                    for common_index in 0..<structs.packed_enums.packed_common_types.count |contains_erased_slot, common_fields, structs, visited, depth, enum_index|:
+                        if structs.packed_enums.packed_common_owners[common_index] == structs.packed_enums.packed_names[enum_index] and structs.packed_enums.packed_common_modules[common_index] == structs.packed_enums.packed_owners[enum_index]:
+                            common_fields <- common_fields + 1.usize()
+                            contains_erased_slot <- true if backend_type_may_contain_erased_pool_handle_slot_inner(structs.packed_enums.packed_common_types[common_index], structs, visited, depth + 1.usize())
+                    true return if common_fields != structs.packed_enums.packed_common_counts[enum_index].usize()
+                    return contains_erased_slot
+                _:
+                    return false
+
+
+        def backend_type_may_contain_erased_pool_handle_slot(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            true return if value_type.kind == TypeKind.Unmodeled or value_type.kind == TypeKind.Fn or value_type.kind == TypeKind.PyObject
+            if value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned:
+                return value_type.bits == structs.target.target_pointer_bits
+            return true if backend_type_is_raw_pool_handle_representation(value_type, structs)
+            return false if value_type.kind != TypeKind.Struct and value_type.kind != TypeKind.PayloadEnum and value_type.kind != TypeKind.PackedEnum and value_type.kind != TypeKind.PackedStore and value_type.kind != TypeKind.Array and value_type.kind != TypeKind.Optional and value_type.kind != TypeKind.ErrorUnion and value_type.kind != TypeKind.DArray and value_type.kind != TypeKind.View
+            visited: mutable BackendTypeVisitSet = BackendTypeVisitSet{keys: [], buckets: [], hashed: false}
+            return backend_type_may_contain_erased_pool_handle_slot_inner(value_type, structs, visited, 0.usize())
+
+
+        # The expression walker handles pool-derived projections and compound values before
+        # this fallback. A local scalar binding has already passed its declaration, assignment,
+        # and call-argument guards; unresolved nonlocal identifiers still fail closed.
+        def backend_expression_may_be_unresolved_pool_handle_source(expression: Expr, value_type: ValueType, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic]:
+            pointer_word: bool = (value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned) and value_type.bits == structs.target.target_pointer_bits
+            return false if not backend_type_is_raw_pool_handle_representation(value_type, structs) and not pointer_word
+            match expression:
+                Expr.Invalid | Expr.Absent | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
+                    return false
+                Expr.Ident(source_name, _):
+                    folded_ok: mutable bool = true
+                    _folded_value: i64 = fold_const_expr(expression, structs, folded_ok)
+                    return false if folded_ok or lookup_index(local_scope, source_name) >= 0
+                    return true
+                # The provenance walker already inspected these expressions. Preserve its
+                # result instead of treating every dynamic pointer-width value as a handle.
+                Expr.Call(_, _, _, _) | Expr.Field(_, _, _) | Expr.Unary(_, _, _) | Expr.Binary(_, _, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _) | Expr.Paren(_, _) | Expr.Move(_, _) | Expr.RegionNew(_, _, _) | Expr.Block(_, _, _, _) | Expr.If(_, _, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.Array(_, _) | Expr.Tuple(_, _) | Expr.SetLit(_, _) | Expr.DictLit(_, _) | Expr.Construct(_, _, _) | Expr.RecordUpdate(_, _, _) | Expr.Refinement(_, _, _) | Expr.GetElse(_, _, _) | Expr.Comprehension(_, _, _, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _) | Expr.Lambda(_, _, _) | Expr.ShorthandMember(_, _):
+                    return false
+                _:
+                    pass
+            folded_ok: mutable bool = true
+            _folded_value: i64 = fold_const_expr(expression, structs, folded_ok)
+            return not folded_ok
+
+
+        # Resolve the source expression that supplies one field of a direct struct
+        # construction. This keeps projection provenance narrow: a handle in a sibling
+        # initializer does not taint a different selected field. Missing fields use their
+        # declared default when present; otherwise the constructor's zero initialization
+        # cannot introduce a pool handle.
+        def backend_aggregate_field_source(expression: Expr, field_name: sview, structs: mutable StructTable&, found: mutable bool&, depth: usize) -> Expr can[Abort.Panic, Memory.Allocate]:
+            found <- false
+            if depth > 128.usize():
+                found <- true
+                return Expr.Invalid
+            match expression:
+                Expr.Construct(construct_type, construct_fields, construct_pos):
+                    field_registry_type: mutable ValueType = annotation_value_type(construct_type, structs)
+                    field_registry_type <- arena_user_struct(structs) if field_registry_type.kind == TypeKind.Arena
+                    return Expr.Invalid if field_registry_type.kind != TypeKind.Struct
+                    struct_slot: usize = field_registry_type.bits.usize()
+                    if struct_slot >= structs.records.names.count or struct_slot >= structs.records.owners.count or struct_slot >= structs.records.field_start.count or struct_slot >= structs.records.field_count.count:
+                        found <- true
+                        return Expr.Invalid
+                    struct_field_start: usize = structs.records.field_start[struct_slot]
+                    struct_field_count: usize = structs.records.field_count[struct_slot]
+                    if struct_field_start > structs.records.field_names.count or struct_field_count > structs.records.field_names.count - struct_field_start:
+                        found <- true
+                        return Expr.Invalid
+                    field_position: i64 = field_index_of(structs, struct_slot, field_name)
+                    return Expr.Invalid if field_position < 0
+                    selected: mutable Expr = Expr.Invalid
+                    construction_order: mutable u32 = 0
+                    for field_init in construct_fields |found, selected, construction_order, field_position, structs, struct_slot|:
+                        supplied_position: mutable i64 = field_index_of(structs, struct_slot, field_init.name)
+                        supplied_position <- construction_order.i64() if field_init.name == ""
+                        construction_order <- construction_order + 1
+                        if supplied_position == field_position:
+                            selected <- field_init.value
+                            found <- true
+                    return selected if found
+                    default_owner: sview = structs.records.owners[struct_slot]
+                    default_row: i64 = field_default_row(structs, default_owner, structs.records.names[struct_slot], field_name)
+                    if default_row >= 0 and default_row.usize() < structs.records.field_default_values.count:
+                        found <- true
+                        return structs.records.field_default_values[default_row.usize()]
+                    found <- true
+                    return Expr.IntLit(0, construct_pos)
+                Expr.RecordUpdate(record_base, record_fields, _):
+                    selected_override_found: mutable bool = false
+                    selected_override: mutable Expr = Expr.Invalid
+                    for override in record_fields |selected_override_found, selected_override, field_name|:
+                        if override.name == field_name:
+                            selected_override <- override.value
+                            selected_override_found <- true
+                    if selected_override_found:
+                        found <- true
+                        return selected_override
+                    return backend_aggregate_field_source(record_base, field_name, structs, found, depth + 1.usize())
+                Expr.Field(nested_base, nested_field, _):
+                    nested_source_found: mutable bool = false
+                    nested_source: Expr = backend_aggregate_field_source(nested_base, nested_field, structs, nested_source_found, depth + 1.usize())
+                    return Expr.Invalid if not nested_source_found
+                    if nested_source is Expr.Invalid:
+                        found <- true
+                        return Expr.Invalid
+                    return backend_aggregate_field_source(nested_source, field_name, structs, found, depth + 1.usize())
+                Expr.Paren(inner, _) | Expr.Move(inner, _):
+                    return backend_aggregate_field_source(inner, field_name, structs, found, depth + 1.usize())
+                Expr.Block(block_statements, block_value, _, _):
+                    block_source_found: mutable bool = false
+                    block_source: Expr = block_value
+                    if block_value is Expr.Ident(block_value_name, _):
+                        block_declared: mutable bool = false
+                        block_decl_row: mutable usize = 0
+                        block_source <- Expr.Invalid
+                        for block_statement_index in 0..<block_statements.count |block_declared, block_decl_row, block_source, block_value_name, block_statements|:
+                            match block_statements[block_statement_index]:
+                                Stmt.VarDecl(block_decl_name, _, block_decl_value, _):
+                                    if block_decl_name == block_value_name:
+                                        block_declared <- true
+                                        block_decl_row <- block_statement_index
+                                        block_source <- block_decl_value
+                                _:
+                                    pass
+                        block_value return if not block_declared
+                        block_binding_names: SubmitGroupNameSet = SubmitGroupNameSet{first: block_value_name, second: "", third: "", fail_closed_nested_scopes: true}
+                        for block_after_decl in block_decl_row + 1..<block_statements.count |block_binding_names, block_statements|:
+                            if submit_group_statement_mentions_names(block_statements[block_after_decl], block_binding_names, true):
+                                found <- true
+                                return Expr.Invalid
+                        found <- true
+                        return Expr.Invalid if block_source is Expr.Invalid
+                        block_selected_found: mutable bool = false
+                        block_selected: Expr = backend_aggregate_field_source(block_source, field_name, structs, block_selected_found, depth + 1.usize())
+                        if not block_selected_found:
+                            found <- true
+                            return Expr.Invalid
+                        found <- true
+                        return block_selected
+                    if block_value is not Expr.Ident(_, _):
+                        block_source <- backend_aggregate_field_source(block_value, field_name, structs, block_source_found, depth + 1.usize())
+                        found <- block_source_found
+                        return block_source
+                    return Expr.Invalid
+                Expr.Call(enum_ctor_callee, enum_ctor_arguments, enum_ctor_argument_names, enum_ctor_pos):
+                    if enum_ctor_callee is Expr.Field(enum_ctor_head, enum_ctor_variant, _):
+                        enum_ctor_index: i64 = penum_index_of_head(structs, enum_ctor_head)
+                        if enum_ctor_index >= 0 and enum_ctor_index.usize() < structs.payload_enums.penum_variant_start.count and enum_ctor_index.usize() < structs.payload_enums.penum_variant_count.count and enum_ctor_index.usize() < structs.payload_enums.penum_names.count:
+                            enum_ctor_variant_start: usize = structs.payload_enums.penum_variant_start[enum_ctor_index.usize()]
+                            enum_ctor_variant_count: usize = structs.payload_enums.penum_variant_count[enum_ctor_index.usize()]
+                            if enum_ctor_variant_start > structs.payload_enums.penum_variants.count or enum_ctor_variant_count > structs.payload_enums.penum_variants.count - enum_ctor_variant_start or enum_ctor_variant_start > structs.payload_enums.penum_variant_owners.count or enum_ctor_variant_count > structs.payload_enums.penum_variant_owners.count - enum_ctor_variant_start:
+                                found <- true
+                                return Expr.Invalid
+                            enum_ctor_variant_offset: i64 = penum_variant_index_owned(structs, enum_ctor_index, packed_constructor_enum_name(enum_ctor_head), enum_ctor_variant)
+                            if enum_ctor_variant_offset >= 0 and enum_ctor_variant_offset < enum_ctor_variant_count.i64():
+                                if enum_ctor_variant_start > structs.payload_enums.penum_variants.count or enum_ctor_variant_count > structs.payload_enums.penum_variants.count - enum_ctor_variant_start or enum_ctor_variant_start > structs.payload_enums.penum_field_type_start.count or enum_ctor_variant_count > structs.payload_enums.penum_field_type_start.count - enum_ctor_variant_start or enum_ctor_variant_start > structs.payload_enums.penum_field_type_count.count or enum_ctor_variant_count > structs.payload_enums.penum_field_type_count.count - enum_ctor_variant_start:
+                                    found <- true
+                                    return Expr.Invalid
+                                enum_projection_offset: mutable usize = 0
+                                enum_projection_matches: mutable usize = 0
+                                for enum_projection_variant in 0..<enum_ctor_variant_count |enum_projection_offset, enum_projection_matches, enum_ctor_variant_start, field_name, structs|:
+                                    enum_projection_slot: usize = enum_ctor_variant_start + enum_projection_variant
+                                    enum_projection_start: usize = structs.payload_enums.penum_field_type_start[enum_projection_slot]
+                                    enum_projection_count: usize = structs.payload_enums.penum_field_type_count[enum_projection_slot]
+                                    if enum_projection_start > structs.payload_enums.penum_field_flat_names.count or enum_projection_count > structs.payload_enums.penum_field_flat_names.count - enum_projection_start or enum_projection_start > structs.payload_enums.penum_field_types.count or enum_projection_count > structs.payload_enums.penum_field_types.count - enum_projection_start:
+                                        found <- true
+                                        return Expr.Invalid
+                                    for enum_projection_field in 0..<enum_projection_count |enum_projection_offset, enum_projection_matches, enum_projection_start, enum_projection_slot, enum_projection_variant, field_name, structs|:
+                                        if structs.payload_enums.penum_field_flat_names[enum_projection_start + enum_projection_field] == field_name:
+                                            enum_projection_offset <- enum_projection_field
+                                            enum_projection_matches <- enum_projection_matches + 1
+                                if enum_projection_matches == 1:
+                                    enum_ctor_slot: usize = enum_ctor_variant_start + enum_ctor_variant_offset.usize()
+                                    enum_ctor_field_start: usize = structs.payload_enums.penum_field_type_start[enum_ctor_slot]
+                                    enum_ctor_field_count: usize = structs.payload_enums.penum_field_type_count[enum_ctor_slot]
+                                    if enum_ctor_field_start > structs.payload_enums.penum_field_flat_names.count or enum_ctor_field_count > structs.payload_enums.penum_field_flat_names.count - enum_ctor_field_start or enum_ctor_field_start > structs.payload_enums.penum_field_types.count or enum_ctor_field_count > structs.payload_enums.penum_field_types.count - enum_ctor_field_start:
+                                        found <- true
+                                        return Expr.Invalid
+                                    # The field reader currently loads the unique declaring
+                                    # variant's offset without checking the runtime tag. Another
+                                    # constructor can therefore expose overlapping payload bytes;
+                                    # only trace a constructor when it declares this exact field.
+                                    if enum_projection_offset >= enum_ctor_field_count or structs.payload_enums.penum_field_flat_names[enum_ctor_field_start + enum_projection_offset] != field_name:
+                                        found <- true
+                                        return Expr.Invalid
+                                    if enum_ctor_arguments.count != enum_ctor_field_count or (enum_ctor_argument_names.count != 0 and enum_ctor_argument_names.count != enum_ctor_arguments.count):
+                                        found <- true
+                                        return Expr.Invalid
+                                    enum_ctor_source_index: i64 = named_argument_index(enum_ctor_argument_names, structs.payload_enums.penum_field_flat_names, enum_ctor_field_start, enum_ctor_field_count, 0.usize(), enum_projection_offset)
+                                    if enum_ctor_source_index < 0 or enum_ctor_source_index.usize() >= enum_ctor_arguments.count:
+                                        found <- true
+                                        return Expr.Invalid
+                                    found <- true
+                                    return enum_ctor_arguments[enum_ctor_source_index.usize()]
+                Expr.If(_, _, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _):
+                    # A projection from a multi-branch expression has multiple possible
+                    # sources; the field-sensitive caller walks each yielded branch.
+                    pass
+                _:
+                    pass
+            return Expr.Invalid
+
+
+        # The builtin concurrency records store their state in raw integer/pointer fields.
+        # Those fields lose the Task/ThreadPool/TaskGroup type as soon as a projection is
+        # made, so the structural ValueType walk above cannot see a lifetime-bearing value
+        # such as `workers.handle`. Keep provenance at the expression boundary for direct
+        # projections and value-preserving syntax. Locals and aggregate initializers are
+        # checked before they can store such a projection, so this bounded walk does not need
+        # a second alias table in Scope.
+        def backend_expression_projects_pool_lifetime_handle(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, depth: usize) -> bool can[Abort.Panic, Memory.Allocate]:
+            true return if depth > 128.usize()
+            match expression:
+                Expr.Field(field_object, field_name, _):
+                    projection_type: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                    projection_is_raw_pointer: bool = backend_type_is_raw_pool_handle_representation(projection_type, structs)
+                    projection_may_be_hidden_handle: bool = projection_is_raw_pointer or ((projection_type.kind == TypeKind.Signed or projection_type.kind == TypeKind.Unsigned) and projection_type.bits == structs.target.target_pointer_bits)
+                    field_object_type: mutable ValueType = expression_type(field_object, local_scope, fns, structs, generics)
+                    wrapper_depth: mutable usize = 0
+                    while (field_object_type.kind == TypeKind.Ref or field_object_type.kind == TypeKind.Optional) and wrapper_depth < 16.usize() |field_object_type, wrapper_depth, structs|:
+                        if field_object_type.kind == TypeKind.Ref:
+                            field_object_type <- ref_target_of(field_object_type, structs)
+                        else:
+                            field_object_type <- optional_payload_of(field_object_type, structs)
+                        wrapper_depth <- wrapper_depth + 1.usize()
+                    true return if field_object_type.kind == TypeKind.Ref or field_object_type.kind == TypeKind.Optional
+                    if field_object_type.kind == TypeKind.Struct:
+                        field_struct: usize = field_object_type.bits.usize()
+                        if field_struct < structs.records.names.count and field_struct < structs.records.owners.count and structs.records.owners[field_struct] == "":
+                            field_struct_name: sview = structs.records.names[field_struct]
+                            return true if field_struct_name == "Task" and (field_name == "handle" or field_name == "state")
+                            return true if field_struct_name == "ThreadPool" and field_name == "handle"
+                            return true if field_struct_name == "TaskGroup" and (field_name == "handle" or field_name == "cleanup")
+                    match field_object:
+                        Expr.If(_, if_then_value, if_else_value, if_pos):
+                            return backend_expression_projects_pool_lifetime_handle(Expr.Field(if_then_value, field_name, if_pos), local_scope, fns, structs, generics, depth + 1.usize()) or backend_expression_projects_pool_lifetime_handle(Expr.Field(if_else_value, field_name, if_pos), local_scope, fns, structs, generics, depth + 1.usize())
+                        Expr.Block(_, block_value, _, block_pos):
+                            block_source_found: mutable bool = false
+                            block_source: Expr = backend_aggregate_field_source(field_object, field_name, structs, block_source_found, depth + 1.usize())
+                            if block_source_found:
+                                return projection_may_be_hidden_handle if block_source is Expr.Invalid
+                                return backend_expression_projects_pool_lifetime_handle(block_source, local_scope, fns, structs, generics, depth + 1.usize())
+                            block_projection: Expr = Expr.Field(block_value, field_name, block_pos)
+                            return backend_expression_projects_pool_lifetime_handle(block_projection, local_scope, fns, structs, generics, depth + 1.usize())
+                        Expr.Match(_, projection_arms, projection_pos) | Expr.Catch(_, projection_arms, projection_pos):
+                            projection_saw_unresolved: mutable bool = false
+                            projection_saw_yield: mutable bool = false
+                            for projection_arm in projection_arms |projection_saw_unresolved, projection_saw_yield, field_name, projection_pos, local_scope, fns, structs, generics, depth|:
+                                continue if projection_arm.body.count == 0
+                                projection_last: Stmt = projection_arm.body[projection_arm.body.count - 1]
+                                if projection_last is Stmt.Expr(projection_yield, _):
+                                    projection_saw_yield <- true
+                                    projection_source_found: mutable bool = false
+                                    projection_source: Expr = backend_aggregate_field_source(projection_yield, field_name, structs, projection_source_found, depth + 1.usize())
+                                    if projection_source_found:
+                                        return projection_may_be_hidden_handle if projection_source is Expr.Invalid
+                                        projection_source_type: ValueType = expression_type(projection_source, local_scope, fns, structs, generics)
+                                        return true if projection_is_raw_pointer and (projection_source_type.kind == TypeKind.Struct or projection_source_type.kind == TypeKind.PayloadEnum or projection_source_type.kind == TypeKind.Array)
+                                        return true if backend_expression_projects_pool_lifetime_handle(projection_source, local_scope, fns, structs, generics, depth + 1.usize())
+                                        return true if backend_expression_may_be_unresolved_pool_handle_source(projection_source, projection_source_type, local_scope, structs)
+                                        continue
+                                    branch_projection: Expr = Expr.Field(projection_yield, field_name, projection_pos)
+                                    if backend_expression_projects_pool_lifetime_handle(branch_projection, local_scope, fns, structs, generics, depth + 1.usize()):
+                                        return true
+                                    projection_saw_unresolved <- true if projection_may_be_hidden_handle
+                            return projection_may_be_hidden_handle if projection_saw_unresolved or not projection_saw_yield
+                            return false
+                        _:
+                            pass
+                    selected_field_source_found: mutable bool = false
+                    selected_field_source: Expr = backend_aggregate_field_source(field_object, field_name, structs, selected_field_source_found, depth)
+                    if selected_field_source_found:
+                        return projection_may_be_hidden_handle if selected_field_source is Expr.Invalid
+                        selected_source_type: ValueType = expression_type(selected_field_source, local_scope, fns, structs, generics)
+                        return true if projection_may_be_hidden_handle and (selected_source_type.kind == TypeKind.Struct or selected_source_type.kind == TypeKind.PayloadEnum or selected_source_type.kind == TypeKind.Array)
+                        return backend_expression_projects_pool_lifetime_handle(selected_field_source, local_scope, fns, structs, generics, depth + 1.usize())
+                        return backend_expression_may_be_unresolved_pool_handle_source(selected_field_source, selected_source_type, local_scope, structs)
+                    projection_has_aggregate_storage: bool = projection_type.kind == TypeKind.Struct or projection_type.kind == TypeKind.PayloadEnum or projection_type.kind == TypeKind.PackedEnum or projection_type.kind == TypeKind.PackedStore or projection_type.kind == TypeKind.Array or projection_type.kind == TypeKind.Optional or projection_type.kind == TypeKind.ErrorUnion or projection_type.kind == TypeKind.DArray or projection_type.kind == TypeKind.View
+                    if projection_has_aggregate_storage and backend_type_may_contain_erased_pool_handle_slot(projection_type, structs):
+                        return true if backend_expression_projects_pool_lifetime_handle(field_object, local_scope, fns, structs, generics, depth + 1.usize())
+                    if field_object is Expr.Ident(local_aggregate_name, _) and lookup_index(local_scope, local_aggregate_name) >= 0:
+                        # Local aggregate stores and updates have already passed the pool
+                        # lifetime guards; reading a raw-width data field does not create a
+                        # handle or need to re-taint the whole record.
+                        return false
+                    return true if projection_may_be_hidden_handle and (field_object_type.kind == TypeKind.PayloadEnum or field_object_type.kind == TypeKind.Struct)
+                    return false
+                Expr.Paren(inner, _):
+                    return backend_expression_projects_pool_lifetime_handle(inner, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Move(inner, _):
+                    return backend_expression_projects_pool_lifetime_handle(inner, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.RegionNew(inner, _, _):
+                    return backend_expression_projects_pool_lifetime_handle(inner, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Unary(operator, operand, _):
+                    return false if operator == TokenKind.Not
+                    return backend_expression_projects_pool_lifetime_handle(operand, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Binary(left, operator, right, _):
+                    # Predicates cannot carry the raw handle value, even when one of their
+                    # operands is a handle projection.
+                    return false if operator == TokenKind.EqEq or operator == TokenKind.BangEq or operator == TokenKind.Lt or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.GtEq or operator == TokenKind.And or operator == TokenKind.Or or operator == TokenKind.In or operator == TokenKind.Is
+                    return backend_expression_projects_pool_lifetime_handle(left, local_scope, fns, structs, generics, depth + 1.usize()) or backend_expression_projects_pool_lifetime_handle(right, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Index(object, index_expression, _):
+                    if object is Expr.Field(cast_source, cast_method, _) and cast_method == "cast":
+                        return backend_expression_projects_pool_lifetime_handle(cast_source, local_scope, fns, structs, generics, depth + 1.usize())
+                    if object is Expr.Array(array_elements, _):
+                        folded_ok: mutable bool = true
+                        folded_position: i64 = fold_const_expr(index_expression, structs, folded_ok)
+                        if folded_ok and folded_position >= 0:
+                            has_spread: mutable bool = false
+                            for element in array_elements |has_spread|:
+                                if element is Expr.Unary(spread_operator, _, _) and spread_operator == TokenKind.Ellipsis:
+                                    has_spread <- true
+                            if not has_spread:
+                                return false if folded_position.usize() >= array_elements.count
+                                return backend_expression_projects_pool_lifetime_handle(array_elements[folded_position.usize()], local_scope, fns, structs, generics, depth + 1.usize())
+                    return backend_expression_projects_pool_lifetime_handle(object, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.IndexN(object, _, _):
+                    if object is Expr.Field(cast_source, cast_method, _) and cast_method == "cast":
+                        return backend_expression_projects_pool_lifetime_handle(cast_source, local_scope, fns, structs, generics, depth + 1.usize())
+                    return backend_expression_projects_pool_lifetime_handle(object, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Slice(object, _, _, _):
+                    return backend_expression_projects_pool_lifetime_handle(object, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Block(_, value, _, _):
+                    return backend_expression_projects_pool_lifetime_handle(value, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.If(_, then_value, else_value, _):
+                    return backend_expression_projects_pool_lifetime_handle(then_value, local_scope, fns, structs, generics, depth + 1.usize()) or backend_expression_projects_pool_lifetime_handle(else_value, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    for element in elements |local_scope, fns, structs, generics, depth|:
+                        return true if backend_expression_projects_pool_lifetime_handle(element, local_scope, fns, structs, generics, depth + 1.usize())
+                    return false
+                Expr.DictLit(entries, _):
+                    for entry in entries |local_scope, fns, structs, generics, depth|:
+                        return true if backend_expression_projects_pool_lifetime_handle(entry.key, local_scope, fns, structs, generics, depth + 1.usize()) or backend_expression_projects_pool_lifetime_handle(entry.value, local_scope, fns, structs, generics, depth + 1.usize())
+                    return false
+                Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                    for field in fields |local_scope, fns, structs, generics, depth|:
+                        return true if backend_expression_projects_pool_lifetime_handle(field.value, local_scope, fns, structs, generics, depth + 1.usize())
+                    match expression:
+                        Expr.RecordUpdate(base, _, _):
+                            return backend_expression_projects_pool_lifetime_handle(base, local_scope, fns, structs, generics, depth + 1.usize())
+                        _:
+                            return false
+                Expr.Refinement(base, _, _):
+                    return backend_expression_projects_pool_lifetime_handle(base, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.GetElse(guarded, _, _):
+                    return backend_expression_projects_pool_lifetime_handle(guarded, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.Match(_, arms, _) | Expr.Catch(_, arms, _):
+                    for arm in arms |local_scope, fns, structs, generics, depth|:
+                        continue if arm.body.count == 0.usize()
+                        arm_last: Stmt = arm.body[arm.body.count - 1.usize()]
+                        if arm_last is Stmt.Expr(arm_yield, _):
+                            return true if backend_expression_projects_pool_lifetime_handle(arm_yield, local_scope, fns, structs, generics, depth + 1.usize())
+                    if expression is Expr.Catch(catch_guarded, _, _):
+                        return backend_expression_projects_pool_lifetime_handle(catch_guarded, local_scope, fns, structs, generics, depth + 1.usize())
+                    return false
+                Expr.Comprehension(_, _, _, body, _):
+                    return backend_expression_projects_pool_lifetime_handle(body, local_scope, fns, structs, generics, depth + 1.usize())
+                Expr.StaticEffectCall(_, _, _, arguments, _, _):
+                    for argument in arguments |local_scope, fns, structs, generics, depth|:
+                        return true if backend_expression_projects_pool_lifetime_handle(argument, local_scope, fns, structs, generics, depth + 1.usize())
+                    return false
+                Expr.Call(callee, arguments, _, _):
+                    if backend_is_trusted_pool_await_call(callee, arguments, local_scope, fns, structs, generics):
+                        awaited_type: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                        return backend_type_is_raw_pool_handle_representation(awaited_type, structs)
+                    call_result_type: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                    call_result_may_hold_handle: bool = backend_type_may_contain_pool_lifetime_handle(call_result_type, structs) or backend_type_may_contain_erased_pool_handle_slot(call_result_type, structs)
+                    match callee:
+                        Expr.Lambda(_, _, _):
+                            # The lifted body has a fresh Scope and can return a captured
+                            # ThreadPool.handle without exposing that provenance to this call.
+                            # Until closure summaries are available, keep immediate closure
+                            # results inside the lifetime boundary.
+                            return call_result_may_hold_handle
+                        Expr.Ident(local_callee_name, _):
+                            if lookup_slot(local_scope, local_callee_name) is local_callee_slot and lookup_type(local_scope, local_callee_name).kind == TypeKind.Fn:
+                                return call_result_may_hold_handle
+                        _:
+                            pass
+                    # Scalar casts are representation-preserving for this provenance check:
+                    # they can turn a raw pointer/integer into another raw pointer/integer.
+                    match callee:
+                        Expr.Field(cast_receiver, cast_name, _):
+                            if cast_name == "cast" or scalar_type_of_name(cast_name, structs.target.target_pointer_bits).kind != TypeKind.Unmodeled:
+                                return backend_expression_projects_pool_lifetime_handle(cast_receiver, local_scope, fns, structs, generics, depth + 1.usize())
+                        Expr.Index(Expr.Field(cast_receiver, cast_name, _), _, _) | Expr.IndexN(Expr.Field(cast_receiver, cast_name, _), _, _):
+                            if cast_name == "cast":
+                                return backend_expression_projects_pool_lifetime_handle(cast_receiver, local_scope, fns, structs, generics, depth + 1.usize())
+                        Expr.Ident(cast_name, _) | Expr.Index(Expr.Ident(cast_name, _), _, _) | Expr.IndexN(Expr.Ident(cast_name, _), _, _):
+                            if cast_name == "cast" or scalar_type_of_name(cast_name, structs.target.target_pointer_bits).kind != TypeKind.Unmodeled:
+                                for argument in arguments |local_scope, fns, structs, generics, depth|:
+                                    return true if backend_expression_projects_pool_lifetime_handle(argument, local_scope, fns, structs, generics, depth + 1.usize())
+                        _:
+                            pass
+                    if call_result_may_hold_handle:
+                        match callee:
+                            Expr.Ident(_, _) | Expr.Scope(_, _, _) | Expr.Index(Expr.Ident(_, _), _, _) | Expr.IndexN(Expr.Ident(_, _), _, _):
+                                pass
+                            _:
+                                indirect_callee_type: ValueType = expression_type(callee, local_scope, fns, structs, generics)
+                                return true if indirect_callee_type.kind == TypeKind.Fn
+                    if call_result_may_hold_handle:
+                        for argument in arguments |local_scope, fns, structs, generics|:
+                            argument_type: ValueType = expression_type(argument, local_scope, fns, structs, generics)
+                            return true if backend_type_may_contain_pool_lifetime_handle(argument_type, structs)
+                            return true if backend_expression_projects_pool_lifetime_handle(argument, local_scope, fns, structs, generics, depth + 1.usize())
+                    return false
+                _:
+                    return false
+
+
+        def backend_expression_may_contain_pool_lifetime_handle(expression: Expr, value_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            # `wait all group` is parsed as a value block carrying this marker, then lowered
+            # to the bundled synchronous join below. Treat that exact direct-local join as
+            # consuming the group handle instead of letting the generic escape check reject
+            # it before statement lowering gets a chance to emit the wait.
+            if expression is Expr.Block(wait_statements, wait_value, _, wait_pos) and wait_statements.count == 0.usize() and fn_return_head_at_offset(wait_pos.offset, wait_pos.line, structs) == "__wait_all":
+                wait_arguments: darray[Expr] = [wait_value]
+                return false if backend_is_trusted_task_group_wait_call(Expr.Ident("task_group_wait_all", wait_pos), wait_arguments, local_scope, fns, structs, generics)
+            return true if backend_type_may_contain_pool_lifetime_handle(value_type, structs)
+            if expression is Expr.Block(_, _, _, await_pos) and fn_return_head_at_offset(await_pos.offset, await_pos.line, structs) == "__await" and backend_type_is_raw_pool_handle_representation(value_type, structs):
+                return true
+            if expression is Expr.Call(callee, arguments, _, _) and backend_type_is_raw_pool_handle_representation(value_type, structs):
+                return true if backend_is_trusted_pool_await_call(callee, arguments, local_scope, fns, structs, generics)
+            return backend_expression_projects_pool_lifetime_handle(expression, local_scope, fns, structs, generics, 0.usize())
+
+
+        # `pool_await` is the one public consumer that synchronously drains a Task before
+        # lexical pool cleanup. Permit only the top-level generic runtime template with its
+        # exact one-parameter Task -> result signature; a same-named module helper, another
+        # overload, an aggregate, or a different consumer remains an ordinary escape.
+        def backend_pool_await_source_is_owned_task(expression: Expr, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.Ident(name, _):
+                    return lookup_slot(local_scope, name) is local_task_slot
+                Expr.Move(inner, _) | Expr.Paren(inner, _):
+                    return backend_pool_await_source_is_owned_task(inner, local_scope, structs)
+                Expr.Block(statements, value, _, pos):
+                    false return if statements.count != 0.usize() or not submit_marker_at(pos.offset, structs)
+                    return value is Expr.Call(_, _, _, _)
+                _:
+                    return false
+
+
+        def backend_is_trusted_pool_await_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if arguments.count != 1.usize()
+            callee_name: mutable sview = ""
+            explicit_types: mutable darray[ValueType] = []
+            match callee:
+                Expr.Ident(name, _):
+                    callee_name <- name
+                Expr.Index(Expr.Ident(name, _), type_expression, _):
+                    callee_name <- name
+                    explicit_types.push(annotation_value_type(type_expression, structs))
+                Expr.IndexN(Expr.Ident(name, _), type_expressions, _):
+                    callee_name <- name
+                    for type_expression in type_expressions |explicit_types, structs|:
+                        explicit_types.push(annotation_value_type(type_expression, structs))
+                _:
+                    return false
+            return false if callee_name != "pool_await"
+            return false if lookup_slot(local_scope, "pool_await") is local_await_slot
+            trusted_slot: i64 = generic_index_of_owner(generics, "", "pool_await")
+            return false if trusted_slot < 0 or trusted_slot.usize() >= generics.param_count.count or trusted_slot.usize() >= generics.owners.count or trusted_slot.usize() >= generics.decls.count
+            return false if generics.owners[trusted_slot.usize()] != "" or generics.param_count[trusted_slot.usize()] != 1
+            return false if generic_index_of(generics, "pool_await") != trusted_slot
+            # A module/top-level monomorphic function of the same arity wins before generic
+            # lookup in the call emitter. Do not apply the generic consumer exception when
+            # that ordinary overload could be selected.
+            return false if function_index_of_arity(fns, "", "pool_await", 1.usize()) >= 0
+            return false if structs.visibility.current_owner != "" and function_index_of_arity(fns, structs.visibility.current_owner, "pool_await", 1.usize()) >= 0
+            top_level_template_count: mutable usize = 0
+            template_scan: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, "pool_await")
+            while template_scan >= 0 |template_scan, generics, top_level_template_count|:
+                top_level_template_count <- top_level_template_count + 1.usize() if template_scan.usize() < generics.owners.count and generics.owners[template_scan.usize()] == ""
+                template_scan <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, "pool_await", template_scan)
+            return false if top_level_template_count != 1.usize()
+            trusted_runtime_line: mutable bool = false
+            match generics.decls[trusted_slot.usize()]:
+                Decl.Func(function_name, params, _, _, _, _, function_pos):
+                    return false if function_name != "pool_await" or params.count != 1.usize()
+                    for trusted_line in structs.annotations.pool_await_runtime_lines |trusted_runtime_line, function_pos|:
+                        trusted_runtime_line <- true if trusted_line == function_pos.line
+                _:
+                    return false
+            return false if not trusted_runtime_line
+            return false if not backend_pool_await_source_is_owned_task(arguments[0], local_scope, structs)
+            inferred_types: darray[ValueType] = infer_generic_args(trusted_slot.usize(), arguments, local_scope, fns, structs, generics)
+            return false if inferred_types.count != 1.usize()
+            return false if explicit_types.count != 0.usize() and (explicit_types.count != inferred_types.count or not value_type_identity_equal(explicit_types[0], inferred_types[0]))
+            actual_task_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            return false if backend_expression_projects_pool_lifetime_handle(arguments[0], local_scope, fns, structs, generics, 0.usize())
+            expected_task_type: ValueType = instantiation_param_type_at(trusted_slot.usize(), inferred_types, 0.usize(), generics, structs)
+            return false if actual_task_type.kind != TypeKind.Struct or not value_type_identity_equal(actual_task_type, expected_task_type)
+            task_base: mutable sview = ""
+            task_arg_start: mutable usize = 0
+            task_arg_count: mutable usize = 0
+            return false if not generic_struct_instantiation_of(structs, actual_task_type, task_base, task_arg_start, task_arg_count) or task_base != "Task" or task_arg_count != 2.usize()
+            return false if actual_task_type.bits.usize() >= structs.records.names.count or actual_task_type.bits.usize() >= structs.records.owners.count or structs.records.names[actual_task_type.bits.usize()] != "Task" or structs.records.owners[actual_task_type.bits.usize()] != ""
+            return false if task_arg_start > structs.generics.generic_struct_inst_args.count or task_arg_count > structs.generics.generic_struct_inst_args.count - task_arg_start
+            result_type: ValueType = generic_return_type_at(trusted_slot.usize(), inferred_types, generics, structs)
+            return value_type_identity_equal(result_type, structs.generics.generic_struct_inst_args[task_arg_start])
+
+
+        # Explicit task_group_add consumes the Task and roots its completion state until the
+        # matching wait. Trust only the unique bundled generic API, a direct local TaskGroup
+        # reference, and a moved builtin Task argument.
+        def backend_is_trusted_task_group_add_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if arguments.count != 2.usize()
+            return false if not submit_group_api_callee_matches(callee, "task_group_add", local_scope, fns, structs, generics)
+            return false if local_scope.group_names.count == 0.usize() or local_scope.group_slots.count != local_scope.group_names.count
+            active_group_index: usize = local_scope.group_names.count - 1.usize()
+            return false if local_scope.group_manual_add.count != local_scope.group_names.count or not local_scope.group_manual_add[active_group_index]
+            active_group_name: sview = local_scope.group_names[active_group_index]
+            active_group_slot: LLVMValueRef = local_scope.group_slots[active_group_index]
+            return false if submit_group_argument_name(arguments[0]) != active_group_name or not (lookup_slot(local_scope, active_group_name) is active_group_slot)
+            return false if not submit_group_runtime_apis_are_unique(fns, generics, structs)
+            generic_slot: i64 = submit_group_unique_generic_index("task_group_add", generics)
+            return false if generic_slot < 0 or generic_slot.usize() >= generics.decls.count
+            inferred_types: darray[ValueType] = infer_generic_args(generic_slot.usize(), arguments, local_scope, fns, structs, generics)
+            return false if inferred_types.count != 1.usize()
+            group_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            expected_group_type: ValueType = instantiation_param_type_at(generic_slot.usize(), inferred_types, 0.usize(), generics, structs)
+            return false if expected_group_type.kind != TypeKind.Ref or group_type.kind != TypeKind.Ref or not value_type_identity_equal(group_type, expected_group_type)
+            group_value_type: ValueType = ref_target_of(expected_group_type, structs)
+            return false if group_value_type.kind != TypeKind.Struct or group_value_type.bits.usize() >= structs.records.names.count or group_value_type.bits.usize() >= structs.records.owners.count or structs.records.names[group_value_type.bits.usize()] != "TaskGroup" or structs.records.owners[group_value_type.bits.usize()] != ""
+            task_type: ValueType = expression_type(arguments[1], local_scope, fns, structs, generics)
+            expected_task_type: ValueType = instantiation_param_type_at(generic_slot.usize(), inferred_types, 1.usize(), generics, structs)
+            return false if not value_type_identity_equal(task_type, expected_task_type)
+            return false if backend_expression_projects_pool_lifetime_handle(arguments[1], local_scope, fns, structs, generics, 0.usize())
+            match arguments[1]:
+                Expr.Move(Expr.Ident(_, _), _):
+                    return true
+                _:
+                    return false
+
+
+        # A TaskGroup wait is a synchronous join, so it consumes the lifetime handle without
+        # letting it escape. Trust only the unique marked runtime API and a direct local group
+        # argument with the exact mutable TaskGroup reference type. Requiring a local identifier
+        # rules out calls that manufacture a handle through an untrusted expression.
+        def backend_is_trusted_task_group_wait_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if arguments.count != 1.usize()
+            return false if not submit_group_api_callee_matches(callee, "task_group_wait_all", local_scope, fns, structs, generics)
+            return false if not submit_group_runtime_apis_are_unique(fns, generics, structs)
+            group_name: sview = submit_group_argument_name(arguments[0])
+            return false if group_name == ""
+            if lookup_slot(local_scope, group_name) is direct_group_slot:
+                _ = direct_group_slot
+            else:
+                return false
+            wait_index: i64 = submit_group_unique_function_index("task_group_wait_all", 1.usize(), fns, generics)
+            return false if wait_index < 0 or wait_index.usize() >= fns.param_start.count or wait_index.usize() >= fns.param_count.count
+            wait_row: usize = wait_index.usize()
+            return false if fns.param_count[wait_row] != 1.usize()
+            parameter_index: usize = fns.param_start[wait_row]
+            return false if parameter_index >= fns.param_types.count
+            expected_group_type: ValueType = fns.param_types[parameter_index]
+            actual_group_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            return false if expected_group_type.kind != TypeKind.Ref or not value_type_identity_equal(actual_group_type, expected_group_type)
+            group_value_type: ValueType = ref_target_of(expected_group_type, structs)
+            return false if group_value_type.kind != TypeKind.Struct or group_value_type.bits.usize() >= structs.records.names.count or group_value_type.bits.usize() >= structs.records.owners.count
+            return false if structs.records.names[group_value_type.bits.usize()] != "TaskGroup" or structs.records.owners[group_value_type.bits.usize()] != ""
+            return true
+
+
 
         # Infer a generic function's full type-argument tuple from its call arguments, by
         # unifying each parameter annotation against the argument's concrete type. Returns the
@@ -411,8 +1296,8 @@ extend Backend:
                         #     needs, where `fn` is its own PARAMETER, not a named function;
                         #   - a bare function NAME has no expression type of its own, so its
                         #     declaration in the FnTable is the only source.
-                        # The annotation's own parameter type expressions are line-keyed exactly as
-                        # annotation_lambda_value_type reads them.
+                        # The annotation's own parameter type expressions are keyed by the fn
+                        # token offset, so same-line callback signatures remain distinct.
                         lambda_handled: mutable bool = false
                         match params[position].type_expression:
                             Expr.Lambda(lam_names, lam_body, lam_line):
@@ -439,12 +1324,12 @@ extend Backend:
                                     lam_probe: mutable usize = 0
                                     lam_index: mutable usize = 0
                                     while lam_probe < structs.function_types.fn_type_param_lines.count |lam_probe, lam_index, lam_line, lam_param_types, bindings, bound_flags, generics, slot, structs|:
-                                        if structs.function_types.fn_type_param_lines[lam_probe] == lam_line.line:
+                                        if structs.function_types.fn_type_param_lines[lam_probe] == lam_line.line and structs.function_types.fn_type_param_offsets[lam_probe] == lam_line.offset:
                                             if lam_index < lam_param_types.count and lam_param_types[lam_index].kind != TypeKind.Unmodeled:
                                                 unify_annotation(structs.function_types.fn_type_param_exprs[lam_probe], lam_param_types[lam_index], generics, slot, structs, bindings, bound_flags)
                                             lam_index <- lam_index + 1
                                         lam_probe <- lam_probe + 1
-                                    lam_return_position: i64 = type_param_position(generics, slot, fn_return_head_at(lam_line.line, structs))
+                                    lam_return_position: i64 = type_param_position(generics, slot, fn_return_head_at_offset(lam_line.offset, lam_line.line, structs))
                                     if lam_return_position >= 0 and not bound_flags[lam_return_position.usize()] and lam_return_type.kind != TypeKind.Unmodeled:
                                         bindings[lam_return_position.usize()] <- copied_type(lam_return_type)
                                         bound_flags[lam_return_position.usize()] <- true
@@ -535,7 +1420,7 @@ extend Backend:
                 return actual_family if actual_family != ""
             match expression:
                 Expr.Lambda(lambda_params, lambda_body, lambda_line):
-                    lambda_family: sview = fn_error_family_at(lambda_line.line, structs)
+                    lambda_family: sview = fn_error_family_at_offset(lambda_line.offset, lambda_line.line, structs)
                     return lambda_family if lambda_family != ""
                 Expr.Ident(callable_name, callable_line):
                     callable_index: i64 = function_index_of(fns, "", callable_name)

@@ -17,12 +17,26 @@ extend Backend:
         # compiler's own AST has ~75; test hierarchies a handful.
         const PACKED_AST_SIZED_MIN_VARIANTS: usize = 48
 
-        def packed_ast_variant_total(structs: StructTable&) -> usize can[Abort.Panic]:
+        def packed_ast_hierarchy_is_large(structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            names_count: usize = structs.packed_enums.packed_names.count
+            variant_epoch: u64 = structs.packed_layouts.packed_variant_count_epoch
+            refinement_epoch: u64 = structs.packed_layouts.ast_refinement_epoch
+            if structs.packed_layouts.packed_ast_sized_hierarchy_valid and structs.packed_layouts.packed_ast_sized_hierarchy_names_count == names_count and structs.packed_layouts.packed_ast_sized_hierarchy_variant_epoch == variant_epoch and structs.packed_layouts.packed_ast_sized_hierarchy_refinement_epoch == refinement_epoch:
+                return structs.packed_layouts.packed_ast_sized_hierarchy_result
             total: mutable usize = 0
-            for enum_slot in 0..<structs.packed_enums.packed_names.count |total, structs|:
+            large: mutable bool = false
+            for enum_slot in 0..<names_count |total, structs, large|:
                 continue if not packed_is_ast_refinement(structs, enum_slot.i64())
                 total <- total + structs.packed_enums.packed_variant_count[enum_slot]
-            total
+                if total >= PACKED_AST_SIZED_MIN_VARIANTS:
+                    large <- true
+                    break
+            structs.packed_layouts.packed_ast_sized_hierarchy_names_count <- names_count
+            structs.packed_layouts.packed_ast_sized_hierarchy_variant_epoch <- variant_epoch
+            structs.packed_layouts.packed_ast_sized_hierarchy_refinement_epoch <- refinement_epoch
+            structs.packed_layouts.packed_ast_sized_hierarchy_result <- large
+            structs.packed_layouts.packed_ast_sized_hierarchy_valid <- true
+            return large
 
         # Whether ENUM_INDEX lives in a sized AST store (packed mode 2 only; callers check).
         def packed_ast_sized_records(structs: mutable StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
@@ -30,7 +44,7 @@ extend Backend:
             resolved_root: i64 = packed_root_index_of(structs, enum_index)
             false return if not packed_is_ast_root_row(structs, resolved_root)
             false return if not (packed_program_has_ast_refinements(structs) or (resolved_root >= 0 and packed_owner_at(structs, resolved_root.usize()) == "Ast"))
-            packed_ast_variant_total(structs) >= PACKED_AST_SIZED_MIN_VARIANTS
+            packed_ast_hierarchy_is_large(structs)
 
         # Whether any store in this program is sized (selects the inlined lookup body).
         def packed_program_sized_records(structs: mutable StructTable&) -> bool can[Abort.Panic]:
@@ -48,6 +62,67 @@ extend Backend:
         def packed_store_runtime_row_bytes(structs: mutable StructTable&, enum_index: i64, packed_mode: i64) -> i64 can[Abort.Panic]:
             0 return if packed_mode == 2 and packed_ast_sized_records(structs, enum_index)
             packed_row_bytes(structs, enum_index)
+
+        # The direct lookup emits i64 shifts, offsets, and a pointer load. Keep malformed
+        # or future callsites on the declared runtime reader instead of constructing invalid
+        # LLVM when their operands do not match that ABI.
+        def packed_ast_sized_read_operands_supported(state: LLVMValueRef, index: LLVMValueRef) -> bool:
+            return false if LLVMGetTypeKind(LLVMTypeOf(state)) != 12
+            index_type: LLVMTypeRef = LLVMTypeOf(index)
+            return false if LLVMGetTypeKind(index_type) != 8
+            return LLVMGetIntTypeWidth(index_type) == 64
+
+        # Resolve AoS handles directly at their read sites when the store layout is known.
+        # Sized AST stores use the address table; optimized fixed-row stores use their
+        # stored stride. Keeping fixed rows direct in a module that also has sized
+        # records avoids the generic reader's per-call record_bytes branch.
+        def packed_ast_sized_record_read(structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, state: LLVMValueRef, index: LLVMValueRef, reader_type: LLVMTypeRef, reader: LLVMValueRef, fallback_args: void&, fallback_count: u32, call_name: cstr) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sized_store: bool = runtime.packed_mode == 2 and packed_ast_sized_records(structs, runtime.active_store_enum)
+            # Compiler-generated stores use record_bytes == 0 only for a sized AST root
+            # (packed_store_runtime_row_bytes). A known active non-AST store is fixed, so
+            # this specialization can omit the runtime zero-stride dispatch. Store values
+            # supplied through FFI must follow the same layout ABI.
+            direct_fixed_store: bool = runtime.packed_mode == 2 and runtime.active_store_is_block and runtime.active_store_enum >= 0 and not sized_store and structs.target.prefer_private_linkage
+            if (sized_store or direct_fixed_store) and inline_aos_store_layout_supported(m) and packed_ast_sized_read_operands_supported(state, index):
+                i8_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+                i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                in_range: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "packed.ast.record.in.range")
+                out_of_range: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "packed.ast.record.out.of.range")
+                chunk_index: LLVMValueRef = LLVMBuildLShr(builder, index, LLVMConstInt(i64_type, 8, 0), "packed.ast.chunk.index")
+                count_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 8, 0)]
+                count_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i8_type, state, (&count_offset[0]).cast[void&], 1, "packed.ast.chunks.count.ptr")
+                chunk_count: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, count_pointer, "packed.ast.chunks.count")
+                outside: LLVMValueRef = LLVMBuildICmp(builder, 35, chunk_index, chunk_count, "packed.ast.chunk.outside")
+                _ = LLVMBuildCondBr(builder, outside, out_of_range, in_range)
+                LLVMPositionBuilderAtEnd(builder, out_of_range)
+                trap_name: sview = "llvm.trap"
+                trap_storage: mutable darray[u8] = []
+                trap_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(trap_name, trap_storage), sview_len(trap_name))
+                trap_fn: LLVMValueRef = LLVMGetIntrinsicDeclaration(m, trap_id, null, 0)
+                trap_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+                _ = LLVMBuildCall2(builder, trap_type, trap_fn, null, 0, "")
+                _ = LLVMBuildUnreachable(builder)
+                LLVMPositionBuilderAtEnd(builder, in_range)
+                data: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, state, "packed.ast.chunks.data")
+                chunk_slot: mutable darray[LLVMValueRef] = [chunk_index]
+                chunk_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i64_type, data, (&chunk_slot[0]).cast[void&], 1, "packed.ast.chunk.ptr")
+                chunk_base: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, chunk_pointer, "packed.ast.chunk.base")
+                in_chunk: LLVMValueRef = LLVMBuildAnd(builder, index, LLVMConstInt(i64_type, 255, 0), "packed.ast.in.chunk")
+                if sized_store:
+                    slot_offset: LLVMValueRef = LLVMBuildMul(builder, in_chunk, LLVMConstInt(i64_type, 8, 0), "packed.ast.slot.offset")
+                    slot_address: LLVMValueRef = LLVMBuildAdd(builder, chunk_base, slot_offset, "packed.ast.slot.address")
+                    slot_pointer: LLVMValueRef = LLVMBuildIntToPtr(builder, slot_address, pointer_type, "packed.ast.slot")
+                    slot_value: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, slot_pointer, "packed.ast.slot.value")
+                    return LLVMBuildIntToPtr(builder, slot_value, pointer_type, "packed.ast.record")
+                record_bytes_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 32, 0)]
+                record_bytes_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i8_type, state, (&record_bytes_offset[0]).cast[void&], 1, "packed.aos.fixed.record.bytes.ptr")
+                record_bytes: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, record_bytes_pointer, "packed.aos.fixed.record.bytes")
+                fixed_offset: LLVMValueRef = LLVMBuildMul(builder, in_chunk, record_bytes, "packed.aos.fixed.offset")
+                fixed_address: LLVMValueRef = LLVMBuildAdd(builder, chunk_base, fixed_offset, "packed.aos.fixed.record.address")
+                return LLVMBuildIntToPtr(builder, fixed_address, pointer_type, "packed.aos.fixed.record")
+            LLVMBuildCall2(builder, reader_type, reader, fallback_args, fallback_count, call_name)
 
         # `ctx_aos_store_alloc_sized(arena, state, bytes) -> {ptr, u32}`, declared on first use.
         def packed_sized_alloc_fn(m: LLVMModuleRef, alloc_type: LLVMTypeRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:

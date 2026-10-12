@@ -23,13 +23,16 @@ extend Backend:
         #
         # Falls back to the runtime entry point when `memcmp` names something that is not
         # an external declaration (a program's own internal function of that name).
-        def sview_equality_callee(runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef, target_bits: u32) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def sview_equality_callee(runtime: Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef, target_bits: u32, wasm_component: bool) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # The freestanding component runtime owns this implementation. Calling it
             # directly avoids manufacturing an unresolved libc `memcmp` import in the
             # guest module; native builds retain the in-module optimized helper below.
-            return runtime.sview_eq if wasm_component_codegen_enabled()
+            return runtime.sview_eq if wasm_component
+            if structs.interned_types.sview_eq_callee is cached:
+                return cached
             m: LLVMModuleRef = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)))
             if LLVMGetNamedFunction(m, "__elisa_sview_eq") is existing_helper:
+                structs.interned_types.sview_eq_callee <- existing_helper
                 return existing_helper
             pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
             size_type: LLVMTypeRef = runtime_size_llvm_type(ctx, target_bits)
@@ -40,7 +43,9 @@ extend Backend:
             if LLVMGetNamedFunction(m, "memcmp") is existing_memcmp:
                 # 0 = ExternalLinkage: only a declaration (or a public definition, which the
                 # linker would bind every libc memcmp call to anyway) is the C function.
-                runtime.sview_eq return if LLVMGetLinkage(existing_memcmp) != 0
+                if LLVMGetLinkage(existing_memcmp) != 0:
+                    structs.interned_types.sview_eq_callee <- runtime.sview_eq
+                    return runtime.sview_eq
                 memcmp_fn <- existing_memcmp
             else:
                 memcmp_fn <- LLVMAddFunction(m, "memcmp", memcmp_type)
@@ -93,6 +98,7 @@ extend Backend:
             LLVMPositionBuilderAtEnd(helper_builder, unequal_block)
             _ = LLVMBuildRet(helper_builder, unequal_value)
             LLVMDisposeBuilder(helper_builder)
+            structs.interned_types.sview_eq_callee <- helper
             return helper
 
         # Operands are already evaluated. Unequal lengths need no runtime call.
@@ -124,7 +130,7 @@ extend Backend:
             LLVMPositionBuilderAtEnd(builder, compare_block)
             arguments: mutable darray[LLVMValueRef] = [left_value, right_value]
             arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
-            code: LLVMValueRef = LLVMBuildIntCast2(builder, LLVMBuildCall2(builder, runtime.sview_eq_type, sview_equality_callee(runtime, ctx, builder, structs.target.target_pointer_bits), arguments_pointer, SVIEW_EQUALITY_ARGUMENT_COUNT, "sview.eq"), LLVMInt64TypeInContext(ctx), 1, "string.eq.code")
+            code: LLVMValueRef = LLVMBuildIntCast2(builder, LLVMBuildCall2(builder, runtime.sview_eq_type, sview_equality_callee(runtime, structs, ctx, builder, structs.target.target_pointer_bits, structs.target.wasm_component_types_enabled), arguments_pointer, SVIEW_EQUALITY_ARGUMENT_COUNT, "sview.eq"), LLVMInt64TypeInContext(ctx), 1, "string.eq.code")
             _ = LLVMBuildStore(builder, code, result_slot)
             _ = LLVMBuildBr(builder, done_block)
             LLVMPositionBuilderAtEnd(builder, done_block)
@@ -191,9 +197,16 @@ extend Backend:
                         return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
                     # The OPERANDS' type is not the result type: `a < b` yields bool but must
                     # compare at a's type. Take whichever side is known; a literal defers.
-                    operand_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                    # Several paths need these raw types again after selecting the operation
+                    # type. Cache each per node and defer the right-side walk until needed.
+                    binary_left_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                    binary_right_type: mutable ValueType = unmodeled_type()
+                    binary_right_type_ready: mutable bool = false
+                    operand_type: mutable ValueType = copied_type(binary_left_type)
                     if operand_type.kind == TypeKind.Unmodeled:
-                        operand_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                        binary_right_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                        binary_right_type_ready <- true
+                        operand_type <- copied_type(binary_right_type)
                     if operand_type.kind == TypeKind.Unmodeled:
                         # Both sides are literals (`2 + 3`): fall back to the context, which
                         # for a comparison is bool — so use i64 there.
@@ -269,8 +282,11 @@ extend Backend:
                     # counterpart of the identity comparison below and applies equally to a
                     # plain reference and an optional reference after its payload is extracted.
                     if binary_operator == TokenKind.Lt or binary_operator == TokenKind.LtEq or binary_operator == TokenKind.Gt or binary_operator == TokenKind.GtEq:
-                        ref_order_left_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
-                        ref_order_right_type: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
+                        ref_order_left_type: ValueType = copied_type(binary_left_type)
+                        if not binary_right_type_ready:
+                            binary_right_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                            binary_right_type_ready <- true
+                        ref_order_right_type: ValueType = copied_type(binary_right_type)
                         if ref_eq_is_pointer_like(ref_order_left_type, structs) and ref_eq_is_pointer_like(ref_order_right_type, structs):
                             if (ref_eq_pointer_value(binary_left, ref_order_left_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is ref_order_left_pointer:
                                 if (ref_eq_pointer_value(binary_right, ref_order_right_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is ref_order_right_pointer:
@@ -289,8 +305,11 @@ extend Backend:
                     # Placed BEFORE the deref, and scoped to Ref on BOTH sides: `cstr == cstr` is
                     # a CONTENT compare (see below), and `null` comparisons are handled earlier.
                     if binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq:
-                        ref_eq_left_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
-                        ref_eq_right_type: mutable ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
+                        ref_eq_left_type: mutable ValueType = copied_type(binary_left_type)
+                        if not binary_right_type_ready:
+                            binary_right_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                            binary_right_type_ready <- true
+                        ref_eq_right_type: mutable ValueType = copied_type(binary_right_type)
                         # An opaque HANDLE against `zeroed`/`null`. The literal is untyped — the
                         # same shape as the Fn/null case just below — so this arrived as
                         # (CStr bits 1, Unmodeled), failed the BOTH-sides pointer-like test under
@@ -406,8 +425,11 @@ extend Backend:
                     # `sview == sview` / `!=`: reject unequal lengths locally,
                     # otherwise use runtime equality, then reduce `code <op> 0`.
                     if operand_type.kind == TypeKind.SView and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq):
-                        sveq_left_source_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
-                        sveq_right_source_type: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
+                        sveq_left_source_type: ValueType = copied_type(binary_left_type)
+                        if not binary_right_type_ready:
+                            binary_right_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                            binary_right_type_ready <- true
+                        sveq_right_source_type: ValueType = copied_type(binary_right_type)
                         if (emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is sveq_left:
                             if (emit_expression(binary_right, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is sveq_right:
                                 if emit_sview_equality_code(sveq_left, sveq_right, sveq_left_source_type, sveq_right_source_type, structs, runtime, m, ctx, builder) is sveq_code:
@@ -433,8 +455,11 @@ extend Backend:
                     # its target, so compare the TARGET's width/kind, not the pointer (`total +
                     # a` where `a: i64&` from a dict `.get` binding must not read as a
                     # mixed-width Ref-vs-i64 mismatch).
-                    left_own_raw: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
-                    right_own_raw: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
+                    left_own_raw: ValueType = copied_type(binary_left_type)
+                    if not binary_right_type_ready:
+                        binary_right_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                        binary_right_type_ready <- true
+                    right_own_raw: ValueType = copied_type(binary_right_type)
                     left_own: ValueType = ref_target_of(left_own_raw, structs) if left_own_raw.kind == TypeKind.Ref else left_own_raw
                     right_own: ValueType = ref_target_of(right_own_raw, structs) if right_own_raw.kind == TypeKind.Ref else right_own_raw
                     # Mixed-width FLOAT operands (`f32 + f64`) follow the OPPOSITE rule from

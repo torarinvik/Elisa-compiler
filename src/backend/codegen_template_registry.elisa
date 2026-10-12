@@ -5,13 +5,40 @@
 extend Backend:
     private:
         const GENERIC_BOUND_ROW_START: u32 = 2147483648
+        const GENERIC_DECLARATION_LINE_CHAIN_THRESHOLD: usize = 32
+        const GENERIC_DECLARATION_LINE_BUCKET_COUNT: usize = 256
+        const GENERIC_DECLARATION_LINE_NOT_FOUND: i64 = -1
 
-        def generic_declaration_lines(file: Ast::File&) -> darray[u32] can[Abort.Panic, Memory.Allocate]:
-            lines: mutable darray[u32] = []
+        # The body-selection passes probe this set once per source declaration. Keep a
+        # linear path for the small tables common in ordinary modules, then use a compact
+        # collision-safe bucket chain once enough rows exist to amortize its setup.
+        struct GenericDeclarationLines:
+            keys: mutable darray[u32] = []
+            buckets: mutable darray[i64] = []
+            next: mutable darray[i64] = []
+
+        def generic_declaration_line_bucket(line: u32) -> usize:
+            return (line.u64() * 2654435761 % GENERIC_DECLARATION_LINE_BUCKET_COUNT.u64()).usize()
+
+        # Membership is the only query this index serves, so prepend rows to each chain;
+        # preserving the input order is unnecessary while exact equality remains decisive.
+        def generic_declaration_lines_index(lines: mutable GenericDeclarationLines&) -> void can[Abort.Panic, Memory.Allocate]:
+            lines.buckets.truncate(0)
+            lines.next.truncate(0)
+            for _ in 0..<GENERIC_DECLARATION_LINE_BUCKET_COUNT |lines|:
+                lines.buckets.push(GENERIC_DECLARATION_LINE_NOT_FOUND)
+            for row in 0..<lines.keys.count |lines|:
+                bucket: usize = generic_declaration_line_bucket(lines.keys[row])
+                lines.next.push(lines.buckets[bucket])
+                lines.buckets[bucket] <- row.i64()
+
+        def generic_declaration_lines(file: Ast::File&) -> GenericDeclarationLines can[Abort.Panic, Memory.Allocate]:
+            lines: mutable GenericDeclarationLines = GenericDeclarationLines{keys: [], buckets: [], next: []}
             for line in file.generic_param_lines |lines|:
-                lines.push(line) if line < GENERIC_BOUND_ROW_START
+                lines.keys.push(line) if line < GENERIC_BOUND_ROW_START
             for annotation in file.enum_annotations |lines|:
-                lines.push(annotation.line) if annotation.owner == "__errorset_param"
+                lines.keys.push(annotation.line) if annotation.owner == "__errorset_param"
+            generic_declaration_lines_index(lines) if lines.keys.count >= GENERIC_DECLARATION_LINE_CHAIN_THRESHOLD
             return lines
 
         # The rows of the annotation table with this `owner`, in table order. For the
@@ -22,8 +49,14 @@ extend Backend:
                 rows.push(annotation) if annotation.owner == owner
             return rows
 
-        def generic_declaration_line_present(lines: darray[u32]&, line: u32) -> bool can[Abort.Panic]:
-            return any present in lines where present == line
+        def generic_declaration_line_present(lines: GenericDeclarationLines&, line: u32) -> bool can[Abort.Panic]:
+            if lines.buckets.count != GENERIC_DECLARATION_LINE_BUCKET_COUNT or lines.next.count != lines.keys.count:
+                return any present in lines.keys where present == line
+            row: mutable i64 = lines.buckets[generic_declaration_line_bucket(line)]
+            while row >= 0 |row, lines, line|:
+                return true if lines.keys[row.usize()] == line
+                row <- lines.next[row.usize()]
+            return false
 
 
         # `[N: usize]` is represented by an ordinary parameter row immediately followed
@@ -52,6 +85,7 @@ extend Backend:
         # emitted as ordinary file-scope declarations, so remove nested source templates while
         # preserving the surrounding declaration tree for the normal module emitter.
         def declaration_without_effect_templates(annotations: darray[Ast::EnumAnnotation]&, declaration: Decl) -> Decl can[Abort.Panic, Memory.Allocate]:
+            return declaration if annotations.count == 0
             match declaration:
                 Decl.Module(module_name, module_body, module_pos):
                     filtered_module: mutable darray[Decl] = []
@@ -203,11 +237,14 @@ extend Backend:
             # Index of a registered generic struct TEMPLATE by base name (-1 = none).
         def generic_struct_index_of_owned(structs: StructTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
             found: mutable i64 = -1
-            for index in 0..<structs.generics.generic_struct_names.count |structs, owner, name, found|:
-                continue if index >= structs.generics.generic_struct_owners.count
-                if structs.generics.generic_struct_names[index] == name and structs.generics.generic_struct_owners[index] == owner:
+            index: mutable i64 = name_chain_first(structs.generics.generic_struct_name_buckets, structs.generics.generic_struct_name_next, structs.generics.generic_struct_names, name)
+            while index >= 0 |structs, owner, name, found, index|:
+                current: i64 = index
+                index <- name_chain_next(structs.generics.generic_struct_name_buckets, structs.generics.generic_struct_name_next, structs.generics.generic_struct_names, name, current)
+                continue if current >= structs.generics.generic_struct_owners.count
+                if structs.generics.generic_struct_names[current.usize()] == name and structs.generics.generic_struct_owners[current.usize()] == owner:
                     return -2 if found >= 0
-                    found <- index.i64()
+                    found <- current
             return found
 
         def generic_struct_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
@@ -229,10 +266,13 @@ extend Backend:
                 prefix_length <- 0 if not found_parent
             # Preserve the legacy imported-template path only when it is unambiguous.
             unique: mutable i64 = -1
-            for index in 0..<structs.generics.generic_struct_names.count |structs, name, unique|:
-                if structs.generics.generic_struct_names[index] == name:
+            index: mutable i64 = name_chain_first(structs.generics.generic_struct_name_buckets, structs.generics.generic_struct_name_next, structs.generics.generic_struct_names, name)
+            while index >= 0 |structs, name, unique, index|:
+                current: i64 = index
+                index <- name_chain_next(structs.generics.generic_struct_name_buckets, structs.generics.generic_struct_name_next, structs.generics.generic_struct_names, name, current)
+                if structs.generics.generic_struct_names[current.usize()] == name:
                     return -2 if unique >= 0
-                    unique <- index.i64()
+                    unique <- current
             return unique
 
         def generic_instance_template_id(instance: usize, structs: StructTable&) -> u32 can[Abort.Panic]:
@@ -256,7 +296,12 @@ extend Backend:
                 param_count: usize = structs.generics.generic_struct_param_names.count - start
                 continue if param_count == 0
                 structs.generics.generic_struct_names <- structs.generics.generic_struct_names.push(struct_name)
-                structs.generics.generic_struct_owners <- structs.generics.generic_struct_owners.push(generic_template_owner_at(file, generic_index))
+                name_chain_extend(structs.generics.generic_struct_name_buckets, structs.generics.generic_struct_name_tails, structs.generics.generic_struct_name_next, structs.generics.generic_struct_names)
+                template_owner: sview = generic_template_owner_at(file, generic_index)
+                structs.generics.generic_struct_owners <- structs.generics.generic_struct_owners.push(template_owner)
                 structs.generics.generic_struct_decls <- structs.generics.generic_struct_decls.push(file.generic_struct_decls[generic_index])
                 structs.generics.generic_struct_param_start <- structs.generics.generic_struct_param_start.push(start)
                 structs.generics.generic_struct_param_count <- structs.generics.generic_struct_param_count.push(param_count)
+                if file.generic_struct_decls[generic_index] is Decl.Struct(_, template_members, _, _, _, _, _):
+                    for member in template_members |structs, template_owner, struct_name|:
+                        record_field_default(template_owner, struct_name, member.name, member.has_default, member.default_value, structs)

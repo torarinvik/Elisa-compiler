@@ -12,11 +12,12 @@ extend Backend:
             # Writing `false return if ... is node` inverts it and rejects every real node --
             # which is exactly the bug that made this verifier silently never warn.
             false return if not (LLVMIsAMDNode(property) is md_node)
-            false return if LLVMGetMDNodeNumOperands(property) == 0
+            operand_count: usize = LLVMGetMDNodeNumOperands(property).usize()
+            false return if operand_count == 0
             # LLVM overwrites every output slot. Seed with a valid handle nevertheless:
             # zero is not a valid LLVMValueRef and would leave an invalid representation if
             # the foreign call ever returned fewer operands than its reported count.
-            operands: mutable darray[LLVMValueRef] = [property for _ in 0..<LLVMGetMDNodeNumOperands(property).usize()]
+            operands: mutable darray[LLVMValueRef] = [property for _ in 0..<operand_count]
             LLVMGetMDNodeOperands(property, (&operands[0]).cast[void&] can Unsafe.PointerCast)
             length: mutable u32 = 0
             if LLVMGetMDString(operands[0], (&length).cast[void&] can Unsafe.PointerCast) is text_pointer:
@@ -238,14 +239,34 @@ extend Backend:
             false return if LLVMGetDataLayoutStr(m).len == 0
             layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(m)
             false return if layout == null
-            return LLVMPointerSize(layout) == 8
+            false return if LLVMPointerSize(layout) != 8
+            ctx: LLVMContextRef = LLVMGetModuleContext(m)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            word_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            # PackedAoSStore stores its first darray as {pointer, usize}; the sized
+            # lookup uses 8-byte field and slot offsets. A 64-bit pointer width alone
+            # does not guarantee those ABI alignments on a custom target layout.
+            false return if LLVMABIAlignmentOfType(layout, pointer_type) != 8
+            return LLVMABIAlignmentOfType(layout, word_type) == 8
 
         def inline_aos_store_record(m: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return if not inline_aos_store_layout_supported(m)
             if LLVMGetNamedFunction(m, "ctx_aos_store_record") is record_fn:
-                inline_aos_store_record_body(m, record_fn)
+                inline_aos_store_record_body(m, record_fn) if aos_store_inline_helper_is_marked(record_fn)
             if LLVMGetNamedFunction(m, "ctx_aos_store_side_slot") is side_fn:
-                inline_aos_store_side_slot_body(m, side_fn)
+                inline_aos_store_side_slot_body(m, side_fn) if aos_store_inline_helper_is_marked(side_fn)
+
+
+
+
+        def inline_aos_helper_signature_supported(fn: LLVMValueRef, ctx: LLVMContextRef) -> bool:
+            false return if LLVMIsDeclaration(fn) == 0 or LLVMCountParams(fn) != 2
+            false return if LLVMGetFunctionCallConv(fn) != 0
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            false return if LLVMTypeOf(LLVMGetParam(fn, 0)) != pointer_type
+            false return if LLVMTypeOf(LLVMGetParam(fn, 1)) != i64_type
+            return LLVMGetReturnType(LLVMGlobalGetValueType(fn)) == pointer_type
 
 
         # `ctx_aos_store_side_slot(state, index)` (a node's cold Pos span,
@@ -253,19 +274,34 @@ extend Backend:
         # side_words at 72 of the 64-bit PackedAoSStore, 256 records per chunk.
         def inline_aos_store_side_slot_body(m: LLVMModuleRef, side_fn: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return if not inline_aos_store_layout_supported(m)
-            return if LLVMIsDeclaration(side_fn) == 0 or LLVMCountParams(side_fn) != 2
+            ctx: LLVMContextRef = LLVMGetModuleContext(m)
+            return if not inline_aos_helper_signature_supported(side_fn, ctx)
             state: LLVMValueRef = LLVMGetParam(side_fn, 0)
             record_index: LLVMValueRef = LLVMGetParam(side_fn, 1)
-            return if LLVMGetTypeKind(LLVMTypeOf(state)) != 12 or LLVMGetTypeKind(LLVMTypeOf(record_index)) != 8
-            return if LLVMGetIntTypeWidth(LLVMTypeOf(record_index)) != 64
-            ctx: LLVMContextRef = LLVMGetModuleContext(m)
             i8_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
             i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
             pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
             builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
             entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, side_fn, "entry")
+            in_range: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, side_fn, "side.in.range")
+            out_of_range: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, side_fn, "side.out.of.range")
             LLVMPositionBuilderAtEnd(builder, entry)
             chunk_index: LLVMValueRef = LLVMBuildLShr(builder, record_index, LLVMConstInt(i64_type, 8, 0), "side.chunk.index")
+            count_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 56, 0)]
+            count_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i8_type, state, (&count_offset[0]).cast[void&], 1, "side.chunks.count.ptr")
+            chunk_count: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, count_pointer, "side.chunks.count")
+            # LLVMIntUGE = 35; match the bounds guard on state.side_chunks[chunk_index].
+            outside: LLVMValueRef = LLVMBuildICmp(builder, 35, chunk_index, chunk_count, "side.chunk.outside")
+            _ = LLVMBuildCondBr(builder, outside, out_of_range, in_range)
+            LLVMPositionBuilderAtEnd(builder, out_of_range)
+            trap_name: sview = "llvm.trap"
+            trap_storage: mutable darray[u8] = []
+            trap_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(trap_name, trap_storage), sview_len(trap_name))
+            trap_fn: LLVMValueRef = LLVMGetIntrinsicDeclaration(m, trap_id, null, 0)
+            trap_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            _ = LLVMBuildCall2(builder, trap_type, trap_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, in_range)
             data_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 48, 0)]
             data_pointer: LLVMValueRef = LLVMBuildGEP2(builder, i8_type, state, (&data_offset[0]).cast[void&], 1, "side.chunks.data.ptr")
             data: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, data_pointer, "side.chunks.data")
@@ -286,13 +322,10 @@ extend Backend:
 
         def inline_aos_store_record_body(m: LLVMModuleRef, record_fn: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return if not inline_aos_store_layout_supported(m)
-            return if LLVMIsDeclaration(record_fn) == 0 or LLVMCountParams(record_fn) != 2
+            ctx: LLVMContextRef = LLVMGetModuleContext(m)
+            return if not inline_aos_helper_signature_supported(record_fn, ctx)
             state: LLVMValueRef = LLVMGetParam(record_fn, 0)
             record_index: LLVMValueRef = LLVMGetParam(record_fn, 1)
-            # LLVMPointerTypeKind = 12, LLVMIntegerTypeKind = 8.
-            return if LLVMGetTypeKind(LLVMTypeOf(state)) != 12 or LLVMGetTypeKind(LLVMTypeOf(record_index)) != 8
-            return if LLVMGetIntTypeWidth(LLVMTypeOf(record_index)) != 64
-            ctx: LLVMContextRef = LLVMGetModuleContext(m)
             i8_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
             i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
             pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
@@ -336,7 +369,8 @@ extend Backend:
                 LLVMPositionBuilderAtEnd(builder, sized_block)
                 slot_offset: LLVMValueRef = LLVMBuildMul(builder, in_chunk, LLVMConstInt(i64_type, 8, 0), "sized.slot.offset")
                 slot_address: LLVMValueRef = LLVMBuildIntToPtr(builder, LLVMBuildAdd(builder, chunk_base, slot_offset, "sized.slot.address"), pointer_type, "sized.slot")
-                _ = LLVMBuildRet(builder, LLVMBuildLoad2(builder, pointer_type, slot_address, "sized.record"))
+                slot_value: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, slot_address, "sized.slot.value")
+                _ = LLVMBuildRet(builder, LLVMBuildIntToPtr(builder, slot_value, pointer_type, "sized.record"))
                 LLVMPositionBuilderAtEnd(builder, fixed_block)
             offset: LLVMValueRef = LLVMBuildMul(builder, in_chunk, record_bytes, "record.offset")
             address: LLVMValueRef = LLVMBuildAdd(builder, chunk_base, offset, "record.address")

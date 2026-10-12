@@ -149,12 +149,22 @@ extend Backend:
                     # around the task call. Do not silently turn asynchronous submission into a
                     # synchronous call while the pool/task ABI lowering is incomplete.
                     if block_statements.count == 0:
-                        if any submit_marker in structs.function_types.fn_return_lines where submit_marker == block_line.line:
+                        if submit_marker_at(block_line.offset, structs):
                             # `submit worker(arg)` lowers to pool_submit1(pool, worker, arg).
                             # The nursery group receives the already-emitted Task value below;
                             # re-emitting the call would enqueue the task twice.
-                            explicit_submit_pool: sview = submit_pool_name_at(block_line.line, structs)
+                            explicit_submit_pool: sview = submit_pool_name_at(block_line.offset, structs)
                             null return if local_scope.pool_names.count == 0 and explicit_submit_pool == ""
+                            # In a lexical pool, only statement-position Task results may be
+                            # collected by the surrounding TaskGroup. A Task value flowing into
+                            # a binding, argument, or aggregate can outlive the pool cleanup.
+                            null return if local_scope.pool_names.count > 0 and expected.kind != TypeKind.Void
+                            null return if local_scope.pool_names.count > 0 and local_scope.group_names.count == 0
+                            # A task in a TaskGroup is consumed by task_group_add, and the
+                            # group's deferred wait frees its completion record before any
+                            # value can escape the enclosing scope. Until ownership can be
+                            # transferred out of that group, accept only discarded submits.
+                            null return if local_scope.group_names.count > 0 and expected.kind != TypeKind.Void
                             match block_value:
                                 Expr.Call(submit_callee, submit_arguments, submit_argument_names, submit_line):
                                     null return if submit_arguments.count != 1
@@ -170,28 +180,34 @@ extend Backend:
                                     submit_ret_type: mutable ValueType = unmodeled_type()
                                     submit_worker_name: mutable sview = ""
                                     submit_worker_row: mutable i64 = -1
+                                    submit_worker_is_generic: mutable bool = false
+                                    submit_worker_generic_types: mutable darray[ValueType] = []
                                     match submit_callee:
                                         Expr.Ident(submit_worker, submit_worker_line):
                                             submit_worker_name <- submit_worker
-                                            submit_worker_row <- submit_worker_index(submit_worker, fns, structs)
+                                            submit_worker_row <- submit_worker_index(submit_worker, submit_arguments[0], fns, structs, generics, local_scope)
                                             submit_arg_type <- expression_type(submit_arguments[0], local_scope, fns, structs, generics)
-                                            # Integer literals are intentionally context-free in
-                                            # expression_type; for submit the worker signature is the
-                                            # context that supplies their concrete argument type.
-                                            submit_arg_type <- param_type_of(fns, "", submit_worker, 0.usize()) if submit_arg_type.kind == TypeKind.Unmodeled
-                                            submit_ret_type <- lookup_return_type(fns, "", submit_worker)
-                                            # A module member (`submit helper(x)` inside `module M:`)
-                                            # is registered under its owner, not the top level.
-                                            if submit_worker_row >= 0 and submit_ret_type.kind == TypeKind.Unmodeled:
+                                            if submit_worker_row >= 0:
+                                                worker_argument_type: ValueType = copied_type(fns.param_types[fns.param_start[submit_worker_row.usize()]])
+                                                # As with ordinary direct calls, the selected worker
+                                                # supplies context for literals and numeric conversions.
+                                                # Other known type mismatches must decline even when
+                                                # LLVM erases their semantic distinction (for example,
+                                                # two enum payloads or indirect aggregate pointers).
+                                                if submit_arg_type.kind == TypeKind.Unmodeled or (is_numeric_type(submit_arg_type) and is_numeric_type(worker_argument_type)):
+                                                    submit_arg_type <- worker_argument_type
+                                                elif not value_type_identity_equal(submit_arg_type, worker_argument_type):
+                                                    return null
                                                 submit_ret_type <- copied_type(fns.returns[submit_worker_row.usize()])
                                         Expr.Index(submit_generic_head, submit_generic_argument, submit_generic_line):
                                             match submit_generic_head:
                                                 Expr.Ident(submit_generic_name, submit_generic_name_line):
                                                     if generic_index_of(generics, submit_generic_name) >= 0:
                                                         submit_worker_name <- submit_generic_name
-                                                        submit_generic_types: mutable darray[ValueType] = [annotation_value_type(submit_generic_argument, structs)]
-                                                        submit_arg_type <- instantiation_param_type(submit_generic_name, submit_generic_types, 0.usize(), generics, structs)
-                                                        submit_ret_type <- generic_return_type(submit_generic_name, submit_generic_types, generics, structs)
+                                                        submit_worker_is_generic <- true
+                                                        submit_worker_generic_types.push(annotation_value_type(submit_generic_argument, structs))
+                                                        submit_arg_type <- instantiation_param_type(submit_generic_name, submit_worker_generic_types, 0.usize(), generics, structs)
+                                                        submit_ret_type <- generic_return_type(submit_generic_name, submit_worker_generic_types, generics, structs)
                                                 _:
                                                     pass
                                         Expr.IndexN(submit_generic_n_head, submit_generic_n_arguments, submit_generic_n_line):
@@ -199,29 +215,45 @@ extend Backend:
                                                 Expr.Ident(submit_generic_n_name, submit_generic_n_name_line):
                                                     if generic_index_of(generics, submit_generic_n_name) >= 0:
                                                         submit_worker_name <- submit_generic_n_name
-                                                        submit_generic_n_types: mutable darray[ValueType] = []
-                                                        submit_generic_n_types.extend([annotation_value_type(submit_generic_n_argument, structs) for submit_generic_n_argument in submit_generic_n_arguments])
-                                                        submit_arg_type <- instantiation_param_type(submit_generic_n_name, submit_generic_n_types, 0.usize(), generics, structs)
-                                                        submit_ret_type <- generic_return_type(submit_generic_n_name, submit_generic_n_types, generics, structs)
+                                                        submit_worker_is_generic <- true
+                                                        submit_worker_generic_types.extend([annotation_value_type(submit_generic_n_argument, structs) for submit_generic_n_argument in submit_generic_n_arguments])
+                                                        submit_arg_type <- instantiation_param_type(submit_generic_n_name, submit_worker_generic_types, 0.usize(), generics, structs)
+                                                        submit_ret_type <- generic_return_type(submit_generic_n_name, submit_worker_generic_types, generics, structs)
                                                 _:
                                                     pass
                                         _:
                                             pass
                                     null return if submit_worker_name == "" or submit_arg_type.kind == TypeKind.Unmodeled or submit_ret_type.kind == TypeKind.Unmodeled
+                                    # A Task may outlive this expression's pool scope. Never
+                                    # enqueue a value carrying a ThreadPool/Task/TaskGroup
+                                    # handle, including raw `.handle` projections.
+                                    null return if backend_expression_may_contain_pool_lifetime_handle(submit_arguments[0], submit_arg_type, local_scope, fns, structs, generics)
                                     submit_pool: sview = explicit_submit_pool if explicit_submit_pool != "" else local_scope.pool_names[local_scope.pool_names.count - 1.usize()]
+                                    # The group is the lifetime owner for automatically collected
+                                    # tasks. Refuse submission from a shorter-lived region so a
+                                    # worker cannot retain DArray views after that region closes.
+                                    null return if local_scope.group_names.count > 0 and not submit_group_lifetime_is_scoped(local_scope)
                                     submit_types: mutable darray[ValueType] = [submit_arg_type, submit_ret_type]
                                     submit_call_arguments: mutable darray[Expr] = [Expr.Ident(submit_pool, submit_line), submit_callee, submit_arguments[0]]
                                     submitted: mutable LLVMValueRef? = null
                                     # A worker that reads the AST captures this scope's store
                                     # (codegen_submit_store_capture.elisa).
-                                    if submit_worker_captures_store(submit_worker_row, fns):
-                                        submitted <- emit_store_capturing_submit(submit_worker_row, submit_pool, submit_arguments[0], submit_arg_type, submit_ret_type, submit_line, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
-                                    else:
+                                    if submit_worker_requires_store(submit_worker_row, fns):
+                                        submitted <- emit_store_capturing_submit(submit_worker_row, submit_pool, submit_arguments[0], submit_arg_type, submit_ret_type, submit_line, local_scope, local_scope.group_names.count > 0, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                                    elif submit_worker_row >= 0:
+                                        null return if not submit_worker_is_plain(submit_worker_row, submit_arg_type, submit_ret_type, fns, structs, ctx)
+                                        submitted <- emit_generic_call("pool_submit1", submit_types, submit_call_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder, -1, 1, submit_worker_row) can Global{Read,Write}
+                                    elif submit_worker_is_generic:
+                                        null return if not submit_generic_worker_is_plain(submit_worker_name, submit_worker_generic_types, submit_arg_type, submit_ret_type, generics, structs, m, ctx)
                                         submitted <- emit_generic_call("pool_submit1", submit_types, submit_call_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                                    else:
+                                        return null
                                     if submitted is submitted_task:
                                         if local_scope.group_names.count > 0:
-                                            group_name: sview = local_scope.group_names[local_scope.group_names.count - 1.usize()]
-                                            if (emit_task_group_add_value(group_name, submitted_task, submit_ret_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is added_task:
+                                            group_index: usize = local_scope.group_names.count - 1.usize()
+                                            null return if group_index >= local_scope.group_slots.count
+                                            group_slot: LLVMValueRef = local_scope.group_slots[group_index]
+                                            if (emit_task_group_add_value(group_slot, submitted_task, submit_ret_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is added_task:
                                                 _ = added_task
                                             else:
                                                 return null
@@ -234,13 +266,44 @@ extend Backend:
                         await_base: mutable sview = ""
                         await_arg_start: mutable usize = 0
                         await_arg_count: mutable usize = 0
-                        await_is_task: bool = generic_struct_instantiation_of(structs, await_task_type, await_base, await_arg_start, await_arg_count) and await_base == "Task" and await_arg_count >= 1
-                        if fn_return_head_at(block_line.line, structs) == "__await" or await_is_task:
+                        await_is_task: mutable bool = generic_struct_instantiation_of(structs, await_task_type, await_base, await_arg_start, await_arg_count) and await_base == "Task"
+                        if await_is_task:
+                            if await_task_type.bits.usize() >= structs.records.names.count or await_task_type.bits.usize() >= structs.records.owners.count:
+                                await_is_task <- false
+                            else:
+                                await_is_task <- structs.records.names[await_task_type.bits.usize()] == "Task" and structs.records.owners[await_task_type.bits.usize()] == ""
+                        if not await_is_task and await_task_type.kind == TypeKind.Struct and await_task_type.bits.usize() < structs.records.names.count and await_task_type.bits.usize() < structs.records.owners.count:
+                            await_is_task <- structs.records.names[await_task_type.bits.usize()] == "Task" and structs.records.owners[await_task_type.bits.usize()] == ""
+                        if fn_return_head_at_offset(block_line.offset, block_line.line, structs) == "__await" or await_is_task:
                             null return if not await_is_task
-                            await_result_type: ValueType = copied_type(structs.generics.generic_struct_inst_args[await_arg_start])
-                            await_types: mutable darray[ValueType] = [await_result_type]
-                            await_arguments: mutable darray[Expr] = [block_value]
-                            return emit_generic_call("pool_await", await_types, await_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                            if await_arg_count == 2:
+                                null return if await_arg_start >= structs.generics.generic_struct_inst_args.count or await_arg_count > structs.generics.generic_struct_inst_args.count - await_arg_start
+                                await_result_type: ValueType = copied_type(structs.generics.generic_struct_inst_args[await_arg_start])
+                                await_types: mutable darray[ValueType] = [await_result_type]
+                                await_arguments: mutable darray[Expr] = [block_value]
+                                if (emit_generic_call("pool_await", await_types, await_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is awaited_value:
+                                    if expected.kind != TypeKind.Unmodeled and is_numeric_type(await_result_type) and is_numeric_type(expected) and (expected.kind != await_result_type.kind or expected.bits != await_result_type.bits):
+                                        return emit_conversion(awaited_value, await_result_type, expected, structs, ctx, builder)
+                                    return awaited_value
+                                return null
+                            return null if await_arg_count > 2
+                            # The synthesized Task handle has no reliable result-type argument.
+                            # Resolve only a unique one-argument overload whose parameter is the
+                            # exact concrete Task type; name-only selection could call the wrong API.
+                            await_direct_args: mutable darray[Expr] = [block_value]
+                            await_api_hits: i64 = overload_match_count(fns, "", "pool_await", await_direct_args, local_scope, structs, generics)
+                            await_api_index: i64 = overload_index_for_args(fns, "", "pool_await", await_direct_args, local_scope, structs, generics)
+                            if await_api_hits == 1 and await_api_index >= 0 and await_api_index.usize() < fns.param_start.count and await_api_index.usize() < fns.param_count.count:
+                                await_api_row: usize = await_api_index.usize()
+                                if fns.param_count[await_api_row] == 1 and fns.param_start[await_api_row] < fns.param_types.count and await_api_row < fns.returns.count:
+                                    await_api_task_type: ValueType = copied_type(fns.param_types[fns.param_start[await_api_row]])
+                                    if value_type_identity_equal(await_api_task_type, await_task_type):
+                                        if (emit_direct_call_indexed(await_api_index, Expr.Invalid, false, await_direct_args, [], local_scope, fns, structs, generics, runtime, m, ctx, builder, null) can Global{Read,Write}) is await_direct_value:
+                                            await_return_type: ValueType = copied_type(fns.returns[await_api_row])
+                                            if expected.kind != TypeKind.Unmodeled and is_numeric_type(await_return_type) and is_numeric_type(expected) and (expected.kind != await_return_type.kind or expected.bits != await_return_type.bits):
+                                                return emit_conversion(await_direct_value, await_return_type, expected, structs, ctx, builder)
+                                            return await_direct_value
+                            return null
                     block_expected: mutable ValueType = copied_type(expected)
                     return emit_scoped_value_block(block_statements, block_value, block_expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
                 _:

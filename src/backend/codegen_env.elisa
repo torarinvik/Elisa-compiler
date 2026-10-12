@@ -24,6 +24,7 @@ include "easm_memstate_domain.elisa"
 include "easm_access_width.elisa"
 include "easm_model.elisa"
 include "easm_checked_decimal.elisa"
+include "easm_text_scan.elisa"
 include "easm_verify_provenance.elisa"
 include "easm_verify_memory.elisa"
 include "easm_verify_function.elisa"
@@ -41,6 +42,8 @@ module Backend:
         # Component guests have a freestanding runtime whose counted string helper
         # deliberately avoids libc. Keep the backend's native memcmp fast path out of
         # component modules, where it would become an unsupported `env::memcmp` import.
+        # `emit_module_core` samples this once into BackendTarget before any body lowering;
+        # hot helpers consume that snapshot instead of probing getenv per expression.
         def wasm_component_codegen_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if getenv("ELISA_STAGE1_WASM_COMPONENT_TYPES") is component_types:
                 return component_types.cast[cstr] != ""
@@ -138,10 +141,8 @@ module Backend:
         # sets ELISA_STAGE1_RUNTIME_STD=1)? Its definitions are the entry points every program
         # links against, so they keep the -O0 linkage policy at every level: the optimised
         # build must not internalise them and let LLVM delete the whole unit.
-        def bundled_runtime_build() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            flag_storage: mutable darray[u8] = []
-            flag_name: cstr = sview_to_cstr("ELISA_STAGE1_RUNTIME_STD", flag_storage)
-            if getenv(flag_name) is flag_bytes:
+        def bundled_runtime_build() -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            if getenv("ELISA_STAGE1_RUNTIME_STD") is flag_bytes:
                 flag_c: cstr = (flag_bytes).cast[cstr] can Unsafe.PointerCast
                 return flag_c == "1"
             return false
@@ -152,10 +153,8 @@ module Backend:
         # level through the same environment used by its optimization pass; keeping the
         # linkage decision here makes library units and program units follow the reference
         # compiler instead of incorrectly using the presence of `main` as a proxy.
-        def prefer_private_linkage_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            flag_storage: mutable darray[u8] = []
-            flag_name: cstr = sview_to_cstr("ELISA_STAGE1_OPT", flag_storage)
-            if getenv(flag_name) is level_bytes:
+        def prefer_private_linkage_enabled() -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            if getenv("ELISA_STAGE1_OPT") is level_bytes:
                 level_c: cstr = (level_bytes).cast[cstr] can Unsafe.PointerCast
                 true return if level_c == "1" or level_c == "2" or level_c == "3"
             return false
@@ -189,11 +188,31 @@ module Backend:
 
 
 
-        # The explicit `submit[pool]` selector recorded on `line`, or "".
-        def submit_pool_name_at(line: i64, structs: StructTable&) -> sview can[Abort.Panic]:
-            paired: usize = structs.annotations.submit_pool_lines.count if structs.annotations.submit_pool_lines.count < structs.annotations.submit_pool_names.count else structs.annotations.submit_pool_names.count
+        # Whether a `submit` marker was recorded at this token offset.
+        def submit_marker_at(offset: u32, structs: StructTable&) -> bool can[Abort.Panic]:
+            if structs.annotations.submit_offsets_sorted:
+                low: mutable usize = 0.usize()
+                high: mutable usize = structs.annotations.submit_offsets.count
+                while low < high |low, high, offset, structs|:
+                    middle: usize = low + (high - low) / 2.usize()
+                    if structs.annotations.submit_offsets[middle] < offset:
+                        low <- middle + 1.usize()
+                    else:
+                        high <- middle
+                false return if low >= structs.annotations.submit_offsets.count
+                return structs.annotations.submit_offsets[low] == offset
+            for probe in 0..<structs.annotations.submit_offsets.count:
+                true return if structs.annotations.submit_offsets[probe] == offset
+            return false
+
+
+
+
+        # The explicit `submit[pool]` selector recorded at the submit keyword's byte offset, or "".
+        def submit_pool_name_at(offset: u32, structs: StructTable&) -> sview can[Abort.Panic]:
+            paired: usize = structs.annotations.submit_pool_offsets.count if structs.annotations.submit_pool_offsets.count < structs.annotations.submit_pool_names.count else structs.annotations.submit_pool_names.count
             for probe in 0..<paired:
-                structs.annotations.submit_pool_names[probe] return if structs.annotations.submit_pool_lines[probe] == line
+                structs.annotations.submit_pool_names[probe] return if structs.annotations.submit_pool_offsets[probe] == offset
             return ""
 
 
@@ -353,14 +372,16 @@ module Backend:
             # frontend's business (it already rejects `x <- 1` on an immutable local), and the
             # backend only needs the underlying type.
             # Record every `fn(…)->R` type's RETURN-type head (parser side-table __lambda_return,
-            # keyed by the fn-type's line) so a Fn ValueType can carry its result type.
+            # keyed by the fn token offset) so a Fn ValueType can carry its result type.
         def register_fn_signatures(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             for annotation in file.enum_annotations |structs|:
                 if annotation.owner == "__lambda_return":
                     structs.function_types.fn_return_lines.push(annotation.line)
                     structs.function_types.fn_return_heads.push(annotation.name)
+                    structs.function_types.fn_return_offsets.push(annotation.offset)
                 if annotation.owner == "__lambda_param":
                     structs.function_types.fn_param_lines.push(annotation.line)
+                    structs.function_types.fn_param_offsets.push(annotation.offset)
                     structs.function_types.fn_param_heads.push(annotation.name)
                 # The QUERY keyword (`count`/`sum`/`any`/…), keyed by the query head's line.
                 # Prefixed so it cannot be confused with a fn-type return head sharing a line.
@@ -381,6 +402,7 @@ module Backend:
                 if annotation.owner == "__query":
                     structs.function_types.fn_return_lines.push(annotation.line)
                     structs.function_types.fn_return_heads.push(annotation.name)
+                    structs.function_types.fn_return_offsets.push(annotation.offset)
                     # Also into the binder-keyed pools. The line-keyed row above stays for the
                     # consumers that have no binder to offer.
                     structs.queries.query_lines.push(annotation.line)
@@ -395,16 +417,23 @@ module Backend:
                 if annotation.name == "__using_alias_target":
                     structs.aliases.module_alias_targets.push(annotation.owner)
                 if annotation.owner == "__submit":
-                    # Reuse the line-keyed return side table as a compact marker; submit
-                    # lines never collide with a function-type expression's line.
+                    # Keep the line-keyed return head for older expression-type queries and
+                    # separately retain the unique token offset for submit lowering.
                     structs.function_types.fn_return_lines.push(annotation.line)
                     structs.function_types.fn_return_heads.push("__submit")
+                    structs.function_types.fn_return_offsets.push(annotation.offset)
+                    if structs.annotations.submit_offsets.count > 0.usize():
+                        previous_submit_offset: usize = structs.annotations.submit_offsets.count - 1.usize()
+                        structs.annotations.submit_offsets_sorted <- false if structs.annotations.submit_offsets[previous_submit_offset] > annotation.offset
+                    structs.annotations.submit_offsets.push(annotation.offset)
                 if annotation.owner == "__await":
                     structs.function_types.fn_return_lines.push(annotation.line)
                     structs.function_types.fn_return_heads.push("__await")
+                    structs.function_types.fn_return_offsets.push(annotation.offset)
                 if annotation.owner == "__wait_all":
                     structs.function_types.fn_return_lines.push(annotation.line)
                     structs.function_types.fn_return_heads.push("__wait_all")
+                    structs.function_types.fn_return_offsets.push(annotation.offset)
                 if annotation.owner == "__clone_error_union":
                     structs.errors.clone_error_lines.push(annotation.line)
                     structs.errors.clone_error_families.push(annotation.name)
@@ -419,6 +448,7 @@ module Backend:
                     structs.errors.param_error_families.push(annotation.name)
                 if annotation.owner == "__fn_error_union":
                     structs.function_types.fn_error_lines.push(annotation.line)
+                    structs.function_types.fn_error_offsets.push(annotation.offset)
                     structs.function_types.fn_error_families.push(annotation.name)
                 if annotation.owner == "__tuple_label":
                     structs.records.tuple_label_lines.push(annotation.line)
@@ -444,7 +474,9 @@ module Backend:
                     structs.storage_layouts.overlay_field_layouts[field_cursor] <- current_overlay
                     field_cursor <- field_cursor + 1
             structs.function_types.fn_type_param_lines <- file.fn_type_param_lines
+            structs.function_types.fn_type_param_offsets <- file.fn_type_param_offsets
             structs.function_types.fn_type_return_lines <- file.fn_type_return_lines
+            structs.function_types.fn_type_return_offsets <- file.fn_type_return_offsets
             structs.function_types.fn_type_return_exprs <- file.fn_type_return_exprs
             structs.function_types.fn_type_param_exprs <- file.fn_type_param_exprs
 
@@ -505,7 +537,7 @@ module Backend:
                 # `all x in [1, 0] where x > 0` once returned TRUE.
                 "" return if ambiguous
                 found return if have
-                return fn_return_head_at(line, structs)
+                return ""
 
         def contract_quantifier_head_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
             found: mutable sview = ""
@@ -529,12 +561,17 @@ module Backend:
 
 
 
-        def fn_return_head_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
-            probe: mutable usize = 0
-            while probe < structs.function_types.fn_return_lines.count |probe, line, structs|:
-                structs.function_types.fn_return_heads[probe] return if structs.function_types.fn_return_lines[probe] == line
-                probe <- probe + 1
-            return sview("", 0, 0)
+        # The synthetic return head at one AST token. It never borrows a marker from another
+        # expression on the same source line.
+        def fn_return_head_at_offset(offset: u32, line: u32, structs: StructTable&) -> sview can[Abort.Panic]:
+            paired: usize = structs.function_types.fn_return_lines.count if structs.function_types.fn_return_lines.count < structs.function_types.fn_return_heads.count else structs.function_types.fn_return_heads.count
+            paired <- structs.function_types.fn_return_offsets.count if structs.function_types.fn_return_offsets.count < paired
+            found: mutable sview = ""
+            for probe in 0..<paired |found, offset, line, structs|:
+                continue if structs.function_types.fn_return_lines[probe] != line or structs.function_types.fn_return_offsets[probe] != offset
+                return "" if found != "" and found != structs.function_types.fn_return_heads[probe]
+                found <- structs.function_types.fn_return_heads[probe]
+            return found
 
 
 

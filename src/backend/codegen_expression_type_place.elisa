@@ -6,6 +6,18 @@
 
 extend Backend:
     private:
+        # Return the type of the row the ordinary direct-call resolver would select.
+        # A unique type match wins; otherwise only a unique argument shape may supply a
+        # return type. Ambiguous or unresolved calls stay Unmodeled so callers do not
+        # infer a return ABI from declaration order.
+        def resolved_call_return_type(owner: sview, name: sview, arguments: darray[Expr]&, argument_names: darray[sview]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, depth: i64) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            index: mutable i64 = overload_index_for_call_args_at_depth(fns, owner, name, arguments, argument_names, local_scope, structs, generics, depth)
+            index <- function_index_of_unique_call_shape(fns, owner, name, arguments, argument_names) if index < 0
+            return copied_type(fns.returns[index.usize()]) if index >= 0 and index.usize() < fns.returns.count
+            return unmodeled_type()
+
+
+
         def expression_type_of_place(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, depth: i64) -> ValueType can[Abort.Panic, Memory.Allocate]:
             # `x.cast[T]` — a reinterpret cast has the target type.
             match expression:
@@ -44,7 +56,11 @@ extend Backend:
                     # A struct subscript is an overloadable `__index__` call. Keep this
                     # before the built-in container cases so the emitted call's return
                     # reference is also visible to place/address resolution.
-                    custom_index_type: ValueType = index_overload_type(indexed_object, index_expression, local_scope, fns, structs, generics)
+                    custom_index_type: ValueType = index_overload_type_for_receiver(indexed_type, index_expression, local_scope, fns, structs, generics)
+                    # Keep the original depth-resetting probe as a fallback. A deeply
+                    # nested receiver can hit the caller's type-depth budget above while
+                    # still being resolvable from this top-level type-only probe.
+                    custom_index_type <- index_overload_type(indexed_object, index_expression, local_scope, fns, structs, generics) if indexed_type.kind == TypeKind.Unmodeled
                     custom_index_type return if custom_index_type.kind != TypeKind.Unmodeled
                     # Do not allocate generic inference scratch for built-in arrays,
                     # views, or strings: only struct receivers can match an Index impl.
@@ -143,17 +159,24 @@ extend Backend:
                     pass
             match expression:
                 Expr.Field(field_object, field_name, field_line):
+                    receiver_type_cached: mutable bool = false
+                    cached_receiver_type: mutable ValueType = unmodeled_type()
                     if structs.visibility.private_member_names.count > 0:
-                        privacy_receiver: ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
-                        check_lowered_private_field(privacy_receiver, field_name, field_line.line, structs)
+                        cached_receiver_type <- expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                        receiver_type_cached <- true
+                        check_lowered_private_field(cached_receiver_type, field_name, field_line.line, structs)
                     # `table.values` on a view-typed receiver IS that view (NodeTable is erased
                     # to its backing view).
                     if field_name == "count":
-                        ps_count_recv_t: ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
-                        ValueType{kind: TypeKind.Signed, bits: 64} return if ps_count_recv_t.kind == TypeKind.PackedStore
+                        if not receiver_type_cached:
+                            cached_receiver_type <- expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                            receiver_type_cached <- true
+                        ValueType{kind: TypeKind.Signed, bits: 64} return if cached_receiver_type.kind == TypeKind.PackedStore
                     if field_name == "values":
-                        nt_values_recv: ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
-                        nt_values_recv return if nt_values_recv.kind == TypeKind.View
+                        if not receiver_type_cached:
+                            cached_receiver_type <- expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                            receiver_type_cached <- true
+                        cached_receiver_type return if cached_receiver_type.kind == TypeKind.View
                     # Bitset flag names type as bool (`token.flags.has_suffix`).
                     ValueType{kind: TypeKind.Bool, bits: 1} return if field_name == "has_suffix" or field_name == "has_prefix"
                     # `d.entry(k).found` / `.value` — the ENTRY api's READ members. `found` is a
@@ -175,7 +198,9 @@ extend Backend:
                                         pass
                             _:
                                 pass
-                    object_type: mutable ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                    object_type: mutable ValueType = cached_receiver_type
+                    if not receiver_type_cached:
+                        object_type <- expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
                     # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
                     # transparent for member access — the frontend has already decided the
                     # access is legal, so the backend just looks through it. An optional HEAP
@@ -217,9 +242,9 @@ extend Backend:
                     # so an Unmodeled answer declined the whole function even though the
                     # emitter could serve the read (`node.span + 0` compiled, `node.span` did not).
                     if object_type.kind == TypeKind.PackedEnum and object_type.bits.usize() < structs.packed_enums.packed_names.count:
-                        packed_common_index: i64 = packed_common_index_of(structs.packed_enums.packed_names[object_type.bits.usize()], field_name, structs)
+                        packed_common_index: i64 = packed_common_index_of_slot(structs, object_type.bits.i64(), field_name)
                         if packed_common_index >= 0:
-                            packed_common_type: ValueType = packed_common_type_at(structs, structs.packed_enums.packed_names[object_type.bits.usize()], packed_common_index.u32())
+                            packed_common_type: ValueType = packed_common_type_at_slot(structs, object_type.bits.i64(), packed_common_index.u32())
                             return packed_common_type if packed_common_type.kind != TypeKind.Unmodeled
                             return ValueType{kind: TypeKind.Signed, bits: 64}
                     # `xs.count` is a usize: unsigned, so `xs.count - 3 <= 0` compares the way
@@ -456,27 +481,46 @@ extend Backend:
                                     cast_enum_value: ValueType = copied_type(structs.const_enums.enum_backings[cast_enum_slot.usize()])
                                     if is_integer_type(cast_enum_value):
                                         return ValueType{kind: cast_enum_value.kind, bits: cast_enum_value.bits, enum_id: (cast_enum_slot + 1).u32()}
-                            top_ufcs: ValueType = lookup_return_type(fns, "", cast_name)
-                            top_ufcs return if top_ufcs.kind != TypeKind.Unmodeled
-                            # Module methods (`module Lexer: def match_char`) live under owner M.
-                            # Prefer arity match: UFCS has implicit receiver + call_arguments.
-                            ufcs_arity: usize = call_arguments.count + 1
-                            ufcs_ret_scan_cursor: mutable i64 = first_function_named(fns, cast_name)
-                            while ufcs_ret_scan_cursor >= 0 |ufcs_ret_scan_cursor, cast_name, fns, ufcs_arity|:
-                                ufcs_ret_scan: usize = ufcs_ret_scan_cursor.usize()
-                                ufcs_ret_scan_cursor <- next_function_named(fns, cast_name, ufcs_ret_scan_cursor)
-                                if fns.names[ufcs_ret_scan] == cast_name and fns.param_count[ufcs_ret_scan] == ufcs_arity:
-                                    return copied_type(fns.returns[ufcs_ret_scan])
-                            ufcs_owner: mutable sview = ""
-                            ufcs_hits: mutable i64 = 0
-                            ufcs_ret_scan2_cursor: mutable i64 = first_function_named(fns, cast_name)
-                            while ufcs_ret_scan2_cursor >= 0 |ufcs_ret_scan2_cursor, ufcs_owner, ufcs_hits, cast_name, fns|:
-                                ufcs_ret_scan2: usize = ufcs_ret_scan2_cursor.usize()
-                                ufcs_ret_scan2_cursor <- next_function_named(fns, cast_name, ufcs_ret_scan2_cursor)
-                                if fns.names[ufcs_ret_scan2] == cast_name:
-                                    ufcs_hits <- ufcs_hits + 1
-                                    ufcs_owner <- fns.owners[ufcs_ret_scan2]
-                            lookup_return_type(fns, ufcs_owner, cast_name) return if ufcs_hits == 1
+                            # Generic UFCS is tried before monomorphic rows by the emitter.
+                            # Keep that precedence here, and retain the selected template slot
+                            # so overloaded generic names do not inherit another row's return.
+                            if generic_index_of(generics, cast_name) >= 0:
+                                ufcs_generic_slot: mutable i64 = -1
+                                ufcs_generic_types: mutable darray[ValueType] = []
+                                ufcs_generic_cursor: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, cast_name)
+                                while ufcs_generic_cursor >= 0 |ufcs_generic_cursor, ufcs_generic_slot, ufcs_generic_types, cast_name, cast_object, call_arguments, local_scope, fns, structs, generics|:
+                                    ufcs_generic_candidate: usize = ufcs_generic_cursor.usize()
+                                    ufcs_generic_cursor <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, cast_name, ufcs_generic_cursor)
+                                    continue if ufcs_generic_slot >= 0
+                                    inferred_ufcs_types: darray[ValueType] = infer_generic_args_ufcs(ufcs_generic_candidate, cast_object, call_arguments, local_scope, fns, structs, generics)
+                                    if inferred_ufcs_types.count != 0:
+                                        ufcs_generic_slot <- ufcs_generic_candidate.i64()
+                                        ufcs_generic_types <- inferred_ufcs_types
+                                if ufcs_generic_slot >= 0:
+                                    return generic_return_type_at(ufcs_generic_slot.usize(), ufcs_generic_types, generics, structs)
+
+                            # Do not normalize malformed call-label metadata while adding the
+                            # implicit UFCS receiver. Ordinary direct-call selection requires
+                            # either no labels or one label slot per explicit argument.
+                            unmodeled_type() return if call_argument_names.count != 0 and call_argument_names.count != call_arguments.count
+                            ufcs_arguments: mutable darray[Expr] = [cast_object]
+                            for ufcs_argument in call_arguments |ufcs_arguments|:
+                                ufcs_arguments.push(ufcs_argument)
+                            ufcs_argument_names: mutable darray[sview] = [""]
+                            for ufcs_name_position in 0..<call_arguments.count |ufcs_argument_names, ufcs_name_position, call_argument_names, call_arguments|:
+                                ufcs_argument_names.push(call_argument_names[ufcs_name_position]) if call_argument_names.count == call_arguments.count
+
+                            # Top-level UFCS rows shadow module members in emit_call_receiver.
+                            # Resolve their return with the same typed-then-unique-shape rule.
+                            if function_index_of(fns, "", cast_name) >= 0:
+                                return resolved_call_return_type("", cast_name, ufcs_arguments, ufcs_argument_names, local_scope, fns, structs, generics, depth)
+
+                            # Resolve the same sole owner / unique-shape owner as the emitter,
+                            # including the implicit receiver and explicit labels/defaults.
+                            ufcs_owner_row: i64 = function_index_for_unique_call_owner(fns, cast_name, call_arguments, call_argument_names, true)
+                            if ufcs_owner_row >= 0:
+                                ufcs_owner: sview = fns.owners[ufcs_owner_row.usize()]
+                                return resolved_call_return_type(ufcs_owner, cast_name, ufcs_arguments, ufcs_argument_names, local_scope, fns, structs, generics, depth)
                             return unmodeled_type()
                         _:
                             pass
@@ -533,6 +577,9 @@ extend Backend:
                             # lookup so a downstream `i64(x) - k` sees an i64 operand, not Unmodeled.
                             prefix_conversion_type: ValueType = scalar_type_of_name(callee_name, structs.target.target_pointer_bits)
                             prefix_conversion_type return if prefix_conversion_type.kind != TypeKind.Unmodeled and call_arguments.count == 1
+                            if structs.visibility.current_owner != "":
+                                if function_has_call_shape(fns, structs.visibility.current_owner, callee_name, call_arguments, call_argument_names):
+                                    return resolved_call_return_type(structs.visibility.current_owner, callee_name, call_arguments, call_argument_names, local_scope, fns, structs, generics, depth)
                             # A GENERIC template is NOT in `fns` — only its instantiations are —
                             # so it must be resolved through the template. Without this a generic
                             # call reports Unmodeled and every type-directed check downstream
@@ -544,76 +591,53 @@ extend Backend:
                             # came from the template even where the user's own overload was the one
                             # being called. Harmless at the top of a statement, fatal one level in:
                             # `add(add(20, 20), 2)` typed its inner call through the std's `add[T]`,
-                            # which made exact_overload_exists reject the OUTER call too, so that
+                            # which made the exact-overload check reject the OUTER call too, so that
                             # routed into the generic path and inferred from a size-less type —
                             # SIGTRAP in LLVM's getTypeSizeInBits for `add`, a plain decline for
                             # `get`/`put`/`push`/`len`. The FLAT call was fine throughout, because
                             # literal arguments never reach this arm.
-                            if generic_index_of(generics, callee_name) >= 0 and not exact_overload_exists(fns, callee_name, call_arguments, local_scope, structs, generics):
+                            if generic_index_of(generics, callee_name) >= 0 and not exact_overload_exists_for_call_args(fns, callee_name, call_arguments, call_argument_names, local_scope, structs, generics, depth):
                                 unmodeled_type() return if call_arguments.count == 0
                                 inferred_return_slot: usize = generic_index_of(generics, callee_name).usize()
                                 inferred_return_args: darray[ValueType] = infer_generic_args(inferred_return_slot, call_arguments, local_scope, fns, structs, generics)
                                 unmodeled_type() return if inferred_return_args.count == 0
                                 return generic_return_type(callee_name, inferred_return_args, generics, structs)
-                            top_return: ValueType = lookup_return_type(fns, "", callee_name)
-                            top_return return if top_return.kind != TypeKind.Unmodeled
-                            # A bare sibling call inside `module M:` means M's OWN member. The
-                            # arity scan below takes the FIRST match across ALL owners, so a
-                            # same-named sibling in another module supplied the type instead --
-                            # `initial()` inside WasmBrowser::Operations typed as
-                            # WasmBrowser::Delivery's DeliveryStatus -- and the declaration then
-                            # declined on a type mismatch, taking the whole body with it. Which
-                            # module won depended on parse order, so adding an unrelated file
-                            # could make a function start or stop compiling. Mirrors the rule the
-                            # EMITTER already applies (codegen_call_named).
-                            if structs.visibility.current_owner != "":
-                                own_ret_scan_cursor: mutable i64 = first_function_named(fns, callee_name)
-                                while own_ret_scan_cursor >= 0 |own_ret_scan_cursor, callee_name, fns, call_arguments, structs|:
-                                    own_ret_scan: usize = own_ret_scan_cursor.usize()
-                                    own_ret_scan_cursor <- next_function_named(fns, callee_name, own_ret_scan_cursor)
-                                    if fns.names[own_ret_scan] == callee_name and fns.owners[own_ret_scan] == structs.visibility.current_owner and fns.param_count[own_ret_scan] == call_arguments.count:
-                                        return copied_type(fns.returns[own_ret_scan])
-                            # Bare sibling call inside a module. Prefer arity-matched overload
-                            # (Token 4-arg forwarding to 5-arg); unique-name fallback otherwise.
-                            bare_ret_arity: usize = call_arguments.count
-                            bare_ret_scan_cursor: mutable i64 = first_function_named(fns, callee_name)
-                            while bare_ret_scan_cursor >= 0 |bare_ret_scan_cursor, callee_name, fns, bare_ret_arity|:
-                                bare_ret_scan: usize = bare_ret_scan_cursor.usize()
-                                bare_ret_scan_cursor <- next_function_named(fns, callee_name, bare_ret_scan_cursor)
-                                if fns.names[bare_ret_scan] == callee_name and fns.param_count[bare_ret_scan] == bare_ret_arity:
-                                    return copied_type(fns.returns[bare_ret_scan])
-                            bare_ret_owner: mutable sview = ""
-                            bare_ret_hits: mutable i64 = 0
-                            bare_ret_scan2_cursor: mutable i64 = first_function_named(fns, callee_name)
-                            while bare_ret_scan2_cursor >= 0 |bare_ret_scan2_cursor, bare_ret_owner, bare_ret_hits, callee_name, fns|:
-                                bare_ret_scan2: usize = bare_ret_scan2_cursor.usize()
-                                bare_ret_scan2_cursor <- next_function_named(fns, callee_name, bare_ret_scan2_cursor)
-                                if fns.names[bare_ret_scan2] == callee_name:
-                                    bare_ret_hits <- bare_ret_hits + 1
-                                    bare_ret_owner <- fns.owners[bare_ret_scan2]
-                            lookup_return_type(fns, bare_ret_owner, callee_name) return if bare_ret_hits == 1
+                            # Bare-call owner precedence mirrors emit_call_named. Resolve the
+                            # return only after selecting the same owner and overload; a name
+                            # lookup's first row does not determine an overloaded call's type.
+                            if function_index_of(fns, "", callee_name) >= 0:
+                                return resolved_call_return_type("", callee_name, call_arguments, call_argument_names, local_scope, fns, structs, generics, depth)
+
+                            bare_owner_row: i64 = function_index_for_unique_call_owner(fns, callee_name, call_arguments, call_argument_names)
+                            if bare_owner_row >= 0:
+                                bare_owner: sview = fns.owners[bare_owner_row.usize()]
+                                return resolved_call_return_type(bare_owner, callee_name, call_arguments, call_argument_names, local_scope, fns, structs, generics, depth)
                             return unmodeled_type()
                         _:
                             pass
-                    # A module-qualified call's type is the qualified function's return type.
+                    # A module-qualified call resolves the same best-ranked owner as the
+                    # emitter, then selects a typed overload or a unique call shape there.
                     match call_callee:
                         Expr.Scope(scope_head, scope_name, scope_line):
-                            match scope_head:
-                                Expr.Ident(module_name, module_name_line):
-                                    # Bare head inside the enclosing module (`Inner::f()` in
-                                    # `module Outer:` -> owner `Outer::Inner`), same rule as
-                                    # emit_call.
-                                    if function_index_of(fns, module_name, scope_name) < 0:
-                                        if qualified_owner_of(fns, structs.visibility.current_owner, module_name) is enclosing_owner:
-                                            return lookup_return_type(fns, enclosing_owner, scope_name)
-                                    return lookup_return_type(fns, module_name, scope_name)
-                                Expr.Scope(nested_head, nested_mid, nested_line):
-                                    # `A::B::f()`: the owner is the verbatim `A::B`.
-                                    if nested_head is Expr.Ident(nested_root, nested_root_line):
-                                        if qualified_owner_of(fns, nested_root, nested_mid) is nested_owner:
-                                            return lookup_return_type(fns, nested_owner, scope_name)
-                                _:
-                                    pass
+                            # Qualified generic functions are inferred by their full member
+                            # path before ordinary function rows, matching emit_call_receiver.
+                            scope_generic_slot: i64 = generic_index_of_scoped_member(generics, fns, structs, scope_head, scope_name)
+                            if scope_generic_slot >= 0 and call_arguments.count > 0:
+                                scope_inferred_args: darray[ValueType] = infer_generic_args(scope_generic_slot.usize(), call_arguments, local_scope, fns, structs, generics)
+                                if scope_inferred_args.count > 0:
+                                    return generic_return_type_at(scope_generic_slot.usize(), scope_inferred_args, generics, structs)
+                            scoped_owner: mutable sview = ""
+                            scoped_rank: mutable i64 = -1
+                            scoped_row: mutable i64 = first_function_named(fns, scope_name)
+                            while scoped_row >= 0 |scoped_row, scoped_owner, scoped_rank, fns, structs, scope_head, scope_name|:
+                                owner: sview = fns.owners[scoped_row.usize()]
+                                rank: i64 = enum_scope_path_rank(owner, scope_head, structs)
+                                if rank > scoped_rank:
+                                    scoped_owner <- owner
+                                    scoped_rank <- rank
+                                scoped_row <- next_function_named(fns, scope_name, scoped_row)
+                            if scoped_rank >= 0:
+                                return resolved_call_return_type(scoped_owner, scope_name, call_arguments, call_argument_names, local_scope, fns, structs, generics, depth)
                         _:
                             pass
                 _:

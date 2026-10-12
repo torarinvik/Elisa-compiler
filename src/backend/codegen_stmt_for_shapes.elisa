@@ -585,12 +585,47 @@ extend Backend:
                                     loop_high <- converted_high
                                 else:
                                     return EmitStatus.Declined
+                            # The range expression is evaluated in the surrounding scope,
+                            # before its binder exists. Evaluate its stride there as well and
+                            # keep the value for the whole loop. Besides matching the range's
+                            # one-time bound evaluation, this prevents a same-named loop
+                            # binder from shadowing a name used by the stride expression.
+                            increment: mutable LLVMValueRef = LLVMConstInt(loop_llvm_type, 1, 0)
+                            if have_step:
+                                if (emit_expression(step_expr, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is step_value:
+                                    if LLVMTypeOf(step_value) != loop_llvm_type:
+                                        step_source_type: ValueType = resolve_type(step_expr, loop_type, local_scope, fns, structs, generics)
+                                        if emit_conversion(step_value, step_source_type, loop_type, structs, ctx, builder) is converted_step:
+                                            increment <- converted_step
+                                        else:
+                                            return EmitStatus.Declined
+                                    else:
+                                        increment <- step_value
+                                else:
+                                    return EmitStatus.Declined
+                            # Stage0 treats a signed stride as a magnitude and skips the
+                            # loop when that magnitude is zero. Preserve the same behavior
+                            # for dynamically computed strides, not only literal-zero checks.
+                            if have_step and loop_type.kind == TypeKind.Signed:
+                                step_is_negative: LLVMValueRef = LLVMBuildICmp(builder, 40, increment, LLVMConstInt(loop_llvm_type, 0, 0), "for.step.negative")
+                                increment <- LLVMBuildSelect(builder, step_is_negative, LLVMBuildNeg(builder, increment, "for.step.negated"), increment, "for.step.magnitude")
                             name_storage: mutable darray[u8] = []
                             # `_` is a discard binder — still need a counter slot, just no name.
-                            slot_name: cstr = "for.i" if for_variable == "_" else sview_to_cstr(for_variable, name_storage)
-                            slot: LLVMValueRef = build_entry_alloca(builder, loop_llvm_type, slot_name)
-                            _ = LLVMBuildStore(builder, loop_low, slot)
-                            declare_local(local_scope, for_variable, slot, loop_type) if for_variable != "_"
+                            counter_slot: LLVMValueRef = build_entry_alloca(builder, loop_llvm_type, "for.counter")
+                            _ = LLVMBuildStore(builder, loop_low, counter_slot)
+                            binder_used_in_body: mutable bool = false
+                            if for_variable != "_":
+                                binder_used_in_body <- submit_group_range_binder_may_be_mentioned(for_body, 0.usize(), for_body.count, for_variable)
+                            binder_slot: mutable LLVMValueRef? = null
+                            # An unused binder needs no local slot or per-iteration copy. The
+                            # fail-closed walk checks direct writes, address-taking, and
+                            # captures; nonempty nested scopes and unknown nodes count as
+                            # possible uses. Block-clause references also retain the slot.
+                            if for_variable != "_" and binder_used_in_body:
+                                binder_name: cstr = sview_to_cstr(for_variable, name_storage)
+                                binder_slot <- build_entry_alloca(builder, loop_llvm_type, binder_name)
+                                if binder_slot is declared_binder_slot:
+                                    declare_local(local_scope, for_variable, declared_binder_slot, loop_type)
 
                             function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                             head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.head")
@@ -598,9 +633,13 @@ extend Backend:
                             step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.step")
                             exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.exit")
 
-                            _ = LLVMBuildBr(builder, head_block)
+                            if have_step:
+                                step_is_nonzero: LLVMValueRef = LLVMBuildICmp(builder, 33, increment, LLVMConstInt(loop_llvm_type, 0, 0), "for.step.nonzero")
+                                _ = LLVMBuildCondBr(builder, step_is_nonzero, head_block, exit_block)
+                            else:
+                                _ = LLVMBuildBr(builder, head_block)
                             LLVMPositionBuilderAtEnd(builder, head_block)
-                            counter: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.i")
+                            counter: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, counter_slot, "for.i")
                             # Ascending: 41 = SLE (`..=`), 40 = SLT (`..<`).
                             # Descending `a..>b`: SGT (38) / UGT (34) — stage0 icmp sgt.
                             signed_predicate: mutable i32 = 41 if inclusive else 40
@@ -610,6 +649,11 @@ extend Backend:
                             _ = LLVMBuildCondBr(builder, keep_going, body_block, exit_block)
 
                             LLVMPositionBuilderAtEnd(builder, body_block)
+                            # The visible binder is a fresh value for each iteration, not
+                            # the induction state. Assignments to it have no effect on which
+                            # value the range visits next.
+                            if binder_slot is iteration_slot:
+                                _ = LLVMBuildStore(builder, counter, iteration_slot)
                             loops.exits <- loops.exits.push(exit_block)
                             loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
                             loops.continues <- loops.continues.push(step_block)
@@ -622,19 +666,25 @@ extend Backend:
                             branch_if_open(body_status, builder, step_block)
 
                             LLVMPositionBuilderAtEnd(builder, step_block)
-                            cur: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.cur")
-                            # The increment: 1, or the range's own STEP. Emitted here rather
-                            # than hoisted because the step of a `for` is a constant in every
-                            # spelling the grammar allows.
-                            increment: mutable LLVMValueRef = LLVMConstInt(loop_llvm_type, 1, 0)
-                            if have_step:
-                                if (emit_expression(step_expr, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is step_value:
-                                    increment <- step_value
-                                else:
-                                    return EmitStatus.Declined
-                            stepped: LLVMValueRef = LLVMBuildSub(builder, cur, increment, "for.next") if descending else LLVMBuildAdd(builder, cur, increment, "for.next")
-                            _ = LLVMBuildStore(builder, stepped, slot)
-                            _ = LLVMBuildBr(builder, head_block)
+                            cur: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, counter_slot, "for.cur")
+                            if have_step or inclusive:
+                                # An overflowing next value lies beyond the finite range type;
+                                # finish after the current iteration instead of wrapping the
+                                # induction counter back into the loop's comparison interval.
+                                stepped: LLVMValueRef = LLVMBuildSub(builder, cur, increment, "for.next") if descending else LLVMBuildAdd(builder, cur, increment, "for.next")
+                                overflow_predicate: mutable i32 = 38 if descending else 40
+                                if loop_type.kind == TypeKind.Unsigned:
+                                    overflow_predicate <- 34 if descending else 36
+                                next_overflow: LLVMValueRef = LLVMBuildICmp(builder, overflow_predicate, stepped, cur, "for.next.overflow")
+                                commit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.step.commit")
+                                _ = LLVMBuildCondBr(builder, next_overflow, exit_block, commit_block)
+                                LLVMPositionBuilderAtEnd(builder, commit_block)
+                                _ = LLVMBuildStore(builder, stepped, counter_slot)
+                                _ = LLVMBuildBr(builder, head_block)
+                            else:
+                                stepped_default: LLVMValueRef = LLVMBuildSub(builder, cur, increment, "for.next") if descending else LLVMBuildAdd(builder, cur, increment, "for.next")
+                                _ = LLVMBuildStore(builder, stepped_default, counter_slot)
+                                _ = LLVMBuildBr(builder, head_block)
 
                             LLVMPositionBuilderAtEnd(builder, exit_block)
                             return EmitStatus.Open

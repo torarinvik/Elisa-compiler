@@ -23,74 +23,126 @@ extend Backend:
         def memory_is_declaration(statement: Stmt) -> bool:
             return statement is Stmt.VarDecl
 
-        def memory_scalar(value: Expr, buffer: sview, scope: mutable Scope&) -> bool can[Abort.Panic]:
+        def memory_proof_begin(function: LLVMValueRef, structs: mutable StructTable&) -> void:
+            if structs.memory.memory_proof_function is previous:
+                if previous == function:
+                    return
+            structs.memory.memory_proof_function <- function
+            # Shared across every speculative proof in this function. Statement visits,
+            # expression visits, overload lookups, and scope copies all spend from it.
+            structs.memory.memory_proof_remaining <- 100000
+            structs.memory.memory_proof_exhausted <- false
+
+        def memory_proof_charge(structs: mutable StructTable&, cost: usize) -> bool:
+            false return if structs.memory.memory_proof_exhausted
+            if cost > structs.memory.memory_proof_remaining:
+                structs.memory.memory_proof_exhausted <- true
+                return false
+            structs.memory.memory_proof_remaining <- structs.memory.memory_proof_remaining - cost
+            return true
+
+        def memory_scalar(value: Expr, buffer: sview, scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, before_allocation: bool = false) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if not memory_proof_charge(structs, 1 + scope.names.count)
             match value:
                 Expr.IntLit(_, _) | Expr.BoolLit(_, _) | Expr.FloatLit(_, _):
                     return true
                 Expr.Ident(name, _):
                     return name != buffer and loop_scratch_scalar_type(lookup_type(scope, name))
                 Expr.Index(head, index, _):
+                    false return if before_allocation
                     if head is Expr.Ident(name, _):
-                        return name == buffer and memory_scalar(index, buffer, scope)
+                        return name == buffer and memory_scalar(index, buffer, scope, fns, structs, generics, before_allocation)
                     return false
                 Expr.Field(head, field, _):
                     if head is Expr.Ident(name, _):
                         return name == buffer and field == "count"
                     return false
                 Expr.Binary(left, op, right, _):
-                    return memory_scalar(left, buffer, scope) and memory_scalar(right, buffer, scope)
+                    # Empty-buffer stack placement moves a fixed allocation ahead of the
+                    # first push argument. Integer arithmetic, division, shifts, and
+                    # overloaded operators can trap or have effects, so keep those fills on
+                    # the old heap path. Later reads do not move the allocation point.
+                    false return if before_allocation
+                    return memory_scalar(left, buffer, scope, fns, structs, generics, before_allocation) and memory_scalar(right, buffer, scope, fns, structs, generics, before_allocation)
                 Expr.Unary(op, inner, _):
-                    return (op == TokenKind.Minus or op == TokenKind.Plus or op == TokenKind.Not or op == TokenKind.Tilde) and memory_scalar(inner, buffer, scope)
+                    false return if before_allocation and op == TokenKind.Minus
+                    return (op == TokenKind.Minus or op == TokenKind.Plus or op == TokenKind.Not or op == TokenKind.Tilde) and memory_scalar(inner, buffer, scope, fns, structs, generics, before_allocation)
                 Expr.Paren(inner, _):
-                    return memory_scalar(inner, buffer, scope)
+                    return memory_scalar(inner, buffer, scope, fns, structs, generics, before_allocation)
                 Expr.If(condition, yes, no, _):
-                    return memory_scalar(condition, buffer, scope) and memory_scalar(yes, buffer, scope) and memory_scalar(no, buffer, scope)
-                # `i.i64()` / `x.u8()`: a numeric conversion of a scalar is itself a scalar.
-                # It takes no argument besides its scalar receiver, so it cannot observe,
-                # alias or grow the buffer (it may trap on an out-of-range value, which is
-                # not an escape). Without this the ubiquitous loop-index spelling
-                # `xs.push(seed + i.i64())` kept every such buffer on the heap.
+                    return memory_scalar(condition, buffer, scope, fns, structs, generics, before_allocation) and memory_scalar(yes, buffer, scope, fns, structs, generics, before_allocation) and memory_scalar(no, buffer, scope, fns, structs, generics, before_allocation)
+                # `i.i64()` / `x.u8()`: only an exact builtin numeric conversion of a scalar
+                # is admitted; matching user `__cast__` hooks fail the test above. In the
+                # pre-allocation mode, potentially trapping integer expressions and
+                # float-to-integer casts also keep the buffer on its old heap path.
                 Expr.Call(callee, arguments, labels, _):
                     false return if arguments.count != 0
                     if callee is Expr.Field(receiver, method, _):
-                        return memory_conversion_method(method) and memory_scalar(receiver, buffer, scope)
+                        return memory_conversion_method(method) and memory_builtin_conversion(receiver, method, scope, fns, structs, generics, before_allocation) and memory_scalar(receiver, buffer, scope, fns, structs, generics, before_allocation)
                     return false
                 _:
                     return false
 
         def memory_conversion_method(method: sview) -> bool:
-            return method == "i64" or method == "i32" or method == "i16" or method == "i8" or method == "u64" or method == "u32" or method == "u16" or method == "u8" or method == "usize" or method == "isize"
+            return when method:
+                "i64" | "i32" | "i16" | "i8" | "u64" | "u32" | "u16" | "u8" | "usize" | "isize" -> true
+                _ -> false
 
-        def memory_scope(scope: Scope&) -> Scope can[Abort.Panic, Memory.Allocate]:
+        # Direct-call lowering gives an exact visible user `__cast__(Source) -> Target`
+        # hook priority over these builtin conversions. A name-only proof would therefore
+        # treat an effectful user hook as a pure scalar cast and could stack-place a buffer
+        # whose fill loop mutates globals or observes its environment. Mirror the emitter's
+        # exact source/target lookup before admitting the builtin-only case.
+        def memory_builtin_conversion(receiver: Expr, method: sview, scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, before_allocation: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if not memory_proof_charge(structs, fns.names.count)
+            target: ValueType = scalar_type_of_name(method, structs.target.target_pointer_bits)
+            return false if not is_integer_type(target)
+            default_source: ValueType = ValueType{kind: TypeKind.Float, bits: 64} if cast_receiver_is_float_literal(receiver) else ValueType{kind: TypeKind.Signed, bits: 64}
+            source: ValueType = resolve_type(receiver, default_source, scope, fns, structs, generics)
+            return false if source.kind == TypeKind.Unmodeled
+            false return if before_allocation and source.kind == TypeKind.Float
+            return cast_hook_index(fns, source, target) < 0
+
+        def memory_scope(scope: Scope&, structs: mutable StructTable&) -> Scope can[Abort.Panic, Memory.Allocate]:
+            empty: Scope = Scope{names: [], types: [], slots: [], pool_names: [], group_names: [], deferred: []}
+            return empty if not memory_proof_charge(structs, scope.names.count + scope.types.count)
             return Scope{names: [name for name in scope.names], types: [kind for kind in scope.types], slots: [], pool_names: [], group_names: [], deferred: []}
 
         # This proof forbids capacity/data observation, calls, aliases, address taking,
         # writes through the buffer, and all further growth. Loops only read scalars.
-        def memory_read_body(body: darray[Stmt]&, buffer: sview, scope: mutable Scope&, allow_return: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            for statement in body |scope|:
+        def memory_read_body(body: darray[Stmt]&, buffer: sview, scope: mutable Scope&, allow_return: bool, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, start: usize = 0) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if not memory_proof_charge(structs, 1 + scope.names.count)
+            # Walk the source body from its cursor instead of copying each candidate's
+            # remaining suffix. The proof is speculative, so keeping its input borrowed
+            # avoids quadratic statement-copying across multiple buffer declarations.
+            for statement_index in start..<body.count |scope|:
+                false return if not memory_proof_charge(structs, 1 + scope.names.count)
+                statement: Stmt = body[statement_index]
                 match statement:
                     Stmt.VarDecl(name, kind, value, _):
                         return false if name == buffer or lookup_type(scope, name).kind != TypeKind.Unmodeled
-                        return false if not scratch_scalar_annotation(kind) or not memory_scalar(value, buffer, scope)
+                        return false if not scratch_scalar_annotation(kind)
+                        scalar_type: ValueType = annotation_value_type(kind, structs)
+                        return false if not loop_scratch_scalar_type(scalar_type) or not memory_scalar(value, buffer, scope, fns, structs, generics)
                         scope.names.push(name)
-                        scope.types.push(ValueType{kind: TypeKind.Signed, bits: 64})
+                        scope.types.push(scalar_type)
                     Stmt.Assign(target, op, value, _):
                         if target is Expr.Ident(name, _):
                             return false if name == buffer or not loop_scratch_scalar_type(lookup_type(scope, name))
-                            return false if not memory_scalar(value, buffer, scope)
+                            return false if not memory_scalar(value, buffer, scope, fns, structs, generics)
                         else:
                             return false
                     Stmt.Return(value, _):
                         return false if not allow_return
                         if value is expression:
-                            return false if not memory_scalar(expression, buffer, scope)
+                            return false if not memory_scalar(expression, buffer, scope, fns, structs, generics)
                         else:
                             return false
                     Stmt.If(condition, yes, no, _):
-                        return false if not memory_scalar(condition, buffer, scope)
-                        yes_scope: mutable Scope = memory_scope(scope)
-                        no_scope: mutable Scope = memory_scope(scope)
-                        return false if not memory_read_body(yes, buffer, yes_scope, allow_return) or not memory_read_body(no, buffer, no_scope, allow_return)
+                        return false if not memory_scalar(condition, buffer, scope, fns, structs, generics)
+                        yes_scope: mutable Scope = memory_scope(scope, structs)
+                        no_scope: mutable Scope = memory_scope(scope, structs)
+                        return false if not memory_read_body(yes, buffer, yes_scope, allow_return, fns, structs, generics) or not memory_read_body(no, buffer, no_scope, allow_return, fns, structs, generics)
                     Stmt.For(binding, names, iterable, nested, _):
                         return false if binding != "" or names.count != 1 or names[0] == buffer
                         return false if lookup_type(scope, names[0]).kind != TypeKind.Unmodeled
@@ -98,19 +150,19 @@ extend Backend:
                             if iterable is Expr.Ident(name, _):
                                 name == buffer
                             elif iterable is Expr.Binary(low, op, high, _):
-                                (op == TokenKind.RangeLt or op == TokenKind.RangeLe) and memory_scalar(low, buffer, scope) and memory_scalar(high, buffer, scope)
+                                (op == TokenKind.RangeLt or op == TokenKind.RangeLe) and memory_scalar(low, buffer, scope, fns, structs, generics) and memory_scalar(high, buffer, scope, fns, structs, generics)
                             else:
                                 false
                         return false if not valid
-                        nested_scope: mutable Scope = memory_scope(scope)
+                        nested_scope: mutable Scope = memory_scope(scope, structs)
                         nested_scope.names.push(names[0])
                         nested_scope.types.push(ValueType{kind: TypeKind.Signed, bits: 64})
-                        return false if not memory_read_body(nested, buffer, nested_scope, false)
+                        return false if not memory_read_body(nested, buffer, nested_scope, false, fns, structs, generics)
                     Stmt.Expr(expression, _):
                         if expression is Expr.Block(nested, value, captures, _):
                             return false if not (value is Expr.Invalid)
-                            nested_scope: mutable Scope = memory_scope(scope)
-                            return false if not memory_read_body(nested, buffer, nested_scope, allow_return)
+                            nested_scope: mutable Scope = memory_scope(scope, structs)
+                            return false if not memory_read_body(nested, buffer, nested_scope, allow_return, fns, structs, generics)
                         else:
                             return false
                     _:
@@ -119,15 +171,18 @@ extend Backend:
 
         # Capture headers are transparent statement blocks, but declarations/yields
         # in a header are not: only unwrap a single statement and an Invalid result.
-        def memory_unwrap(statement: Stmt) -> Stmt can[Abort.Panic]:
+        def memory_unwrap(statement: Stmt, structs: mutable StructTable&) -> Stmt can[Abort.Panic]:
+            return statement if not memory_proof_charge(structs, 1)
             if statement is Stmt.Expr(expression, _):
                 if expression is Expr.Block(nested, value, captures, _):
                     if nested.count == 1 and value is Expr.Invalid:
-                        return memory_unwrap(nested[0])
+                        return memory_unwrap(nested[0], structs)
             return statement
 
-        def memory_fill_bound(statement: Stmt, buffer: sview, scope: mutable Scope&) -> Expr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            unwrapped: Stmt = memory_unwrap(statement)
+        def memory_fill_bound(statement: Stmt, buffer: sview, scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> Expr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if not memory_proof_charge(structs, 1 + scope.names.count)
+            unwrapped: Stmt = memory_unwrap(statement, structs)
+            return null if structs.memory.memory_proof_exhausted
             if unwrapped is Stmt.For(binding, names, iterable, nested, pos):
                 return null if binding != "" or names.count != 1 or names[0] == buffer or nested.count != 1
                 return null if lookup_type(scope, names[0]).kind != TypeKind.Unmodeled
@@ -152,10 +207,10 @@ extend Backend:
                             if callee is Expr.Field(head, method, _):
                                 if head is Expr.Ident(name, _):
                                     return null if name != buffer or method != "push"
-                                    inner: mutable Scope = memory_scope(scope)
+                                    inner: mutable Scope = memory_scope(scope, structs)
                                     inner.names.push(names[0])
                                     inner.types.push(ValueType{kind: TypeKind.Signed, bits: 64})
-                                    return high if memory_scalar(args[0], "", inner)
+                                    return high if memory_scalar(args[0], "", inner, fns, structs, generics, true)
             return null
 
         def memory_buffer_type(annotation: Expr) -> bool can[Abort.Panic]:
@@ -168,9 +223,11 @@ extend Backend:
                     return name == "darray" and element_name == "i64"
             return false
 
-        def memory_buffer_bound(body: darray[Stmt]&, row: usize, scope: mutable Scope&, structs: StructTable&) -> Expr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def memory_buffer_bound(body: darray[Stmt]&, row: usize, scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> Expr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if not memory_proof_charge(structs, 1 + scope.names.count)
             if body[row] is Stmt.VarDecl(name, kind, value, pos):
                 return null if not memory_buffer_type(kind) or lookup_type(scope, name).kind != TypeKind.Unmodeled
+                return null if not memory_proof_charge(structs, structs.regions.local_region_lines.count)
                 for line in structs.regions.local_region_lines:
                     return null if line == pos.line
                 if value is Expr.Array(elements, _):
@@ -178,34 +235,36 @@ extend Backend:
                     start: mutable usize = row + 1
                     if elements.count == 0:
                         return null if start >= body.count
-                        if memory_fill_bound(body[start], name, scope) is fill_bound:
+                        if memory_fill_bound(body[start], name, scope, fns, structs, generics) is fill_bound:
                             bound <- fill_bound
                             start <- start + 1
                         else:
                             return null
                     else:
                         for element in elements:
-                            return null if not memory_scalar(element, "", scope)
-                    rest: darray[Stmt] = [body[index] for index in start..<body.count]
-                    read_scope: mutable Scope = memory_scope(scope)
-                    return bound if memory_read_body(rest, name, read_scope, true)
+                            return null if not memory_scalar(element, "", scope, fns, structs, generics, true)
+                    read_scope: mutable Scope = memory_scope(scope, structs)
+                    return bound if memory_read_body(body, name, read_scope, true, fns, structs, generics, start)
             return null
 
         def memory_emit_buffer(body: darray[Stmt]&, row: usize, block_tail: Expr, return_type: ValueType, scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return 0 if not memory_is_declaration(body[row])
             return 0 if not structs.memory.memory_speed_enabled
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            memory_proof_begin(function, structs)
+            return 0 if structs.memory.memory_proof_exhausted
             # A value block's tail is evaluated after its statements and outlives them:
             # `x = if c: buf: darray[i64] = [..]; buf` hands the stack storage to the
             # caller. The read proof only walks the statements, so the tail must be a
             # scalar read too, or the buffer stays on the heap.
             if body[row] is Stmt.VarDecl(tail_buffer, _, _, _):
                 if not (block_tail is Expr.Invalid):
-                    tail_scope: mutable Scope = memory_scope(scope)
-                    return 0 if not memory_scalar(block_tail, tail_buffer, tail_scope)
-            if memory_buffer_bound(body, row, scope, structs) is bound:
+                    tail_scope: mutable Scope = memory_scope(scope, structs)
+                    return 0 if not memory_scalar(block_tail, tail_buffer, tail_scope, fns, structs, generics)
+            if memory_buffer_bound(body, row, scope, fns, structs, generics) is bound:
                 if body[row] is Stmt.VarDecl(name, kind, value, pos):
                     if value is Expr.Array(elements, array_pos):
-                        function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        return 0 if not memory_proof_charge(structs, structs.memory.memory_stack_functions.count)
                         stack_count: i64 =
                             candidate: mutable i64 = 0
                             if bound is Expr.IntLit(number, _):
@@ -246,34 +305,37 @@ extend Backend:
                         return -1
             return 0
 
-        def memory_find_helper(declarations: darray[Decl]&, name: sview, owner: sview, here: sview) -> Decl? can[Abort.Panic, Memory.Allocate]:
+        def memory_find_helper(declarations: darray[Decl]&, name: sview, owner: sview, here: sview, structs: mutable StructTable&) -> Decl? can[Abort.Panic, Memory.Allocate]:
             for declaration in declarations:
+                return null if not memory_proof_charge(structs, 1)
                 if declaration is Decl.Func(candidate, params, result, body, effects, decorators, pos):
                     return declaration if candidate == name and owner == here
                 elif declaration is Decl.Module(module_name, nested, pos):
-                    if memory_find_helper(nested, name, owner, module_name) is found:
+                    if memory_find_helper(nested, name, owner, module_name, structs) is found:
                         return found
                 elif declaration is Decl.Scoped(nested, pos):
-                    if memory_find_helper(nested, name, owner, here) is found:
+                    if memory_find_helper(nested, name, owner, here, structs) is found:
                         return found
             return null
 
         # Avoid capture without renaming source locals. A collision is a fallback,
         # not an invitation to resolve a helper-local name in the caller's scope.
-        def memory_names_free(body: darray[Stmt]&, result: sview, caller: mutable Scope&) -> bool can[Abort.Panic, Memory.Allocate]:
+        def memory_names_free(body: darray[Stmt]&, result: sview, caller: mutable Scope&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
             for statement in body:
+                return false if not memory_proof_charge(structs, 1 + caller.names.count)
                 match statement:
                     Stmt.VarDecl(name, kind, value, pos):
                         return false if name == result or name == "__memory_helper_scratch" or lookup_type(caller, name).kind != TypeKind.Unmodeled
                     Stmt.For(binding, names, iterable, nested, pos):
                         for name in names:
+                            return false if not memory_proof_charge(structs, 1 + caller.names.count)
                             return false if name == result or name == "__memory_helper_scratch" or lookup_type(caller, name).kind != TypeKind.Unmodeled
-                        return false if not memory_names_free(nested, result, caller)
+                        return false if not memory_names_free(nested, result, caller, structs)
                     Stmt.If(condition, yes, no, pos):
-                        return false if not memory_names_free(yes, result, caller) or not memory_names_free(no, result, caller)
+                        return false if not memory_names_free(yes, result, caller, structs) or not memory_names_free(no, result, caller, structs)
                     Stmt.Expr(expression, pos):
                         if expression is Expr.Block(nested, value, captures, block_pos):
-                            return false if not memory_names_free(nested, result, caller)
+                            return false if not memory_names_free(nested, result, caller, structs)
                     _:
                         pass
             return true
@@ -281,6 +343,9 @@ extend Backend:
         def memory_emit_helper(statement: Stmt, return_type: ValueType, scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return 0 if loops.exits.count == 0 or not memory_is_declaration(statement)
             return 0 if not structs.memory.memory_speed_enabled or not structs.memory.memory_helper_enabled
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            memory_proof_begin(function, structs)
+            return 0 if structs.memory.memory_proof_exhausted
             return 0 if lookup_type(scope, "__memory_helper_scratch").kind != TypeKind.Unmodeled
             if statement is Stmt.VarDecl(result_name, result_kind, value, pos):
                 return 0 if result_name == "_" or result_name == "__memory_helper_scratch" or lookup_type(scope, result_name).kind != TypeKind.Unmodeled
@@ -300,7 +365,9 @@ extend Backend:
                     return 0 if name == ""
                     # Templates are absent from FnTable. Count source declarations too,
                     # so a generic/non-generic name collision cannot select another body.
-                    return 0 if scratch_declaration_count(structs.memory.memory_declarations, name) != 1
+                    declaration_count: usize = scratch_declaration_count(structs.memory.memory_declarations, name, structs)
+                    return 0 if structs.memory.memory_proof_exhausted or declaration_count != 1
+                    return 0 if not memory_proof_charge(structs, fns.names.count)
                     target: i64 = scratch_unique_target(name, owner, fns)
                     return 0 if target < 0
                     row: usize = target.usize()
@@ -308,8 +375,9 @@ extend Backend:
                     return 0 if fns.returns[row].kind != TypeKind.Signed or fns.returns[row].bits != 64
                     return 0 if args.count != fns.param_count[row] or args.count > 4
                     for label in labels:
+                        return 0 if not memory_proof_charge(structs, 1)
                         return 0 if label != ""
-                    if memory_find_helper(structs.memory.memory_declarations, name, owner, "") is declaration:
+                    if memory_find_helper(structs.memory.memory_declarations, name, owner, "", structs) is declaration:
                         if declaration is Decl.Func(helper_name, params, result, body, effects, decorators, helper_pos):
                             return 0 if fns.lines[row] != helper_pos.line
                             return 0 if decorators.count != 0 or body.count < 3 or body.count > 8 or params.count != args.count
@@ -320,26 +388,26 @@ extend Backend:
                                 return 0 if parameter.kind != TypeKind.Signed or parameter.bits != 64
                                 parameter_name: sview = params[index].name
                                 return 0 if parameter_name == result_name or parameter_name == "__memory_helper_scratch" or lookup_type(scope, parameter_name).kind != TypeKind.Unmodeled
-                                return 0 if not memory_scalar(args[index], "", scope)
+                                return 0 if not memory_scalar(args[index], "", scope, fns, structs, generics)
                                 helper_scope.names.push(parameter_name)
                                 helper_scope.types.push(parameter)
                                 bound_params.push(Stmt.VarDecl(parameter_name, Expr.Ident("i64", pos), args[index], pos))
-                            return 0 if not memory_names_free(body, result_name, scope)
-                            if memory_buffer_bound(body, 0, helper_scope, structs) is bound:
+                            return 0 if not memory_names_free(body, result_name, scope, structs)
+                            if memory_buffer_bound(body, 0, helper_scope, fns, structs, generics) is bound:
                                 # A single final return is lowered to a scalar copy before reset.
                                 if body[body.count - 1] is Stmt.Return(return_value, return_pos):
                                     if return_value is expression:
                                         inner: darray[Stmt] = [body[index] for index in 2..<(body.count - 1)]
-                                        read_scope: mutable Scope = memory_scope(helper_scope)
+                                        read_scope: mutable Scope = memory_scope(helper_scope, structs)
                                         buffer_name: sview =
                                             if body[0] is Stmt.VarDecl(buffer, kind, initial, _):
                                                 buffer
                                             else:
                                                 ""
-                                        return 0 if not memory_read_body(inner, buffer_name, read_scope, false)
-                                        return 0 if not memory_scalar(expression, buffer_name, read_scope)
+                                        return 0 if not memory_read_body(inner, buffer_name, read_scope, false, fns, structs, generics)
+                                        return 0 if not memory_scalar(expression, buffer_name, read_scope, fns, structs, generics)
                                         # Require a counted fill, not an arbitrary second statement.
-                                        return 0 if not (memory_fill_bound(body[1], buffer_name, helper_scope) is fill)
+                                        return 0 if not (memory_fill_bound(body[1], buffer_name, helper_scope, fns, structs, generics) is fill)
                                         output_kind: Expr = Expr.Unary(TokenKind.Mutable, Expr.Ident("i64", pos), pos)
                                         output: Stmt = Stmt.VarDecl(result_name, output_kind, Expr.IntLit(0, pos), pos)
                                         return -1 if (emit_statement(output, return_type, scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) != EmitStatus.Open
