@@ -69,7 +69,10 @@ NON_CALL_KEYWORDS = {
 # Source-language intrinsics without ordinary source definitions. Keep this list
 # narrow: an unresolved free call is an unknown effect unless explicitly known pure.
 PURE_FREE_CALLS = {"sview", "sview_len", "sview_at", "getenv"}
-DEF_RE = re.compile(r"^(\s*)def (\w+)(?:\[[^\]]*\])?\((.*?)\)\s*(?:->|:)")
+# Ghost definitions are verification-only, but their bodies are still useful to the
+# audit when a proof contract calls them. Analyzing their real call graph avoids
+# misclassifying a known pure ghost helper as an unknown runtime effect.
+DEF_RE = re.compile(r"^(\s*)(?:ghost\s+)?def (\w+)(?:\[[^\]]*\])?\((.*?)\)\s*(?:->|:)")
 EXTERN_FUNC_RE = re.compile(r"^\s*extern\s+(\w+)\s*\(")
 TABLE_DECL_RE = re.compile(r"\b(\w+)\s*:\s*(?:lmut\s+|mutable\s+|heap\s+)*SymbolTable\b")
 GLOBAL_RE = re.compile(r"^\s*global\s+mutable\s+(\w+)(?:\s*:\s*([^#=\n]*))?")
@@ -1484,6 +1487,67 @@ def return_value_before_guard(expression):
     return expression[:guard_index].strip() if guard_index is not None else expression
 
 
+def _top_level_conditional_keyword(expression, keyword, start=0):
+    """Find a whitespace-delimited conditional keyword outside values and strings."""
+    stack = []
+    matching_open = {")": "(", "]": "[", "}": "{"}
+    quote = ""
+    escaped = False
+    for index, char in enumerate(expression):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            continue
+        if char in "([{":
+            stack.append(char)
+            continue
+        if char in matching_open:
+            if stack and stack[-1] == matching_open[char]:
+                stack.pop()
+            continue
+        if stack or index < start or not expression.startswith(keyword, index):
+            continue
+        end = index + len(keyword)
+        if index > 0 and end < len(expression) and expression[index - 1].isspace() and expression[end].isspace():
+            return index
+    return -1
+
+
+def returned_value_arms(expression):
+    """Return only value arms, excluding predicates from a conditional return."""
+    expression = expression.strip()
+    lines = expression.splitlines()
+    if lines and re.match(r"^if\b", lines[0]) and has_top_level_colon(lines[0]):
+        # `return if predicate:\n    value\nelse:\n    other` is a block
+        # expression. The predicate controls selection but is not returned. Since
+        # returned_expressions intentionally flattens indentation, strip only the
+        # branch headers and retain every branch value for the alias check.
+        branch_headers = re.compile(r"^(?:if|elif|else)\b.*:\s*$")
+        if any(branch_headers.match(line) for line in lines[1:]):
+            values = [line for line in lines[1:] if not branch_headers.match(line)]
+            return ["\n".join(values).strip()] if values else []
+
+    conditional = _top_level_conditional_keyword(expression, "if", start=1)
+    if conditional >= 0:
+        else_index = _top_level_conditional_keyword(expression, "else", conditional + 2)
+        if else_index >= 0:
+            # Ternary form (`value if predicate else other`): both value operands
+            # can escape; references used only by the predicate cannot.
+            return returned_value_arms(expression[:conditional]) + returned_value_arms(
+                expression[else_index + len("else"):]
+            )
+        # The no-else spelling is a postfix guard, so only its prefix is a value.
+        return returned_value_arms(expression[:conditional])
+    return [expression] if expression else []
+
+
 def returned_expressions(text):
     """Yield inline returns and indented return-value blocks from one function body."""
     lines = text.splitlines()
@@ -1682,76 +1746,77 @@ def analyze(
                 expression = return_value_before_guard(
                     returned_expression.strip().rstrip(";").strip()
                 )
-                if argument_is_whole_table(expression, tables, table_aliases):
-                    writes.add("returned-whole-table-alias")
-                    continue
-                unwrapped = expression
-                while unwrapped.startswith("(") and matching_delimiter(unwrapped, 0) == len(unwrapped) - 1:
-                    unwrapped = unwrapped[1:-1].strip()
-                borrowed = unwrapped.startswith("&")
-                if borrowed:
-                    unwrapped = unwrapped[1:].strip()
+                for expression in returned_value_arms(expression):
+                    if not expression:
+                        continue
+                    if argument_is_whole_table(expression, tables, table_aliases):
+                        writes.add("returned-whole-table-alias")
+                        continue
+                    unwrapped = expression
                     while unwrapped.startswith("(") and matching_delimiter(unwrapped, 0) == len(unwrapped) - 1:
                         unwrapped = unwrapped[1:-1].strip()
-                field_path = re.fullmatch(
-                    r"(\w+)((?:\s*\.\s*\w+|\s*\[[^\]\n]*\])*)", unwrapped
-                )
-                direct_field = bool(field_path and field_path.group(1) in tables)
-                alias_derived = bool(
-                    field_path
-                    and field_path.group(1) in field_aliases | diagnostic_aliases
-                )
-                if direct_field or alias_derived:
-                    value_type = table_field_expression_type(
-                        unwrapped,
-                        tables,
-                        table_field_types,
-                        type_aliases,
-                        struct_field_types,
+                    borrowed = unwrapped.startswith("&")
+                    if borrowed:
+                        unwrapped = unwrapped[1:].strip()
+                        while unwrapped.startswith("(") and matching_delimiter(unwrapped, 0) == len(unwrapped) - 1:
+                            unwrapped = unwrapped[1:-1].strip()
+                    field_path = re.fullmatch(
+                        r"(\w+)((?:\s*\.\s*\w+|\s*\[[^\]\n]*\])*)", unwrapped
                     )
-                    if alias_derived and not direct_field:
-                        value_type = local_path_expression_type(
-                            unwrapped, text, struct_field_types
-                        )
-                    copied_value_is_safe = bool(
-                        value_type
-                        and type_is_copy_value(value_type, type_aliases, struct_field_types)
-                        and not type_may_contain_reference(
-                            value_type, type_aliases, struct_field_types
-                        )
+                    direct_field = bool(field_path and field_path.group(1) in tables)
+                    alias_derived = bool(
+                        field_path
+                        and field_path.group(1) in field_aliases | diagnostic_aliases
                     )
-                    if borrowed or not copied_value_is_safe:
-                        writes.add("returned-table-field-alias")
-                elif any(
-                    re.search(r"\b" + re.escape(alias) + r"\b", expression)
-                    for alias in tables | table_aliases | field_aliases | diagnostic_aliases
-                ) and (
-                    (
-                        declared_return_type
-                        and (
-                            not type_is_copy_value(
+                    if direct_field or alias_derived:
+                        value_type = table_field_expression_type(
+                            unwrapped,
+                            tables,
+                            table_field_types,
+                            type_aliases,
+                            struct_field_types,
+                        )
+                        if alias_derived and not direct_field:
+                            value_type = local_path_expression_type(
+                                unwrapped, text, struct_field_types
+                            )
+                        copied_value_is_safe = bool(
+                            value_type
+                            and type_is_copy_value(value_type, type_aliases, struct_field_types)
+                            and not type_may_contain_reference(
+                                value_type, type_aliases, struct_field_types
+                            )
+                        )
+                        if borrowed or not copied_value_is_safe:
+                            writes.add("returned-table-field-alias")
+                    elif any(
+                        re.search(r"\b" + re.escape(alias) + r"\b", expression)
+                        for alias in tables | table_aliases | field_aliases | diagnostic_aliases
+                    ) and (
+                        (
+                            not declared_return_type
+                            or not type_is_copy_value(
                                 declared_return_type, type_aliases, struct_field_types
                             )
                             or type_may_contain_reference(
                                 declared_return_type, type_aliases, struct_field_types
                             )
                         )
-                    )
-                    or not returned_shared_paths_are_copies(
-                        expression,
-                        text,
-                        tables,
-                        field_aliases,
-                        diagnostic_aliases,
-                        table_field_types,
-                        type_aliases,
-                        struct_field_types,
-                    )
-                ):
-                    # A computed/block return that mentions shared table state and
-                    # could carry an alias cannot be proven to return a copy. A known
-                    # scalar result remains safe even when computed from table fields.
-                    writes.add("returned-unknown-table-alias")
+                        and not returned_shared_paths_are_copies(
+                            expression,
+                            text,
+                            tables,
+                            field_aliases,
+                            diagnostic_aliases,
+                            table_field_types,
+                            type_aliases,
+                            struct_field_types,
+                        )
+                    ):
+                        # A computed/block return that mentions shared table state and
+                        # could carry an alias cannot be proven to return a copy. A known
+                        # scalar result remains safe even when computed from table fields.
+                        writes.add("returned-unknown-table-alias")
             if glob_re is not None:
                 for m in glob_re.finditer(text):
                     lead = text[max(0, m.start() - 2):m.start()]
@@ -1781,13 +1846,26 @@ def analyze(
             # accumulated diagnostics stream instead of trying to infer its use mode.
             if diagnostic_aliases:
                 reads_diag = True
+            # A raw pointer cast can let a value stored in the shared table escape as an
+            # address. Catch direct paths too; the local alias pass below handles copied
+            # reference-bearing fields such as `name: sview = table.current_name`.
+            table_field_part = r"(?:\s*\.\s*\w+|\s*\[[^\]\n]*\])"
+            for table in sorted(tables):
+                te = re.escape(table)
+                table_cast_source = re.compile(
+                    BORROWED_NAME_PREFIX + r"\b" + te + r"\b\s*\.\s*(?P<field>\w+)"
+                    + table_field_part + r"*(?:\s*\))*\s*\.\s*cast\s*\["
+                )
+                if any(match.group("field") != "diagnostics" for match in table_cast_source.finditer(code_text)):
+                    writes.add("table-backed-address-cast")
             for alias in sorted(field_aliases):
                 ae = re.escape(alias)
-                if alias in borrowed_field_aliases and re.search(
-                    r"(?:\(\s*)*\b" + ae + r"\b(?:\s*\))*\s*\.\s*cast\s*\[", code_text
-                ):
+                alias_part = table_field_part
+                cast_source = BORROWED_NAME_PREFIX + r"\b" + ae + r"\b" + alias_part + r"*(?:\s*\))*"
+                # A copied `sview` is still a reference-bearing alias. Its `.data` pointer
+                # can be cast and escape even though the local itself was not borrowed with `&`.
+                if re.search(cast_source + r"\s*\.\s*cast\s*\[", code_text):
                     writes.add("table-backed-address-cast")
-                alias_part = r"(?:\.\w+|\[[^\]\n]*\])"
                 alias_path = r"\b" + ae + alias_part + r"*"
                 if alias in borrowed_field_aliases and re.search(r"\b" + ae + r"\s*<-", text):
                     writes.add("alias:" + alias)

@@ -139,6 +139,45 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
         self.assertFalse(audit.append_only(info, "root")[0])
 
+    def test_ghost_helper_in_contract_is_analyzed_as_a_known_callee(self):
+        ghost_header = "ghost def count_from(names: darray[sview]&, index: usize) -> i64:"
+        match = audit.DEF_RE.match(ghost_header)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(2), "count_from")
+        self.assertEqual(match.group(3), "names: darray[sview]&, index: usize")
+
+        info = analyze({
+            "count_from": [definition(
+                "names: darray[sview]&, index: usize",
+                "ghost def count_from(names: darray[sview]&, index: usize) -> i64:\n"
+                "    return 0 if index >= names.count\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    ensure count_from([], 0) == 0\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertTrue(append_only, writes)
+
+    def test_unknown_call_in_ghost_helper_still_fails_closed(self):
+        info = analyze({
+            "count_from": [definition(
+                "names: darray[sview]&",
+                "ghost def count_from(names: darray[sview]&):\n"
+                "    unknown_side_effect()\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    ensure count_from([]) == 0\n",
+            )],
+        })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
     def test_unknown_zero_argument_call_in_helper_fails_closed(self):
         info = analyze({
             "unknown_helper": [definition(
@@ -473,6 +512,82 @@ class SemanticParallelAuditTest(unittest.TestCase):
         append_only, writes, _ = audit.append_only(info, "selected_duplicate_count")
         self.assertTrue(append_only, writes)
 
+    def test_table_field_used_only_in_block_return_predicate_stays_append_only(self):
+        info = analyze({
+            "choose": [definition(
+                "table: SymbolTable&, enabled: bool",
+                'def choose(table: SymbolTable&, enabled: bool) -> u32:\n'
+                '    return if table.current_name == "x":\n'
+                '        1\n'
+                '    else:\n'
+                '        0\n',
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, current_name="sview"))
+
+        append_only, writes, _ = audit.append_only(info, "choose")
+        self.assertTrue(append_only, writes)
+
+    def test_table_field_used_only_in_nested_block_return_predicate_stays_append_only(self):
+        info = analyze({
+            "choose": [definition(
+                "table: SymbolTable&, enabled: bool",
+                'def choose(table: SymbolTable&, enabled: bool) -> u32:\n'
+                '    return if enabled:\n'
+                '        if table.current_name == "x":\n'
+                '            1\n'
+                '        else:\n'
+                '            0\n'
+                '    else:\n'
+                '        2\n',
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, current_name="sview"))
+
+        append_only, writes, _ = audit.append_only(info, "choose")
+        self.assertTrue(append_only, writes)
+
+    def test_reference_in_nested_block_return_arm_remains_rejected(self):
+        info = analyze({
+            "choose": [definition(
+                "table: SymbolTable&, enabled: bool",
+                'def choose(table: SymbolTable&, enabled: bool) -> sview:\n'
+                '    return if enabled:\n'
+                '        if table.current_name == "x":\n'
+                '            table.current_name\n'
+                '        else:\n'
+                '            "fallback"\n'
+                '    else:\n'
+                '        "other"\n',
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, current_name="sview"))
+
+        append_only, writes, _ = audit.append_only(info, "choose")
+        self.assertFalse(append_only)
+
+    def test_table_field_used_only_in_postfix_return_predicate_stays_append_only(self):
+        info = analyze({
+            "choose": [definition(
+                "table: SymbolTable&, enabled: bool",
+                'def choose(table: SymbolTable&, enabled: bool) -> u32:\n'
+                '    return 1 if table.current_name == "x" else 0\n',
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, current_name="sview"))
+
+        append_only, writes, _ = audit.append_only(info, "choose")
+        self.assertTrue(append_only, writes)
+
+    def test_reference_in_postfix_return_value_arm_remains_rejected(self):
+        info = analyze({
+            "choose": [definition(
+                "table: SymbolTable&, enabled: bool",
+                'def choose(table: SymbolTable&, enabled: bool) -> sview:\n'
+                '    return table.current_name if enabled else "fallback"\n',
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, current_name="sview"))
+
+        append_only, writes, _ = audit.append_only(info, "choose")
+        self.assertFalse(append_only)
+        self.assertIn("returned-table-field-alias", writes)
+
     def test_newline_return_value_block_cannot_escape_table_field(self):
         info = analyze({
             "expose": [definition(
@@ -522,7 +637,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
         append_only, writes, _ = audit.append_only(info, "expose")
         self.assertFalse(append_only)
-        self.assertTrue(any("returned-unknown-table-alias" in write for write in writes), writes)
+        self.assertIn("returned-table-field-alias", writes)
 
     def test_table_derived_receiver_from_known_helper_is_rejected(self):
         info = analyze({
@@ -669,6 +784,68 @@ class SemanticParallelAuditTest(unittest.TestCase):
                 "    mutate_address(bits)\n",
             )],
         })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_grouped_address_cast_of_table_field_is_rejected(self):
+        fields = dict(TABLE_FIELD_TYPES, current_name="sview")
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    bits: usize = (&table.current_name).cast[usize]\n",
+            )],
+        }, table_field_types=fields)
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_direct_table_view_data_cast_is_rejected(self):
+        fields = dict(TABLE_FIELD_TYPES, current_name="sview")
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    bits: usize = table.current_name.data.cast[usize]\n",
+            )],
+        }, table_field_types=fields)
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_grouped_table_view_data_cast_is_rejected(self):
+        fields = dict(TABLE_FIELD_TYPES, current_name="sview")
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    bits: usize = (table.current_name.data).cast[usize]\n",
+            )],
+        }, table_field_types=fields)
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_grouped_address_cast_of_copied_table_view_is_rejected(self):
+        fields = dict(TABLE_FIELD_TYPES, current_name="sview")
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    name: sview = table.current_name\n"
+                "    bits: usize = (&name.data).cast[usize]\n",
+            )],
+        }, table_field_types=fields)
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_direct_data_cast_of_copied_table_view_is_rejected(self):
+        fields = dict(TABLE_FIELD_TYPES, current_name="sview")
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    name: sview = table.current_name\n"
+                "    bits: usize = name.data.cast[usize]\n",
+            )],
+        }, table_field_types=fields)
 
         self.assertFalse(audit.append_only(info, "root")[0])
 
