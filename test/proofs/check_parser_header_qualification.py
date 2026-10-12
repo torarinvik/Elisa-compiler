@@ -77,17 +77,14 @@ if qualifier != expected_qualifier:
 if 'include "./parser_header_qualification.elisa"' not in IMPORTER.read_text():
     raise SystemExit("production parser assembly no longer includes the qualified-header helper")
 expected_peek = compact("""def peek_at(parser: Parser&, offset: usize) -> TokenKind:
+            TokenKind.Eof return if parser.position >= parser.tokens.count
+            remaining: usize = parser.tokens.count - parser.position
+            TokenKind.Eof return if offset >= remaining
             token_index: usize = parser.position + offset
-            machine over token_index:
-                state Peek
-                start Peek
-                Peek, _ if token_index < parser.tokens.count:
-                    return parser.tokens[token_index].kind
-                Peek, _:
-                    return TokenKind.Eof
-            return TokenKind.Eof""")
+            TokenKind.Eof return if token_index >= parser.tokens.count
+            return parser.tokens[token_index].kind""")
 if compact(function_section(CURSOR.read_text(), "peek_at")) != expected_peek:
-    raise SystemExit("parser lookahead no longer bounds token indexing and maps past-end reads to EOF")
+    raise SystemExit("parser lookahead no longer checks remaining length before adding and indexing")
 expected_capture = compact("""def capture_extern_header_contracts(parser: lmut Parser, extern_line: u32) -> void:
             can Abort.Panic, Memory.Allocate:
                 machine over parser.position while parser.peek() != TokenKind.Eof:
@@ -131,6 +128,7 @@ positive_names = {
     "offset_before_remaining_end_is_in_range",
     "offset_at_remaining_end_is_rejected",
     "offset_after_remaining_end_is_rejected",
+    "peek_index_is_inside_when_offset_fits",
     "following_peek_index_is_at_or_before_token_end",
     "preceding_peek_index_is_inside_token_stream",
     "cursor_predecessor_index_is_inside_token_stream",
@@ -159,6 +157,7 @@ positive_shapes = {
     "offset_before_remaining_end_is_in_range": "requires position < token_count requires offset < token_count - position ensure result == true return ParserHeaderQualification::offset_is_in_range(position, token_count, offset)",
     "offset_at_remaining_end_is_rejected": "requires position < token_count requires offset == token_count - position ensure result == true return not ParserHeaderQualification::offset_is_in_range(position, token_count, offset)",
     "offset_after_remaining_end_is_rejected": "requires position < token_count requires offset > token_count - position ensure result == true return not ParserHeaderQualification::offset_is_in_range(position, token_count, offset)",
+    "peek_index_is_inside_when_offset_fits": "requires position < token_count requires offset < token_count - position ensure result == true return position + offset < token_count",
     "following_peek_index_is_at_or_before_token_end": "requires position < token_count requires offset < token_count - position ensure result == true return position + offset + 1 <= token_count",
     "preceding_peek_index_is_inside_token_stream": "requires position < token_count requires offset > 0 requires offset < token_count - position ensure result == true return position + (offset - 1) < token_count",
     "cursor_predecessor_index_is_inside_token_stream": "requires position > 0 requires position < token_count ensure result == true return position - 1 < token_count",
@@ -182,6 +181,7 @@ for path, shapes in ((POSITIVE, positive_shapes), (NEGATIVE, negative_shapes)):
             "offset_before_remaining_end_is_in_range",
             "offset_at_remaining_end_is_rejected",
             "offset_after_remaining_end_is_rejected",
+            "peek_index_is_inside_when_offset_fits",
             "following_peek_index_is_at_or_before_token_end",
             "preceding_peek_index_is_inside_token_stream",
         } else (
