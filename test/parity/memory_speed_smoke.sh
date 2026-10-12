@@ -9,7 +9,7 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$WORK/hooks.o"
-for fixture in memory_speed_helper_reuse memory_speed_capacity memory_speed_stack memory_speed_fallbacks memory_speed_stack_budget memory_speed_stack_bounds memory_speed_helper_fallback memory_speed_helper_module memory_speed_generic_collision; do
+for fixture in memory_speed_helper_reuse memory_speed_capacity memory_speed_stack memory_speed_stack_builtin_cast memory_speed_stack_conversions memory_speed_custom_cast_stack memory_speed_custom_cast_local_type memory_speed_fallbacks memory_speed_stack_budget memory_speed_stack_bounds memory_speed_helper_fallback memory_speed_helper_module memory_speed_generic_collision; do
     for stage in 0 1; do
         compiler="$STAGE0"
         [[ "$stage" == 0 ]] || compiler="$STAGE1"
@@ -37,6 +37,9 @@ assert 'call i64 @measure(' not in main
 assert 'call void @arena_reset(' in main
 assert 'memory.reserve.count' in (p/'memory_speed_capacity.ll').read_text()
 assert 'memory.stack.buffer' in (p/'memory_speed_stack.ll').read_text()
+assert 'memory.stack.buffer' in (p/'memory_speed_stack_builtin_cast.ll').read_text()
+assert 'memory.stack.buffer' not in (p/'memory_speed_custom_cast_stack.ll').read_text()
+assert 'memory.stack.buffer' not in (p/'memory_speed_custom_cast_local_type.ll').read_text()
 fallback=(p/'memory_speed_fallbacks.ll').read_text()
 assert 'memory.stack.buffer' not in fallback
 assert 'memory.reserve.count' not in fallback

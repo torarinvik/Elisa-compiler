@@ -42,7 +42,8 @@ for repro in \
     zeroed_nonnull_reference_array_field.elisa \
     zeroed_nonnull_reference_tuple.elisa \
     zeroed_nonnull_reference_nested_field.elisa \
-    zeroed_nonnull_reference_generic_field.elisa; do
+    zeroed_nonnull_reference_generic_field.elisa \
+    zeroed_nonnull_reference_generic_field_line0.elisa; do
     for compiler in "${COMPILERS[@]}"; do
         for level in 0 2; do
             output="$WORK/$(basename -- "$compiler")-${repro%.elisa}-O$level.ll"

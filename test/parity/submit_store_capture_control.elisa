@@ -1,0 +1,110 @@
+# The compiler-AST field forces the worker hidden-store ABI, as in ParPassTicket.
+# The worker reads an IntLit payload from the captured store and combines it with
+# the captured bias, so a missing or wrong store changes the observed Task result.
+include "../../src/parser/parser_tokens.elisa"
+include "../../src/parser/parser_token_position.elisa"
+
+struct SubmitTicket:
+    node: Ast::Expr
+    bias: i64
+
+global mutable submit_group_gate: AtomicSlot[i64] = zeroed
+global mutable submit_group_finished: AtomicSlot[i64] = zeroed
+global mutable submit_group_result: AtomicSlot[i64] = zeroed
+
+def read_submit_ticket(ticket: SubmitTicket) -> i64:
+    return match ticket.node:
+        Ast::Expr.IntLit(value, _): ticket.bias + value
+        _: ticket.bias
+
+def subtract_submit_ticket(ticket: SubmitTicket) -> i64:
+    return match ticket.node:
+        Ast::Expr.IntLit(value, _): ticket.bias - value
+        _: ticket.bias
+
+# Overloads can differ in source parameter type and hidden store ABI. The submit
+# resolver must choose the Store-carrying overload from the actual argument type.
+def overloaded_submit_worker(value: i64) -> i64:
+    return value + 1000
+
+def overloaded_submit_worker(ticket: SubmitTicket) -> i64:
+    return match ticket.node:
+        Ast::Expr.IntLit(value, _): ticket.bias + value
+        _: ticket.bias
+
+# Plain submit also has to preserve the exact overload row selected from the
+# argument type. The i64 overload deliberately appears first so name-only Fn
+# lookup would hand the wrong ABI to pool_submit1.
+def plain_overloaded_submit_worker(value: i64) -> i64:
+    return value + 1000
+
+def plain_overloaded_submit_worker(value: i32) -> i64:
+    return value.i64() + 2000
+
+def read_submit_ticket_after_gate(ticket: SubmitTicket) -> i64:
+    can Atomics.Load, Atomics.Store, Thread.Sleep, Global{Read,Write}:
+        while load(&submit_group_gate, MemoryOrder.Acquire) == 0:
+            sleep_usec(1000.u64())
+        result: i64 = match ticket.node:
+            Ast::Expr.IntLit(value, _): ticket.bias + value
+            _: ticket.bias
+        store(&submit_group_result, result, MemoryOrder.Release)
+        store(&submit_group_finished, 1, MemoryOrder.Release)
+        return result
+
+def release_submit_group_gate(value: i64) -> i64:
+    can Atomics.Store, Thread.Sleep, Global{Read,Write}:
+        _ = value
+        sleep_usec(250_000.u64())
+        store(&submit_group_gate, 1, MemoryOrder.Release)
+        return 0
+
+# A source symbol is allowed to occupy the compiler's first candidate name. The thunk
+# generator must skip it instead of relying on LLVM's auto-suffixing behavior.
+def __submit_store_thunk_0(bits: uintptr) -> i64:
+    return 7
+
+def main() -> i64:
+    can Memory.Allocate, Memory.Release, Abort.Panic, Parallel, Unsafe.PointerCast, Pool.Create, Pool.Submit, Pool.Await, Pool.WaitAll, Pool.Shutdown, Thread.Spawn, Thread.Join, Thread.Sleep, Atomics.Store, Atomics.Load, Atomics.CompareExchange, Sync{Lock,Wait,Unlock,Notify}, Global{Read,Write}:
+        plain_submit_argument: i32 = 7
+        region nodes(65536):
+            store: Ast::Node.Store[Local] = Ast::Node.Store(nodes)
+            in store:
+                node: Ast::Expr = new Ast::Expr.IntLit(value: 10, pos: zeroed)
+                pool workers(2):
+                    pool secondary_workers(1):
+                        first_task: Task[i64, Pending] = submit[workers] read_submit_ticket(SubmitTicket{node: node, bias: 20})
+                        second_task: Task[i64, Pending] = submit[secondary_workers] read_submit_ticket(SubmitTicket{node: node, bias: 42})
+                        distinct_worker_task: Task[i64, Pending] = submit[workers] subtract_submit_ticket(SubmitTicket{node: node, bias: 100})
+                        overloaded_task: Task[i64, Pending] = submit[workers] overloaded_submit_worker(SubmitTicket{node: node, bias: 60})
+                        plain_overloaded_task: Task[i64, Pending] = submit[workers] plain_overloaded_submit_worker(plain_submit_argument)
+                        # Both explicit selectors share this physical source line. The task
+                        # values are retained until the nested pool scopes join at block exit.
+                        same_line_tasks = (submit[workers] read_submit_ticket(SubmitTicket{node: node, bias: 31}), submit[secondary_workers] read_submit_ticket(SubmitTicket{node: node, bias: 53}))
+                        first_result: i64 = pool_await(move first_task)
+                        second_result: i64 = pool_await(move second_task)
+                        distinct_worker_result: i64 = pool_await(move distinct_worker_task)
+                        overloaded_result: i64 = pool_await(move overloaded_task)
+                        plain_overloaded_result: i64 = pool_await(move plain_overloaded_task)
+                        if first_result != 30 or second_result != 52 or distinct_worker_result != 90 or overloaded_result != 70 or plain_overloaded_result != 2007:
+                            return 1
+                        loop_capture_group: mutable TaskGroup = task_group_new()
+                        for group_iteration in [0] |loop_capture_group|:
+                            loop_capture_task: Task[i64, Pending] = submit[workers] plain_overloaded_submit_worker(plain_submit_argument)
+                            task_group_add(loop_capture_group, move loop_capture_task)
+                        wait all loop_capture_group
+                store(&submit_group_gate, 0, MemoryOrder.Release)
+                store(&submit_group_finished, 0, MemoryOrder.Release)
+                store(&submit_group_result, 0, MemoryOrder.Release)
+                shared_workers: mutable ThreadPool = pool_new(2)
+                direct_plain_overloaded_result: i64 = pool_await(submit[shared_workers] plain_overloaded_submit_worker(plain_submit_argument))
+                if direct_plain_overloaded_result != 2007:
+                    return 1
+                manual_group: mutable TaskGroup = task_group_new()
+                submit[shared_workers] read_submit_ticket_after_gate(SubmitTicket{node: node, bias: 20})
+                submit[shared_workers] release_submit_group_gate(0)
+                task_group_wait_all(&manual_group)
+                finished_before_pool_shutdown: i64 = load(&submit_group_finished, MemoryOrder.Acquire)
+                result_before_pool_shutdown: i64 = load(&submit_group_result, MemoryOrder.Acquire)
+                pool_shutdown(&shared_workers)
+                return 0 if finished_before_pool_shutdown == 1 and result_before_pool_shutdown == 30 else 1

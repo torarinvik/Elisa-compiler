@@ -5,16 +5,33 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-stale-stage1.XXXXXX")"
+WORK="$(mktemp -d "$ROOT/bin/.elisa-stale-stage1.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 [[ -x "$ROOT/bin/elisac-stage1" ]] || {
   echo "stage1 stale-product smoke requires $ROOT/bin/elisac-stage1 (run scripts/elisac_stage1.sh --seed)" >&2
   exit 2
 }
+[[ -s "$ROOT/bin/elisac-stage1.provenance.json" ]] || {
+  echo "stage1 stale-product smoke requires the Stage1 provenance record (run scripts/elisac_stage1.sh --seed)" >&2
+  exit 2
+}
 
 install -m 755 "$ROOT/bin/elisac-stage1" "$WORK/elisac-stage1"
-touch -t 202001010000 "$WORK/elisac-stage1"
+cp "$ROOT/bin/elisac-stage1.provenance.json" "$WORK/elisac-stage1.provenance.json"
+python3 - "$WORK/elisac-stage1.provenance.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+manifest = json.loads(manifest_path.read_text())
+# Model a product built against a different source snapshot. The deliberately mismatched
+# stat-cache key forces the routine path to recompute the real content digest.
+manifest["source_tree_sha256"] = "0" * 64
+manifest["source_tree_stat_fingerprint"] = "0" * 64
+manifest_path.write_text(json.dumps(manifest))
+PY
 
 # This check EXISTS to prove the guard refuses. An environment that has already opted out
 # (`ELISA_ALLOW_STALE_STAGE1=1`) would turn the refusal into a success and the check would
@@ -35,7 +52,7 @@ set -e
   cat "$WORK/stderr" >&2
   exit 1
 }
-grep -q 'stage1 product binary is stale:' "$WORK/stderr" || {
+grep -q 'stage1 product is stale: provenance mismatch in source_tree_sha256' "$WORK/stderr" || {
   echo "stage1 stale-product smoke FAIL: missing stale-product diagnostic" >&2
   cat "$WORK/stderr" >&2
   exit 1

@@ -12,4 +12,9 @@ grep -Fq 'submit requires an active pool scope' <<< "$bad" || { echo "submit out
 good=$(printf 'def work(value: i64) -> i64:\n    return value + 1\ndef ok() -> void:\n    pool workers(1):\n        _ = submit work(7)\n' | "$RPT")
 grep -Fq 'P 0' <<< "$good" || { echo "submit inside pool rejected: $good" >&2; exit 1; }
 
-echo "submit scope smoke OK: submit requires an active pool block"
+same_line_bad_pool=$(printf 'def work(value: i64) -> i64:\n    return value + 1\ndef check() -> void:\n    not_pool: i64 = 1\n    pool workers(1):\n        pair = (submit[workers] work(7), submit[not_pool] work(8))\n' | "$RPT")
+grep -qx 'P 0' <<< "$same_line_bad_pool" || { echo "same-line submit selector parse failed: $same_line_bad_pool" >&2; exit 1; }
+grep -qx 'D 1' <<< "$same_line_bad_pool" || { echo "same-line non-pool selector was not rejected independently: $same_line_bad_pool" >&2; exit 1; }
+grep -Fq 'not_pool' <<< "$same_line_bad_pool" || { echo "same-line diagnostic did not identify the invalid pool: $same_line_bad_pool" >&2; exit 1; }
+
+echo "submit scope smoke OK: pool scope and per-submit selector validation"

@@ -17,7 +17,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-arena-lifecycle.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 ulimit -c 0 || true
 
-for case_name in arena_lifetime_evidence arena_reuse_identity arena_rewind_lifecycle arena_tail_capacity arena_adopt_reuse_indices arena_free_hint_lifecycle; do
+for case_name in arena_lifetime_evidence arena_reuse_identity arena_rewind_lifecycle arena_tail_capacity arena_adopt_reuse_indices arena_free_hint_lifecycle arena_fixed_reuse_after_hint_displacement; do
     source_file="$ROOT/test/repro/$case_name.elisa"
     stage1_executable="$WORK/$case_name.stage1"
     stage0_archive="$WORK/$case_name.stage0.a"
@@ -54,4 +54,4 @@ for case_name in arena_lifetime_evidence arena_reuse_identity arena_rewind_lifec
     fi
 done
 
-echo "arena runtime lifecycle smoke OK: adoption, trim, rewind, reuse, tail growth, and free-hint lifecycle pass on stage0/stage1"
+echo "arena runtime lifecycle smoke OK: adoption, trim, rewind, reuse, tail growth, and free-hint lifecycle (including displaced fixed-arena hints) pass on stage0/stage1"
