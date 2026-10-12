@@ -391,10 +391,23 @@ extend Semantic:
                         return bam_place_root(rooted_inner)
                     # `xs[i]` is interior storage of `xs`, so a borrow of it is a borrow of
                     # the container -- stage0 reports `return &xs[0]` on a local array.
-                    Expr.Index(rooted_indexed, rooted_index, rooted_index_pos):
+                    Expr.Index(rooted_indexed, _, _) | Expr.IndexN(rooted_indexed, _, _):
                         return bam_place_root(rooted_indexed)
                     _:
                         return ""
+
+        # Preserve the identifier occurrence along with its spelling. Callable/global
+        # effect summaries must distinguish a file global from a same-named local in
+        # another lexical scope.
+        def bam_place_root_position(place: Ast::Expr) -> (known: bool, position: Ast::Pos):
+            can Abort.Panic:
+                match place:
+                    Expr.Ident(_, rooted_pos):
+                        return (true, rooted_pos)
+                    Expr.Field(rooted_object, _, _) | Expr.Paren(rooted_object, _) | Expr.Index(rooted_object, _, _) | Expr.IndexN(rooted_object, _, _):
+                        return bam_place_root_position(rooted_object)
+                    _:
+                        return (false, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0})
 
         def bam_collect_local_pattern(pattern: Ast::Pattern, binders: BorrowBinders&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -1174,6 +1187,22 @@ extend Semantic:
                     _:
                         return ""
 
+        # Match the root above with the exact identifier occurrence so closure effects can
+        # distinguish local storage from a same-named file global or parameter.
+        def bam_borrow_root_position(expression: Ast::Expr) -> (known: bool, position: Ast::Pos):
+            can Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, operand, _) if operator == TokenKind.Ampersand:
+                        return bam_place_root_position(operand)
+                    Expr.Index(Expr.Field(receiver, selector, _), target, _):
+                        return bam_borrow_root_position(receiver) if selector == "cast" and bam_type_is_address(target)
+                        return bam_place_root_position(receiver) if selector == "ref"
+                        return (false, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0})
+                    Expr.Paren(inner, _):
+                        return bam_borrow_root_position(inner)
+                    _:
+                        return (false, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0})
+
         # Whether a declared result physically contains a reference, following struct fields
         # and value aggregates. `view[T]` and `sview` are borrowed handles in their own right,
         # and their element type does not mean the handle stores those elements by value.
@@ -1374,7 +1403,7 @@ extend Semantic:
         # A callback or call without a usable top-level summary has unknown store behavior.
         # Treat each reference argument as a possible destination and each other argument
         # carrying a local root as a source.
-        def bam_store_unknown_call_targets(call: Ast::Expr, callee_name: sview, call_arguments: darray[Ast::Expr], source_numbers: darray[usize], writable_ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, locals: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, table: lmut SymbolTable) -> void:
+        def bam_store_unknown_call_targets(call: Ast::Expr, callee_name: sview, call_arguments: darray[Ast::Expr], source_numbers: darray[usize], synthetic_global_targets: darray[sview], writable_ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, locals: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 local_index: mutable dict[sview, bool] = {}
                 for local_name in locals |local_index|:
@@ -1399,8 +1428,9 @@ extend Semantic:
                         _:
                             pass
                     target_root: sview = bam_place_root(target_place)
-                    if target_root != "" and bam_store_target_is_ref(target_root, writable_ref_params, link_names, link_targets):
-                        reaches: bool = reachable_count > 1 if argument_reaches_local[target] else reachable_count > 0
+                    is_global_target: bool = any global_target in synthetic_global_targets where global_target == target_root
+                    if target_root != "" and (is_global_target or bam_store_target_is_ref(target_root, writable_ref_params, link_names, link_targets)):
+                        reaches: bool = (reachable_count > 1) if (argument_reaches_local[target]) else (reachable_count > 0)
                         if reaches:
                             code: u32 = bam_store_call_argument_state_code(source_numbers, target)
                             call_pos: Ast::Pos = Ast::expr_pos(call)
@@ -1410,26 +1440,53 @@ extend Semantic:
         # A local function value may close over the caller's mutable reference parameters and
         # locals. Include those possible captures only when this binding is known to hold a
         # closure; an opaque callback parameter is modeled from its explicit arguments.
-        def bam_store_unknown_local_call_targets(call: Ast::Expr, callee_name: sview, callee_pos: Ast::Pos, call_arguments: darray[Ast::Expr], writable_ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, locals: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, table: lmut SymbolTable) -> void:
+        def bam_store_unknown_local_call_targets(call: Ast::Expr, callee_name: sview, callee_pos: Ast::Pos, call_arguments: darray[Ast::Expr], capture_names: darray[sview]&, global_targets: darray[sview]&, global_stores: darray[BorrowLocalCallableGlobalStore]&, writable_ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, locals: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 runtime_arguments: mutable darray[Ast::Expr] = []
                 source_numbers: mutable darray[usize] = bam_store_identity_argument_numbers(call_arguments.count)
                 runtime_arguments.extend(call_arguments)
-                for target_name in writable_ref_params:
-                    runtime_arguments.push(Expr.Ident(target_name, callee_pos))
-                    source_numbers.push(0)
-                for alias_name in link_names:
-                    runtime_arguments.push(Expr.Ident(alias_name, callee_pos))
-                    source_numbers.push(0)
-                for local_name in locals:
-                    runtime_arguments.push(Expr.Ident(local_name, callee_pos))
-                    source_numbers.push(0)
-                    runtime_arguments.push(Expr.Unary(TokenKind.Ampersand, Expr.Ident(local_name, callee_pos), callee_pos))
-                    source_numbers.push(0)
-                for escaping_name in escape_names:
-                    runtime_arguments.push(Expr.Ident(escaping_name, callee_pos))
-                    source_numbers.push(0)
-                table <- bam_store_unknown_call_targets(call, callee_name, runtime_arguments, source_numbers, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                for capture_name in capture_names:
+                    is_ref_target: bool = any target_name in writable_ref_params where target_name == capture_name
+                    is_link_target: bool = any alias_name in link_names where alias_name == capture_name
+                    is_local_source: bool = any local_name in locals where local_name == capture_name
+                    is_tracked_source: bool = any escaping_name in escape_names where escaping_name == capture_name
+                    if is_ref_target or is_link_target or is_local_source or is_tracked_source:
+                        runtime_arguments.push(Expr.Ident(capture_name, callee_pos))
+                        source_numbers.push(0)
+                    if is_local_source:
+                        runtime_arguments.push(Expr.Unary(TokenKind.Ampersand, Expr.Ident(capture_name, callee_pos), callee_pos))
+                        source_numbers.push(0)
+                # Retain the ordinary unknown-call analysis for captured values that may
+                # flow through writable reference arguments.
+                table <- bam_store_unknown_call_targets(call, callee_name, runtime_arguments, source_numbers, [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                # Explicit arguments may be lambda parameters, so keep their conservative
+                # global-target behavior. Captures are handled below by their exact recorded
+                # source/target pair instead of being cross-producted with every global write.
+                for global_target in global_targets:
+                    target_arguments: mutable darray[Ast::Expr] = []
+                    target_numbers: mutable darray[usize] = []
+                    target_arguments.extend(call_arguments)
+                    target_numbers.extend(bam_store_identity_argument_numbers(call_arguments.count))
+                    target_arguments.push(Expr.Ident(global_target, callee_pos))
+                    target_numbers.push(0)
+                    table <- bam_store_unknown_call_targets(call, callee_name, target_arguments, target_numbers, [global_target], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                # Each captured source is checked only against the global destination it
+                # may reach. Keep this separate from the ordinary unknown-call pass above,
+                # which also handles captured references passed through writable arguments.
+                for store in global_stores:
+                    store_arguments: mutable darray[Ast::Expr] = []
+                    store_numbers: mutable darray[usize] = []
+                    pair_locals: mutable darray[sview] = []
+                    pair_locals.extend(locals)
+                    pair_locals.push(store.source_name) if not (any local_name in pair_locals where local_name == store.source_name)
+                    store_arguments.push(Expr.Ident(store.source_name, callee_pos))
+                    store_numbers.push(0)
+                    if store.source_is_address:
+                        store_arguments.push(Expr.Unary(TokenKind.Ampersand, Expr.Ident(store.source_name, callee_pos), callee_pos))
+                        store_numbers.push(0)
+                    store_arguments.push(Expr.Ident(store.target_name, callee_pos))
+                    store_numbers.push(0)
+                    table <- bam_store_unknown_call_targets(call, callee_name, store_arguments, store_numbers, [store.target_name], writable_ref_params, link_names, link_targets, pair_locals, lend_names, lend_positions, escape_names, escape_roots, table)
 
         # `ea(out, &x)` where `out` is a reference parameter and `ea` may store its second
         # argument through its first (store_through_summary): the call publishes `&x` into the
@@ -1439,23 +1496,26 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match call:
                     Expr.Call(Expr.Ident(callee_name, callee_pos), call_arguments, call_argument_names, call_pos):
-                        callee_binding_kind: u8 = borrow_reference_site_kind(reference_sites, function_owner, callee_pos, table)
+                        callee_binding_kind, callee_binding_known, callee_binding_id = borrow_reference_site_lookup(reference_sites, function_owner, callee_pos, table)
                         shadowed: bool = callee_binding_kind != 0
                         named_arguments: bool = any argument_name in call_argument_names where argument_name != ""
                         if shadowed:
-                            if callee_binding_kind == 2 and borrow_reference_site_is_local_callable(reference_sites, function_owner, callee_pos, table):
-                                table <- bam_store_unknown_local_call_targets(call, callee_name, callee_pos, call_arguments, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                            if callee_binding_kind == 2 and callee_binding_known and borrow_local_callable_state(reference_sites.local_callables, callee_binding_id):
+                                closure_captures: darray[sview] = borrow_local_callable_captures(reference_sites.local_callables, callee_binding_id)
+                                closure_global_targets: darray[sview] = borrow_local_callable_global_targets(reference_sites.local_callables, callee_binding_id)
+                                closure_global_stores: darray[BorrowLocalCallableGlobalStore] = borrow_local_callable_global_stores(reference_sites.local_callables, callee_binding_id)
+                                table <- bam_store_unknown_local_call_targets(call, callee_name, callee_pos, call_arguments, closure_captures, closure_global_targets, closure_global_stores, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
                             else:
-                                table <- bam_store_unknown_call_targets(call, callee_name, call_arguments, source_numbers, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                                table <- bam_store_unknown_call_targets(call, callee_name, call_arguments, source_numbers, [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
                             return
                         if not sts_is_declared(summary, callee_name):
-                            table <- bam_store_unknown_call_targets(call, callee_name, call_arguments, source_numbers, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                            table <- bam_store_unknown_call_targets(call, callee_name, call_arguments, source_numbers, [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
                             return
                         return if not sts_has_writable(summary, callee_name)
                         if named_arguments:
                             actual_formals: mutable darray[usize] = []
                             if not bam_call_formal_positions(callee_name, call_arguments, call_argument_names, table, actual_formals):
-                                table <- bam_store_unknown_call_targets(call, callee_name, call_arguments, source_numbers, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                                table <- bam_store_unknown_call_targets(call, callee_name, call_arguments, source_numbers, [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
                                 return
                             target_actual: mutable usize = 0
                             while target_actual < call_arguments.count |target_actual, table, actual_formals| -> table:
@@ -1527,7 +1587,7 @@ extend Semantic:
                             synthetic_call: Ast::Expr = Expr.Call(Expr.Ident(call_name, Ast::pos_at_line(0)), runtime_arguments, runtime_names, call_pos)
                             table <- bam_store_call_through(synthetic_call, false, runtime_source_numbers, locals, writable_ref_params, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                         else:
-                            table <- bam_store_unknown_call_targets(call, call_name, runtime_arguments, runtime_source_numbers, writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                            table <- bam_store_unknown_call_targets(call, call_name, runtime_arguments, runtime_source_numbers, [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
                     _:
                         pass
 
@@ -1535,7 +1595,7 @@ extend Semantic:
         # are intentionally opaque because their bodies may run after this frame has ended.
         def bam_store_call_expression(expression: Ast::Expr, locals: darray[sview]&, ref_params: darray[sview]&, writable_ref_params: darray[sview]&, ref_param_types: darray[u32]&, link_names: darray[sview]&, link_targets: darray[sview]&, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                return if writable_ref_params.count == 0
+                return if writable_ref_params.count == 0 and summary.globals.count == 0
                 match expression:
                     Expr.Call(callee, arguments, _, _):
                         table <- bam_store_call_expression(callee, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
@@ -1566,7 +1626,7 @@ extend Semantic:
                         for argument in arguments |table, reference_sites| -> table:
                             table <- bam_store_call_expression(argument, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                         return if candidates.count > 0
-                        table <- bam_store_unknown_call_targets(expression, operation, arguments, [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
+                        table <- bam_store_unknown_call_targets(expression, operation, arguments, [], [], writable_ref_params, link_names, link_targets, locals, lend_names, lend_positions, escape_names, escape_roots, table)
                     Expr.Scope(base, _, _):
                         table <- bam_store_call_expression(base, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                     Expr.Field(object, _, _):
@@ -1645,13 +1705,13 @@ extend Semantic:
                             table <- bam_store_call_expression(value, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             binder_pos: mutable Ast::Pos = source_binder_position(table, name, declaration_pos.line, 0, "__pattern_binder")
                             binder_pos <- declaration_pos if binder_pos.line == 0
-                            bam_remember_local_callable(binder_pos, value, function_owner, reference_sites, table)
+                            bam_remember_local_callable(binder_pos, value, function_owner, reference_sites, table, summary.globals)
                         Stmt.Assign(target, _, value, _):
                             table <- bam_store_call_expression(target, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             table <- bam_store_call_expression(value, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             match target:
                                 Expr.Ident(_, target_pos):
-                                    bam_remember_local_callable(target_pos, value, function_owner, reference_sites, table)
+                                    bam_remember_local_callable(target_pos, value, function_owner, reference_sites, table, summary.globals)
                                 _:
                                     pass
                         Stmt.Expr(value, _):
@@ -1718,10 +1778,339 @@ extend Semantic:
                     _:
                         return expression
 
+        def bam_store_capture_pattern(pattern: Ast::Pattern, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Pin(name):
+                        out.push(name) if name != ""
+                    Pattern.As(_, nested) | Pattern.Variant(_, nested) | Pattern.Struct(_, nested) | Pattern.Field(_, nested) | Pattern.Tuple(nested) | Pattern.Or(nested):
+                        for child in nested |out|:
+                            bam_store_capture_pattern(child, out)
+                    _:
+                        pass
+
+        def bam_store_capture_expression(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        out.push(name) if name != ""
+                    Expr.Call(callee, arguments, _, _):
+                        bam_store_capture_expression(callee, out)
+                        for argument in arguments |out|:
+                            bam_store_capture_expression(argument, out)
+                    Expr.StaticEffectCall(effect_type, _, candidates, arguments, _, _):
+                        bam_store_capture_expression(effect_type, out)
+                        for candidate in candidates |out|:
+                            for capture in candidate.captures |out|:
+                                bam_store_capture_expression(capture, out)
+                        for argument in arguments |out|:
+                            bam_store_capture_expression(argument, out)
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                        bam_store_capture_expression(object, out)
+                    Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                        bam_store_capture_expression(object, out)
+                        bam_store_capture_expression(index, out)
+                    Expr.Slice(object, low, high, _):
+                        bam_store_capture_expression(object, out)
+                        bam_store_capture_expression(low, out)
+                        bam_store_capture_expression(high, out)
+                    Expr.IndexN(object, indices, _):
+                        bam_store_capture_expression(object, out)
+                        for index in indices |out|:
+                            bam_store_capture_expression(index, out)
+                    Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.Paren(operand, _) | Expr.RegionNew(operand, _, _):
+                        bam_store_capture_expression(operand, out)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |out|:
+                            bam_store_capture_expression(element, out)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |out|:
+                            bam_store_capture_expression(entry.key, out)
+                            bam_store_capture_expression(entry.value, out)
+                    Expr.Construct(head, fields, _) | Expr.RecordUpdate(head, fields, _):
+                        bam_store_capture_expression(head, out)
+                        for field in fields |out|:
+                            bam_store_capture_expression(field.value, out)
+                    Expr.If(condition, then_value, else_value, _):
+                        bam_store_capture_expression(condition, out)
+                        bam_store_capture_expression(then_value, out)
+                        bam_store_capture_expression(else_value, out)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        bam_store_capture_expression(scrutinee, out)
+                        for arm in arms |out|:
+                            bam_store_capture_pattern(arm.pattern, out)
+                            bam_store_capture_expression(arm.guard, out)
+                            bam_store_capture_statements(arm.body, out)
+                    Expr.Comprehension(_, iterable, condition, body, _):
+                        bam_store_capture_expression(iterable, out)
+                        bam_store_capture_expression(condition, out)
+                        bam_store_capture_expression(body, out)
+                    Expr.Refinement(base, predicate, _):
+                        bam_store_capture_expression(base, out)
+                        bam_store_capture_expression(predicate, out)
+                    Expr.GetElse(guarded, recovery, _):
+                        bam_store_capture_expression(guarded, out)
+                        bam_store_capture_statements(recovery, out)
+                    Expr.Lambda(_, body, _):
+                        bam_store_capture_statements(body, out)
+                    Expr.Block(statements, value, captures, _):
+                        for capture in captures |out|:
+                            out.push(capture) if capture != ""
+                        bam_store_capture_statements(statements, out)
+                        bam_store_capture_expression(value, out)
+                    _:
+                        pass
+
+        def bam_store_capture_statements(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            bam_store_capture_expression(expression, out)
+                        Stmt.VarDecl(_, _, value, _):
+                            bam_store_capture_expression(value, out)
+                        Stmt.Assign(target, _, value, _):
+                            bam_store_capture_expression(target, out)
+                            bam_store_capture_expression(value, out)
+                        Stmt.If(condition, then_body, else_body, _):
+                            bam_store_capture_expression(condition, out)
+                            bam_store_capture_statements(then_body, out)
+                            bam_store_capture_statements(else_body, out)
+                        Stmt.While(condition, body, _):
+                            bam_store_capture_expression(condition, out)
+                            bam_store_capture_statements(body, out)
+                        Stmt.For(_, _, iterable, body, _):
+                            bam_store_capture_expression(iterable, out)
+                            bam_store_capture_statements(body, out)
+                        Stmt.Block(_, _, _, body, _):
+                            bam_store_capture_statements(body, out)
+                        Stmt.Match(scrutinee, arms, _):
+                            bam_store_capture_expression(scrutinee, out)
+                            for arm in arms |out|:
+                                bam_store_capture_pattern(arm.pattern, out)
+                                bam_store_capture_expression(arm.guard, out)
+                                bam_store_capture_statements(arm.body, out)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                bam_store_capture_expression(returned, out)
+                        Stmt.Contract(_, value, _):
+                            bam_store_capture_expression(value, out)
+                        _:
+                            pass
+
+        def bam_store_global_target_expression(expression: Ast::Expr, global_names: darray[sview]&, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, captures: darray[sview]&, stores: mutable darray[BorrowLocalCallableGlobalStore]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(Expr.Lambda(_, lambda_body, _), arguments, _, _):
+                        bam_store_global_target_statements(lambda_body, global_names, owner, reference_sites, table, captures, stores, out)
+                        for argument in arguments |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(argument, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Call(callee, arguments, _, _):
+                        match callee:
+                            Expr.Lambda(_, _, _):
+                                pass
+                            _:
+                                bam_store_global_target_expression(callee, global_names, owner, reference_sites, table, captures, stores, out)
+                        for argument in arguments |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(argument, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
+                        for candidate in candidates |global_names, owner, reference_sites, table, captures, stores, out|:
+                            for capture in candidate.captures |global_names, owner, reference_sites, table, captures, stores, out|:
+                                bam_store_global_target_expression(capture, global_names, owner, reference_sites, table, captures, stores, out)
+                        for argument in arguments |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(argument, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                        bam_store_global_target_expression(object, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                        bam_store_global_target_expression(object, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(index, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Slice(object, low, high, _):
+                        bam_store_global_target_expression(object, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(low, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(high, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.IndexN(object, indices, _):
+                        bam_store_global_target_expression(object, global_names, owner, reference_sites, table, captures, stores, out)
+                        for index in indices |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(index, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.Paren(operand, _) | Expr.RegionNew(operand, _, _):
+                        bam_store_global_target_expression(operand, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(element, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(entry.key, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_expression(entry.value, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Construct(head, fields, _) | Expr.RecordUpdate(head, fields, _):
+                        bam_store_global_target_expression(head, global_names, owner, reference_sites, table, captures, stores, out)
+                        for field in fields |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(field.value, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.If(condition, then_value, else_value, _):
+                        bam_store_global_target_expression(condition, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(then_value, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(else_value, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        bam_store_global_target_expression(scrutinee, global_names, owner, reference_sites, table, captures, stores, out)
+                        for arm in arms |global_names, owner, reference_sites, table, captures, stores, out|:
+                            bam_store_global_target_expression(arm.guard, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_statements(arm.body, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Comprehension(_, iterable, condition, body, _):
+                        bam_store_global_target_expression(iterable, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(condition, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(body, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Refinement(base, predicate, _):
+                        bam_store_global_target_expression(base, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(predicate, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.GetElse(guarded, recovery, _):
+                        bam_store_global_target_expression(guarded, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_statements(recovery, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Lambda(_, lambda_body, _):
+                        # Conservatively include effects of a nested closure stored in a
+                        # local. The binding/call flow for nested function values is not
+                        # tracked here, so omitting its body could miss a global write when
+                        # that local closure is invoked by the outer closure.
+                        bam_store_global_target_statements(lambda_body, global_names, owner, reference_sites, table, captures, stores, out)
+                    Expr.Block(statements, value, _, _):
+                        bam_store_global_target_statements(statements, global_names, owner, reference_sites, table, captures, stores, out)
+                        bam_store_global_target_expression(value, global_names, owner, reference_sites, table, captures, stores, out)
+                    _:
+                        pass
+
+        def bam_store_global_target_place(place: Ast::Expr, global_names: darray[sview]&, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    # Multiple assignment is represented as an array/tuple of independent
+                    # places. Inspect each leaf so a closure's global effects include every
+                    # destination, including nested destructuring targets.
+                    Expr.Array(targets, _) | Expr.Tuple(targets, _):
+                        for target in targets |global_names, owner, reference_sites, table, out|:
+                            bam_store_global_target_place(target, global_names, owner, reference_sites, table, out)
+                    _:
+                        target_name: sview = bam_place_root(place)
+                        root_position_known, root_position = bam_place_root_position(place)
+                        root_is_local: mutable bool = false
+                        if root_position_known:
+                            root_is_local <- borrow_reference_site_is_local(reference_sites, owner, root_position, table)
+                        if target_name != "" and (any global_name in global_names where global_name == target_name) and not root_is_local:
+                            out.push(target_name) if not (any prior in out where prior == target_name)
+
+        # Preserve source/destination correspondence in multiple assignment. The parser
+        # represents destructuring places and their RHS values as matching Array/Tuple
+        # trees; only pair corresponding leaves when both shapes and lengths agree.
+        # When a single global destination receives an aggregate, inspect its aggregate
+        # elements as possible stored references, always pairing them with that one target.
+        def bam_store_global_target_source_pairs(target: Ast::Expr, value: Ast::Expr, global_names: darray[sview]&, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, captures: darray[sview]&, stores: mutable darray[BorrowLocalCallableGlobalStore]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                target_value: Ast::Expr = bam_strip_paren(target)
+                source_value: Ast::Expr = bam_strip_paren(value)
+                match target_value:
+                    Expr.Array(targets, _):
+                        match source_value:
+                            Expr.Array(values, _):
+                                if targets.count == values.count:
+                                    index: mutable usize = 0
+                                    while index < targets.count |index, targets, values, global_names, owner, reference_sites, table, captures, stores|:
+                                        bam_store_global_target_source_pairs(targets[index], values[index], global_names, owner, reference_sites, table, captures, stores)
+                                        index <- index + 1
+                                    return
+                            _:
+                                pass
+                    Expr.Tuple(targets, _):
+                        match source_value:
+                            Expr.Tuple(values, _):
+                                if targets.count == values.count:
+                                    index: mutable usize = 0
+                                    while index < targets.count |index, targets, values, global_names, owner, reference_sites, table, captures, stores|:
+                                        bam_store_global_target_source_pairs(targets[index], values[index], global_names, owner, reference_sites, table, captures, stores)
+                                        index <- index + 1
+                                    return
+                            _:
+                                pass
+                    _:
+                        pass
+                match source_value:
+                    Expr.Array(values, _) | Expr.Tuple(values, _):
+                        for source_element in values |target, global_names, owner, reference_sites, table, captures, stores|:
+                            bam_store_global_target_source_pairs(target, source_element, global_names, owner, reference_sites, table, captures, stores)
+                        return
+                    _:
+                        pass
+                target_names: mutable darray[sview] = []
+                bam_store_global_target_place(target, global_names, owner, reference_sites, table, target_names)
+                source_name: sview = bam_borrow_root(source_value)
+                source_known, source_position = bam_borrow_root_position(source_value)
+                source_may_be_local: bool = source_known and borrow_reference_site_kind(reference_sites, owner, source_position, table) != 0
+                for target_name in target_names |stores, source_name, source_may_be_local|:
+                    if source_may_be_local:
+                        # A recorded source has a borrow root (direct `&`, `.ref`, or an
+                        # address-preserving cast), so the synthetic call analysis models
+                        # its underlying local as an address.
+                        known_pair: bool = any prior in stores where prior.source_name == source_name and prior.target_name == target_name and prior.source_is_address
+                        stores.push(BorrowLocalCallableGlobalStore{source_name: source_name, target_name: target_name, source_is_address: true}) if not known_pair
+                raw_sources: mutable darray[sview] = []
+                bam_store_capture_expression(source_value, raw_sources)
+                for target_name in target_names |raw_sources, stores|:
+                    for raw_source in raw_sources |target_name, captures, stores|:
+                        if any capture_name in captures where capture_name == raw_source:
+                            known_pair: bool = any prior in stores where prior.source_name == raw_source and prior.target_name == target_name and not prior.source_is_address
+                            stores.push(BorrowLocalCallableGlobalStore{source_name: raw_source, target_name: target_name, source_is_address: false}) if not known_pair
+
+        def bam_store_global_target_statements(statements: darray[Ast::Stmt], global_names: darray[sview]&, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, captures: darray[sview]&, stores: mutable darray[BorrowLocalCallableGlobalStore]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |global_names, owner, reference_sites, table, captures, stores, out|:
+                    match statement:
+                        Stmt.Assign(target, _, value, _):
+                            assignment_targets: mutable darray[sview] = []
+                            bam_store_global_target_place(target, global_names, owner, reference_sites, table, assignment_targets)
+                            bam_store_global_target_source_pairs(target, value, global_names, owner, reference_sites, table, captures, stores) if assignment_targets.count > 0
+                            for target_name in assignment_targets |out|:
+                                out.push(target_name) if not (any prior in out where prior == target_name)
+                            bam_store_global_target_expression(target, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_expression(value, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.Expr(expression, _):
+                            bam_store_global_target_expression(expression, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.VarDecl(_, _, value, _):
+                            bam_store_global_target_expression(value, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.If(condition, then_body, else_body, _):
+                            bam_store_global_target_expression(condition, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_statements(then_body, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_statements(else_body, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.While(condition, body, _):
+                            bam_store_global_target_expression(condition, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_statements(body, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.For(_, _, iterable, body, _):
+                            bam_store_global_target_expression(iterable, global_names, owner, reference_sites, table, captures, stores, out)
+                            bam_store_global_target_statements(body, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.Block(_, _, _, body, _):
+                            bam_store_global_target_statements(body, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.Match(scrutinee, arms, _):
+                            bam_store_global_target_expression(scrutinee, global_names, owner, reference_sites, table, captures, stores, out)
+                            for arm in arms |global_names, owner, reference_sites, table, captures, stores, out|:
+                                bam_store_global_target_expression(arm.guard, global_names, owner, reference_sites, table, captures, stores, out)
+                                bam_store_global_target_statements(arm.body, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                bam_store_global_target_expression(returned, global_names, owner, reference_sites, table, captures, stores, out)
+                        Stmt.Contract(_, value, _):
+                            bam_store_global_target_expression(value, global_names, owner, reference_sites, table, captures, stores, out)
+                        _:
+                            pass
+
+        def bam_store_merge_capture_names(target: mutable darray[sview]&, source: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for capture in source |target|:
+                    target.push(capture) if not (any prior in target where prior == capture)
+
+        def bam_store_merge_global_stores(target: mutable darray[BorrowLocalCallableGlobalStore]&, source: darray[BorrowLocalCallableGlobalStore]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for store in source |target|:
+                    known_pair: bool = any prior in target where prior.source_name == store.source_name and prior.target_name == store.target_name and prior.source_is_address == store.source_is_address
+                    target.push(store) if not known_pair
+
         # Track only closure values that are syntactically known. Unknown function values
         # (including ordinary callback parameters) must not make every local look captured.
         def bam_value_is_local_callable(value: Ast::Expr, owner: DeclId, reference_sites: BorrowReferenceSites&, table: SymbolTable&) -> bool:
-            can Abort.Panic:
+            can Memory.Allocate, Abort.Panic:
                 match value:
                     Expr.Lambda(_, _, _):
                         return true
@@ -1733,13 +2122,149 @@ extend Semantic:
                         return bam_value_is_local_callable(then_value, owner, reference_sites, table) or bam_value_is_local_callable(else_value, owner, reference_sites, table)
                     Expr.Block(_, block_value, _, _):
                         return bam_value_is_local_callable(block_value, owner, reference_sites, table)
+                    Expr.Match(_, arms, _) | Expr.Catch(_, arms, _):
+                        for arm in arms:
+                            return true if bam_store_statement_tail_is_local_callable(arm.body, owner, reference_sites, table)
+                        return false
+                    Expr.GetElse(guarded, recovery, _):
+                        return bam_value_is_local_callable(guarded, owner, reference_sites, table) or bam_store_statement_tail_is_local_callable(recovery, owner, reference_sites, table)
                     _:
                         return false
 
-        def bam_remember_local_callable(binding_position: Ast::Pos, value: Ast::Expr, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> void:
+        def bam_store_statement_tail_is_local_callable(statements: darray[Ast::Stmt], owner: DeclId, reference_sites: BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if statements.count == 0
+                match statements[statements.count - 1]:
+                    Stmt.Expr(expression, _):
+                        return bam_value_is_local_callable(expression, owner, reference_sites, table)
+                    Stmt.Return(value, _):
+                        if value is returned:
+                            return bam_value_is_local_callable(returned, owner, reference_sites, table)
+                        return false
+                    _:
+                        return false
+
+        def bam_value_local_callable_captures(value: Ast::Expr, owner: DeclId, reference_sites: BorrowReferenceSites&, table: SymbolTable&) -> darray[sview]:
             can Memory.Allocate, Abort.Panic:
-                known, binding_id = ownership_binding_at_position(table, owner, binding_position)
-                borrow_set_local_callable(reference_sites, binding_id, bam_value_is_local_callable(value, owner, reference_sites, table)) if known
+                captures: mutable darray[sview] = []
+                match value:
+                    Expr.Lambda(_, body, _):
+                        all_uses: mutable darray[sview] = []
+                        # This name-only collector cannot distinguish an inner binder from an
+                        # outer same-spelled reference in a sibling/nested scope. Retain every
+                        # used name as a possible capture: ambiguous names may add a
+                        # conservative warning, but subtracting them by spelling can silently
+                        # miss a real escape. Global-store pairs below are still tied to their
+                        # own syntactic borrowed root, so this fallback does not cross-product
+                        # unrelated captures with global destinations.
+                        bam_store_capture_statements(body, all_uses)
+                        for use_name in all_uses |captures|:
+                            captures.push(use_name) if not (any prior in captures where prior == use_name)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        captures <- bam_value_local_callable_captures(inner, owner, reference_sites, table)
+                    Expr.Ident(_, position):
+                        known, binding_id = borrow_reference_site_binding(reference_sites, owner, position, table)
+                        captures <- borrow_local_callable_captures(reference_sites.local_callables, binding_id) if known
+                    Expr.If(_, then_value, else_value, _):
+                        then_captures: darray[sview] = bam_value_local_callable_captures(then_value, owner, reference_sites, table)
+                        else_captures: darray[sview] = bam_value_local_callable_captures(else_value, owner, reference_sites, table)
+                        bam_store_merge_capture_names(captures, then_captures)
+                        bam_store_merge_capture_names(captures, else_captures)
+                    Expr.Block(_, block_value, _, _):
+                        captures <- bam_value_local_callable_captures(block_value, owner, reference_sites, table)
+                    Expr.Match(_, arms, _) | Expr.Catch(_, arms, _):
+                        for arm in arms:
+                            if arm.body.count > 0:
+                                match arm.body[arm.body.count - 1]:
+                                    Stmt.Expr(tail_value, _):
+                                        arm_captures: darray[sview] = bam_value_local_callable_captures(tail_value, owner, reference_sites, table)
+                                        bam_store_merge_capture_names(captures, arm_captures)
+                                    Stmt.Return(tail_option, _):
+                                        if tail_option is tail_value:
+                                            arm_captures: darray[sview] = bam_value_local_callable_captures(tail_value, owner, reference_sites, table)
+                                            bam_store_merge_capture_names(captures, arm_captures)
+                                    _:
+                                        pass
+                    Expr.GetElse(guarded, recovery, _):
+                        guarded_captures: darray[sview] = bam_value_local_callable_captures(guarded, owner, reference_sites, table)
+                        bam_store_merge_capture_names(captures, guarded_captures)
+                        if recovery.count > 0:
+                            match recovery[recovery.count - 1]:
+                                Stmt.Expr(tail_value, _):
+                                    recovery_captures: darray[sview] = bam_value_local_callable_captures(tail_value, owner, reference_sites, table)
+                                    bam_store_merge_capture_names(captures, recovery_captures)
+                                Stmt.Return(tail_option, _):
+                                    if tail_option is tail_value:
+                                        recovery_captures: darray[sview] = bam_value_local_callable_captures(tail_value, owner, reference_sites, table)
+                                        bam_store_merge_capture_names(captures, recovery_captures)
+                                _:
+                                    pass
+                    _:
+                        pass
+                return captures
+
+        def bam_value_local_callable_global_targets(value: Ast::Expr, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, global_names: darray[sview]&, captures: darray[sview]&, global_stores: mutable darray[BorrowLocalCallableGlobalStore]&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                targets: mutable darray[sview] = []
+                match value:
+                    Expr.Lambda(_, body, _):
+                        possible_targets: mutable darray[sview] = []
+                        bam_store_global_target_statements(body, global_names, owner, reference_sites, table, captures, global_stores, possible_targets)
+                        for global_target in possible_targets |targets|:
+                            targets.push(global_target) if not (any prior in targets where prior == global_target)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        targets <- bam_value_local_callable_global_targets(inner, owner, reference_sites, table, global_names, captures, global_stores)
+                    Expr.Ident(_, position):
+                        known, binding_id = borrow_reference_site_binding(reference_sites, owner, position, table)
+                        targets <- borrow_local_callable_global_targets(reference_sites.local_callables, binding_id) if known
+                        prior_stores: darray[BorrowLocalCallableGlobalStore] = borrow_local_callable_global_stores(reference_sites.local_callables, binding_id) if known else []
+                        bam_store_merge_global_stores(global_stores, prior_stores)
+                    Expr.If(_, then_value, else_value, _):
+                        then_targets: darray[sview] = bam_value_local_callable_global_targets(then_value, owner, reference_sites, table, global_names, captures, global_stores)
+                        else_targets: darray[sview] = bam_value_local_callable_global_targets(else_value, owner, reference_sites, table, global_names, captures, global_stores)
+                        bam_store_merge_capture_names(targets, then_targets)
+                        bam_store_merge_capture_names(targets, else_targets)
+                    Expr.Block(_, block_value, _, _):
+                        targets <- bam_value_local_callable_global_targets(block_value, owner, reference_sites, table, global_names, captures, global_stores)
+                    Expr.Match(_, arms, _) | Expr.Catch(_, arms, _):
+                        for arm in arms:
+                            if arm.body.count > 0:
+                                match arm.body[arm.body.count - 1]:
+                                    Stmt.Expr(tail_value, _):
+                                        arm_targets: darray[sview] = bam_value_local_callable_global_targets(tail_value, owner, reference_sites, table, global_names, captures, global_stores)
+                                        bam_store_merge_capture_names(targets, arm_targets)
+                                    Stmt.Return(tail_option, _):
+                                        if tail_option is tail_value:
+                                            arm_targets: darray[sview] = bam_value_local_callable_global_targets(tail_value, owner, reference_sites, table, global_names, captures, global_stores)
+                                            bam_store_merge_capture_names(targets, arm_targets)
+                                    _:
+                                        pass
+                    Expr.GetElse(guarded, recovery, _):
+                        guarded_targets: darray[sview] = bam_value_local_callable_global_targets(guarded, owner, reference_sites, table, global_names, captures, global_stores)
+                        bam_store_merge_capture_names(targets, guarded_targets)
+                        if recovery.count > 0:
+                            match recovery[recovery.count - 1]:
+                                Stmt.Expr(tail_value, _):
+                                    recovery_targets: darray[sview] = bam_value_local_callable_global_targets(tail_value, owner, reference_sites, table, global_names, captures, global_stores)
+                                    bam_store_merge_capture_names(targets, recovery_targets)
+                                Stmt.Return(tail_option, _):
+                                    if tail_option is tail_value:
+                                        recovery_targets: darray[sview] = bam_value_local_callable_global_targets(tail_value, owner, reference_sites, table, global_names, captures, global_stores)
+                                        bam_store_merge_capture_names(targets, recovery_targets)
+                                _:
+                                    pass
+                    _:
+                        pass
+                return targets
+
+        def bam_remember_local_callable(binding_position: Ast::Pos, value: Ast::Expr, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, global_names: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                known, binding_id = borrow_reference_site_binding(reference_sites, owner, binding_position, table)
+                is_callable: bool = bam_value_is_local_callable(value, owner, reference_sites, table)
+                captures: darray[sview] = bam_value_local_callable_captures(value, owner, reference_sites, table) if is_callable else []
+                global_stores: mutable darray[BorrowLocalCallableGlobalStore] = []
+                global_targets: darray[sview] = bam_value_local_callable_global_targets(value, owner, reference_sites, table, global_names, captures, global_stores) if is_callable else []
+                borrow_set_local_callable(reference_sites, binding_id, is_callable, captures, global_targets, global_stores) if known
 
         # `name = &place` links `name` to `place`; `name = other` where `other` is itself a
         # linked reference local copies the reference, so `name` names what `other` names.
@@ -1890,14 +2415,14 @@ extend Semantic:
                             table <- bam_store_call_expression(declared_value, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             binder_pos: mutable Ast::Pos = source_binder_position(table, declared_name, declaration_pos.line, 0, "__pattern_binder")
                             binder_pos <- declaration_pos if binder_pos.line == 0
-                            bam_remember_local_callable(binder_pos, declared_value, function_owner, reference_sites, table)
+                            bam_remember_local_callable(binder_pos, declared_value, function_owner, reference_sites, table, summary.globals)
                             bam_escape_track_declaration(declared_name, declared_value, lend_names, lend_positions, escape_names, escape_roots)
                         Stmt.Assign(store_target, store_operator, store_value, store_pos):
                             table <- bam_store_call_expression(store_target, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             table <- bam_store_call_expression(store_value, locals, ref_params, writable_ref_params, ref_param_types, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             match store_target:
                                 Expr.Ident(_, target_pos):
-                                    bam_remember_local_callable(target_pos, store_value, function_owner, reference_sites, table)
+                                    bam_remember_local_callable(target_pos, store_value, function_owner, reference_sites, table, summary.globals)
                                 _:
                                     pass
                             stored: sview = bam_borrow_root(store_value)
@@ -2074,6 +2599,11 @@ extend Semantic:
                 for declaration in declarations |table, reference_sites| -> table:
                     match declaration:
                         Decl.Func(function_name, function_parameters, function_return, function_body, function_effects, function_decorators, function_pos):
+                            # `reference_sites` is shared across declarations for its lazy
+                            # source-site index, but callable flow is function-local. Reuse
+                            # its backing capacity without carrying prior functions' rows into
+                            # branch snapshots or binding searches.
+                            reference_sites.local_callables.truncate(0)
                             function_owner: DeclId = function_declaration_id(table, function_name, function_pos.offset)
                             binders: mutable BorrowBinders = empty_borrow_binders()
                             borrow_function_binders(function_parameters, function_body, binders)

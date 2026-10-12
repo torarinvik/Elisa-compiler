@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cross-language compiler and runtime comparison for matmul, sieve, darray_sum,
-# darray_count_sum, darray_growth, and darray_counted_fill.
+# Cross-language compiler and runtime comparison for the arithmetic, DArray,
+# and packed side-table workloads listed below.
 # See README.cross-language.md for flags, checksum semantics, and known allocator differences.
 set -euo pipefail
 
@@ -147,6 +147,7 @@ result = {
     "machine": platform.machine(),
     "qualified": False,
     "allowed_cpu_count": None,
+    "allowed_cpu_ids": None,
     "effective_cgroup_cpu_quota": None,
     "cgroup_quota_sources": [],
     "cgroup_membership_lines": [],
@@ -170,11 +171,14 @@ def mapped_cgroup_dir(cgroup_path, mount_root, mount_point):
 if system == "Linux":
     issues = []
     try:
-        allowed = len(os.sched_getaffinity(0))
+        allowed_cpu_ids = sorted(os.sched_getaffinity(0))
+        allowed = len(allowed_cpu_ids)
     except (AttributeError, OSError):
+        allowed_cpu_ids = None
         allowed = os.cpu_count() or 0
         issues.append("could not read the process CPU affinity mask")
     result["allowed_cpu_count"] = allowed
+    result["allowed_cpu_ids"] = allowed_cpu_ids
 
     memberships = []
     try:
@@ -565,7 +569,7 @@ case "$HOST_ARCH" in
   *) echo "unsupported host architecture for a native CPU comparison: $HOST_ARCH" >&2; exit 2 ;;
 esac
 
-benches=(matmul sieve darray_sum darray_count_sum darray_growth darray_counted_fill)
+benches=(matmul sieve darray_sum darray_count_sum darray_growth darray_counted_fill packed_side_table_write packed_side_table_read)
 toolchain_inputs=(
   "$ELISA_BIN"
   "$ELISA_BIN.provenance.json"
@@ -765,7 +769,7 @@ fi
   echo "load_gate=load1/effective_cpu_capacity <= 0.20; Mac uses logical CPUs and Linux uses the minimum of affinity CPUs and cgroup quota; admission checked before preflight builds and load checked before/after every timed sample; violations write ABORTED.txt"
   echo "benchmark_host_lock=$BENCH_LOCK_PATH (held until run exit; concurrent runs on this host are rejected)"
   echo "source_manifest_sha256=$(tool_sha256 "$OUT/sources.sha256")"
-  echo "canonical_workload_fingerprint=canonical_workload_fingerprint.json (workload-only source/checksum/status fingerprint)"
+  echo "canonical_workload_fingerprint=canonical_workload_fingerprint.json (scope, workload, host, environment, helper, and shared-toolchain parity; includes a per-run provenance fingerprint)"
   echo "expected_canonical_workload_fingerprint=${EXPECTED_CANONICAL_FINGERPRINT:-<none>}"
   echo "toolchain_manifest_sha256=$(tool_sha256 "$OUT/toolchain.before.sha256")"
   echo "toolchain_after_run=toolchain.after-run.sha256 (checked before exit)"
@@ -774,9 +778,11 @@ fi
   echo "bench_timeout_seconds=$BENCH_TIMEOUT_SECONDS"
 } | tee "$OUT/metadata.txt"
 
+BENCH_CLEARED_ENV_NAMES="$(IFS=,; printf '%s' "${BENCH_ENV_OVERRIDES_CLEARED[*]}")"
 python3 - "$OUT" "$BUILD_REPEAT" "$BENCH_TIMEOUT_SECONDS" "$HERE" "$ROOT" \
   "$ELISA_BIN" "$RUNTIME" "$CLANG" "$RUSTC" "$ZIG" "$RUN_ID" \
-  "$EXPECTED_CANONICAL_FINGERPRINT" "$COMPILE_ONLY" \
+  "$EXPECTED_CANONICAL_FINGERPRINT" "$COMPILE_ONLY" "$REPEAT" \
+  "$BENCH_CLEARED_ENV_NAMES" "$INHERITED_ELISACORE_NAMES" \
   "$ELISA_OVERFLOW_FLAG" "$RUST_OVERFLOW_CHECKS" "$ZIG_OPTIMIZE" \
   "$RUNTIME_PROFILE_MODE" "$RUNTIME_PROFILE_OPT_LEVEL" "$RUNTIME_PROFILE_OVERFLOW" \
   "${#CLANG_CPU_FLAGS[@]}" "${CLANG_CPU_FLAGS[@]}" "${benches[@]}" <<'PY'
@@ -801,17 +807,20 @@ timeout_seconds = int(sys.argv[3])
 source_dir = Path(sys.argv[4])
 root = Path(sys.argv[5])
 sys.path.insert(0, str(root / "scripts"))
-from bench_load_gate import LoadGateError, check_load_gate, load_average
+from bench_load_gate import LOAD_FRACTION, LoadGateError, check_load_gate, load_average
 elisa_bin, runtime, clang, rustc, zig = sys.argv[6:11]
 elisa_bin, runtime, clang, rustc, zig = (str(Path(path).resolve()) for path in (elisa_bin, runtime, clang, rustc, zig))
 run_id = sys.argv[11]
 expected_fingerprint_path = sys.argv[12]
 compile_only = sys.argv[13] == "1"
-elisa_overflow_flag, rust_overflow_checks, zig_optimize = sys.argv[14:17]
-runtime_profile_mode, runtime_profile_opt_level, runtime_profile_overflow = sys.argv[17:20]
-cpu_flag_count = int(sys.argv[20])
-cpu_flags = sys.argv[21:21 + cpu_flag_count]
-benches = sys.argv[21 + cpu_flag_count:]
+runtime_repeat = int(sys.argv[14])
+cleared_loader_allocator_names = sorted(filter(None, sys.argv[15].split(",")))
+cleared_elisacore_names = sorted(filter(None, sys.argv[16].split()))
+elisa_overflow_flag, rust_overflow_checks, zig_optimize = sys.argv[17:20]
+runtime_profile_mode, runtime_profile_opt_level, runtime_profile_overflow = sys.argv[20:23]
+cpu_flag_count = int(sys.argv[23])
+cpu_flags = sys.argv[24:24 + cpu_flag_count]
+benches = sys.argv[24 + cpu_flag_count:]
 variants = ("elisa", "c", "rust", "zig")
 dead_strip = shlex.split(os.environ.get("ELISA_LD_DEAD_STRIP", ""))
 link_flags = shlex.split(os.environ.get("ELISA_LINK_EXE_FLAGS", ""))
@@ -854,6 +863,8 @@ expected_checksums = {
     "darray_count_sum": "751804663071387784",
     "darray_growth": "3759023315128811",
     "darray_counted_fill": "7999998000000",
+    "packed_side_table_write": "2147516416",
+    "packed_side_table_read": "549764202496",
 }
 expected_exit_statuses = {
     "matmul": 113,
@@ -862,6 +873,8 @@ expected_exit_statuses = {
     "darray_count_sum": 152,
     "darray_growth": 72,
     "darray_counted_fill": 8,
+    "packed_side_table_write": 74,
+    "packed_side_table_read": 119,
 }
 
 def mark_aborted(kind, reason):
@@ -952,26 +965,80 @@ def comparator_toolchain_identity():
     rows = []
     for line in (out / "toolchain.before.sha256").read_text().splitlines():
         digest, separator, raw_path = line.partition("  ")
-        if not separator or len(digest) != 64:
+        if not separator or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
             raise RuntimeError("malformed toolchain.before.sha256 manifest")
         raw_path_obj = Path(raw_path)
-        if str(raw_path_obj.resolve()) in candidate_products or raw_path_obj.name.endswith(".provenance.json"):
+        resolved_path = str(raw_path_obj.resolve())
+        if resolved_path in candidate_products or raw_path_obj.name.endswith(".provenance.json"):
             continue
-        rows.append({"name": Path(raw_path).name, "sha256": digest})
+        rows.append({"path": resolved_path, "sha256": digest.lower()})
     if not rows:
         raise RuntimeError("toolchain manifest contains no pinned comparator tools")
-    return sorted(rows, key=lambda row: (row["name"], row["sha256"]))
+    return sorted(rows, key=lambda row: (row["path"], row["sha256"]))
 
 def benchmark_helper_hashes():
     paths = (
         root / "scripts" / "bench_load_gate.py",
         root / "scripts" / "platform.sh",
         root / "scripts" / "stage1_provenance.py",
+        root / "scripts" / "elisac_stage1.sh",
+        root / "scripts" / "build_runtime_object.sh",
     )
     return {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in paths
     }
+
+ENVIRONMENT_INPUT_NAMES = (
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP",
+    "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET", "LLVM_CONFIG",
+    "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "LIBRARY_PATH",
+    "CCC_OVERRIDE_OPTIONS", "CLANG_CONFIG_FILE",
+    "ZIG_LIB_DIR", "ZIG_GLOBAL_CACHE_DIR", "ZIG_LOCAL_CACHE_DIR",
+    "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_WRAPPER", "CFLAGS", "CPPFLAGS", "CXXFLAGS", "LDFLAGS", "CC", "CXX", "AR", "LD",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+)
+
+def environment_input_hashes(environment, names=ENVIRONMENT_INPUT_NAMES):
+    return {
+        name: {
+            "present": name in environment,
+            "sha256": hashlib.sha256(os.fsencode(environment[name])).hexdigest() if name in environment else None,
+        }
+        for name in names
+    }
+
+def run_environment_input_hashes(environment):
+    names = set(ENVIRONMENT_INPUT_NAMES)
+    names.update(name for name in environment if name.startswith(("ELISA_", "ELISACORE_")))
+    return environment_input_hashes(environment, sorted(names))
+
+def parity_environment_input_hashes(environment):
+    """Fingerprint effective settings while normalizing candidate-specific artifact paths."""
+    normalized_paths = {
+        "ELISA_STAGE1_BIN": "<stage1-binary>",
+        "ELISA_STAGE1_SELF": "<stage1-binary>",
+        "ELISA_STAGE1_ROOT": "<stage1-source-root>",
+        "ELISA_RUNTIME_OBJ": "<runtime-object>",
+    }
+    projected = run_environment_input_hashes(environment)
+    for name, normalized_value in normalized_paths.items():
+        raw = projected.get(name, {"present": False, "sha256": None})
+        projected[name] = {
+            "present": raw["present"],
+            "normalized_value": normalized_value if raw["present"] else None,
+        }
+    return projected
+
+def parse_toolchain_manifest():
+    rows = []
+    for line in (out / "toolchain.before.sha256").read_text().splitlines():
+        digest, separator, raw_path = line.partition("  ")
+        if not separator or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()) or not raw_path:
+            raise RuntimeError("malformed toolchain.before.sha256 manifest")
+        rows.append({"path": str(Path(raw_path).resolve()), "sha256": digest.lower()})
+    return sorted(rows, key=lambda row: (row["path"], row["sha256"]))
 
 def write_canonical_workload_fingerprint(observed_results):
     """Record source/checksum/status parity independently of candidate compiler sources."""
@@ -995,12 +1062,25 @@ def write_canonical_workload_fingerprint(observed_results):
             },
         })
     payload = {
-        "schema": "canonical-codegen-workloads-v4",
+        "schema": "canonical-codegen-workloads-v5",
         "scope": "compile_only" if compile_only else "full_runtime",
         "runner_sha256": hashlib.sha256((source_dir / "cross_language.sh").read_bytes()).hexdigest(),
         "benchmark_helper_sha256": benchmark_helper_hashes(),
         "comparator_toolchain": comparator_toolchain_identity(),
         "platform": host_platform_identity(),
+        "measurement_protocol": {
+            "build_repeats": repeat,
+            "runtime_repeats": runtime_repeat,
+            "timeout_seconds": timeout_seconds,
+            "load_gate_fraction": LOAD_FRACTION,
+        },
+        "environment": {
+            "cleared_loader_allocator_names": cleared_loader_allocator_names,
+            "cleared_elisacore_names": cleared_elisacore_names,
+            "ambient_inputs": environment_input_hashes(os.environ),
+            "effective_build_inputs": parity_environment_input_hashes(child_env),
+            "effective_runtime_inputs": parity_environment_input_hashes(os.environ),
+        },
         "compile_profile": {
             "elisa": {"opt": "-O3", "overflow": elisa_overflow_flag},
             "elisa_runtime": {
@@ -1015,13 +1095,36 @@ def write_canonical_workload_fingerprint(observed_results):
         "workloads": workloads,
     }
     canonical_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    source_manifest_bytes = (out / "sources.sha256").read_bytes()
+    toolchain_manifest_bytes = (out / "toolchain.before.sha256").read_bytes()
+    metadata_bytes = (out / "metadata.txt").read_bytes()
+    qualification_bytes = (out / "host_qualification.json").read_bytes()
+    runtime_artifact_sha256 = hashlib.sha256(Path(runtime).read_bytes()).hexdigest()
+    run_provenance = {
+        "scope": payload["scope"],
+        "source_manifest_sha256": hashlib.sha256(source_manifest_bytes).hexdigest(),
+        "toolchain_manifest_sha256": hashlib.sha256(toolchain_manifest_bytes).hexdigest(),
+        "toolchain_manifest": parse_toolchain_manifest(),
+        "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+        "host_qualification_sha256": hashlib.sha256(qualification_bytes).hexdigest(),
+        "runtime_artifact_sha256": runtime_artifact_sha256,
+        "build_environment_inputs": run_environment_input_hashes(child_env),
+        "runtime_environment_inputs": run_environment_input_hashes(os.environ),
+    }
+    run_binding_bytes = json.dumps(
+        {"payload": payload, "run_provenance": run_provenance},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     record = {
         "schema": payload["schema"],
         "fingerprint_sha256": hashlib.sha256(canonical_bytes).hexdigest(),
+        "run_fingerprint_sha256": hashlib.sha256(run_binding_bytes).hexdigest(),
         # Runtime bytes can legitimately change when this candidate compiler builds them.
         # Keep their identity per run without making workload/profile parity revision-sensitive.
-        "runtime_artifact_sha256": hashlib.sha256(Path(runtime).read_bytes()).hexdigest(),
+        "runtime_artifact_sha256": runtime_artifact_sha256,
         "payload": payload,
+        "run_provenance": run_provenance,
     }
     fingerprint_file = out / "canonical_workload_fingerprint.json"
     fingerprint_file.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -1033,12 +1136,22 @@ def write_canonical_workload_fingerprint(observed_results):
             reference = json.loads(reference_path.read_text())
         except (OSError, json.JSONDecodeError) as error:
             mark_aborted("canonical workload fingerprint check failed", f"cannot read {reference_path}: {error}")
-        reference_payload = reference.get("payload") if isinstance(reference, dict) else None
+        if not isinstance(reference, dict):
+            mark_aborted("canonical workload fingerprint check failed", f"reference {reference_path} is not a JSON object")
+        reference_payload = reference.get("payload")
         reference_scope = reference_payload.get("scope") if isinstance(reference_payload, dict) else None
+        if reference_scope not in ("compile_only", "full_runtime"):
+            mark_aborted("canonical workload fingerprint check failed", f"reference {reference_path} has an invalid run scope")
         completion_marker = "COMPILE_COMPLETE" if reference_scope == "compile_only" else "COMPLETE"
         reference_directory = reference_path.resolve().parent
         marker_path = reference_directory / completion_marker
-        if (reference_directory / "ABORTED.txt").exists() or not marker_path.is_file() or not marker_path.read_text().strip():
+        other_marker = reference_directory / ("COMPLETE" if completion_marker == "COMPILE_COMPLETE" else "COMPILE_COMPLETE")
+        if (
+            (reference_directory / "ABORTED.txt").exists()
+            or not marker_path.is_file()
+            or marker_path.stat().st_size == 0
+            or other_marker.exists()
+        ):
             mark_aborted(
                 "canonical workload fingerprint check failed",
                 f"reference {reference_path} has no successful {completion_marker} marker",
@@ -1048,15 +1161,60 @@ def write_canonical_workload_fingerprint(observed_results):
                 "canonical workload fingerprint scope mismatch",
                 f"candidate scope {payload['scope']} does not match reference scope {reference_scope!r}",
             )
+        reference_provenance = reference.get("run_provenance")
+        if not isinstance(reference_provenance, dict):
+            mark_aborted("canonical workload fingerprint check failed", f"reference {reference_path} has no run provenance")
+        reference_run_binding = json.dumps(
+            {"payload": reference_payload, "run_provenance": reference_provenance},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if reference.get("run_fingerprint_sha256") != hashlib.sha256(reference_run_binding).hexdigest():
+            mark_aborted("canonical workload fingerprint check failed", f"reference {reference_path} has invalid run provenance integrity")
+        if reference.get("runtime_artifact_sha256") != reference_provenance.get("runtime_artifact_sha256"):
+            mark_aborted("canonical workload fingerprint check failed", f"reference {reference_path} has inconsistent runtime artifact provenance")
         if (
-            not isinstance(reference, dict)
-            or reference.get("schema") != record["schema"]
+            reference.get("schema") != record["schema"]
             or reference.get("fingerprint_sha256") != record["fingerprint_sha256"]
             or reference.get("payload") != payload
         ):
             mark_aborted(
                 "canonical workload fingerprint mismatch",
                 f"candidate fingerprint {record['fingerprint_sha256']} does not match reference {reference_path}",
+            )
+        reference_runtime_sha256 = reference_provenance.get("runtime_artifact_sha256")
+        if (
+            not isinstance(reference_runtime_sha256, str)
+            or len(reference_runtime_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in reference_runtime_sha256.lower())
+        ):
+            mark_aborted("canonical workload fingerprint check failed", f"reference {reference_path} has an invalid runtime artifact hash")
+        runtime_comparison = {
+            "policy": (
+                "must_match_shared_selected_runtime"
+                if runtime_profile_mode == "selected-runtime-object"
+                else "report_candidate_rebuilt_runtime"
+            ),
+            "reference_sha256": reference_runtime_sha256.lower(),
+            "candidate_sha256": runtime_artifact_sha256,
+            "equal": reference_runtime_sha256.lower() == runtime_artifact_sha256,
+        }
+        run_provenance["runtime_artifact_comparison"] = runtime_comparison
+        run_binding_bytes = json.dumps(
+            {"payload": payload, "run_provenance": run_provenance},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        record["run_fingerprint_sha256"] = hashlib.sha256(run_binding_bytes).hexdigest()
+        record["run_provenance"] = run_provenance
+        record["runtime_artifact_comparison"] = runtime_comparison
+        fingerprint_file.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        if runtime_profile_mode == "selected-runtime-object" and not runtime_comparison["equal"]:
+            mark_aborted(
+                "runtime artifact parity mismatch",
+                "selected runtime objects differ: "
+                f"reference SHA-256 {runtime_comparison['reference_sha256']}, "
+                f"candidate SHA-256 {runtime_comparison['candidate_sha256']}",
             )
     return record["fingerprint_sha256"]
 
@@ -1089,19 +1247,24 @@ def correctness_preflight(stage):
             observed = {variant: run_once(out / bench / variant) for variant in variants}
         except RuntimeError as error:
             mark_aborted("correctness preflight failed", f"{stage}: {error}")
-        statuses = {variant: result[0] for variant, result in observed.items()}
-        streams = {variant: (result[1], result[2]) for variant, result in observed.items()}
-        if len(set(statuses.values())) != 1 or len(set(streams.values())) != 1:
+        expected_output = f"{expected_checksums[bench]}\n".encode()
+        expected_status = expected_exit_statuses[bench]
+        accepted_streams = ((expected_output, b""), (b"", expected_output))
+        invalid = {
+            variant: (code, stdout, stderr)
+            for variant, (code, stdout, stderr) in observed.items()
+            if code != expected_status or (stdout, stderr) not in accepted_streams
+        }
+        if invalid:
             printable = {
                 variant: (code, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"))
-                for variant, (code, stdout, stderr) in observed.items()
+                for variant, (code, stdout, stderr) in invalid.items()
             }
-            mark_aborted("correctness preflight failed", f"{stage}: status/stdout/stderr mismatch for {bench}: {printable}")
-        expected_output = f"{expected_checksums[bench]}\n".encode()
-        if streams["elisa"] != (expected_output, b"") or statuses["elisa"] != expected_exit_statuses[bench]:
-            actual = (streams["elisa"][0].decode("utf-8", errors="replace"), streams["elisa"][1].decode("utf-8", errors="replace"), statuses["elisa"])
-            mark_aborted("correctness preflight failed", f"{stage}: independent checksum mismatch for {bench}: expected {(expected_checksums[bench], expected_exit_statuses[bench])}, got {actual}")
-        results[bench] = {"checksum": expected_output.decode("utf-8"), "exit_status": statuses["elisa"]}
+            mark_aborted(
+                "correctness preflight failed",
+                f"{stage}: expected exact checksum on one stream and exit status {expected_status} for {bench}; got {printable}",
+            )
+        results[bench] = {"checksum": expected_output.decode("utf-8"), "exit_status": expected_status}
     return results
 
 def current_source_manifest():
@@ -1508,8 +1671,8 @@ for bench in benches:
             enforce_load_gate(load_after, f"after runtime sample {bench}/{variant}/{sample + 1}")
             if proc.returncode != exit_statuses[bench]:
                 raise RuntimeError(f"timed status changed: {bench}/{variant} returned {proc.returncode}")
-            if stdout != checksums[bench] or stderr:
-                raise RuntimeError(f"timed full checksum changed: {bench}/{variant}")
+            if (stdout, stderr) not in ((checksums[bench], b""), (b"", checksums[bench])):
+                raise RuntimeError(f"timed exact checksum output changed: {bench}/{variant}")
             verify_artifact(bench, variant, f"after runtime sample {bench}/{variant}/{sample + 1}")
             cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
             times[bench][variant]["wall"].append(elapsed_ns / 1e9)
@@ -1554,7 +1717,12 @@ runtime_ratio_fields = (
     ("elisa_over_zig_median_child_cpu", "zig", "cpu"),
 )
 runtime_ratio_records = []
-for bench in benches:
+# The side-table read fixture uses volatile native accesses while Elisa emits
+# ordinary helper accesses. Keep correctness/build coverage, but omit its
+# runtime ratios and geometric mean until both sides share that access contract.
+diagnostic_only_runtime_benches = {"packed_side_table_read"}
+runtime_comparison_benches = [bench for bench in benches if bench not in diagnostic_only_runtime_benches]
+for bench in runtime_comparison_benches:
     record = {}
     for field, comparator, axis in runtime_ratio_fields:
         elisa_median = statistics.median(times[bench]["elisa"][axis])
@@ -1571,7 +1739,7 @@ runtime_ratio_path = out / "runtime_ratios.csv"
 with runtime_ratio_path.open("w", newline="") as stream:
     writer = csv.writer(stream)
     writer.writerow(("benchmark", *(field for field, _, _ in runtime_ratio_fields)))
-    for bench, record in zip(benches, runtime_ratio_records):
+    for bench, record in zip(runtime_comparison_benches, runtime_ratio_records):
         writer.writerow((bench, *(f"{record[field]:.6f}" for field, _, _ in runtime_ratio_fields)))
     writer.writerow(("geometric_mean", *(f"{runtime_ratio_means[field]:.6f}" for field, _, _ in runtime_ratio_fields)))
 
@@ -1586,9 +1754,9 @@ for metric, label in (("wall", "best/median wall seconds"), ("cpu", "best/median
             values.append(f"{min(samples):.6f}/{statistics.median(samples):.6f}")
         checksum = checksums[bench].decode("utf-8").strip()
         print(f"{bench:<12} {checksum:>18} " + " ".join(f"{value:>17}" for value in values))
-print("\nGenerated runtime Elisa/comparator median ratios (<1.0 means Elisa is faster)")
+print("\nGenerated runtime Elisa/comparator median ratios (<1.0 means Elisa is faster; diagnostic-only workloads are omitted)")
 print(f"{'benchmark':<20} {'Elisa/Rust wall':>17} {'Elisa/Rust CPU':>17} {'Elisa/Zig wall':>17} {'Elisa/Zig CPU':>17}")
-for bench, record in zip(benches, runtime_ratio_records):
+for bench, record in zip(runtime_comparison_benches, runtime_ratio_records):
     values = [record[field] for field, _, _ in runtime_ratio_fields]
     print(f"{bench:<20} " + " ".join(f"{value:>17.3f}" for value in values))
 values = [runtime_ratio_means[field] for field, _, _ in runtime_ratio_fields]

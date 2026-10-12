@@ -7,12 +7,22 @@ extend Backend:
         const REGION_FACT_BUCKET_COUNT: usize = 1024
         const REGION_FACT_HASH_OFFSET: u64 = 14695981039346656037
         const REGION_FACT_HASH_PRIME: u64 = 1099511628211
+        const REGION_ALIAS_GRAPH_INDEX_THRESHOLD: usize = 16
+        const REGION_ALIAS_GRAPH_MIN_BUCKET_COUNT: usize = 16
+        const REGION_ALIAS_GRAPH_MAX_ROWS: usize = 262144
 
         def region_fact_name_bucket(name: sview) -> usize:
             hash: mutable u64 = REGION_FACT_HASH_OFFSET
             for index in 0..<sview_len(name) |hash, name|:
                 hash <- (hash ^ sview_at(name, index).u64()) * REGION_FACT_HASH_PRIME
             return (hash % REGION_FACT_BUCKET_COUNT.u64()).usize()
+
+
+        def region_alias_graph_hash(name: sview) -> u64:
+            hash: mutable u64 = REGION_FACT_HASH_OFFSET
+            for index in 0..<sview_len(name) |hash, name|:
+                hash <- (hash ^ sview_at(name, index).u64()) * REGION_FACT_HASH_PRIME
+            return hash
 
         def region_build_name_index(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             structs.regions.region_fact_buckets <- []
@@ -36,6 +46,7 @@ extend Backend:
         # store into the longer-lived `structs` (likewise for scope_load_aliases).
         def region_load_aliases(body: darray[Stmt], structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                structs.regions.region_alias_graph_active <- false
                 structs.regions.region_alias_names <- []
                 structs.regions.region_alias_roots <- []
                 ref_alias_collect(body, structs, structs.regions.region_alias_names, structs.regions.region_alias_roots)
@@ -45,8 +56,15 @@ extend Backend:
         # map depends only on its body and bound declaration types. Capture that map on its
         # first visit, then restore it by declaration visitation order on later rounds. The
         # flat tables keep duplicate name/line fact rows separate and avoid nested darrays.
-        def region_alias_cache_visit(visit_slot: usize, capture_current: bool, structs: mutable StructTable&, starts: mutable darray[usize]&, counts: mutable darray[usize]&, names: mutable darray[sview]&, roots: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+        def region_alias_graph_ensure_slot(visit_slot: usize, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             can Abort.Panic, Memory.Allocate:
+                while structs.regions.region_alias_graph_slot_rows.count <= visit_slot |visit_slot, structs|:
+                    structs.regions.region_alias_graph_slot_rows.push(-1)
+
+
+        def region_alias_cache_visit(visit_slot: usize, capture_current: bool, restore_current: bool, structs: mutable StructTable&, starts: mutable darray[usize]&, counts: mutable darray[usize]&, names: mutable darray[sview]&, roots: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                region_alias_graph_ensure_slot(visit_slot, structs)
                 if visit_slot == starts.count:
                     starts.push(names.count)
                     cached_count: mutable usize = 0
@@ -60,13 +78,354 @@ extend Backend:
                         structs.regions.region_alias_roots <- []
                     counts.push(cached_count)
                     return
+                if capture_current:
+                    # Indexed functions reserve an empty alias-cache slot. If a graph later
+                    # fails validation, append the body-collected rows and repoint the slot
+                    # so later fixed-point rounds can restore the flat fallback.
+                    starts[visit_slot] <- names.count
+                    cached_count: usize = structs.regions.region_alias_names.count
+                    counts[visit_slot] <- cached_count
+                    for alias_index in 0..<cached_count |names, roots, structs|:
+                        names.push(structs.regions.region_alias_names[alias_index])
+                        roots.push(structs.regions.region_alias_roots[alias_index])
                 structs.regions.region_alias_names <- []
                 structs.regions.region_alias_roots <- []
-                start: usize = starts[visit_slot]
-                count: usize = counts[visit_slot]
-                for alias_index in 0..<count |names, roots, structs, start|:
-                    structs.regions.region_alias_names.push(names[start + alias_index])
-                    structs.regions.region_alias_roots.push(roots[start + alias_index])
+                if not capture_current and restore_current:
+                    start: usize = starts[visit_slot]
+                    count: usize = counts[visit_slot]
+                    for alias_index in 0..<count |names, roots, structs, start|:
+                        structs.regions.region_alias_names.push(names[start + alias_index])
+                        structs.regions.region_alias_roots.push(roots[start + alias_index])
+
+
+        # Return the graph-local node for NAME, using full sview equality after the hash
+        # probe. Buckets contain global node rows, but the selected bucket range belongs to
+        # exactly one function graph.
+        def region_alias_graph_find_node(visit_slot: usize, name: sview, structs: StructTable&) -> i64 can[Abort.Panic]:
+            return -1 if visit_slot >= structs.regions.region_alias_graph_slot_rows.count
+            graph_row: i64 = structs.regions.region_alias_graph_slot_rows[visit_slot]
+            return -1 if graph_row < 0
+            return region_alias_graph_find_graph_node(graph_row.usize(), name, structs)
+
+
+        def region_alias_graph_find_graph_node(graph_row: usize, name: sview, structs: StructTable&) -> i64 can[Abort.Panic]:
+            return -1 if graph_row >= structs.regions.region_alias_graph_bucket_starts.count or graph_row >= structs.regions.region_alias_graph_bucket_counts.count
+            bucket_count: usize = structs.regions.region_alias_graph_bucket_counts[graph_row]
+            return -1 if bucket_count == 0 or (bucket_count & (bucket_count - 1.usize())) != 0.usize()
+            bucket_start: usize = structs.regions.region_alias_graph_bucket_starts[graph_row]
+            return -1 if bucket_start > structs.regions.region_alias_graph_buckets.count or bucket_count > structs.regions.region_alias_graph_buckets.count - bucket_start
+            bucket: usize = (region_alias_graph_hash(name) & (bucket_count.u64() - 1.u64())).usize()
+            probes: mutable usize = 0
+            while probes < bucket_count |bucket, bucket_count, bucket_start, name, probes, structs|:
+                node: i64 = structs.regions.region_alias_graph_buckets[bucket_start + bucket]
+                return -1 if node < 0
+                return node if node.usize() < structs.regions.region_alias_graph_node_names.count and structs.regions.region_alias_graph_node_names[node.usize()] == name
+                bucket <- (bucket + 1.usize()) & (bucket_count - 1.usize())
+                probes <- probes + 1.usize()
+            return -1
+
+
+        # Validate the complete graph before publishing its slot. The runtime row check is
+        # deliberately constant-time; these O(nodes + edges + buckets) checks happen once
+        # during construction, before the graph can be used by a function scan.
+        def region_alias_graph_storage_valid(graph_row: usize, params: darray[ParamDecl]&, structs: StructTable&) -> bool can[Abort.Panic]:
+            return false if graph_row >= structs.regions.region_alias_graph_node_starts.count or graph_row >= structs.regions.region_alias_graph_node_counts.count or graph_row >= structs.regions.region_alias_graph_edge_starts.count or graph_row >= structs.regions.region_alias_graph_edge_counts.count or graph_row >= structs.regions.region_alias_graph_bucket_starts.count or graph_row >= structs.regions.region_alias_graph_bucket_counts.count or graph_row >= structs.regions.region_alias_graph_generations.count
+            node_start: usize = structs.regions.region_alias_graph_node_starts[graph_row]
+            node_count: usize = structs.regions.region_alias_graph_node_counts[graph_row]
+            return false if node_start > structs.regions.region_alias_graph_node_names.count or node_count > structs.regions.region_alias_graph_node_names.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_heads.count or node_count > structs.regions.region_alias_graph_node_heads.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_tails.count or node_count > structs.regions.region_alias_graph_node_tails.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_params.count or node_count > structs.regions.region_alias_graph_node_params.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_seen.count or node_count > structs.regions.region_alias_graph_node_seen.count - node_start
+            edge_start: usize = structs.regions.region_alias_graph_edge_starts[graph_row]
+            edge_count: usize = structs.regions.region_alias_graph_edge_counts[graph_row]
+            return false if edge_start > structs.regions.region_alias_graph_edge_sources.count or edge_count > structs.regions.region_alias_graph_edge_sources.count - edge_start
+            return false if edge_start > structs.regions.region_alias_graph_edge_targets.count or edge_count > structs.regions.region_alias_graph_edge_targets.count - edge_start
+            return false if edge_start > structs.regions.region_alias_graph_edge_next.count or edge_count > structs.regions.region_alias_graph_edge_next.count - edge_start
+            bucket_start: usize = structs.regions.region_alias_graph_bucket_starts[graph_row]
+            bucket_count: usize = structs.regions.region_alias_graph_bucket_counts[graph_row]
+            return false if bucket_count == 0 or (bucket_count & (bucket_count - 1.usize())) != 0.usize()
+            return false if bucket_start > structs.regions.region_alias_graph_buckets.count or bucket_count > structs.regions.region_alias_graph_buckets.count - bucket_start
+            occupied_buckets: mutable usize = 0
+            for bucket_offset in 0..<bucket_count |bucket_offset, bucket_start, node_start, node_count, occupied_buckets, structs|:
+                bucket_node: i64 = structs.regions.region_alias_graph_buckets[bucket_start + bucket_offset]
+                if bucket_node >= 0:
+                    return false if bucket_node.usize() < node_start or bucket_node.usize() - node_start >= node_count
+                    occupied_buckets <- occupied_buckets + 1.usize()
+                else:
+                    return false if bucket_node != -1
+            return false if occupied_buckets != node_count
+            for node_offset in 0..<node_count |node_offset, node_start, params, structs|:
+                node_index: usize = node_start + node_offset
+                return false if region_alias_graph_find_graph_node(graph_row, structs.regions.region_alias_graph_node_names[node_index], structs) != node_index.i64()
+                parameter_index: i64 = structs.regions.region_alias_graph_node_params[node_index]
+                return false if parameter_index < -1 or (parameter_index >= 0 and parameter_index.usize() >= params.count)
+                return false if parameter_index >= 0 and params[parameter_index.usize()].name != structs.regions.region_alias_graph_node_names[node_index]
+            for parameter_index in 0..<params.count |parameter_index, node_start, node_count, params, structs|:
+                parameter_node: i64 = region_alias_graph_find_graph_node(graph_row, params[parameter_index].name, structs)
+                return false if parameter_node < 0 or parameter_node.usize() < node_start or parameter_node.usize() - node_start >= node_count
+                first_parameter: i64 = structs.regions.region_alias_graph_node_params[parameter_node.usize()]
+                return false if first_parameter < 0 or first_parameter.usize() > parameter_index
+            for edge_offset in 0..<edge_count |edge_offset, edge_start, node_start, node_count, structs|:
+                source_node: i64 = structs.regions.region_alias_graph_edge_sources[edge_start + edge_offset]
+                target_node: i64 = structs.regions.region_alias_graph_edge_targets[edge_start + edge_offset]
+                return false if source_node < 0 or target_node < 0 or source_node.usize() < node_start or source_node.usize() - node_start >= node_count or target_node.usize() < node_start or target_node.usize() - node_start >= node_count
+            walked_edges: mutable usize = 0
+            for node_offset in 0..<node_count |node_offset, node_start, edge_start, edge_count, walked_edges, structs|:
+                node_index: usize = node_start + node_offset
+                edge_cursor: i64 = structs.regions.region_alias_graph_node_heads[node_index]
+                tail: i64 = structs.regions.region_alias_graph_node_tails[node_index]
+                if edge_cursor < 0:
+                    return false if edge_cursor != -1 or tail != -1
+                    continue
+                return false if tail < 0 or tail.usize() < edge_start or tail.usize() - edge_start >= edge_count
+                node_steps: mutable usize = 0
+                last_edge: i64 = -1
+                while edge_cursor >= 0 |edge_cursor, edge_start, edge_count, node_index, node_steps, last_edge, walked_edges, structs|:
+                    return false if node_steps >= edge_count
+                    edge_index: usize = edge_cursor.usize()
+                    return false if edge_index < edge_start or edge_index - edge_start >= edge_count
+                    return false if structs.regions.region_alias_graph_edge_sources[edge_index] != node_index.i64()
+                    next_edge: i64 = structs.regions.region_alias_graph_edge_next[edge_index]
+                    return false if next_edge < -1 or (next_edge >= 0 and (next_edge.usize() < edge_start or next_edge.usize() - edge_start >= edge_count))
+                    node_steps <- node_steps + 1.usize()
+                    walked_edges <- walked_edges + 1.usize()
+                    last_edge <- edge_cursor
+                    edge_cursor <- next_edge
+                return false if last_edge != tail
+            return walked_edges == edge_count
+
+
+        # Check row-level bounds in constant time before indexed traversal. Graph publication
+        # happens only after the builder validates every row; this guard keeps stale or
+        # inconsistent metadata on the fallback path.
+        def region_alias_graph_row_valid(visit_slot: usize, structs: StructTable&) -> bool can[Abort.Panic]:
+            return false if visit_slot >= structs.regions.region_alias_graph_slot_rows.count
+            mapped_row: i64 = structs.regions.region_alias_graph_slot_rows[visit_slot]
+            return false if mapped_row < 0
+            graph_row: usize = mapped_row.usize()
+            return false if graph_row >= structs.regions.region_alias_graph_node_starts.count or graph_row >= structs.regions.region_alias_graph_node_counts.count or graph_row >= structs.regions.region_alias_graph_edge_starts.count or graph_row >= structs.regions.region_alias_graph_edge_counts.count or graph_row >= structs.regions.region_alias_graph_bucket_starts.count or graph_row >= structs.regions.region_alias_graph_bucket_counts.count or graph_row >= structs.regions.region_alias_graph_generations.count
+            node_start: usize = structs.regions.region_alias_graph_node_starts[graph_row]
+            node_count: usize = structs.regions.region_alias_graph_node_counts[graph_row]
+            return false if node_start > structs.regions.region_alias_graph_node_names.count or node_count > structs.regions.region_alias_graph_node_names.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_heads.count or node_count > structs.regions.region_alias_graph_node_heads.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_tails.count or node_count > structs.regions.region_alias_graph_node_tails.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_params.count or node_count > structs.regions.region_alias_graph_node_params.count - node_start
+            return false if node_start > structs.regions.region_alias_graph_node_seen.count or node_count > structs.regions.region_alias_graph_node_seen.count - node_start
+            edge_start: usize = structs.regions.region_alias_graph_edge_starts[graph_row]
+            edge_count: usize = structs.regions.region_alias_graph_edge_counts[graph_row]
+            return false if edge_start > structs.regions.region_alias_graph_edge_sources.count or edge_count > structs.regions.region_alias_graph_edge_sources.count - edge_start
+            return false if edge_start > structs.regions.region_alias_graph_edge_targets.count or edge_count > structs.regions.region_alias_graph_edge_targets.count - edge_start
+            return false if edge_start > structs.regions.region_alias_graph_edge_next.count or edge_count > structs.regions.region_alias_graph_edge_next.count - edge_start
+            bucket_start: usize = structs.regions.region_alias_graph_bucket_starts[graph_row]
+            bucket_count: usize = structs.regions.region_alias_graph_bucket_counts[graph_row]
+            return false if bucket_count == 0 or (bucket_count & (bucket_count - 1.usize())) != 0.usize()
+            return false if bucket_start > structs.regions.region_alias_graph_buckets.count or bucket_count > structs.regions.region_alias_graph_buckets.count - bucket_start
+            return true
+
+
+        # Recreate the old flat alias inputs in exact collector order if an indexed walk
+        # cannot obtain a generation stamp. The stored source/target rows retain duplicates.
+        def region_alias_graph_restore_linear_aliases(visit_slot: usize, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                return false if visit_slot >= structs.regions.region_alias_graph_slot_rows.count
+                mapped_row: i64 = structs.regions.region_alias_graph_slot_rows[visit_slot]
+                return false if mapped_row < 0 or mapped_row.usize() >= structs.regions.region_alias_graph_node_starts.count or mapped_row.usize() >= structs.regions.region_alias_graph_node_counts.count or mapped_row.usize() >= structs.regions.region_alias_graph_edge_starts.count or mapped_row.usize() >= structs.regions.region_alias_graph_edge_counts.count
+                graph_row: usize = mapped_row.usize()
+                node_start: usize = structs.regions.region_alias_graph_node_starts[graph_row]
+                node_count: usize = structs.regions.region_alias_graph_node_counts[graph_row]
+                return false if node_start > structs.regions.region_alias_graph_node_names.count or node_count > structs.regions.region_alias_graph_node_names.count - node_start
+                edge_start: usize = structs.regions.region_alias_graph_edge_starts[graph_row]
+                edge_count: usize = structs.regions.region_alias_graph_edge_counts[graph_row]
+                return false if edge_start > structs.regions.region_alias_graph_edge_sources.count or edge_count > structs.regions.region_alias_graph_edge_sources.count - edge_start
+                return false if edge_start > structs.regions.region_alias_graph_edge_targets.count or edge_count > structs.regions.region_alias_graph_edge_targets.count - edge_start
+                for edge_offset in 0..<edge_count |edge_offset, edge_start, node_start, node_count, structs|:
+                    source_node: i64 = structs.regions.region_alias_graph_edge_sources[edge_start + edge_offset]
+                    target_node: i64 = structs.regions.region_alias_graph_edge_targets[edge_start + edge_offset]
+                    return false if source_node < 0 or target_node < 0
+                    source_index: usize = source_node.usize()
+                    target_index: usize = target_node.usize()
+                    return false if source_index < node_start or target_index < node_start
+                    return false if source_index - node_start >= node_count or target_index - node_start >= node_count
+                structs.regions.region_alias_names <- []
+                structs.regions.region_alias_roots <- []
+                for edge_offset in 0..<edge_count |edge_offset, edge_start, structs|:
+                    source_node: usize = structs.regions.region_alias_graph_edge_sources[edge_start + edge_offset].usize()
+                    target_node: usize = structs.regions.region_alias_graph_edge_targets[edge_start + edge_offset].usize()
+                    structs.regions.region_alias_names.push(structs.regions.region_alias_graph_node_names[source_node])
+                    structs.regions.region_alias_roots.push(structs.regions.region_alias_graph_node_names[target_node])
+                return true
+
+
+        def region_alias_graph_intern_node(graph_row: usize, name: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            existing: i64 = region_alias_graph_find_graph_node(graph_row, name, structs)
+            return existing if existing >= 0
+            return -1 if graph_row >= structs.regions.region_alias_graph_bucket_starts.count or graph_row >= structs.regions.region_alias_graph_bucket_counts.count
+            bucket_count: usize = structs.regions.region_alias_graph_bucket_counts[graph_row]
+            return -1 if bucket_count == 0
+            bucket_start: usize = structs.regions.region_alias_graph_bucket_starts[graph_row]
+            bucket: usize = (region_alias_graph_hash(name) & (bucket_count.u64() - 1.u64())).usize()
+            probes: mutable usize = 0
+            while probes < bucket_count |bucket, bucket_count, bucket_start, name, probes, structs|:
+                bucket_row: usize = bucket_start + bucket
+                if structs.regions.region_alias_graph_buckets[bucket_row] < 0:
+                    node: usize = structs.regions.region_alias_graph_node_names.count
+                    structs.regions.region_alias_graph_node_names.push(name)
+                    structs.regions.region_alias_graph_node_heads.push(-1)
+                    structs.regions.region_alias_graph_node_tails.push(-1)
+                    structs.regions.region_alias_graph_node_params.push(-1)
+                    structs.regions.region_alias_graph_node_seen.push(0)
+                    structs.regions.region_alias_graph_buckets[bucket_row] <- node.i64()
+                    return node.i64()
+                bucket <- (bucket + 1.usize()) & (bucket_count - 1.usize())
+                probes <- probes + 1.usize()
+            # Capacity is sized for all alias endpoints and parameters at a load factor <= 1/2.
+            return -1
+
+
+        def region_alias_graph_rollback(graph_row: usize, structs: mutable StructTable&) -> void:
+            node_start: usize = structs.regions.region_alias_graph_node_starts[graph_row]
+            edge_start: usize = structs.regions.region_alias_graph_edge_starts[graph_row]
+            bucket_start: usize = structs.regions.region_alias_graph_bucket_starts[graph_row]
+            structs.regions.region_alias_graph_node_names.truncate(node_start)
+            structs.regions.region_alias_graph_node_heads.truncate(node_start)
+            structs.regions.region_alias_graph_node_tails.truncate(node_start)
+            structs.regions.region_alias_graph_node_params.truncate(node_start)
+            structs.regions.region_alias_graph_node_seen.truncate(node_start)
+            structs.regions.region_alias_graph_edge_sources.truncate(edge_start)
+            structs.regions.region_alias_graph_edge_targets.truncate(edge_start)
+            structs.regions.region_alias_graph_edge_next.truncate(edge_start)
+            structs.regions.region_alias_graph_buckets.truncate(bucket_start)
+            structs.regions.region_alias_graph_node_starts.truncate(graph_row)
+            structs.regions.region_alias_graph_node_counts.truncate(graph_row)
+            structs.regions.region_alias_graph_edge_starts.truncate(graph_row)
+            structs.regions.region_alias_graph_edge_counts.truncate(graph_row)
+            structs.regions.region_alias_graph_bucket_starts.truncate(graph_row)
+            structs.regions.region_alias_graph_bucket_counts.truncate(graph_row)
+            structs.regions.region_alias_graph_generations.truncate(graph_row)
+
+
+        # Build one graph after the first alias collection for a function. Alias edges are
+        # appended in collector order and are never deduplicated: branch and rebind alternatives
+        # deliberately widen the possible referents. Node interning only merges equal names.
+        # Any capacity or consistency failure rolls back all appended rows and leaves the
+        # caller on the original linear walk.
+        def region_alias_graph_build(visit_slot: usize, params: darray[ParamDecl]&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                return false if visit_slot >= structs.regions.region_alias_graph_slot_rows.count
+                return true if structs.regions.region_alias_graph_slot_rows[visit_slot] >= 0
+                alias_count: usize = structs.regions.region_alias_names.count
+                return false if alias_count < REGION_ALIAS_GRAPH_INDEX_THRESHOLD or alias_count != structs.regions.region_alias_roots.count
+                # Bound the per-graph arithmetic before multiplying or doubling. Oversized
+                # graphs retain the exact linear fallback and cannot leave a partial index.
+                return false if alias_count > REGION_ALIAS_GRAPH_MAX_ROWS or params.count > REGION_ALIAS_GRAPH_MAX_ROWS
+                node_limit: usize = alias_count * 2 + params.count
+                return false if node_limit > REGION_ALIAS_GRAPH_MAX_ROWS / 2
+                bucket_count: mutable usize = REGION_ALIAS_GRAPH_MIN_BUCKET_COUNT
+                while bucket_count < node_limit * 2 |bucket_count, node_limit|:
+                    bucket_count <- bucket_count * 2
+                return false if bucket_count > REGION_ALIAS_GRAPH_MAX_ROWS
+                node_start: usize = structs.regions.region_alias_graph_node_names.count
+                edge_start: usize = structs.regions.region_alias_graph_edge_targets.count
+                return false if structs.regions.region_alias_graph_edge_sources.count != edge_start
+                bucket_start: usize = structs.regions.region_alias_graph_buckets.count
+                graph_row: usize = structs.regions.region_alias_graph_node_starts.count
+                return false if graph_row >= REGION_ALIAS_GRAPH_MAX_ROWS
+                return false if node_start > REGION_ALIAS_GRAPH_MAX_ROWS - node_limit
+                return false if edge_start > REGION_ALIAS_GRAPH_MAX_ROWS - alias_count
+                return false if bucket_start > REGION_ALIAS_GRAPH_MAX_ROWS - bucket_count
+                structs.regions.region_alias_graph_node_starts.push(node_start)
+                structs.regions.region_alias_graph_node_counts.push(0)
+                structs.regions.region_alias_graph_edge_starts.push(edge_start)
+                structs.regions.region_alias_graph_edge_counts.push(0)
+                structs.regions.region_alias_graph_bucket_starts.push(bucket_start)
+                structs.regions.region_alias_graph_bucket_counts.push(bucket_count)
+                structs.regions.region_alias_graph_generations.push(0)
+                for _ in 0..<bucket_count |structs|:
+                    structs.regions.region_alias_graph_buckets.push(-1)
+                failed: mutable bool = false
+                for alias_index in 0..<alias_count |structs, graph_row, failed|:
+                    source_node: i64 = region_alias_graph_intern_node(graph_row, structs.regions.region_alias_names[alias_index], structs)
+                    target_node: i64 = region_alias_graph_intern_node(graph_row, structs.regions.region_alias_roots[alias_index], structs)
+                    if source_node < 0 or target_node < 0:
+                        failed <- true
+                        break
+                    edge: usize = structs.regions.region_alias_graph_edge_targets.count
+                    structs.regions.region_alias_graph_edge_sources.push(source_node)
+                    structs.regions.region_alias_graph_edge_targets.push(target_node)
+                    structs.regions.region_alias_graph_edge_next.push(-1)
+                    source: usize = source_node.usize()
+                    previous_edge: i64 = structs.regions.region_alias_graph_node_tails[source]
+                    if previous_edge >= 0:
+                        structs.regions.region_alias_graph_edge_next[previous_edge.usize()] <- edge.i64()
+                    else:
+                        structs.regions.region_alias_graph_node_heads[source] <- edge.i64()
+                    structs.regions.region_alias_graph_node_tails[source] <- edge.i64()
+                if not failed:
+                    for parameter_index in 0..<params.count |structs, graph_row, params, failed|:
+                        parameter_node: i64 = region_alias_graph_intern_node(graph_row, params[parameter_index].name, structs)
+                        if parameter_node < 0:
+                            failed <- true
+                            break
+                        parameter_slot: usize = parameter_node.usize()
+                        if structs.regions.region_alias_graph_node_params[parameter_slot] < 0:
+                            structs.regions.region_alias_graph_node_params[parameter_slot] <- parameter_index.i64()
+                if failed:
+                    region_alias_graph_rollback(graph_row, structs)
+                    return false
+                node_count: usize = structs.regions.region_alias_graph_node_names.count - node_start
+                edge_count: usize = structs.regions.region_alias_graph_edge_targets.count - edge_start
+                if node_count > REGION_ALIAS_GRAPH_MAX_ROWS or edge_count != alias_count or structs.regions.region_alias_graph_edge_sources.count - edge_start != alias_count:
+                    region_alias_graph_rollback(graph_row, structs)
+                    return false
+                structs.regions.region_alias_graph_node_counts[graph_row] <- node_count
+                structs.regions.region_alias_graph_edge_counts[graph_row] <- edge_count
+                if not region_alias_graph_storage_valid(graph_row, params, structs):
+                    region_alias_graph_rollback(graph_row, structs)
+                    return false
+                # Publish the visit-to-graph mapping only after every node and edge validates.
+                structs.regions.region_alias_graph_slot_rows[visit_slot] <- graph_row.i64()
+                return true
+
+
+        def region_alias_graph_next_generation(visit_slot: usize, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
+            graph_row: i64 = structs.regions.region_alias_graph_slot_rows[visit_slot]
+            graph_index: usize = graph_row.usize()
+            node_start: usize = structs.regions.region_alias_graph_node_starts[graph_index]
+            node_count: usize = structs.regions.region_alias_graph_node_counts[graph_index]
+            previous_generation: u64 = structs.regions.region_alias_graph_generations[graph_index]
+            generation: mutable u64 = 1.u64()
+            if previous_generation == 18446744073709551615:
+                for node_offset in 0..<node_count |structs, node_start|:
+                    structs.regions.region_alias_graph_node_seen[node_start + node_offset] <- 0
+            else:
+                generation <- previous_generation + 1.u64()
+            structs.regions.region_alias_graph_generations[graph_index] <- generation
+            return generation
+
+
+        def region_mark_all_root_parameters(params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic]:
+            for parameter_index in 0..<params.count |params, flags, structs|:
+                parameter_type: ValueType = parameter_value_type(params[parameter_index].type_expression, structs)
+                flags[parameter_index] <- true if ref_type_can_grow(parameter_type, structs)
+
+
+        def region_mark_all_forwarded_parameters(parameter_position: usize, callee_fact_row: usize, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic]:
+            return if not region_fact_parameter_has_region(callee_fact_row, parameter_position, structs)
+            return if fact_row >= structs.regions.region_fact_starts.count or fact_row >= structs.regions.region_fact_counts.count
+            start: usize = structs.regions.region_fact_starts[fact_row]
+            count: usize = structs.regions.region_fact_counts[fact_row]
+            return if start > structs.regions.region_fact_params.count
+            available: usize = structs.regions.region_fact_params.count - start
+            bounded_count: mutable usize = count if count < available else available
+            bounded_count <- params.count if params.count < bounded_count else bounded_count
+            for caller_position in 0..<bounded_count |caller_position, start, params, structs, changed|:
+                parameter_type: ValueType = parameter_value_type(params[caller_position].type_expression, structs)
+                continue if not ref_type_can_grow(parameter_type, structs)
+                slot: usize = start + caller_position
+                if not structs.regions.region_fact_params[slot]:
+                    structs.regions.region_fact_params[slot] <- true
+                    changed <- true
 
 
 
@@ -124,6 +483,83 @@ extend Backend:
         def region_mark_root(root: sview, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 return if root == "" or root == "?"
+                graph_slot: usize = structs.regions.region_alias_graph_active_slot
+                if structs.regions.region_alias_graph_active and graph_slot < structs.regions.region_alias_graph_slot_rows.count and structs.regions.region_alias_graph_slot_rows[graph_slot] >= 0:
+                    graph_failed: mutable bool = false
+                    structs.regions.region_alias_graph_pending_nodes.truncate(0)
+                    graph_row: usize = structs.regions.region_alias_graph_slot_rows[graph_slot].usize()
+                    node_start: usize = structs.regions.region_alias_graph_node_starts[graph_row]
+                    node_count: usize = structs.regions.region_alias_graph_node_counts[graph_row]
+                    edge_start: usize = structs.regions.region_alias_graph_edge_starts[graph_row]
+                    edge_count: usize = structs.regions.region_alias_graph_edge_counts[graph_row]
+                    root_node: i64 = region_alias_graph_find_node(graph_slot, root, structs)
+                    if root_node < 0:
+                        # Every alias endpoint and parameter name is interned while the
+                        # graph is built. A missing name therefore has no work in the old
+                        # linear path either; keep the indexed graph active for later roots.
+                        return
+                    elif root_node.usize() < node_start or root_node.usize() - node_start >= node_count:
+                        graph_failed <- true
+                    else:
+                        generation: u64 = region_alias_graph_next_generation(graph_slot, structs)
+                        if generation == 0:
+                            graph_failed <- true
+                        else:
+                            structs.regions.region_alias_graph_pending_nodes.push(root_node)
+                            structs.regions.region_alias_graph_node_seen[root_node.usize()] <- generation
+                            cursor: mutable usize = 0
+                            while cursor < structs.regions.region_alias_graph_pending_nodes.count |cursor, params, flags, structs, graph_row, node_start, node_count, edge_start, edge_count, generation, graph_failed|:
+                                current_node: i64 = structs.regions.region_alias_graph_pending_nodes[cursor]
+                                cursor <- cursor + 1.usize()
+                                if current_node < 0 or current_node.usize() < node_start or current_node.usize() - node_start >= node_count:
+                                    graph_failed <- true
+                                    break
+                                current_node_index: usize = current_node.usize()
+                                if structs.regions.region_alias_graph_node_names[current_node_index] == "" or structs.regions.region_alias_graph_node_names[current_node_index] == "?":
+                                    continue
+                                parameter_index: i64 = structs.regions.region_alias_graph_node_params[current_node_index]
+                                if parameter_index < -1 or (parameter_index >= 0 and parameter_index.usize() >= params.count):
+                                    graph_failed <- true
+                                    break
+                                if parameter_index >= 0:
+                                    if params[parameter_index.usize()].name != structs.regions.region_alias_graph_node_names[current_node_index]:
+                                        graph_failed <- true
+                                        break
+                                    parameter_type: ValueType = parameter_value_type(params[parameter_index.usize()].type_expression, structs)
+                                    flags[parameter_index.usize()] <- true if ref_type_can_grow(parameter_type, structs)
+                                edge_cursor: mutable i64 = structs.regions.region_alias_graph_node_heads[current_node_index]
+                                edge_steps: mutable usize = 0
+                                while edge_cursor >= 0 and edge_steps < edge_count |edge_cursor, edge_steps, structs, edge_start, edge_count, node_start, node_count, generation, graph_failed|:
+                                    edge_index: usize = edge_cursor.usize()
+                                    if edge_index < edge_start or edge_index - edge_start >= edge_count:
+                                        graph_failed <- true
+                                        break
+                                    if structs.regions.region_alias_graph_edge_sources[edge_index] != current_node_index.i64():
+                                        graph_failed <- true
+                                        break
+                                    target_node: i64 = structs.regions.region_alias_graph_edge_targets[edge_index]
+                                    if target_node < 0 or target_node.usize() < node_start or target_node.usize() - node_start >= node_count:
+                                        graph_failed <- true
+                                        break
+                                    if structs.regions.region_alias_graph_node_seen[target_node.usize()] != generation:
+                                        structs.regions.region_alias_graph_node_seen[target_node.usize()] <- generation
+                                        structs.regions.region_alias_graph_pending_nodes.push(target_node)
+                                    edge_cursor <- structs.regions.region_alias_graph_edge_next[edge_index]
+                                    edge_steps <- edge_steps + 1.usize()
+                                if edge_cursor != -1:
+                                    graph_failed <- true
+                                break if graph_failed
+                            if not graph_failed:
+                                return
+                    restored: bool = region_alias_graph_restore_linear_aliases(graph_slot, structs)
+                    structs.regions.region_alias_graph_active <- false
+                    if not restored:
+                        region_mark_all_root_parameters(params, flags, structs)
+                        return
+                elif structs.regions.region_alias_graph_active:
+                    structs.regions.region_alias_graph_active <- false
+                    region_mark_all_root_parameters(params, flags, structs)
+                    return
                 has_alias: mutable bool = false
                 for alias_index in 0..<structs.regions.region_alias_names.count |has_alias, structs, root|:
                     has_alias <- true if structs.regions.region_alias_names[alias_index] == root
@@ -320,13 +756,19 @@ extend Backend:
 
 
 
-        def body_region_parameter_flags(params: darray[ParamDecl]&, body: darray[Stmt], structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def body_region_parameter_flags(params: darray[ParamDecl]&, body: darray[Stmt], graph_slot: usize, structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                region_alias_graph_ensure_slot(graph_slot, structs)
                 for _ in 0..<params.count |flags|:
                     flags.push(false)
+                structs.regions.region_alias_graph_active <- false
                 return if params_manage_arena(params, structs)
                 region_load_aliases(body, structs)
+                region_alias_graph_build(graph_slot, params, structs)
+                structs.regions.region_alias_graph_active_slot <- graph_slot
+                structs.regions.region_alias_graph_active <- region_alias_graph_row_valid(graph_slot, structs)
                 region_scan_statements(body, params, flags, structs)
+                structs.regions.region_alias_graph_active <- false
                 return
 
 
@@ -342,11 +784,13 @@ extend Backend:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 false return if not params_manage_arena(params, structs)
                 outside_flags: mutable darray[bool] = []
+                structs.regions.region_alias_graph_active <- false
                 for _ in 0..<params.count |outside_flags|:
                     outside_flags.push(false)
                 structs.memory.region_scan_skips_in_blocks <- true
                 region_load_aliases(body, structs)
                 region_scan_statements(body, params, outside_flags, structs)
+                structs.regions.region_alias_graph_active <- false
                 structs.memory.region_scan_skips_in_blocks <- false
                 for outside_flag in outside_flags:
                     true return if outside_flag
@@ -513,6 +957,105 @@ extend Backend:
         def region_mark_forwarded(root: sview, parameter_position: usize, callee_fact_row: usize, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 return if root == "" or root == "?"
+                graph_slot: usize = structs.regions.region_alias_graph_active_slot
+                if structs.regions.region_alias_graph_active and graph_slot < structs.regions.region_alias_graph_slot_rows.count and structs.regions.region_alias_graph_slot_rows[graph_slot] >= 0:
+                    graph_failed: mutable bool = false
+                    structs.regions.region_alias_graph_pending_nodes.truncate(0)
+                    graph_row: usize = structs.regions.region_alias_graph_slot_rows[graph_slot].usize()
+                    node_start: usize = structs.regions.region_alias_graph_node_starts[graph_row]
+                    node_count: usize = structs.regions.region_alias_graph_node_counts[graph_row]
+                    edge_start: usize = structs.regions.region_alias_graph_edge_starts[graph_row]
+                    edge_count: usize = structs.regions.region_alias_graph_edge_counts[graph_row]
+                    root_node: i64 = region_alias_graph_find_node(graph_slot, root, structs)
+                    if root_node < 0:
+                        # Every alias endpoint and parameter name is interned while the
+                        # graph is built. A missing name therefore has no work in the old
+                        # linear path either; keep the indexed graph active for later roots.
+                        return
+                    elif root_node.usize() < node_start or root_node.usize() - node_start >= node_count:
+                        graph_failed <- true
+                    else:
+                        generation: u64 = region_alias_graph_next_generation(graph_slot, structs)
+                        if generation == 0:
+                            graph_failed <- true
+                        else:
+                            structs.regions.region_alias_graph_pending_nodes.push(root_node)
+                            structs.regions.region_alias_graph_node_seen[root_node.usize()] <- generation
+                            node_cursor: mutable usize = 0
+                            while node_cursor < structs.regions.region_alias_graph_pending_nodes.count |node_cursor, structs, graph_row, node_start, node_count, edge_start, edge_count, generation, params, parameter_position, callee_fact_row, fact_row, changed, graph_failed|:
+                                current_node: i64 = structs.regions.region_alias_graph_pending_nodes[node_cursor]
+                                node_cursor <- node_cursor + 1.usize()
+                                if current_node < 0 or current_node.usize() < node_start or current_node.usize() - node_start >= node_count:
+                                    graph_failed <- true
+                                    break
+                                current_node_index: usize = current_node.usize()
+                                if structs.regions.region_alias_graph_node_names[current_node_index] == "" or structs.regions.region_alias_graph_node_names[current_node_index] == "?":
+                                    continue
+                                edge_cursor: mutable i64 = structs.regions.region_alias_graph_node_heads[current_node_index]
+                                edge_steps: mutable usize = 0
+                                while edge_cursor >= 0 and edge_steps < edge_count |edge_cursor, edge_steps, structs, edge_start, edge_count, node_start, node_count, generation, graph_failed|:
+                                    edge_index: usize = edge_cursor.usize()
+                                    if edge_index < edge_start or edge_index - edge_start >= edge_count:
+                                        graph_failed <- true
+                                        break
+                                    if structs.regions.region_alias_graph_edge_sources[edge_index] != current_node_index.i64():
+                                        graph_failed <- true
+                                        break
+                                    target_node: i64 = structs.regions.region_alias_graph_edge_targets[edge_index]
+                                    if target_node < 0 or target_node.usize() < node_start or target_node.usize() - node_start >= node_count:
+                                        graph_failed <- true
+                                        break
+                                    if structs.regions.region_alias_graph_node_seen[target_node.usize()] != generation:
+                                        structs.regions.region_alias_graph_node_seen[target_node.usize()] <- generation
+                                        structs.regions.region_alias_graph_pending_nodes.push(target_node)
+                                    edge_cursor <- structs.regions.region_alias_graph_edge_next[edge_index]
+                                    edge_steps <- edge_steps + 1.usize()
+                                if edge_cursor != -1:
+                                    graph_failed <- true
+                                break if graph_failed
+                                caller_position: i64 = structs.regions.region_alias_graph_node_params[current_node_index]
+                                if caller_position < -1 or (caller_position >= 0 and caller_position.usize() >= params.count):
+                                    graph_failed <- true
+                                    break
+                                if caller_position >= 0:
+                                    if params[caller_position.usize()].name != structs.regions.region_alias_graph_node_names[current_node_index]:
+                                        graph_failed <- true
+                                        break
+                                    if fact_row >= structs.regions.region_fact_starts.count or fact_row >= structs.regions.region_fact_counts.count:
+                                        graph_failed <- true
+                                        break
+                                    fact_start: usize = structs.regions.region_fact_starts[fact_row]
+                                    fact_count: usize = structs.regions.region_fact_counts[fact_row]
+                                    if caller_position.usize() >= fact_count or fact_start > structs.regions.region_fact_params.count or fact_count > structs.regions.region_fact_params.count - fact_start:
+                                        graph_failed <- true
+                                        break
+                                    slot: usize = fact_start + caller_position.usize()
+                                    if not structs.regions.region_fact_params[slot] and region_fact_parameter_has_region(callee_fact_row, parameter_position, structs):
+                                        structs.regions.region_fact_params[slot] <- true
+                                        changed <- true
+                            if not graph_failed:
+                                return
+                    restored: bool = region_alias_graph_restore_linear_aliases(graph_slot, structs)
+                    structs.regions.region_alias_graph_active <- false
+                    if not restored:
+                        region_mark_all_forwarded_parameters(parameter_position, callee_fact_row, params, structs, fact_row, changed)
+                        return
+                    # The indexed path validates the caller fact row before it mutates
+                    # individual slots. If that validation caused the graph walk to fall
+                    # back, keep the same fail-closed behavior here: the legacy path below
+                    # indexes these rows directly.
+                    if fact_row >= structs.regions.region_fact_starts.count or fact_row >= structs.regions.region_fact_counts.count:
+                        region_mark_all_forwarded_parameters(parameter_position, callee_fact_row, params, structs, fact_row, changed)
+                        return
+                    fallback_fact_start: usize = structs.regions.region_fact_starts[fact_row]
+                    fallback_fact_count: usize = structs.regions.region_fact_counts[fact_row]
+                    if fallback_fact_start > structs.regions.region_fact_params.count or fallback_fact_count != params.count or fallback_fact_count > structs.regions.region_fact_params.count - fallback_fact_start:
+                        region_mark_all_forwarded_parameters(parameter_position, callee_fact_row, params, structs, fact_row, changed)
+                        return
+                elif structs.regions.region_alias_graph_active:
+                    structs.regions.region_alias_graph_active <- false
+                    region_mark_all_forwarded_parameters(parameter_position, callee_fact_row, params, structs, fact_row, changed)
+                    return
                 has_alias: mutable bool = false
                 for alias_index in 0..<structs.regions.region_alias_names.count |has_alias, structs, root|:
                     has_alias <- true if structs.regions.region_alias_names[alias_index] == root
@@ -800,9 +1343,14 @@ extend Backend:
                 for declaration in declarations |structs, generics|:
                     if declaration is Decl.Func(region_fact_name, region_fact_params, region_fact_return, region_fact_body, region_fact_effects, region_fact_decorators, region_fact_line):
                         flags: mutable darray[bool] = []
+                        graph_slot: usize = structs.regions.region_fact_names.count
+                        region_alias_graph_ensure_slot(graph_slot, structs)
+                        previous_owner: sview = structs.visibility.current_owner
+                        structs.visibility.current_owner <- owner
                         placeholder_bound: usize = region_bind_template_placeholders(region_fact_name, region_fact_line.line, generics, structs)
-                        body_region_parameter_flags(region_fact_params, region_fact_body, structs, flags)
+                        body_region_parameter_flags(region_fact_params, region_fact_body, graph_slot, structs, flags)
                         pop_type_bindings(structs, placeholder_bound)
+                        structs.visibility.current_owner <- previous_owner
                         structs.regions.region_fact_names <- structs.regions.region_fact_names.push(region_fact_name)
                         structs.regions.region_fact_owners <- structs.regions.region_fact_owners.push(owner)
                         structs.regions.region_fact_lines <- structs.regions.region_fact_lines.push(region_fact_line.line)
@@ -835,14 +1383,36 @@ extend Backend:
                             previous_owner: sview = structs.visibility.current_owner
                             structs.visibility.current_owner <- owner
                             forward_placeholder_bound: usize = region_bind_template_placeholders(region_forward_fact_name, region_forward_fact_line.line, generics, structs)
-                            if visit_slot == alias_starts.count:
+                            graph_candidate: bool = visit_slot < structs.regions.region_alias_graph_slot_rows.count and structs.regions.region_alias_graph_slot_rows[visit_slot] >= 0
+                            graph_ready: bool = graph_candidate and region_alias_graph_row_valid(visit_slot, structs)
+                            if graph_ready:
+                                region_alias_cache_visit(visit_slot, false, false, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                            elif graph_candidate:
+                                # The graph is immutable after publication. If its metadata
+                                # no longer validates, rebuild the flat collector output from
+                                # this in-scope body once and keep using the linear path.
+                                if visit_slot == alias_starts.count:
+                                    region_load_aliases(region_forward_fact_body, structs)
+                                    region_alias_cache_visit(visit_slot, true, false, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                                elif alias_counts[visit_slot] == 0:
+                                    region_load_aliases(region_forward_fact_body, structs)
+                                    region_alias_cache_visit(visit_slot, true, false, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                                else:
+                                    region_alias_cache_visit(visit_slot, false, true, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                            elif visit_slot == alias_starts.count:
                                 region_load_aliases(region_forward_fact_body, structs)
-                            region_alias_cache_visit(visit_slot, true, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                                region_alias_cache_visit(visit_slot, true, false, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                            else:
+                                region_alias_cache_visit(visit_slot, false, true, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                            structs.regions.region_alias_graph_active_slot <- visit_slot
+                            structs.regions.region_alias_graph_active <- graph_ready
                             region_scan_forwarding_statements(region_forward_fact_body, region_forward_fact_params, structs, row.usize(), changed)
+                            structs.regions.region_alias_graph_active <- false
                             pop_type_bindings(structs, forward_placeholder_bound)
                             structs.visibility.current_owner <- previous_owner
                         else:
-                            region_alias_cache_visit(visit_slot, false, structs, alias_starts, alias_counts, alias_names, alias_roots)
+                            structs.regions.region_alias_graph_active <- false
+                            region_alias_cache_visit(visit_slot, false, false, structs, alias_starts, alias_counts, alias_names, alias_roots)
                     elif declaration is Decl.Module(region_forward_module_name, region_forward_module_body, region_forward_module_line):
                         region_apply_forwarding_declarations(region_forward_module_body, region_forward_module_name, structs, generics, managed_by_visit, alias_starts, alias_counts, alias_names, alias_roots, visit_index, changed)
                     elif declaration is Decl.Scoped(region_forward_scoped_body, region_forward_scoped_line):

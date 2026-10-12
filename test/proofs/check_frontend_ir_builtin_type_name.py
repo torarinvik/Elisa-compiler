@@ -31,31 +31,40 @@ proof_text = POSITIVE.read_text()
 
 
 def match_names(block, description):
-    arms = [line.strip() for line in block.splitlines() if line.strip()]
-    if not arms or arms[-1] != "_ -> false":
+    lines = [line.rstrip() for line in block.splitlines()]
+    arms = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
+            continue
+        header = lines[index].strip()
+        if ":" in header:
+            pattern, body = header.rsplit(":", 1)
+            arms.append((pattern.strip(), body.strip()))
+            index += 1
+        else:
+            raise SystemExit(f"{description} contains a malformed literal match arm")
+    if not arms or arms[-1] != ("_", "false"):
         raise SystemExit(f"{description} lost its false fallback")
     found_names = []
-    for arm in arms[:-1]:
-        if not re.fullmatch(r'"[^"\\]+"(?:\s*\|\s*"[^"\\]+")*\s*->\s*true', arm):
+    for pattern, result in arms[:-1]:
+        if result != "true" or not re.fullmatch(r'"[^"\\]+"(?:\s*\|\s*"[^"\\]+")*', pattern):
             raise SystemExit(f"{description} contains a non-literal or non-true arm")
-        found_names.extend(re.findall(r'"([^"\\]+)"', arm))
+        found_names.extend(re.findall(r'"([^"\\]+)"', pattern))
     if found_names != list(names):
         raise SystemExit(f"{description} arms differ from the ordered closed set")
 
 
-def require_spec_match(text, description):
-    match = re.search(
-        r"ensure\s+result\s*==\s*\(\s*when\s+name:\s*\n(.*?)^\s*\)",
-        text,
-        re.DOTALL | re.MULTILINE,
-    )
-    if not match:
-        raise SystemExit(f"{description} must specify the closed set with pattern matching")
-    match_names(match.group(1), description)
+def require_spec_closed_set(text, description):
+    literal_set = "or".join(f'name=="{name}"' for name in names)
+    contract = "ensureresult==(" + literal_set + ")"
+    if contract not in "".join(text.split()):
+        raise SystemExit(f"{description} must specify the exact closed builtin set")
 
 
-require_spec_match(source_text, "production classifier contract")
-require_spec_match(proof_text, "proof contract")
+require_spec_closed_set(source_text, "production classifier contract")
+require_spec_closed_set(proof_text, "proof contract")
 classifier = re.search(
     r"(?m)^\s*def is_builtin_type_name\([^\n]*\n(.*?)(?=^\s*def |\Z)",
     source_text,
@@ -64,7 +73,7 @@ classifier = re.search(
 if not classifier:
     raise SystemExit("production builtin classifier is missing")
 dispatch = re.search(
-    r"return\s+when\s+name:\s*\n(.*)",
+    r"return\s+match\s+name:\s*\n(.*)",
     classifier.group(1),
     re.DOTALL,
 )

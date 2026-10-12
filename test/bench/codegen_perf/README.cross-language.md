@@ -1,8 +1,8 @@
 # Cross-language compiler and runtime benchmarks
 
 `cross_language.sh` compares the Elisa and C kernels with equivalent Rust and Zig
-implementations for `matmul`, `sieve`, `darray_sum`, `darray_count_sum`, `darray_growth`, and
-`darray_counted_fill`. It measures
+implementations for `matmul`, `sieve`, `darray_sum`, `darray_count_sum`, `darray_growth`,
+`darray_counted_fill`, `packed_side_table_write`, and `packed_side_table_read`. It measures
 object-only compile time as the primary compiler metric, end-to-end executable build time as
 a second metric, then checksums and times generated-program runtime.
 
@@ -38,8 +38,9 @@ compiler/build sample and again after the timed executable builds; success write
 `COMPILE_COMPLETE` instead of the full-suite `COMPLETE`.
 
 The suite is intentionally substantial: `matmul` performs 30 300×300 multiplies, `sieve`
-runs 30 sieves of ten million entries, and `darray_sum` traverses four million entries 200
-times. `darray_count_sum` preserves the same checksum, but moves both traversals into helpers
+runs 30 sieves of ten million entries, `darray_sum` traverses four million entries 200
+times, and `packed_side_table_read` performs 16,777,216 common-field reads. `darray_count_sum`
+preserves the same checksum, but moves both traversals into helpers
 that each contain one ordinary counted loop. This lets candidates that prove `0..<xs.count` /
 `xs[i]` be measured without nested loops. `REPEAT` controls runtime samples and `BUILD_REPEAT`
 controls both compiler sample
@@ -91,6 +92,10 @@ use their toolchain-selected linker defaults; the harness does not force them on
 linker, and `metadata.txt` records that policy. End-to-end build timings therefore include
 this toolchain difference. Object-only compile time remains the primary compiler metric and
 does not include executable linking.
+Treat object-only time as each toolchain's standalone compilation path, including standard-library
+and runtime work triggered by the fixture. Elisa fixtures include runtime source, Rust uses its
+already compiled standard library, and Zig's fresh per-sample cache can include standard-library
+compilation. These timings do not normalize the amount of library work across toolchains.
 For static LLVM configurations, the manifest also records the archive list reported by the
 selected `llvm-config`. The runner does not content-hash the Linux external linker, compiler
 sysroots and runtimes, SDK, dependencies of dynamic compiler libraries, or OS libraries;
@@ -110,8 +115,11 @@ its provenance file, and runtime object. Those candidate artifact hashes remain 
 run outputs. The Elisa runtime profile records whether the runtime was selected or rebuilt and,
 for the safe profile, the runtime optimization level and checked overflow mode. The safe profile
 rebuilds that object with the selected Stage1 compiler, so candidate-generated runtime bytes may
-differ while workload and profile parity still match. Candidate and reference runs must use the
-same scope, benchmark helpers, comparator toolchain, host identity, and CPU entitlement. A
+differ while workload and profile parity still match. The runner records both runtime SHA-256
+hashes and their equality in the candidate fingerprint for this profile. For the selected-runtime
+profile, the candidate and reference runtime hashes must match or the candidate run aborts.
+Candidate and reference runs must use the same scope, benchmark helpers, comparator toolchain,
+host identity, and CPU entitlement. A
 reference fingerprint is accepted only when its run directory has the matching nonempty
 `COMPLETE` or `COMPILE_COMPLETE` marker and no `ABORTED.txt`. To require candidate parity before
 any timed compiler sample, set `ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT` to the primary run's
@@ -167,8 +175,9 @@ runs still record the post-build manifest but do not produce an after-runtime ma
 All variants must agree on the full checksum and process exit status before runtime timing.
 The harness also checks independently calculated totals: `matmul` -432360, `sieve` 19937370,
 both `darray_sum` and `darray_count_sum` 751804663071387784, `darray_growth` 3759023315128811,
-and `darray_counted_fill` 7999998000000. Their exit statuses are respectively 113, 189, 152,
-152, 72, and 8.
+`darray_counted_fill` 7999998000000, `packed_side_table_write` 2147516416, and
+`packed_side_table_read` 549764202496. Their exit statuses are respectively 113, 189, 152,
+152, 72, 8, 74, and 119.
 These fixed values catch a shared implementation mistake that a four-way agreement check
 alone would miss.
 
@@ -234,14 +243,47 @@ arithmetic in `darray_count_sum`. Each language uses the same seed to initialize
 C, Rust, and Zig reserve exactly four million slots before the fill. All four then run one
 indexed sum pass. The checksum is `7999998000000`, with exit status 8.
 
+The packed side-table workloads build 65,536 dynamic AoS records in 256-record chunks. Each
+record has a 12-byte inline row (`i32` tag plus two `u32` payload words) and one common `i64`
+stamp stored in the side table; the dense record index serves as its handle. Elisa selects the
+dynamic AoS ABI with `@packed_profile(build_heavy)` and marks the common field
+`@storage(side_table)`. Constructors
+therefore record their common words through the runtime helper
+`ctx_aos_store_record_side_words_at` in `elisacore_std/stores_packed_aos.elisa`. The
+`packed_side_table_write` workload stores the stamps during construction, then reads each common
+field once for its checksum (`2147516416`, exit status 74). This store-plus-readback keeps the
+side-table writes observable in all four fixtures. The C, Rust, and Zig fixtures use the same row size and explicit
+chunk/offset helpers. They zero each record row inside the construction loop immediately before
+writing its tag and payload, matching the generated Elisa constructor's per-record row-zeroing
+order. They leave side slots uninitialized until each is written. Native side-table stores and
+readback loads are ordinary accesses; the final checksum consumes every loaded stamp. The native
+helpers model the side-table indexing and access while Elisa uses its generated AoS store and
+runtime helper.
+
+`packed_side_table_read` builds the same records, then makes 256 full passes over their handles
+and reads each common stamp. Elisa lowers `node.stamp` through the runtime helper
+`ctx_aos_store_read_side_word`; the other fixtures use matching chunk/offset helpers with
+volatile loads. The total checksum is `549764202496`, with exit status 119. Because Elisa emits
+ordinary helper accesses while the native fixtures force volatile row/side-table stores and
+side-table loads, this workload is
+diagnostic-only for runtime: correctness, compilation, and build samples remain available, but
+`runtime_ratios.csv` and its geometric means omit it. Its raw runtime samples are not a
+cross-language performance claim. The write workload above is the side-table runtime comparison
+and uses ordinary side-table accesses in every fixture. Each implementation releases its storage
+before terminating: Elisa frees the owning region on return, while the C, Rust, and Zig references
+free their record, side-table, descriptor, and handle allocations as applicable. Their
+allocator-specific setup and teardown paths differ, so runtime ratios include that lifetime
+difference.
+
 Rust compile and executable-build samples use rustc's default codegen-unit setting, recorded in
 the canonical profile and toolchain metadata. Object-only Rust samples write to a fresh output
 directory because the default profile may emit multiple objects. Every object-only sample uses
 a fresh per-sample output directory, and the runner requires nonempty object output so an old
 artifact cannot satisfy a later sample's check. Executable-build samples remove their previous
 binary before timing and require a nonempty executable result. The Zig fixtures print their
-checksum to stderr while the other variants print to stdout. Preflight accepts either stream and requires
-the same bytes, but tiny runtime comparisons include this output-path difference.
+checksum to stderr while the other variants print to stdout. Preflight and timed runtime checks
+require the exact expected checksum bytes on exactly one stream, no extra bytes on the other
+stream, and the expected exit status. The checksum may use a different stream by language.
 
 Elisa also keeps dynamic darray bounds checks in optimized output. Rust may prove checks
 redundant in these indexed loops. Zig `ReleaseFast` disables safety checks and C has no bounds
@@ -255,3 +297,7 @@ object; the safe profile builds a separate `-O2` runtime with checked arithmetic
 records the runtime path, hash, and build mode. Fixed workload sizes keep signed arithmetic
 in range in the fast profile; do not generalize that configuration to arbitrary programs. Use
 `BENCH_PROFILE=safe` for checked arithmetic and Zig's safety-enabled release mode.
+The packed side-table helpers in that Elisa runtime object therefore use the runtime object's
+optimization level, while the analogous native helpers are compiled with each fixture's release
+flags. Packed workload timings compare the configured toolchains and their runtime boundaries;
+they do not isolate helpers compiled at an identical optimization level.

@@ -257,15 +257,33 @@ extend Semantic:
         # Resolved local/parameter references indexed by (function declaration, source
         # offset). This distinguishes a shadowed call at its actual lexical site from a
         # same-spelled binder in another branch or later statement.
+        struct BorrowLocalCallableGlobalStore:
+            source_name: sview
+            target_name: sview
+            source_is_address: bool
+
         struct BorrowLocalCallable:
+            # Exact lexical identity avoids confusing same-spelled binders in disjoint scopes.
             binding_id: BindingId
+            # Branch/loop joins retain whether any reachable path can hold a closure.
             may_be_callable: bool
+            # Possible outer bindings read by closures assigned to this local.
+            capture_names: darray[sview]
+            # File globals directly written by closures assigned to this local.
+            global_targets: darray[sview]
+            # Captured identifiers used as possible values written to each global.
+            # Keeping the pair prevents unrelated captures from becoming false sources.
+            global_stores: darray[BorrowLocalCallableGlobalStore]
 
         struct BorrowReferenceSites:
             # 1 = parameter, 2 = local. Retaining the binding class lets conservative
             # indirect-call handling distinguish an opaque callback parameter from a
             # closure value created in this function.
-            keys: mutable dict[u64, u8]
+            # The value is the row in the parallel reference columns, keeping both the
+            # binding kind and BindingId available without duplicating them in the index.
+            # u32 matches the symbol indexes and uses half the payload of usize on 64-bit.
+            # SYMBOL_INDEX_ROW_NONE marks duplicate or otherwise ambiguous start offsets.
+            keys: mutable dict[u64, u32]
             local_callables: mutable darray[BorrowLocalCallable]
             initialized: bool = false
 
@@ -277,24 +295,72 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 return BorrowReferenceSites{keys: {}, local_callables: []}
 
-        def borrow_set_local_callable(sites: mutable BorrowReferenceSites&, binding_id: BindingId, may_be_callable: bool) -> void:
+        def borrow_set_local_callable(sites: mutable BorrowReferenceSites&, binding_id: BindingId, may_be_callable: bool, capture_names: darray[sview], global_targets: darray[sview], global_stores: darray[BorrowLocalCallableGlobalStore]) -> void:
             can Memory.Allocate, Abort.Panic:
-                row: mutable usize = 0
-                while row < sites.local_callables.count |row, sites|:
-                    if ownership_binding_ids_equal(sites.local_callables[row].binding_id, binding_id):
-                        sites.local_callables[row] <- BorrowLocalCallable{binding_id: binding_id, may_be_callable: may_be_callable}
-                        return
-                    row <- row + 1
-                sites.local_callables.push(BorrowLocalCallable{binding_id: binding_id, may_be_callable: may_be_callable})
+                slot: usize = borrow_local_callable_slot(sites.local_callables, binding_id)
+                state: BorrowLocalCallable = BorrowLocalCallable{binding_id: binding_id, may_be_callable: may_be_callable, capture_names: capture_names, global_targets: global_targets, global_stores: global_stores}
+                if slot < sites.local_callables.count:
+                    sites.local_callables[slot] <- state
+                    return
+                # Resolver binding serials follow source traversal. Keep the common append
+                # path allocation-free beyond darray growth; preserve the sorted invariant if
+                # a future traversal records a binding out of order.
+                if sites.local_callables.count == 0 or borrow_binding_id_precedes(sites.local_callables[sites.local_callables.count - 1].binding_id, binding_id):
+                    sites.local_callables.push(state)
+                    return
+                ordered: mutable darray[BorrowLocalCallable] = []
+                inserted: mutable bool = false
+                for prior in sites.local_callables |ordered, inserted|:
+                    if not inserted and borrow_binding_id_precedes(binding_id, prior.binding_id):
+                        ordered.push(state)
+                        inserted <- true
+                    ordered.push(prior)
+                ordered.push(state) if not inserted
+                sites.local_callables <- ordered
+
+        def borrow_binding_id_precedes(left: BindingId, right: BindingId) -> bool:
+            can Abort.Panic:
+                return left.owner.value < right.owner.value or (left.owner.value == right.owner.value and left.serial < right.serial)
+
+        # Callable rows are kept sorted by BindingId so lookup and state joins do not
+        # repeatedly scan the complete closure-state vector.
+        def borrow_local_callable_slot(states: darray[BorrowLocalCallable]&, binding_id: BindingId) -> usize:
+            can Abort.Panic:
+                low: mutable usize = 0
+                high: mutable usize = states.count
+                while low < high |low, high, states, binding_id|:
+                    middle: usize = low + (high - low) / 2
+                    candidate: BindingId = states[middle].binding_id
+                    if ownership_binding_ids_equal(candidate, binding_id):
+                        return middle
+                    if borrow_binding_id_precedes(candidate, binding_id):
+                        low <- middle + 1
+                    else:
+                        high <- middle
+                return states.count
 
         def borrow_local_callable_state(states: darray[BorrowLocalCallable]&, binding_id: BindingId) -> bool:
             can Abort.Panic:
-                return any callable in states where ownership_binding_ids_equal(callable.binding_id, binding_id) and callable.may_be_callable
+                slot: usize = borrow_local_callable_slot(states, binding_id)
+                return slot < states.count and states[slot].may_be_callable
 
-        def borrow_reference_site_is_local_callable(sites: BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> bool:
-            can Abort.Panic:
-                known, binding_id = ownership_binding_at_position(table, owner, position)
-                return known and borrow_local_callable_state(sites.local_callables, binding_id)
+        def borrow_local_callable_captures(states: darray[BorrowLocalCallable]&, binding_id: BindingId) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                slot: usize = borrow_local_callable_slot(states, binding_id)
+                return states[slot].capture_names if slot < states.count
+                return []
+
+        def borrow_local_callable_global_targets(states: darray[BorrowLocalCallable]&, binding_id: BindingId) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                slot: usize = borrow_local_callable_slot(states, binding_id)
+                return states[slot].global_targets if slot < states.count
+                return []
+
+        def borrow_local_callable_global_stores(states: darray[BorrowLocalCallable]&, binding_id: BindingId) -> darray[BorrowLocalCallableGlobalStore]:
+            can Memory.Allocate, Abort.Panic:
+                slot: usize = borrow_local_callable_slot(states, binding_id)
+                return states[slot].global_stores if slot < states.count
+                return []
 
         def borrow_snapshot_local_callables(sites: BorrowReferenceSites&) -> darray[BorrowLocalCallable]:
             can Memory.Allocate, Abort.Panic:
@@ -304,43 +370,146 @@ extend Semantic:
 
         def borrow_restore_local_callables(sites: mutable BorrowReferenceSites&, snapshot: darray[BorrowLocalCallable]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                sites.local_callables <- []
+                sites.local_callables.truncate(0)
                 sites.local_callables.extend(snapshot)
 
         def borrow_join_local_callable_states(left: darray[BorrowLocalCallable]&, right: darray[BorrowLocalCallable]&) -> darray[BorrowLocalCallable]:
             can Memory.Allocate, Abort.Panic:
                 joined: mutable darray[BorrowLocalCallable] = []
-                for callable in left |joined, right|:
-                    may_be_callable: bool = callable.may_be_callable or borrow_local_callable_state(right, callable.binding_id)
-                    joined.push(BorrowLocalCallable{binding_id: callable.binding_id, may_be_callable: may_be_callable})
-                for callable in right |joined, left|:
-                    if not any prior in left where ownership_binding_ids_equal(prior.binding_id, callable.binding_id):
-                        joined.push(callable)
+                left_row: mutable usize = 0
+                right_row: mutable usize = 0
+                while left_row < left.count or right_row < right.count |joined, left_row, right_row, left, right|:
+                    if left_row >= left.count:
+                        joined.push(right[right_row])
+                        right_row <- right_row + 1
+                    elif right_row >= right.count:
+                        joined.push(left[left_row])
+                        left_row <- left_row + 1
+                    elif ownership_binding_ids_equal(left[left_row].binding_id, right[right_row].binding_id):
+                        callable: BorrowLocalCallable = left[left_row]
+                        other: BorrowLocalCallable = right[right_row]
+                        captures: mutable darray[sview] = []
+                        for capture in callable.capture_names |captures|:
+                            captures.push(capture) if not (any prior in captures where prior == capture)
+                        for capture in other.capture_names |captures|:
+                            captures.push(capture) if not (any prior in captures where prior == capture)
+                        targets: mutable darray[sview] = []
+                        for target in callable.global_targets |targets|:
+                            targets.push(target) if not (any prior in targets where prior == target)
+                        for target in other.global_targets |targets|:
+                            targets.push(target) if not (any prior in targets where prior == target)
+                        stores: mutable darray[BorrowLocalCallableGlobalStore] = []
+                        for store in callable.global_stores |stores|:
+                            stores.push(store) if not (any prior in stores where prior.source_name == store.source_name and prior.target_name == store.target_name and prior.source_is_address == store.source_is_address)
+                        for store in other.global_stores |stores|:
+                            stores.push(store) if not (any prior in stores where prior.source_name == store.source_name and prior.target_name == store.target_name and prior.source_is_address == store.source_is_address)
+                        joined.push(BorrowLocalCallable{binding_id: callable.binding_id, may_be_callable: callable.may_be_callable or other.may_be_callable, capture_names: captures, global_targets: targets, global_stores: stores})
+                        left_row <- left_row + 1
+                        right_row <- right_row + 1
+                    elif borrow_binding_id_precedes(left[left_row].binding_id, right[right_row].binding_id):
+                        joined.push(left[left_row])
+                        left_row <- left_row + 1
+                    else:
+                        joined.push(right[right_row])
+                        right_row <- right_row + 1
                 return joined
 
         def borrow_local_callable_states_equal(left: darray[BorrowLocalCallable]&, right: darray[BorrowLocalCallable]&) -> bool:
             can Abort.Panic:
                 return false if left.count != right.count
-                for callable in left:
-                    return false if not any other in right where ownership_binding_ids_equal(callable.binding_id, other.binding_id) and callable.may_be_callable == other.may_be_callable
+                for row in 0..<left.count |right|:
+                    callable: BorrowLocalCallable = left[row]
+                    other: BorrowLocalCallable = right[row]
+                    return false if not ownership_binding_ids_equal(callable.binding_id, other.binding_id) or callable.may_be_callable != other.may_be_callable or callable.capture_names.count != other.capture_names.count or callable.global_targets.count != other.global_targets.count or callable.global_stores.count != other.global_stores.count
+                    for capture in callable.capture_names:
+                        return false if not (any other_capture in other.capture_names where other_capture == capture)
+                    for target in callable.global_targets:
+                        return false if not (any other_target in other.global_targets where other_target == target)
+                    for store in callable.global_stores:
+                        return false if not (any other_store in other.global_stores where other_store.source_name == store.source_name and other_store.target_name == store.target_name and other_store.source_is_address == store.source_is_address)
                 return true
 
         def borrow_merge_local_callable_states(sites: mutable BorrowReferenceSites&, left: darray[BorrowLocalCallable]&, right: darray[BorrowLocalCallable]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 sites.local_callables <- borrow_join_local_callable_states(left, right)
 
+        def borrow_reference_site_row(sites: mutable BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> (known: bool, row: usize):
+            can Memory.Allocate, Abort.Panic:
+                return (false, 0) if position.end_offset <= position.offset
+                if not sites.initialized:
+                    if table.ref_pos.count == table.ref_binding_ids.count and table.ref_kind.count == table.ref_binding_ids.count:
+                        for row in 0..<table.ref_binding_ids.count |sites, table|:
+                            if table.ref_pos[row].end_offset > table.ref_pos[row].offset:
+                                key: u64 = borrow_reference_site_key(table.ref_binding_ids[row].owner, table.ref_pos[row])
+                                if sites.keys.get(key) is previous:
+                                    previous_row: usize = previous.usize()
+                                    if previous == SYMBOL_INDEX_ROW_NONE or previous_row >= table.ref_pos.count or previous_row >= table.ref_kind.count or previous_row >= table.ref_binding_ids.count:
+                                        sites.keys <- sites.keys.put(key, SYMBOL_INDEX_ROW_NONE) can Global{Read,Write}
+                                    else:
+                                        previous_pos: Ast::Pos = table.ref_pos[previous_row]
+                                        same_site: bool = previous_pos.offset == table.ref_pos[row].offset and previous_pos.end_offset == table.ref_pos[row].end_offset
+                                        same_binding: bool = ownership_binding_ids_equal(table.ref_binding_ids[previous_row], table.ref_binding_ids[row])
+                                        same_kind: bool = table.ref_kind[previous_row] == table.ref_kind[row]
+                                        if not same_site or not same_binding or not same_kind:
+                                            sites.keys <- sites.keys.put(key, SYMBOL_INDEX_ROW_NONE) can Global{Read,Write}
+                                else:
+                                    row_value: u32 = row.u32() if row < SYMBOL_INDEX_ROW_NONE.usize() else SYMBOL_INDEX_ROW_NONE
+                                    sites.keys <- sites.keys.put(key, row_value) can Global{Read,Write}
+                    sites.initialized <- true
+                if sites.keys.get(borrow_reference_site_key(owner, position)) is indexed_row and indexed_row != SYMBOL_INDEX_ROW_NONE:
+                    row: usize = indexed_row.usize()
+                    if row < table.ref_pos.count and row < table.ref_binding_ids.count and row < table.ref_kind.count:
+                        recorded: Ast::Pos = table.ref_pos[row]
+                        if table.ref_binding_ids[row].owner.value == owner.value and recorded.offset == position.offset and recorded.end_offset == position.end_offset:
+                            return (true, row)
+                return (false, 0)
+
+        # Return both properties together so indirect-call handling performs one cache
+        # probe on its common path. Ambiguous cache entries fall back to an exact scan.
+        def borrow_reference_site_lookup(sites: mutable BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> (kind: u8, binding_known: bool, binding_id: BindingId):
+            can Memory.Allocate, Abort.Panic:
+                missing: BindingId = BindingId{owner: DeclId{value: INVALID_DECL_ID_VALUE}, serial: FIRST_BINDING_SERIAL}
+                return (0, false, missing) if position.end_offset <= position.offset
+                return (0, false, missing) if owner.value == INVALID_DECL_ID_VALUE or owner.value.usize() >= table.symbols.count
+                return (0, false, missing) if table.ref_pos.count != table.ref_binding_ids.count or table.ref_kind.count != table.ref_binding_ids.count
+                row_known, row = borrow_reference_site_row(sites, owner, position, table)
+                if row_known:
+                    kind: u8 = table.ref_kind[row]
+                    return (kind, kind != 0, table.ref_binding_ids[row])
+                found: mutable bool = false
+                binding_ambiguous: mutable bool = false
+                kind_ambiguous: mutable bool = false
+                result_kind: mutable u8 = 0
+                result_binding: mutable BindingId = missing
+                for candidate in 0..<table.ref_binding_ids.count |candidate, found, binding_ambiguous, kind_ambiguous, result_kind, result_binding, table, owner, position|:
+                    id: BindingId = table.ref_binding_ids[candidate]
+                    recorded: Ast::Pos = table.ref_pos[candidate]
+                    continue if id.owner.value != owner.value or recorded.offset != position.offset or recorded.end_offset != position.end_offset
+                    if not found:
+                        found <- true
+                        result_kind <- table.ref_kind[candidate]
+                        result_binding <- id
+                    else:
+                        binding_ambiguous <- true if not ownership_binding_ids_equal(result_binding, id)
+                        kind_ambiguous <- true if result_kind != table.ref_kind[candidate]
+                return (0, false, missing) if not found
+                return (3, false, missing) if kind_ambiguous
+                return (result_kind, not binding_ambiguous and result_kind != 0, result_binding if not binding_ambiguous else missing)
+
         def borrow_reference_site_kind(sites: mutable BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> u8:
             can Memory.Allocate, Abort.Panic:
-                0 return if position.end_offset <= position.offset
-                if not sites.initialized:
-                    for row in 0..<table.ref_binding_ids.count |sites, table|:
-                        if table.ref_pos[row].end_offset > table.ref_pos[row].offset:
-                            key: u64 = borrow_reference_site_key(table.ref_binding_ids[row].owner, table.ref_pos[row])
-                            sites.keys <- sites.keys.put(key, table.ref_kind[row]) can Global{Read,Write}
-                    sites.initialized <- true
-                if sites.keys.get(borrow_reference_site_key(owner, position)) is kind:
-                    return kind
-                return 0
+                kind, binding_known, binding_id = borrow_reference_site_lookup(sites, owner, position, table)
+                return kind
+
+        def borrow_reference_site_binding(sites: mutable BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> (known: bool, binding_id: BindingId):
+            can Memory.Allocate, Abort.Panic:
+                kind, known, binding_id = borrow_reference_site_lookup(sites, owner, position, table)
+                return (known, binding_id)
+
+        def borrow_reference_site_is_local_callable(sites: mutable BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                known, binding_id = borrow_reference_site_binding(sites, owner, position, table)
+                return known and borrow_local_callable_state(sites.local_callables, binding_id)
 
         def borrow_reference_site_is_local(sites: mutable BorrowReferenceSites&, owner: DeclId, position: Ast::Pos, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:

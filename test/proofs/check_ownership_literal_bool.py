@@ -551,6 +551,52 @@ except SystemExit:
 else:
     raise SystemExit("ownership literal-bool source gate accepted the nested loop-analysis bypass")
 
+loop_proof_contracts = {
+    "loop_backedge_reachability_tracks_condition": (
+        "backedge_was_reachable: bool, condition_known: bool, condition_value: bool",
+        "backedge_was_reachable and (not condition_known or condition_value)",
+    ),
+    "stable_complete_true_loop_marks_exit_unreachable": (
+        "fixed_point_reached: bool, body_coverage_complete: bool, condition_known: bool, condition_value: bool",
+        "fixed_point_reached and body_coverage_complete and condition_known and condition_value",
+    ),
+}
+for theorem_name, (parameters, formula) in loop_proof_contracts.items():
+    expected_theorem = compact_source(f"""def {theorem_name}({parameters}) -> bool:
+        ensure result == ({formula})
+        return {formula}""")
+    if source_function(proof_source, theorem_name) != expected_theorem:
+        raise SystemExit(f"{theorem_name} no longer states the source-bound loop transfer")
+loop_wrappers = {
+    "loop_backedge_reachability_matches_the_guard": (
+        "backedge_was_reachable: bool, condition_known: bool, condition_value: bool",
+        "loop_backedge_reachability_tracks_condition",
+        "backedge_was_reachable and (not condition_known or condition_value)",
+    ),
+    "complete_true_loop_transfer_is_correct": (
+        "fixed_point_reached: bool, body_coverage_complete: bool, condition_known: bool, condition_value: bool",
+        "stable_complete_true_loop_marks_exit_unreachable",
+        "fixed_point_reached and body_coverage_complete and condition_known and condition_value",
+    ),
+}
+for theorem_name, (parameters, helper_name, formula) in loop_wrappers.items():
+    parameter_names = ", ".join(item.split(":", 1)[0] for item in parameters.split(", "))
+    expected_theorem = compact_source(f"""def {theorem_name}({parameters}) -> bool:
+        ensure result == true
+        return OwnershipLiteralBoolSpecification::{helper_name}({parameter_names}) == ({formula})""")
+    if source_function(proof_source, theorem_name) != expected_theorem:
+        raise SystemExit(f"{theorem_name} no longer connects the loop model to its proof obligation")
+loop_source = source_function(flow_source, "ownership_flow_loop")
+for anchor in (
+    "back.reachable<-back.reachableandliteral.valueifliteral.known",
+    "ifownership_frontiers_equal(&head,&next):",
+    "ifnotback.coverage_complete:",
+    "elifliteral.knownandliteral.value:",
+    "flow.reachable<-false",
+):
+    if anchor not in loop_source:
+        raise SystemExit("literal-boolean loop proofs are no longer tied to the fixed-point source guards")
+
 # Match-arm guard facts must control that arm's branch frontier and join.
 require_match_arm_structure(derived_source, "derived_source_walk", "Stmt.Match(value, arms, _):",
     """Stmt.Match(value, arms, _):
@@ -674,12 +720,16 @@ positive_names = {
     "the_depth_cutoff_discards_literal_facts",
     "an_unsupported_expression_is_conservatively_unknown",
     "a_parenthesized_unknown_stays_unknown_and_false",
+    "loop_backedge_reachability_matches_the_guard",
+    "complete_true_loop_transfer_is_correct",
 }
 negative_names = {
     "depth_limited_boolean_may_remain_known",
     "unsupported_expression_may_supply_a_truth_value",
     "parentheses_may_invent_knownness",
     "parenthesized_unknown_may_be_true",
+    "a_known_false_guard_may_reach_the_loop_body",
+    "a_complete_known_true_loop_may_fall_through",
 }
 for path, expected in ((POSITIVE, positive_names), (NEGATIVE, negative_names)):
     found = set(re.findall(r"(?m)^def\s+(\w+)\s*\(", path.read_text()))

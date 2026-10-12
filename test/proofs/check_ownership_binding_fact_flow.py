@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = ROOT.parent / "elisa-proof"
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+PROOF_PROCESS_TIMEOUT_SECONDS = 60
 if not __debug__:
     raise SystemExit("run without Python -O")
 try:
@@ -32,7 +33,7 @@ hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in i
 
 def run(path):
     process = subprocess.run([str(BIN), "--json", str(path)], capture_output=True,
-                             text=True, timeout=60)
+                             text=True, timeout=PROOF_PROCESS_TIMEOUT_SECONDS)
     report = json.loads(process.stdout)
     assert report["summary"]["semantic_errors"] == 0, report.get("semantic_diagnostics")
     assert not report["trust"]["trusted_assumptions"]

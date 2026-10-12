@@ -26,13 +26,25 @@ def _live_linux_capacity(qualification: dict[str, object]) -> tuple[int, float |
         raise LoadGateError(f"Linux benchmark host architecture changed or is unqualified: {machine!r}")
 
     try:
-        allowed = len(os.sched_getaffinity(0))
+        allowed_cpu_ids = sorted(os.sched_getaffinity(0))
     except (AttributeError, OSError) as error:
         raise LoadGateError(f"could not read current Linux CPU affinity: {error}") from error
+    allowed = len(allowed_cpu_ids)
     expected_allowed = qualification.get("allowed_cpu_count")
-    if not isinstance(expected_allowed, int) or isinstance(expected_allowed, bool) or allowed != expected_allowed:
+    expected_cpu_ids = qualification.get("allowed_cpu_ids")
+    if (
+        not isinstance(expected_allowed, int)
+        or isinstance(expected_allowed, bool)
+        or not isinstance(expected_cpu_ids, list)
+        or any(not isinstance(cpu_id, int) or isinstance(cpu_id, bool) for cpu_id in expected_cpu_ids)
+        or len(expected_cpu_ids) != expected_allowed
+        or len(set(expected_cpu_ids)) != len(expected_cpu_ids)
+    ):
+        raise LoadGateError("Linux host qualification is missing a valid CPU affinity set")
+    expected_cpu_ids = sorted(expected_cpu_ids)
+    if allowed != expected_allowed or allowed_cpu_ids != expected_cpu_ids:
         raise LoadGateError(
-            f"current Linux affinity count {allowed} differs from qualified count {expected_allowed!r}"
+            f"current Linux affinity set {allowed_cpu_ids!r} differs from qualified set {expected_cpu_ids!r}"
         )
     if allowed < 64:
         raise LoadGateError(f"current Linux affinity permits only {allowed} CPUs; at least 64 are required")
@@ -115,6 +127,7 @@ def _live_linux_capacity(qualification: dict[str, object]) -> tuple[int, float |
 
     details: dict[str, object] = {
         "live_allowed_cpu_count": allowed,
+        "live_allowed_cpu_ids": allowed_cpu_ids,
         "live_cgroup_cpu_quota": effective_quota,
         "live_cgroup_quota_sources": verified_sources,
         "live_cgroup_membership_lines": membership_lines,

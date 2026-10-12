@@ -31,6 +31,7 @@ class BenchLoadGateTests(unittest.TestCase):
             "system": "Linux",
             "qualified": qualified,
             "allowed_cpu_count": allowed,
+            "allowed_cpu_ids": list(range(allowed)),
             "effective_cgroup_cpu_quota": quota,
         }))
 
@@ -45,6 +46,7 @@ class BenchLoadGateTests(unittest.TestCase):
             "machine": "x86_64",
             "qualified": True,
             "allowed_cpu_count": 80,
+            "allowed_cpu_ids": list(range(80)),
             "effective_cgroup_cpu_quota": 64.0,
             "cgroup_quota_sources": [{
                 "quota_path": str(quota_path),
@@ -63,7 +65,7 @@ class BenchLoadGateTests(unittest.TestCase):
             "namespace": namespace,
         }
 
-    def patch_live_linux_state(self, stack, state, *, affinity=80, membership_lines=None):
+    def patch_live_linux_state(self, stack, state, *, affinity=80, affinity_ids=None, membership_lines=None):
         original_read_text = Path.read_text
         original_read_bytes = Path.read_bytes
         original_readlink = gate.os.readlink
@@ -85,7 +87,8 @@ class BenchLoadGateTests(unittest.TestCase):
                 return state["namespace"]["init"]
             return original_readlink(path, *args, **kwargs)
 
-        stack.enter_context(patch.object(gate.os, "sched_getaffinity", return_value=set(range(affinity)), create=True))
+        live_affinity = set(range(affinity)) if affinity_ids is None else set(affinity_ids)
+        stack.enter_context(patch.object(gate.os, "sched_getaffinity", return_value=live_affinity, create=True))
         stack.enter_context(patch.object(gate.platform, "machine", return_value="x86_64"))
         stack.enter_context(patch.object(Path, "read_text", read_text))
         stack.enter_context(patch.object(Path, "read_bytes", read_bytes))
@@ -186,6 +189,7 @@ class BenchLoadGateTests(unittest.TestCase):
         self.assertTrue(record["passed"])
         self.assertEqual(record["effective_cpu_capacity"], 64.0)
         self.assertEqual(record["live_allowed_cpu_count"], 80)
+        self.assertEqual(record["live_allowed_cpu_ids"], list(range(80)))
         self.assertEqual(record["live_cgroup_cpu_quota"], 64.0)
 
     def test_live_linux_capacity_aborts_when_affinity_changes(self):
@@ -197,7 +201,18 @@ class BenchLoadGateTests(unittest.TestCase):
                     (0.0, 0.0, 0.0), "changed Linux affinity", self.output, "Linux",
                     self.qualification, require_live_linux=True,
                 )
-        self.assertIn("affinity count", (self.output / "ABORTED.txt").read_text())
+        self.assertIn("affinity set", (self.output / "ABORTED.txt").read_text())
+
+        same_count_output = self.root / "same-count-affinity-output"
+        same_count_output.mkdir()
+        with ExitStack() as stack:
+            self.patch_live_linux_state(stack, state, affinity_ids=set(range(1, 81)))
+            with self.assertRaises(gate.LoadGateError):
+                gate.check_load_gate(
+                    (0.0, 0.0, 0.0), "same-count changed Linux affinity", same_count_output, "Linux",
+                    self.qualification, require_live_linux=True,
+                )
+        self.assertIn("affinity set", (same_count_output / "ABORTED.txt").read_text())
 
     def test_live_linux_capacity_aborts_when_membership_or_quota_changes(self):
         state = self.write_live_qualification()

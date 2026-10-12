@@ -517,6 +517,20 @@ COMPREHENSION_VIEW_TAINT_EDGES = (
     ("Expr.Comprehension(variable, iterable, condition, body, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
 )
 
+COMPREHENSION_BINDER_VIEW_TAINT_EDGES = (
+    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _):", "iterable_may_yield_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _):", "chv_flow_bind(comprehension_flow, variable, false, iterable_may_yield_owned_view, false)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _):", "body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
+)
+
+IDENTIFIER_VIEW_TAINT_EDGES = (
+    ("Expr.Ident(bound_name, _):", "index: usize = chv_flow_latest(flow, bound_name)"),
+    ("Expr.Ident(bound_name, _):", "return index < flow.names.count and flow.may_owned_view[index]"),
+)
+
 METHOD_CALL_VIEW_RESULT_EDGES = (
     ("Expr.Call(Expr.Field(receiver, _, _), call_arguments, _, _):", "receiver_root: sview = chv_place_root(receiver)"),
     ("Expr.Call(Expr.Field(receiver, _, _), call_arguments, _, _):", "receiver_index: usize = chv_flow_latest(flow, receiver_root) if receiver_root != \"\" else flow.names.count"),
@@ -896,6 +910,11 @@ theorem_routes = {
     "proof_chv_comprehension_result_tracks_yielded_view": {
         "body_may_be_owned_view": COMPREHENSION_VIEW_TAINT_EDGES,
     },
+    "proof_chv_comprehension_element_view_reaches_yielded_result": {
+        "collection_taint_reaches_iterable_binding": ARRAY_VIEW_TAINT_EDGES[:4] + (HOLDER_WALK_STATEMENT_EDGES[-1],) + IDENTIFIER_VIEW_TAINT_EDGES,
+        "iterable_taint_reaches_binder": COMPREHENSION_BINDER_VIEW_TAINT_EDGES[:3],
+        "binder_taint_reaches_result": IDENTIFIER_VIEW_TAINT_EDGES + COMPREHENSION_BINDER_VIEW_TAINT_EDGES[3:],
+    },
     "proof_chv_method_result_tracks_receiver_or_arguments": {
         "receiver_may_be_owned": (METHOD_CALL_VIEW_RESULT_EDGES[2],),
         "arguments_may_be_owned": (METHOD_CALL_VIEW_RESULT_EDGES[3],),
@@ -1030,6 +1049,13 @@ for name, routes in theorem_routes.items():
         proof_source, proof_edges = holder_walk_statements, ASSIGN_VIEW_TAINT_EDGES
     elif name == "proof_chv_comprehension_result_tracks_yielded_view":
         proof_source, proof_edges = holder_walk_expressions, COMPREHENSION_VIEW_TAINT_EDGES
+    elif name == "proof_chv_comprehension_element_view_reaches_yielded_result":
+        proof_source = "\n".join((
+            holder_walk_expressions,
+            holder_walk_statements,
+            function_section(holder_text, "chv_is_owned_view"),
+        ))
+        proof_edges = ARRAY_VIEW_TAINT_EDGES[:4] + (HOLDER_WALK_STATEMENT_EDGES[-1],) + IDENTIFIER_VIEW_TAINT_EDGES + COMPREHENSION_BINDER_VIEW_TAINT_EDGES
     elif name == "proof_chv_method_result_tracks_receiver_or_arguments":
         proof_source = function_section(holder_text, "chv_is_owned_view")
         proof_edges = METHOD_CALL_VIEW_RESULT_EDGES
@@ -1117,6 +1143,8 @@ for name, routes in theorem_routes.items():
         validate_exact_boolean_theorem(positive_text, name, routes, "rhs_may_be_view or ((compound_assignment or target_is_projection) and previous_root_may_be_view)", proof_source, proof_edges)
     elif name == "proof_chv_comprehension_result_tracks_yielded_view":
         validate_exact_boolean_theorem(positive_text, name, routes, "body_may_be_owned_view", proof_source, proof_edges)
+    elif name == "proof_chv_comprehension_element_view_reaches_yielded_result":
+        validate_exact_boolean_theorem(positive_text, name, routes, "collection_taint_reaches_iterable_binding and iterable_taint_reaches_binder and binder_taint_reaches_result", proof_source, proof_edges)
     elif name == "proof_chv_method_result_tracks_receiver_or_arguments":
         validate_exact_boolean_theorem(positive_text, name, routes, "receiver_may_be_owned or arguments_may_be_owned", proof_source, proof_edges)
     elif name == "proof_chv_callable_result_tracks_argument_view":
@@ -1178,6 +1206,8 @@ for source, edges, label in (
 validate_edge_set(holder_walk_expressions, ARRAY_VIEW_TAINT_EDGES, "holder-view array and tuple taint")
 validate_edge_set(holder_walk_expressions, DICT_VIEW_TAINT_EDGES, "holder-view dictionary taint")
 validate_edge_set(holder_walk_expressions, COMPREHENSION_VIEW_TAINT_EDGES, "holder-view comprehension result taint")
+validate_edge_set(holder_walk_expressions, COMPREHENSION_BINDER_VIEW_TAINT_EDGES, "holder-view comprehension binder taint")
+validate_edge_set(function_section(holder_text, "chv_is_owned_view"), IDENTIFIER_VIEW_TAINT_EDGES, "holder-view identifier taint lookup")
 validate_edge_set(holder_walk_expressions, CONSTRUCT_VIEW_TAINT_EDGES, "holder-view constructed aggregate taint")
 validate_edge_set(holder_walk_expressions, RECORD_UPDATE_VIEW_TAINT_EDGES, "holder-view record-update taint")
 validate_edge_set(holder_walk_statements, ASSIGN_VIEW_TAINT_EDGES, "holder-view assigned aggregate taint")
