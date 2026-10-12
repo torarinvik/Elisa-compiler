@@ -30,6 +30,56 @@ extend Backend:
 
 
 
+        # `chunks_exact(view, n)` divides the unsigned view length by `n`. Check the
+        # divisor before constructing URem so zero never reaches an undefined LLVM
+        # remainder, and require signed sizes to be positive (negative sizes must not
+        # become enormous unsigned chunks through a signed/unsigned reinterpretation).
+        # The exactness branch dominates the later UDiv in the constructor.
+        def emit_chunks_exact_validation(chunk_size_source: LLVMValueRef, chunk_size: LLVMValueRef, total: LLVMValueRef, chunk_size_is_signed: bool, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            chunk_type: LLVMTypeRef = LLVMTypeOf(chunk_size)
+            chunk_source_type: LLVMTypeRef = LLVMTypeOf(chunk_size_source)
+            zero: LLVMValueRef = LLVMConstInt(chunk_type, 0, 0)
+            source_zero: LLVMValueRef = LLVMConstInt(chunk_source_type, 0, 0)
+            source_positive: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::SGT, chunk_size_source, source_zero, "chunks.size.positive") if chunk_size_is_signed else LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+            target_nonzero: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::NE, chunk_size, zero, "chunks.size.nonzero")
+            fits_target: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+            if LLVMGetIntTypeWidth(chunk_source_type) > LLVMGetIntTypeWidth(chunk_type):
+                roundtrip: LLVMValueRef = LLVMBuildZExt(builder, chunk_size, chunk_source_type, "chunks.size.roundtrip")
+                fits_target <- LLVMBuildICmp(builder, LLVMIntPredicate::EQ, roundtrip, chunk_size_source, "chunks.size.fits")
+            size_valid: LLVMValueRef = LLVMBuildAnd(builder, source_positive, LLVMBuildAnd(builder, target_nonzero, fits_target, "chunks.size.target.valid"), "chunks.size.valid")
+            parent: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            nonzero_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "chunks.size.ok")
+            exact_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "chunks.exact.ok")
+            fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "chunks.invalid")
+            _ = LLVMBuildCondBr(builder, size_valid, nonzero_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, fail_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, nonzero_block)
+            remainder: LLVMValueRef = LLVMBuildURem(builder, total, chunk_size, "chunks.remainder")
+            exact: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::EQ, remainder, zero, "chunks.divisible")
+            _ = LLVMBuildCondBr(builder, exact, exact_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, exact_block)
+
+
+
+
+        # Before a loop indexes a source view using another view's count, require that
+        # the source has at least that many elements. Callers normalize both usize counts
+        # to i64 first, so this comparison is unsigned and has identical operand widths on
+        # 32-bit and 64-bit targets.
+        def emit_required_count_available_guard(required_count: LLVMValueRef, available_count: LLVMValueRef, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            enough: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGE, available_count, required_count, "view.count.available")
+            parent: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "view.count.ok")
+            fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "view.count.short")
+            _ = LLVMBuildCondBr(builder, enough, ok_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, fail_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, ok_block)
+
+
+
+
         # In forced bounds mode, reject null and near-null addresses before they are
         # dereferenced. Runtime-derived pointers are compared directly; this deliberately
         # stays conservative for stack/global addresses, which is safe and keeps the
@@ -62,28 +112,29 @@ extend Backend:
         # The only elision is the sound one: a CONSTANT index inside a fixed extent
         # cannot vary at runtime, so its guard would be `br i1 true` with a dead trap
         # arm. The near-null dereference guard remains -fbounds-check only, as in stage0.
-        def emit_index_bounds_guard(array_slot: LLVMValueRef, array_type: ValueType, index: LLVMValueRef, runtime: Runtime&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_index_bounds_guard(array_slot: LLVMValueRef, array_type: ValueType, index: LLVMValueRef, index_is_signed: bool, runtime: Runtime&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             emit_pointer_deref_guard(array_slot, runtime, m, ctx, builder)
             count_pointer: mutable LLVMValueRef = LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
-            count_value: mutable LLVMValueRef = LLVMConstInt(LLVMTypeOf(index), 0, 0)
+            index_width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(index))
+            comparison_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx) if index_width < 64 else LLVMTypeOf(index)
+            count_value: mutable LLVMValueRef = LLVMConstInt(comparison_type, 0, 0)
             if array_type.kind == TypeKind.DArray:
                 count_pointer <- LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), array_slot, 1, "bounds.count.ptr")
                 count_value <- LLVMBuildLoad2(builder, darray_size_type(ctx, structs.target.target_pointer_bits), count_pointer, "bounds.count")
             elif array_type.kind == TypeKind.Array:
                 extent: u64 = structs.interned_types.array_extents[array_type.bits.usize()].u64()
-                if LLVMIsAConstantInt(index) is constant_index:
-                    return if LLVMConstIntGetZExtValue(constant_index) < extent
-                # AT THE INDEX'S OWN WIDTH, not i64. `usize` is 64-bit natively and
-                # 32-bit on wasm32, so a hardcoded i64 extent under an i32 index
-                # emitted `icmp ult i32, i64` -- invalid wasm the component
-                # validator rejects ("expected i32, found i64"), and invisible on
-                # a native build where both operands are already 64-bit. Same
-                # class as test/fixtures/wasm/component_const_width.elisa, which
-                # caught the other direction.
-                count_value <- LLVMConstInt(LLVMTypeOf(index), extent, 0)
+                if index_width <= 64 and LLVMIsAConstantInt(index) is constant_index:
+                    constant_index_bits: u64 = LLVMConstIntGetZExtValue(constant_index)
+                    signed_index_limit: u64 = 9223372036854775808.u64() if index_width == 64 else (1.u64() << (index_width - 1).u64())
+                    constant_nonnegative: bool = not index_is_signed or constant_index_bits < signed_index_limit
+                    return if constant_nonnegative and constant_index_bits < extent
+                # Keep the complete u64 extent; emit_count_bounds_guard widens the
+                # narrower source index before comparing, so wasm32 cannot truncate
+                # a large fixed-array extent to i32.
+                count_value <- LLVMConstInt(comparison_type, extent, 0)
             else:
                 return
-            emit_count_bounds_guard(index, count_value, runtime, m, ctx, builder)
+            emit_count_bounds_guard(index, count_value, index_is_signed, runtime, m, ctx, builder)
 
 
 
@@ -93,11 +144,13 @@ extend Backend:
         # sites (local read, field/returned read, store) pass that here. They had NO guard at
         # all: stage0 guards DArray and View alike (emitDebugIndexBoundsGuard), while stage1
         # read and wrote `v[i]` for any `i` -- an out-of-bounds read or store with no trap.
-        # A signed index is compared UNSIGNED, so a negative one is out of range too.
-        def emit_count_bounds_guard(index: LLVMValueRef, count_value: LLVMValueRef, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # Keep the unsigned count comparison, and add a signed nonnegative check
+        # before it whenever the source index was signed. The guard receives the
+        # original-width value so narrowing for usize/GEP cannot erase sign or range.
+        def emit_count_bounds_guard(index: LLVMValueRef, count_value: LLVMValueRef, index_is_signed: bool, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # BOTH OPERANDS AT ONE WIDTH. Darray counts use target-sized usize storage.
-            # Widen the narrower unsigned operand so unusually wide source indices remain
-            # checked without truncating either the index or the stored count.
+            # Widen the narrower operand only for the unsigned comparison; the separate
+            # signed check below rejects negative values before they can pass that compare.
             compare_index: mutable LLVMValueRef = index
             compare_count: mutable LLVMValueRef = count_value
             index_type: LLVMTypeRef = LLVMTypeOf(index)
@@ -106,7 +159,11 @@ extend Backend:
                 compare_index <- LLVMBuildZExt(builder, index, count_type, "wd.index.wide")
             elif index_type != count_type:
                 compare_count <- LLVMBuildZExt(builder, count_value, index_type, "wd.count.wide")
-            valid: LLVMValueRef = LLVMBuildICmp(builder, 36, compare_index, compare_count, "wd.in_bounds")
+            unsigned_valid: LLVMValueRef = LLVMBuildICmp(builder, 36, compare_index, compare_count, "wd.in_bounds.unsigned")
+            valid: LLVMValueRef = unsigned_valid
+            if index_is_signed:
+                index_nonnegative: LLVMValueRef = LLVMBuildICmp(builder, 39, index, LLVMConstInt(index_type, 0, 0), "wd.index.nonnegative")
+                valid <- LLVMBuildAnd(builder, index_nonnegative, unsigned_valid, "wd.in_bounds.signed")
             parent: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
             ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "wd.ok")
             # Inside a `get xs[i] else <recovery>` the failure edge is the RECOVERY, not a
