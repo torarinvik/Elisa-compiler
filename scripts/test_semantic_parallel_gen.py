@@ -46,6 +46,38 @@ def analyze(
 
 
 class SemanticParallelAuditTest(unittest.TestCase):
+    def test_generated_parallel_call_uses_explicit_lmut_update(self):
+        line = (
+            "        table <- par_pass_run(file, &loop_view, flags, table, shared_pool, 35, 8) "
+            "can Global{Read,Write}"
+        )
+        calls, errors = audit.par_run_calls([line])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["start"], calls[0]["count"]), (35, 8))
+        self.assertIsNotNone(calls[0]["match"].group(2))
+        self.assertIsNotNone(calls[0]["match"].group(3))
+        self.assertEqual(audit.normalized_par_run_line(line, calls[0]["match"]), line)
+
+    def test_bare_parallel_call_normalizes_to_explicit_lmut_update(self):
+        line = (
+            "        par_pass_run(file, &loop_view, flags, table, shared_pool, 35, 8) "
+            "can Global{Read,Write}"
+        )
+        calls, errors = audit.par_run_calls([line])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["start"], calls[0]["count"]), (35, 8))
+        self.assertIsNone(calls[0]["match"].group(2))
+        self.assertIsNotNone(calls[0]["match"].group(3))
+        self.assertEqual(
+            audit.normalized_par_run_line(line, calls[0]["match"]),
+            "        table <- par_pass_run(file, &loop_view, flags, table, shared_pool, 35, 8) "
+            "can Global{Read,Write}",
+        )
+
     def test_method_receiver_stops_at_nested_index_boundary(self):
         self.assertEqual(
             list(audit.call_sites("table.symbols[cur.usize()]")),
@@ -254,6 +286,214 @@ class SemanticParallelAuditTest(unittest.TestCase):
         })
 
         self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_immutable_reference_alias_can_be_read_and_forwarded_read_only(self):
+        info = analyze({
+            "inspect_symbol": [definition(
+                "symbol: Symbol&",
+                "def inspect_symbol(symbol: Symbol&):\n"
+                "    name: sview = symbol.name\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    symbol: Symbol& = &table.symbols[0]\n"
+                "    inspect_symbol(symbol)\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertTrue(append_only, writes)
+        self.assertNotIn("ref:symbols", writes)
+
+    def test_mutable_reference_alias_is_rejected_at_borrow(self):
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    symbol: mutable Symbol& = &table.symbols[0]\n",
+            )],
+        })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_immutable_reference_alias_cannot_be_forwarded_mutably(self):
+        info = analyze({
+            "mutate_symbol": [definition(
+                "symbol: mutable Symbol&",
+                "def mutate_symbol(symbol: mutable Symbol&):\n"
+                "    symbol.name <- \"changed\"\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    symbol: Symbol& = &table.symbols[0]\n"
+                "    mutate_symbol(symbol)\n",
+            )],
+        })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_immutable_reference_alias_cannot_escape(self):
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable) -> Symbol&:\n"
+                "    symbol: Symbol& = &table.symbols[0]\n"
+                "    return symbol\n",
+            )],
+        })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_nested_field_reference_from_immutable_alias_cannot_escape_and_mutate(self):
+        info = analyze({
+            "state_names": [definition(
+                "table: SymbolTable&",
+                "def state_names(table: SymbolTable&) -> mutable darray[sview]&:\n"
+                "    family: Ast::StateFamily& = &table.state_family_declarations[0]\n"
+                "    return &family.states\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    names: mutable darray[sview]& = state_names(table)\n"
+                '    names.push("escaped mutation")\n',
+            )],
+        }, table_field_types=dict(
+            TABLE_FIELD_TYPES,
+            state_family_declarations="mutable darray[Ast::StateFamily]",
+        ), struct_field_types={
+            "Ast::StateFamily": [{"states": "mutable darray[sview]"}],
+            "SymbolKind": [[]],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+
+    def test_nested_field_value_from_immutable_alias_is_still_tainted_on_return(self):
+        info = analyze({
+            "state_names": [definition(
+                "table: SymbolTable&",
+                "def state_names(table: SymbolTable&) -> mutable darray[sview]:\n"
+                "    family: Ast::StateFamily& = &table.state_family_declarations[0]\n"
+                "    return family.states\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    names: mutable darray[sview] = state_names(table)\n"
+                '    names.push("possibly shared backing")\n',
+            )],
+        }, table_field_types=dict(
+            TABLE_FIELD_TYPES,
+            state_family_declarations="mutable darray[Ast::StateFamily]",
+        ), struct_field_types={
+            "Ast::StateFamily": [{"states": "mutable darray[sview]"}],
+            "SymbolKind": [[]],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+
+    def test_scalar_field_from_immutable_alias_can_return_by_value(self):
+        info = analyze({
+            "state_code": [definition(
+                "table: SymbolTable&",
+                "def state_code(table: SymbolTable&) -> i32:\n"
+                "    family: Ast::StateFamily& = &table.state_family_declarations[0]\n"
+                "    return family.code\n",
+            )],
+        }, table_field_types=dict(
+            TABLE_FIELD_TYPES,
+            state_family_declarations="mutable darray[Ast::StateFamily]",
+        ), struct_field_types={
+            "StateFamily": [{"code": "i32", "states": "mutable darray[sview]"}],
+            "SymbolKind": [[]],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "state_code")
+        self.assertTrue(append_only, writes)
+
+    def test_computed_scalar_return_from_table_field_stays_append_only(self):
+        info = analyze({
+            "next_duplicate_count": [definition(
+                "table: SymbolTable&",
+                "def next_duplicate_count(table: SymbolTable&) -> u32:\n"
+                "    return table.duplicates + 1\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "next_duplicate_count")
+        self.assertTrue(append_only, writes)
+
+    def test_conditional_scalar_return_from_table_field_stays_append_only(self):
+        info = analyze({
+            "selected_duplicate_count": [definition(
+                "table: SymbolTable&, enabled: bool",
+                "def selected_duplicate_count(table: SymbolTable&, enabled: bool) -> u32:\n"
+                "    return if enabled:\n"
+                "        table.duplicates\n"
+                "    else:\n"
+                "        0\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "selected_duplicate_count")
+        self.assertTrue(append_only, writes)
+
+    def test_newline_return_value_block_cannot_escape_table_field(self):
+        info = analyze({
+            "expose": [definition(
+                "table: SymbolTable&",
+                "def expose(table: SymbolTable&) -> mutable darray[Symbol]:\n"
+                "    return\n"
+                "        table.symbols\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    view: mutable darray[Symbol] = expose(table)\n"
+                '    view.push(Symbol{name: "x"})\n',
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+
+    def test_multiline_parenthesized_return_cannot_escape_table_field(self):
+        info = analyze({
+            "expose": [definition(
+                "table: SymbolTable&",
+                "def expose(table: SymbolTable&) -> mutable darray[Symbol]:\n"
+                "    return (\n"
+                "        table.symbols\n"
+                "    )\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "expose")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+
+    def test_multiline_conditional_return_cannot_escape_table_field(self):
+        info = analyze({
+            "expose": [definition(
+                "table: SymbolTable&, enabled: bool",
+                "def expose(table: SymbolTable&, enabled: bool) -> mutable darray[Symbol]:\n"
+                "    return if enabled:\n"
+                "        table.symbols\n"
+                "    else:\n"
+                "        []\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "expose")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-unknown-table-alias" in write for write in writes), writes)
 
     def test_table_derived_receiver_from_known_helper_is_rejected(self):
         info = analyze({

@@ -81,7 +81,7 @@ ENUM_RE = re.compile(r"^(\s*)(?:const\s+)?enum\s+(\w+)\b.*:\s*$")
 ENUM_VARIANT_RE = re.compile(r"^\s+([A-Z]\w*)\b")
 CALL_RE = re.compile(r"\b([A-Za-z_]\w*)[ \t]*(?:\[[^\]\n]*\])?[ \t]*\(")
 PAR_RUN_RE = re.compile(
-    r"^([ \t]*table <- par_pass_run\(file, &loop_view, flags, table, )"
+    r"^([ \t]*)(table <- )?par_pass_run\(file, &loop_view, flags, table, "
     r"(shared_pool, )?(\d+), (\d+)\)([ \t]+can[ \t]+[^\n]+)?[ \t]*$"
 )
 PAR_RUN_ANY_RE = re.compile(r"\bpar_pass_run\s*\(")
@@ -362,14 +362,14 @@ def par_run_calls(lines, offset=0):
             errors.append(offset + index + 1)
             continue
         calls.append({"line": offset + index, "match": match,
-                      "start": int(match.group(3)), "count": int(match.group(4))})
+                      "start": int(match.group(4)), "count": int(match.group(5))})
     return calls, errors
 
 
 def normalized_par_run_line(line, match):
-    """Add the pool parameter to a valid generated call, preserving effects and indentation."""
-    return (match.group(1) + "shared_pool, " + match.group(3) + ", " + match.group(4) + ")"
-            + (match.group(5) or ""))
+    """Emit the lmut call with an explicit table update while preserving effects/indentation."""
+    return (match.group(1) + "table <- par_pass_run(file, &loop_view, flags, table, shared_pool, "
+            + match.group(4) + ", " + match.group(5) + ")" + (match.group(6) or ""))
 
 
 def parse_parallel_dispatch(source):
@@ -905,6 +905,46 @@ def type_is_copy_value(type_expression, aliases, structs, seen=frozenset()):
     return memo.get(root, False)
 
 
+def type_may_contain_reference(type_expression, aliases, structs):
+    """Whether a copied type could still carry a reference into shared storage."""
+    pending = [type_expression]
+    visited = set()
+    while pending:
+        expression = pending.pop().strip()
+        while expression.startswith("(") and matching_delimiter(expression, 0) == len(expression) - 1:
+            expression = expression[1:-1].strip()
+        while expression.endswith("?"):
+            expression = expression[:-1].rstrip()
+        if "&" in expression:
+            return True
+        expression = re.sub(r"^(?:(?:mutable|lmut|static|heap|stack)\s+)+", "", expression)
+        if "[" in expression or "{" in expression or "," in expression:
+            # Generic containers and compound types are not needed to prove the
+            # copy-only return case; fail closed if the copy checker admits one.
+            return True
+        if not re.fullmatch(r"(?:\w+::)*\w+", expression):
+            return True
+        name = expression.rsplit("::", 1)[-1]
+        if name in COPY_VALUE_TYPE_NAMES:
+            continue
+        if name in visited:
+            return True
+        visited.add(name)
+        candidates = aliases.get(name, ())
+        if candidates:
+            pending.extend(candidates)
+            continue
+        schemas = structs.get(name, ())
+        if not schemas:
+            return True
+        for fields in schemas:
+            if isinstance(fields, dict):
+                pending.extend(fields.values())
+            else:
+                pending.extend(fields)
+    return False
+
+
 def local_table_field_aliases(text, tables, table_field_types, type_aliases, struct_field_types):
     """Track simple local aliases of SymbolTable fields for mutation checks at callsites."""
     if not tables:
@@ -1009,6 +1049,35 @@ def local_table_field_aliases(text, tables, table_field_types, type_aliases, str
                     borrowed_aliases.add(target_name)
                     changed = True
     return field_aliases, diagnostic_aliases, borrowed_aliases
+
+
+def immutable_table_field_borrow_starts(text, tables):
+    """Locations of direct table-field borrows stored in explicitly immutable refs.
+
+    A bare `T&` local cannot mutate its referent; `mutable T&` and `lmut T&` can.
+    The caller still tracks the local as a table-backed alias, so forwarding it to a
+    mutable formal or returning it remains rejected by the usual escape checks.
+    Only a single-line, explicitly typed direct borrow is recognized here.
+    """
+    if not tables:
+        return set()
+    table_names = "(?:" + "|".join(sorted(map(re.escape, tables))) + ")"
+    assignment = re.compile(
+        r"^[ \t]*\w+[ \t]*:[ \t]*(?P<type>[^=\n]+?)[ \t]*(?:<-|=(?!=))[ \t]*"
+        r"(?P<rhs>(?:\([ \t]*)*&[ \t]*(?:\([ \t]*)*" + table_names
+        + r"\.(?:\w+)(?:(?:\s*\.\s*\w+)|(?:\s*\[[^\]\n]*\]))*(?:\s*\))*)[ \t]*$",
+        re.MULTILINE,
+    )
+    borrow = re.compile(r"&[ \t]*(?:" + table_names + r")\s*\.\s*\w+\b")
+    starts = set()
+    for match in assignment.finditer(text):
+        type_expression = match.group("type").strip()
+        if not type_expression.endswith("&") or re.search(r"\b(?:mutable|lmut)\b", type_expression):
+            continue
+        rhs_borrow = borrow.search(match.group("rhs"))
+        if rhs_borrow is not None:
+            starts.add(match.start("rhs") + rhs_borrow.start())
+    return starts
 
 
 def argument_is_table_field_or_alias(argument, tables, aliases):
@@ -1119,6 +1188,36 @@ def local_path_expression_type(expression, text, struct_field_types):
             return ""
         current_type = member_types[0]
     return current_type
+
+
+def returned_shared_paths_are_copies(
+    expression, text, tables, field_aliases, diagnostic_aliases,
+    table_field_types, type_aliases, struct_field_types,
+):
+    """Prove every returned path into shared state is a non-reference copy value."""
+    roots = tables | field_aliases | diagnostic_aliases
+    if not roots:
+        return False
+    paths = []
+    for root in sorted(roots):
+        pattern = re.compile(
+            r"\b" + re.escape(root)
+            + r"((?:\s*\.\s*\w+|\s*\[[^\]\n]*\])*)"
+        )
+        paths.extend(match.group(0) for match in pattern.finditer(expression))
+    if not paths:
+        return False
+    for path in paths:
+        value_type = table_field_expression_type(
+            path, tables, table_field_types, type_aliases, struct_field_types
+        )
+        if not value_type:
+            value_type = local_path_expression_type(path, text, struct_field_types)
+        if not value_type or not type_is_copy_value(
+            value_type, type_aliases, struct_field_types
+        ) or type_may_contain_reference(value_type, type_aliases, struct_field_types):
+            return False
+    return True
 
 
 def is_builtin_darray_type(type_expression, aliases, seen=frozenset()):
@@ -1339,6 +1438,54 @@ def argument_is_whole_table(argument, tables, aliases):
     return bool(re.fullmatch(r"\w+", expression) and expression in tables | aliases)
 
 
+def returned_expressions(text):
+    """Yield inline returns and indented return-value blocks from one function body."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.search(r"\breturn\b", line)
+        if match is None:
+            continue
+        inline = line[match.end():].strip()
+        base_indent = len(line) - len(line.lstrip())
+        parts = [inline] if inline else []
+        value_block = not inline
+        open_delimiters = []
+
+        def update_delimiters(part):
+            for char in part:
+                if char in "([{":
+                    open_delimiters.append(char)
+                elif char in ")]}":
+                    if open_delimiters:
+                        open_delimiters.pop()
+
+        if inline:
+            update_delimiters(inline)
+            value_block = bool(open_delimiters) or bool(
+                re.match(r"(?:if|match|for)\b", inline) and inline.rstrip().endswith(":")
+            )
+        for following in lines[index + 1:]:
+            stripped = following.strip()
+            indent = len(following) - len(following.lstrip()) if stripped else base_indent + 1
+            continuation = bool(re.match(r"(?:else|elif|catch)\b", stripped))
+            if stripped and indent <= base_indent and not continuation and not open_delimiters:
+                break
+            if stripped and indent <= base_indent and not continuation and not value_block:
+                break
+            if stripped:
+                parts.append(stripped)
+                update_delimiters(stripped)
+            elif value_block:
+                parts.append("")
+            if not open_delimiters and value_block and not continuation and indent <= base_indent:
+                # An indented return block or the final branch of a block expression
+                # ends when parsing returns to the statement's indentation.
+                break
+        expression = "\n".join(parts).strip()
+        if expression:
+            yield expression
+
+
 def argument_is_table_backed(argument, tables, table_aliases, field_aliases):
     return (
         argument_is_whole_table(argument, tables, table_aliases)
@@ -1437,6 +1584,8 @@ def analyze(
             field_aliases, diagnostic_aliases, borrowed_field_aliases = local_table_field_aliases(
                 text, tables, table_field_types, type_aliases, struct_field_types
             )
+            immutable_borrow_starts = immutable_table_field_borrow_starts(code_text, tables)
+            declared_return_type = function_return_type(d)
             for t in sorted(tables):
                 te = re.escape(t)
                 for m in re.finditer(te + r"\.(\w+)(?:(?:\.\w+)|(?:\[[^\]\n]*\]))*\s*<-", text):
@@ -1448,8 +1597,9 @@ def analyze(
                 for m in re.finditer(r"\bin\s+" + te + r"\.(\w+)(?:(?:\.\w+)|(?:\[[^\]\n]*\]))*\s*:", text):
                     if m.group(1) != "diagnostics":
                         writes.add("in:" + m.group(1))
-                for m in re.finditer(r"&\s*" + te + r"\.(\w+)", text):
-                    writes.add("ref:" + m.group(1))
+                for m in re.finditer(r"&\s*" + te + r"\.(\w+)", code_text):
+                    if m.start() not in immutable_borrow_starts:
+                        writes.add("ref:" + m.group(1))
                 # Only an in-place push extends diagnostics. A replacement can discard
                 # earlier sequential results, and every other use reads them.
                 for m in re.finditer(r"\b" + te + r"\.diagnostics\b", text):
@@ -1472,8 +1622,8 @@ def analyze(
             # alias beyond this function's local analysis. Mark that source helper as
             # effectful so every caller's audited closure fails closed. Scalar field
             # copies remain safe to return.
-            for returned in re.finditer(r"\breturn\s+([^\n]+)", text):
-                expression = returned.group(1).strip().rstrip(";").strip()
+            for returned_expression in returned_expressions(code_text):
+                expression = returned_expression.strip().rstrip(";").strip()
                 if argument_is_whole_table(expression, tables, table_aliases):
                     writes.add("returned-whole-table-alias")
                     continue
@@ -1486,14 +1636,14 @@ def analyze(
                     while unwrapped.startswith("(") and matching_delimiter(unwrapped, 0) == len(unwrapped) - 1:
                         unwrapped = unwrapped[1:-1].strip()
                 field_path = re.fullmatch(
-                    r"(\w+)((?:\s*\.\s*\w+|\s*\[[^\]\n]*\])+)", unwrapped
+                    r"(\w+)((?:\s*\.\s*\w+|\s*\[[^\]\n]*\])*)", unwrapped
                 )
                 direct_field = bool(field_path and field_path.group(1) in tables)
-                direct_alias = bool(
-                    re.fullmatch(r"\w+", unwrapped)
-                    and unwrapped in field_aliases | diagnostic_aliases
+                alias_derived = bool(
+                    field_path
+                    and field_path.group(1) in field_aliases | diagnostic_aliases
                 )
-                if direct_field or direct_alias:
+                if direct_field or alias_derived:
                     value_type = table_field_expression_type(
                         unwrapped,
                         tables,
@@ -1501,10 +1651,49 @@ def analyze(
                         type_aliases,
                         struct_field_types,
                     )
-                    if borrowed or direct_alias or not value_type or not type_is_copy_value(
-                        value_type, type_aliases, struct_field_types
-                    ):
+                    if alias_derived and not direct_field:
+                        value_type = local_path_expression_type(
+                            unwrapped, text, struct_field_types
+                        )
+                    copied_value_is_safe = bool(
+                        value_type
+                        and type_is_copy_value(value_type, type_aliases, struct_field_types)
+                        and not type_may_contain_reference(
+                            value_type, type_aliases, struct_field_types
+                        )
+                    )
+                    if borrowed or not copied_value_is_safe:
                         writes.add("returned-table-field-alias")
+                elif any(
+                    re.search(r"\b" + re.escape(alias) + r"\b", expression)
+                    for alias in tables | table_aliases | field_aliases | diagnostic_aliases
+                ) and (
+                    (
+                        declared_return_type
+                        and (
+                            not type_is_copy_value(
+                                declared_return_type, type_aliases, struct_field_types
+                            )
+                            or type_may_contain_reference(
+                                declared_return_type, type_aliases, struct_field_types
+                            )
+                        )
+                    )
+                    or not returned_shared_paths_are_copies(
+                        expression,
+                        text,
+                        tables,
+                        field_aliases,
+                        diagnostic_aliases,
+                        table_field_types,
+                        type_aliases,
+                        struct_field_types,
+                    )
+                ):
+                    # A computed/block return that mentions shared table state and
+                    # could carry an alias cannot be proven to return a copy. A known
+                    # scalar result remains safe even when computed from table fields.
+                    writes.add("returned-unknown-table-alias")
             if glob_re is not None:
                 for m in glob_re.finditer(text):
                     lead = text[max(0, m.start() - 2):m.start()]
@@ -2097,8 +2286,10 @@ def generated_parallel_errors(info):
         errors.append("semantic_api.elisa: par_pass_run call found outside check_full_into_pipeline")
     if not pipeline_calls:
         errors.append("semantic_api.elisa: no generated par_pass_run calls found")
-    if any(call["match"].group(2) is None for call in pipeline_calls):
+    if any(call["match"].group(3) is None for call in pipeline_calls):
         errors.append("semantic_api.elisa: generated par_pass_run call is missing shared_pool")
+    if any(call["match"].group(2) is None for call in pipeline_calls):
+        errors.append("semantic_api.elisa: par_pass_run calls must explicitly update the lmut table")
     counts = [call["count"] for call in pipeline_calls]
     max_batch = max(counts, default=1)
     bound = re.search(r"^\s*const PAR_PASS_MAX_BATCH: usize = (\d+)\s*$", passes, re.M)
@@ -2198,7 +2389,7 @@ def main(argv):
             print("semantic_parallel_gen: refusing --write: " + str(error))
             return 1
         open(API, "w", encoding="utf-8").write("\n".join(flat))
-        generated_counts = [int(m.group(4)) for line in flat for m in [PAR_RUN_RE.search(line)] if m]
+        generated_counts = [int(m.group(5)) for line in flat for m in [PAR_RUN_RE.search(line)] if m]
         if calls or not generated_counts:
             max_batch = max((len(run) for run in runs), default=1)
             open(PASSES, "w", encoding="utf-8").write(passes_source(flags, calls, max_batch))

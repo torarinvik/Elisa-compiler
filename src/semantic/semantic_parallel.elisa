@@ -14,10 +14,10 @@
 #   then each job arena is released;
 # - the worker reads the AST through the submitting scope's store, which `submit` captures
 #   (a worker may only read a captured store; both compilers reject one that builds nodes);
-# - after every job joins, each job's copy is compared with the frozen table (everything but
-#   `diagnostics` must be byte-identical: a pass that reassigned, grew or rebuilt a table field
-#   is a misclassified pass and aborts the compile), and the diagnostics are appended in pass
-#   order, which is exactly the order the sequential passes would have produced.
+# - each worker compares its local table with the frozen table (everything but `diagnostics`
+#   must be byte-identical: a pass that reassigned, grew or rebuilt a table field is a
+#   misclassified pass and aborts the compile); after every job joins, diagnostics are appended
+#   in pass order, which is exactly the order the sequential passes would have produced.
 #
 # ELISA_SEMANTIC_SERIAL=1 runs the same passes in the same order on the calling thread.
 #
@@ -31,10 +31,12 @@ extend Semantic:
             view_bits: uintptr
             flags: ParPassFlags
             pass_id: u32
-            # Owns the result until the join copies it into the parent table, then is freed.
+            # Owns copied diagnostic payloads until the parent appends them, then is freed.
             arena: mutable Arena
-            # The job's result: the frozen table's bytes with the job's own diagnostics.
-            table: mutable SymbolTable
+            # The worker's local table must match the frozen table outside diagnostics.
+            table_unchanged: bool = false
+            # Only the owned diagnostics descriptor is needed after the worker returns.
+            diagnostics: mutable darray[Diagnostic] = []
 
         # What a worker receives. `ast` is always null: its type is what makes the worker an
         # AST reader, so both compilers thread the AST store into it and `submit` captures the
@@ -128,11 +130,22 @@ extend Semantic:
                 job: mutable heap ParPassJob& = ticket.job_bits.cast[mutable heap ParPassJob&]
                 file: heap Ast::File& = job.file_bits.cast[heap Ast::File&]
                 view: heap Ast::File& = job.view_bits.cast[heap Ast::File&]
-                table: mutable SymbolTable = SymbolTable()
+                # Every byte is overwritten by the shallow copy before any field is read.
+                # Avoid constructing the normal table, which reserves its full text buffer
+                # only to discard that allocation immediately.
+                table: mutable SymbolTable = zeroed
                 _ = memcpy((&table).cast[mutable void&], job.shared_bits.cast[void&], size_of(SymbolTable))
                 table.diagnostics <- []
-                table <- par_pass_call(job.pass_id, file, view, job.flags, table) can Global{Read,Write}
-                _ = memcpy((&job.table).cast[mutable void&], (&table).cast[void&], size_of(SymbolTable))
+                par_pass_call(job.pass_id, file, view, job.flags, table) can Global{Read,Write}
+                # Check while the worker-local table still exists. Keeping only the bool in the
+                # job avoids copying the complete SymbolTable a second time for the parent check.
+                local_bits: uintptr = (&table).cast[void&].uintptr()
+                diagnostics_offset: usize = ((&table.diagnostics).cast[void&].uintptr() - local_bits).usize()
+                diagnostics_end: usize = diagnostics_offset + size_of(darray[Diagnostic])
+                table_size: usize = size_of(SymbolTable)
+                head_same: bool = memcmp(local_bits.cast[void&], job.shared_bits.cast[void&], diagnostics_offset) == 0
+                tail_same: bool = memcmp((local_bits + diagnostics_end.uintptr()).cast[void&], (job.shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
+                job.table_unchanged <- head_same and tail_same
                 # Clone the records before this frame releases its inferred arena. All
                 # textual fields must also be cloned, even source views and empty defaults.
                 owned: mutable darray[Diagnostic] = zeroed
@@ -175,7 +188,7 @@ extend Semantic:
                     }
                 # Raw record transfer avoids rebinding the explicit arena-owned buffer
                 # through an inferred lmut region. No darray layout assumption is needed.
-                _ = memcpy((&job.table.diagnostics).cast[mutable void&], (&owned).cast[void&], size_of(darray[Diagnostic]))
+                _ = memcpy((&job.diagnostics).cast[mutable void&], (&owned).cast[void&], size_of(darray[Diagnostic]))
                 return 0
 
         # True when ELISA_SEMANTIC_SERIAL is set to anything but "0" or "".
@@ -201,14 +214,14 @@ extend Semantic:
             can Memory.Allocate, Memory.Release, Abort.Panic, Parallel, Unsafe.PointerCast, Pool.Submit, Pool.WaitAll, Thread.Spawn, Thread.Join, Atomics.Store, Atomics.Load, Atomics.CompareExchange, Sync{Lock,Wait,Unlock,Notify}:
                 if count < 2 or shared_pool.handle == null:
                     for offset in 0..<count |table, file, view, flags, first|:
-                        table <- par_pass_call(first + offset, file, view, flags, table) can Global{Read,Write}
+                        par_pass_call(first + offset, file, view, flags, table) can Global{Read,Write}
                     return
                 jobs: mutable darray[ParPassJob] = []
                 shared_bits: uintptr = (&table).cast[void&].uintptr()
                 file_bits: uintptr = file.cast[void&].uintptr()
                 view_bits: uintptr = view.cast[void&].uintptr()
                 for offset in 0..<count |jobs, shared_bits, file_bits, view_bits, flags, first|:
-                    jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, table: SymbolTable()})
+                    jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, diagnostics: []})
                 # Each job's address, taken from the buffer itself (not base + i * size_of).
                 job_addresses: mutable darray[uintptr] = []
                 for offset in 0..<count |job_addresses, jobs|:
@@ -222,22 +235,13 @@ extend Semantic:
                         task: Task[u32, Pending] = submit[shared_pool] par_pass_worker(ParPassTicket{job_bits: job_bits, ast: null})
                         task_group_add(&group, move task)
                 task_group_wait_all(&group)
-                # Every job's table must still be the frozen table's bytes outside `diagnostics`:
-                # anything else is a pass that reassigned, grew or rebuilt a table field, i.e. one
-                # the audit misclassified. Then splice the diagnostics in pass order.
-                diagnostics_offset: usize = ((&table.diagnostics).cast[void&].uintptr() - shared_bits).usize()
-                diagnostics_end: usize = diagnostics_offset + size_of(darray[Diagnostic])
-                table_size: usize = size_of(SymbolTable)
-                for job_bits in job_addresses |table, shared_bits, diagnostics_offset, diagnostics_end, table_size|:
-                    job: heap ParPassJob& = job_bits.cast[heap ParPassJob&]
-                    copy_bits: uintptr = (&job.table).cast[void&].uintptr()
-                    head_same: bool = memcmp(copy_bits.cast[void&], shared_bits.cast[void&], diagnostics_offset) == 0
-                    tail_same: bool = memcmp((copy_bits + diagnostics_end.uintptr()).cast[void&], (shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
-                    panic("semantic_parallel: a pass run concurrently wrote a SymbolTable field other than diagnostics") if not (head_same and tail_same)
                 # Validate every job before the splice mutates parent backing storage.
                 for job_bits in job_addresses |table|:
+                    job: heap ParPassJob& = job_bits.cast[heap ParPassJob&]
+                    panic("semantic_parallel: a pass run concurrently wrote a SymbolTable field other than diagnostics") if not job.table_unchanged
+                for job_bits in job_addresses |table|:
                     job: mutable heap ParPassJob& = job_bits.cast[mutable heap ParPassJob&]
-                    for index in 0..<job.table.diagnostics.count |table, job|:
-                        source_bits: uintptr = (&job.table.diagnostics[index]).cast[void&].uintptr()
+                    for index in 0..<job.diagnostics.count |table, job|:
+                        source_bits: uintptr = (&job.diagnostics[index]).cast[void&].uintptr()
                         table <- par_pass_parent_diagnostic(source_bits, table)
                     arena_free(&job.arena) can Global{Read,Write}
