@@ -9,11 +9,23 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-seed-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 mkdir -p "$WORK/scripts" "$WORK/src/driver" "$WORK/core/compiler/bin" "$WORK/core/compiler/src" "$WORK/lib" "$WORK/tmp"
+printf '%s\n' 'fake llvm library' > "$WORK/lib/libLLVM.dylib"
 # The wrapper sources its seed half, so the fixture worktree needs both files --
 # and the seed half shells out to write_profiler_hook_fallbacks.sh to refresh the
 # runtime's optional-hook object (3c7e6552), so that has to come along too or the
 # seed dies on a missing file in a worktree that is otherwise complete.
-for part in platform.sh elisac_stage1.sh process_rss.sh assert_stage0_fresh.sh assert_stage1_fresh.sh elisac_stage1_seed.sh write_profiler_hook_fallbacks.sh build_runtime_object.sh stage1_provenance.py; do
+# The provenance manifest fingerprints every build helper, including the object cache.
+for part in \
+  platform.sh \
+  elisac_stage1.sh \
+  stage1_object_cache.py \
+  process_rss.sh \
+  assert_stage0_fresh.sh \
+  assert_stage1_fresh.sh \
+  elisac_stage1_seed.sh \
+  write_profiler_hook_fallbacks.sh \
+  build_runtime_object.sh \
+  stage1_provenance.py; do
   cp "$ROOT/scripts/$part" "$WORK/scripts/$part"
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
@@ -68,13 +80,31 @@ go -C "$WORK/core/compiler" build -buildvcs=true -o "$WORK/core/compiler/bin/eli
 
 # The stubs write a BYTE, not an empty file: build_runtime_object.sh refuses to
 # publish a zero-length runtime object now, and a stub that produces nothing makes
-# the seed fail for a reason this gate is not about.
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'printf "%s\\n" "$FAKE_LLVM_LIBDIR"' \
-  > "$WORK/llvm-config"
+# the seed fail for a reason this gate is not about. Provenance also asks LLVM for
+# its version and selected shared-library path, so model those queries explicitly.
+cat > "$WORK/llvm-config" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  --version) echo "23.1.3" ;;
+  --bindir) echo "$FAKE_LLVM_BINDIR" ;;
+  --libdir) echo "$FAKE_LLVM_LIBDIR" ;;
+  "--link-shared --libfiles") echo "$FAKE_LLVM_LIBDIR/libLLVM.dylib" ;;
+  *) echo "unsupported llvm-config arguments: $*" >&2; exit 2 ;;
+esac
+STUB
 chmod +x "$WORK/llvm-config"
+
+# The provenance probe resolves and fingerprints the external linker selected by Clang.
+# Keep that tool deterministic in this smoke fixture instead of interrogating the host linker.
+cat > "$WORK/ld" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  -v|--version) echo "seed-fresh-worktree-smoke linker" ;;
+esac
+STUB
+chmod +x "$WORK/ld"
 
 # The stage1 PRODUCT this stub "links" is executed by the seed to build the runtime
 # object, so it has to be a working script rather than a touched file -- and it has to
@@ -84,6 +114,14 @@ chmod +x "$WORK/llvm-config"
 cat > "$WORK/clang" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  echo "clang version seed-fresh-worktree-smoke"
+  exit 0
+fi
+if [[ "${1:-}" == "-###" ]]; then
+  printf '"%s" -v\n' "$FAKE_LINKER" >&2
+  exit 0
+fi
 if [[ ! -e "$FAKE_CLANG_ARGS" ]]; then
   printf '%s\n' "$@" > "$FAKE_CLANG_ARGS"
 fi
@@ -115,23 +153,37 @@ chmod +x "$WORK/clang"
 # its own $ROOT -- so under run_all this fixture's stub clang wrote its "fake object" script
 # straight over build/runtime/elisacore_runtime.o, and the ~27 gates that link against the
 # runtime failed with `ld: unknown file type` for the rest of the run (2026-09-16).
+# Keep this stub seed's lock private; a real Stage1 seed on the host stays serialized.
 FAKE_LLVM_LIBDIR="$WORK/lib" \
+FAKE_LLVM_BINDIR="$WORK" \
 TMPDIR="$WORK/tmp" \
+ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR="$WORK/tmp/elisac-stage1-global-seed.lock" \
 ELISA_RUNTIME_OBJ="$WORK/build/runtime/elisacore_runtime.o" \
 ELISA_PARSE_REPORT="$WORK/build/parse_report" \
 FAKE_CLANG_ARGS="$WORK/clang.args" \
+FAKE_LINKER="$WORK/ld" \
 ELISA_CORE="$WORK/core" \
 ELISACORE_BIN="$WORK/core/compiler/bin/elisac" \
 ELISA_STAGE1_BIN="$WORK/bin/elisac-stage1" \
 LLVM_CONFIG="$WORK/llvm-config" \
 ELISA_CLANG="$WORK/clang" \
-  bash "$WORK/scripts/elisac_stage1.sh" --seed >/dev/null
+  bash "$WORK/scripts/elisac_stage1.sh" --seed >"$WORK/seed.log" 2>&1 || {
+    cat "$WORK/seed.log" >&2
+    exit 1
+  }
+
+grep -F "seed: building Stage1 product with stage0 bootstrap compiler $WORK/core/compiler/bin/elisac" "$WORK/seed.log" >/dev/null
 
 [[ -x "$WORK/bin/elisac-stage1" ]]
 [[ -f "$WORK/build/elisac_stage1.o" ]]
 [[ ! -e "$WORK/build/.elisac-stage1-seed.lock" ]]
 [[ ! -e "$WORK/tmp/elisac-stage1-global-seed.lock" ]]
-bash "$WORK/scripts/assert_stage1_fresh.sh" "$WORK/bin/elisac-stage1"
+LLVM_CONFIG="$WORK/llvm-config" \
+ELISA_CLANG="$WORK/clang" \
+ELISA_LLVM_BIN_DIR="$WORK" \
+ELISA_LLVM_LIBDIR="$WORK/lib" \
+ELISA_LLVM_LIBS="-lLLVM" \
+  bash "$WORK/scripts/assert_stage1_fresh.sh" "$WORK/bin/elisac-stage1"
 grep -Fx -- '-fno-builtin' "$WORK/clang.args" >/dev/null
 case "$(uname -s)" in
   Linux)
