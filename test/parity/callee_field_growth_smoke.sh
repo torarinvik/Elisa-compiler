@@ -4,6 +4,7 @@
 # (transitively) grows, pushes, clears or replaces. .pos: a view of `p.source` survives a
 # callee that grows only `p.names` (directly or through a recursive helper). .neg: the
 # callee grows / clears `p.source`, directly or through a helper.
+# The three-hop pair checks that transitive summaries reach a caller across multiple waves.
 # retired_generation.neg: each darray buffer generation is its own lifetime (retired buffers
 # are never exempt), so a view from one generator call dies at the next. stage0 accepts it.
 # stage0 also accepts the two field .neg cases: it does not invalidate through a whole-struct
