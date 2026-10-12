@@ -13,7 +13,7 @@ PROVER = ROOT.parent / "elisa-proof"
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 POSITIVE = HERE / "ownership_binding_lookup.elisa"
 NEGATIVE = HERE / "ownership_binding_lookup_rejected.elisa"
@@ -149,7 +149,7 @@ SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, T
            ROOT / "src/semantic/ownership_binding_flow.elisa"]
 compiler_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(compiler_product) + ".provenance.json")
-INPUTS = [BIN, MANIFEST, MANIFEST_CHECKSUM, (PROVER / "ELISA_COMPILER_REV").resolve(strict=True),
+INPUTS = [*source_include_closure([POSITIVE, NEGATIVE]), BIN, MANIFEST, MANIFEST_CHECKSUM, (PROVER / "ELISA_COMPILER_REV").resolve(strict=True),
           Path(manifest["compiler"]["executable"]["path"]).resolve(strict=True), compiler_product,
           Path(manifest["runtime"]["path"]).resolve(strict=True),
           Path(manifest["profile_hooks"]["path"]).resolve(strict=True),

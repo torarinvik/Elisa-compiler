@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 root = Path(__file__).resolve().parents[2]
 prover = root.parent / "elisa-proof"
@@ -24,6 +24,8 @@ inputs = [binary, manifest, manifest_checksum, prover / "ELISA_COMPILER_REV",
           here / "ownership_binding_identity.elisa", here / "ownership_binding_identity_rejected.elisa",
           here / "ownership_identity_replay_probe.elisa", here / "ownership_binding_separation.elisa",
           here / "ownership_binding_scope_isolation.elisa", here / "ownership_binding_scope_isolation_rejected.elisa"]
+inputs.extend(source_include_closure([path for path in inputs
+                                     if path.suffix == ".elisa" and path.is_relative_to(here)]))
 hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
 
 def run(name):

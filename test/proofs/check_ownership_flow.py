@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -38,6 +38,8 @@ inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
           HERE / "derived_source_loop_head.elisa", HERE / "derived_source_loop_head_rejected.elisa",
           HERE / "derived_source_loop_exit.elisa", HERE / "derived_source_loop_exit_rejected.elisa",
           HERE / "derived_source_for_entry.elisa", HERE / "derived_source_for_entry_rejected.elisa"]
+inputs.extend(source_include_closure([path for path in inputs
+                                     if path.suffix == ".elisa" and path.is_relative_to(HERE)]))
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def run(name):

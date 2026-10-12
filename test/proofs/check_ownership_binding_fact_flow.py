@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -26,6 +26,7 @@ semantic_sources = [ROOT / "src/semantic/binding_identity_types.elisa",
                     ROOT / "src/semantic/ownership_binding_flow.elisa"]
 inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
           HERE / "proof_product_gate.py", Path(__file__), proof, rejected, *semantic_sources]
+inputs.extend(source_include_closure([proof, rejected]))
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
@@ -52,6 +53,9 @@ expected_positive = {"matching_binding_join_is_componentwise", "foreign_left_bin
                      "eligible_binding_is_consumed_once", "arbitrary_binding_fact_cannot_be_accepted_twice",
                      "failed_consumption_preserves_every_fact",
                      "unreachable_binding_cannot_be_consumed", "unknown_binding_cannot_be_consumed",
+                     "accepted_consume_requires_every_move_precondition",
+                     "consume_predicate_matches_exact_move_eligibility",
+                     "accepted_consume_marks_arbitrary_eligible_fact_consumed",
                      "invalid_owner_cannot_be_consumed"}
 assert expected_positive <= verified
 assert all(row.get("verified") for row in positive["declaration_details"] if row["kind"] == "function")
@@ -59,7 +63,8 @@ assert all(row.get("verified") for row in positive["declaration_details"] if row
 code, negative = run(rejected)
 expected_false = {"foreign_binding_can_join_as_known", "foreign_serial_binding_can_join_as_known",
                   "foreign_right_serial_binding_can_join_as_known", "foreign_fact_can_replace_join_target",
-                  "consumed_binding_can_be_consumed_again", "arbitrary_binding_fact_can_be_accepted_twice"}
+                  "consumed_binding_can_be_consumed_again", "arbitrary_binding_fact_can_be_accepted_twice",
+                  "accepted_consume_may_leave_fact_live"}
 assert code == 1 and negative["status"] == "failed"
 assert {row["name"] for row in negative["findings"]} == expected_false
 assert all(row["kind"] == "ensure-unproven" for row in negative["findings"])
