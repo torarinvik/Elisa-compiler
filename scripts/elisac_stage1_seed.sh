@@ -194,7 +194,10 @@ seed_build() {
       exit 2
       ;;
   esac
-  "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
+  # Stage1 includes its own standard-library copy; authorize only that exact file. The
+  # bootstrap loader still requires it to appear in the expanded include set.
+  ELISACORE_TRUSTED_RUNTIME_SOURCE="$ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" \
+    "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
   seed_peak_rss_kb=0
   while kill -0 "$seed_pid" 2>/dev/null; do

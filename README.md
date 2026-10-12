@@ -36,6 +36,9 @@ See [docs/wasm.md](docs/wasm.md) for export adapters, JavaScript loading, memory
 runtime import customization. The standing end-to-end check is
 `test/parity/wasm_smoke.sh`.
 
+See [docs/structured_concurrency.md](docs/structured_concurrency.md) for task nurseries,
+worker pools, and task-group joins.
+
 | Piece | Role |
 |-------|------|
 | `src/driver/elisac.elisa` | Product entry: real lexer → parser → `Backend::emit` → object |

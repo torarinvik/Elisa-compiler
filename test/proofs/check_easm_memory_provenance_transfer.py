@@ -23,10 +23,12 @@ MODEL = HERE / "easm_memory_provenance_transfer.elisa"
 POSITIVE_NAMES = {
     "pseudo_instruction_preserves_destination_provenance",
     "pseudo_instruction_preserves_source_provenance",
-    "absent_register_destination_is_a_noop",
+    "non_exchange_without_a_destination_is_a_state_noop",
     "move_cannot_create_provenance_from_an_untracked_source",
+    "move_copies_a_tracked_source_provenance_component",
     "move_from_a_nonregister_clears_the_old_destination_provenance",
     "lea_cannot_create_provenance_from_an_untracked_base",
+    "lea_copies_a_tracked_base_provenance_component",
     "lea_without_a_parsed_base_clears_old_destination_provenance",
     "pointer_arithmetic_preserves_destination_provenance",
     "every_other_register_write_kills_stale_destination_provenance",
@@ -42,6 +44,7 @@ NEGATIVE_NAMES = {
     "false_claim_move_invents_provenance_from_an_untracked_source",
     "false_claim_unknown_write_preserves_stale_provenance",
     "false_claim_arithmetic_destroys_valid_pointer_provenance",
+    "false_claim_xchg_without_destination_preserves_the_source",
 }
 
 if not __debug__:
@@ -104,9 +107,16 @@ if memory.count('easm_provenance_set_parameter(states,destination,inherited,inhe
 if memory.count('easm_provenance_set_parameter(states,source,destination_type,destination_parameter)') != 1 or \
         memory.count('easm_provenance_set_parameter(states,destination,source_type,source_parameter)') != 1:
     raise SystemExit("xchg must snapshot both provenance components before replacing either register")
-if memory.count(compact('if easm_starts(op,"mov"):')) != 1 or \
-        memory.count(compact('elif easm_starts(op,"lea"):')) != 1 or \
-        memory.count(compact('elif easm_starts(op,"add") or easm_starts(op,"sub") or easm_starts(op,"inc") or easm_starts(op,"dec"):')) != 1:
+destination_guard = memory.find('ifdestination=="":return')
+if destination_guard < 6 or memory[destination_guard - 6:destination_guard] != "return":
+    raise SystemExit("xchg handling must return before the ordinary destination-write transfer")
+dispatch_start = memory.find("op:sview=instruction.op")
+dispatch_end = memory.find("easm_provenance_set_parameter(states,destination,inherited,inherited_parameter)", dispatch_start)
+if dispatch_start < 0 or dispatch_end < 0:
+    raise SystemExit("could not isolate the ordinary register-write transfer")
+dispatch = memory[dispatch_start:dispatch_end]
+classified_prefixes = re.findall(r'easm_starts\(op,"([^"]+)"\)', dispatch)
+if classified_prefixes != ["mov", "lea", "add", "sub", "inc", "dec"]:
     raise SystemExit("provenance-preserving opcode classes changed; revise the proof model before admission")
 
 proof_text = code_only(POSITIVE.read_text())

@@ -543,7 +543,7 @@ EXPECTS=(
     "cannot mutate \"xs\" while it is being iterated: darray push of xs"
     "items\" while it is being iterated"
     "items\" while it is being iterated: reassignment of"
-    'value escapes its `in auto:` scope via store into longer-lived storage'
+    'value backed by a short-lived region escapes via store into longer-lived storage'
     'by mutable reference while "p.items" is being iterated: the callee may push/clear/replace it through "p"'
     "storage dependency facts were invalidated for interior reference \"r\""
     "variable \"g\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]"
@@ -622,7 +622,7 @@ run_case region_returned_stored_borrow pos "$REPO_ROOT/test/repro/region_returne
 run_case region_returned_stored_borrow neg "$REPO_ROOT/test/repro/region_returned_stored_borrow.neg.elisa" "cannot be returned with a region-less type"
 
 echo "-- view_return_escape --"
-region_return_msg="value escapes its \`in auto:\` scope via return; the inferred region is freed at scope exit"
+region_return_msg="value backed by a short-lived region escapes via return; the region ends at scope exit"
 for escape_shape in darray binding tail tuple struct_field; do
     run_case "view_return_escape_$escape_shape" pos "$FIXTURES/view_return_escape_$escape_shape.pos.elisa" "$region_return_msg"
 done
@@ -693,7 +693,7 @@ require_stage0_region_control region_param_container_return_reference_element "$
 run_case local_view_escape_binding pos "$FIXTURES/local_view_escape_binding.pos.elisa" "view of local \"v\" escapes via return; the array dies at scope exit"
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "escapes via return; the array dies at scope exit"
 run_case local_view_escape_struct_field pos "$FIXTURES/local_view_escape_struct_field.pos.elisa" "view of local \"s\" escapes via return; the array dies at scope exit"
-run_case local_view_escape_view_call pos "$FIXTURES/local_view_escape_view_call.pos.elisa" "value escapes its \`in auto:\` scope via return"
+run_case local_view_escape_view_call pos "$FIXTURES/local_view_escape_view_call.pos.elisa" "value backed by a short-lived region escapes via return"
 run_case local_view_escape_more neg "$FIXTURES/local_view_escape_more.neg.elisa" "escapes via return"
 run_case return_ref_local_in_block pos "$FIXTURES/return_ref_local_in_block.pos.elisa" "returning a reference into function-local storage"
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "returning a reference into function-local storage"
