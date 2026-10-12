@@ -4,14 +4,23 @@
 # Writes out (the live log the Mac tails), rc, and <gate>.log per gate.
 set -uo pipefail
 s1="$1"; s0="$2"; OPT="$3"; JOBS="$4"; shift 4; GATES=("$@")
-W="${ELISA_REMOTE_ROOT:-/root/elisa}"; LV="${ELISA_REMOTE_LLVM:-21}"; RUNDIR="$PWD"
+W="${ELISA_REMOTE_ROOT:-/root/elisa}"; RUNDIR="$PWD"
+# Use the exact LLVM selected by setup_host.sh for every tool and CGo flag.
+LLVM_CONFIG="${ELISA_REMOTE_LLVM_CONFIG:-$W/bin/llvm-config}"
+[[ -x "$LLVM_CONFIG" ]] || { echo "missing selected llvm-config: $LLVM_CONFIG"; exit 2; }
+LLVM_BIN_DIR="$("$LLVM_CONFIG" --bindir)"
+LLVM_INCLUDE_DIR="$("$LLVM_CONFIG" --includedir)"
+LLVM_LIB_DIR="$("$LLVM_CONFIG" --libdir)"
+LLVM_VERSION="$("$LLVM_CONFIG" --version)"
+LLVM_KEY="${LLVM_VERSION//[^[:alnum:]._-]/_}"
 # Our toolchain only; the box is shared (another session's clang-19 stays the default).
-export PATH="$W/bin:$W/go/bin:/usr/lib/llvm-$LV/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$W/bin:$W/go/bin:$LLVM_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="$W/home" GOCACHE="$W/cache/go-build" GOPATH="$W/cache/gopath" GOFLAGS=-mod=mod
 export XDG_CACHE_HOME="$W/cache" ELISA_S0_CACHE_DIR="$W/cache/s0cache"
-export LLVM_CONFIG=/usr/lib/llvm-$LV/bin/llvm-config ELISA_LLVM_BIN_DIR=/usr/lib/llvm-$LV/bin
-export ELISA_CLANG="$W/bin/clang" ELISA_REAL_CLANG=/usr/lib/llvm-$LV/bin/clang
-export LLC=/usr/lib/llvm-$LV/bin/llc LLVM_MC=/usr/lib/llvm-$LV/bin/llvm-mc ELISA_LLVM_OPT=/usr/lib/llvm-$LV/bin/opt
+export ELISA_REMOTE_ROOT="$W" ELISA_REMOTE_LLVM_CONFIG="$LLVM_CONFIG" LLVM_CONFIG
+export ELISA_LLVM_BIN_DIR="$LLVM_BIN_DIR"
+export ELISA_CLANG="$W/bin/clang" ELISA_REAL_CLANG="$LLVM_BIN_DIR/clang"
+export LLC="$LLVM_BIN_DIR/llc" LLVM_MC="$LLVM_BIN_DIR/llvm-mc" ELISA_LLVM_OPT="$LLVM_BIN_DIR/opt"
 export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 ELISA_TOOL_SHIM_DIR="$W/bin"
 ulimit -s unlimited
 mkdir -p "$HOME" "$W/cache" "$W/locks" "$W/seed"
@@ -23,21 +32,23 @@ stamp() { date +%s; }
 [[ "$(z3 --version 2>/dev/null)" == *"version 5."* ]] || { echo "z3 >= 5 missing from $W/bin (run setup_host.sh)"; finish 2; }
 
 # --- stage0, once per rev ---------------------------------------------------------------
-S0="$W/src/s0-$s0"; S0BIN="$S0/compiler/bin/elisac"
+S0="$W/src/s0-$s0"; S0BIN="$W/cache/stage0/$s0-$LLVM_KEY/elisac"
+S0LOCK="$W/locks/s0-$s0-$LLVM_KEY.lock"
 t=$(stamp)
 (
   flock 9
   if [[ ! -x "$S0BIN" ]]; then
-    cd "$S0/compiler" && CGO_CFLAGS="-I/usr/lib/llvm-$LV/include" \
-      CGO_LDFLAGS="-L/usr/lib/llvm-$LV/lib -Wl,-rpath,/usr/lib/llvm-$LV/lib" \
-      go build -o bin/elisac.part ./src && mv bin/elisac.part bin/elisac
+    mkdir -p "$(dirname "$S0BIN")"
+    cd "$S0/compiler" && CGO_CFLAGS="-I$LLVM_INCLUDE_DIR" \
+      CGO_LDFLAGS="-L$LLVM_LIB_DIR -Wl,-rpath,$LLVM_LIB_DIR" \
+      go build -o "$S0BIN.part" ./src && mv "$S0BIN.part" "$S0BIN"
   fi
-) 9>"$W/locks/s0-$s0.lock" > "$RUNDIR/stage0_build.log" 2>&1
+) 9>"$S0LOCK" > "$RUNDIR/stage0_build.log" 2>&1
 [[ -x "$S0BIN" ]] || { echo "stage0 build FAILED:"; tail -20 "$RUNDIR/stage0_build.log"; finish 2; }
 echo "stage0 $s0: $(( $(stamp) - t ))s"
 
 # --- stage1 seed, once per (s1, s0, opt) --------------------------------------------------
-KEY="$s1-$s0$OPT"; SEED="$W/seed/$KEY"
+KEY="$s1-$s0-llvm-$LLVM_KEY$OPT"; SEED="$W/seed/$KEY"
 t=$(stamp)
 (
   flock 9

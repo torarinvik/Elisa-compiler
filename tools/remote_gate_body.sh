@@ -5,10 +5,12 @@ git config --global --get-all safe.directory | grep -qx "$RDIR" || git config --
 git config --global --get-all safe.directory | grep -qx "$RCORE" || git config --global --add safe.directory "$RCORE"
 # Always rebuild stage0 first: Go's cache makes it seconds, and the seed needs VCS build info
 # matching the synced tree. remote_env.sh only rebuilds a non-ELF binary.
-(cd "$RCORE/compiler" && PATH=/usr/local/go/bin:$PATH CGO_CFLAGS="-I/usr/lib/llvm-21/include" CGO_LDFLAGS="-L/usr/lib/llvm-21/lib -Wl,-rpath,/usr/lib/llvm-21/lib" go build -o bin/elisac ./src)
 # The shared gate-host environment: tools/linux_shim first on PATH unless ELISA_NO_LINUX_SHIM (the suite's
 # Apple-ld link flags), LLVM/clang paths, stack limit and the stage0 oracle cache.
 ELISA_REMOTE_DIR="$RDIR" ELISA_REMOTE_CORE="$RCORE" source "$RDIR/tools/remote_env.sh"
+LLVM_INCLUDE_DIR="$("$LLVM_CONFIG" --includedir)"
+LLVM_LIB_DIR="$("$LLVM_CONFIG" --libdir)"
+(cd "$RCORE/compiler" && CGO_CFLAGS="-I$LLVM_INCLUDE_DIR" CGO_LDFLAGS="-L$LLVM_LIB_DIR -Wl,-rpath,$LLVM_LIB_DIR" go build -o bin/elisac ./src)
 mkdir -p bin build/runtime
 [ -f "$ELISA_RUNTIME_OBJ" ] || bash scripts/build_runtime_object.sh
 # The seed guard defaults to 6 GB; Linux stage0 peaks above it, and the gate host has far more.

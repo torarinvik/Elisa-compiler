@@ -11,7 +11,7 @@ These optional remote tools require an explicitly configured, currently verified
 
 | file | role |
 |---|---|
-| `setup_host.sh` | LLVM 21 (apt.llvm.org), z3 5.1.0 release binary, Go 1.27.1, the clang shim |
+| `setup_host.sh` | latest stable LLVM from apt.llvm.org (or an explicit LLVM config/major), z3 5.1.0 release binary, Go 1.27.1, the clang shim |
 | `remote_gate.sh` | ships committed trees (`git archive`), builds stage0 per rev, seeds per (s1, s0, opt), runs gates in parallel, prints a summary |
 | `gate_body.sh` | the host half of `remote_gate.sh` (shipped on every run) |
 | `host_invalid.txt` | `<gate> <row>` rows the host cannot honour: reported SKIP-HOST, not FAIL |

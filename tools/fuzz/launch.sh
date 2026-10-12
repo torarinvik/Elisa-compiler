@@ -41,9 +41,11 @@ for e in ${EXTRA[@]+"${EXTRA[@]}"}; do
 done
 rssh "cc -O2 -shared -fPIC -o $W/fuzz/tools/guard.so $W/fuzz/tools/guard.c"
 rssh "cd $OUT && cat > run.sh" <<EOF
-export PATH=$W/bin:/usr/lib/llvm-21/bin:/usr/bin:/bin HOME=$W/home
-export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 ELISA_CLANG=$W/bin/clang ELISA_REAL_CLANG=/usr/lib/llvm-21/bin/clang
-export LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config ELISA_RUNTIME_OBJ=$SEED/build/runtime/elisacore_runtime.o
+export LLVM_CONFIG=$W/bin/llvm-config
+LLVM_BINDIR="\$("$W/bin/llvm-config" --bindir)"
+export PATH=$W/bin:\$LLVM_BINDIR:/usr/bin:/bin HOME=$W/home
+export ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 ELISA_CLANG=$W/bin/clang ELISA_REAL_CLANG=\$LLVM_BINDIR/clang
+export ELISA_RUNTIME_OBJ=$SEED/build/runtime/elisacore_runtime.o
 echo \$\$ > $OUT/pid
 export TMPDIR=$OUT/tmp; mkdir -p \$TMPDIR
 ulimit -s unlimited
