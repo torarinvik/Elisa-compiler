@@ -33,7 +33,8 @@ def task_group_wait_all(group: TaskGroup&) -> void:
     return
 
 def pool_submit1[A, R](pool: ThreadPool&, fn: fn(A) -> R, arg: A) -> Task[R, i64]:
-    return zeroed
+    task: Task[R, i64] = zeroed
+    return move task
 
 def task_group_add[R](group: TaskGroup&, task: Task[R, i64]) -> void:
     _ = move task
@@ -43,17 +44,19 @@ def bump(value: i64) -> i64:
     return value + 1
 
 def early_exit() -> i64:
-    workers: mutable ThreadPool = pool_new(1)
-    nursery on(workers):
-        submit bump(41)
-        return 17
+    pool workers(1):
+        nursery on(workers):
+            submit bump(41)
+            return 17
     return 0
 
 def main() -> i64:
-    workers: mutable ThreadPool = pool_new(2)
-    nursery on(workers):
-        workers: i64 = 1
-        submit bump(41)
+    pool workers(2):
+        nursery on(workers):
+            workers: i64 = 1
+            submit bump(41)
+        nursery on(workers):
+            submit bump(42)
     return 42
 ELISA
 
@@ -82,8 +85,22 @@ grep -Eq 'call .*@task_group_wait_all' "$WORK/main.ll" || {
     cat "$WORK/main.ll" >&2
     exit 1
 }
-if grep -Eq 'call .*@pool_shutdown' "$WORK/main.ll"; then
-    echo "shared-pool nursery shut down a caller-owned pool" >&2
+main_join_count="$(grep -Ec 'call .*@task_group_wait_all' "$WORK/main.ll" || true)"
+if [[ "$main_join_count" -ne 2 ]]; then
+    echo "shared-pool batches emitted $main_join_count joins; expected one join per nursery" >&2
+    cat "$WORK/main.ll" >&2
+    exit 1
+fi
+main_join_line="$(grep -n 'call .*@task_group_wait_all' "$WORK/main.ll" | tail -n 1 | cut -d: -f1 || true)"
+main_shutdown_line="$(grep -n 'call .*@pool_shutdown' "$WORK/main.ll" | head -n 1 | cut -d: -f1 || true)"
+if [[ -z "$main_join_line" || -z "$main_shutdown_line" || "$main_join_line" -ge "$main_shutdown_line" ]]; then
+    echo "shared-pool batches did not join before the caller's pool scope shut down" >&2
+    cat "$WORK/main.ll" >&2
+    exit 1
+fi
+pool_shutdowns="$(grep -Ec 'call .*@pool_shutdown' "$WORK/main.ll" || true)"
+if [[ "$pool_shutdowns" -ne 1 ]]; then
+    echo "shared-pool nursery emitted $pool_shutdowns pool shutdowns in main; expected only the caller's" >&2
     cat "$WORK/main.ll" >&2
     exit 1
 fi
@@ -93,17 +110,25 @@ if [[ "$pool_creations" -ne 1 ]]; then
     grep -n 'pool_new\|pool_shutdown' "$WORK/main.ll" >&2 || true
     exit 1
 fi
+pool_submissions="$(grep -Ec 'call .*@pool_submit1[^;]*ptr %workers[, )]' "$WORK/main.ll" || true)"
+if [[ "$pool_submissions" -ne 2 ]]; then
+    echo "shared-pool batches submitted $pool_submissions tasks to the caller-owned pool; expected 2" >&2
+    grep -n 'pool_submit1\|task_group_wait_all\|pool_new\|pool_shutdown' "$WORK/main.ll" >&2 || true
+    exit 1
+fi
 
 awk '/^define .*@early_exit\(/,/^}/' "$WORK/shared-pool.ll" >"$WORK/early-exit.ll"
 join_line="$(grep -n 'call .*@task_group_wait_all' "$WORK/early-exit.ll" | head -n 1 | cut -d: -f1 || true)"
+shutdown_line="$(grep -n 'call .*@pool_shutdown' "$WORK/early-exit.ll" | head -n 1 | cut -d: -f1 || true)"
 return_line="$(grep -n 'ret i64 17' "$WORK/early-exit.ll" | head -n 1 | cut -d: -f1 || true)"
-if [[ -z "$join_line" || -z "$return_line" || "$join_line" -ge "$return_line" ]]; then
-    echo "early return bypassed the shared-pool nursery TaskGroup join" >&2
+if [[ -z "$join_line" || -z "$shutdown_line" || -z "$return_line" || "$join_line" -ge "$shutdown_line" || "$shutdown_line" -ge "$return_line" ]]; then
+    echo "early return did not join the nursery before the caller's pool scope shut down" >&2
     cat "$WORK/early-exit.ll" >&2
     exit 1
 fi
-if grep -Eq 'call .*@pool_shutdown' "$WORK/early-exit.ll"; then
-    echo "early return shut down a caller-owned pool" >&2
+early_shutdowns="$(grep -Ec 'call .*@pool_shutdown' "$WORK/early-exit.ll" || true)"
+if [[ "$early_shutdowns" -ne 1 ]]; then
+    echo "early return emitted $early_shutdowns pool shutdowns; expected only the caller's" >&2
     cat "$WORK/early-exit.ll" >&2
     exit 1
 fi
@@ -160,4 +185,4 @@ if env -u ELISA_STAGE1_RUNTIME_STD "$STAGE1" -emit fmt -o "$WORK/malformed.fmt" 
     exit 1
 fi
 
-echo "nursery on(pool) smoke OK: formatter, pool type and mutability checks, implicit submit target, and caller-owned pool lifetime"
+echo "nursery on(pool) smoke OK: formatter, pool type and mutability checks, two batches on one caller-owned pool, and early-exit cleanup"
