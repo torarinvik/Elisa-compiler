@@ -21,6 +21,8 @@
 # Self-contained on purpose: it uses no driver-local helpers, so it can be
 # included by a probe as well as by the driver.
 
+include "./frontend_ir_bounds.elisa"
+
 module FrontendIr:
     public:
         # A parsed field: its ID and the byte span of its payload within the
@@ -72,7 +74,6 @@ module FrontendIr:
         # Reading is a hand-rolled cursor: each decoder returns success and writes
         # the next offset through an out-parameter, so a caller can chain reads
         # with `ok <- ok and next_read(...)` and stop at the first short read.
-
         def ir_uvarint(data: darray[u8]&, offset: usize, out_value: mutable u64&, out_next: mutable usize&) -> bool:
             can Abort.Panic:
                 shift: mutable u32 = 0
@@ -81,13 +82,15 @@ module FrontendIr:
                 while position < data.count |shift, result, position, out_value, out_next|:
                     byte: u8 = data[position]
                     position <- position + 1
-                    result <- result | ((byte & 0x7f).u64() << shift.u64())
+                    payload: u8 = byte & 0x7f
+                    false return if not frontend_ir_varint_payload_fits(shift.u64(), payload.u64())
+                    result <- result | (payload.u64() << shift.u64())
                     if (byte & 0x80) == 0:
                         out_value <- result
                         out_next <- position
                         return true
                     shift <- shift + 7
-                    false return if shift > 63
+                    false return if not frontend_ir_varint_continued_shift_fits(shift.u64())
                 return false
 
         # Signed values are zigzagged, so the low bit carries the sign.
@@ -107,10 +110,13 @@ module FrontendIr:
                 length: mutable u64 = 0
                 next: mutable usize = offset
                 false return if not ir_uvarint(data, offset, &length, &next)
-                false return if next + length.usize() > data.count
+                false return if next > data.count
+                span_length: usize = length.usize()
+                false return if span_length.u64() != length
+                false return if not frontend_ir_span_length_fits((data.count - next).u64(), span_length.u64())
                 out_start <- next
-                out_length <- length.usize()
-                out_next <- next + length.usize()
+                out_length <- span_length
+                out_next <- next + span_length
                 return true
 
         # "ELISAIR2\n", compared byte by byte so this file needs no string helpers.
@@ -132,19 +138,21 @@ module FrontendIr:
         # element, a map's key and value, an inline struct's type name) are read
         # only to keep the cursor aligned; the outermost kind is what skipping
         # needs, so it is the only part retained.
-        def ir_skip_value_schema(data: darray[u8]&, offset: usize, out_kind: mutable u8&, out_next: mutable usize&) -> bool:
+        def ir_skip_value_schema(data: darray[u8]&, offset: usize, out_kind: mutable u8&, out_next: mutable usize&, remaining_depth: usize) -> bool:
+            decreases remaining_depth
             can Abort.Panic:
-                false return if offset >= data.count
+                false return if not frontend_ir_schema_budget_step_fits(remaining_depth.u64())
+                false return if not frontend_ir_cursor_step_fits(data.count.u64(), offset.u64())
                 kind: u8 = data[offset]
                 next: mutable usize = offset + 1
                 inner: mutable u8 = 0
                 name_start: mutable usize = 0
                 name_length: mutable usize = 0
                 if kind == 5:
-                    false return if not ir_skip_value_schema(data, next, &inner, &next)
+                    false return if not ir_skip_value_schema(data, next, &inner, &next, remaining_depth - 1)
                 if kind == 6:
-                    false return if not ir_skip_value_schema(data, next, &inner, &next)
-                    false return if not ir_skip_value_schema(data, next, &inner, &next)
+                    false return if not ir_skip_value_schema(data, next, &inner, &next, remaining_depth - 1)
+                    false return if not ir_skip_value_schema(data, next, &inner, &next, remaining_depth - 1)
                 if kind == 7:
                     false return if not ir_span(data, next, &name_start, &name_length, &next)
                 out_kind <- kind
@@ -161,10 +169,10 @@ module FrontendIr:
                     kind: mutable u8 = 0
                     ok: mutable bool = ir_uvarint(data, position, &field_id, &position)
                     ok <- ok and ir_span(data, position, &name_start, &name_length, &position)
-                    ok <- ok and ir_skip_value_schema(data, position, &kind, &position)
-                    if not ok:
+                    ok <- ok and ir_skip_value_schema(data, position, &kind, &position, data.count)
+                    if not ok or not frontend_ir_u32_value_fits(field_id):
                         bundle.ok <- false
-                        bundle.error_line <- "truncated field descriptor"
+                        bundle.error_line <- "truncated or oversized field descriptor"
                         break
                     bundle.type_fields <- bundle.type_fields.push(IrTypeField{name_start: name_start, name_length: name_length, id: field_id.u32(), kind: kind})
                 out_next <- position
@@ -179,9 +187,9 @@ module FrontendIr:
                 ok: mutable bool = ir_uvarint(data, offset, &type_id, &position)
                 ok <- ok and ir_span(data, position, &name_start, &name_length, &position)
                 ok <- ok and ir_uvarint(data, position, &field_count, &position)
-                if not ok:
+                if not ok or not frontend_ir_u32_value_fits(type_id) or not frontend_ir_count_fits_input(field_count, data.count.u64()):
                     bundle.ok <- false
-                    bundle.error_line <- "truncated type descriptor"
+                    bundle.error_line <- "truncated or oversized type descriptor"
                     return
                 first_field: usize = bundle.type_fields.count
                 bundle <- ir_read_type_fields(data, position, field_count.usize(), &position, bundle)
@@ -195,6 +203,10 @@ module FrontendIr:
                 if not ir_uvarint(data, offset, &count, &position):
                     bundle.ok <- false
                     bundle.error_line <- "truncated type table"
+                    return
+                if not frontend_ir_count_fits_input(count, data.count.u64()):
+                    bundle.ok <- false
+                    bundle.error_line <- "type count exceeds input size"
                     return
                 for _ in 0..<count.usize() |bundle, position|:
                     bundle <- ir_read_one_type(data, position, &position, bundle)
@@ -210,9 +222,9 @@ module FrontendIr:
                     payload_length: mutable usize = 0
                     ok: mutable bool = ir_uvarint(data, position, &field_id, &position)
                     ok <- ok and ir_span(data, position, &payload_start, &payload_length, &position)
-                    if not ok or position > limit:
+                    if not ok or position > limit or not frontend_ir_u32_value_fits(field_id):
                         bundle.ok <- false
-                        bundle.error_line <- "truncated node field"
+                        bundle.error_line <- "truncated or oversized node field"
                         break
                     bundle.fields <- bundle.fields.push(IrField{id: field_id.u32(), start: payload_start, length: payload_length})
 
@@ -223,9 +235,9 @@ module FrontendIr:
                 field_count: mutable u64 = 0
                 ok: mutable bool = ir_uvarint(data, start, &type_id, &position)
                 ok <- ok and ir_uvarint(data, position, &field_count, &position)
-                if not ok:
+                if not ok or not frontend_ir_u32_value_fits(type_id) or not frontend_ir_count_fits_input(field_count, data.count.u64()):
                     bundle.ok <- false
-                    bundle.error_line <- "truncated node header"
+                    bundle.error_line <- "truncated or oversized node header"
                     return
                 first_field: usize = bundle.fields.count
                 bundle <- ir_read_node_fields(data, position, field_count.usize(), limit, bundle)
@@ -238,6 +250,10 @@ module FrontendIr:
                 if not ir_uvarint(data, offset, &count, &position):
                     bundle.ok <- false
                     bundle.error_line <- "truncated node table"
+                    return
+                if not frontend_ir_count_fits_input(count, data.count.u64()):
+                    bundle.ok <- false
+                    bundle.error_line <- "node count exceeds input size"
                     return
                 for _ in 0..<count.usize() |bundle, position|:
                     body_start: mutable usize = 0
@@ -277,10 +293,15 @@ module FrontendIr:
                     bundle.ok <- false
                     bundle.error_line <- "truncated root reference"
                     return
-                bundle.root <- root.u32()
-                if root == 0 or root.usize() > bundle.nodes.count:
+                if not frontend_ir_u32_value_fits(root):
+                    bundle.ok <- false
+                    bundle.error_line <- "root reference exceeds supported range"
+                    return
+                if not frontend_ir_root_is_valid(root, bundle.nodes.count.u64()):
                     bundle.ok <- false
                     bundle.error_line <- "root reference is out of range"
+                    return
+                bundle.root <- root.u32()
 
     public:
         # Parse a `.elisair` image. Never panics on malformed input — `ok` is false
@@ -299,11 +320,11 @@ module FrontendIr:
                     bundle.ok <- false
                     bundle.error_line <- "truncated version"
                     return bundle
-                bundle.version <- version.u32()
-                if version != 2:
+                if not frontend_ir_version_is_supported(version):
                     bundle.ok <- false
                     bundle.error_line <- "unsupported frontend IR version"
                     return bundle
+                bundle.version <- version.u32()
                 bundle <- ir_read_header(data, position, &position, bundle)
                 bundle return if not bundle.ok
                 bundle <- ir_read_type_table(data, position, &position, bundle)

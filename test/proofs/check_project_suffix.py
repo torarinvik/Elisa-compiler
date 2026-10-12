@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +91,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV", stage1_product,
           stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", POSITIVE,
           NEGATIVE, PROJECT, RESOLVE, DRIVER]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 

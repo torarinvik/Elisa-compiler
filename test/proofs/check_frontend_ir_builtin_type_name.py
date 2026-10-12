@@ -6,11 +6,11 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = ROOT.parent / "elisa-proof"
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 POSITIVE = HERE / "frontend_ir_builtin_type_name.elisa"
@@ -21,27 +21,56 @@ TYPE_WRITER = ROOT / "src/driver/frontend_ir_types.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 
+
 if not __debug__:
     raise SystemExit("run without Python -O")
 
 names = ("darray", "view", "sview", "dict", "set", "deque", "array", "slice", "optional")
-predicate = " or ".join(f'name == "{name}"' for name in names)
-contract = f"ensure result == ({predicate})"
 source_text = HELPER.read_text()
 proof_text = POSITIVE.read_text()
-# Line wrapping and an outer grouping do not change the exact contract clauses.
-compact_contract = "".join(contract.split())
-def compact_source(text):
-    # Preserve whitespace inside string literals: "da rray" is not "darray".
-    compact = re.sub(r'"(?:\\.|[^"\\])*"|\s+',
-                     lambda match: match.group(0) if match.group(0).startswith('"') else "",
-                     text)
-    return compact.replace("ensure(result", "ensureresult")
 
-if compact_contract not in compact_source(source_text):
-    raise SystemExit("production classifier contract is not the complete closed builtin set")
-if compact_contract not in compact_source(proof_text):
-    raise SystemExit("proof no longer states the complete production classifier contract")
+
+def match_names(block, description):
+    arms = [line.strip() for line in block.splitlines() if line.strip()]
+    if not arms or arms[-1] != "_ -> false":
+        raise SystemExit(f"{description} lost its false fallback")
+    found_names = []
+    for arm in arms[:-1]:
+        if not re.fullmatch(r'"[^"\\]+"(?:\s*\|\s*"[^"\\]+")*\s*->\s*true', arm):
+            raise SystemExit(f"{description} contains a non-literal or non-true arm")
+        found_names.extend(re.findall(r'"([^"\\]+)"', arm))
+    if found_names != list(names):
+        raise SystemExit(f"{description} arms differ from the ordered closed set")
+
+
+def require_spec_match(text, description):
+    match = re.search(
+        r"ensure\s+result\s*==\s*\(\s*when\s+name:\s*\n(.*?)^\s*\)",
+        text,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not match:
+        raise SystemExit(f"{description} must specify the closed set with pattern matching")
+    match_names(match.group(1), description)
+
+
+require_spec_match(source_text, "production classifier contract")
+require_spec_match(proof_text, "proof contract")
+classifier = re.search(
+    r"(?m)^\s*def is_builtin_type_name\([^\n]*\n(.*?)(?=^\s*def |\Z)",
+    source_text,
+    re.DOTALL,
+)
+if not classifier:
+    raise SystemExit("production builtin classifier is missing")
+dispatch = re.search(
+    r"return\s+when\s+name:\s*\n(.*)",
+    classifier.group(1),
+    re.DOTALL,
+)
+if not dispatch:
+    raise SystemExit("production builtin classifier lost its exhaustive literal match")
+match_names(dispatch.group(1), "production builtin match")
 if 'include "./frontend_ir_builtin_type_name.elisa"' not in WRITER.read_text():
     raise SystemExit("frontend IR writer no longer imports the classifier")
 if "FrontendIrBuiltinTypeName::is_builtin_type_name(name)" not in TYPE_WRITER.read_text():
@@ -56,10 +85,11 @@ if manifest.get("compile_mode") != "strict":
 
 stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
+source_closure = source_include_closure([POSITIVE, NEGATIVE, WRITER, TYPE_WRITER])
 inputs = [
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POSITIVE, NEGATIVE, HELPER, WRITER, TYPE_WRITER,
+    *source_closure,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

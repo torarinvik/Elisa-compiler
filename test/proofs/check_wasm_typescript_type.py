@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,30 +49,38 @@ bigint_arms = (
     '"i64"|"u64"|"char"->true',
     '_->false',
 )
+number_arms = (
+    '"cstr"|"i64"|"u64"|"char"|"bool"|"void"->false',
+    '_->true',
+)
 pattern_arms = types_text.count("->") - types_text.count("->sview") - types_text.count("->bool")
-expected_pattern_arms = len(expected_arms) + len(bigint_arms)
-if any(types_text.count(arm) != 1 for arm in expected_arms) or pattern_arms != expected_pattern_arms:
+expected_pattern_arms = len(expected_arms) + 3 * len(bigint_arms) + len(number_arms)
+if (
+    any(types_text.count(arm) != 1 for arm in expected_arms + number_arms)
+    or any(types_text.count(arm) != 3 for arm in bigint_arms)
+    or pattern_arms != expected_pattern_arms
+):
     raise SystemExit("TypeScript implementation no longer matches the exact closed result table")
 if "defwasm_ts_input_requires_bigint(type_text:sview)->bool:" not in types_text:
     raise SystemExit("WASM input conversion classifier is missing")
-if any(types_text.count(arm) != 1 for arm in bigint_arms):
+if any(types_text.count(arm) != 3 for arm in bigint_arms):
     raise SystemExit("WASM input conversion implementation no longer matches the i64 type set")
 typescript_contracts = tuple(compact_source(clause) for clause in (
     'ensure (result == "string | number") == (type_text == "cstr" and parameter)',
     'ensure (result == "string") == (type_text == "cstr" and not parameter)',
-    'ensure (result == "bigint") == (type_text == "i64" or type_text == "u64" or type_text == "char")',
+    'ensure (result == "bigint") == (when type_text: "i64" | "u64" | "char" -> true _ -> false)',
     'ensure (result == "boolean") == (type_text == "bool")',
     'ensure (result == "void") == (type_text == "void")',
-    'ensure (result == "number") == (type_text != "cstr" and type_text != "i64" and type_text != "u64" and type_text != "char" and type_text != "bool" and type_text != "void")',
+    'ensure (result == "number") == (when type_text: "cstr" | "i64" | "u64" | "char" | "bool" | "void" -> false _ -> true)',
 ))
 positive_text = compact_source(POSITIVE.read_text())
 if any(contract not in types_text or contract not in positive_text for contract in typescript_contracts):
-    raise SystemExit("WASM TypeScript contracts and proof do not share the exact equality specification")
+    raise SystemExit("WASM TypeScript contracts and proof do not share the exact pattern specification")
 bigint_input_contract = compact_source(
-    'ensure result == (type_text == "i64" or type_text == "u64" or type_text == "char")'
+    'ensure result == (when type_text: "i64" | "u64" | "char" -> true _ -> false)'
 )
 if bigint_input_contract not in types_text:
-    raise SystemExit("WASM BigInt input classifier has no exact logical contract")
+    raise SystemExit("WASM BigInt input classifier lost its exact pattern contract")
 
 bindings_text = compact_source(BINDINGS.read_text())
 exports_text = compact_source(EXPORTS.read_text())
@@ -116,6 +124,7 @@ inputs = [
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
     POSITIVE, NEGATIVE, TYPES, SCALAR, BINDINGS, EXPORTS, EMITTER, DRIVER,
 ]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +18,7 @@ MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 POSITIVE = HERE / "wasm_scalar_wasm_type.elisa"
 NEGATIVE = HERE / "wasm_scalar_wasm_type_rejected.elisa"
 SCALAR = ROOT / "src/driver/wasm_scalar_wasm_type.elisa"
+ABI_CLASSIFICATION = ROOT / "src/driver/wasm_abi_type_classification.elisa"
 BINDINGS = ROOT / "src/driver/emit_wasm_bindings.elisa"
 EXPORTS = ROOT / "src/driver/emit_wasm_exports.elisa"
 EMITTER = ROOT / "src/driver/emit_wasm.elisa"
@@ -32,7 +33,8 @@ def compact(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
-scalar_text = compact(SCALAR.read_text())
+scalar_source = SCALAR.read_text()
+scalar_text = compact(scalar_source)
 expected_arms = (
     '"i8"|"u8"|"i16"|"u16"|"i32"|"u32"|"int"|"isize"|"usize"|"uintptr"|"bool"->"i32"',
     '"i64"|"u64"|"char"->"i64"',
@@ -43,22 +45,53 @@ expected_arms = (
 )
 if "returnwhentype_text:" not in scalar_text:
     raise SystemExit("WASM scalar helper no longer implements a pattern table")
-contract_clauses = (
-    'ensure(result=="i32")==(' + 'type_text=="i8"ortype_text=="u8"ortype_text=="i16"ortype_text=="u16"ortype_text=="i32"ortype_text=="u32"ortype_text=="int"ortype_text=="isize"ortype_text=="usize"ortype_text=="uintptr"ortype_text=="bool")',
-    'ensure(result=="i64")==(' + 'type_text=="i64"ortype_text=="u64"ortype_text=="char")',
+positive_text = compact(POSITIVE.read_text())
+membership = 'whentype_text:"i8"|"u8"|"i16"|"u16"|"i32"|"u32"|"int"|"isize"|"usize"|"uintptr"|"bool"|"i64"|"u64"|"char"|"f32"|"f64"|"void"->true_->false'
+membership_declaration = re.search(
+    r"(?m)^\s*def is_scalar_type_name\([^\n]*\n(.*?)(?=^\s*def |\Z)",
+    scalar_source,
+    re.DOTALL,
+)
+if not membership_declaration or compact(membership_declaration.group(1)).count(membership) != 2:
+    raise SystemExit("WASM scalar membership predicate contract and implementation no longer share the exact pattern table")
+membership_match = re.search(
+    r"(?m)^\s*return\s+when\s+type_text:\s*\n(.*)",
+    membership_declaration.group(1),
+    re.DOTALL,
+)
+expected_membership_arms = (
+    '"i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "int" | "isize" | "usize" | "uintptr" | "bool" | "i64" | "u64" | "char" | "f32" | "f64" | "void" -> true',
+    "_ -> false",
+)
+actual_membership_arms = tuple(
+    line.strip() for line in membership_match.group(1).splitlines() if line.strip()
+) if membership_match else ()
+if actual_membership_arms != expected_membership_arms:
+    raise SystemExit("WASM scalar membership implementation no longer matches its exact pattern table")
+if "source_scalar_name_membership_is_exact" not in positive_text or membership not in positive_text:
+    raise SystemExit("WASM scalar membership proof no longer states the exact supported name set")
+production_contract_clauses = (
+    'ensure(result=="i32")==(' + 'whentype_text:"i8"|"u8"|"i16"|"u16"|"i32"|"u32"|"int"|"isize"|"usize"|"uintptr"|"bool"->true_->false)',
+    'ensure(result=="i64")==(' + 'whentype_text:"i64"|"u64"|"char"->true_->false)',
     'ensure(result=="f32")==(' + 'type_text=="f32")',
     'ensure(result=="f64")==(' + 'type_text=="f64")',
     'ensure(result=="void")==(' + 'type_text=="void")',
-    'ensure(result=="")==(' + 'type_text!="i8"andtype_text!="u8"andtype_text!="i16"andtype_text!="u16"andtype_text!="i32"andtype_text!="u32"andtype_text!="int"andtype_text!="isize"andtype_text!="usize"andtype_text!="uintptr"andtype_text!="bool"andtype_text!="i64"andtype_text!="u64"andtype_text!="char"andtype_text!="f32"andtype_text!="f64"andtype_text!="void")',
+    'ensure(result=="")== (notis_scalar_type_name(type_text))',
 )
-pattern_arms = scalar_text.count("->") - scalar_text.count("->sview")
+proof_contract_clauses = production_contract_clauses[:-1] + (
+    'ensure(result=="")== (notWasmScalarWasmType::is_scalar_type_name(type_text))',
+)
+mapping_body = scalar_text.split("canAbort.Panic:returnwhentype_text:", 1)[1]
+pattern_arms = mapping_body.count("->") - mapping_body.count("->sview")
 if any(scalar_text.count(arm) != 1 for arm in expected_arms) or pattern_arms != len(expected_arms):
     raise SystemExit("WASM scalar implementation no longer matches the exact closed mapping")
-positive_text = compact(POSITIVE.read_text())
-if any(clause not in scalar_text or clause not in positive_text for clause in contract_clauses):
-    raise SystemExit("WASM scalar contract and proof do not share the supported exact equality specification")
+if any(compact(clause) not in scalar_text for clause in production_contract_clauses):
+    raise SystemExit("WASM scalar production contracts no longer use the supported exact pattern specification")
+if any(compact(clause) not in positive_text for clause in proof_contract_clauses):
+    raise SystemExit("WASM scalar contract and proof do not share the supported exact pattern specification")
 
 bindings_text = compact(BINDINGS.read_text())
+abi_classification_text = compact(ABI_CLASSIFICATION.read_text())
 exports_text = compact(EXPORTS.read_text())
 emitter_text = compact(EMITTER.read_text())
 driver_text = compact(DRIVER.read_text())
@@ -66,8 +99,12 @@ if 'include"./wasm_scalar_wasm_type.elisa"' not in bindings_text:
     raise SystemExit("WASM binding builder no longer imports the proved scalar mapping")
 if "returnWasmScalarWasmType::wasm_scalar_wasm_type(type_text)" not in bindings_text:
     raise SystemExit("WASM binding helper no longer delegates to the proved table")
-if "scalar:sview=wasm_scalar_wasm_type(type_text)" not in bindings_text:
-    raise SystemExit("WASM ABI binding no longer uses the proved scalar table")
+if 'include"./wasm_abi_type_classification.elisa"' not in bindings_text:
+    raise SystemExit("WASM binding builder no longer imports the proved ABI classifier")
+if "WasmAbiTypeClassification::classify(type_text,component)" not in bindings_text:
+    raise SystemExit("WASM ABI binding no longer delegates type mapping to the classifier")
+if "WasmScalarWasmType::wasm_scalar_wasm_type(type_text)" not in abi_classification_text:
+    raise SystemExit("WASM ABI classifier no longer uses the proved scalar table")
 if 'include"./emit_wasm_bindings.elisa"' not in emitter_text or 'include"./emit_wasm_exports.elisa"' not in emitter_text:
     raise SystemExit("WASM emitter no longer connects the proved binding helper to exports")
 if "wasm_abi_binding(" not in exports_text:
@@ -94,8 +131,9 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = [
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POSITIVE, NEGATIVE, SCALAR, BINDINGS, EXPORTS, EMITTER, DRIVER,
+    POSITIVE, NEGATIVE, SCALAR, ABI_CLASSIFICATION, BINDINGS, EXPORTS, EMITTER, DRIVER,
 ]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
@@ -118,6 +156,8 @@ assert positive == run(POSITIVE)[1], "WASM scalar mapping report changed across 
 verified = {row["name"] for row in positive["declaration_details"] if row.get("verified")}
 assert {
     "wasm_scalar_wasm_type",
+    "is_scalar_type_name",
+    "source_scalar_name_membership_is_exact",
     "source_scalar_mapping_is_exact",
     "integer_scalar_names_use_i32",
     "wider_and_non_integer_scalars_keep_their_wasm_types",

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -83,9 +83,10 @@ if compiler_head != product_manifest["compiler"]["source_revision"]:
 
 stage1_product = Path(product_manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
+source_closure = source_include_closure([POSITIVE, NEGATIVE, ABI_SCAN, RESOLVE, REPORT])
 INPUTS = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV", stage1_product,
-          stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE,
-          PROJECT, RESOLVE, REPORT, ABI_SCAN, DRIVER]
+          stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", DRIVER,
+          *source_closure]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in INPUTS}
 
 
