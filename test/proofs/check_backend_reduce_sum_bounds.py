@@ -25,10 +25,15 @@ POSITIVE = HERE / "backend_reduce_sum_bounds.elisa"
 NEGATIVE = HERE / "backend_reduce_sum_bounds_rejected.elisa"
 POSITIVE_NAMES = {
     "reduce_sum_loop_body_requires_index_below_count",
+    "reduce_sum_initial_index_satisfies_count_bound",
+    "reduce_sum_loop_step_preserves_count_bound",
     "empty_reduce_sum_view_skips_the_body",
     "one_past_reduce_sum_index_is_rejected",
 }
-NEGATIVE_NAMES = {"false_claim_one_past_reduce_sum_index_is_bounded"}
+NEGATIVE_NAMES = {
+    "false_claim_one_past_reduce_sum_index_is_bounded",
+    "false_claim_reduce_sum_step_stays_strictly_below_count",
+}
 
 
 def compact(text: str) -> str:
@@ -101,6 +106,18 @@ if "ULT:i32=36" not in compact(LLVM_C.read_text()):
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:
     raise SystemExit("reduce_sum bound proof inventory changed")
+positive_text = POSITIVE.read_text()
+expected_positive = {
+    "reduce_sum_initial_index_satisfies_count_bound": "def reduce_sum_initial_index_satisfies_count_bound(count:u64)->bool:\nensure result==true\nreturn 0<=count",
+    "reduce_sum_loop_step_preserves_count_bound": "def reduce_sum_loop_step_preserves_count_bound(index:u64,count:u64)->bool:\nrequires index<count\nensure result==true\nreturn index+1<=count",
+}
+for name, expected in expected_positive.items():
+    if compact(function_section(positive_text, name)) != compact(expected):
+        raise SystemExit(f"reduce_sum loop invariant theorem {name} changed")
+negative_text = NEGATIVE.read_text()
+expected_negative = "def false_claim_reduce_sum_step_stays_strictly_below_count(index:u64,count:u64)->bool:\nrequires index<count\nrequires index+1==count\nensure result==true\nreturn index+1<count"
+if compact(function_section(negative_text, "false_claim_reduce_sum_step_stays_strictly_below_count")) != compact(expected_negative):
+    raise SystemExit("reduce_sum loop-step negative control changed")
 if 'include "./backend_reduce_sum_bounds.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative control no longer includes the admitted reduce_sum proof")
 
