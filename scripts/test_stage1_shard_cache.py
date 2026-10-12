@@ -113,6 +113,25 @@ class ShardCacheTests(unittest.TestCase):
             self.publish()
             self.assertTrue(self.restore())
 
+    def test_malformed_manifest_fields_are_cache_misses(self):
+        stamp = self.cache / self.ticket["key"] / "manifest.json"
+        mutations = (
+            ("missing stream", lambda value: value.pop("stdout")),
+            ("unknown field", lambda value: value.update(extra="unknown")),
+            ("boolean size", lambda value: value["object"].update(size=True)),
+            ("malformed checksum", lambda value: value["stderr"].update(sha256="A" * 64)),
+        )
+        for label, mutate in mutations:
+            with self.subTest(manifest_error=label):
+                self.publish()
+                manifest = json.loads(stamp.read_text())
+                mutate(manifest)
+                stamp.write_text(json.dumps(manifest))
+                self.output.write_bytes(b"prior good output")
+                self.assertFalse(self.restore())
+                self.assertEqual(self.output.read_bytes(), b"prior good output")
+                self.assertFalse(list(self.root.glob("*.incoming-*")))
+
     def test_failed_publication_has_no_admissible_partial_bundle(self):
         real_replace = shard.os.replace
         def fail_commit(src, dst):
@@ -128,27 +147,28 @@ class ShardCacheTests(unittest.TestCase):
     def test_mid_restore_mutation_is_not_admitted(self):
         self.publish()
         self.output.write_bytes(b"prior")
-        real_copy = shard.synced_copy
+        real_copy = shard.copy_fingerprint
         changed = False
-        def race(src, dst, limit=shard.MAX_BYTES):
+        def race(src, dst, *, allow_empty=False, limit=shard.MAX_BYTES):
             nonlocal changed
             if Path(src).name == "object" and not changed:
                 Path(src).write_bytes(b"racing corrupted bytes")
                 changed = True
-            return real_copy(src, dst, limit)
-        with patch.object(shard, "synced_copy", side_effect=race):
+            return real_copy(src, dst, allow_empty=allow_empty, limit=limit)
+        with patch.object(shard, "copy_fingerprint", side_effect=race):
             self.assertFalse(self.restore())
         self.assertEqual(self.output.read_bytes(), b"prior")
 
     def test_staged_copy_corruption_and_oversized_manifest(self):
         self.publish()
         self.output.write_bytes(b"prior")
-        real_copy = shard.synced_copy
-        def corrupt_copy(src, dst, limit=shard.MAX_BYTES):
-            real_copy(src, dst, limit)
+        real_copy = shard.copy_fingerprint
+        def corrupt_copy(src, dst, *, allow_empty=False, limit=shard.MAX_BYTES):
+            result = real_copy(src, dst, allow_empty=allow_empty, limit=limit)
             if Path(src).name == "stderr":
                 Path(dst).write_bytes(b"corrupted empty stream copy")
-        with patch.object(shard, "synced_copy", side_effect=corrupt_copy):
+            return result
+        with patch.object(shard, "copy_fingerprint", side_effect=corrupt_copy):
             self.assertFalse(self.restore())
         self.assertEqual(self.output.read_bytes(), b"prior")
         (self.cache / self.ticket["key"] / "manifest.json").write_bytes(b" " * 16385)
@@ -312,6 +332,30 @@ class ShardCacheTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
         self.assertFalse(self.err.exists())
         self.assertFalse((self.cache / fresh["key"]).exists())
+
+    def test_batch_output_copy_is_attested_before_cache_publication(self):
+        self.publish()
+        fresh = None
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
+            fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
+            batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
+            real_copy = shard.copy_fingerprint
+
+            def corrupt_output_copy(src, dst, *, allow_empty=False, limit=shard.MAX_BYTES):
+                result = real_copy(src, dst, allow_empty=allow_empty, limit=limit)
+                if Path(dst).name.startswith(self.output.name + ".incoming-"):
+                    Path(dst).write_bytes(b"damaged output staging copy")
+                return result
+
+            with patch.object(shard, "copy_fingerprint", side_effect=corrupt_output_copy):
+                with self.assertRaisesRegex(ValueError, "batch restored copy corrupted"):
+                    batch.finish()
+        self.assertFalse((self.cache / fresh["key"]).exists())
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.out.exists())
+        self.assertFalse(self.err.exists())
+        self.assertFalse(list(self.root.glob("*.incoming-*")))
 
     def test_batch_lifecycle_and_failed_admission_cleanup(self):
         with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:

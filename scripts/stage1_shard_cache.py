@@ -139,16 +139,10 @@ def locked(cache, key, exclusive):
 
 
 def verify_bundle(entry, ticket):
+    manifest = read_bundle_manifest(entry, ticket)
+    if not manifest:
+        return False
     try:
-        with (entry / "manifest.json").open("rb") as stream:
-            raw = stream.read(16385)
-        if len(raw) > 16384:
-            return False
-        manifest = json.loads(raw)
-        if manifest["schema"] != SCHEMA or manifest["key"] != ticket["key"]:
-            return False
-        if manifest["recipe_digest"] != digest(canonical(ticket["recipe"])) or manifest["snapshot"] != ticket["snapshot"]["identity"]:
-            return False
         for name in ("object", "stdout", "stderr"):
             if fingerprint(entry / name, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != manifest[name]:
                 return False
@@ -175,6 +169,61 @@ def synced_copy(source, target, limit=MAX_BYTES):
             dst.write(block)
         dst.flush()
         os.fsync(dst.fileno())
+
+
+def copy_fingerprint(source, target, *, allow_empty=False, limit=MAX_BYTES):
+    """Copy an exact regular-file snapshot while hashing the bytes read."""
+    source = Path(source).resolve(strict=True)
+    digest_state = hashlib.sha256()
+    size = 0
+    with source.open("rb") as src:
+        before = os.fstat(src.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("artifact is not a regular file")
+        with Path(target).open("xb") as dst:
+            while block := src.read(1024 * 1024):
+                size += len(block)
+                if size > limit:
+                    raise ValueError("copied artifact exceeds limit")
+                digest_state.update(block)
+                dst.write(block)
+            dst.flush()
+            os.fsync(dst.fileno())
+        after = os.fstat(src.fileno())
+    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise ValueError("artifact changed while copying")
+    if not size and not allow_empty:
+        raise ValueError("empty artifact")
+    return {"sha256": digest_state.hexdigest(), "size": size}
+
+
+def read_bundle_manifest(entry, ticket):
+    try:
+        with (entry / "manifest.json").open("rb") as stream:
+            raw = stream.read(16385)
+        if len(raw) > 16384:
+            return False
+        manifest = json.loads(raw)
+        if not isinstance(manifest, dict) or set(manifest) != {
+            "schema", "key", "recipe_digest", "snapshot", "object", "stdout", "stderr"
+        }:
+            return False
+        if manifest["schema"] != SCHEMA or manifest["key"] != ticket["key"]:
+            return False
+        if manifest["recipe_digest"] != digest(canonical(ticket["recipe"])) or manifest["snapshot"] != ticket["snapshot"]["identity"]:
+            return False
+        for name, limit, allow_empty in (("object", MAX_BYTES, False), ("stdout", MAX_STREAM, True), ("stderr", MAX_STREAM, True)):
+            identity = manifest[name]
+            if not isinstance(identity, dict) or set(identity) != {"sha256", "size"}:
+                return False
+            checksum, size = identity["sha256"], identity["size"]
+            if not isinstance(checksum, str) or len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum):
+                return False
+            if type(size) is not int or size < (0 if allow_empty else 1) or size > limit:
+                return False
+        return manifest
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 def publish(cache, ticket, obj, stdout, stderr, *, _validator=validate_ticket):
@@ -214,14 +263,14 @@ def publish(cache, ticket, obj, stdout, stderr, *, _validator=validate_ticket):
             shutil.rmtree(retired, ignore_errors=True)
 
 
-def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket, _receipt=None):
+def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket, _receipt=None, _verify_copies=True):
     _validator(ticket)
     if len({str(Path(path).resolve()) for path in (output, stdout, stderr)}) != 3:
         raise ValueError("restore output paths must be distinct")
     staged = []
     try:
         with locked(cache, ticket["key"], False) as entry:
-            manifest = verify_bundle(entry, ticket)
+            manifest = read_bundle_manifest(entry, ticket)
             if not manifest:
                 return False
             for name, target in (("object", output), ("stdout", stdout), ("stderr", stderr)):
@@ -232,8 +281,10 @@ def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket
                 Path(temporary).unlink()
                 staged.append((Path(temporary), target))
                 limit = MAX_BYTES if name == "object" else MAX_STREAM
-                synced_copy(entry / name, temporary, limit)
-                if fingerprint(temporary, allow_empty=name != "object", limit=limit) != manifest[name]:
+                copied = copy_fingerprint(entry / name, temporary, allow_empty=name != "object", limit=limit)
+                if copied != manifest[name]:
+                    return False
+                if _verify_copies and fingerprint(temporary, allow_empty=name != "object", limit=limit) != manifest[name]:
                     return False
             _validator(ticket)
             # Object commits last; publication errors are fatal, never a cold retry
@@ -366,7 +417,7 @@ class BatchInvocation:
         index = len(self.outputs)
         staged = [self.work / f"hit-{index}-{name}" for name in ("object", "stdout", "stderr")]
         expected = {}
-        hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected)
+        hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected, _verify_copies=False)
         if hit:
             targets = [Path(path) for path in (output, stdout, stderr)]
             if len({str(path.resolve()) for path in targets}) != 3:
@@ -389,11 +440,8 @@ class BatchInvocation:
         # Snapshot admission can change independently of shared artifacts too.
         for ticket in self.prepared:
             self.validate(ticket)
-        for ticket, staged, _, expected in self.outputs:
+        for ticket, _, _, _ in self.outputs:
             self.validate(ticket)
-            for name, source in zip(("object", "stdout", "stderr"), staged):
-                if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
-                    raise ValueError("private restored hit changed before finalization")
         for ticket in self.publications:
             self.validate(ticket)
         for path, expected in self.admitted_snapshots.items():
@@ -402,27 +450,14 @@ class BatchInvocation:
         current_pins, current_artifacts = self._read_shared()
         if current_pins != self.pins or current_artifacts != self.artifacts:
             raise ValueError("shared artifacts changed during batch")
-        for ticket in self.publications:
-            staged = self.work / "publication" / ticket["key"]
-            retired = None
-            with locked(self.cache, ticket["key"], True) as entry:
-                if verify_bundle(entry, ticket):
-                    continue
-                if not verify_bundle(staged, ticket):
-                    raise ValueError("private batch bundle corrupted")
-                if entry.exists():
-                    retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=self.cache))
-                    retired.rmdir()
-                    os.replace(entry, retired)
-                os.replace(staged, entry)
-                sync_directory(self.cache)
-            if retired:
-                shutil.rmtree(retired, ignore_errors=True)
-        for _, staged, targets, expected in self.outputs:
-            # Copy across filesystems into output-local temporary files, verify
-            # copied bytes, and preserve fatal diagnostic publication semantics.
-            copies = []
-            try:
+        # Prepare and attest every output-local copy before publishing any cache
+        # generation or destination. Hashing during the copy validates the staged
+        # hit; hashing the copy validates the bytes actually written to disk.
+        output_copies = []
+        try:
+            for _, staged, targets, expected in self.outputs:
+                copies = []
+                output_copies.append(copies)
                 for name, source, target in zip(("object", "stdout", "stderr"), staged, targets):
                     target.parent.mkdir(parents=True, exist_ok=True)
                     fd, tmp = tempfile.mkstemp(prefix=target.name + ".incoming-", dir=target.parent)
@@ -430,16 +465,36 @@ class BatchInvocation:
                     Path(tmp).unlink()
                     copies.append((Path(tmp), target))
                     limit = MAX_BYTES if name == "object" else MAX_STREAM
-                    synced_copy(source, tmp, limit)
+                    copied = copy_fingerprint(source, tmp, allow_empty=name != "object", limit=limit)
+                    if copied != expected[name]:
+                        raise ValueError("private restored hit changed before finalization")
                     if fingerprint(tmp, allow_empty=name != "object", limit=limit) != expected[name]:
                         raise ValueError("batch restored copy corrupted")
+            for ticket in self.publications:
+                staged = self.work / "publication" / ticket["key"]
+                retired = None
+                with locked(self.cache, ticket["key"], True) as entry:
+                    if verify_bundle(entry, ticket):
+                        continue
+                    if not verify_bundle(staged, ticket):
+                        raise ValueError("private batch bundle corrupted")
+                    if entry.exists():
+                        retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=self.cache))
+                        retired.rmdir()
+                        os.replace(entry, retired)
+                    os.replace(staged, entry)
+                    sync_directory(self.cache)
+                if retired:
+                    shutil.rmtree(retired, ignore_errors=True)
+            for copies in output_copies:
                 for index in (1, 2, 0):
                     os.replace(*copies[index])
-            finally:
+            self.finished = True
+            return dict(self.metrics)
+        finally:
+            for copies in output_copies:
                 for temporary, _ in copies:
                     temporary.unlink(missing_ok=True)
-        self.finished = True
-        return dict(self.metrics)
 
     def close(self):
         self.closed = True
