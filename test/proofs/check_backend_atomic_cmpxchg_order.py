@@ -296,8 +296,8 @@ def check_mapping_case(path: Path, name: str, success: str, failure: str,
     section = compact(function_section(path.read_text(), name))
     expected = (
         f"requiressuccess=={success_index}andfailure=={failure_index}ensureresult==true"
-        f"mappedsuccess:i64={success_rhs}mappedfailure:i64={failure_rhs}"
-        f"returnmappedsuccess=={actual_success}andmappedfailure=={actual_failure}"
+        f"mapped_success:i64={success_rhs}mapped_failure:i64={failure_rhs}"
+        f"returnmapped_success=={actual_success}andmapped_failure=={actual_failure}"
     )
     if expected not in section:
         raise SystemExit(f"{name} no longer proves the source-selected LLVM order pair")
