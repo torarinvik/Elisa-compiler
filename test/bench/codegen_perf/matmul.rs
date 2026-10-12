@@ -20,7 +20,7 @@ fn main() {
         }
     }
     let mut total: i64 = 0;
-    for x in c {
+    for &x in &c {
         total += x;
     }
     println!("{total}");

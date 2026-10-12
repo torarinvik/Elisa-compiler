@@ -1,10 +1,7 @@
 use std::process;
 
 fn sieve(n: usize) -> i64 {
-    let mut flags: Vec<u8> = Vec::with_capacity(n);
-    for _i in 0..n {
-        flags.push(1);
-    }
+    let mut flags: Vec<u8> = vec![1u8; n];
     flags[0] = 0;
     flags[1] = 0;
     let mut p: usize = 2;
