@@ -16,11 +16,80 @@
 #
 # The stored argument must be a view of OWNED storage: `x.as_sview()` / `x.as_cstr()` /
 # `x.view()` / `x[a:b]` whose root `x` is a local declared with a non-reference type outside
-# any region block, or a local bound once to such a view. The target argument's root must be
-# a reference parameter of the calling function (storage that outlives it). Only calls to a
-# uniquely declared free function are checked; methods and overloads are left alone.
+# any region block, or a local bound once to such a view. The target argument must be a
+# reference parameter of the calling function, a local alias of one, or a call result that
+# may return one. Direct, scoped, generic, and deferred static-effect calls use summaries.
+# Same-name overloads are unioned.
+# Without typed field provenance, projections may be conservatively treated as caller
+# references whenever this function has a reference parameter. This can reject a local
+# projection such as `local_holder.slot`; the source gate records this precision boundary.
+# Field calls are conservatively treated as unknown calls because this pass has no resolved
+# callable identity for distinguishing UFCS methods from callable fields.
 extend Semantic:
     private:
+        const CHV_VIEW_ALIAS_MAX_DEPTH: u32 = 8
+        const CHV_REF_ALIAS_MAX_DEPTH: u32 = 8
+        const CHV_DIAGNOSTIC_ARGUMENT_NUMBER_BASE: usize = 1
+
+        # Per-function, source-ordered view and reference provenance. The arrays are
+        # parallel: every lexical binding has one row; owned says whether it names local
+        # container storage, and the two may facts join values assigned to that binding.
+        # Branches clone this state and merge only rows that were visible on entry.
+        struct CHVViewFlow:
+            names: mutable darray[sview] = []
+            owned: mutable darray[bool] = []
+            may_owned_view: mutable darray[bool] = []
+            may_alias_reference: mutable darray[bool] = []
+            last_value_may_be_owned_view: bool = false
+
+        def chv_flow_latest(flow: CHVViewFlow&, name: sview) -> usize:
+            can Abort.Panic:
+                index: mutable usize = flow.names.count
+                while index > 0 |index, flow|:
+                    index <- index - 1
+                    return index if flow.names[index] == name
+                return flow.names.count
+
+        def chv_flow_clone(flow: CHVViewFlow&) -> CHVViewFlow:
+            can Memory.Allocate, Abort.Panic:
+                clone: mutable CHVViewFlow = CHVViewFlow{}
+                clone.names.extend(flow.names)
+                clone.owned.extend(flow.owned)
+                clone.may_owned_view.extend(flow.may_owned_view)
+                clone.may_alias_reference.extend(flow.may_alias_reference)
+                clone.last_value_may_be_owned_view <- flow.last_value_may_be_owned_view
+                return clone
+
+        def chv_flow_bind(flow: mutable CHVViewFlow&, name: sview, owned: bool, may_owned_view: bool, may_alias_reference: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                flow.names.push(name)
+                flow.owned.push(owned)
+                flow.may_owned_view.push(may_owned_view)
+                flow.may_alias_reference.push(may_alias_reference)
+
+        def chv_flow_truncate(flow: mutable CHVViewFlow&, mark: usize) -> void:
+            can Abort.Panic:
+                flow.names.truncate(mark)
+                flow.owned.truncate(mark)
+                flow.may_owned_view.truncate(mark)
+                flow.may_alias_reference.truncate(mark)
+
+        def chv_flow_merge(target: mutable CHVViewFlow&, source: CHVViewFlow&, visible_count: usize) -> void:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < visible_count and index < target.names.count and index < source.names.count |index, target, source|:
+                    target.may_owned_view[index] <- target.may_owned_view[index] or source.may_owned_view[index]
+                    target.may_alias_reference[index] <- target.may_alias_reference[index] or source.may_alias_reference[index]
+                    index <- index + 1
+
+        def chv_flow_set_merge(target: mutable CHVViewFlow&, left: CHVViewFlow&, right: CHVViewFlow&, visible_count: usize) -> void:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:
+                    target.may_owned_view[index] <- left.may_owned_view[index] or right.may_owned_view[index]
+                    target.may_alias_reference[index] <- left.may_alias_reference[index] or right.may_alias_reference[index]
+                    index <- index + 1
+
         # Whether TYPE_EXPRESSION names a struct in HOLDERS: `S`, `mutable S`, `S&`, `Mod::S`.
         def chv_type_names_holder(type_expression: Ast::Expr, holders: darray[sview]&) -> bool:
             can Memory.Allocate, Abort.Panic:
@@ -75,21 +144,20 @@ extend Semantic:
                 seen: mutable darray[sview] = []
                 functions: mutable darray[Ast::Decl] = []
                 sts_collect_declared(declarations, seen, functions)
-                seen_hash_counts: dict[u64, u32] = sts_name_hash_counts(seen) can Global{Read,Write}
                 summarised: mutable darray[Ast::Decl] = []
-                for function in functions |summary, seen, seen_hash_counts, summarised|:
+                for function in functions |summary, summarised|:
                     match function:
                         Decl.Func(function_name, function_parameters, _, _, _, _, _):
-                            if sts_declared_once(seen, seen_hash_counts, function_name):
+                            if not sts_is_declared(summary, function_name):
                                 sts_declare(summary, function_name) can Global{Read,Write}
-                                position: mutable usize = 0
-                                writable_found: mutable bool = false
-                                for parameter in function_parameters |position, writable_found, summary|:
-                                    if param_is_mutable_ref(parameter) and chv_type_names_holder(parameter.type_expression, holders):
-                                        sts_add_writable(summary, function_name, position) can Global{Read,Write}
-                                        writable_found <- true
-                                    position <- position + 1
-                                summarised.push(function) if writable_found and function_parameters.count > 1
+                            position: mutable usize = 0
+                            writable_found: mutable bool = false
+                            for parameter in function_parameters |position, writable_found, summary|:
+                                if param_is_mutable_ref(parameter) and chv_type_names_holder(parameter.type_expression, holders):
+                                    sts_add_writable(summary, function_name, position) can Global{Read,Write}
+                                    writable_found <- true
+                                position <- position + 1
+                            summarised.push(function) if writable_found and function_parameters.count > 1
                         _:
                             pass
                 more_rows: mutable bool = summarised.count > 0
@@ -116,31 +184,156 @@ extend Semantic:
                             owned.push(declared_name) if not in_region and (typed_owned or literal_owned)
                             view_names.push(declared_name)
                             view_values.push(declared_value)
-                        Stmt.Assign(Expr.Ident(assigned_name, _), _, _, _):
-                            binders.push(assigned_name)
-                        Stmt.If(_, then_body, else_body, _):
+                            chv_scan_expression_locals(declared_value, in_region, binders, owned, view_names, view_values)
+                        Stmt.Assign(target, _, assigned_value, _):
+                            if target is Expr.Ident(assigned_name, _):
+                                binders.push(assigned_name)
+                            chv_scan_expression_locals(target, in_region, binders, owned, view_names, view_values)
+                            chv_scan_expression_locals(assigned_value, in_region, binders, owned, view_names, view_values)
+                        Stmt.If(condition, then_body, else_body, _):
+                            chv_scan_expression_locals(condition, in_region, binders, owned, view_names, view_values)
                             chv_scan_locals(then_body, in_region, binders, owned, view_names, view_values)
                             chv_scan_locals(else_body, in_region, binders, owned, view_names, view_values)
-                        Stmt.While(_, loop_body, _):
+                        Stmt.While(condition, loop_body, _):
+                            chv_scan_expression_locals(condition, in_region, binders, owned, view_names, view_values)
                             chv_scan_locals(loop_body, in_region, binders, owned, view_names, view_values)
-                        Stmt.For(_, loop_variables, _, loop_body, _):
+                        Stmt.For(_, loop_variables, iterable, loop_body, _):
                             for loop_variable in loop_variables |binders|:
                                 binders.push(loop_variable)
+                            chv_scan_expression_locals(iterable, in_region, binders, owned, view_names, view_values)
                             chv_scan_locals(loop_body, in_region, binders, owned, view_names, view_values)
                         Stmt.Block(kind, _, binding, block_body, _):
                             binders.push(binding) if binding != ""
                             chv_scan_locals(block_body, in_region or kind == "region" or kind == "in", binders, owned, view_names, view_values)
-                        Stmt.Match(_, arms, _):
+                        Stmt.Match(scrutinee, arms, _):
+                            chv_scan_expression_locals(scrutinee, in_region, binders, owned, view_names, view_values)
                             for arm in arms |binders, owned, view_names, view_values|:
                                 pattern_names: mutable darray[sview] = []
                                 collect_pattern_binding_names(arm.pattern, pattern_names)
                                 for pattern_name in pattern_names |binders|:
                                     binders.push(pattern_name)
+                                chv_scan_expression_locals(arm.guard, in_region, binders, owned, view_names, view_values)
                                 chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)
-                        Stmt.Expr(Expr.Block(block_statements, _, _, _), _):
-                            chv_scan_locals(block_statements, in_region, binders, owned, view_names, view_values)
-                        _:
+                        Stmt.Expr(expression, _):
+                            chv_scan_expression_locals(expression, in_region, binders, owned, view_names, view_values)
+                        Stmt.Return(value, _):
+                            chv_scan_expression_locals(returned_value, in_region, binders, owned, view_names, view_values) if value is returned_value
+                        Stmt.Contract(_, expression, _):
+                            chv_scan_expression_locals(expression, in_region, binders, owned, view_names, view_values)
+                        Stmt.Invalid:
                             pass
+                        Stmt.Break(_, _):
+                            pass
+                        Stmt.Continue(_, _):
+                            pass
+
+        # Find block-local declarations inside expression children before the diagnostic
+        # walk runs, so nested value blocks contribute their owned containers and views.
+        def chv_scan_expression_locals(expression: Ast::Expr, in_region: bool, binders: mutable darray[sview]&, owned: mutable darray[sview]&, view_names: mutable darray[sview]&, view_values: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Invalid:
+                        pass
+                    Expr.Absent:
+                        pass
+                    Expr.IntLit(_, _):
+                        pass
+                    Expr.FloatLit(_, _):
+                        pass
+                    Expr.StringLit(_, _):
+                        pass
+                    Expr.CharLit(_, _):
+                        pass
+                    Expr.BoolLit(_, _):
+                        pass
+                    Expr.Ident(_, _):
+                        pass
+                    Expr.Call(callee, arguments, _, _):
+                        chv_scan_expression_locals(callee, in_region, binders, owned, view_names, view_values)
+                        for argument in arguments |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(argument, in_region, binders, owned, view_names, view_values)
+                    Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
+                        for child in Ast::effect_runtime_children(candidates, arguments) |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(child, in_region, binders, owned, view_names, view_values)
+                    Expr.Field(object, _, _):
+                        chv_scan_expression_locals(object, in_region, binders, owned, view_names, view_values)
+                    Expr.Scope(base, _, _):
+                        chv_scan_expression_locals(base, in_region, binders, owned, view_names, view_values)
+                    Expr.ShorthandMember(_, _):
+                        pass
+                    Expr.Index(object, index, _):
+                        chv_scan_expression_locals(object, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(index, in_region, binders, owned, view_names, view_values) if not index_receiver_is_type_application(object)
+                    Expr.Slice(object, low, high, _):
+                        chv_scan_expression_locals(object, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(low, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(high, in_region, binders, owned, view_names, view_values)
+                    Expr.IndexN(object, arguments, _):
+                        chv_scan_expression_locals(object, in_region, binders, owned, view_names, view_values)
+                        for argument in arguments |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(argument, in_region, binders, owned, view_names, view_values) if not index_receiver_is_type_application(object)
+                    Expr.Binary(left, _, right, _):
+                        chv_scan_expression_locals(left, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(right, in_region, binders, owned, view_names, view_values)
+                    Expr.Unary(_, operand, _):
+                        chv_scan_expression_locals(operand, in_region, binders, owned, view_names, view_values)
+                    Expr.Move(operand, _):
+                        chv_scan_expression_locals(operand, in_region, binders, owned, view_names, view_values)
+                    Expr.RegionNew(operand, _, _):
+                        chv_scan_expression_locals(operand, in_region, binders, owned, view_names, view_values)
+                    Expr.Paren(inner, _):
+                        chv_scan_expression_locals(inner, in_region, binders, owned, view_names, view_values)
+                    Expr.Array(elements, _):
+                        for element in elements |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(element, in_region, binders, owned, view_names, view_values)
+                    Expr.Tuple(elements, _):
+                        for element in elements |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(element, in_region, binders, owned, view_names, view_values)
+                    Expr.SetLit(elements, _):
+                        for element in elements |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(element, in_region, binders, owned, view_names, view_values)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(entry.key, in_region, binders, owned, view_names, view_values)
+                            chv_scan_expression_locals(entry.value, in_region, binders, owned, view_names, view_values)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(field.value, in_region, binders, owned, view_names, view_values)
+                    Expr.RecordUpdate(base, fields, _):
+                        chv_scan_expression_locals(base, in_region, binders, owned, view_names, view_values)
+                        for field in fields |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(field.value, in_region, binders, owned, view_names, view_values)
+                    Expr.If(condition, then_value, else_value, _):
+                        chv_scan_expression_locals(condition, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(then_value, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(else_value, in_region, binders, owned, view_names, view_values)
+                    Expr.Match(scrutinee, arms, _):
+                        chv_scan_expression_locals(scrutinee, in_region, binders, owned, view_names, view_values)
+                        for arm in arms |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(arm.guard, in_region, binders, owned, view_names, view_values)
+                            chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)
+                    Expr.Catch(guarded, arms, _):
+                        chv_scan_expression_locals(guarded, in_region, binders, owned, view_names, view_values)
+                        for arm in arms |binders, owned, view_names, view_values|:
+                            chv_scan_expression_locals(arm.guard, in_region, binders, owned, view_names, view_values)
+                            chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)
+                    Expr.Comprehension(variable, iterable, condition, body, _):
+                        chv_scan_expression_locals(iterable, in_region, binders, owned, view_names, view_values)
+                        comprehension_binders: mutable darray[sview] = [name for name in binders]
+                        comprehension_binders.push(variable)
+                        chv_scan_expression_locals(condition, in_region, comprehension_binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(body, in_region, comprehension_binders, owned, view_names, view_values)
+                    Expr.Refinement(base, predicate, _):
+                        chv_scan_expression_locals(base, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(predicate, in_region, binders, owned, view_names, view_values)
+                    Expr.GetElse(guarded, recovery, _):
+                        chv_scan_expression_locals(guarded, in_region, binders, owned, view_names, view_values)
+                        chv_scan_locals(recovery, in_region, binders, owned, view_names, view_values)
+                    Expr.Lambda(_, _, _):
+                        pass
+                    Expr.Block(statements, value, _, _):
+                        chv_scan_locals(statements, in_region, binders, owned, view_names, view_values)
+                        chv_scan_expression_locals(value, in_region, binders, owned, view_names, view_values)
 
         # `darray[T]`, `dict[K, V]`, `set[T]` or `dstr`, under any `mutable`.
         def chv_type_is_owned_container(type_expression: Ast::Expr) -> bool:
@@ -203,113 +396,559 @@ extend Semantic:
                     _:
                         return ""
 
-        # Whether ARGUMENT is a view of owned local storage: a direct view of an owned place, or
-        # a name bound exactly once to one (followed through `w = v` chains).
-        def chv_is_owned_view(argument: Ast::Expr, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, depth: u32) -> bool:
+        # Whether ARGUMENT may be a view of owned local storage. Alias values are summarized
+        # when their binding/assignment is visited, so a later safe reassignment clears stale
+        # provenance and a branch merge retains a may-owned fact only when either path has it.
+        def chv_is_owned_view(argument: Ast::Expr, flow: CHVViewFlow&, depth: u32) -> bool:
             can Memory.Allocate, Abort.Panic:
-                return false if depth > 8
+                if depth > CHV_VIEW_ALIAS_MAX_DEPTH:
+                    return true
                 root: sview = chv_view_call_local(argument)
                 if root != "":
-                    return borrow_bound_once(binders, root) and lvre_has(owned, root)
+                    index: usize = chv_flow_latest(flow, root)
+                    return index < flow.names.count and (flow.owned[index] or flow.may_owned_view[index])
                 match argument:
                     Expr.Paren(inner, _):
-                        return chv_is_owned_view(inner, binders, owned, view_names, view_values, depth + 1)
+                        return chv_is_owned_view(inner, flow, depth + 1)
+                    Expr.Move(inner, _):
+                        return chv_is_owned_view(inner, flow, depth + 1)
                     Expr.Ident(bound_name, _):
-                        return false if not borrow_bound_once(binders, bound_name)
-                        for index in 0..<view_names.count:
-                            return chv_is_owned_view(view_values[index], binders, owned, view_names, view_values, depth + 1) if view_names[index] == bound_name
-                        return false
+                        index: usize = chv_flow_latest(flow, bound_name)
+                        return index < flow.names.count and flow.may_owned_view[index]
+                    Expr.If(_, then_value, else_value, _):
+                        return chv_is_owned_view(then_value, flow, depth + 1) or chv_is_owned_view(else_value, flow, depth + 1)
+                    Expr.Index(object, _, _):
+                        return chv_is_owned_view(object, flow, depth + 1)
+                    Expr.IndexN(object, _, _):
+                        return chv_is_owned_view(object, flow, depth + 1)
+                    Expr.Unary(_, operand, _):
+                        return chv_is_owned_view(operand, flow, depth + 1)
+                    Expr.Binary(left, _, right, _):
+                        return chv_is_owned_view(left, flow, depth + 1) or chv_is_owned_view(right, flow, depth + 1)
                     _:
                         return false
 
-        def chv_check_call(call: Ast::Expr, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+        # A writable reference may be hidden behind a local reference alias or a call
+        # returning a reference. Unknown call results conservatively alias any caller
+        # reference, while local aliases use the branch-joined flow fact.
+        def chv_expression_may_alias_ref(argument: Ast::Expr, ref_params: darray[sview]&, flow: CHVViewFlow&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if depth > CHV_REF_ALIAS_MAX_DEPTH:
+                    return ref_params.count > 0
+                match argument:
+                    Expr.Paren(inner, _):
+                        return chv_expression_may_alias_ref(inner, ref_params, flow, depth + 1)
+                    Expr.Move(inner, _):
+                        return chv_expression_may_alias_ref(inner, ref_params, flow, depth + 1)
+                    Expr.If(_, then_value, else_value, _):
+                        return chv_expression_may_alias_ref(then_value, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(else_value, ref_params, flow, depth + 1)
+                    Expr.Call(_, _, _, _):
+                        return ref_params.count > 0
+                    Expr.Binary(left, _, right, _):
+                        return chv_expression_may_alias_ref(left, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(right, ref_params, flow, depth + 1)
+                    Expr.Unary(_, operand, _):
+                        return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)
+                    Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _) | Expr.Block(_, _, _, _) | Expr.GetElse(_, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                        return ref_params.count > 0
+                    Expr.Refinement(base, _, _):
+                        return chv_expression_may_alias_ref(base, ref_params, flow, depth + 1)
+                    _:
+                        root: sview = chv_place_root(exclusivity_strip_address(argument).place)
+                        if root == "":
+                            return false
+                        return true if any reference_parameter in ref_params where reference_parameter == root
+                        index: usize = chv_flow_latest(flow, root)
+                        return index < flow.names.count and flow.may_alias_reference[index]
+
+        def chv_call_method_info(callee: Ast::Expr, depth: u32) -> (found: bool, receiver: Ast::Expr, method: sview):
+            can Memory.Allocate, Abort.Panic:
+                return (false, Ast::Expr.Absent, sview("", 0, 0)) if depth > CHV_VIEW_ALIAS_MAX_DEPTH
+                match callee:
+                    Expr.Field(receiver, method, _):
+                        return (true, receiver, method)
+                    Expr.Paren(inner, _):
+                        return chv_call_method_info(inner, depth + 1)
+                    Expr.Index(head, _, _):
+                        return chv_call_method_info(head, depth + 1)
+                    Expr.IndexN(head, _, _):
+                        return chv_call_method_info(head, depth + 1)
+                    _:
+                        return (false, Ast::Expr.Absent, sview("", 0, 0))
+
+        def chv_walk_call_callee(callee: Ast::Expr, in_region: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, receiver_owned_view: mutable bool&, receiver_may_alias_reference: mutable bool&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Field(receiver, _, _):
+                        table <- chv_walk_expression(receiver, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        receiver_owned_view <- flow.last_value_may_be_owned_view
+                        receiver_may_alias_reference <- chv_expression_may_alias_ref(receiver, ref_params, flow, 0)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Paren(inner, _):
+                        table <- chv_walk_call_callee(inner, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, table)
+                    Expr.Index(head, index, _):
+                        table <- chv_walk_call_callee(head, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, table)
+                        table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not index_receiver_is_type_application(head)
+                    Expr.IndexN(head, arguments, _):
+                        table <- chv_walk_call_callee(head, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, table)
+                        for argument in arguments |table| -> table:
+                            table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not index_receiver_is_type_application(head)
+                    _:
+                        table <- chv_walk_expression(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+
+        def chv_owned_view_at(arguments: darray[Ast::Expr], owned_views: darray[bool], index: usize, flow: CHVViewFlow&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return owned_views[index] if index < owned_views.count
+                return chv_is_owned_view(arguments[index], flow, 0) if index < arguments.count
+                return true
+
+        def chv_alias_reference_at(arguments: darray[Ast::Expr], aliases_reference: darray[bool], index: usize, ref_params: darray[sview]&, flow: CHVViewFlow&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return aliases_reference[index] if index < aliases_reference.count
+                return chv_expression_may_alias_ref(arguments[index], ref_params, flow, 0) if index < arguments.count
+                return true
+
+        def chv_check_call_target(callee_name: sview, call_arguments: darray[Ast::Expr], argument_owned_views: darray[bool], argument_may_alias_refs: darray[bool], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not sts_has_writable(summary, callee_name)
+                source_checked: mutable darray[bool] = []
+                source_is_owned_view: mutable darray[bool] = []
+                source_cache_ready: mutable bool = false
+                target: mutable usize = 0
+                while target < call_arguments.count |target, table| -> table:
+                    if sts_is_writable(summary, callee_name, target):
+                        if chv_alias_reference_at(call_arguments, argument_may_alias_refs, target, ref_params, flow):
+                            if not source_cache_ready:
+                                for source_index in 0..<call_arguments.count |source_checked, source_is_owned_view|:
+                                    source_checked.push(false)
+                                    source_is_owned_view.push(false)
+                                source_cache_ready <- true
+                            source: mutable usize = 0
+                            while source < call_arguments.count |source, table| -> table:
+                                if source != target and sts_has_pair(summary, callee_name, target, source):
+                                    if not source_checked[source]:
+                                        source_is_owned_view[source] <- chv_owned_view_at(call_arguments, argument_owned_views, source, flow)
+                                        source_checked[source] <- true
+                                    if source_is_owned_view[source]:
+                                        at: Ast::Pos = Ast::expr_pos(call_arguments[source])
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", pos: at, line: at.line, expected: "", actual: "", state_code: (target + CHV_DIAGNOSTIC_ARGUMENT_NUMBER_BASE).u32()})
+                                source <- source + 1
+                    target <- target + 1
+
+        def chv_call_has_named_arguments(argument_names: darray[sview]) -> bool:
+            can Abort.Panic:
+                return any argument_name in argument_names where argument_name != ""
+
+        # An indirect or external call has no source summary. If it receives a caller
+        # reference, an alias of one, or a result that may return one, plus an owned view,
+        # assume the call may store that view through the reference.
+        def chv_check_unknown_call(call_arguments: darray[Ast::Expr], argument_owned_views: darray[bool], argument_may_alias_refs: darray[bool], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for target in 0..<call_arguments.count |table| -> table:
+                    if chv_alias_reference_at(call_arguments, argument_may_alias_refs, target, ref_params, flow):
+                        for source in 0..<call_arguments.count |table| -> table:
+                            if source != target and chv_owned_view_at(call_arguments, argument_owned_views, source, flow):
+                                at: Ast::Pos = Ast::expr_pos(call_arguments[source])
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", pos: at, line: at.line, expected: "", actual: "", state_code: (target + CHV_DIAGNOSTIC_ARGUMENT_NUMBER_BASE).u32()})
+
+        def chv_check_named_call(callee_name: sview, call_arguments: darray[Ast::Expr], argument_names: darray[sview], argument_owned_views: darray[bool], argument_may_alias_refs: darray[bool], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if not chv_call_has_named_arguments(argument_names) and sts_is_declared(summary, callee_name) and not (any binder in binders where binder == callee_name):
+                    chv_check_call_target(callee_name, call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                else:
+                    chv_check_unknown_call(call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+
+        def chv_check_named_callee(callee: Ast::Expr, call_arguments: darray[Ast::Expr], argument_names: darray[sview], argument_owned_views: darray[bool], argument_may_alias_refs: darray[bool], method_receiver_owned_view: bool, method_receiver_may_alias_ref: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(callee_name, _):
+                        chv_check_named_call(callee_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.Scope(_, scoped_name, _):
+                        chv_check_named_call(scoped_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.Field(receiver, _, _):
+                        method_arguments: mutable darray[Ast::Expr] = [receiver]
+                        method_arguments.extend(call_arguments)
+                        method_owned_views: mutable darray[bool] = [method_receiver_owned_view]
+                        method_owned_views.extend(argument_owned_views)
+                        method_may_alias_refs: mutable darray[bool] = [method_receiver_may_alias_ref]
+                        method_may_alias_refs.extend(argument_may_alias_refs)
+                        chv_check_unknown_call(method_arguments, method_owned_views, method_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+                    Expr.Index(head, _, _):
+                        chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.IndexN(head, _, _):
+                        chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.Paren(inner, _):
+                        chv_check_named_callee(inner, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    _:
+                        chv_check_unknown_call(call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+
+        def chv_check_call(call: Ast::Expr, argument_owned_views: darray[bool], argument_may_alias_refs: darray[bool], method_receiver_owned_view: bool, method_receiver_may_alias_ref: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match call:
-                    Expr.Call(Expr.Ident(callee_name, _), call_arguments, _, _):
-                        return if not sts_has_writable(summary, callee_name)
-                        source_checked: mutable darray[bool] = []
-                        source_is_owned_view: mutable darray[bool] = []
-                        source_cache_ready: mutable bool = false
-                        target: mutable usize = 0
-                        while target < call_arguments.count |target, table| -> table:
-                            if sts_is_writable(summary, callee_name, target):
-                                target_root: sview = chv_place_root(exclusivity_strip_address(call_arguments[target]).place)
-                                if target_root != "" and (any outer in ref_params where outer == target_root):
-                                    if not source_cache_ready:
-                                        for source_index in 0..<call_arguments.count |source_checked, source_is_owned_view|:
-                                            source_checked.push(false)
-                                            source_is_owned_view.push(false)
-                                        source_cache_ready <- true
-                                    source: mutable usize = 0
-                                    while source < call_arguments.count |source, table| -> table:
-                                        if source != target and sts_has_pair(summary, callee_name, target, source):
-                                            if not source_checked[source]:
-                                                source_is_owned_view[source] <- chv_is_owned_view(call_arguments[source], binders, owned, view_names, view_values, 0)
-                                                source_checked[source] <- true
-                                            if source_is_owned_view[source]:
-                                                at: Ast::Pos = Ast::expr_pos(call_arguments[source])
-                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", pos: at, line: at.line, expected: "", actual: "", state_code: (target + 1).u32()})
-                                        source <- source + 1
-                            target <- target + 1
+                    Expr.Call(callee, call_arguments, argument_names, _):
+                        chv_check_named_callee(callee, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                     _:
                         pass
 
-        def chv_walk_expression(expression: Ast::Expr, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+        def chv_check_static_effect_call(candidates: darray[Ast::StaticEffectCandidate], arguments: darray[Ast::Expr], argument_names: darray[sview], runtime_owned_views: darray[bool], runtime_may_alias_refs: darray[bool], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                match expression:
-                    Expr.Call(callee, arguments, _, _):
-                        table <- chv_check_call(expression, ref_params, binders, owned, view_names, view_values, summary, table)
-                        table <- chv_walk_expression(callee, ref_params, binders, owned, view_names, view_values, summary, table)
-                        for argument in arguments |table| -> table:
-                            table <- chv_walk_expression(argument, ref_params, binders, owned, view_names, view_values, summary, table)
-                    Expr.Binary(left, _, right, _):
-                        table <- chv_walk_expression(left, ref_params, binders, owned, view_names, view_values, summary, table)
-                        table <- chv_walk_expression(right, ref_params, binders, owned, view_names, view_values, summary, table)
-                    Expr.Unary(_, operand, _):
-                        table <- chv_walk_expression(operand, ref_params, binders, owned, view_names, view_values, summary, table)
-                    Expr.Paren(inner, _):
-                        table <- chv_walk_expression(inner, ref_params, binders, owned, view_names, view_values, summary, table)
-                    Expr.Field(object, _, _):
-                        table <- chv_walk_expression(object, ref_params, binders, owned, view_names, view_values, summary, table)
-                    Expr.If(condition, then_value, else_value, _):
-                        table <- chv_walk_expression(condition, ref_params, binders, owned, view_names, view_values, summary, table)
-                        table <- chv_walk_expression(then_value, ref_params, binders, owned, view_names, view_values, summary, table)
-                        table <- chv_walk_expression(else_value, ref_params, binders, owned, view_names, view_values, summary, table)
-                    Expr.Block(block_statements, block_value, _, _):
-                        table <- chv_walk_statements(block_statements, ref_params, binders, owned, view_names, view_values, summary, table)
-                        table <- chv_walk_expression(block_value, ref_params, binders, owned, view_names, view_values, summary, table)
-                    _:
-                        pass
+                argument_offset: mutable usize = 0
+                for candidate in candidates |argument_offset|:
+                    argument_offset <- argument_offset + candidate.captures.count
+                candidate_capture_offset: mutable usize = 0
+                for candidate in candidates |table| -> table:
+                    candidate_arguments: mutable darray[Ast::Expr] = []
+                    candidate_owned_views: mutable darray[bool] = []
+                    candidate_may_alias_refs: mutable darray[bool] = []
+                    candidate_arguments.extend(candidate.captures)
+                    candidate_arguments.extend(arguments)
+                    for capture_index in 0..<candidate.captures.count |candidate_owned_views, candidate_may_alias_refs|:
+                        candidate_owned_views.push(runtime_owned_views[candidate_capture_offset + capture_index]) if candidate_capture_offset + capture_index < runtime_owned_views.count else candidate_owned_views.push(true)
+                        candidate_may_alias_refs.push(runtime_may_alias_refs[candidate_capture_offset + capture_index]) if candidate_capture_offset + capture_index < runtime_may_alias_refs.count else candidate_may_alias_refs.push(true)
+                    for argument_index in 0..<arguments.count |candidate_owned_views, candidate_may_alias_refs|:
+                        candidate_owned_views.push(runtime_owned_views[argument_offset + argument_index]) if argument_offset + argument_index < runtime_owned_views.count else candidate_owned_views.push(true)
+                        candidate_may_alias_refs.push(runtime_may_alias_refs[argument_offset + argument_index]) if argument_offset + argument_index < runtime_may_alias_refs.count else candidate_may_alias_refs.push(true)
+                    chv_check_call_target(candidate.callee, candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not chv_call_has_named_arguments(argument_names)
+                    chv_check_unknown_call(candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table) if chv_call_has_named_arguments(argument_names)
+                    candidate_capture_offset <- candidate_capture_offset + candidate.captures.count
 
-        def chv_walk_statements(statements: darray[Ast::Stmt], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+        def chv_walk_expression(expression: Ast::Expr, in_region: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                flow.last_value_may_be_owned_view <- false
+                match expression:
+                    Expr.Invalid:
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Absent:
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.IntLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.FloatLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.StringLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.CharLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.BoolLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Ident(identifier_name, _):
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.Call(callee, arguments, _, _):
+                        result_may_be_owned_view: bool = chv_is_owned_view(expression, flow, 0)
+                        method_found, _, method_name = chv_call_method_info(callee, 0)
+                        receiver_may_be_owned_view: mutable bool = false
+                        receiver_may_alias_reference: mutable bool = false
+                        table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, table)
+                        result_may_be_owned_view <- chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == "as_sview" or method_name == "as_cstr" or method_name == "view"))
+                        argument_owned_views: mutable darray[bool] = []
+                        argument_may_alias_refs: mutable darray[bool] = []
+                        for argument in arguments |table| -> table:
+                            table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            argument_owned_views.push(flow.last_value_may_be_owned_view)
+                            argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))
+                        table <- chv_check_call(expression, argument_owned_views, argument_may_alias_refs, receiver_may_be_owned_view, receiver_may_alias_reference, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- result_may_be_owned_view
+                    Expr.StaticEffectCall(_, _, candidates, arguments, argument_names, _):
+                        runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)
+                        runtime_owned_views: mutable darray[bool] = []
+                        runtime_may_alias_refs: mutable darray[bool] = []
+                        for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:
+                            table <- chv_walk_expression(child, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            runtime_owned_views.push(flow.last_value_may_be_owned_view)
+                            runtime_may_alias_refs.push(chv_expression_may_alias_ref(child, ref_params, flow, 0))
+                        chv_check_static_effect_call(candidates, arguments, argument_names, runtime_owned_views, runtime_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Field(object, _, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Scope(base, _, _):
+                        table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.ShorthandMember(_, _):
+                        pass
+                    Expr.Index(object, index, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        object_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        object_may_alias_ref: bool = chv_expression_may_alias_ref(object, ref_params, flow, 0)
+                        if not index_receiver_is_type_application(object):
+                            table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            index_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                            index_may_alias_ref: bool = chv_expression_may_alias_ref(index, ref_params, flow, 0)
+                            chv_check_unknown_call([object, index], [object_may_be_owned_view, index_may_be_owned_view], [object_may_alias_ref, index_may_alias_ref], ref_params, binders, owned, view_names, view_values, flow, table)
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.Slice(object, low, high, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        table <- chv_walk_expression(low, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        table <- chv_walk_expression(high, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.IndexN(object, arguments, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        indexed_arguments: mutable darray[Ast::Expr] = [object]
+                        indexed_owned_views: mutable darray[bool] = [flow.last_value_may_be_owned_view]
+                        indexed_alias_refs: mutable darray[bool] = [chv_expression_may_alias_ref(object, ref_params, flow, 0)]
+                        if not index_receiver_is_type_application(object):
+                            for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:
+                                table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                                indexed_arguments.push(argument)
+                                indexed_owned_views.push(flow.last_value_may_be_owned_view)
+                                indexed_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))
+                            chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.Binary(left, _, right, _):
+                        table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        left_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        left_may_alias_ref: bool = chv_expression_may_alias_ref(left, ref_params, flow, 0)
+                        table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        right_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        right_may_alias_ref: bool = chv_expression_may_alias_ref(right, ref_params, flow, 0)
+                        binary_arguments: darray[Ast::Expr] = [left, right]
+                        binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]
+                        binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]
+                        chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.Unary(operator, operand, _):
+                        table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        operand_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        operand_may_alias_ref: bool = chv_expression_may_alias_ref(operand, ref_params, flow, 0)
+                        if operator == TokenKind.Minus:
+                            chv_check_unknown_call([operand], [operand_may_be_owned_view], [operand_may_alias_ref], ref_params, binders, owned, view_names, view_values, flow, table)
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.Move(operand, _):
+                        table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.RegionNew(operand, _, _):
+                        table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Paren(inner, _):
+                        table <- chv_walk_expression(inner, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.Array(elements, _):
+                        for element in elements |table| -> table:
+                            table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Tuple(elements, _):
+                        for element in elements |table| -> table:
+                            table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.SetLit(elements, _):
+                        for element in elements |table| -> table:
+                            table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table| -> table:
+                            table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Construct(_, fields, _):
+                        for field in fields |table| -> table:
+                            table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        for field in fields |table| -> table:
+                            table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.If(condition, then_value, else_value, _):
+                        table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        branch_mark: usize = flow.names.count
+                        then_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        else_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        table <- chv_walk_expression(then_value, in_region, ref_params, binders, owned, view_names, view_values, then_flow, summary, table)
+                        table <- chv_walk_expression(else_value, in_region, ref_params, binders, owned, view_names, view_values, else_flow, summary, table)
+                        branch_value_may_be_owned: bool = then_flow.last_value_may_be_owned_view or else_flow.last_value_may_be_owned_view
+                        chv_flow_set_merge(flow, then_flow, else_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Match(scrutinee, arms, _):
+                        table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        branch_mark: usize = flow.names.count
+                        entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        merged_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        merged_ready: mutable bool = false
+                        branch_value_may_be_owned: mutable bool = false
+                        for arm in arms |table| -> table:
+                            arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                            pattern_names: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm.pattern, pattern_names)
+                            for pattern_name in pattern_names |arm_flow|:
+                                chv_flow_bind(arm_flow, pattern_name, false, false, false)
+                            table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)
+                            table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)
+                            branch_value_may_be_owned <- branch_value_may_be_owned or arm_flow.last_value_may_be_owned_view
+                            if not merged_ready:
+                                chv_flow_set_merge(merged_flow, arm_flow, arm_flow, branch_mark)
+                                merged_ready <- true
+                            else:
+                                chv_flow_merge(merged_flow, arm_flow, branch_mark)
+                        chv_flow_set_merge(flow, merged_flow, merged_flow, branch_mark) if merged_ready
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Catch(guarded, arms, _):
+                        branch_mark: usize = flow.names.count
+                        entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        guarded_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                        table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, guarded_flow, summary, table)
+                        branch_value_may_be_owned: mutable bool = guarded_flow.last_value_may_be_owned_view
+                        merged_flow: mutable CHVViewFlow = chv_flow_clone(guarded_flow)
+                        for arm in arms |table| -> table:
+                            arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                            chv_flow_merge(arm_flow, guarded_flow, branch_mark)
+                            pattern_names: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm.pattern, pattern_names)
+                            for pattern_name in pattern_names |arm_flow|:
+                                chv_flow_bind(arm_flow, pattern_name, false, false, false)
+                            table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)
+                            table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)
+                            branch_value_may_be_owned <- branch_value_may_be_owned or arm_flow.last_value_may_be_owned_view
+                            chv_flow_merge(merged_flow, arm_flow, branch_mark)
+                        chv_flow_set_merge(flow, guarded_flow, merged_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Comprehension(variable, iterable, condition, body, _):
+                        table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        branch_mark: usize = flow.names.count
+                        comprehension_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        chv_flow_bind(comprehension_flow, variable, false, false, false)
+                        comprehension_ref_params: mutable darray[sview] = []
+                        comprehension_binders: mutable darray[sview] = [name for name in binders]
+                        comprehension_owned: mutable darray[sview] = [name for name in owned]
+                        comprehension_view_names: mutable darray[sview] = [name for name in view_names]
+                        comprehension_view_values: mutable darray[Ast::Expr] = [value for value in view_values]
+                        for outer_ref in ref_params |comprehension_ref_params|:
+                            comprehension_ref_params.push(outer_ref) if outer_ref != variable
+                        comprehension_binders.push(variable)
+                        chv_scan_expression_locals(condition, in_region, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values)
+                        chv_scan_expression_locals(body, in_region, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values)
+                        table <- chv_walk_expression(condition, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)
+                        table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)
+                        chv_flow_merge(flow, comprehension_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Refinement(base, predicate, _):
+                        table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        base_may_be_owned: bool = flow.last_value_may_be_owned_view
+                        table <- chv_walk_expression(predicate, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- base_may_be_owned
+                    Expr.GetElse(guarded, recovery, _):
+                        branch_mark: usize = flow.names.count
+                        guarded_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, guarded_flow, summary, table)
+                        branch_value_may_be_owned: mutable bool = guarded_flow.last_value_may_be_owned_view
+                        recovery_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        chv_flow_merge(recovery_flow, guarded_flow, branch_mark)
+                        table <- chv_walk_statements(recovery, in_region, ref_params, binders, owned, view_names, view_values, recovery_flow, summary, table)
+                        branch_value_may_be_owned <- branch_value_may_be_owned or recovery_flow.last_value_may_be_owned_view
+                        chv_flow_set_merge(flow, guarded_flow, recovery_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Lambda(parameters, body, _):
+                        flow.last_value_may_be_owned_view <- false
+                        lambda_ref_params: mutable darray[sview] = []
+                        lambda_binders: mutable darray[sview] = []
+                        lambda_owned: mutable darray[sview] = []
+                        lambda_view_names: mutable darray[sview] = []
+                        lambda_view_values: mutable darray[Ast::Expr] = []
+                        lambda_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        for outer_ref in ref_params |lambda_ref_params, parameters|:
+                            shadowed: bool = any parameter in parameters where parameter == outer_ref
+                            lambda_ref_params.push(outer_ref) if not shadowed
+                        for binder in binders |lambda_binders|:
+                            lambda_binders.push(binder)
+                        for parameter in parameters |lambda_binders|:
+                            lambda_binders.push(parameter)
+                            chv_flow_bind(lambda_flow, parameter, false, false, false)
+                        for local_owned in owned |lambda_owned|:
+                            lambda_owned.push(local_owned)
+                        for view_index in 0..<view_names.count |view_index, lambda_view_names|:
+                            lambda_view_names.push(view_names[view_index])
+                            lambda_view_values.push(view_values[view_index]) if view_index < view_values.count
+                        chv_scan_locals(body, in_region, lambda_binders, lambda_owned, lambda_view_names, lambda_view_values)
+                        table <- chv_walk_statements(body, in_region, lambda_ref_params, lambda_binders, lambda_owned, lambda_view_names, lambda_view_values, lambda_flow, summary, table)
+                    Expr.Block(block_statements, block_value, _, _):
+                        block_mark: usize = flow.names.count
+                        table <- chv_walk_statements(block_statements, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        table <- chv_walk_expression(block_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        block_value_may_be_owned: bool = flow.last_value_may_be_owned_view
+                        chv_flow_truncate(flow, block_mark)
+                        flow.last_value_may_be_owned_view <- block_value_may_be_owned
+
+        def chv_walk_statements(statements: darray[Ast::Stmt], in_region: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
+                        Stmt.Invalid:
+                            pass
                         Stmt.Expr(statement_value, _):
-                            table <- chv_walk_expression(statement_value, ref_params, binders, owned, view_names, view_values, summary, table)
-                        Stmt.VarDecl(_, _, declared_value, _):
-                            table <- chv_walk_expression(declared_value, ref_params, binders, owned, view_names, view_values, summary, table)
-                        Stmt.Assign(_, _, assigned_value, _):
-                            table <- chv_walk_expression(assigned_value, ref_params, binders, owned, view_names, view_values, summary, table)
-                        Stmt.Return(returned, _):
-                            table <- chv_walk_expression(returned_value, ref_params, binders, owned, view_names, view_values, summary, table) if returned is returned_value
+                            table <- chv_walk_expression(statement_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        Stmt.VarDecl(declared_name, type_expression, declared_value, _):
+                            table <- chv_walk_expression(declared_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            typed_owned: bool = chv_type_is_owned_container(type_expression) and not type_marker_present_here(type_expression, TokenKind.Ampersand)
+                            literal_owned: bool = (type_expression is Expr.Absent) and (declared_value is Expr.Array(_, _))
+                            declared_alias_ref: bool = chv_expression_may_alias_ref(declared_value, ref_params, flow, 0)
+                            chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)
+                        Stmt.Assign(target, operator, assigned_value, _):
+                            assigned_name: sview = ident_name_of(target)
+                            previous_may_owned_view: mutable bool = false
+                            previous_may_alias_reference: mutable bool = false
+                            previous_index: usize = chv_flow_latest(flow, assigned_name) if assigned_name != "" else flow.names.count
+                            previous_may_owned_view <- flow.may_owned_view[previous_index] if previous_index < flow.names.count
+                            previous_may_alias_reference <- flow.may_alias_reference[previous_index] if previous_index < flow.names.count
+                            table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            assigned_alias: bool = flow.last_value_may_be_owned_view or (operator != TokenKind.Assign and previous_may_owned_view)
+                            assigned_alias_ref: bool = chv_expression_may_alias_ref(assigned_value, ref_params, flow, 0) or (operator != TokenKind.Assign and previous_may_alias_reference)
+                            if assigned_name != "":
+                                assigned_index: usize = chv_flow_latest(flow, assigned_name)
+                                if assigned_index < flow.names.count:
+                                    flow.may_owned_view[assigned_index] <- assigned_alias
+                                    flow.may_alias_reference[assigned_index] <- assigned_alias_ref
+                                else:
+                                    chv_flow_bind(flow, assigned_name, false, assigned_alias, assigned_alias_ref)
+                        Stmt.Return(value, _):
+                            table <- chv_walk_expression(return_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if value is return_value
                         Stmt.If(condition, then_body, else_body, _):
-                            table <- chv_walk_expression(condition, ref_params, binders, owned, view_names, view_values, summary, table)
-                            table <- chv_walk_statements(then_body, ref_params, binders, owned, view_names, view_values, summary, table)
-                            table <- chv_walk_statements(else_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            branch_mark: usize = flow.names.count
+                            then_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                            else_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                            table <- chv_walk_statements(then_body, in_region, ref_params, binders, owned, view_names, view_values, then_flow, summary, table)
+                            table <- chv_walk_statements(else_body, in_region, ref_params, binders, owned, view_names, view_values, else_flow, summary, table)
+                            chv_flow_set_merge(flow, then_flow, else_flow, branch_mark)
                         Stmt.While(condition, loop_body, _):
-                            table <- chv_walk_expression(condition, ref_params, binders, owned, view_names, view_values, summary, table)
-                            table <- chv_walk_statements(loop_body, ref_params, binders, owned, view_names, view_values, summary, table)
-                        Stmt.For(_, _, iterable, loop_body, _):
-                            table <- chv_walk_expression(iterable, ref_params, binders, owned, view_names, view_values, summary, table)
-                            table <- chv_walk_statements(loop_body, ref_params, binders, owned, view_names, view_values, summary, table)
-                        Stmt.Block(_, _, _, block_body, _):
-                            table <- chv_walk_statements(block_body, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            branch_mark: usize = flow.names.count
+                            loop_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                            table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)
+                            chv_flow_merge(flow, loop_flow, branch_mark)
+                        Stmt.For(_, loop_variables, iterable, loop_body, _):
+                            table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            branch_mark: usize = flow.names.count
+                            loop_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                            for loop_variable in loop_variables |loop_flow|:
+                                chv_flow_bind(loop_flow, loop_variable, false, false, false)
+                            table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)
+                            chv_flow_merge(flow, loop_flow, branch_mark)
+                        Stmt.Block(kind, _, binding, block_body, _):
+                            block_mark: usize = flow.names.count
+                            chv_flow_bind(flow, binding, false, false, false) if binding != ""
+                            table <- chv_walk_statements(block_body, in_region or kind == "region" or kind == "in", ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            chv_flow_truncate(flow, block_mark)
                         Stmt.Match(scrutinee, arms, _):
-                            table <- chv_walk_expression(scrutinee, ref_params, binders, owned, view_names, view_values, summary, table)
+                            table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            branch_mark: usize = flow.names.count
+                            entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                            merged_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                            merged_ready: mutable bool = false
                             for arm in arms |table| -> table:
-                                table <- chv_walk_statements(arm.body, ref_params, binders, owned, view_names, view_values, summary, table)
-                        _:
+                                arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                                pattern_names: mutable darray[sview] = []
+                                collect_pattern_binding_names(arm.pattern, pattern_names)
+                                for pattern_name in pattern_names |arm_flow|:
+                                    chv_flow_bind(arm_flow, pattern_name, false, false, false)
+                                table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)
+                                table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)
+                                if not merged_ready:
+                                    chv_flow_set_merge(merged_flow, arm_flow, arm_flow, branch_mark)
+                                    merged_ready <- true
+                                else:
+                                    chv_flow_merge(merged_flow, arm_flow, branch_mark)
+                            chv_flow_set_merge(flow, merged_flow, merged_flow, branch_mark) if merged_ready
+                        Stmt.Contract(_, expression, _):
+                            table <- chv_walk_expression(expression, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        Stmt.Break(_, _):
+                            pass
+                        Stmt.Continue(_, _):
                             pass
 
         def chv_walk_declarations(declarations: darray[Ast::Decl], summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
@@ -319,15 +958,19 @@ extend Semantic:
                         Decl.Func(_, parameters, _, body, _, _, _):
                             ref_params: mutable darray[sview] = []
                             binders: mutable darray[sview] = []
+                            flow: mutable CHVViewFlow = CHVViewFlow{}
                             for parameter in parameters |ref_params, binders|:
                                 binders.push(parameter.name)
                                 ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                                parameter_owned: bool = chv_type_is_owned_container(parameter.type_expression) and not type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                                parameter_may_alias_reference: bool = type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                                chv_flow_bind(flow, parameter.name, parameter_owned, false, parameter_may_alias_reference)
                             if ref_params.count > 0:
                                 owned: mutable darray[sview] = []
                                 view_names: mutable darray[sview] = []
                                 view_values: mutable darray[Ast::Expr] = []
                                 chv_scan_locals(body, false, binders, owned, view_names, view_values)
-                                table <- chv_walk_statements(body, ref_params, binders, owned, view_names, view_values, summary, table) if owned.count > 0
+                                table <- chv_walk_statements(body, false, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                         Decl.Module(_, module_body, _):
                             table <- chv_walk_declarations(module_body, summary, table)
                         Decl.Scoped(scoped_body, _):
@@ -341,5 +984,4 @@ extend Semantic:
                 holders: darray[sview] = chv_view_holders(file.top_decls)
                 return if holders.count == 0
                 summary: StoreThroughSummary = chv_build_summary(file.top_decls, holders) can Global{Read,Write}
-                return if summary.writable_function.count == 0
                 table <- chv_walk_declarations(file.top_decls, summary, table)

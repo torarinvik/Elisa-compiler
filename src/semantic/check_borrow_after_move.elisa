@@ -1153,6 +1153,26 @@ extend Semantic:
                 bam_escape_collect_roots(value, lend_names, lend_positions, escape_names, escape_roots, value_roots)
                 return any value_root in value_roots where (any known_local in locals where known_local == value_root)
 
+        # A call target may be a local reference alias such as `alias = &out`. Follow the
+        # flow-insensitive alias links collected for the function to see whether it can
+        # designate one of the caller's reference parameters.
+        def bam_store_target_reaches_ref(name: sview, ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, visited: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if any ref_param in ref_params where ref_param == name
+                false return if any visited_name in visited where visited_name == name
+                visited.push(name)
+                link_row: mutable usize = 0
+                while link_row < link_names.count |link_row, visited|:
+                    if link_names[link_row] == name and bam_store_target_reaches_ref(link_targets[link_row], ref_params, link_names, link_targets, visited):
+                        return true
+                    link_row <- link_row + 1
+                return false
+
+        def bam_store_target_is_ref(name: sview, ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                visited: mutable darray[sview] = []
+                return bam_store_target_reaches_ref(name, ref_params, link_names, link_targets, visited)
+
         # `out.push(v)` into a reference parameter's darray whose element type carries a
         # reference: stage0's analyzeBuiltinDarrayPushCall retention check.
         def bam_store_push(push_call: Ast::Expr, locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, table: lmut SymbolTable) -> void:
@@ -1172,14 +1192,111 @@ extend Semantic:
                     _:
                         pass
 
+        # Map named actual arguments to formal slots only when the callee has one
+        # unambiguous declaration. Unknown/overloaded calls stay on the conservative path.
+        def bam_call_formal_positions(callee_name: sview, arguments: darray[Ast::Expr], argument_names: darray[sview], table: SymbolTable&, actual_formals: mutable darray[usize]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                declaration_id: mutable DeclId = DeclId{value: 4294967295}
+                declaration_count: mutable usize = 0
+                for symbol in table.symbols |declaration_id, declaration_count, callee_name|:
+                    if symbol.kind == SymbolKind.Func and symbol.name == callee_name:
+                        declaration_id <- symbol.id
+                        declaration_count <- declaration_count + 1
+                return false if declaration_count != 1
+
+                formal_names: mutable darray[sview] = []
+                formal_row: mutable u32 = function_param_chain_head(table, callee_name)
+                while formal_row != 4294967295 |formal_names, formal_row, declaration_id|:
+                    row: usize = formal_row.usize()
+                    if row < table.function_param_declaration_id.count and table.function_param_declaration_id[row].value == declaration_id.value:
+                        formal_names.push(table.function_param_name[row])
+                    formal_row <- table.function_param_name_next[row]
+                used: mutable darray[bool] = []
+                while used.count < formal_names.count |used, formal_names|:
+                    used.push(false)
+                positional: mutable usize = 0
+                saw_named: mutable bool = false
+                for actual_index in 0..<arguments.count |actual_formals, formal_names, used, positional, saw_named, argument_names|:
+                    label: sview = argument_names[actual_index] if actual_index < argument_names.count else ""
+                    formal: mutable usize = formal_names.count
+                    if label != "":
+                        saw_named <- true
+                        for formal_index in 0..<formal_names.count |formal, formal_names, label|:
+                            formal <- formal_index if formal_names[formal_index] == label
+                    else:
+                        return false if saw_named
+                        while positional < formal_names.count and used[positional] |positional, formal_names, used|:
+                            positional <- positional + 1
+                        formal <- positional
+                        positional <- positional + 1
+                    return false if formal >= formal_names.count or used[formal]
+                    used[formal] <- true
+                    actual_formals.push(formal)
+                return true
+
+        # A local callback has no top-level summary. Treat each mutable reference argument
+        # as a possible destination and each other argument carrying a local root as a source.
+        def bam_store_unknown_call_targets(call: Ast::Expr, callee_name: sview, call_arguments: darray[Ast::Expr], writable_ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, locals: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                argument_reaches_local: mutable darray[bool] = []
+                reachable_count: mutable usize = 0
+                for source_argument in call_arguments |argument_reaches_local, reachable_count|:
+                    source_reaches_local: bool = bam_roots_reach_local(source_argument, locals, lend_names, lend_positions, escape_names, escape_roots)
+                    argument_reaches_local.push(source_reaches_local)
+                    reachable_count <- reachable_count + 1 if source_reaches_local
+                target: mutable usize = 0
+                while target < call_arguments.count |target, table, argument_reaches_local, reachable_count| -> table:
+                    target_place: mutable Ast::Expr = bam_strip_paren(call_arguments[target])
+                    match target_place:
+                        Expr.Unary(TokenKind.Ampersand, address_operand, _):
+                            target_place <- address_operand
+                        _:
+                            pass
+                    target_root: sview = bam_place_root(target_place)
+                    if target_root != "" and bam_store_target_is_ref(target_root, writable_ref_params, link_names, link_targets):
+                        reaches: bool = reachable_count > 1 if argument_reaches_local[target] else reachable_count > 0
+                        if reaches:
+                            code: u32 = (target + 1).u32() * 10 + 4
+                            call_pos: Ast::Pos = Ast::expr_pos(call)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StoreRefToLocal, name: callee_name, pos: call_pos, line: call_pos.line, expected: "", actual: "", state_code: code})
+                    target <- target + 1
+
         # `ea(out, &x)` where `out` is a reference parameter and `ea` may store its second
         # argument through its first (store_through_summary): the call publishes `&x` into the
         # caller's storage. stage0's queueCallArgumentStoreChecks; state_code 10*(i+1)+4 names
         # the 1-based argument.
-        def bam_store_call_through(call: Ast::Expr, locals: darray[sview]&, ref_params: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+        def bam_store_call_through(call: Ast::Expr, locals: darray[sview]&, ref_params: darray[sview]&, link_names: darray[sview]&, link_targets: darray[sview]&, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview]&, escape_roots: darray[sview]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match call:
-                    Expr.Call(Expr.Ident(callee_name, _), call_arguments, _, call_pos):
+                    Expr.Call(Expr.Ident(callee_name, callee_pos), call_arguments, call_argument_names, call_pos):
+                        shadowed: bool = borrow_reference_site_is_local(reference_sites, function_owner, callee_pos, table)
+                        named_arguments: bool = any argument_name in call_argument_names where argument_name != ""
+                        if shadowed or named_arguments or not sts_is_declared(summary, callee_name):
+                            # Local or unknown callables have no usable top-level summary, and
+                            # named arguments have no positional map here. Treat every argument
+                            # as a possible target/source pair for either form.
+                            argument_reaches_local: mutable darray[bool] = []
+                            reachable_count: mutable usize = 0
+                            for source_argument in call_arguments |argument_reaches_local, reachable_count|:
+                                source_reaches_local: bool = bam_roots_reach_local(source_argument, locals, lend_names, lend_positions, escape_names, escape_roots)
+                                argument_reaches_local.push(source_reaches_local)
+                                reachable_count <- reachable_count + 1 if source_reaches_local
+                            target: mutable usize = 0
+                            while target < call_arguments.count |target, table, argument_reaches_local, reachable_count| -> table:
+                                target_place: mutable Ast::Expr = bam_strip_paren(call_arguments[target])
+                                match target_place:
+                                    Expr.Unary(TokenKind.Ampersand, address_operand, _):
+                                        target_place <- address_operand
+                                    _:
+                                        pass
+                                target_root: sview = bam_place_root(target_place)
+                                if target_root != "" and bam_store_target_is_ref(target_root, ref_params, link_names, link_targets):
+                                    reaches: bool = reachable_count > 1 if argument_reaches_local[target] else reachable_count > 0
+                                    if reaches:
+                                        code: u32 = (target + 1).u32() * 10 + 4
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StoreRefToLocal, name: callee_name, pos: call_pos, line: call_pos.line, expected: "", actual: "", state_code: code})
+                                target <- target + 1
+                            return
                         return if not sts_has_writable(summary, callee_name)
                         target: mutable usize = 0
                         while target < call_arguments.count |target, table| -> table:
@@ -1191,7 +1308,7 @@ extend Semantic:
                                     _:
                                         pass
                                 target_root: sview = bam_place_root(target_place)
-                                if target_root != "" and (any outer in ref_params where outer == target_root):
+                                if target_root != "" and bam_store_target_is_ref(target_root, ref_params, link_names, link_targets):
                                     reaches: mutable bool = false
                                     source: mutable usize = 0
                                     while source < call_arguments.count and not reaches |source, reaches|:
@@ -1324,18 +1441,18 @@ extend Semantic:
         # `al.begin <- &x` stores the borrow on the SECOND pass. Walk the body until the carried
         # roots stop growing (roots only grow, so the last walk reports a superset of the earlier
         # ones) and keep only that walk's diagnostics.
-        def bam_store_loop[@r](body: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]& @r, escape_roots: mutable darray[sview]& @r, link_names: darray[sview]&, link_targets: darray[sview]&, summary: StoreThroughSummary&, round: u32, table: lmut SymbolTable) -> void:
+        def bam_store_loop[@r](body: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]& @r, escape_roots: mutable darray[sview]& @r, link_names: darray[sview]&, link_targets: darray[sview]&, summary: StoreThroughSummary&, round: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 diagnostic_mark: usize = table.diagnostics.count
                 loop_names: mutable darray[sview] @r = []
                 loop_roots: mutable darray[sview] @r = []
                 loop_names.extend(escape_names)
                 loop_roots.extend(escape_roots)
-                table <- bam_store_statements(body, locals, ref_params, ref_param_types, lend_names, lend_positions, loop_names, loop_roots, link_names, link_targets, summary, table)
+                table <- bam_store_statements(body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, loop_names, loop_roots, link_names, link_targets, summary, table)
                 grew: bool = bam_escape_merge_branch_grew(escape_names, escape_roots, loop_names, loop_roots)
                 if grew and round < 8:
                     table.diagnostics <- table.diagnostics.truncate(diagnostic_mark)
-                    table <- bam_store_loop(body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, round + 1, table)
+                    table <- bam_store_loop(body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, round + 1, table)
 
         # `out.p <- &local` where `out` is a REFERENCE parameter: the frame dies at the return
         # but the pointee it just published lives on in the caller's storage. stage0 reports
@@ -1344,9 +1461,9 @@ extend Semantic:
         # reaching it through a value: `out.push(&x)` into a reference-carrying darray
         # (state 1), an aggregate literal or alias holding `&x` (state 2), and a local
         # reference alias `r = &x; out.r <- r` (state 3).
-        def bam_store_statements[@r](statements: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]& @r, escape_roots: mutable darray[sview]& @r, link_names: darray[sview]&, link_targets: darray[sview]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+        def bam_store_statements[@r](statements: darray[Ast::Stmt], locals: darray[sview]&, ref_params: darray[sview]&, ref_param_types: darray[u32]&, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview]& @r, escape_roots: mutable darray[sview]& @r, link_names: darray[sview]&, link_targets: darray[sview]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table, escape_names, escape_roots| -> table:
+                for statement in statements |table, escape_names, escape_roots, reference_sites| -> table:
                     match statement:
                         Stmt.VarDecl(declared_name, _, declared_value, _):
                             bam_escape_track_declaration(declared_name, declared_value, lend_names, lend_positions, escape_names, escape_roots)
@@ -1376,7 +1493,7 @@ extend Semantic:
                                 bam_store_forward(target_root, forwarded_roots, link_names, link_targets, forward_seen, escape_names, escape_roots)
                         Stmt.Expr(push_call, _):
                             table <- bam_store_push(push_call, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, table)
-                            table <- bam_store_call_through(push_call, locals, ref_params, lend_names, lend_positions, escape_names, escape_roots, summary, table)
+                            table <- bam_store_call_through(push_call, locals, ref_params, link_names, link_targets, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, summary, table)
                             bam_escape_track_insert(push_call, lend_names, lend_positions, escape_names, escape_roots)
                             match push_call:
                                 Expr.Call(Expr.Field(forward_receiver, forward_method, _), forward_arguments, _, _):
@@ -1398,27 +1515,27 @@ extend Semantic:
                             then_roots.extend(escape_roots)
                             else_names.extend(escape_names)
                             else_roots.extend(escape_roots)
-                            table <- bam_store_statements(branch_then, locals, ref_params, ref_param_types, lend_names, lend_positions, then_names, then_roots, link_names, link_targets, summary, table)
-                            table <- bam_store_statements(branch_else, locals, ref_params, ref_param_types, lend_names, lend_positions, else_names, else_roots, link_names, link_targets, summary, table)
+                            table <- bam_store_statements(branch_then, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, then_names, then_roots, link_names, link_targets, summary, table)
+                            table <- bam_store_statements(branch_else, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, else_names, else_roots, link_names, link_targets, summary, table)
                             bam_escape_merge_branch(escape_names, escape_roots, then_names, then_roots)
                             bam_escape_merge_branch(escape_names, escape_roots, else_names, else_roots)
                         Stmt.While(loop_condition, loop_body, loop_pos):
-                            table <- bam_store_loop(loop_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, 0, table)
+                            table <- bam_store_loop(loop_body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, 0, table)
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
-                            table <- bam_store_loop(for_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, 0, table)
+                            table <- bam_store_loop(for_body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, 0, table)
                         Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
-                            table <- bam_store_statements(block_body, locals, ref_params, ref_param_types, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, table)
+                            table <- bam_store_statements(block_body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, escape_names, escape_roots, link_names, link_targets, summary, table)
                         Stmt.Match(match_scrutinee, match_arms, match_pos):
                             base_names: mutable darray[sview] @r = []
                             base_roots: mutable darray[sview] @r = []
                             base_names.extend(escape_names)
                             base_roots.extend(escape_roots)
-                            for match_arm in match_arms |table, base_names, base_roots, escape_names, escape_roots| -> table:
+                            for match_arm in match_arms |table, base_names, base_roots, escape_names, escape_roots, reference_sites| -> table:
                                 arm_names: mutable darray[sview] @r = []
                                 arm_roots: mutable darray[sview] @r = []
                                 arm_names.extend(base_names)
                                 arm_roots.extend(base_roots)
-                                table <- bam_store_statements(match_arm.body, locals, ref_params, ref_param_types, lend_names, lend_positions, arm_names, arm_roots, link_names, link_targets, summary, table)
+                                table <- bam_store_statements(match_arm.body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, arm_names, arm_roots, link_names, link_targets, summary, table)
                                 bam_escape_merge_branch(escape_names, escape_roots, arm_names, arm_roots)
                         _:
                             pass
@@ -1500,11 +1617,12 @@ extend Semantic:
                         _:
                             pass
 
-        def bam_declarations(declarations: darray[Ast::Decl], region_param_lines: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+        def bam_declarations(declarations: darray[Ast::Decl], region_param_lines: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, summary: StoreThroughSummary&, reference_sites: mutable BorrowReferenceSites&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |table| -> table:
+                for declaration in declarations |table, reference_sites| -> table:
                     match declaration:
                         Decl.Func(function_name, function_parameters, function_return, function_body, function_effects, function_decorators, function_pos):
+                            function_owner: DeclId = function_declaration_id(table, function_name, function_pos.offset)
                             binders: mutable BorrowBinders = empty_borrow_binders()
                             borrow_function_binders(function_parameters, function_body, binders)
                             # One unreadable pattern and the whole function is skipped: a name this
@@ -1558,15 +1676,15 @@ extend Semantic:
                             link_targets: mutable darray[sview] = []
                             bam_store_ref_links(function_body, link_names, link_targets)
                             store_roots: mutable darray[sview] = []
-                            table <- bam_store_statements(function_body, locals, ref_params, ref_param_types, lend_names, lend_positions, store_names, store_roots, link_names, link_targets, summary, table) if (ref_params.count > 0 or summary.globals.count > 0) and locals.count > 0
+                            table <- bam_store_statements(function_body, locals, ref_params, ref_param_types, function_owner, reference_sites, lend_names, lend_positions, store_names, store_roots, link_names, link_targets, summary, table) if (ref_params.count > 0 or summary.globals.count > 0) and locals.count > 0
                             table <- bam_global_store_statements(function_body, locals, table) if locals.count > 0
                         Decl.Module(module_name, module_body, module_pos):
                             previous_module: sview = table.current_module
                             table.current_module <- module_name
-                            table <- bam_declarations(module_body, region_param_lines, lend_names, lend_positions, summary, table) can Global{Read,Write}
+                            table <- bam_declarations(module_body, region_param_lines, lend_names, lend_positions, summary, reference_sites, table) can Global{Read,Write}
                             table.current_module <- previous_module
                         Decl.Scoped(scoped_body, scoped_pos):
-                            table <- bam_declarations(scoped_body, region_param_lines, lend_names, lend_positions, summary, table) can Global{Read,Write}
+                            table <- bam_declarations(scoped_body, region_param_lines, lend_names, lend_positions, summary, reference_sites, table) can Global{Read,Write}
                         _:
                             pass
 
@@ -1606,5 +1724,6 @@ extend Semantic:
                             lend_positions.push(wrapper_positions[wrapper_index])
                             more_lenders <- true
                         wrapper_index <- wrapper_index + 1
-                summary: StoreThroughSummary = build_store_through_summary(declarations, table) can Global{Read,Write}
-                table <- bam_declarations(declarations, region_param_lines, lend_names, lend_positions, summary, table) can Global{Read,Write}
+                reference_sites: mutable BorrowReferenceSites = empty_borrow_reference_sites()
+                summary: StoreThroughSummary = build_store_through_summary(declarations, reference_sites, table) can Global{Read,Write}
+                table <- bam_declarations(declarations, region_param_lines, lend_names, lend_positions, summary, reference_sites, table) can Global{Read,Write}
