@@ -3,8 +3,11 @@
 Current execution policy: use local compute. All rented Vast instances and their
 SSH endpoints below are historical evidence, not available infrastructure. Do not
 wait for or reconnect to them. Serialize local seeds and coordinate CPU use.
-Mac paired measurements are exploratory only; qualified speed claims require a
-controlled host and recorded toolchain.
+Paired Mac A/B measurements are allowed after exact source-matched correctness
+parity and at least 60 seconds with load1 at or below 2.0 on the 10-CPU Mac.
+Record the selected toolchain from `LLVM_CONFIG` (`scripts/platform.sh` chooses the
+current Homebrew LLVM on macOS). Treat Mac results as exploratory because no
+approved 64-core Linux host is available for qualification.
 
 Targets (stage1 compiling itself, `src/driver/elisac.elisa`, ~253k lines after includes):
 
@@ -229,6 +232,17 @@ invalid backend IR in an object build prints numbered values instead of names.
   ordinal, then use that ordinal to read its explicit value from the parallel pool. Membership
   checks use the ordinal so an explicit value of `-1` remains valid. Compare codegen CPU and
   variant rows visited on enum-heavy and self-hosting inputs; no gain is measured yet.
+- Semantic setup now collects SoA layout owners, loop-binder positions, and quantifier lines in
+  one annotation pass, and collects using-alias rows, protocol declarations, and generic extern
+  names in one annotation pass on each semantic entry path. Per-column source order is preserved;
+  measure annotation rows and semantic CPU on the self-hosting input before claiming a gain.
+- Region-storage struct and enum leaf-name indexes now retain distinct names only. Exact string
+  checks remain within each hash chain; source row counts still guard index freshness. Compare
+  index rows, build CPU, pass CPU, and peak RSS on self-hosting and enum-heavy inputs.
+- Borrow-flow replay now keeps branch outcomes as compact snapshots and merges them directly,
+  avoiding append-log materialization for each join. Compare allocation counts, replay CPU, and
+  peak RSS on branch-heavy and loop-heavy inputs; preserve wildcard, tombstone, and traversal-order
+  behavior. No gain is measured yet.
 - Loop back-edge storage diagnostics reuse their probe and result arrays across invalidated
   names. Compare allocation counts and semantic CPU on loop-heavy inputs; no gain is measured
   yet.
