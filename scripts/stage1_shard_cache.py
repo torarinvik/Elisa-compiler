@@ -414,20 +414,54 @@ class BatchInvocation:
 
     def restore(self, ticket, output, stdout, stderr):
         self._open()
-        index = len(self.outputs)
-        staged = [self.work / f"hit-{index}-{name}" for name in ("object", "stdout", "stderr")]
-        expected = {}
-        hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected, _verify_copies=False)
-        if hit:
-            targets = [Path(path) for path in (output, stdout, stderr)]
-            if len({str(path.resolve()) for path in targets}) != 3:
-                raise ValueError("batch output paths must be distinct")
-            previous = {str(path.resolve()) for _, _, paths, _ in self.outputs for path in paths}
-            if previous.intersection(str(path.resolve()) for path in targets):
-                raise ValueError("batch shards share output paths")
-            self.outputs.append((ticket, staged, targets, expected))
-        self.metrics["hits" if hit else "misses"] += 1
-        return hit
+        targets = [Path(path) for path in (output, stdout, stderr)]
+        if len({str(path.resolve()) for path in targets}) != 3:
+            raise ValueError("batch output paths must be distinct")
+        previous = {str(path.resolve()) for _, _, paths, _ in self.outputs for path in paths}
+        if previous.intersection(str(path.resolve()) for path in targets):
+            raise ValueError("batch shards share output paths")
+        staged = []
+        created_directories = []
+        retained = False
+        try:
+            # Stage directly beside each destination. The cache restore writes
+            # each payload once; finish() attests these private files before any
+            # publication, then commits them with same-filesystem renames.
+            for target in targets:
+                missing = []
+                parent = target.parent
+                while not parent.exists():
+                    missing.append(parent)
+                    if parent == parent.parent:
+                        break
+                    parent = parent.parent
+                for directory in reversed(missing):
+                    try:
+                        directory.mkdir()
+                    except FileExistsError:
+                        if not directory.is_dir():
+                            raise
+                    else:
+                        created_directories.append(directory)
+                fd, temporary = tempfile.mkstemp(prefix=target.name + ".incoming-", dir=target.parent)
+                os.close(fd)
+                staged.append(Path(temporary))
+            expected = {}
+            hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected, _verify_copies=False)
+            if hit:
+                self.outputs.append((ticket, staged, targets, expected))
+                retained = True
+            self.metrics["hits" if hit else "misses"] += 1
+            return hit
+        finally:
+            if not retained:
+                for path in staged:
+                    path.unlink(missing_ok=True)
+                for directory in reversed(created_directories):
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
 
     def publish(self, ticket, obj, stdout, stderr):
         self._open()
@@ -440,8 +474,11 @@ class BatchInvocation:
         # Snapshot admission can change independently of shared artifacts too.
         for ticket in self.prepared:
             self.validate(ticket)
-        for ticket, _, _, _ in self.outputs:
+        for ticket, staged, _, expected in self.outputs:
             self.validate(ticket)
+            for name, source in zip(("object", "stdout", "stderr"), staged):
+                if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
+                    raise ValueError("private restored hit changed before finalization")
         for ticket in self.publications:
             self.validate(ticket)
         for path, expected in self.admitted_snapshots.items():
@@ -450,54 +487,42 @@ class BatchInvocation:
         current_pins, current_artifacts = self._read_shared()
         if current_pins != self.pins or current_artifacts != self.artifacts:
             raise ValueError("shared artifacts changed during batch")
-        # Prepare and attest every output-local copy before publishing any cache
-        # generation or destination. Hashing during the copy validates the staged
-        # hit; hashing the copy validates the bytes actually written to disk.
-        output_copies = []
-        try:
-            for _, staged, targets, expected in self.outputs:
-                copies = []
-                output_copies.append(copies)
-                for name, source, target in zip(("object", "stdout", "stderr"), staged, targets):
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    fd, tmp = tempfile.mkstemp(prefix=target.name + ".incoming-", dir=target.parent)
-                    os.close(fd)
-                    Path(tmp).unlink()
-                    copies.append((Path(tmp), target))
-                    limit = MAX_BYTES if name == "object" else MAX_STREAM
-                    copied = copy_fingerprint(source, tmp, allow_empty=name != "object", limit=limit)
-                    if copied != expected[name]:
-                        raise ValueError("private restored hit changed before finalization")
-                    if fingerprint(tmp, allow_empty=name != "object", limit=limit) != expected[name]:
-                        raise ValueError("batch restored copy corrupted")
-            for ticket in self.publications:
-                staged = self.work / "publication" / ticket["key"]
-                retired = None
-                with locked(self.cache, ticket["key"], True) as entry:
-                    if verify_bundle(entry, ticket):
-                        continue
-                    if not verify_bundle(staged, ticket):
-                        raise ValueError("private batch bundle corrupted")
-                    if entry.exists():
-                        retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=self.cache))
-                        retired.rmdir()
-                        os.replace(entry, retired)
-                    os.replace(staged, entry)
-                    sync_directory(self.cache)
-                if retired:
-                    shutil.rmtree(retired, ignore_errors=True)
-            for copies in output_copies:
-                for index in (1, 2, 0):
-                    os.replace(*copies[index])
-            self.finished = True
-            return dict(self.metrics)
-        finally:
-            for copies in output_copies:
-                for temporary, _ in copies:
-                    temporary.unlink(missing_ok=True)
+        # Every hit has already been staged beside its destination and verified.
+        # Only now publish cache generations and replace destinations.
+        for ticket in self.publications:
+            staged = self.work / "publication" / ticket["key"]
+            retired = None
+            with locked(self.cache, ticket["key"], True) as entry:
+                if verify_bundle(entry, ticket):
+                    continue
+                if not verify_bundle(staged, ticket):
+                    raise ValueError("private batch bundle corrupted")
+                if entry.exists():
+                    retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=self.cache))
+                    retired.rmdir()
+                    os.replace(entry, retired)
+                os.replace(staged, entry)
+                sync_directory(self.cache)
+            if retired:
+                shutil.rmtree(retired, ignore_errors=True)
+        # Cache publication may take long enough for another process to tamper
+        # with an output-local staging path; attest again immediately before
+        # the atomic renames.
+        for _, staged, _, expected in self.outputs:
+            for name, source in zip(("object", "stdout", "stderr"), staged):
+                if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
+                    raise ValueError("private restored hit changed before destination commit")
+        for _, staged, targets, _ in self.outputs:
+            for index in (1, 2, 0):
+                os.replace(staged[index], targets[index])
+        self.finished = True
+        return dict(self.metrics)
 
     def close(self):
         self.closed = True
+        for _, staged, _, _ in self.outputs:
+            for path in staged:
+                path.unlink(missing_ok=True)
         shutil.rmtree(self.work, ignore_errors=True)
 
     def __enter__(self):

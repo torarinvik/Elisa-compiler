@@ -325,33 +325,67 @@ class ShardCacheTests(unittest.TestCase):
             self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
             fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
             batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
-            (batch.work / "hit-0-object").write_bytes(b"corrupted after restore")
+            batch.outputs[0][1][0].write_bytes(b"corrupted after restore")
             with self.assertRaises(ValueError):
                 batch.finish()
         self.assertFalse(self.output.exists())
         self.assertFalse(self.out.exists())
         self.assertFalse(self.err.exists())
         self.assertFalse((self.cache / fresh["key"]).exists())
+        self.assertFalse(list(self.root.glob("*.incoming-*")))
 
-    def test_batch_output_copy_is_attested_before_cache_publication(self):
+    def test_batch_staged_copy_is_attested_before_cache_publication(self):
+        self.publish()
+        fresh = None
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            real_copy = shard.copy_fingerprint
+
+            def corrupt_staged_copy(src, dst, *, allow_empty=False, limit=shard.MAX_BYTES):
+                result = real_copy(src, dst, allow_empty=allow_empty, limit=limit)
+                if Path(src).parent == self.cache / self.ticket["key"] and Path(src).name == "object":
+                    Path(dst).write_bytes(b"damaged private staging copy")
+                return result
+
+            with patch.object(shard, "copy_fingerprint", side_effect=corrupt_staged_copy):
+                self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
+            fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
+            batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
+            with self.assertRaisesRegex(ValueError, "private restored hit changed before finalization"):
+                batch.finish()
+        self.assertFalse((self.cache / fresh["key"]).exists())
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.out.exists())
+        self.assertFalse(self.err.exists())
+        self.assertFalse(list(self.root.glob("*.incoming-*")))
+
+    def test_batch_miss_removes_new_destination_directories(self):
+        output = self.root / "new-output" / "nested" / "object.o"
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            ticket = batch.prepare(self.files["snapshot"], self.options)
+            self.assertFalse(batch.restore(ticket, output, str(output) + ".out", str(output) + ".err"))
+            self.assertTrue(batch.finish())
+        self.assertFalse(output.parent.parent.exists())
+        self.assertFalse(list(self.root.glob("*.incoming-*")))
+
+    def test_batch_staging_is_rechecked_after_cache_publication(self):
         self.publish()
         fresh = None
         with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
             self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
             fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
             batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
-            real_copy = shard.copy_fingerprint
+            real_verify = shard.verify_bundle
 
-            def corrupt_output_copy(src, dst, *, allow_empty=False, limit=shard.MAX_BYTES):
-                result = real_copy(src, dst, allow_empty=allow_empty, limit=limit)
-                if Path(dst).name.startswith(self.output.name + ".incoming-"):
-                    Path(dst).write_bytes(b"damaged output staging copy")
+            def mutate_hit_while_publishing(entry, ticket):
+                result = real_verify(entry, ticket)
+                if Path(entry) == batch.work / "publication" / ticket["key"]:
+                    batch.outputs[0][1][0].write_bytes(b"changed during cache publication")
                 return result
 
-            with patch.object(shard, "copy_fingerprint", side_effect=corrupt_output_copy):
-                with self.assertRaisesRegex(ValueError, "batch restored copy corrupted"):
+            with patch.object(shard, "verify_bundle", side_effect=mutate_hit_while_publishing):
+                with self.assertRaisesRegex(ValueError, "changed before destination commit"):
                     batch.finish()
-        self.assertFalse((self.cache / fresh["key"]).exists())
+        self.assertTrue((self.cache / fresh["key"]).exists())
         self.assertFalse(self.output.exists())
         self.assertFalse(self.out.exists())
         self.assertFalse(self.err.exists())
