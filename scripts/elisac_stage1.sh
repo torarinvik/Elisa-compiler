@@ -266,7 +266,10 @@ driver_args=("$@")
 # normalised, every ELISA_* variable, every file of the source's include graph
 # (`-emit deps`), and the standard library tree the driver may pull in implicitly.
 # A hit restores the object and replays both diagnostic streams; a miss compiles
-# and stores the object plus diagnostics. Integrity metadata is mandatory;
+# and stores the object plus diagnostics. The product provenance manifest is
+# part of the key because it attests the exact LLVM toolchain artifacts; a
+# reseed after an in-place LLVM update must not reuse objects from the old ABI.
+# Integrity metadata is mandatory;
 # legacy, partial, or corrupted entries take the ordinary compile path.
 stage1_cache_key=""
 stage1_cache_out=""
@@ -276,6 +279,7 @@ stage1_cache_environment() {
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
   local index=0 count=${#driver_args[@]} arg emit="obj" source=""
+  local provenance_file="${BIN}.provenance.json"
   local -a normalized=() auxiliary_inputs=()
   while (( index < count )); do
     arg="${driver_args[index]}"
@@ -304,6 +308,7 @@ stage1_cache_prepare() {
     index=$((index + 1))
   done
   [[ "$emit" == obj && -n "$stage1_cache_out" && -n "$source" ]] || return 1
+  [[ -f "$provenance_file" && -r "$provenance_file" ]] || return 1
   local deps_file
   deps_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps.XXXXXX")"
   if ! "$BIN" -emit deps -o "$deps_file" "$source" </dev/null >/dev/null 2>&1; then
@@ -312,8 +317,8 @@ stage1_cache_prepare() {
   fi
   stage1_cache_key="$(
     {
-      printf 'elisac-stage1-object-cache v2\n'
-      shasum -a 256 "$BIN" | cut -d' ' -f1 || exit 1
+      printf 'elisac-stage1-object-cache v3\n'
+      shasum -a 256 "$BIN" "$provenance_file" | cut -d' ' -f1 || exit 1
       printf '%s\0' "${normalized[@]}"
       printf '\n'
       stage1_cache_environment || true

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Cache admission must never publish partial, corrupt, or mismatched bytes."""
+import hashlib
 import io
 import json
 import os
@@ -20,6 +21,35 @@ class CacheIntegrityTest(unittest.TestCase):
         self.entry, self.source, self.output = (root / p for p in ("cache/key.o", "source.o", "output.o"))
         self.source.write_bytes(b"object payload" * 100)
         self.output.write_bytes(b"previous valid output")
+
+    def cache_key(self, compiler, source):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        script = (
+            'set -uo pipefail\n'
+            'driver_args=("$SOURCE_INPUT" -o output.o)\n'
+            'stage1_cache_out=""\n'
+            'stage1_cache_environment() { return 1; }\n'
+            + function.group()
+            + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
+        )
+        env = dict(
+            os.environ,
+            ROOT=str(root),
+            BIN=str(compiler),
+            ELISA_STAGE1_CACHE="1",
+            SOURCE_INPUT=str(source),
+        )
+        result = subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
+        return result.stdout
+
+    def fake_dependency_compiler(self, compiler, source):
+        compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$SOURCE_INPUT" > "$4"\n')
+        compiler.chmod(0o755)
+        source.write_text("def main() -> i64: return 42\n")
+        Path(f"{compiler}.provenance.json").write_text('{"schema":"elisa-stage1-provenance-v5"}\n')
 
     def publish(self):
         self.assertTrue(cache.publish(self.entry, self.source, "key"))
@@ -76,6 +106,7 @@ class CacheIntegrityTest(unittest.TestCase):
         compiler = self.source.parent / "fake-compiler"
         compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$MISSING_DEPENDENCY" > "$4"\n')
         compiler.chmod(0o755)
+        Path(f"{compiler}.provenance.json").write_text('{"schema":"elisa-stage1-provenance-v5"}\n')
         script = 'set -uo pipefail\ndriver_args=(source.elisa -o output.o)\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nif stage1_cache_prepare; then exit 9; fi\n'
         env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", MISSING_DEPENDENCY=str(self.source.parent / "missing.elisa"))
         result = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
@@ -88,10 +119,8 @@ class CacheIntegrityTest(unittest.TestCase):
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
         self.assertIsNotNone(function)
         compiler = self.source.parent / "fake-compiler"
-        compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$SOURCE_INPUT" > "$4"\n')
-        compiler.chmod(0o755)
+        self.fake_dependency_compiler(compiler, self.source.parent / "source.elisa")
         source = self.source.parent / "source.elisa"
-        source.write_bytes(b"def main() -> i64: return 42\n")
         profile = self.source.parent / "profile.elisa"
         script = 'set -uo pipefail\ndriver_args=("$SOURCE_INPUT" -o output.o -fprofile-use "$PROFILE_INPUT")\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
         env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", SOURCE_INPUT=str(source), PROFILE_INPUT=str(profile))
@@ -106,6 +135,36 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertNotEqual(*keys)
         profile.unlink()
         self.assertEqual(subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode, 7)
+
+    def test_same_path_llvm_replacement_changes_cache_identity(self):
+        compiler = self.source.parent / "fake-compiler"
+        source = self.source.parent / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        library = self.source.parent / "libLLVM.dylib"
+        library.write_bytes(b"LLVM shared library v1")
+        manifest = Path(f"{compiler}.provenance.json")
+
+        def record_toolchain():
+            toolchain = {
+                "link_libraries": [{
+                    "path": str(library.resolve()),
+                    "sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
+                }],
+            }
+            manifest.write_text(json.dumps({"schema": "elisa-stage1-provenance-v5", "llvm_toolchain": toolchain}))
+
+        record_toolchain()
+        first_key = self.cache_key(compiler, source)
+        before = library.stat()
+        library.write_bytes(b"LLVM shared library v2")
+        os.utime(library, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = library.stat()
+        self.assertEqual(after.st_size, before.st_size)
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+        record_toolchain()
+        second_key = self.cache_key(compiler, source)
+        self.assertNotEqual(first_key, second_key)
 
     def test_contract_override_participates_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent
