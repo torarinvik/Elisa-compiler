@@ -26,6 +26,8 @@ POSITIVE = HERE / "backend_zip_map_bounds.elisa"
 NEGATIVE = HERE / "backend_zip_map_bounds_rejected.elisa"
 POSITIVE_NAMES = {
     "zip_index_is_inside_every_view",
+    "zip_loop_initial_index_is_within_destination",
+    "zip_loop_step_preserves_all_view_bounds",
     "source_count_guard_accepts_a_covering_view",
     "source_count_guard_rejects_a_short_view",
     "zero_destination_has_no_loop_index",
@@ -33,6 +35,7 @@ POSITIVE_NAMES = {
 NEGATIVE_NAMES = {
     "false_claim_short_source_covers_destination",
     "false_claim_source_guard_accepts_short_view",
+    "false_claim_zip_loop_step_stays_strictly_below_destination",
 }
 
 
@@ -132,6 +135,18 @@ if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(COLLEC
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:
     raise SystemExit("zip_map bounds proof inventory changed")
+positive_text = POSITIVE.read_text()
+expected_positive = {
+    "zip_loop_initial_index_is_within_destination": "def zip_loop_initial_index_is_within_destination(destination_count:u64)->bool:\nensure result==true\nreturn 0<=destination_count",
+    "zip_loop_step_preserves_all_view_bounds": "def zip_loop_step_preserves_all_view_bounds(index:u64,destination_count:u64,source1_count:u64,source2_count:u64)->bool:\nrequires index<destination_count\nrequires destination_count<=source1_count and destination_count<=source2_count\nensure result==true\nreturn index+1<=destination_count and index+1<=source1_count and index+1<=source2_count",
+}
+for name, expected in expected_positive.items():
+    if compact(function_section(positive_text, name)) != compact(expected):
+        raise SystemExit(f"zip_map loop invariant theorem {name} changed")
+negative_text = NEGATIVE.read_text()
+expected_negative = "def false_claim_zip_loop_step_stays_strictly_below_destination(index:u64,destination_count:u64)->bool:\nrequires index<destination_count\nrequires index+1==destination_count\nensure result==true\nreturn index+1<destination_count"
+if compact(function_section(negative_text, "false_claim_zip_loop_step_stays_strictly_below_destination")) != compact(expected_negative):
+    raise SystemExit("zip_map loop-step negative control changed")
 if 'include "./backend_zip_map_bounds.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the admitted zip_map bounds proof")
 
