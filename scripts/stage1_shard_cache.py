@@ -159,6 +159,20 @@ def sync_directory(path):
         os.close(fd)
 
 
+def open_private_exclusive(path):
+    """Create a binary file that stays private when atomically published."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        # O_CREAT's mode is umask-filtered. These files can be renamed into the
+        # caller's output paths, so retain mkstemp's private mode explicitly.
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
 def synced_copy(source, target, limit=MAX_BYTES):
     with Path(source).open("rb") as src, Path(target).open("xb") as dst:
         size = 0
@@ -180,7 +194,7 @@ def copy_fingerprint(source, target, *, allow_empty=False, limit=MAX_BYTES):
         before = os.fstat(src.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("artifact is not a regular file")
-        with Path(target).open("xb") as dst:
+        with open_private_exclusive(target) as dst:
             while block := src.read(1024 * 1024):
                 size += len(block)
                 if size > limit:

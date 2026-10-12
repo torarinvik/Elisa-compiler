@@ -70,6 +70,8 @@ class ShardCacheTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), self.files["object"].read_bytes())
         self.assertEqual(self.err.read_bytes(), b"optimization remark\n")
         self.assertEqual(self.out.read_bytes(), b"")
+        for restored in (self.output, self.out, self.err):
+            self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
 
     def test_options_and_actual_artifacts_invalidate(self):
         for key in shard.FIELDS - {"logical_shards", "logical_shard", "opt_pipeline", "codegen_opt", "producer_discovery_version", "llvm_discovery_version", "resolved_output_policy", "coverage_policy", "pgo_policy"}:
