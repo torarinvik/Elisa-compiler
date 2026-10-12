@@ -29,7 +29,10 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 WORK="$(mktemp -d)"
 source "$REPO_ROOT/scripts/benchmark_host_lock.sh"
-trap 'elisa_benchmark_lock_release; rm -rf "$WORK"' EXIT INT TERM HUP
+trap 'elisa_benchmark_finish; rm -rf "$WORK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 elisa_benchmark_lock_acquire "$WORK"
 elisa_benchmark_host_qualification "$REPO_ROOT" "$WORK"
 elisa_benchmark_load_check "before resolving or building the compiler" 1
