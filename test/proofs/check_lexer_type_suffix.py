@@ -50,12 +50,11 @@ helper_text = HELPER.read_text()
 core_text = CORE.read_text()
 lexer_text = LEXER.read_text()
 helper = compact(function_section(helper_text, "is_valid_type_suffix"))
-exact_match = 'when suffix: ' + " | ".join(f'"{spelling}"' for spelling in SUPPORTED) + " -> true _ -> false"
-if compact(f"ensure result == ({exact_match})") not in helper:
+exact_predicate = " or ".join(f'suffix == "{spelling}"' for spelling in SUPPORTED)
+if compact(f"ensure result == ({exact_predicate})") not in helper:
     raise SystemExit("production suffix contract no longer characterizes the complete accepted set")
-expected_table = 'return when suffix: ' + " | ".join(f'"{spelling}"' for spelling in SUPPORTED) + " -> true _ -> false"
-if compact(expected_table) not in helper:
-    raise SystemExit("production suffix decision table differs from the exact contract")
+if compact(f"return ({exact_predicate})") not in helper:
+    raise SystemExit("production suffix decision expression differs from the exact contract")
 if 'include "./lexer_type_suffix.elisa"' not in core_text:
     raise SystemExit("lexer core no longer imports the proved suffix grammar")
 if 'include "./lexer_core.elisa"' not in lexer_text:
@@ -82,7 +81,7 @@ if "valid:bool=when suffix:" in reader:
 positive_text = POSITIVE.read_text()
 exact_proof = (
     f"def type_suffix_predicate_is_exact(suffix: sview) -> bool: "
-    f"ensure result == ({exact_match}) "
+    f"ensure result == ({exact_predicate}) "
     "return LexerTypeSuffix::is_valid_type_suffix(suffix)"
 )
 if compact(function_section(positive_text, "type_suffix_predicate_is_exact")) != compact(exact_proof):
