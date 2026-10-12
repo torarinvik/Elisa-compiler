@@ -127,6 +127,21 @@ def every_boolean_flag_tuple_uses_the_exact_size_rule(is_mutex: bool, is_cond: b
 if compact(function_chunk(positive_text, "every_boolean_flag_tuple_uses_the_exact_size_rule")) != compact(expected_universal_theorem):
     raise SystemExit("universal theorem no longer proves the exact boolean size rule through the source model")
 
+expected_type_name_theorem = """
+def source_type_names_select_the_exact_inline_host_size(ctype: sview) -> i64 can[Abort.Panic]:
+    ensure result == (
+        when ctype:
+            "pthread_mutex_t" -> EXPECTED_PTHREAD_MUTEX_HOST_BYTES
+            "pthread_cond_t" -> EXPECTED_PTHREAD_COND_HOST_BYTES
+            "pthread_once_t" -> EXPECTED_PTHREAD_ONCE_HOST_BYTES
+            _ -> EXPECTED_UNKNOWN_OPAQUE_HOST_BYTES
+    )
+    can Abort.Panic:
+        return BackendOpaqueTypeSize::c_opaque_host_size_for_type(ctype)
+"""
+if compact(function_chunk(positive_text, "source_type_names_select_the_exact_inline_host_size")) != compact(expected_type_name_theorem):
+    raise SystemExit("source proof no longer universally connects C type names to exact inline host sizes")
+
 registration = compact(function_chunk(extern_text, "register_one_opaque_extern"))
 if registration.count("c_opaque_host_size(decorators,annotation_args)") != 1:
     raise SystemExit("opaque alias registration no longer consults the proved wrapper exactly once")
@@ -135,25 +150,36 @@ if "ifopaque_size<=0:" not in registration or "intern_array_type(ValueType{kind:
 
 positive_names = {
     "every_boolean_flag_tuple_uses_the_exact_size_rule",
+    "source_type_names_select_the_exact_inline_host_size",
     "supported_inline_opaque_types_have_exact_sizes",
     "no_supported_type_flag_uses_the_unknown_sentinel",
 }
 negative_names = {
     "mutex_flag_cannot_claim_pointer_size",
     "no_type_flags_cannot_guess_an_inline_size",
+    "condition_type_cannot_claim_mutex_host_size",
+    "unknown_type_cannot_claim_mutex_host_size",
 }
 declarations = lambda text: set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", text))
 if declarations(positive_text) != positive_names or declarations(negative_text) != negative_names:
     raise SystemExit("opaque host-size theorem inventory changed")
 source_include = 'include "../../src/backend/codegen_opaque_host_size.elisa"'
-if source_include not in positive_text or source_include not in negative_text:
-    raise SystemExit("positive and rejected proofs must each include the model source directly")
+type_source_include = 'include "../../src/backend/codegen_opaque_type_size.elisa"'
+if any(source_include not in text or type_source_include not in text for text in (positive_text, negative_text)):
+    raise SystemExit("positive and rejected proofs must each include the model and source type adapter directly")
 if 'include "./codegen_opaque_host_size.elisa"' in negative_text:
     raise SystemExit("rejected proof must not import the positive theorem module")
 if "BackendOpaqueHostSize::c_opaque_host_size_from_flags" not in positive_text:
     raise SystemExit("proof no longer invokes the production boolean size model")
-if 'include "../../src/backend/codegen_opaque_type_size.elisa"' in positive_text or 'include "../../src/backend/codegen_opaque_type_size.elisa"' in negative_text:
-    raise SystemExit("proof must not claim the unmodeled source-string adapter is replayed")
+if "BackendOpaqueTypeSize::c_opaque_host_size_for_type(ctype)" not in positive_text:
+    raise SystemExit("proof no longer invokes the production source-string adapter")
+negative_adapter_shapes = {
+    "condition_type_cannot_claim_mutex_host_size": "ensure result == true can Abort.Panic: return BackendOpaqueTypeSize::c_opaque_host_size_for_type(\"pthread_cond_t\") == BackendOpaqueHostSize::PTHREAD_MUTEX_HOST_BYTES",
+    "unknown_type_cannot_claim_mutex_host_size": "ensure result == true can Abort.Panic: return BackendOpaqueTypeSize::c_opaque_host_size_for_type(\"pthread_rwlock_t\") == BackendOpaqueHostSize::PTHREAD_MUTEX_HOST_BYTES",
+}
+for name, shape in negative_adapter_shapes.items():
+    if compact(shape) not in compact(function_chunk(negative_text, name)):
+        raise SystemExit(f"{name} no longer tests a false production adapter mapping")
 
 try:
     manifest = require_current_product(BIN, PROVER)
@@ -199,7 +225,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "source-pinned one-hot pthread inline opaque C size mapping and extern alias consumer",
+    "scope": "source-pinned C type-name adapter, one-hot pthread inline opaque C size model, and extern alias consumer",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_revision": manifest["proof"].get("head"),

@@ -26,7 +26,10 @@ correctness preflight, it uses the shared benchmark load gate and requires
 `load1 / logical_CPU <= 0.20`. Use `cross_language.sh` for qualified Linux timing. A closed
 gate writes `ABORTED.txt` without launching the preflight builds. The runner also holds the
 shared cross-language benchmark lock, so compiler timing suites cannot overlap on the host.
-Passing admission does not authorize timing. Before any timed pair, the runner still uses
+After correctness preflight, the load gate must remain under the same limit for 60 consecutive
+seconds before the first timed pair. A high sample or a polling gap over 1.5 seconds resets the
+window; if it does not pass within 15 minutes, the run aborts before timing. Passing admission
+does not authorize timing. Before any timed pair, the runner still uses
 isolated cache directories to verify exact parent/candidate
 stdout and diagnostics for both the original-source priming compile and the body edit,
 along with reuse reports and prior snapshot hashes for every workload. It then alternates arm

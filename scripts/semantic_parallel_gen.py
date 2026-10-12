@@ -925,10 +925,14 @@ def type_may_contain_reference(type_expression, aliases, structs):
         if not re.fullmatch(r"(?:\w+::)*\w+", expression):
             return True
         name = expression.rsplit("::", 1)[-1]
+        if name == "sview":
+            # sview is bitwise-copyable, but its data pointer can still refer into
+            # shared storage and outlive the object that owns that backing.
+            return True
         if name in COPY_VALUE_TYPE_NAMES:
             continue
         if name in visited:
-            return True
+            continue
         visited.add(name)
         candidates = aliases.get(name, ())
         if candidates:
@@ -1010,7 +1014,11 @@ def local_table_field_aliases(text, tables, table_field_types, type_aliases, str
             else expression_is_copy
             or bool(source_type and type_is_copy_value(source_type, type_aliases, struct_field_types))
         )
-        if source_is_copy:
+        if source_is_copy and not type_may_contain_reference(
+            source_type, type_aliases, struct_field_types
+        ) and (not expression_type or not type_may_contain_reference(
+            expression_type, type_aliases, struct_field_types
+        )):
             continue
         target = diagnostic_aliases if field_name == "diagnostics" else field_aliases
         target.add(target_name)
@@ -1023,8 +1031,9 @@ def local_table_field_aliases(text, tables, table_field_types, type_aliases, str
         changed = False
         for match in alias_assignment.finditer(text):
             target_name, source_name = match.group(1), match.group(2)
-            if type_is_copy_value(
-                local_types.get(target_name, ""), type_aliases, struct_field_types
+            target_type = local_types.get(target_name, "")
+            if type_is_copy_value(target_type, type_aliases, struct_field_types) and not type_may_contain_reference(
+                target_type, type_aliases, struct_field_types
             ):
                 continue
             if source_name in field_aliases and target_name not in field_aliases:
@@ -1438,6 +1447,43 @@ def argument_is_whole_table(argument, tables, aliases):
     return bool(re.fullmatch(r"\w+", expression) and expression in tables | aliases)
 
 
+def has_top_level_colon(expression):
+    """Whether a colon occurs outside nested value delimiters."""
+    stack = []
+    matching_open = {")": "(", "]": "[", "}": "{"}
+    for index, char in enumerate(expression):
+        if char in "([{":
+            stack.append(char)
+        elif char in matching_open:
+            if stack and stack[-1] == matching_open[char]:
+                stack.pop()
+        elif char == ":" and not stack:
+            previous = expression[index - 1] if index else ""
+            following = expression[index + 1] if index + 1 < len(expression) else ""
+            if previous != ":" and following != ":":
+                return True
+    return False
+
+
+def return_value_before_guard(expression):
+    """Discard only a no-else postfix guard; retain both arms of a value ternary."""
+    stack = []
+    matching_open = {")": "(", "]": "[", "}": "{"}
+    guard_index = None
+    for index, char in enumerate(expression):
+        if char in "([{":
+            stack.append(char)
+        elif char in matching_open:
+            if stack and stack[-1] == matching_open[char]:
+                stack.pop()
+        elif not stack:
+            if expression.startswith(" if ", index) and guard_index is None:
+                guard_index = index
+            elif expression.startswith(" else ", index) and guard_index is not None:
+                return expression
+    return expression[:guard_index].strip() if guard_index is not None else expression
+
+
 def returned_expressions(text):
     """Yield inline returns and indented return-value blocks from one function body."""
     lines = text.splitlines()
@@ -1446,7 +1492,15 @@ def returned_expressions(text):
         if match is None:
             continue
         inline = line[match.end():].strip()
+        prefix = line[:match.start()].strip()
+        if prefix and re.match(r"if\b", inline):
+            yield prefix
+            continue
         base_indent = len(line) - len(line.lstrip())
+        if re.match(r"if\b", inline) and not has_top_level_colon(inline):
+            # Postfix guard form (`false return if condition`) has no returned
+            # expression; the return value precedes the keyword on this line.
+            continue
         parts = [inline] if inline else []
         value_block = not inline
         open_delimiters = []
@@ -1597,6 +1651,8 @@ def analyze(
                 for m in re.finditer(r"\bin\s+" + te + r"\.(\w+)(?:(?:\.\w+)|(?:\[[^\]\n]*\]))*\s*:", text):
                     if m.group(1) != "diagnostics":
                         writes.add("in:" + m.group(1))
+                if re.search(r"&\s*(?:\(\s*)*" + te + r"\b(?!\s*\.)", code_text):
+                    writes.add("ref:whole-table")
                 for m in re.finditer(r"&\s*" + te + r"\.(\w+)", code_text):
                     if m.start() not in immutable_borrow_starts:
                         writes.add("ref:" + m.group(1))
@@ -1623,7 +1679,9 @@ def analyze(
             # effectful so every caller's audited closure fails closed. Scalar field
             # copies remain safe to return.
             for returned_expression in returned_expressions(code_text):
-                expression = returned_expression.strip().rstrip(";").strip()
+                expression = return_value_before_guard(
+                    returned_expression.strip().rstrip(";").strip()
+                )
                 if argument_is_whole_table(expression, tables, table_aliases):
                     writes.add("returned-whole-table-alias")
                     continue
@@ -1725,6 +1783,10 @@ def analyze(
                 reads_diag = True
             for alias in sorted(field_aliases):
                 ae = re.escape(alias)
+                if alias in borrowed_field_aliases and re.search(
+                    r"(?:\(\s*)*\b" + ae + r"\b(?:\s*\))*\s*\.\s*cast\s*\[", code_text
+                ):
+                    writes.add("table-backed-address-cast")
                 alias_part = r"(?:\.\w+|\[[^\]\n]*\])"
                 alias_path = r"\b" + ae + alias_part + r"*"
                 if alias in borrowed_field_aliases and re.search(r"\b" + ae + r"\s*<-", text):

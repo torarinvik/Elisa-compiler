@@ -59,12 +59,19 @@ also revalidates the qualified affinity count, cgroup membership and namespace, 
 and quota files against the initial host qualification; any change fails closed. It checks this
 limit before starting preflight builds, so a closed gate does not launch the benchmark build
 matrix. This admission check does not establish correctness: exact correctness preflight is
-still required before timing. The runner then checks the same limit before the first and every
-later compile, build, and runtime sample, and again after each sample finishes. A pre-sample
-violation starts no sample; a post-sample violation lets the in-flight sample finish, writes
-`ABORTED.txt`, and prevents either completion marker from being written. Treat every partial
-artifact from that run as unusable. The load gate does not change the separate
-64-core x86_64 Linux qualification.
+still required before timing. After that preflight, the runner samples load once per second and
+requires the same limit to hold for 60 consecutive seconds before the first timed sample. An
+over-limit sample or a sampling gap longer than 1.5 seconds resets the window. If no qualifying
+window appears within 15 minutes, the runner aborts before timing. The runner then checks the
+same limit before every later compile, build, and runtime sample, and again after each sample
+finishes. A pre-sample violation starts no sample; a post-sample violation lets the in-flight
+sample finish, writes `ABORTED.txt`, and prevents either completion marker from being written.
+Treat every partial artifact from that run as unusable. The load gate does not change the
+separate 64-core x86_64 Linux qualification.
+
+The auxiliary `run.sh` and the paired incremental runner use the same 60-second admission
+after correctness preflight and before their first timed sample; their per-sample load checks
+remain in place.
 
 Release flags are recorded in `metadata.txt`. The default fast profile uses Elisa
 `-O3 -foverflow=wrap`, C `clang -O3`, Rust `-C opt-level=3` with the toolchain's default
@@ -309,3 +316,19 @@ The packed side-table helpers in that Elisa runtime object therefore use the run
 optimization level, while the analogous native helpers are compiled with each fixture's release
 flags. Packed workload timings compare the configured toolchains and their runtime boundaries;
 they do not isolate helpers compiled at an identical optimization level.
+
+## Paired compiler A/B runs
+
+Use `paired_cross_language.sh REFERENCE_STAGE1 CANDIDATE_STAGE1 [OUTPUT_DIR]` to compare two
+Stage1 compiler binaries against the same cross-language workloads. The runner first performs
+an untimed exact-correctness preflight with each compiler and requires identical canonical
+workload fingerprints before it starts any timed pair. It then runs full suites in A-B-B-A
+order for each block. Set `PAIRED_BLOCKS` to repeat that order; the ordinary `REPEAT` and
+`BUILD_REPEAT` settings control samples inside each suite.
+
+`paired_ab_summary.csv` reports candidate/reference ratios for Elisa compile, executable-build,
+and (unless `COMPILE_ONLY=1`) runtime wall and child CPU samples. Values below 1.0 mean the
+candidate was faster. `paired_ab_pairs.csv` keeps each A/B block's per-workload medians, and
+`paired_ab_report.json` records the fingerprints and run order. The individual suite directories
+retain raw samples and their host, source, toolchain, and compiler manifests. An aborted or
+incomplete suite prevents a paired report from being written.

@@ -19,6 +19,52 @@
 # none of them can invent one.
 extend Semantic:
     private:
+        # Exact identifier-position -> declaration identity index. Definition references are
+        # built by name resolution before this pass; bucket chains retain exact offset checks
+        # and avoid rescanning the full reference list for every call initializer.
+        struct BorrowResolvedCallTargets:
+            slots: mutable darray[u32] = []
+            positions: mutable darray[Ast::Pos] = []
+            declaration_ids: mutable darray[DeclId] = []
+            ambiguous: mutable darray[bool] = []
+
+        const BORROW_CALL_TARGET_NONE: u32 = 4294967295
+
+        def bam_definition_reference_hash(pos: Ast::Pos) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = (14695981039346656037 ^ pos.offset.u64()) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ pos.end_offset.u64()) * SEMANTIC_HASH_PRIME
+                return hash
+
+        def bam_build_definition_target_index(table: SymbolTable&) -> BorrowResolvedCallTargets:
+            can Memory.Allocate, Abort.Panic:
+                index: mutable BorrowResolvedCallTargets = BorrowResolvedCallTargets{}
+                capacity: mutable usize = 16
+                while capacity < table.definition_references.count * 2 |capacity|:
+                    capacity <- capacity * 2
+                index.slots.reserve(capacity)
+                for _ in 0..<capacity |index|:
+                    index.slots.push(0)
+                for reference in table.definition_references |index|:
+                    hash: u64 = bam_definition_reference_hash(reference.pos)
+                    slot: mutable usize = hash.usize() & (capacity - 1)
+                    duplicate: mutable bool = false
+                    while index.slots[slot] != 0 |slot, duplicate, index, reference|:
+                        row: usize = (index.slots[slot] - 1).usize()
+                        prior_pos: Ast::Pos = index.positions[row]
+                        if prior_pos.offset == reference.pos.offset and prior_pos.end_offset == reference.pos.end_offset:
+                            index.ambiguous[row] <- true if index.declaration_ids[row].value != reference.declaration_id.value
+                            duplicate <- true
+                            break
+                        slot <- (slot + 1) & (capacity - 1)
+                    if not duplicate:
+                        row: usize = index.positions.count
+                        index.positions.push(reference.pos)
+                        index.declaration_ids.push(reference.declaration_id)
+                        index.ambiguous.push(false)
+                        index.slots[slot] <- row.u32() + 1
+                return index
+
         # Where `name` sits in `names`, or `names.count` when it is absent.
         def bam_index_of(names: darray[sview]&, name: sview) -> usize:
             can Abort.Panic:
@@ -116,15 +162,83 @@ extend Semantic:
 
         # `r = lend(&o)`: a call to a single-reference-parameter function that returns a
         # reference can only hand back a borrow of that argument.
-        def bam_lend_owner(value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, borrow_names: darray[sview]&, borrow_fields: darray[sview]&, borrow_owners: darray[sview]&) -> sview:
+        def bam_definition_target(pos: Ast::Pos, index: BorrowResolvedCallTargets&) -> DeclId:
+            can Abort.Panic:
+                return DeclId{value: 4294967295} if index.slots.count == 0
+                hash: u64 = bam_definition_reference_hash(pos)
+                capacity: usize = index.slots.count
+                slot: mutable usize = hash.usize() & (capacity - 1)
+                while index.slots[slot] != 0 |slot, index, pos, capacity|:
+                    row: usize = (index.slots[slot] - 1).usize()
+                    reference_pos: Ast::Pos = index.positions[row]
+                    if reference_pos.offset == pos.offset and reference_pos.end_offset == pos.end_offset:
+                        return DeclId{value: 4294967295} if index.ambiguous[row]
+                        return index.declaration_ids[row]
+                    slot <- (slot + 1) & (capacity - 1)
+                return DeclId{value: 4294967295}
+
+        def bam_direct_callee_target(callee: Ast::Expr, index: BorrowResolvedCallTargets&) -> DeclId:
+            can Abort.Panic:
+                match callee:
+                    Expr.Ident(_, callee_pos):
+                        return bam_definition_target(callee_pos, index)
+                    _:
+                        return DeclId{value: 4294967295}
+
+        # Map the annotated extern formal to exactly one call argument. Named arguments use
+        # the formal spelling; positional arguments use the formal slot. Malformed or duplicate
+        # mappings are left unknown, so invalid calls cannot redirect a borrow to another owner.
+        def bam_extern_lend_argument_index(argument_count: usize, argument_names: darray[sview]&, formal_position: usize, formal_name: sview) -> i64:
+            can Abort.Panic:
+                matched: mutable i64 = -1
+                positional_position: mutable usize = 0
+                saw_named: mutable bool = false
+                argument_index: mutable usize = 0
+                while argument_index < argument_count |matched, positional_position, saw_named, argument_index|:
+                    argument_name: sview = argument_names[argument_index] if argument_index < argument_names.count else ""
+                    if argument_name != "":
+                        saw_named <- true
+                        if argument_name == formal_name:
+                            return -1 if matched >= 0
+                            matched <- argument_index.i64()
+                    else:
+                        return -1 if saw_named
+                        if positional_position == formal_position:
+                            return -1 if matched >= 0
+                            matched <- argument_index.i64()
+                        positional_position <- positional_position + 1
+                    argument_index <- argument_index + 1
+                return matched
+
+        def bam_extern_lend_owner(value: Ast::Expr, owners: darray[sview]&, borrow_names: darray[sview]&, borrow_fields: darray[sview]&, borrow_owners: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, _):
+                        target: DeclId = bam_direct_callee_target(callee, call_targets)
+                        "" return if target.value == 4294967295
+                        lender_slot: mutable usize = extern_lend_ids.count
+                        for index in 0..<extern_lend_ids.count |lender_slot, target, extern_lend_ids|:
+                            if extern_lend_ids[index].value == target.value:
+                                return "" if lender_slot < extern_lend_ids.count
+                                lender_slot <- index
+                        "" return if lender_slot >= extern_lend_ids.count or lender_slot >= extern_lend_positions.count or lender_slot >= extern_lend_names.count
+                        argument_index: i64 = bam_extern_lend_argument_index(arguments.count, argument_names, extern_lend_positions[lender_slot], extern_lend_names[lender_slot])
+                        "" return if argument_index < 0 or argument_index.usize() >= arguments.count
+                        return bam_value_owner(arguments[argument_index.usize()], owners, borrow_names, borrow_fields, borrow_owners)
+                    _:
+                        return ""
+
+        def bam_lend_owner(value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, borrow_names: darray[sview]&, borrow_fields: darray[sview]&, borrow_owners: darray[sview]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&) -> sview:
             can Memory.Allocate, Abort.Panic:
                 match value:
                     Expr.Call(lend_callee, lend_arguments, lend_labels, lend_pos):
+                        target: DeclId = bam_direct_callee_target(lend_callee, call_targets)
+                        "" return if target.value == 4294967295
                         slot: usize = bam_index_of(lend_names, ident_name_of(lend_callee))
-                        "" return if slot >= lend_names.count
-                        position: usize = lend_positions[slot]
-                        "" return if position >= lend_arguments.count
-                        return bam_value_owner(lend_arguments[position], owners, borrow_names, borrow_fields, borrow_owners)
+                        if slot < lend_names.count and slot < lend_positions.count:
+                            position: usize = lend_positions[slot]
+                            return bam_value_owner(lend_arguments[position], owners, borrow_names, borrow_fields, borrow_owners) if position < lend_arguments.count
+                        return bam_extern_lend_owner(value, owners, borrow_names, borrow_fields, borrow_owners, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets)
                     _:
                         return ""
 
@@ -209,11 +323,11 @@ extend Semantic:
         # An annotation that is not a reference (`y: K = r`) copies the pointee instead, and
         # check_ref_value_copy reports that. Callers pass this decision directly so an
         # untyped assignment needs no placeholder annotation node.
-        def bam_bind(name: sview, holds_reference: bool, value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&) -> void:
+        def bam_bind(name: sview, holds_reference: bool, value: Ast::Expr, owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if not binders_bound_once(binders, name)
                 borrowed: mutable sview = bam_value_owner(value, owners, borrow_names, borrow_fields, borrow_owners)
-                borrowed <- bam_lend_owner(value, owners, lend_names, lend_positions, borrow_names, borrow_fields, borrow_owners) if borrowed == ""
+                borrowed <- bam_lend_owner(value, owners, lend_names, lend_positions, borrow_names, borrow_fields, borrow_owners, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets) if borrowed == ""
                 if borrowed != "":
                     bam_push_borrow(borrow_names, borrow_fields, borrow_owners, name, "", borrowed) if holds_reference
                     return
@@ -225,7 +339,7 @@ extend Semantic:
                     _:
                         pass
 
-        def bam_statements(statements: darray[Ast::Stmt], owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, kinds: mutable darray[u32]&, details: mutable darray[sview]&, flow: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+        def bam_statements(statements: darray[Ast::Stmt], owners: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, binders: BorrowBinders&, borrow_names: mutable darray[sview]&, borrow_fields: mutable darray[sview]&, borrow_owners: mutable darray[sview]&, kinds: mutable darray[u32]&, details: mutable darray[sview]&, flow: mutable darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |borrow_names, borrow_fields, borrow_owners, kinds, details, flow, table| -> table:
                     # Everything after a return/break/continue is unreachable.
@@ -237,7 +351,7 @@ extend Semantic:
                             declared_move: sview = bam_moved_owner(declared_value, owners)
                             table <- bam_expression(declared_value, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table) if declared_move == ""
                             bam_set_consumed(owners, kinds, details, declared_move, 2, declared_name)
-                            bam_bind(declared_name, rvc_is_absent(declared_type) or affine_annotation_is_ref(declared_type), declared_value, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners)
+                            bam_bind(declared_name, rvc_is_absent(declared_type) or affine_annotation_is_ref(declared_type), declared_value, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners)
                         Stmt.Assign(assign_target, assign_operator, assign_value, assign_pos):
                             assign_name: sview = ident_name_of(assign_target)
                             table <- bam_expression(assign_target, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table) if assign_name == ""
@@ -253,7 +367,7 @@ extend Semantic:
                                 bam_set_consumed(owners, kinds, details, assign_name, 0, "") if assign_name != assign_move
                             else:
                                 bam_set_consumed(owners, kinds, details, assign_move, 2, assign_name)
-                                bam_bind(assign_name, true, assign_value, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners)
+                                bam_bind(assign_name, true, assign_value, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners)
                         Stmt.Return(returned_option, returned_pos):
                             if returned_option is returned_expression:
                                 table <- bam_expression(returned_expression, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table) if bam_moved_owner(returned_expression, owners) == ""
@@ -272,8 +386,8 @@ extend Semantic:
                             then_details.extend(details)
                             else_kinds.extend(kinds)
                             else_details.extend(details)
-                            table <- bam_statements(branch_then, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, then_kinds, then_details, then_flow, table)
-                            table <- bam_statements(branch_else, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, else_kinds, else_details, else_flow, table)
+                            table <- bam_statements(branch_then, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, then_kinds, then_details, then_flow, table)
+                            table <- bam_statements(branch_else, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, else_kinds, else_details, else_flow, table)
                             bam_merge(kinds, details, then_kinds, then_details) if not then_flow[0]
                             bam_merge(kinds, details, else_kinds, else_details) if not else_flow[0]
                             flow[0] <- true if then_flow[0] and else_flow[0] and branch_else.count > 0
@@ -284,7 +398,7 @@ extend Semantic:
                             loop_flow: mutable darray[bool] = [false]
                             loop_kinds.extend(kinds)
                             loop_details.extend(details)
-                            table <- bam_statements(loop_body, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, loop_kinds, loop_details, loop_flow, table)
+                            table <- bam_statements(loop_body, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, loop_kinds, loop_details, loop_flow, table)
                             bam_merge(kinds, details, loop_kinds, loop_details) if not loop_flow[0]
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
                             table <- bam_expression(for_iterable, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
@@ -293,7 +407,7 @@ extend Semantic:
                             each_flow: mutable darray[bool] = [false]
                             each_kinds.extend(kinds)
                             each_details.extend(details)
-                            table <- bam_statements(for_body, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, each_kinds, each_details, each_flow, table)
+                            table <- bam_statements(for_body, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, each_kinds, each_details, each_flow, table)
                             bam_merge(kinds, details, each_kinds, each_details) if not each_flow[0]
                         Stmt.Match(match_scrutinee, match_arms, match_pos):
                             table <- bam_expression(match_scrutinee, owners, borrow_names, borrow_fields, borrow_owners, kinds, details, table)
@@ -308,7 +422,7 @@ extend Semantic:
                                 arm_flow: mutable darray[bool] = [false]
                                 arm_kinds.extend(pre_kinds)
                                 arm_details.extend(pre_details)
-                                table <- bam_statements(match_arm.body, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, arm_kinds, arm_details, arm_flow, table)
+                                table <- bam_statements(match_arm.body, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, arm_kinds, arm_details, arm_flow, table)
                                 if not arm_flow[0]:
                                     bam_merge(kinds, details, arm_kinds, arm_details)
                                     open_arms <- open_arms + 1
@@ -321,14 +435,14 @@ extend Semantic:
                         Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
                             block_inline: bool = block_kind == "can" or block_kind == "trusted" or block_kind == "region" or block_kind == "in" or block_kind == "with" or block_kind == "nursery" or block_kind == "pool" or block_kind == "static"
                             if block_inline:
-                                table <- bam_statements(block_body, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, table)
+                                table <- bam_statements(block_body, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, table)
                             else:
                                 block_kinds: mutable darray[u32] = []
                                 block_details: mutable darray[sview] = []
                                 block_flow: mutable darray[bool] = [false]
                                 block_kinds.extend(kinds)
                                 block_details.extend(details)
-                                table <- bam_statements(block_body, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, block_kinds, block_details, block_flow, table)
+                                table <- bam_statements(block_body, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, block_kinds, block_details, block_flow, table)
                                 bam_merge(kinds, details, block_kinds, block_details) if not block_flow[0]
                         _:
                             pass
@@ -1212,6 +1326,8 @@ extend Semantic:
                 visited.push(type_id)
                 kind: SemTypeKind = interned_kind(type_id, table)
                 return true if kind == SemTypeKind.Ref
+                return true if kind == SemTypeKind.String and interned_name(type_id, table) == "sview"
+                return true if kind == SemTypeKind.Container and interned_name(type_id, table) == "view"
                 if kind == SemTypeKind.Tuple or kind == SemTypeKind.Optional:
                     element_position: mutable u32 = 0
                     while element_position < interned_elem_count(type_id, table) |element_position, visited|:
@@ -1240,6 +1356,86 @@ extend Semantic:
                         return true if table.enum_payload_owner[payload_index] == owner and bam_type_contains_reference(table.enum_payload_type_id[payload_index], visited, table)
                         payload_index <- payload_index + 1
                 return false
+
+        # Return true only when the structural type proves that it cannot contain a
+        # reference. Named and unrecognized aggregate types remain unknown: their owner
+        # can be module-qualified, but a bare interned name has lost that identity here.
+        def bam_type_is_proven_reference_free(type_id: u32, visited: mutable dict[u32, bool]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return false if type_id == 0
+                return true if visited.get(type_id) is already_seen
+                visited <- visited.put(type_id, true) can Global{Read,Write}
+                kind: SemTypeKind = interned_kind(type_id, table)
+                return true if kind == SemTypeKind.Int or kind == SemTypeKind.Float or kind == SemTypeKind.Bool or kind == SemTypeKind.Char
+                return interned_name(type_id, table) == "dstr" if kind == SemTypeKind.String
+                return false if kind == SemTypeKind.Ref or kind == SemTypeKind.Region or kind == SemTypeKind.Named or kind == SemTypeKind.Unknown
+                if kind == SemTypeKind.Optional or kind == SemTypeKind.Tuple:
+                    element_position: mutable u32 = 0
+                    while element_position < interned_elem_count(type_id, table) |element_position, visited|:
+                        return false if not bam_type_is_proven_reference_free(interned_elem(type_id, element_position, table), visited, table)
+                        element_position <- element_position + 1
+                    return true
+                if kind == SemTypeKind.Container:
+                    container_name: sview = interned_name(type_id, table)
+                    return false if container_name == "view" or interned_elem_count(type_id, table) == 0
+                    return false if container_name != "darray" and container_name != "array" and container_name != "set" and container_name != "dict" and container_name != "list"
+                    element_position: mutable u32 = 0
+                    while element_position < interned_elem_count(type_id, table) |element_position, visited|:
+                        return false if not bam_type_is_proven_reference_free(interned_elem(type_id, element_position, table), visited, table)
+                        element_position <- element_position + 1
+                    return true
+                return false
+
+        def bam_type_is_proven_reference_free_cached(type_id: u32, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                if reference_sites.type_reference_free.get(type_id) is cached_result:
+                    return cached_result
+                visited: mutable dict[u32, bool] = {}
+                result: bool = bam_type_is_proven_reference_free(type_id, visited, table)
+                reference_sites.type_reference_free <- reference_sites.type_reference_free.put(type_id, result) can Global{Read,Write}
+                return result
+
+        def bam_binding_type_hash(binding_id: BindingId) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = (14695981039346656037 ^ binding_id.owner.value.u64()) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ binding_id.serial) * SEMANTIC_HASH_PRIME
+                return hash
+
+        # Build the exact-binding type index once, then read only the matching hash chain.
+        # Full IDs are always compared after hashing; duplicate conflicting declarations
+        # degrade to unknown instead of selecting one shadowed or inconsistent row.
+        def bam_binding_declared_type_id(binding_id: BindingId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                while reference_sites.binding_type_indexed_count < table.binding_declared_types.count and reference_sites.binding_type_indexed_count < SYMBOL_INDEX_ROW_NONE.usize() |binding_id, reference_sites, table|:
+                    declared: BindingDeclaredType = table.binding_declared_types[reference_sites.binding_type_indexed_count]
+                    hash: u64 = bam_binding_type_hash(declared.binding_id)
+                    head: u32 = SYMBOL_INDEX_ROW_NONE
+                    if reference_sites.binding_type_heads.get(hash) is existing_head:
+                        head <- existing_head
+                    reference_sites.binding_type_next.push(head)
+                    reference_sites.binding_type_heads <- reference_sites.binding_type_heads.put(hash, reference_sites.binding_type_indexed_count.u32()) can Global{Read,Write}
+                    reference_sites.binding_type_indexed_count <- reference_sites.binding_type_indexed_count + 1
+                hash: u64 = bam_binding_type_hash(binding_id)
+                if reference_sites.binding_type_heads.get(hash) is head:
+                    found: mutable bool = false
+                    type_id: mutable u32 = 0
+                    row: mutable u32 = head
+                    while row != SYMBOL_INDEX_ROW_NONE |row, binding_id, reference_sites, table, found, type_id|:
+                        declared: BindingDeclaredType = table.binding_declared_types[row.usize()]
+                        if ownership_binding_ids_equal(declared.binding_id, binding_id):
+                            return 0 if found and type_id != declared.type_id
+                            type_id <- declared.type_id
+                            found <- true
+                        row <- reference_sites.binding_type_next[row.usize()]
+                    return type_id if found
+                return 0
+
+        # Unknown declarations stay conservative. A proven scalar source should not
+        # become a reference alias just because it appears in a closure-local assignment.
+        def bam_binding_may_carry_reference(binding_id: BindingId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                type_id: u32 = bam_binding_declared_type_id(binding_id, reference_sites, table)
+                return not bam_type_is_proven_reference_free_cached(type_id, reference_sites, table)
 
         # An INTERIOR place (`out.p`, `out[i]`) -- writing one publishes through the target's
         # own storage. A bare `p <- ...` writes the POINTEE of a reference parameter, which is
@@ -1912,7 +2108,6 @@ extend Semantic:
         def bam_store_local_alias_add_root(alias_id: BindingId, root_id: BindingId, root_kind: u8, root_name: sview, root_known: bool, facts: mutable darray[BorrowLocalCallableAliasRoot]&) -> bool:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 false return if root_name == ""
-                false return if any prior in facts where ownership_binding_ids_equal(prior.alias_binding_id, alias_id) and ownership_binding_ids_equal(prior.root_binding_id, root_id) and prior.root_binding_kind == root_kind and prior.root_binding_known == root_known
                 facts.push(BorrowLocalCallableAliasRoot{alias_binding_id: alias_id, root_binding_id: root_id, root_binding_kind: root_kind, root_name: root_name, root_binding_known: root_known})
                 return true
 
@@ -1921,15 +2116,76 @@ extend Semantic:
                 unknown_id: BindingId = BindingId{owner: DeclId{value: INVALID_DECL_ID_VALUE}, serial: FIRST_BINDING_SERIAL}
                 return bam_store_local_alias_add_root(alias_id, unknown_id, BORROW_LOCAL_ALIAS_UNKNOWN_ROOT_KIND, "<unknown-local-alias>", false, facts)
 
+        def bam_store_local_alias_binding_hash(binding_id: BindingId) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = (14695981039346656037 ^ binding_id.owner.value.u64()) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ binding_id.serial) * SEMANTIC_HASH_PRIME
+                return hash
+
+        def bam_store_local_alias_edge_hash(alias_id: BindingId, source_id: BindingId) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = (14695981039346656037 ^ bam_store_local_alias_binding_hash(source_id)) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ bam_store_local_alias_binding_hash(alias_id)) * SEMANTIC_HASH_PRIME
+                return hash
+
+        def bam_store_local_alias_root_hash(alias_id: BindingId, root_id: BindingId, root_kind: u8, root_known: bool) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = bam_store_local_alias_binding_hash(alias_id)
+                hash <- (hash ^ bam_store_local_alias_binding_hash(root_id)) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ root_kind.u64()) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ (1.u64() if root_known else 0.u64())) * SEMANTIC_HASH_PRIME
+                return hash
+
+        # Collision-safe fact insertion for the indexed worklist. Hashes select a chain;
+        # complete BindingIds and root metadata decide equality.
+        def bam_store_local_alias_graph_add_root(graph: mutable BorrowLocalCallableAliasGraph&, alias_id: BindingId, root_id: BindingId, root_kind: u8, root_name: sview, root_known: bool) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                hash: u64 = bam_store_local_alias_root_hash(alias_id, root_id, root_kind, root_known)
+                head: u32 = SYMBOL_INDEX_ROW_NONE
+                if graph.root_heads.get(hash) is found_head:
+                    head <- found_head
+                    row: mutable u32 = head
+                    while row != SYMBOL_INDEX_ROW_NONE |row, graph, alias_id, root_id, root_kind, root_known|:
+                        prior: BorrowLocalCallableAliasRoot = graph.roots[row.usize()]
+                        false return if ownership_binding_ids_equal(prior.alias_binding_id, alias_id) and ownership_binding_ids_equal(prior.root_binding_id, root_id) and prior.root_binding_kind == root_kind and prior.root_binding_known == root_known
+                        row <- graph.root_next[row.usize()]
+                row_index: u32 = graph.roots.count.u32()
+                graph.roots.push(BorrowLocalCallableAliasRoot{alias_binding_id: alias_id, root_binding_id: root_id, root_binding_kind: root_kind, root_name: root_name, root_binding_known: root_known})
+                graph.root_next.push(head)
+                graph.root_heads <- graph.root_heads.put(hash, row_index) can Global{Read,Write}
+                return true
+
+        def bam_store_local_alias_graph_add_edge(graph: mutable BorrowLocalCallableAliasGraph&, edge: BorrowLocalCallableAliasEdge) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                source_hash: u64 = bam_store_local_alias_binding_hash(edge.source_binding_id)
+                pair_hash: u64 = bam_store_local_alias_edge_hash(edge.alias_binding_id, edge.source_binding_id)
+                source_head: u32 = SYMBOL_INDEX_ROW_NONE
+                if graph.edge_heads.get(source_hash) is found_head:
+                    source_head <- found_head
+                pair_head: u32 = SYMBOL_INDEX_ROW_NONE
+                if graph.edge_pair_heads.get(pair_hash) is found_head:
+                    pair_head <- found_head
+                    row: mutable u32 = pair_head
+                    while row != SYMBOL_INDEX_ROW_NONE |row, graph, edge|:
+                        prior: BorrowLocalCallableAliasEdge = graph.edges[row.usize()]
+                        return if ownership_binding_ids_equal(prior.source_binding_id, edge.source_binding_id) and ownership_binding_ids_equal(prior.alias_binding_id, edge.alias_binding_id)
+                        row <- graph.edge_pair_next[row.usize()]
+                row_index: u32 = graph.edges.count.u32()
+                graph.edges.push(edge)
+                graph.edge_next.push(source_head)
+                graph.edge_pair_next.push(pair_head)
+                graph.edge_heads <- graph.edge_heads.put(source_hash, row_index) can Global{Read,Write}
+                graph.edge_pair_heads <- graph.edge_pair_heads.put(pair_hash, row_index) can Global{Read,Write}
+
         def bam_store_local_alias_add_edge(alias_id: BindingId, source_id: BindingId, edges: mutable darray[BorrowLocalCallableAliasEdge]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if ownership_binding_ids_equal(alias_id, source_id)
-                return if any prior in edges where ownership_binding_ids_equal(prior.alias_binding_id, alias_id) and ownership_binding_ids_equal(prior.source_binding_id, source_id)
                 edges.push(BorrowLocalCallableAliasEdge{alias_binding_id: alias_id, source_binding_id: source_id})
 
-        # Resolve closure aliases by lexical BindingIds. One AST pass collects direct
-        # roots and alias edges; the worklist propagates roots through chains regardless
-        # of source order. Nested lambdas are scanned separately by the expression walker.
+        # Resolve closure aliases by lexical BindingIds. One AST pass appends root and
+        # edge facts without repeated scans; collision-safe hash chains deduplicate roots
+        # and index edges before the worklist propagates roots independent of source order.
+        # Nested lambdas are scanned separately by the expression walker.
         def bam_store_local_alias_value(alias_id: BindingId, value: Ast::Expr, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, facts: mutable darray[BorrowLocalCallableAliasRoot]&, edges: mutable darray[BorrowLocalCallableAliasEdge]&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 direct_root: sview = bam_borrow_root(value)
@@ -1942,23 +2198,20 @@ extend Semantic:
                 match value:
                     Expr.Ident(_, position):
                         source_known, source_id = borrow_reference_site_binding(reference_sites, owner, position, table)
-                        if source_known:
+                        if source_known and bam_binding_may_carry_reference(source_id, reference_sites, table):
                             bam_store_local_alias_add_edge(alias_id, source_id, edges)
                     Expr.Call(callee, arguments, argument_names, _):
                         callee_name: mutable sview = ""
-                        callee_position: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
                         callee_kind: mutable u8 = 0
                         bare_callee: mutable bool = false
                         qualified_callee: mutable bool = false
                         match callee:
                             Expr.Ident(name, position):
                                 callee_name <- name
-                                callee_position <- position
                                 callee_kind <- borrow_reference_site_kind(reference_sites, owner, position, table)
                                 bare_callee <- true
                             Expr.Scope(_, name, position) | Expr.Field(_, name, position):
                                 callee_name <- name
-                                callee_position <- position
                                 qualified_callee <- true
                             _:
                                 pass
@@ -1966,12 +2219,19 @@ extend Semantic:
                         if bare_callee and callee_kind == 0 and not has_named_arguments:
                             # Exact positional summaries retain the narrow, resolved path.
                             lender_index: mutable usize = 0
+                            matched_lender: mutable bool = false
                             while lender_index < lend_names.count and lender_index < lend_positions.count |lender_index, alias_id, arguments, callee_name, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
                                 if lend_names[lender_index] == callee_name:
+                                    matched_lender <- true
                                     argument_index: usize = lend_positions[lender_index]
                                     if argument_index < arguments.count:
                                         bam_store_local_alias_value(alias_id, arguments[argument_index], owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+                                    else:
+                                        bam_store_local_alias_add_unknown_root(alias_id, facts)
                                 lender_index <- lender_index + 1
+                            if not matched_lender:
+                                return_type_id: u32 = function_return_type_id(table, callee_name)
+                                bam_store_local_alias_add_unknown_root(alias_id, facts) if not bam_type_is_proven_reference_free_cached(return_type_id, reference_sites, table)
                         else:
                             known_lender: bool = callee_name != "" and (any lender_name in lend_names where lender_name == callee_name)
                             if known_lender:
@@ -1985,8 +2245,14 @@ extend Semantic:
                                         bam_store_local_alias_value(alias_id, receiver, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                                     _:
                                         pass
-                            elif (bare_callee and callee_kind == 2) or qualified_callee or not bare_callee:
-                                # A local callable, method, qualified call, or computed callee
+                            elif bare_callee and callee_kind == 0:
+                                # Named direct calls can also return a borrowed aggregate.
+                                # Use the unique concrete return type when possible; unresolved
+                                # schemes and Named rows stay conservative.
+                                return_type_id: u32 = function_return_type_id(table, callee_name)
+                                bam_store_local_alias_add_unknown_root(alias_id, facts) if not bam_type_is_proven_reference_free_cached(return_type_id, reference_sites, table)
+                            elif (bare_callee and callee_kind != 0) or qualified_callee or not bare_callee:
+                                # A local or parameter callable, method, qualified call, or computed callee
                                 # can return a captured/local reference without a usable
                                 # lender summary. Keep argument/receiver roots and add an
                                 # explicit maybe-local marker for a later global-store check.
@@ -2017,7 +2283,7 @@ extend Semantic:
                         bam_store_local_alias_value(alias_id, block_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                     Expr.Match(scrutinee, arms, match_pos) | Expr.Catch(scrutinee, arms, match_pos):
                         for arm in arms |alias_id, scrutinee, match_pos, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
-                            bam_store_local_alias_pattern(arm.pattern, scrutinee, match_pos, true, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+                            bam_store_local_alias_pattern_bindings(arm.pattern, scrutinee, arm_report_pos(arm, match_pos.line), owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                             bam_store_local_alias_statements(arm.body, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                             if arm.body.count > 0:
                                 match arm.body[arm.body.count - 1]:
@@ -2028,39 +2294,6 @@ extend Semantic:
                                             bam_store_local_alias_value(alias_id, arm_return_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                                     _:
                                         pass
-                    _:
-                        pass
-
-        # Whole-value pattern bindings retain exact provenance. Destructuring projections
-        # may select a reference from an opaque aggregate, so bind those names to a
-        # conservative marker instead of silently treating them as non-aliases.
-        def bam_store_local_alias_pattern_name(name: sview, value: Ast::Expr, position: Ast::Pos, whole_value: bool, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, facts: mutable darray[BorrowLocalCallableAliasRoot]&, edges: mutable darray[BorrowLocalCallableAliasEdge]&) -> void:
-            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
-                binder_position: Ast::Pos = source_binder_position(table, name, position.line, 0, "__pattern_binder")
-                if binder_position.line > 0:
-                    binder_known, binder_id = borrow_reference_site_binding(reference_sites, owner, binder_position, table)
-                    if binder_known:
-                        if whole_value:
-                            bam_store_local_alias_value(binder_id, value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
-                        else:
-                            bam_store_local_alias_add_unknown_root(binder_id, facts)
-
-        def bam_store_local_alias_pattern(pattern: Ast::Pattern, value: Ast::Expr, position: Ast::Pos, whole_value: bool, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, facts: mutable darray[BorrowLocalCallableAliasRoot]&, edges: mutable darray[BorrowLocalCallableAliasEdge]&) -> void:
-            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
-                match pattern:
-                    Pattern.Binding(name) | Pattern.TypeBind(_, name):
-                        bam_store_local_alias_pattern_name(name, value, position, whole_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
-                    Pattern.Rest(name):
-                        bam_store_local_alias_pattern_name(name, value, position, false, owner, reference_sites, table, lend_names, lend_positions, facts, edges) if name != ""
-                    Pattern.As(name, inner):
-                        bam_store_local_alias_pattern_name(name, value, position, whole_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
-                        bam_store_local_alias_pattern(inner, value, position, whole_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
-                    Pattern.Or(options):
-                        for option in options |value, position, whole_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
-                            bam_store_local_alias_pattern(option, value, position, whole_value, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
-                    Pattern.Variant(_, children) | Pattern.Struct(_, children) | Pattern.Field(_, children) | Pattern.Tuple(children):
-                        for child in children |value, position, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
-                            bam_store_local_alias_pattern(child, value, position, false, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                     _:
                         pass
 
@@ -2105,6 +2338,153 @@ extend Semantic:
                     _:
                         pass
 
+        # Match-arm binders have resolver-recorded declaration positions and exact
+        # BindingIds. A whole-value binding can inherit the scrutinee's alias facts;
+        # projected/destructured bindings are conservatively unknown because this pass
+        # does not model field/variant projection types.
+        def bam_store_local_alias_pattern_binder_is_whole(pattern: Ast::Pattern, binder_name: sview) -> bool:
+            can Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.TypeBind(_, name):
+                        return name == binder_name
+                    Pattern.As(name, inner):
+                        return name == binder_name or bam_store_local_alias_pattern_binder_is_whole(inner, binder_name)
+                    Pattern.Or(options):
+                        return false if options.count == 0
+                        for option in options |binder_name|:
+                            return false if not bam_store_local_alias_pattern_binder_is_whole(option, binder_name)
+                        return true
+                    _:
+                        return false
+
+        def bam_store_local_alias_pattern_bindings(pattern: Ast::Pattern, scrutinee: Ast::Expr, arm_position: Ast::Pos, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, facts: mutable darray[BorrowLocalCallableAliasRoot]&, edges: mutable darray[BorrowLocalCallableAliasEdge]&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                arm_names: mutable darray[sview] = []
+                gather_arm_pattern(pattern, arm_names)
+                binder_positions: darray[Ast::Pos] = arm_pattern_binder_positions(table, pattern, arm_names, 0, arm_position)
+                pattern_index: mutable usize = 0
+                while pattern_index < arm_names.count |pattern_index, arm_names, binder_positions, scrutinee, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
+                    binder_name: sview = arm_names[pattern_index]
+                    if binder_name != "" and binder_name != "_":
+                        binder_position: Ast::Pos = binder_positions[pattern_index] if pattern_index < binder_positions.count else Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+                        binding_known, alias_id = borrow_reference_site_binding(reference_sites, owner, binder_position, table)
+                        if binding_known:
+                            whole_value: bool = bam_store_local_alias_pattern_binder_is_whole(pattern, binder_name)
+                            if whole_value:
+                                bam_store_local_alias_value(alias_id, scrutinee, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+                            else:
+                                bam_store_local_alias_add_unknown_root(alias_id, facts)
+                    pattern_index <- pattern_index + 1
+
+        # Resolve only types attached to the exact iterable binding. The global
+        # name-keyed type sidecar can describe a shadowed binding, so it is not safe
+        # for deciding whether a loop binder can carry a reference.
+        # Named TypeIds keep a bare spelling, not a module or generic-parameter identity.
+        # Resolve a field only when every same-named type declaration is this one Struct
+        # and the name is not a generic parameter of the function using the binding.
+        def bam_named_type_has_unique_struct_declaration(type_name: sview, owner: DeclId, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if owner.value == INVALID_DECL_ID_VALUE or owner.value.usize() >= table.symbols.count
+                owner_line: u32 = table.symbols[owner.value.usize()].line
+                return false if function_generic_param_named(table, owner_line, type_name)
+                found_struct: mutable bool = false
+                cursor: mutable u32 = symbol_chain_head(table, type_name)
+                while cursor != SYMBOL_INDEX_ROW_NONE |cursor, found_struct, table, type_name|:
+                    symbol: Symbol = table.symbols[cursor.usize()]
+                    if symbol.name == type_name and (symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum or symbol.kind == SymbolKind.Alias or symbol.kind == SymbolKind.Extern):
+                        return false if found_struct or symbol.kind != SymbolKind.Struct
+                        found_struct <- true
+                    cursor <- table.symbol_name_next[cursor.usize()]
+                return found_struct
+
+        def bam_unique_struct_field_type_id(type_name: sview, field_name: sview, owner: DeclId, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                return 0 if not bam_named_type_has_unique_struct_declaration(type_name, owner, table)
+                return field_type_id_of(table, type_name, field_name)
+
+        def bam_store_local_alias_iterable_type_id(iterable: Ast::Expr, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match iterable:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return bam_store_local_alias_iterable_type_id(inner, owner, reference_sites, table)
+                    Expr.Ident(_, position):
+                        binding_known, binding_id = borrow_reference_site_binding(reference_sites, owner, position, table)
+                        return 0 if not binding_known
+                        return bam_binding_declared_type_id(binding_id, reference_sites, table)
+                    Expr.Field(object, field_name, _):
+                        object_type_id: mutable u32 = bam_store_local_alias_iterable_type_id(object, owner, reference_sites, table)
+                        while interned_kind(object_type_id, table) == SemTypeKind.Ref:
+                            return 0 if interned_elem_count(object_type_id, table) != 1.u32()
+                            object_type_id <- interned_elem(object_type_id, 0, table)
+                        return bam_unique_struct_field_type_id(interned_name(object_type_id, table), field_name, owner, table) if interned_kind(object_type_id, table) == SemTypeKind.Named
+                        return 0
+                    Expr.Call(Expr.Ident(callee_name, callee_position), _, _, _):
+                        callee_binding_known, _ = borrow_reference_site_binding(reference_sites, owner, callee_position, table)
+                        return 0 if callee_binding_known
+                        return function_return_type_id(table, callee_name)
+                    _:
+                        return 0
+
+        # Unknown iterable shapes stay conservative. A known scalar range or string
+        # produces scalar values; a typed container uses its exact yielded element type.
+        # Multi-binder dict and tuple loops select the corresponding item type.
+        def bam_store_local_alias_iterable_binding_may_carry_reference(iterable: Ast::Expr, binder_count: usize, binder_index: usize, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match iterable:
+                    Expr.Binary(_, operator, _, _) if operator == TokenKind.Range or operator == TokenKind.RangeLt or operator == TokenKind.RangeLe or operator == TokenKind.RangeGt:
+                        return false
+                    Expr.StringLit(_, _):
+                        return false
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return bam_store_local_alias_iterable_binding_may_carry_reference(inner, binder_count, binder_index, owner, reference_sites, table)
+                    _:
+                        pass
+                iterable_type_id: mutable u32 = bam_store_local_alias_iterable_type_id(iterable, owner, reference_sites, table)
+                return true if iterable_type_id == 0
+                while interned_kind(iterable_type_id, table) == SemTypeKind.Ref |iterable_type_id|:
+                    return true if interned_elem_count(iterable_type_id, table) != 1.u32()
+                    iterable_type_id <- interned_elem(iterable_type_id, 0, table)
+                iterable_kind: SemTypeKind = interned_kind(iterable_type_id, table)
+                if iterable_kind == SemTypeKind.Container:
+                    elem_count: usize = interned_elem_count(iterable_type_id, table).usize()
+                    container_name: sview = interned_name(iterable_type_id, table)
+                    return true if elem_count == 0
+                    item_type_id: mutable u32 = 0
+                    if container_name == "dict" and binder_count == 2 and elem_count == 2:
+                        item_type_id <- interned_elem(iterable_type_id, binder_index.u32(), table)
+                    elif (container_name == "darray" or container_name == "array" or container_name == "set") and elem_count > 0:
+                        item_type_id <- interned_elem(iterable_type_id, 0, table)
+                        if binder_count > 1:
+                            if interned_kind(item_type_id, table) == SemTypeKind.Tuple and interned_elem_count(item_type_id, table).usize() == binder_count:
+                                item_type_id <- interned_elem(item_type_id, binder_index.u32(), table)
+                            else:
+                                return true
+                    else:
+                        # User generics and iterable containers with no established
+                        # item-to-type-argument mapping remain opaque.
+                        return true
+                    return not bam_type_is_proven_reference_free_cached(item_type_id, reference_sites, table)
+                if iterable_kind == SemTypeKind.Tuple:
+                    return not bam_type_is_proven_reference_free_cached(iterable_type_id, reference_sites, table)
+                return false if iterable_kind == SemTypeKind.String or iterable_kind == SemTypeKind.Int or iterable_kind == SemTypeKind.Float or iterable_kind == SemTypeKind.Bool or iterable_kind == SemTypeKind.Char
+                return true
+
+        # Exact multi-binder literal loops can pair each tuple component with its
+        # corresponding binder. Any opaque or mismatched item keeps the conservative path.
+        def bam_store_local_alias_literal_tuple_iterable_matches(iterable: Ast::Expr, binder_count: usize) -> bool:
+            can Abort.Panic:
+                match iterable:
+                    Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements:
+                            match element:
+                                Expr.Tuple(values, _) if values.count == binder_count:
+                                    pass
+                                _:
+                                    return false
+                        return true
+                    _:
+                        return false
+
         def bam_store_local_alias_statements(statements: darray[Ast::Stmt], owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, facts: mutable darray[BorrowLocalCallableAliasRoot]&, edges: mutable darray[BorrowLocalCallableAliasEdge]&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 for statement in statements |owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
@@ -2130,9 +2510,9 @@ extend Semantic:
                             bam_store_local_alias_statements(body, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                         Stmt.For(_, variables, iterable, body, for_pos):
                             bam_store_local_alias_expression(iterable, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
-                            # A literal collection gives a bounded, exact candidate set for
-                            # a single loop variable. Opaque iterables and multi-binder
-                            # unpacking are left to the ordinary direct-borrow paths.
+                            # A literal collection gives an exact candidate set for a
+                            # single loop variable. Opaque iterables receive conservative
+                            # element provenance below.
                             if variables.count == 1:
                                 match iterable:
                                     Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
@@ -2146,12 +2526,34 @@ extend Semantic:
                                         binder_position: Ast::Pos = source_binder_position(table, variables[0], for_pos.line, 0, "__for_binder")
                                         if binder_position.line > 0:
                                             binder_known, binder_id = borrow_reference_site_binding(reference_sites, owner, binder_position, table)
+                                            if binder_known and bam_store_local_alias_iterable_binding_may_carry_reference(iterable, variables.count, 0, owner, reference_sites, table):
+                                                # The iterable itself is not the yielded value's
+                                                # provenance. Preserve uncertainty only when its
+                                                # exact item type can carry a local reference.
+                                                bam_store_local_alias_add_unknown_root(binder_id, facts)
+                            else:
+                                if bam_store_local_alias_literal_tuple_iterable_matches(iterable, variables.count):
+                                    for binder_index in 0..<variables.count |binder_index, variables, for_pos, iterable, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
+                                        binder_position: Ast::Pos = source_binder_position(table, variables[binder_index], for_pos.line, binder_index, "__for_binder")
+                                        if binder_position.line > 0:
+                                            binder_known, binder_id = borrow_reference_site_binding(reference_sites, owner, binder_position, table)
                                             if binder_known:
-                                                # An opaque iterable can carry local references
-                                                # through its element binder. Preserve any known
-                                                # roots from the iterable and fail closed when
-                                                # the element is later stored globally.
-                                                bam_store_local_alias_value(binder_id, iterable, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+                                                match iterable:
+                                                    Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                                                        for element in elements |binder_id, binder_index, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
+                                                            match element:
+                                                                Expr.Tuple(values, _):
+                                                                    bam_store_local_alias_value(binder_id, values[binder_index], owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+                                                                _:
+                                                                    pass
+                                                    _:
+                                                        pass
+                                else:
+                                    for binder_index in 0..<variables.count |binder_index, variables, for_pos, owner, reference_sites, table, facts|:
+                                        binder_position: Ast::Pos = source_binder_position(table, variables[binder_index], for_pos.line, binder_index, "__for_binder")
+                                        if binder_position.line > 0:
+                                            binder_known, binder_id = borrow_reference_site_binding(reference_sites, owner, binder_position, table)
+                                            if binder_known and bam_store_local_alias_iterable_binding_may_carry_reference(iterable, variables.count, binder_index, owner, reference_sites, table):
                                                 bam_store_local_alias_add_unknown_root(binder_id, facts)
                             bam_store_local_alias_statements(body, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                         Stmt.Block(_, _, _, body, _):
@@ -2159,7 +2561,7 @@ extend Semantic:
                         Stmt.Match(scrutinee, arms, match_pos):
                             bam_store_local_alias_expression(scrutinee, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                             for arm in arms |scrutinee, match_pos, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
-                                bam_store_local_alias_pattern(arm.pattern, scrutinee, match_pos, true, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+                                bam_store_local_alias_pattern_bindings(arm.pattern, scrutinee, arm_report_pos(arm, match_pos.line), owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                                 bam_store_local_alias_expression(arm.guard, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                                 bam_store_local_alias_statements(arm.body, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                         Stmt.Return(value, _):
@@ -2210,6 +2612,7 @@ extend Semantic:
                     Expr.Match(scrutinee, arms, match_pos) | Expr.Catch(scrutinee, arms, match_pos):
                         bam_store_local_alias_expression(scrutinee, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                         for arm in arms |scrutinee, match_pos, owner, reference_sites, table, lend_names, lend_positions, facts, edges|:
+                            bam_store_local_alias_pattern_bindings(arm.pattern, scrutinee, arm_report_pos(arm, match_pos.line), owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                             bam_store_local_alias_expression(arm.guard, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                             bam_store_local_alias_statements(arm.body, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
                     Expr.Comprehension(_, iterable, condition, body, _):
@@ -2234,17 +2637,28 @@ extend Semantic:
                 facts.extend(inherited)
                 edges: mutable darray[BorrowLocalCallableAliasEdge] = []
                 bam_store_local_alias_statements(statements, owner, reference_sites, table, lend_names, lend_positions, facts, edges)
+
+                graph: mutable BorrowLocalCallableAliasGraph = BorrowLocalCallableAliasGraph{roots: [], root_next: [], root_heads: {}, edges: [], edge_next: [], edge_heads: {}, edge_pair_next: [], edge_pair_heads: {}}
+                for fact in facts |graph|:
+                    bam_store_local_alias_graph_add_root(graph, fact.alias_binding_id, fact.root_binding_id, fact.root_binding_kind, fact.root_name, fact.root_binding_known)
+                for edge in edges |graph|:
+                    bam_store_local_alias_graph_add_edge(graph, edge)
                 pending: mutable darray[BorrowLocalCallableAliasRoot] = []
-                pending.extend(facts)
+                pending.extend(graph.roots)
                 pending_index: mutable usize = 0
-                while pending_index < pending.count |pending_index, pending, edges, facts|:
+                while pending_index < pending.count |pending_index, pending, graph|:
                     source: BorrowLocalCallableAliasRoot = pending[pending_index]
                     pending_index <- pending_index + 1
-                    for edge in edges |source, facts, pending|:
-                        if ownership_binding_ids_equal(edge.source_binding_id, source.alias_binding_id):
-                            if bam_store_local_alias_add_root(edge.alias_binding_id, source.root_binding_id, source.root_binding_kind, source.root_name, source.root_binding_known, facts):
-                                pending.push(BorrowLocalCallableAliasRoot{alias_binding_id: edge.alias_binding_id, root_binding_id: source.root_binding_id, root_binding_kind: source.root_binding_kind, root_name: source.root_name, root_binding_known: source.root_binding_known})
-                return facts
+                    edge_hash: u64 = bam_store_local_alias_binding_hash(source.alias_binding_id)
+                    if graph.edge_heads.get(edge_hash) is edge_head:
+                        edge_row: mutable u32 = edge_head
+                        while edge_row != SYMBOL_INDEX_ROW_NONE |edge_row, pending, graph, source|:
+                            edge: BorrowLocalCallableAliasEdge = graph.edges[edge_row.usize()]
+                            if ownership_binding_ids_equal(edge.source_binding_id, source.alias_binding_id):
+                                if bam_store_local_alias_graph_add_root(graph, edge.alias_binding_id, source.root_binding_id, source.root_binding_kind, source.root_name, source.root_binding_known):
+                                    pending.push(graph.roots[graph.roots.count - 1])
+                            edge_row <- graph.edge_next[edge_row.usize()]
+                return graph.roots
 
         def bam_store_global_target_expression(expression: Ast::Expr, global_names: darray[sview]&, owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, lend_names: darray[sview]&, lend_positions: darray[usize]&, captures: darray[sview]&, stores: mutable darray[BorrowLocalCallableGlobalStore]&, aliases: darray[BorrowLocalCallableAliasRoot]&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
@@ -2968,7 +3382,59 @@ extend Semantic:
                         _:
                             pass
 
-        def bam_declarations(declarations: darray[Ast::Decl], region_param_lines: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, summary: StoreThroughSummary&, reference_sites: mutable BorrowReferenceSites&, table: lmut SymbolTable) -> void:
+        # External borrow-return contracts are declaration-specific. Their call sites use
+        # DefinitionReference IDs, so a same-spelled overload or shadowing local cannot inherit
+        # another extern's lender summary. This pass intentionally handles only bare, callable
+        # top-level externs whose @borrows_return argument names one provenance-bearing formal.
+        def bam_collect_extern_lenders(declarations: darray[Ast::Decl], annotation_args: darray[sview]&, extern_params: darray[Ast::ExternParam]&, enum_annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, lender_ids: mutable darray[DeclId]&, lender_positions: mutable darray[usize]&, lender_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |lender_ids, lender_positions, lender_names|:
+                    match declaration:
+                        Decl.Extern(name, param_start, arity, _, callable, _, decorators, line):
+                            continue if not callable or line.offset == 0
+                            has_pointer_return: bool = any annotation in enum_annotations where annotation.owner == "__extern_return_ptr" and annotation.name == name and annotation.line == line.line
+                            continue if not has_pointer_return
+                            summary_count: mutable u32 = 0
+                            summary_position: mutable usize = 0
+                            summary_name: mutable sview = ""
+                            for decorator in decorators |summary_count, summary_position, summary_name|:
+                                continue if decorator.name != "borrows_return" or decorator.arg_count != 1
+                                annotation_index: usize = decorator.arg_start.usize()
+                                continue if annotation_index >= annotation_args.count
+                                source_name: sview = annotation_args[annotation_index]
+                                matches: mutable u32 = 0
+                                formal_index: mutable usize = 0
+                                while formal_index < arity.usize() |matches, formal_index|:
+                                    extern_index: usize = param_start.usize() + formal_index
+                                    if extern_index < extern_params.count:
+                                        parameter: Ast::ExternParam = extern_params[extern_index]
+                                        if parameter.name == source_name and parameter.provenance_bearing:
+                                            matches <- matches + 1
+                                            summary_position <- formal_index
+                                            summary_name <- source_name
+                                    formal_index <- formal_index + 1
+                                if matches == 1:
+                                    summary_count <- summary_count + 1
+                                else:
+                                    summary_count <- 2
+                            continue if summary_count != 1
+                            symbol_matches: mutable u32 = 0
+                            target: mutable DeclId = DeclId{value: 4294967295}
+                            for symbol in table.symbols |symbol_matches, target|:
+                                if symbol.kind == SymbolKind.Func and symbol.name == name and symbol.offset == line.offset and symbol.module_owner == "":
+                                    symbol_matches <- symbol_matches + 1
+                                    target <- symbol.id
+                            if symbol_matches == 1:
+                                lender_ids.push(target)
+                                lender_positions.push(summary_position)
+                                lender_names.push(summary_name)
+                        Decl.Scoped(scoped_body, _):
+                            bam_collect_extern_lenders(scoped_body, annotation_args, extern_params, enum_annotations, table, lender_ids, lender_positions, lender_names)
+                        # Qualified/module members have no DefinitionReference call-target row.
+                        _:
+                            pass
+
+        def bam_declarations(declarations: darray[Ast::Decl], region_param_lines: darray[u32]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, extern_lend_ids: darray[DeclId]&, extern_lend_positions: darray[usize]&, extern_lend_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, summary: StoreThroughSummary&, reference_sites: mutable BorrowReferenceSites&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 for declaration in declarations |table, reference_sites| -> table:
                     match declaration:
@@ -3008,7 +3474,7 @@ extend Semantic:
                             escape_names: mutable darray[sview] = []
                             escape_roots: mutable darray[sview] = []
                             flow: mutable darray[bool] = [false]
-                            table <- bam_statements(function_body, owners, lend_names, lend_positions, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, table) if owners.count > 0
+                            table <- bam_statements(function_body, owners, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, binders, borrow_names, borrow_fields, borrow_owners, kinds, details, flow, table) if owners.count > 0
                             returns_reference: mutable bool = false
                             returns_reference_aggregate: mutable bool = false
                             if function_return is declared_return:
@@ -3042,15 +3508,15 @@ extend Semantic:
                         Decl.Module(module_name, module_body, module_pos):
                             previous_module: sview = table.current_module
                             table.current_module <- module_name
-                            table <- bam_declarations(module_body, region_param_lines, lend_names, lend_positions, summary, reference_sites, table) can Global{Read,Write}
+                            table <- bam_declarations(module_body, region_param_lines, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, summary, reference_sites, table) can Global{Read,Write}
                             table.current_module <- previous_module
                         Decl.Scoped(scoped_body, scoped_pos):
-                            table <- bam_declarations(scoped_body, region_param_lines, lend_names, lend_positions, summary, reference_sites, table) can Global{Read,Write}
+                            table <- bam_declarations(scoped_body, region_param_lines, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, summary, reference_sites, table) can Global{Read,Write}
                         _:
                             pass
 
     public:
-        def check_borrow_after_move(declarations: darray[Ast::Decl], region_param_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+        def check_borrow_after_move(declarations: darray[Ast::Decl], region_param_lines: darray[u32]&, annotation_args: darray[sview]&, extern_params: darray[Ast::ExternParam]&, enum_annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 candidate_names: mutable darray[sview] = []
                 candidate_positions: mutable darray[usize] = []
@@ -3085,6 +3551,12 @@ extend Semantic:
                             lend_positions.push(wrapper_positions[wrapper_index])
                             more_lenders <- true
                         wrapper_index <- wrapper_index + 1
+                extern_lend_ids: mutable darray[DeclId] = []
+                extern_lend_positions: mutable darray[usize] = []
+                extern_lend_names: mutable darray[sview] = []
+                bam_collect_extern_lenders(declarations, annotation_args, extern_params, enum_annotations, table, extern_lend_ids, extern_lend_positions, extern_lend_names)
                 reference_sites: mutable BorrowReferenceSites = empty_borrow_reference_sites()
                 summary: StoreThroughSummary = build_store_through_summary(declarations, reference_sites, table) can Global{Read,Write}
-                table <- bam_declarations(declarations, region_param_lines, lend_names, lend_positions, summary, reference_sites, table) can Global{Read,Write}
+                call_targets: mutable BorrowResolvedCallTargets = BorrowResolvedCallTargets{}
+                call_targets <- bam_build_definition_target_index(table) if lend_names.count > 0 or extern_lend_ids.count > 0
+                table <- bam_declarations(declarations, region_param_lines, lend_names, lend_positions, extern_lend_ids, extern_lend_positions, extern_lend_names, call_targets, summary, reference_sites, table) can Global{Read,Write}

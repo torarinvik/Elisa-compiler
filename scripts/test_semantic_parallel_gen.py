@@ -429,6 +429,35 @@ class SemanticParallelAuditTest(unittest.TestCase):
         append_only, writes, _ = audit.append_only(info, "next_duplicate_count")
         self.assertTrue(append_only, writes)
 
+    def test_sview_return_from_table_field_is_rejected_as_borrowed_storage(self):
+        info = analyze({
+            "name_view": [definition(
+                "table: SymbolTable&",
+                "def name_view(table: SymbolTable&) -> sview:\n"
+                "    return table.current_name\n",
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, current_name="sview"))
+
+        append_only, writes, _ = audit.append_only(info, "name_view")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+
+    def test_copyable_struct_with_sview_field_is_still_borrowed(self):
+        info = analyze({
+            "view_record": [definition(
+                "table: SymbolTable&",
+                "def view_record(table: SymbolTable&) -> ViewRecord:\n"
+                "    return table.view_record\n",
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, view_record="ViewRecord"), struct_field_types={
+            "ViewRecord": [{"name": "sview", "ordinal": "usize"}],
+            "SymbolKind": [[]],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "view_record")
+        self.assertFalse(append_only)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+
     def test_conditional_scalar_return_from_table_field_stays_append_only(self):
         info = analyze({
             "selected_duplicate_count": [definition(

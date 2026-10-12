@@ -87,16 +87,41 @@ mark_incomplete_run() {
     wait "$BENCH_LOCK_PID" 2>/dev/null || true
     unset BENCH_LOCK_PID
   fi
-  if (( status != 0 )) && [[ ! -f "$OUT/ABORTED.txt" ]] && [[ ! -f "$OUT/COMPLETE" ]] && [[ ! -f "$OUT/COMPILE_COMPLETE" ]]; then
+  if (( status != 0 )) && [[ ! -f "$OUT/ABORTED.txt" ]] && [[ ! -f "$OUT/COMPLETE" ]] && [[ ! -f "$OUT/COMPILE_COMPLETE" ]] && [[ ! -f "$OUT/PREFLIGHT_COMPLETE" ]]; then
     printf 'ABORTED — runner exited with status %d before completion.\nAny partial outputs and measurements from this run are unusable.\n' "$status" >"$OUT/ABORTED.txt" || true
   fi
   return "$status"
 }
 trap mark_incomplete_run EXIT
 BENCH_LOCK_PATH="${ELISA_BENCH_LOCK_PATH:-/tmp/elisa-cross-language-benchmark.lock}"
-BENCH_LOCK_READY="$OUT/.benchmark-lock-ready"
-mkfifo "$BENCH_LOCK_READY"
-python3 - "$BENCH_LOCK_PATH" "$$" <<'PY' >"$BENCH_LOCK_READY" &
+BENCH_LOCK_PID=""
+INHERITED_BENCH_LOCK_FD="${ELISA_BENCH_LOCK_FD:-}"
+if [[ -n "$INHERITED_BENCH_LOCK_FD" ]]; then
+  python3 - "$INHERITED_BENCH_LOCK_FD" "$BENCH_LOCK_PATH" <<'PY'
+import fcntl
+import os
+import sys
+
+try:
+    fd = int(sys.argv[1])
+    held = os.fstat(fd)
+    expected = os.stat(sys.argv[2])
+except (OSError, ValueError) as error:
+    raise SystemExit(f"invalid inherited benchmark lock: {error}")
+if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
+    raise SystemExit("inherited benchmark lock does not refer to the configured host lock")
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as error:
+    raise SystemExit(f"inherited benchmark lock is not held by this descriptor: {error}")
+PY
+  [[ "$INHERITED_BENCH_LOCK_FD" =~ ^[0-9]+$ ]] || { echo "invalid inherited benchmark lock descriptor" >&2; exit 2; }
+  eval "exec ${INHERITED_BENCH_LOCK_FD}>&-"
+  unset ELISA_BENCH_LOCK_FD
+else
+  BENCH_LOCK_READY="$OUT/.benchmark-lock-ready"
+  mkfifo "$BENCH_LOCK_READY"
+  python3 - "$BENCH_LOCK_PATH" "$$" <<'PY' >"$BENCH_LOCK_READY" &
 import fcntl
 import os
 import sys
@@ -113,20 +138,21 @@ parent_pid = int(sys.argv[2])
 while os.getppid() == parent_pid:
     time.sleep(0.5)
 PY
-BENCH_LOCK_PID=$!
-BENCH_LOCK_STATUS=""
-if ! IFS= read -r BENCH_LOCK_STATUS <"$BENCH_LOCK_READY"; then
+  BENCH_LOCK_PID=$!
+  BENCH_LOCK_STATUS=""
+  if ! IFS= read -r BENCH_LOCK_STATUS <"$BENCH_LOCK_READY"; then
+    rm -f "$BENCH_LOCK_READY"
+    echo "could not acquire the host-wide cross-language benchmark lock" >&2
+    exit 2
+  fi
   rm -f "$BENCH_LOCK_READY"
-  echo "could not acquire the host-wide cross-language benchmark lock" >&2
-  exit 2
-fi
-rm -f "$BENCH_LOCK_READY"
-if [[ "$BENCH_LOCK_STATUS" != locked ]]; then
-  wait "$BENCH_LOCK_PID" 2>/dev/null || true
-  unset BENCH_LOCK_PID
-  printf 'ABORTED — another cross-language benchmark holds the host lock at %s.\nNo benchmark builds or timed samples were started.\n' "$BENCH_LOCK_PATH" >"$OUT/ABORTED.txt"
-  echo "another cross-language benchmark holds the host lock; retry after it completes" >&2
-  exit 2
+  if [[ "$BENCH_LOCK_STATUS" != locked ]]; then
+    wait "$BENCH_LOCK_PID" 2>/dev/null || true
+    unset BENCH_LOCK_PID
+    printf 'ABORTED — another cross-language benchmark holds the host lock at %s.\nNo benchmark builds or timed samples were started.\n' "$BENCH_LOCK_PATH" >"$OUT/ABORTED.txt"
+    echo "another cross-language benchmark holds the host lock; retry after it completes" >&2
+    exit 2
+  fi
 fi
 RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 HOST_QUALIFICATION="$OUT/host_qualification.json"
@@ -302,6 +328,9 @@ BUILD_REPEAT="${BUILD_REPEAT:-$REPEAT}"
 [[ "$BUILD_REPEAT" =~ ^[1-9][0-9]*$ ]] || { echo "BUILD_REPEAT must be a positive integer" >&2; exit 2; }
 COMPILE_ONLY="${COMPILE_ONLY:-0}"
 [[ "$COMPILE_ONLY" == 0 || "$COMPILE_ONLY" == 1 ]] || { echo "COMPILE_ONLY must be 0 or 1" >&2; exit 2; }
+PREFLIGHT_ONLY="${ELISA_BENCH_PREFLIGHT_ONLY:-0}"
+[[ "$PREFLIGHT_ONLY" == 0 || "$PREFLIGHT_ONLY" == 1 ]] || { echo "ELISA_BENCH_PREFLIGHT_ONLY must be 0 or 1" >&2; exit 2; }
+unset ELISA_BENCH_PREFLIGHT_ONLY
 BENCH_TIMEOUT_SECONDS="${BENCH_TIMEOUT_SECONDS:-900}"
 [[ "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { echo "BENCH_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2; }
 BENCH_PROFILE="${BENCH_PROFILE:-fast}"
@@ -765,6 +794,7 @@ fi
   echo "repeat=$REPEAT (best and median wall and child user+system CPU seconds; correctness preflight is untimed)"
   echo "build_repeat=$BUILD_REPEAT (object-only and end-to-end build samples; variants rotated per metric/sample)"
   echo "compile_only=$COMPILE_ONLY (timed runtime samples skipped when set to 1; exact checksum preflight retained)"
+  echo "preflight_only=$PREFLIGHT_ONLY (exact correctness and canonical fingerprint only; no timed samples)"
   echo "load_gate=load1/effective_cpu_capacity <= 0.20; Mac uses logical CPUs and Linux uses the minimum of affinity CPUs and cgroup quota; admission checked before preflight builds and load checked before/after every timed sample; violations write ABORTED.txt"
   echo "benchmark_host_lock=$BENCH_LOCK_PATH (held until run exit; concurrent runs on this host are rejected)"
   echo "source_manifest_sha256=$(tool_sha256 "$OUT/sources.sha256")"
@@ -778,7 +808,7 @@ fi
 } | tee "$OUT/metadata.txt"
 
 BENCH_CLEARED_ENV_NAMES="$(IFS=,; printf '%s' "${BENCH_ENV_OVERRIDES_CLEARED[*]}")"
-python3 - "$OUT" "$BUILD_REPEAT" "$BENCH_TIMEOUT_SECONDS" "$HERE" "$ROOT" \
+ELISA_BENCH_PREFLIGHT_ONLY="$PREFLIGHT_ONLY" python3 - "$OUT" "$BUILD_REPEAT" "$BENCH_TIMEOUT_SECONDS" "$HERE" "$ROOT" \
   "$ELISA_BIN" "$RUNTIME" "$CLANG" "$RUSTC" "$ZIG" "$RUN_ID" \
   "$EXPECTED_CANONICAL_FINGERPRINT" "$COMPILE_ONLY" "$REPEAT" \
   "$BENCH_CLEARED_ENV_NAMES" "$INHERITED_ELISACORE_NAMES" \
@@ -801,12 +831,19 @@ import time
 from pathlib import Path
 
 out = Path(sys.argv[1])
+preflight_only = os.environ.pop("ELISA_BENCH_PREFLIGHT_ONLY", "0") == "1"
 repeat = int(sys.argv[2])
 timeout_seconds = int(sys.argv[3])
 source_dir = Path(sys.argv[4])
 root = Path(sys.argv[5])
 sys.path.insert(0, str(root / "scripts"))
-from bench_load_gate import LOAD_FRACTION, LoadGateError, check_load_gate, load_average
+from bench_load_gate import (
+    LOAD_FRACTION,
+    LoadGateError,
+    check_load_gate,
+    load_average,
+    wait_for_sustained_load_gate,
+)
 elisa_bin, runtime, clang, rustc, zig = sys.argv[6:11]
 elisa_bin, runtime, clang, rustc, zig = (str(Path(path).resolve()) for path in (elisa_bin, runtime, clang, rustc, zig))
 run_id = sys.argv[11]
@@ -1173,15 +1210,18 @@ def write_canonical_workload_fingerprint(observed_results):
         reference_directory = reference_path.resolve().parent
         marker_path = reference_directory / completion_marker
         other_marker = reference_directory / ("COMPLETE" if completion_marker == "COMPILE_COMPLETE" else "COMPILE_COMPLETE")
+        preflight_marker = reference_directory / "PREFLIGHT_COMPLETE"
+        successful_timing_marker = (
+            marker_path.is_file() and marker_path.stat().st_size > 0 and not other_marker.exists()
+        )
+        successful_preflight_marker = preflight_marker.is_file() and preflight_marker.stat().st_size > 0
         if (
             (reference_directory / "ABORTED.txt").exists()
-            or not marker_path.is_file()
-            or marker_path.stat().st_size == 0
-            or other_marker.exists()
+            or not (successful_timing_marker or successful_preflight_marker)
         ):
             mark_aborted(
                 "canonical workload fingerprint check failed",
-                f"reference {reference_path} has no successful {completion_marker} marker",
+                f"reference {reference_path} has no successful {completion_marker} or PREFLIGHT_COMPLETE marker",
             )
         if reference_scope != payload["scope"]:
             mark_aborted(
@@ -1338,7 +1378,25 @@ assert_build_sources_unchanged("after correctness preflight")
 canonical_fingerprint = write_canonical_workload_fingerprint(correctness_before_timing)
 assert_build_sources_unchanged("before timed compiler/build samples")
 print(f"Canonical workload fingerprint: {canonical_fingerprint}")
-enforce_load_gate(load_average(), "before the first timed compile/build sample")
+if preflight_only:
+    (out / "PREFLIGHT_COMPLETE").write_text(
+        "exact correctness preflight and canonical fingerprint complete\n"
+    )
+    print("Preflight-only run complete. No timed benchmark samples were started.", flush=True)
+    raise SystemExit(0)
+print(
+    "Waiting for the load gate to hold for 60 seconds before timed samples.",
+    flush=True,
+)
+try:
+    wait_for_sustained_load_gate(
+        out,
+        platform.system(),
+        out / "host_qualification.json",
+        require_live_linux=True,
+    )
+except LoadGateError as error:
+    raise SystemExit(str(error)) from error
 
 def zig_cache_args(bench, phase, sample):
     base = log_root / "zig-cache-samples" / run_id / bench / f"{phase}-{sample:02d}"

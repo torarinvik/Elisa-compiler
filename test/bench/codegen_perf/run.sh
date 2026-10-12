@@ -2,6 +2,8 @@
 . "$(dirname "${BASH_SOURCE[0]}")/../../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
 # Auxiliary runtime comparison for GENERATED code. Use cross_language.sh for qualified
 # compiler-throughput, Zig/Rust, and runtime comparisons.
+# After the first correctness preflight, timed samples wait for 60 seconds under the shared
+# load threshold; point checks remain around each sample.
 #   test/bench/codegen_perf/run.sh <outdir> [bench ...]
 # Env: ELISACORE_BIN (stage0), REPEAT (default 7), SKIP_S0=1, SKIP_C=1, CALLGRIND=1,
 #      S1_BIN (call this stage1 product directly instead of the wrapper, e.g. a gen2 candidate),
@@ -170,6 +172,24 @@ except LoadGateError as error:
 PY
 }
 
+sustained_load_gate() {
+  local stage="$1"
+  python3 - "$ROOT" "$OUT" "$HOST_QUALIFICATION" "$SYSTEM" "$stage" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from bench_load_gate import LoadGateError, wait_for_sustained_load_gate
+try:
+    wait_for_sustained_load_gate(
+        Path(sys.argv[2]), sys.argv[4], Path(sys.argv[3]),
+        stage=sys.argv[5], require_live_linux=True,
+    )
+except LoadGateError as error:
+    print(f"sustained timing load gate failed: {error}", file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
 variants=()
 if [[ -z "${SKIP_C:-}" ]]; then variants+=(c); fi
 if [[ -z "${SKIP_S0:-}" && -n "$S0" ]]; then variants+=(s0); fi
@@ -279,6 +299,7 @@ print(match.group(1).decode("ascii").replace(",", ""))
 PY
 }
 printf '%-14s %-8s %10s %6s %14s\n' bench variant cpu_s rc instr
+TIMED_ADMISSION_PASSED=0
 for b in "${benches[@]}"; do
   src="$HERE/$b.elisa"
   load_gate "before builds for $b"
@@ -308,6 +329,10 @@ for b in "${benches[@]}"; do
   done
   preflight "$b"
   load_gate "after correctness preflight for $b"
+  if (( TIMED_ADMISSION_PASSED == 0 )); then
+    sustained_load_gate "before the first timed sample"
+    TIMED_ADMISSION_PASSED=1
+  fi
   for v in "${variants[@]}"; do
     r="$(best "$OUT/$b.correctness.json" "$OUT/$b.$v")"; ir="-"
     if [[ -n "${CALLGRIND:-}" ]]; then

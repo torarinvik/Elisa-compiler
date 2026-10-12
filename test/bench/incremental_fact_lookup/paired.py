@@ -103,7 +103,12 @@ pins, fingerprints, libraries = {}, {}, {}
 # carry an older platform.sh, but both products must be checked against the same current LLVM.
 benchmark_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(benchmark_root / "scripts"))
-from bench_load_gate import LoadGateError, check_load_gate, load_average
+from bench_load_gate import (
+    LoadGateError,
+    check_load_gate,
+    load_average,
+    wait_for_sustained_load_gate,
+)
 
 system = platform.system()
 host_qualification = args.output / "host_qualification.json"
@@ -297,7 +302,16 @@ for arm, (root, binary) in products.items():
 # Establish exact parent/candidate output, diagnostics, cache snapshots, and cache reports
 # before any timed sample. Priming runs are also load-gated so they cannot push the host
 # above the admitted threshold before a measured compile starts.
-enforce_load_gate("before the first timed pair")
+print("Waiting for the load gate to hold for 60 seconds before timed pairs.", flush=True)
+try:
+    wait_for_sustained_load_gate(
+        args.output,
+        system,
+        host_qualification,
+        stage="before the first timed pair",
+    )
+except LoadGateError as error:
+    raise SystemExit(str(error)) from error
 for workload in manifest['workloads']:
     name = workload['directory']
     source_directory = args.corpus / name

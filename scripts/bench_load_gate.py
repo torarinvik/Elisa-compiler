@@ -8,11 +8,15 @@ import math
 import os
 import platform
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
 
 LOAD_FRACTION = 0.20
+LOAD_GATE_STABLE_SECONDS = 60.0
+LOAD_GATE_SAMPLE_INTERVAL_SECONDS = 1.0
+LOAD_GATE_MAX_WAIT_SECONDS = 900.0
 
 
 class LoadGateError(RuntimeError):
@@ -279,6 +283,145 @@ def check_load_gate(
         )
         raise LoadGateError(reason)
     return record
+
+
+def wait_for_sustained_load_gate(
+    output: Path,
+    system: str,
+    qualification_path: Path,
+    *,
+    stage: str = "before the first timed sample",
+    stable_seconds: float = LOAD_GATE_STABLE_SECONDS,
+    sample_interval_seconds: float = LOAD_GATE_SAMPLE_INTERVAL_SECONDS,
+    max_wait_seconds: float = LOAD_GATE_MAX_WAIT_SECONDS,
+    require_live_linux: bool = False,
+) -> dict[str, object]:
+    """Wait until every sampled load value stays within the limit for one full interval.
+
+    A sample gap longer than 1.5 polling intervals resets the stable window because the
+    missing interval cannot establish that the load stayed under the limit.
+    """
+    if (
+        not math.isfinite(stable_seconds)
+        or stable_seconds <= 0
+        or not math.isfinite(sample_interval_seconds)
+        or sample_interval_seconds <= 0
+        or not math.isfinite(max_wait_seconds)
+        or max_wait_seconds <= 0
+    ):
+        raise ValueError("sustained load gate durations must be finite and positive")
+
+    output.mkdir(parents=True, exist_ok=True)
+    admission_path = output / "load_gate_sustained_admission.jsonl"
+    started_at = time.monotonic()
+    previous_sample_at: float | None = None
+    stable_since: float | None = None
+    sample_count = 0
+    last_record: dict[str, object] = {}
+
+    while True:
+        capacity_error: str | None = None
+        try:
+            capacity, details = effective_cpu_capacity(
+                system,
+                qualification_path,
+                require_live_linux=require_live_linux,
+            )
+        except LoadGateError as error:
+            capacity = None
+            details = {"system": system}
+            capacity_error = str(error)
+
+        load = load_average()
+        sampled_at = time.monotonic()
+        if (
+            previous_sample_at is not None
+            and sampled_at - previous_sample_at > sample_interval_seconds * 1.5
+        ):
+            stable_since = None
+        load1 = load[0] if load else None
+        limit = LOAD_FRACTION * capacity if capacity is not None else None
+        passed = (
+            capacity is not None
+            and math.isfinite(capacity)
+            and capacity > 0
+            and load1 is not None
+            and math.isfinite(float(load1))
+            and limit is not None
+            and float(load1) <= limit
+        )
+        if passed:
+            if stable_since is None:
+                stable_since = sampled_at
+            stable_for = sampled_at - stable_since
+        else:
+            stable_since = None
+            stable_for = 0.0
+        sample_count += 1
+        elapsed = sampled_at - started_at
+        sustained = (
+            passed
+            and stable_for >= stable_seconds
+            and elapsed <= max_wait_seconds
+        )
+        record: dict[str, object] = {
+            **details,
+            "stage": stage,
+            "sample_number": sample_count,
+            "sampled_at_epoch_seconds": time.time(),
+            "load1": load1,
+            "load5": load[1] if len(load) > 1 else None,
+            "load15": load[2] if len(load) > 2 else None,
+            "effective_cpu_capacity": capacity,
+            "load1_limit": limit,
+            "passed": passed,
+            "consecutive_below_limit_seconds": stable_for,
+            "required_stable_seconds": stable_seconds,
+            "sample_interval_seconds": sample_interval_seconds,
+            "sustained_gate_passed": sustained,
+        }
+        if capacity_error is not None:
+            record["capacity_error"] = capacity_error
+        with admission_path.open("a") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+        last_record = record
+
+        if sustained:
+            summary = {
+                **record,
+                "sample_count": sample_count,
+                "waited_seconds": elapsed,
+                "max_wait_seconds": max_wait_seconds,
+            }
+            (output / "load_gate_sustained_admission.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n"
+            )
+            return summary
+
+        if capacity_error is not None or capacity is None:
+            reason = capacity_error or "effective CPU capacity is unavailable"
+            timing_note = "No timed benchmark samples were started.\n"
+            (output / "ABORTED.txt").write_text(
+                f"ABORTED — sustained timing load gate failed {stage}.\n"
+                f"{reason}\n{timing_note}"
+            )
+            raise LoadGateError(reason)
+
+        if elapsed >= max_wait_seconds:
+            reason = (
+                f"load1={last_record.get('load1')!r}, effective_cpu_capacity={capacity!r}, "
+                f"required load1 <= {limit:.2f} continuously for {stable_seconds:.0f}s; "
+                f"no qualifying window within {max_wait_seconds:.0f}s"
+            )
+            (output / "ABORTED.txt").write_text(
+                f"ABORTED — sustained timing load gate failed {stage}.\n"
+                f"{reason}\nNo timed benchmark samples were started.\n"
+            )
+            raise LoadGateError(reason)
+
+        previous_sample_at = sampled_at
+        remaining = max_wait_seconds - elapsed
+        time.sleep(min(sample_interval_seconds, remaining))
 
 
 def main(arguments: list[str]) -> int:

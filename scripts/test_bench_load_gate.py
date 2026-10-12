@@ -240,5 +240,160 @@ class BenchLoadGateTests(unittest.TestCase):
         self.assertIn("quota changed", (quota_output / "ABORTED.txt").read_text())
 
 
+class FakeClock:
+    def __init__(self, extra_sleep=None):
+        self.now = 0.0
+        self.sleep_count = 0
+        self.extra_sleep = extra_sleep or {}
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return 1_800_000_000.0 + self.now
+
+    def sleep(self, seconds):
+        self.sleep_count += 1
+        self.now += seconds + self.extra_sleep.get(self.sleep_count, 0.0)
+
+
+class SustainedLoadGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.output = self.root / "output"
+        self.output.mkdir()
+        self.qualification = self.root / "host_qualification.json"
+
+    def test_high_sample_resets_the_full_stable_window(self):
+        loads = iter([
+            (2.0, 0.0, 0.0),
+            (1.9, 0.0, 0.0),
+            (2.01, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+        ])
+        clock = FakeClock()
+        with patch.object(gate, "effective_cpu_capacity", return_value=(10.0, {"logical_cpu_count": 10})):
+            with patch.object(gate, "load_average", side_effect=lambda: next(loads)):
+                with patch.object(gate, "time", clock):
+                    result = gate.wait_for_sustained_load_gate(
+                        self.output,
+                        "Darwin",
+                        self.qualification,
+                        stable_seconds=2.0,
+                        sample_interval_seconds=1.0,
+                        max_wait_seconds=10.0,
+                    )
+
+        self.assertEqual(result["sample_count"], 6)
+        self.assertEqual(result["consecutive_below_limit_seconds"], 2.0)
+        records = [
+            json.loads(line)
+            for line in (self.output / "load_gate_sustained_admission.jsonl").read_text().splitlines()
+        ]
+        self.assertFalse(records[2]["passed"])
+        self.assertTrue(records[-1]["sustained_gate_passed"])
+        self.assertTrue((self.output / "load_gate_sustained_admission.json").is_file())
+        self.assertFalse((self.output / "ABORTED.txt").exists())
+
+    def test_missed_sample_interval_resets_the_stable_window(self):
+        clock = FakeClock(extra_sleep={2: 1.0})
+        with patch.object(gate, "effective_cpu_capacity", return_value=(10.0, {"logical_cpu_count": 10})):
+            with patch.object(gate, "load_average", return_value=(1.0, 0.0, 0.0)):
+                with patch.object(gate, "time", clock):
+                    result = gate.wait_for_sustained_load_gate(
+                        self.output,
+                        "Darwin",
+                        self.qualification,
+                        stable_seconds=2.0,
+                        sample_interval_seconds=1.0,
+                        max_wait_seconds=10.0,
+                    )
+
+        self.assertEqual(result["sample_count"], 5)
+        records = [
+            json.loads(line)
+            for line in (self.output / "load_gate_sustained_admission.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(records[2]["consecutive_below_limit_seconds"], 0.0)
+
+    def test_timeout_aborts_before_timed_samples(self):
+        clock = FakeClock()
+        with patch.object(gate, "effective_cpu_capacity", return_value=(10.0, {"logical_cpu_count": 10})):
+            with patch.object(gate, "load_average", return_value=(3.0, 0.0, 0.0)):
+                with patch.object(gate, "time", clock):
+                    with self.assertRaises(gate.LoadGateError):
+                        gate.wait_for_sustained_load_gate(
+                            self.output,
+                            "Darwin",
+                            self.qualification,
+                            stable_seconds=2.0,
+                            sample_interval_seconds=1.0,
+                            max_wait_seconds=2.0,
+                        )
+
+        self.assertIn("No timed benchmark samples were started", (self.output / "ABORTED.txt").read_text())
+        self.assertEqual(
+            len((self.output / "load_gate_sustained_admission.jsonl").read_text().splitlines()),
+            3,
+        )
+
+    def test_late_poll_cannot_admit_after_max_wait(self):
+        clock = FakeClock(extra_sleep={2: 0.6})
+        with patch.object(gate, "effective_cpu_capacity", return_value=(10.0, {"logical_cpu_count": 10})):
+            with patch.object(gate, "load_average", return_value=(1.0, 0.0, 0.0)):
+                with patch.object(gate, "time", clock):
+                    with self.assertRaises(gate.LoadGateError):
+                        gate.wait_for_sustained_load_gate(
+                            self.output,
+                            "Darwin",
+                            self.qualification,
+                            stable_seconds=1.5,
+                            sample_interval_seconds=1.0,
+                            max_wait_seconds=1.5,
+                        )
+
+        records = [
+            json.loads(line)
+            for line in (self.output / "load_gate_sustained_admission.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue(records[-1]["passed"])
+        self.assertGreater(records[-1]["consecutive_below_limit_seconds"], 1.5)
+        self.assertFalse(records[-1]["sustained_gate_passed"])
+        self.assertIn("No timed benchmark samples were started", (self.output / "ABORTED.txt").read_text())
+
+    def test_live_linux_sustained_admission_revalidates_capacity(self):
+        state = BenchLoadGateTests.write_live_qualification(self)
+        clock = FakeClock()
+        with ExitStack() as stack:
+            BenchLoadGateTests.patch_live_linux_state(self, stack, state)
+            stack.enter_context(patch.object(gate, "load_average", return_value=(12.8, 0.0, 0.0)))
+            stack.enter_context(patch.object(gate, "time", clock))
+            result = gate.wait_for_sustained_load_gate(
+                self.output,
+                "Linux",
+                self.qualification,
+                stable_seconds=1.0,
+                sample_interval_seconds=1.0,
+                max_wait_seconds=2.0,
+                require_live_linux=True,
+            )
+
+        self.assertEqual(result["effective_cpu_capacity"], 64.0)
+        self.assertEqual(result["live_allowed_cpu_count"], 80)
+        self.assertEqual(result["live_allowed_cpu_ids"], list(range(80)))
+        self.assertEqual(result["live_cgroup_cpu_quota"], 64.0)
+        self.assertTrue(result["sustained_gate_passed"])
+        records = [
+            json.loads(line)
+            for line in (self.output / "load_gate_sustained_admission.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["passed"] for record in records))
+
+
 if __name__ == "__main__":
     unittest.main()
