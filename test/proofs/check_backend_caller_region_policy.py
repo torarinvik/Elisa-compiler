@@ -27,13 +27,20 @@ POSITIVE_NAMES = {
     "a_dynamic_array_reference_carries_its_region",
     "returned_caller_owned_storage_keeps_its_region",
     "an_ast_arena_return_keeps_its_region",
+    "signature_arena_requirement_is_exact",
+    "an_explicit_allocator_suppresses_a_second_hidden_slot",
+    "an_owned_return_uses_a_hidden_slot_without_an_explicit_allocator",
 }
 NEGATIVE_NAMES = {
     "false_claim_nonreference_type_grows",
     "false_claim_plain_reference_needs_caller_region",
     "false_claim_caller_owned_return_does_not_keep_its_region",
     "false_claim_plain_return_keeps_a_caller_region",
+    "false_claim_explicit_allocator_adds_a_second_hidden_slot",
 }
+
+if not __debug__:
+    raise SystemExit("run without Python -O")
 
 
 def compact(text: str) -> str:
@@ -82,6 +89,12 @@ def value_type_returns_caller_region(value_type: ValueType, structs: mutable Str
     true return if value_type_owns_region_storage(value_type, structs, 0)
     return ast_value_needs_arena(value_type, structs)
 """,
+    "signature_needs_arena": """
+def signature_needs_arena(params: darray[ParamDecl]&, return_value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+    can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+        false return if params_manage_arena(params, structs)
+        return value_type_returns_caller_region(return_value_type, structs)
+""",
 }
 for name, expected in production_shapes.items():
     if compact(function_section(regions_text, name)) != compact(expected):
@@ -128,6 +141,23 @@ def an_ast_arena_return_keeps_its_region(owns_region_storage: bool, ast_value_ne
     ensure result == true
     return owns_region_storage or ast_value_needs_arena
 """,
+    "signature_arena_requirement_is_exact": """
+def signature_arena_requirement_is_exact(params_manage_arena: bool, return_type_carries_caller_region: bool) -> bool:
+    ensure result == (not params_manage_arena and return_type_carries_caller_region)
+    return not params_manage_arena and return_type_carries_caller_region
+""",
+    "an_explicit_allocator_suppresses_a_second_hidden_slot": """
+def an_explicit_allocator_suppresses_a_second_hidden_slot(params_manage_arena: bool, return_type_carries_caller_region: bool) -> bool:
+    requires params_manage_arena
+    ensure result == false
+    return not params_manage_arena and return_type_carries_caller_region
+""",
+    "an_owned_return_uses_a_hidden_slot_without_an_explicit_allocator": """
+def an_owned_return_uses_a_hidden_slot_without_an_explicit_allocator(params_manage_arena: bool, return_type_carries_caller_region: bool) -> bool:
+    requires not params_manage_arena and return_type_carries_caller_region
+    ensure result == true
+    return not params_manage_arena and return_type_carries_caller_region
+""",
 }
 negative_shapes = {
     "false_claim_nonreference_type_grows": """
@@ -153,6 +183,12 @@ def false_claim_plain_return_keeps_a_caller_region(owns_region_storage: bool, as
     requires not owns_region_storage and not ast_value_needs_arena
     ensure result == true
     return owns_region_storage or ast_value_needs_arena
+""",
+    "false_claim_explicit_allocator_adds_a_second_hidden_slot": """
+def false_claim_explicit_allocator_adds_a_second_hidden_slot(params_manage_arena: bool, return_type_carries_caller_region: bool) -> bool:
+    requires params_manage_arena and return_type_carries_caller_region
+    ensure result == true
+    return not params_manage_arena and return_type_carries_caller_region
 """,
 }
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:
@@ -199,7 +235,7 @@ def replay(path: Path) -> tuple[int, dict]:
 code, positive = replay(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
 assert positive["summary"]["declarations"] == len(POSITIVE_NAMES)
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 14
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 20
 assert not positive["findings"]
 assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == POSITIVE_NAMES
 assert positive == replay(POSITIVE)[1], "caller-region proof report changed across identical runs"
@@ -207,7 +243,7 @@ assert positive == replay(POSITIVE)[1], "caller-region proof report changed acro
 code, negative = replay(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
 assert negative["summary"]["declarations"] == len(POSITIVE_NAMES) + len(NEGATIVE_NAMES)
-assert negative["summary"]["obligations"] == 22 and negative["summary"]["proven"] == 18
+assert negative["summary"]["obligations"] == 30 and negative["summary"]["proven"] == 25
 assert {row["name"] for row in negative["findings"]} == NEGATIVE_NAMES
 assert all(row["kind"] == "ensure-unproven" and row["status"] in ("unknown", "disproved")
            for row in negative["findings"])
@@ -217,7 +253,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "caller-region proof inputs changed during replay or provenance validation"
 print(json.dumps({
     "admitted": True,
-    "scope": "ref growth, caller-region reference selection, and returned caller-owned/AST arena policies",
+    "scope": "ref growth, caller-region reference and return selection, and explicit-arena slot suppression",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_refused": sorted(NEGATIVE_NAMES),
     "proof_revision": product["proof"].get("head"),
