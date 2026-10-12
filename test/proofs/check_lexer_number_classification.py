@@ -20,6 +20,7 @@ NUMBERS = ROOT / "src/lexer/lexer_numbers.elisa"
 LEXER = ROOT / "src/lexer/lexer.elisa"
 POSITIVE = HERE / "lexer_number_classification.elisa"
 NEGATIVE = HERE / "lexer_number_classification_rejected.elisa"
+SEPARATOR_MODEL = HERE / "lexer_number_separator_model.elisa"
 PROOF_REPLAY_TIMEOUT_SECONDS = 60
 
 if not __debug__:
@@ -88,6 +89,24 @@ require_fragments(function_section(numbers_text, "is_digit"), (
 require_fragments(function_section(numbers_text, "is_hex_digit"), (
     "return LexerNumberClassification::is_hex_digit(character)",
 ), "numeric FSM hexadecimal-digit predicate")
+require_fragments(function_section(numbers_text, "classify_number_input"), (
+    "if c == '_' and lexer.position > 0:",
+    "previous: char = lexer.source[lexer.position - 1].char()",
+    "following: char = lexer.peek(1)",
+    "return NumberClass.DecimalSeparator if previous.is_digit() and following.is_digit()",
+    "return NumberClass.HexSeparator if previous.is_hex_digit() and following.is_hex_digit()",
+), "contextual underscore classification")
+underscore_source = compact(function_section(numbers_text, "classify_number_input"))
+underscore_steps = (
+    "if c == '_' and lexer.position > 0:",
+    "previous: char = lexer.source[lexer.position - 1].char()",
+    "following: char = lexer.peek(1)",
+    "return NumberClass.DecimalSeparator if previous.is_digit() and following.is_digit()",
+    "return NumberClass.HexSeparator if previous.is_hex_digit() and following.is_hex_digit()",
+)
+underscore_positions = [underscore_source.find(compact(step)) for step in underscore_steps]
+if any(position < 0 for position in underscore_positions) or underscore_positions != sorted(underscore_positions):
+    raise SystemExit("contextual underscore classification no longer preserves its guarded decimal-first order")
 if 'include "./lexer_numbers.elisa"' not in LEXER.read_text():
     raise SystemExit("production lexer no longer imports the numeric scanner")
 read_number = compact(function_section(numbers_text, "read_number"))
@@ -104,19 +123,42 @@ positive_names = {
     "exponent_mark_is_hex_digit_but_not_hex_alpha",
     "non_ascii_decimal_digit_is_outside_ascii_number_classes",
     "contextual_classes_are_not_static_character_classes",
+    "adjacent_decimal_digits_are_decimal_separators",
+    "adjacent_hex_letters_are_hex_separators",
+    "decimal_digits_take_precedence_over_the_hex_class",
+    "a_mixed_decimal_and_hex_pair_uses_the_hex_class",
+    "a_pair_without_a_shared_digit_class_is_other",
 }
 negative_names = {
     "false_claim_unicode_digit_is_ascii_digit",
     "false_claim_exponent_marker_is_plain_hex_alpha",
     "false_claim_decimal_point_is_a_fraction_opening_class",
     "false_claim_plus_sign_is_a_valid_exponent_marker_class",
+    "false_claim_decimal_digit_pair_is_a_hex_separator",
+    "false_claim_mixed_decimal_hex_pair_is_a_decimal_separator",
 }
 for path, expected in ((POSITIVE, positive_names), (NEGATIVE, negative_names)):
     proof_text = path.read_text()
     if declarations(path) != expected:
         raise SystemExit(f"{path.name} proof declaration inventory changed")
-    if 'include "../../src/lexer/lexer_number_classification.elisa"' not in proof_text:
-        raise SystemExit(f"{path.name} no longer includes the production classifier")
+    if 'include "./lexer_number_separator_model.elisa"' not in proof_text:
+        raise SystemExit(f"{path.name} no longer includes the adjacent-character separator model")
+if 'include "../../src/lexer/lexer_number_classification.elisa"' not in SEPARATOR_MODEL.read_text():
+    raise SystemExit("underscore model no longer uses the production character predicates")
+separator_model = compact(function_section(SEPARATOR_MODEL.read_text(), "numeric_separator_model"))
+separator_condition = "LexerNumberClassification::is_decimal_digit(previous) and LexerNumberClassification::is_decimal_digit(following)"
+hex_condition = "LexerNumberClassification::is_hex_digit(previous) and LexerNumberClassification::is_hex_digit(following)"
+expected_separator_model = compact(
+    "def numeric_separator_model(previous: char, following: char) -> LexerNumberClassification::NumberClass: "
+    f"ensure result == (LexerNumberClassification::NumberClass.DecimalSeparator if {separator_condition} "
+    f"else LexerNumberClassification::NumberClass.HexSeparator if {hex_condition} "
+    "else LexerNumberClassification::NumberClass.Other) "
+    f"return LexerNumberClassification::NumberClass.DecimalSeparator if {separator_condition} "
+    f"else LexerNumberClassification::NumberClass.HexSeparator if {hex_condition} "
+    "else LexerNumberClassification::NumberClass.Other"
+)
+if separator_model != expected_separator_model:
+    raise SystemExit("underscore proof model no longer has the decimal-first/hex-second decision table")
 
 positive_shapes = {
     "every_character_uses_its_exact_closed_class": "ensure result == true return match character: '0'..='9': LexerNumberClassification::classify_char(character) == LexerNumberClassification::NumberClass.Digit 'e' | 'E': LexerNumberClassification::classify_char(character) == LexerNumberClassification::NumberClass.ExpMarkOther 'a'..='d' | 'f' | 'A'..='D' | 'F': LexerNumberClassification::classify_char(character) == LexerNumberClassification::NumberClass.HexAlpha '.': LexerNumberClassification::classify_char(character) == LexerNumberClassification::NumberClass.OtherDot '+' | '-': LexerNumberClassification::classify_char(character) == LexerNumberClassification::NumberClass.Sign _: LexerNumberClassification::classify_char(character) == LexerNumberClassification::NumberClass.Other",
@@ -126,12 +168,19 @@ positive_shapes = {
     "exponent_mark_is_hex_digit_but_not_hex_alpha": "ensure result == true return LexerNumberClassification::is_hex_digit('e') and LexerNumberClassification::classify_char('e') == LexerNumberClassification::NumberClass.ExpMarkOther",
     "non_ascii_decimal_digit_is_outside_ascii_number_classes": "ensure result == true return not LexerNumberClassification::is_decimal_digit('١') and LexerNumberClassification::classify_char('١') == LexerNumberClassification::NumberClass.Other",
     "contextual_classes_are_not_static_character_classes": "ensure result == true return LexerNumberClassification::classify_char(character) != LexerNumberClassification::NumberClass.ExpMarkValid and LexerNumberClassification::classify_char(character) != LexerNumberClassification::NumberClass.FractionDot and LexerNumberClassification::classify_char(character) != LexerNumberClassification::NumberClass.HexPrefix and LexerNumberClassification::classify_char(character) != LexerNumberClassification::NumberClass.DecimalSeparator and LexerNumberClassification::classify_char(character) != LexerNumberClassification::NumberClass.HexSeparator",
+    "adjacent_decimal_digits_are_decimal_separators": "requires LexerNumberClassification::is_decimal_digit(previous) and LexerNumberClassification::is_decimal_digit(following) ensure result == true return numeric_separator_model(previous, following) == LexerNumberClassification::NumberClass.DecimalSeparator",
+    "adjacent_hex_letters_are_hex_separators": "requires previous in 'a'..='f' and following in 'A'..='F' ensure result == true return numeric_separator_model(previous, following) == LexerNumberClassification::NumberClass.HexSeparator",
+    "decimal_digits_take_precedence_over_the_hex_class": "requires LexerNumberClassification::is_decimal_digit(previous) and LexerNumberClassification::is_decimal_digit(following) ensure result == true return numeric_separator_model(previous, following) == LexerNumberClassification::NumberClass.DecimalSeparator",
+    "a_mixed_decimal_and_hex_pair_uses_the_hex_class": "ensure result == true return numeric_separator_model('1', 'a') == LexerNumberClassification::NumberClass.HexSeparator",
+    "a_pair_without_a_shared_digit_class_is_other": "ensure result == true return numeric_separator_model('g', '9') == LexerNumberClassification::NumberClass.Other",
 }
 negative_shapes = {
     "false_claim_unicode_digit_is_ascii_digit": "ensure result == true return LexerNumberClassification::is_decimal_digit('١')",
     "false_claim_exponent_marker_is_plain_hex_alpha": "ensure result == true return LexerNumberClassification::classify_char('e') == LexerNumberClassification::NumberClass.HexAlpha",
     "false_claim_decimal_point_is_a_fraction_opening_class": "ensure result == true return LexerNumberClassification::classify_char('.') == LexerNumberClassification::NumberClass.FractionDot",
     "false_claim_plus_sign_is_a_valid_exponent_marker_class": "ensure result == true return LexerNumberClassification::classify_char('+') == LexerNumberClassification::NumberClass.ExpMarkValid",
+    "false_claim_decimal_digit_pair_is_a_hex_separator": "ensure result == true return numeric_separator_model('1', '9') == LexerNumberClassification::NumberClass.HexSeparator",
+    "false_claim_mixed_decimal_hex_pair_is_a_decimal_separator": "ensure result == true return numeric_separator_model('1', 'a') == LexerNumberClassification::NumberClass.DecimalSeparator",
 }
 for path, shapes in ((POSITIVE, positive_shapes), (NEGATIVE, negative_shapes)):
     proof_text = path.read_text()
@@ -169,17 +218,17 @@ def run(path: Path) -> tuple[int, dict]:
 
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
-assert positive["summary"]["declarations"] == len(positive_names) + 3
+assert positive["summary"]["declarations"] == len(positive_names) + 4
 assert positive["summary"]["proven"] == positive["summary"]["obligations"]
 assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "numeric-character proof report changed across repeated runs"
 verified = {row["name"] for row in positive["declaration_details"] if row.get("verified")}
-assert positive_names | {"classify_char", "is_decimal_digit", "is_hex_digit"} <= verified
+assert positive_names | {"classify_char", "is_decimal_digit", "is_hex_digit", "numeric_separator_model"} <= verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
 assert negative["verification_state"] == "disproved"
-assert negative["summary"]["declarations"] == len(negative_names) + 3
+assert negative["summary"]["declarations"] == len(negative_names) + 4
 assert {(row["kind"], row["name"]) for row in negative["findings"]} == {
     ("ensure-unproven", name) for name in negative_names
 }
@@ -188,12 +237,15 @@ assert all(row["status"] == "disproved" and row["counterexample_found"]
 assert {"classify_char", "is_decimal_digit", "is_hex_digit"} <= {
     row["name"] for row in negative["declaration_details"] if row.get("verified")
 }
+assert "numeric_separator_model" in {
+    row["name"] for row in negative["declaration_details"] if row.get("verified")
+}
 assert product == require_current_product(BIN, PROVER)
 hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 assert hashes_before == hashes_after, "numeric-character proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "closed ASCII character classification and digit predicates used by the numeric lexer FSM",
+    "scope": "closed ASCII character classes, digit predicates, and decimal-first contextual underscore classification used by the numeric lexer FSM",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_revision": product["proof"].get("head"),
