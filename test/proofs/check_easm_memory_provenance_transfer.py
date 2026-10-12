@@ -34,6 +34,10 @@ POSITIVE_NAMES = {
     "xchg_swaps_source_provenance",
     "xchg_with_one_unparsed_operand_clears_the_surviving_register",
 }
+MODEL_NAMES = {
+    "provenance_destination_after",
+    "provenance_source_after",
+}
 NEGATIVE_NAMES = {
     "false_claim_move_invents_provenance_from_an_untracked_source",
     "false_claim_unknown_write_preserves_stale_provenance",
@@ -106,7 +110,7 @@ if memory.count(compact('if easm_starts(op,"mov"):')) != 1 or \
     raise SystemExit("provenance-preserving opcode classes changed; revise the proof model before admission")
 
 proof_text = code_only(POSITIVE.read_text())
-if declared_functions(POSITIVE) != POSITIVE_NAMES:
+if declared_functions(POSITIVE) != POSITIVE_NAMES | MODEL_NAMES:
     raise SystemExit("positive EASM provenance proof inventory is incomplete or contains extras")
 if declared_functions(NEGATIVE) != NEGATIVE_NAMES:
     raise SystemExit("negative EASM provenance proof inventory is incomplete or contains extras")
@@ -160,7 +164,7 @@ code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
 assert positive["summary"]["proven"] == positive["summary"]["obligations"]
 assert not positive["findings"]
-assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == POSITIVE_NAMES
+assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == POSITIVE_NAMES | MODEL_NAMES
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
