@@ -9,14 +9,13 @@ set -euo pipefail
 EXPECTED_CANONICAL_FINGERPRINT="${ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT:-}"
 unset ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT
 
-# Remove inherited loader injection/search paths and allocator tuning before any
-# compiler, linker, preflight executable, or timed executable is launched. The
-# platform setup below may add back an explicitly selected LLVM library path.
+# Remove inherited DYLD_*/LD_* overrides and allocator tuning before any
+# compiler, linker, preflight executable, or timed executable is launched. Keep
+# bare LD intact for linker selection.
 # Keep inherited variable names for the run manifest without recording values.
 BENCH_ENV_OVERRIDES_CLEARED=()
 for env_name in \
-  DYLD_INSERT_LIBRARIES DYLD_FORCE_FLAT_NAMESPACE DYLD_LIBRARY_PATH LD_LIBRARY_PATH \
-  LD_PRELOAD LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT GLIBC_TUNABLES \
+  "${!DYLD_@}" "${!LD_@}" GLIBC_TUNABLES \
   "${!MALLOC_@}" "${!Malloc@}" "${!JEMALLOC_@}" "${!TCMALLOC_@}" "${!MIMALLOC_@}"; do
   [[ -n "$env_name" ]] || continue
   if printenv "$env_name" >/dev/null 2>&1; then
@@ -863,8 +862,8 @@ expected_checksums = {
     "darray_count_sum": "751804663071387784",
     "darray_growth": "3759023315128811",
     "darray_counted_fill": "7999998000000",
-    "packed_side_table_write": "2147516416",
-    "packed_side_table_read": "549764202496",
+    "packed_side_table_write": "4295032832",
+    "packed_side_table_read": "551911718912",
 }
 expected_exit_statuses = {
     "matmul": 113,
@@ -873,8 +872,8 @@ expected_exit_statuses = {
     "darray_count_sum": 152,
     "darray_growth": 72,
     "darray_counted_fill": 8,
-    "packed_side_table_write": 74,
-    "packed_side_table_read": 119,
+    "packed_side_table_write": 148,
+    "packed_side_table_read": 193,
 }
 
 def mark_aborted(kind, reason):
@@ -884,7 +883,7 @@ def mark_aborted(kind, reason):
     )
     raise SystemExit(reason)
 
-def host_platform_identity():
+def host_platform_profile():
     host = platform.uname()
     models = set()
     features = set()
@@ -983,6 +982,7 @@ def benchmark_helper_hashes():
         root / "scripts" / "stage1_provenance.py",
         root / "scripts" / "elisac_stage1.sh",
         root / "scripts" / "build_runtime_object.sh",
+        root / "scripts" / "write_profiler_hook_fallbacks.sh",
     )
     return {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1040,6 +1040,32 @@ def parse_toolchain_manifest():
         rows.append({"path": str(Path(raw_path).resolve()), "sha256": digest.lower()})
     return sorted(rows, key=lambda row: (row["path"], row["sha256"]))
 
+def shared_runtime_source_manifest():
+    """Fingerprint runtime source inputs independently of changing compiler sources."""
+    runtime_root = root / "elisacore_std"
+    if not runtime_root.is_dir():
+        raise RuntimeError(f"missing runtime source directory: {runtime_root}")
+    paths = [
+        path for path in runtime_root.rglob("*")
+        if path.is_file() and not path.is_symlink() and path.suffix in (".elisa", ".elisai")
+    ]
+    paths.extend((
+        root / "scripts" / "build_runtime_object.sh",
+        root / "scripts" / "write_profiler_hook_fallbacks.sh",
+    ))
+    rows = []
+    for path in sorted(set(paths)):
+        if not path.is_file():
+            raise RuntimeError(f"missing shared runtime source input: {path}")
+        rows.append({
+            "path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    if not any(row["path"].startswith("elisacore_std/") for row in rows):
+        raise RuntimeError("shared runtime source manifest contains no runtime sources")
+    manifest_bytes = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"sha256": hashlib.sha256(manifest_bytes).hexdigest(), "files": rows}
+
 def write_canonical_workload_fingerprint(observed_results):
     """Record source/checksum/status parity independently of candidate compiler sources."""
     workloads = []
@@ -1067,7 +1093,7 @@ def write_canonical_workload_fingerprint(observed_results):
         "runner_sha256": hashlib.sha256((source_dir / "cross_language.sh").read_bytes()).hexdigest(),
         "benchmark_helper_sha256": benchmark_helper_hashes(),
         "comparator_toolchain": comparator_toolchain_identity(),
-        "platform": host_platform_identity(),
+        "platform": host_platform_profile(),
         "measurement_protocol": {
             "build_repeats": repeat,
             "runtime_repeats": runtime_repeat,
@@ -1108,6 +1134,7 @@ def write_canonical_workload_fingerprint(observed_results):
         "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
         "host_qualification_sha256": hashlib.sha256(qualification_bytes).hexdigest(),
         "runtime_artifact_sha256": runtime_artifact_sha256,
+        "shared_runtime_source_manifest": shared_runtime_source_manifest(),
         "build_environment_inputs": run_environment_input_hashes(child_env),
         "runtime_environment_inputs": run_environment_input_hashes(os.environ),
     }
@@ -1182,6 +1209,14 @@ def write_canonical_workload_fingerprint(observed_results):
                 "canonical workload fingerprint mismatch",
                 f"candidate fingerprint {record['fingerprint_sha256']} does not match reference {reference_path}",
             )
+        if runtime_profile_mode == "rebuilt-from-source":
+            reference_runtime_sources = reference_provenance.get("shared_runtime_source_manifest")
+            candidate_runtime_sources = run_provenance["shared_runtime_source_manifest"]
+            if reference_runtime_sources != candidate_runtime_sources:
+                mark_aborted(
+                    "shared runtime source mismatch",
+                    "rebuilt-runtime comparison requires identical runtime source and build-helper inputs",
+                )
         reference_runtime_sha256 = reference_provenance.get("runtime_artifact_sha256")
         if (
             not isinstance(reference_runtime_sha256, str)
@@ -1193,7 +1228,7 @@ def write_canonical_workload_fingerprint(observed_results):
             "policy": (
                 "must_match_shared_selected_runtime"
                 if runtime_profile_mode == "selected-runtime-object"
-                else "report_candidate_rebuilt_runtime"
+                else "report_both_rebuilt_runtime_hashes_allow_difference"
             ),
             "reference_sha256": reference_runtime_sha256.lower(),
             "candidate_sha256": runtime_artifact_sha256,
@@ -1209,6 +1244,10 @@ def write_canonical_workload_fingerprint(observed_results):
         record["run_provenance"] = run_provenance
         record["runtime_artifact_comparison"] = runtime_comparison
         fingerprint_file.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        print(f"runtime_artifact_policy={runtime_comparison['policy']}")
+        print(f"runtime_artifact_reference_sha256={runtime_comparison['reference_sha256']}")
+        print(f"runtime_artifact_candidate_sha256={runtime_comparison['candidate_sha256']}")
+        print(f"runtime_artifact_hashes_equal={runtime_comparison['equal']}")
         if runtime_profile_mode == "selected-runtime-object" and not runtime_comparison["equal"]:
             mark_aborted(
                 "runtime artifact parity mismatch",
@@ -1469,6 +1508,8 @@ RATIO_FIELDS = (
     ("elisa_over_zig_median_wall", "zig", "wall"),
     ("elisa_over_zig_median_child_cpu", "zig", "cpu"),
 )
+diagnostic_only_benches = {"packed_side_table_read"}
+comparison_benches = [bench for bench in benches if bench not in diagnostic_only_benches]
 
 def ratio_record(bench, metric_times):
     result = {}
@@ -1482,7 +1523,7 @@ def ratio_record(bench, metric_times):
 
 def write_ratio_results(metric, metric_times):
     path = out / f"{metric}_ratios.csv"
-    records = [ratio_record(bench, metric_times) for bench in benches]
+    records = [ratio_record(bench, metric_times) for bench in comparison_benches]
     geometric_means = {
         field: math.exp(sum(math.log(record[field]) for record in records) / len(records))
         for field, _, _ in RATIO_FIELDS
@@ -1490,22 +1531,23 @@ def write_ratio_results(metric, metric_times):
     with path.open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(("benchmark", *(field for field, _, _ in RATIO_FIELDS)))
-        for bench, record in zip(benches, records):
+        for bench, record in zip(comparison_benches, records):
             writer.writerow((bench, *(f"{record[field]:.6f}" for field, _, _ in RATIO_FIELDS)))
         writer.writerow(("geometric_mean", *(f"{geometric_means[field]:.6f}" for field, _, _ in RATIO_FIELDS)))
-    return path, records, geometric_means
+    return path, comparison_benches, records, geometric_means
 
-def print_ratio_summary(title, records, geometric_means):
+def print_ratio_summary(title, compared_benches, records, geometric_means):
     print(f"\n{title} Elisa/comparator median ratios (<1.0 means Elisa is faster)")
     print(f"{'benchmark':<20} {'Elisa/Rust wall':>17} {'Elisa/Rust CPU':>17} {'Elisa/Zig wall':>17} {'Elisa/Zig CPU':>17}")
-    for bench, record in zip(benches, records):
+    print("Diagnostic-only workloads omitted from ratios and geometric mean: " + ", ".join(sorted(diagnostic_only_benches)))
+    for bench, record in zip(compared_benches, records):
         values = [record[field] for field, _, _ in RATIO_FIELDS]
         print(f"{bench:<20} " + " ".join(f"{value:>17.3f}" for value in values))
     values = [geometric_means[field] for field, _, _ in RATIO_FIELDS]
     print(f"{'geometric mean':<20} " + " ".join(f"{value:>17.3f}" for value in values))
 
-compile_ratio_path, compile_ratio_records, compile_ratio_means = write_ratio_results("compile", times["compile"])
-build_ratio_path, build_ratio_records, build_ratio_means = write_ratio_results("build", times["build"])
+compile_ratio_path, compile_comparison_benches, compile_ratio_records, compile_ratio_means = write_ratio_results("compile", times["compile"])
+build_ratio_path, build_comparison_benches, build_ratio_records, build_ratio_means = write_ratio_results("build", times["build"])
 
 def print_summary(metric, title):
     print(f"\n{title} (median wall seconds / child CPU seconds)")
@@ -1516,8 +1558,8 @@ def print_summary(metric, title):
 
 print_summary("compile", "Object-only compiler time")
 print_summary("build", "End-to-end executable build time")
-print_ratio_summary("Object-only compile", compile_ratio_records, compile_ratio_means)
-print_ratio_summary("Executable build", build_ratio_records, build_ratio_means)
+print_ratio_summary("Object-only compile", compile_comparison_benches, compile_ratio_records, compile_ratio_means)
+print_ratio_summary("Executable build", build_comparison_benches, build_ratio_records, build_ratio_means)
 print(f"Object compile samples/results: {compile_samples_path} / {out / 'compile_results.csv'}")
 print(f"Executable build samples/results: {build_samples_path} / {out / 'build_results.csv'}")
 print(f"Compile ratios: {compile_ratio_path}")
@@ -1718,10 +1760,10 @@ runtime_ratio_fields = (
 )
 runtime_ratio_records = []
 # The side-table read fixture uses volatile native accesses while Elisa emits
-# ordinary helper accesses. Keep correctness/build coverage, but omit its
-# runtime ratios and geometric mean until both sides share that access contract.
-diagnostic_only_runtime_benches = {"packed_side_table_read"}
-runtime_comparison_benches = [bench for bench in benches if bench not in diagnostic_only_runtime_benches]
+# ordinary helper accesses. Keep correctness and raw compile/build/runtime samples,
+# but omit all cross-language ratios until both sides share that access contract.
+diagnostic_only_benches = {"packed_side_table_read"}
+runtime_comparison_benches = [bench for bench in benches if bench not in diagnostic_only_benches]
 for bench in runtime_comparison_benches:
     record = {}
     for field, comparator, axis in runtime_ratio_fields:
@@ -1746,14 +1788,15 @@ with runtime_ratio_path.open("w", newline="") as stream:
 print("\nFull checksums and exit statuses matched in a separate preflight; timed fresh processes were checked again (repeat count per variant: " + str(repeat) + ")")
 for metric, label in (("wall", "best/median wall seconds"), ("cpu", "best/median child CPU seconds")):
     print(f"\n{label}")
-    print(f"{'benchmark':<12} {'checksum':>8} {'Elisa':>17} {'C':>17} {'Rust':>17} {'Zig':>17}")
+    print(f"{'benchmark':<30} {'checksum':>18} {'Elisa':>17} {'C':>17} {'Rust':>17} {'Zig':>17}")
     for bench in benches:
         values = []
         for variant in variants:
             samples = times[bench][variant][metric]
             values.append(f"{min(samples):.6f}/{statistics.median(samples):.6f}")
         checksum = checksums[bench].decode("utf-8").strip()
-        print(f"{bench:<12} {checksum:>18} " + " ".join(f"{value:>17}" for value in values))
+        label = f"{bench} (diagnostic-only)" if bench in diagnostic_only_benches else bench
+        print(f"{label:<30} {checksum:>18} " + " ".join(f"{value:>17}" for value in values))
 print("\nGenerated runtime Elisa/comparator median ratios (<1.0 means Elisa is faster; diagnostic-only workloads are omitted)")
 print(f"{'benchmark':<20} {'Elisa/Rust wall':>17} {'Elisa/Rust CPU':>17} {'Elisa/Zig wall':>17} {'Elisa/Zig CPU':>17}")
 for bench, record in zip(runtime_comparison_benches, runtime_ratio_records):

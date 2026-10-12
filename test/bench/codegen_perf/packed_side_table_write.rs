@@ -66,6 +66,26 @@ fn load_side(
     }
 }
 
+#[inline(never)]
+fn checksum_records(records: &[RecordChunk], count: usize) -> u64 {
+    let mut total = 0;
+    for i in 0..count {
+        let chunk_index = i / CHUNK_RECORDS;
+        let offset = i - chunk_index * CHUNK_RECORDS;
+        let record = unsafe {
+            records
+                .get_unchecked(chunk_index)
+                .get_unchecked(offset)
+                .assume_init_ref()
+        };
+        if record.tag == 1 {
+            let payload = u64::from(record.payload_low) | (u64::from(record.payload_high) << 32);
+            total += u64::from(record.tag) + payload;
+        }
+    }
+    total
+}
+
 fn main() {
     let mut records: Vec<RecordChunk> = (0..CHUNK_COUNT)
         .map(|_| Box::new([MaybeUninit::<Record>::uninit(); CHUNK_RECORDS]))
@@ -104,6 +124,7 @@ fn main() {
     for &handle in &handles {
         total += load_side(Some(&side[..]), handle, RECORD_COUNT, 1, 0);
     }
+    total += checksum_records(&records, RECORD_COUNT);
 
     println!("{total}");
     drop(records);

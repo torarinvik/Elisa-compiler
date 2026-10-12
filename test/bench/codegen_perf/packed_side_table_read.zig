@@ -45,6 +45,20 @@ noinline fn loadSide(
     return slot.*;
 }
 
+noinline fn checksumRecords(records: []const RecordChunk, count: usize) u64 {
+    var total: u64 = 0;
+    for (0..count) |i| {
+        const chunk_index = i / chunk_records;
+        const offset = i - chunk_index * chunk_records;
+        const record = records[chunk_index].items[offset];
+        if (record.tag == 1) {
+            const payload: u64 = @as(u64, record.payload_low) | (@as(u64, record.payload_high) << 32);
+            total += @as(u64, record.tag) + payload;
+        }
+    }
+    return total;
+}
+
 fn alloc(comptime T: type, count: usize) []T {
     return std.heap.c_allocator.alloc(T, count) catch @panic("allocation failed");
 }
@@ -64,13 +78,10 @@ pub fn main() void {
         const offset = i - chunk_index * chunk_records;
         const stamp: u64 = @as(u64, @intCast(i)) + 1;
         records[chunk_index].items[offset] = .{ .tag = 0, .payload_low = 0, .payload_high = 0 };
-        const tag: *volatile u32 = &records[chunk_index].items[offset].tag;
-        tag.* = 1;
+        records[chunk_index].items[offset].tag = 1;
         const payload_bits: u64 = @intCast(i);
-        const payload_low: *volatile u32 = &records[chunk_index].items[offset].payload_low;
-        payload_low.* = @truncate(payload_bits);
-        const payload_high: *volatile u32 = &records[chunk_index].items[offset].payload_high;
-        payload_high.* = @truncate(payload_bits >> 32);
+        records[chunk_index].items[offset].payload_low = @truncate(payload_bits);
+        records[chunk_index].items[offset].payload_high = @truncate(payload_bits >> 32);
         const words = [_]u64{stamp};
         storeSide(side, words[0..], @intCast(i), i + 1, 1);
         handles[i] = @intCast(i);
@@ -80,6 +91,7 @@ pub fn main() void {
     for (0..read_passes) |_| {
         for (handles) |handle| total += loadSide(side, handle, record_count, 1, 0);
     }
+    total += checksumRecords(records[0..], record_count);
 
     std.debug.print("{d}\n", .{total});
     for (records) |chunk| std.heap.c_allocator.free(chunk.items);

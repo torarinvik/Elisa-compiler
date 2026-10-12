@@ -41,6 +41,20 @@ noinline fn loadSide(
     return chunks_opt[chunk_index].words[offset + word_offset];
 }
 
+noinline fn checksumRecords(records: []const RecordChunk, count: usize) u64 {
+    var total: u64 = 0;
+    for (0..count) |i| {
+        const chunk_index = i / chunk_records;
+        const offset = i - chunk_index * chunk_records;
+        const record = records[chunk_index].items[offset];
+        if (record.tag == 1) {
+            const payload: u64 = @as(u64, record.payload_low) | (@as(u64, record.payload_high) << 32);
+            total += @as(u64, record.tag) + payload;
+        }
+    }
+    return total;
+}
+
 fn alloc(comptime T: type, count: usize) []T {
     return std.heap.c_allocator.alloc(T, count) catch @panic("allocation failed");
 }
@@ -73,6 +87,7 @@ pub fn main() void {
     for (handles) |handle| {
         total += loadSide(side, handle, record_count, 1, 0);
     }
+    total += checksumRecords(records[0..], record_count);
 
     std.debug.print("{d}\n", .{total});
     for (records) |chunk| std.heap.c_allocator.free(chunk.items);

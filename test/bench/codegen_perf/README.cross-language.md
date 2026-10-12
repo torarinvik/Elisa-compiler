@@ -118,8 +118,13 @@ rebuilds that object with the selected Stage1 compiler, so candidate-generated r
 differ while workload and profile parity still match. The runner records both runtime SHA-256
 hashes and their equality in the candidate fingerprint for this profile. For the selected-runtime
 profile, the candidate and reference runtime hashes must match or the candidate run aborts.
+For rebuilt-runtime pairs, it also compares a separate shared-runtime-source manifest covering
+the `elisacore_std` sources and interfaces plus the runtime builder and profiler-hook generator.
+The full source manifests are retained per run but are not compared because they include the
+compiler sources that differ between baseline and candidate.
 Candidate and reference runs must use the same scope, benchmark helpers, comparator toolchain,
-host identity, and CPU entitlement. A
+recorded host profile, and CPU entitlement. The profile includes OS release/build, CPU model
+and features, and the process's CPU entitlement; it does not identify a unique physical host. A
 reference fingerprint is accepted only when its run directory has the matching nonempty
 `COMPLETE` or `COMPILE_COMPLETE` marker and no `ABORTED.txt`. To require candidate parity before
 any timed compiler sample, set `ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT` to the primary run's
@@ -135,10 +140,10 @@ reaped by their parent. Each compiler process group has a timeout so a stuck fro
 or child worker is killed with its parent.
 
 `compile_ratios.csv`, `build_ratios.csv`, and `runtime_ratios.csv` report Elisa's median time
-divided by Rust's and Zig's median time for each workload, with wall time and child CPU kept
-separate. A ratio below `1.0` means Elisa is faster. Each file ends with an unweighted
-geometric mean across the listed workloads; the per-workload raw measurements remain the source
-of truth. Compile-only runs produce the compile and build ratio files but no runtime ratio file.
+divided by Rust's and Zig's median time for each comparison workload, with wall time and child CPU
+kept separate. A ratio below `1.0` means Elisa is faster. Each file ends with an unweighted
+geometric mean across the listed comparison workloads; the per-workload raw measurements remain
+the source of truth. Compile-only runs produce the compile and build ratio files but no runtime ratio file.
 
 The ordinary Elisa semantic path is measured: incremental fact shadow/cache settings and
 forced contracts are cleared, the opt-in Stage1 object cache is disabled, and Stage1 uses one
@@ -150,11 +155,12 @@ its own cache cannot turn later samples into hits; those directories are created
 timer starts. The OS page cache remains under normal OS control, and the correctness preflights
 and executable hashing can warm it. `metadata.txt` records these policies and the shared
 source/toolchain fingerprints.
-Before launching tools, the runner also clears inherited loader injection/debug variables
-(`DYLD_INSERT_LIBRARIES`, `DYLD_FORCE_FLAT_NAMESPACE`, `LD_PRELOAD`, `LD_AUDIT`, `LD_DEBUG`,
-and `LD_DEBUG_OUTPUT`) and common allocator tuning variables (`GLIBC_TUNABLES`, `MALLOC_*`,
-`Malloc*`, `JEMALLOC_*`, `TCMALLOC_*`, and `MIMALLOC_*`). It records the cleared variable
-names in `metadata.txt` without recording their values.
+Before launching tools, the runner clears every inherited `DYLD_*` and `LD_*` variable,
+including library search paths, preload/audit/debug controls, and root overrides; the bare `LD`
+variable is preserved for linker selection. It also clears common allocator tuning
+variables (`GLIBC_TUNABLES`, `MALLOC_*`, `Malloc*`, `JEMALLOC_*`, `TCMALLOC_*`, and
+`MIMALLOC_*`). It records the cleared variable names in the run fingerprint and `metadata.txt`
+without recording their values.
 
 Runtime `samples.csv` stores every fresh-process wall and child CPU sample with launch order and
 load1 before and after the sample;
@@ -175,9 +181,9 @@ runs still record the post-build manifest but do not produce an after-runtime ma
 All variants must agree on the full checksum and process exit status before runtime timing.
 The harness also checks independently calculated totals: `matmul` -432360, `sieve` 19937370,
 both `darray_sum` and `darray_count_sum` 751804663071387784, `darray_growth` 3759023315128811,
-`darray_counted_fill` 7999998000000, `packed_side_table_write` 2147516416, and
-`packed_side_table_read` 549764202496. Their exit statuses are respectively 113, 189, 152,
-152, 72, 8, 74, and 119.
+`darray_counted_fill` 7999998000000, `packed_side_table_write` 4295032832, and
+`packed_side_table_read` 551911718912. Their exit statuses are respectively 113, 189, 152,
+152, 72, 8, 148, and 193.
 These fixed values catch a shared implementation mistake that a four-way agreement check
 alone would miss.
 
@@ -251,25 +257,27 @@ dynamic AoS ABI with `@packed_profile(build_heavy)` and marks the common field
 therefore record their common words through the runtime helper
 `ctx_aos_store_record_side_words_at` in `elisacore_std/stores_packed_aos.elisa`. The
 `packed_side_table_write` workload stores the stamps during construction, then reads each common
-field once for its checksum (`2147516416`, exit status 74). This store-plus-readback keeps the
-side-table writes observable in all four fixtures. The C, Rust, and Zig fixtures use the same row size and explicit
+field once and checksums every row's variant tag and payload once (`4295032832`, exit status 148).
+This keeps both side-table and base-row writes observable in all four fixtures. The C, Rust, and
+Zig fixtures use the same row size and explicit
 chunk/offset helpers. They zero each record row inside the construction loop immediately before
 writing its tag and payload, matching the generated Elisa constructor's per-record row-zeroing
 order. They leave side slots uninitialized until each is written. Native side-table stores and
-readback loads are ordinary accesses; the final checksum consumes every loaded stamp. The native
+readback loads are ordinary accesses; the final checksum consumes every loaded stamp and every
+row's tag and payload. The native
 helpers model the side-table indexing and access while Elisa uses its generated AoS store and
 runtime helper.
 
-`packed_side_table_read` builds the same records, then makes 256 full passes over their handles
-and reads each common stamp. Elisa lowers `node.stamp` through the runtime helper
+`packed_side_table_read` builds the same records, checksums every row's variant tag and payload
+once, then makes 256 full passes over their handles and reads each common stamp
+(`551911718912`, exit status 193). Elisa lowers `node.stamp` through the runtime helper
 `ctx_aos_store_read_side_word`; the other fixtures use matching chunk/offset helpers with
-volatile loads. The total checksum is `549764202496`, with exit status 119. Because Elisa emits
-ordinary helper accesses while the native fixtures force volatile row/side-table stores and
-side-table loads, this workload is
-diagnostic-only for runtime: correctness, compilation, and build samples remain available, but
-`runtime_ratios.csv` and its geometric means omit it. Its raw runtime samples are not a
-cross-language performance claim. The write workload above is the side-table runtime comparison
-and uses ordinary side-table accesses in every fixture. Each implementation releases its storage
+volatile loads. Because Elisa emits ordinary helper accesses while the native fixtures force
+volatile side-table stores and loads, this workload is diagnostic-only for cross-language timing:
+correctness checks and raw compile, build, and runtime samples remain available, but all three
+ratio files and their geometric means omit it. Its raw timing samples are not cross-language
+performance claims. The write workload above is the side-table runtime comparison and uses
+ordinary side-table accesses in every fixture. Each implementation releases its storage
 before terminating: Elisa frees the owning region on return, while the C, Rust, and Zig references
 free their record, side-table, descriptor, and handle allocations as applicable. Their
 allocator-specific setup and teardown paths differ, so runtime ratios include that lifetime

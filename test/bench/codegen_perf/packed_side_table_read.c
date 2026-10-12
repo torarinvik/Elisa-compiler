@@ -6,9 +6,9 @@
 enum { RECORD_COUNT = 65536, CHUNK_RECORDS = 256, CHUNK_COUNT = RECORD_COUNT / CHUNK_RECORDS, READ_PASSES = 256 };
 
 typedef struct {
-    volatile uint32_t tag;
-    volatile uint32_t payload_low;
-    volatile uint32_t payload_high;
+    uint32_t tag;
+    uint32_t payload_low;
+    uint32_t payload_high;
 } Record;
 
 typedef struct {
@@ -51,6 +51,20 @@ static NOINLINE uint64_t load_side(
     return chunks[chunk_index].words[offset + word_offset];
 }
 
+static NOINLINE uint64_t checksum_records(const RecordChunk *records, size_t count) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t chunk_index = i / CHUNK_RECORDS;
+        const size_t offset = i - chunk_index * CHUNK_RECORDS;
+        const Record *record = &records[chunk_index].items[offset];
+        if (record->tag == 1) {
+            const uint64_t payload = ((uint64_t)record->payload_high << 32) | record->payload_low;
+            total += (uint64_t)record->tag + payload;
+        }
+    }
+    return total;
+}
+
 int main(void) {
     RecordChunk *records = calloc(CHUNK_COUNT, sizeof(*records));
     SideChunk *side = calloc(CHUNK_COUNT, sizeof(*side));
@@ -68,7 +82,7 @@ int main(void) {
         const size_t offset = i - chunk_index * CHUNK_RECORDS;
         const uint64_t stamp = (uint64_t)i + 1;
         const uint64_t words[1] = {stamp};
-        memset((void *)&records[chunk_index].items[offset], 0, sizeof(Record));
+        memset(&records[chunk_index].items[offset], 0, sizeof(Record));
         records[chunk_index].items[offset].tag = 1;
         records[chunk_index].items[offset].payload_low = (uint32_t)i;
         records[chunk_index].items[offset].payload_high = (uint32_t)((uint64_t)i >> 32);
@@ -82,6 +96,7 @@ int main(void) {
             total += load_side(side, handles[i], RECORD_COUNT, 1, 0);
         }
     }
+    total += checksum_records(records, RECORD_COUNT);
 
     printf("%llu\n", (unsigned long long)total);
     const int status = (int)(total % 251);

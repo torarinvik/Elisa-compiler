@@ -51,6 +51,20 @@ static NOINLINE uint64_t load_side(
     return chunks[chunk_index].words[offset + word_offset];
 }
 
+static NOINLINE uint64_t checksum_records(const RecordChunk *records, size_t count) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t chunk_index = i / CHUNK_RECORDS;
+        const size_t offset = i - chunk_index * CHUNK_RECORDS;
+        const Record *record = &records[chunk_index].items[offset];
+        if (record->tag == 1) {
+            const uint64_t payload = ((uint64_t)record->payload_high << 32) | record->payload_low;
+            total += (uint64_t)record->tag + payload;
+        }
+    }
+    return total;
+}
+
 int main(void) {
     RecordChunk *records = calloc(CHUNK_COUNT, sizeof(*records));
     SideChunk *side = calloc(CHUNK_COUNT, sizeof(*side));
@@ -80,6 +94,7 @@ int main(void) {
     for (size_t i = 0; i < RECORD_COUNT; ++i) {
         total += load_side(side, handles[i], RECORD_COUNT, 1, 0);
     }
+    total += checksum_records(records, RECORD_COUNT);
 
     printf("%llu\n", (unsigned long long)total);
     const int status = (int)(total % 251);
