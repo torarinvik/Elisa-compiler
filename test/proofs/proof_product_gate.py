@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,18 @@ from typing import Optional
 
 MANIFEST_SCHEMA = "elisa-proof-build-manifest-v1"
 STAGE1_SCHEMA = "elisa-stage1-provenance-v1"
+STAGE1_SOURCE_DIRS = ("src", "elisacore_std")
+STAGE1_BUILD_RECIPES = (
+    "scripts/elisac_stage1.sh",
+    "scripts/stage1_object_cache.py",
+    "scripts/elisac_stage1_seed.sh",
+    "scripts/assert_stage0_fresh.sh",
+    "scripts/process_rss.sh",
+    "scripts/build_runtime_object.sh",
+    "scripts/write_profiler_hook_fallbacks.sh",
+    "scripts/stage1_provenance.py",
+)
+ELISA_INCLUDE = re.compile(r'^\s*include\s+"([^"]+)"', re.MULTILINE)
 
 
 def _tree_digest(root: Path) -> str:
@@ -21,6 +34,38 @@ def _tree_digest(root: Path) -> str:
             digest.update(relative.encode() + b"\0")
             digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
+
+
+def _stage1_input_digest(root: Path, paths: tuple[str, ...]) -> str:
+    """Match scripts/stage1_provenance.py's ordered source-input fingerprint."""
+    digest = hashlib.sha256()
+    files = []
+    for name in paths:
+        path = root / name
+        if path.is_dir():
+            files.extend(candidate for candidate in path.rglob("*") if candidate.is_file())
+        elif path.is_file():
+            files.append(path)
+    for path in sorted(set(files), key=lambda item: item.relative_to(root).as_posix()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def source_include_closure(roots: list[Path]) -> list[Path]:
+    """Return every source file reachable through literal Elisa include directives."""
+    pending = list(roots)
+    seen: set[Path] = set()
+    while pending:
+        path = pending.pop().resolve(strict=True)
+        if path in seen:
+            continue
+        seen.add(path)
+        pending.extend((path.parent / relative).resolve(strict=True)
+                       for relative in ELISA_INCLUDE.findall(path.read_text()))
+    return sorted(seen)
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -93,6 +138,16 @@ def require_current_product(binary: Path, prover_root: Path) -> dict:
             compiler.get("stage1_revision") != revision_pin or
             compiler.get("source_dirty") is not False):
         raise ValueError("proof executable compiler provenance does not match ELISA_COMPILER_REV")
+
+    compiler_root = Path(__file__).resolve().parents[2]
+    checkout_revision = _git(compiler_root, "rev-parse", "HEAD")
+    if revision != checkout_revision:
+        raise ValueError("proof executable was built from a different compiler checkout revision")
+    current_source_tree = _stage1_input_digest(compiler_root, STAGE1_SOURCE_DIRS)
+    current_build_recipe = _stage1_input_digest(compiler_root, STAGE1_BUILD_RECIPES)
+    if (compiler.get("source_tree_sha256") != current_source_tree or
+            compiler.get("build_recipe_sha256") != current_build_recipe):
+        raise ValueError("proof executable was built from different current compiler source or build inputs")
 
     stage1_path = Path(compiler["product"]["path"]).resolve(strict=True)
     provenance_path = Path(str(stage1_path) + ".provenance.json")
