@@ -396,28 +396,32 @@ extend Semantic:
                     _:
                         return ""
 
-        def bam_collect_locals(statements: darray[Ast::Stmt], binders: BorrowBinders&, out: mutable darray[sview]&) -> void:
+        def bam_collect_locals(statements: darray[Ast::Stmt], binders: BorrowBinders&, out: mutable darray[sview]&, collect_perm_containers: bool, perm_containers: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |out|:
+                for statement in statements |out, perm_containers|:
                     match statement:
                         Stmt.VarDecl(declared_name, declared_type, declared_value, declared_pos):
                             # A plain `T` / `mutable T` annotation is frame storage. A region
                             # qualifier or a reference is not, and neither is an inferred binding.
-                            out.push(declared_name) if not rvc_is_absent(rvc_value_type(declared_type)) and binders_bound_once(binders, declared_name)
+                            value_type: Ast::Expr = rvc_value_type(declared_type)
+                            if not rvc_is_absent(value_type):
+                                unique_binder: bool = binders_bound_once(binders, declared_name)
+                                out.push(declared_name) if unique_binder
+                                perm_containers.push(declared_name) if collect_perm_containers and unique_binder and emit_ast_expr_head_is_container(value_type)
                         Stmt.If(branch_condition, branch_then, branch_else, branch_pos):
-                            bam_collect_locals(branch_then, binders, out)
-                            bam_collect_locals(branch_else, binders, out)
+                            bam_collect_locals(branch_then, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_locals(branch_else, binders, out, collect_perm_containers, perm_containers)
                         Stmt.While(loop_condition, loop_body, loop_pos):
-                            bam_collect_locals(loop_body, binders, out)
+                            bam_collect_locals(loop_body, binders, out, collect_perm_containers, perm_containers)
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
-                            bam_collect_locals(for_body, binders, out)
+                            bam_collect_locals(for_body, binders, out, collect_perm_containers, perm_containers)
                         Stmt.Match(match_scrutinee, match_arms, match_pos):
-                            for match_arm in match_arms |out|:
-                                bam_collect_locals(match_arm.body, binders, out)
+                            for match_arm in match_arms |out, perm_containers|:
+                                bam_collect_locals(match_arm.body, binders, out, collect_perm_containers, perm_containers)
                         # `can …:` / `trusted …:` / `region …:` / `try:` bodies declare frame
                         # locals too; skipping them let `can X: local = 5; return &local` escape.
                         Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
-                            bam_collect_locals(block_body, binders, out)
+                            bam_collect_locals(block_body, binders, out, collect_perm_containers, perm_containers)
                         _:
                             pass
 
@@ -906,7 +910,9 @@ extend Semantic:
         # returnBorrowContainerInsertMethods).
         def bam_is_container_insert(method: sview) -> bool:
             can Abort.Panic:
-                return method == "push" or method == "extend" or method == "insert" or method == "put" or method == "add" or method == "append" or method == "push_back" or method == "push_front" or method == "set"
+                return when method:
+                    "push" | "extend" | "insert" | "put" | "add" | "append" | "push_back" | "push_front" | "set" -> true
+                    _ -> false
 
         # `out.push(&x)` as a statement: the receiver now ALSO holds the arguments' roots, so a
         # later `return out` carries them. The receiver's existing roots stay.
@@ -1040,34 +1046,6 @@ extend Semantic:
                     Expr.Unary(operator, operand, _): operator == TokenKind.Ampersand and (operand is Expr.Index(_, _, _))
                     Expr.Paren(inner, _): bam_borrow_is_element(inner)
                     _: false
-
-        # Plain container locals (`out: mutable darray[T] = ...`, no region qualifier).
-        def bam_collect_container_locals(statements: darray[Ast::Stmt], binders: BorrowBinders&, out: mutable darray[sview]&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                plain: mutable darray[sview] = []
-                bam_collect_locals(statements, binders, plain)
-                bam_collect_container_decls(statements, plain, out)
-
-        def bam_collect_container_decls(statements: darray[Ast::Stmt], plain: darray[sview]&, out: mutable darray[sview]&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                for statement in statements |out|:
-                    match statement:
-                        Stmt.VarDecl(declared_name, declared_type, _, _):
-                            out.push(declared_name) if emit_ast_expr_head_is_container(rvc_value_type(declared_type)) and (any plain_name in plain where plain_name == declared_name)
-                        Stmt.If(_, branch_then, branch_else, _):
-                            bam_collect_container_decls(branch_then, plain, out)
-                            bam_collect_container_decls(branch_else, plain, out)
-                        Stmt.While(_, loop_body, _):
-                            bam_collect_container_decls(loop_body, plain, out)
-                        Stmt.For(_, _, _, for_body, _):
-                            bam_collect_container_decls(for_body, plain, out)
-                        Stmt.Match(_, match_arms, _):
-                            for match_arm in match_arms |out|:
-                                bam_collect_container_decls(match_arm.body, plain, out)
-                        Stmt.Block(_, _, _, block_body, _):
-                            bam_collect_container_decls(block_body, plain, out)
-                        _:
-                            pass
 
         def bam_borrow_root(expression: Ast::Expr) -> sview:
             can Memory.Allocate, Abort.Panic:
@@ -1532,13 +1510,17 @@ extend Semantic:
                             # One unreadable pattern and the whole function is skipped: a name this
                             # walk cannot count may be bound twice, and then it reads the wrong one.
                             readable: bool = not (any binder in binders.names where binder == "*")
+                            collect_perm_containers: bool = false
+                            if function_return is static_return:
+                                collect_perm_containers <- bam_annotation_is_static(static_return) and bam_type_is_address(static_return) and not auto_region_params_mention_arena(function_parameters) and not (any region_line in region_param_lines where region_line == function_pos.line)
                             owners: mutable darray[sview] = []
                             locals: mutable darray[sview] = []
+                            perm_containers: mutable darray[sview] = []
                             if readable:
                                 for parameter in function_parameters |owners|:
                                     owners.push(parameter.name) if bam_owner_type_name(parameter.type_expression, table) != "" and binders_bound_once(binders, parameter.name)
                                 bam_collect_owners(function_body, binders, table, owners)
-                                bam_collect_locals(function_body, binders, locals)
+                                bam_collect_locals(function_body, binders, locals, collect_perm_containers, perm_containers)
                                 for value_parameter in function_parameters |locals|:
                                     locals.push(value_parameter.name) if not affine_annotation_is_ref(value_parameter.type_expression) and binders_bound_once(binders, value_parameter.name)
                             kinds: mutable darray[u32] = []
@@ -1564,10 +1546,6 @@ extend Semantic:
                             # Inspect returns in every function: a local reference can escape
                             # inside a struct/tuple/container, or through a known aggregate
                             # lender, even when the function's declared result is not itself T&.
-                            perm_containers: mutable darray[sview] = []
-                            if function_return is static_return:
-                                if bam_annotation_is_static(static_return) and bam_type_is_address(static_return) and not auto_region_params_mention_arena(function_parameters) and not (any region_line in region_param_lines where region_line == function_pos.line):
-                                    bam_collect_container_locals(function_body, binders, perm_containers)
                             table <- bam_escape_statements(function_body, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, table, returns_reference_aggregate, returns_reference, true) if (returns_reference or returns_reference_aggregate) and locals.count > 0
                             ref_params: mutable darray[sview] = []
                             ref_param_types: mutable darray[u32] = []

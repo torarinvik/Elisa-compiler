@@ -102,9 +102,10 @@ extend Semantic:
             lookup_field_starts: mutable darray[usize] = []
             lookup_field_counts: mutable darray[usize] = []
             lookup_fields: mutable darray[sview] = []
-            # name_hash of every callee looked up since this was last cleared: a function's
-            # summary depends on the prior rows of exactly these names.
+            # Round-zero name_hash dependencies for the current function. The fixpoint
+            # scheduler reads these only after the first summary pass.
             looked_up: mutable darray[u64] = []
+            collect_looked_up: bool = false
 
         def pgs_key(function: sview, tag: sview) -> u64:
             can Abort.Panic:
@@ -158,8 +159,9 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 tag: sview = vro_tag(position)
                 false return if tag == "" or callee == ""
-                prior.looked_up.push(name_hash(callee))
-                key: u64 = pgs_key(callee, tag)
+                callee_hash: u64 = name_hash(callee)
+                prior.looked_up.push(callee_hash) if prior.collect_looked_up
+                key: u64 = (callee_hash * SEMANTIC_HASH_PRIME) ^ name_hash(tag)
                 cached: mutable u32 = pgs_lookup_head(prior, key)
                 while cached != SYMBOL_INDEX_ROW_NONE:
                     cache_row: usize = cached.usize()
@@ -462,7 +464,9 @@ extend Semantic:
 
         def pgs_integer_spelling(spelling: sview) -> bool:
             can Abort.Panic:
-                return spelling == "usize" or spelling == "isize" or spelling == "u8" or spelling == "u16" or spelling == "u32" or spelling == "u64" or spelling == "i8" or spelling == "i16" or spelling == "i32" or spelling == "i64" or spelling == "mutable usize" or spelling == "mutable isize" or spelling == "mutable u32" or spelling == "mutable u64" or spelling == "mutable i32" or spelling == "mutable i64"
+                return when spelling:
+                    "usize" | "isize" | "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "mutable usize" | "mutable isize" | "mutable u32" | "mutable u64" | "mutable i32" | "mutable i64" -> true
+                    _ -> false
 
         # `X.count` / `X.len` on a place, unless some struct declares a field of that name
         # with a non-integer type (that field could hold storage, so it keeps the escape rule).
@@ -560,13 +564,18 @@ extend Semantic:
                     dep_starts.push(0)
                     dep_counts.push(0)
                 changed: mutable dict[u64, bool] = {}
-                for round in 0..<64 |rows, file, table, functions, cache, cache_starts, cache_counts, dep_hashes, dep_starts, dep_counts, changed|:
+                # One map is reused while round zero records dependencies. Its value is the
+                # last function index that used a hash, so duplicate call/parameter probes
+                # within a function collapse without allocating a set per function.
+                dependency_owner: mutable dict[u64, usize] = {}
+                for round in 0..<64 |rows, file, table, functions, cache, cache_starts, cache_counts, dep_hashes, dep_starts, dep_counts, changed, dependency_owner|:
                     prior: mutable PgsPrior = PgsPrior{}
                     prior <- pgs_index(rows, prior) can Global{Read,Write}
+                    prior.collect_looked_up <- round == 0
                     next: mutable darray[sview] = []
                     next_cache: mutable darray[sview] = []
                     next_changed: mutable dict[u64, bool] = {}
-                    for function_index in 0..<functions.count |prior, next, next_cache, next_changed, round, functions, cache, cache_starts, cache_counts, dep_hashes, dep_starts, dep_counts, changed, table|:
+                    for function_index in 0..<functions.count |prior, next, next_cache, next_changed, round, functions, cache, cache_starts, cache_counts, dep_hashes, dep_starts, dep_counts, changed, dependency_owner, table|:
                         cached_start: usize = cache_starts[function_index]
                         cached_count: usize = cache_counts[function_index]
                         recompute: mutable bool = round == 0
@@ -581,10 +590,17 @@ extend Semantic:
                             if functions[function_index] is Decl.Func(function_name, function_params, _, function_body, _, _, _):
                                 prior.looked_up <- []
                                 pgs_function(function_name, function_params, function_body, false, prior, table, next) can Global{Read,Write}
-                                dep_starts[function_index] <- dep_hashes.count
-                                dep_counts[function_index] <- prior.looked_up.count
-                                for looked in prior.looked_up |dep_hashes|:
-                                    dep_hashes.push(looked)
+                                # Lookup sites depend only on this body and the fixed symbol
+                                # table, not on the prior summary values. Round zero visits
+                                # every function, so retain each distinct callee hash once.
+                                if round == 0:
+                                    dep_starts[function_index] <- dep_hashes.count
+                                    for looked in prior.looked_up |dep_hashes, dependency_owner, function_index|:
+                                        if dependency_owner.get(looked) is prior_function:
+                                            continue if prior_function == function_index
+                                        dependency_owner <- dependency_owner.put(looked, function_index) can Global{Read,Write}
+                                        dep_hashes.push(looked)
+                                    dep_counts[function_index] <- dep_hashes.count - dep_starts[function_index]
                                 same_rows: mutable bool = next.count - start == cached_count
                                 for compare_index in 0..<cached_count |same_rows, next, cache, start, cached_start|:
                                     same_rows <- false if same_rows and next[start + compare_index] != cache[cached_start + compare_index]
@@ -596,9 +612,16 @@ extend Semantic:
                         cache_counts[function_index] <- next.count - start
                         for keep_index in start..<next.count |next_cache, next|:
                             next_cache.push(next[keep_index])
-                    next_prior: mutable PgsPrior = PgsPrior{}
-                    next_prior <- pgs_index(next, next_prior) can Global{Read,Write}
-                    same: bool = pgs_rows_covered(next, prior) and pgs_rows_covered(rows, next_prior)
+                    # If no function's exact cached segment changed, every segment in
+                    # `next` is either copied from `cache` or was just compared equal to
+                    # that cache. Since `cache` is the segment encoding of `rows`, the
+                    # complete row sequence is unchanged; avoid rebuilding its index and
+                    # doing two set-coverage walks on this fixpoint round.
+                    same: mutable bool = next_changed.count == 0
+                    if not same:
+                        next_prior: mutable PgsPrior = PgsPrior{}
+                        next_prior <- pgs_index(next, next_prior) can Global{Read,Write}
+                        same <- pgs_rows_covered(next, prior) and pgs_rows_covered(rows, next_prior)
                     rows <- next
                     cache <- next_cache
                     changed <- next_changed

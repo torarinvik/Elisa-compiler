@@ -3,6 +3,218 @@
 # declaration ASTs when validating spawn/pool arguments and callback results.
 extend Semantic:
     private:
+        # These cutoffs are static allocation heuristics; retain them as compile-time
+        # scorecard items until measurements confirm the index build amortizes its cost.
+        const THREAD_ALIAS_INDEX_NONE: u32 = 4294967295
+        const THREAD_CALLBACK_INDEX_NONE: u32 = 4294967295
+        const THREAD_ALIAS_INDEX_MIN_ROWS: usize = 8.usize()
+        const THREAD_CALLBACK_INDEX_MIN_ROWS: usize = 8.usize()
+
+        enum ThreadTypeSource:
+            Declaration(Ast::Decl)
+            Expression(Ast::Expr)
+
+        struct ThreadCallbackIndex:
+            names: mutable darray[sview] = []
+            modules: mutable darray[sview] = []
+            return_types: mutable darray[Ast::Expr] = []
+            flags: mutable darray[bool] = []
+            classified: mutable darray[bool] = []
+            duplicate_next: mutable darray[u32] = []
+            duplicate_tail: mutable darray[u32] = []
+            slots: mutable darray[u32] = []
+            index_attempted: mutable bool = false
+            index_built: mutable bool = false
+            type_owners: mutable darray[sview] = []
+            type_owner_modules: mutable darray[sview] = []
+            type_owner_lines: mutable darray[u32] = []
+            type_sources: mutable darray[ThreadTypeSource] = []
+            type_next: mutable darray[u32] = []
+            type_heads: mutable dict[u64, u32] = {}
+            type_tails: mutable dict[u64, u32] = {}
+            type_counts: mutable dict[u64, u32] = {}
+            scope_module_names: mutable darray[sview] = []
+            scope_module_next: mutable darray[u32] = []
+            scope_module_heads: mutable dict[u64, u32] = {}
+            scope_module_index_attempted: mutable bool = false
+            scope_module_index_built: mutable bool = false
+
+        # Exact visited keys pair module scope with the type spelling. The open-addressed
+        # table keeps recursive aggregate walks near-linear without conflating `A::Item`
+        # and `B::Item`.
+        struct ThreadTypeVisitSet:
+            names: mutable darray[sview] = []
+            modules: mutable darray[sview] = []
+            slots: mutable darray[u32] = []
+
+        const THREAD_TYPE_VISIT_EMPTY: u32 = 4294967295
+        const THREAD_TYPE_VISIT_HASH_MIN_ROWS: usize = 4.usize()
+
+        def thread_type_visit_hash(module_scope: sview, name: sview) -> u64:
+            can Abort.Panic:
+                return (name_hash(module_scope) * 1099511628211) ^ name_hash(name)
+
+        def thread_type_visit_slot(set: ThreadTypeVisitSet&, module_scope: sview, name: sview) -> usize:
+            can Abort.Panic:
+                mask: usize = set.slots.count - 1.usize()
+                slot: mutable usize = thread_type_visit_hash(module_scope, name).usize() & mask
+                while set.slots[slot] != THREAD_TYPE_VISIT_EMPTY |slot, set, module_scope, name, mask|:
+                    row: usize = set.slots[slot].usize()
+                    return slot if row < set.names.count and row < set.modules.count and set.names[row] == name and set.modules[row] == module_scope
+                    slot <- (slot + 1.usize()) & mask
+                return slot
+
+        def thread_type_visit_grow(set: mutable ThreadTypeVisitSet&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                capacity: mutable usize = 16.usize()
+                while capacity < (set.names.count + 1.usize()) * 2.usize() |capacity, set|:
+                    capacity <- capacity * 2.usize()
+                set.slots <- []
+                for _slot in 0..<capacity |set|:
+                    set.slots <- set.slots.push(THREAD_TYPE_VISIT_EMPTY)
+                for row in 0..<set.names.count |row, set|:
+                    slot: usize = thread_type_visit_slot(set, set.modules[row], set.names[row])
+                    set.slots[slot] <- row.u32()
+
+        def thread_type_visit_contains(set: ThreadTypeVisitSet&, module_scope: sview, name: sview) -> bool:
+            can Abort.Panic:
+                if set.slots.count == 0:
+                    for row in 0..<set.names.count:
+                        return true if set.names[row] == name and row < set.modules.count and set.modules[row] == module_scope
+                    return false
+                return set.slots[thread_type_visit_slot(set, module_scope, name)] != THREAD_TYPE_VISIT_EMPTY
+
+        def thread_type_visit_add(set: mutable ThreadTypeVisitSet&, module_scope: sview, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if set.slots.count == 0 and set.names.count < THREAD_TYPE_VISIT_HASH_MIN_ROWS:
+                    set.names <- set.names.push(name)
+                    set.modules <- set.modules.push(module_scope)
+                    return
+                thread_type_visit_grow(set) if set.slots.count < (set.names.count + 1.usize()) * 2.usize()
+                slot: usize = thread_type_visit_slot(set, module_scope, name)
+                return if set.slots[slot] != THREAD_TYPE_VISIT_EMPTY
+                set.slots[slot] <- set.names.count.u32()
+                set.names <- set.names.push(name)
+                set.modules <- set.modules.push(module_scope)
+
+
+        def new_thread_callback_index() -> ThreadCallbackIndex can[Abort.Panic]:
+            return ThreadCallbackIndex{names: [], modules: [], return_types: [], flags: [], classified: [], duplicate_next: [], duplicate_tail: [], slots: [], index_attempted: false, index_built: false, type_owners: [], type_owner_modules: [], type_owner_lines: [], type_sources: [], type_next: [], type_heads: {}, type_tails: {}, type_counts: {}, scope_module_names: [], scope_module_next: [], scope_module_heads: {}, scope_module_index_attempted: false, scope_module_index_built: false}
+
+
+        # Retain one AST declaration row per named aggregate instead of flattening every
+        # member into the index. The symbol table's structural projections omit positional
+        # structs and erase reference qualifiers, so queried declarations still walk their
+        # original member expressions on demand.
+        def thread_index_type_row(callbacks: mutable ThreadCallbackIndex&, owner: sview, owner_module: sview, owner_line: u32, source: ThreadTypeSource) -> void:
+            can Memory.Allocate, Abort.Panic:
+                row: usize = callbacks.type_owners.count
+                callbacks.type_owners <- callbacks.type_owners.push(owner)
+                callbacks.type_owner_modules <- callbacks.type_owner_modules.push(owner_module)
+                callbacks.type_owner_lines <- callbacks.type_owner_lines.push(owner_line)
+                callbacks.type_sources <- callbacks.type_sources.push(source)
+                callbacks.type_next <- callbacks.type_next.push(THREAD_CALLBACK_INDEX_NONE)
+                hash: u64 = name_hash(owner)
+                prior_tail: mutable u32 = THREAD_CALLBACK_INDEX_NONE
+                can Global{Read,Write}:
+                    prior_tail <- tail_row if callbacks.type_tails.get(hash) is tail_row
+                if prior_tail != THREAD_CALLBACK_INDEX_NONE:
+                    callbacks.type_next[prior_tail.usize()] <- row.u32()
+                else:
+                    callbacks.type_heads <- callbacks.type_heads.put(hash, row.u32()) can Global{Read,Write}
+                callbacks.type_tails <- callbacks.type_tails.put(hash, row.u32()) can Global{Read,Write}
+                old_count: mutable u32 = 0
+                can Global{Read,Write}:
+                    old_count <- count if callbacks.type_counts.get(hash) is count
+                callbacks.type_counts <- callbacks.type_counts.put(hash, old_count + 1) can Global{Read,Write}
+
+
+        def thread_index_type_declaration(callbacks: mutable ThreadCallbackIndex&, owner: sview, owner_module: sview, owner_line: u32, declaration: Ast::Decl) -> void:
+            can Memory.Allocate, Abort.Panic:
+                thread_index_type_row(callbacks, owner, owner_module, owner_line, ThreadTypeSource.Declaration(declaration))
+
+
+        def thread_index_type_expression(callbacks: mutable ThreadCallbackIndex&, owner: sview, owner_module: sview, owner_line: u32, expression: Ast::Expr) -> void:
+            can Memory.Allocate, Abort.Panic:
+                thread_index_type_row(callbacks, owner, owner_module, owner_line, ThreadTypeSource.Expression(expression))
+
+
+        # Build a per-pass open-addressed spelling index. Each slot stores the first source
+        # row for a name, and same-spelling overloads remain in a compact row chain so their
+        # return types can be classified only when that callback spelling is queried.
+        def thread_build_callback_name_index(callbacks: mutable ThreadCallbackIndex&) -> void can[Abort.Panic, Memory.Allocate]:
+            callbacks.index_attempted <- true
+            callbacks.index_built <- false
+            callbacks.slots <- []
+            return if callbacks.names.count != callbacks.modules.count or callbacks.names.count != callbacks.return_types.count or callbacks.names.count != callbacks.flags.count or callbacks.names.count != callbacks.classified.count or callbacks.names.count != callbacks.duplicate_next.count or callbacks.names.count != callbacks.duplicate_tail.count
+            # The lookup's linear fallback is cheaper for tiny callback sets and avoids
+            # allocating a slot array at all when the source declares no functions.
+            return if callbacks.names.count < THREAD_CALLBACK_INDEX_MIN_ROWS
+            return if callbacks.names.count >= 2147483647.usize()
+            capacity: usize = callbacks.names.count + callbacks.names.count + 1.usize()
+            for _slot in 0..<capacity |callbacks|:
+                callbacks.slots <- callbacks.slots.push(THREAD_CALLBACK_INDEX_NONE)
+            for callback_row in 0..<callbacks.names.count |callback_row, callbacks, capacity|:
+                callback_hash: u64 = name_hash(callbacks.names[callback_row])
+                slot: mutable usize = callback_hash.usize() % capacity
+                probes: mutable usize = 0.usize()
+                slot_found: mutable bool = false
+                while probes < capacity |slot, probes, slot_found, callback_row, callbacks, capacity|:
+                    existing_row: u32 = callbacks.slots[slot]
+                    if existing_row == THREAD_CALLBACK_INDEX_NONE:
+                        callbacks.slots[slot] <- callback_row.u32()
+                        slot_found <- true
+                    elif callbacks.names[existing_row.usize()] == callbacks.names[callback_row]:
+                        head_row: usize = existing_row.usize()
+                        tail_row: usize = callbacks.duplicate_tail[head_row].usize()
+                        return if tail_row >= callbacks.names.count
+                        callbacks.duplicate_next[tail_row] <- callback_row.u32()
+                        callbacks.duplicate_tail[head_row] <- callback_row.u32()
+                        slot_found <- true
+                    else:
+                        slot <- slot + 1.usize()
+                        slot <- 0.usize() if slot >= capacity
+                        probes <- probes + 1.usize()
+                return if not slot_found
+            callbacks.index_built <- true
+
+
+
+        # Build once for this pass: type checks recur for callback results, parameters, locals,
+        # and nested fields. Hashes select a collision bucket; exact names and every duplicate
+        # row remain visible to the resolver in their original source order.
+        def thread_build_alias_name_index(table: lmut SymbolTable) -> SymbolTable can[Abort.Panic, Memory.Allocate]:
+            table.thread_alias_name_heads <- {}
+            table.thread_alias_name_tails <- {}
+            table.thread_alias_name_counts <- {}
+            table.thread_alias_name_next <- []
+            table.thread_alias_name_index_count <- table.type_alias_name.count
+            table.thread_alias_name_index_built <- false
+            return table if table.type_alias_name.count >= THREAD_ALIAS_INDEX_NONE.usize()
+            for alias_index in 0..<table.type_alias_name.count |alias_index, table|:
+                table <- table.thread_alias_name_next.push(THREAD_ALIAS_INDEX_NONE)
+                alias_hash: u64 = name_hash(table.type_alias_name[alias_index])
+                prior_tail: mutable u32 = THREAD_ALIAS_INDEX_NONE
+                can Global{Read,Write}:
+                    prior_tail <- tail_row if table.thread_alias_name_tails.get(alias_hash) is tail_row
+                if prior_tail != THREAD_ALIAS_INDEX_NONE:
+                    table.thread_alias_name_next[prior_tail.usize()] <- alias_index.u32()
+                else:
+                    table.thread_alias_name_heads <- table.thread_alias_name_heads.put(alias_hash, alias_index.u32()) can Global{Read,Write}
+                table.thread_alias_name_tails <- table.thread_alias_name_tails.put(alias_hash, alias_index.u32()) can Global{Read,Write}
+                old_count: mutable u32 = 0
+                can Global{Read,Write}:
+                    old_count <- count if table.thread_alias_name_counts.get(alias_hash) is count
+                table.thread_alias_name_counts <- table.thread_alias_name_counts.put(alias_hash, old_count + 1) can Global{Read,Write}
+            table.thread_alias_name_index_built <- true
+            return table
+
+
+        def thread_alias_name_index_is_valid(table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return table.thread_alias_name_index_built and table.thread_alias_name_index_count == table.type_alias_name.count and table.thread_alias_name_next.count == table.type_alias_name.count and table.type_alias_target.count == table.type_alias_name.count and table.type_alias_module.count == table.type_alias_name.count and table.type_alias_declarations.count == table.type_alias_name.count
+
+
         def thread_has_submit_marker(annotations: darray[Ast::EnumAnnotation]&, pos: Ast::Pos) -> bool:
             can Abort.Panic:
                 for annotation in annotations:
@@ -77,6 +289,315 @@ extend Semantic:
                 return type_contains_operator(type_expression, TokenKind.Ampersand) and not type_contains_operator(type_expression, TokenKind.Static)
 
 
+        def thread_scope_module_matches(expression: Ast::Expr, module_name: sview, end: usize) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return false if end != sview_len(name)
+                        for offset in 0..<end |offset, module_name, name|:
+                            return false if sview_at(module_name, offset) != sview_at(name, offset)
+                        return true
+                    Expr.Scope(base, name, _):
+                        name_length: usize = sview_len(name)
+                        false return if end < name_length + 2.usize()
+                        suffix_start: usize = end - name_length
+                        for offset in 0..<name_length |offset, module_name, name, suffix_start|:
+                            return false if sview_at(module_name, suffix_start + offset) != sview_at(name, offset)
+                        false return if sview_at(module_name, suffix_start - 1.usize()) != 58 or sview_at(module_name, suffix_start - 2.usize()) != 58
+                        return thread_scope_module_matches(base, module_name, suffix_start - 2.usize())
+                    _:
+                        return false
+
+
+        # Hash a qualified scope directly from its AST segments using the same FNV-1a byte
+        # sequence as name_hash. This lets the resolver probe only candidate declarations in
+        # the matching hash bucket instead of rescanning module strings once per reference.
+        def thread_scope_module_hash(expression: Ast::Expr) -> u64:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name_hash(name)
+                    Expr.Scope(base, name, _):
+                        hash: mutable u64 = thread_scope_module_hash(base)
+                        hash <- (hash ^ 58) * SEMANTIC_HASH_PRIME
+                        hash <- (hash ^ 58) * SEMANTIC_HASH_PRIME
+                        for byte in name |hash|:
+                            hash <- (hash ^ byte.u64()) * SEMANTIC_HASH_PRIME
+                        return hash
+                    _:
+                        return 0
+
+
+        # Keep one exact candidate per canonical module string. Hash collisions remain a
+        # linked bucket and are checked by string equality before the source scope is matched.
+        def thread_scope_module_index_add(callbacks: mutable ThreadCallbackIndex&, module_name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if module_name == ""
+                hash: u64 = name_hash(module_name)
+                previous: mutable u32 = THREAD_CALLBACK_INDEX_NONE
+                can Global{Read,Write}:
+                    previous <- head if callbacks.scope_module_heads.get(hash) is head
+                row: mutable u32 = previous
+                while row != THREAD_CALLBACK_INDEX_NONE |row, callbacks, module_name|:
+                    break if row.usize() >= callbacks.scope_module_names.count or row.usize() >= callbacks.scope_module_next.count
+                    return if callbacks.scope_module_names[row.usize()] == module_name
+                    row <- callbacks.scope_module_next[row.usize()]
+                new_row: u32 = callbacks.scope_module_names.count.u32()
+                callbacks.scope_module_names <- callbacks.scope_module_names.push(module_name)
+                callbacks.scope_module_next <- callbacks.scope_module_next.push(previous)
+                callbacks.scope_module_heads <- callbacks.scope_module_heads.put(hash, new_row) can Global{Read,Write}
+
+
+        def thread_build_scope_module_index(callbacks: mutable ThreadCallbackIndex&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callbacks.scope_module_names <- []
+                callbacks.scope_module_next <- []
+                callbacks.scope_module_heads <- {}
+                callbacks.scope_module_index_built <- false
+                callback_module_count: usize = callbacks.modules.count
+                for module_index in 0..<callback_module_count |callbacks|:
+                    module_name: sview = callbacks.modules[module_index]
+                    thread_scope_module_index_add(callbacks, module_name) can Global{Read,Write}
+                type_owner_module_count: usize = callbacks.type_owner_modules.count
+                for module_index in 0..<type_owner_module_count |callbacks|:
+                    module_name: sview = callbacks.type_owner_modules[module_index]
+                    thread_scope_module_index_add(callbacks, module_name) can Global{Read,Write}
+                for module_name in table.type_alias_module |callbacks|:
+                    thread_scope_module_index_add(callbacks, module_name) can Global{Read,Write}
+                for module_name in table.qualified_type_module |callbacks|:
+                    thread_scope_module_index_add(callbacks, module_name) can Global{Read,Write}
+                callbacks.scope_module_index_built <- callbacks.scope_module_names.count == callbacks.scope_module_next.count
+
+
+        # Hash to the candidate bucket, then match the complete nested scope expression against
+        # stable canonical names. This avoids flattening into and growing table storage.
+        def thread_scope_module_name(expression: Ast::Expr, callbacks: mutable ThreadCallbackIndex&, table: SymbolTable&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                if not callbacks.scope_module_index_attempted:
+                    callbacks.scope_module_index_attempted <- true
+                    can Global{Read,Write}:
+                        thread_build_scope_module_index(callbacks, table)
+                return "" if not callbacks.scope_module_index_built or callbacks.scope_module_names.count != callbacks.scope_module_next.count
+                hash: u64 = thread_scope_module_hash(expression)
+                row: mutable u32 = THREAD_CALLBACK_INDEX_NONE
+                can Global{Read,Write}:
+                    row <- head if callbacks.scope_module_heads.get(hash) is head
+                while row != THREAD_CALLBACK_INDEX_NONE |row, callbacks, expression|:
+                    return callbacks.scope_module_names[row.usize()] if row.usize() < callbacks.scope_module_names.count and row.usize() < callbacks.scope_module_next.count and thread_scope_module_matches(expression, callbacks.scope_module_names[row.usize()], sview_len(callbacks.scope_module_names[row.usize()]))
+                    break if row.usize() >= callbacks.scope_module_next.count
+                    row <- callbacks.scope_module_next[row.usize()]
+                return ""
+
+
+        # Follow the by-value shape of a declared type and reject a nonstatic reference
+        # anywhere in it. Thread payloads are copied by value, so a pointer nested in a
+        # tuple, container, alias, or struct is just as frame-bound as a direct `T&`.
+        # The bounded walk fails closed on excessive nesting; recursive named structs use
+        # `visited` to terminate without treating a harmless recursive edge as a borrow.
+        def thread_type_contains_nonstatic_reference(type_expression: Ast::Expr, table: SymbolTable&, callbacks: mutable ThreadCallbackIndex&, visited: mutable ThreadTypeVisitSet&, depth: usize, static_context: bool, generic_scope_line: u32, module_scope: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                true return if depth > 16.usize()
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        if operator == TokenKind.Ampersand or operator == TokenKind.Lmut:
+                            true return if not static_context
+                            return thread_type_contains_nonstatic_reference(operand, table, callbacks, visited, depth + 1.usize(), false, generic_scope_line, module_scope)
+                        return thread_type_contains_nonstatic_reference(operand, table, callbacks, visited, depth + 1.usize(), static_context or operator == TokenKind.Static, generic_scope_line, module_scope)
+                    Expr.Index(head, argument, _):
+                        true return if thread_type_contains_nonstatic_reference(argument, table, callbacks, visited, depth + 1.usize(), false, generic_scope_line, module_scope)
+                        return thread_type_contains_nonstatic_reference(head, table, callbacks, visited, depth + 1.usize(), static_context, generic_scope_line, module_scope)
+                    Expr.Refinement(base, _, _):
+                        return thread_type_contains_nonstatic_reference(base, table, callbacks, visited, depth + 1.usize(), static_context, generic_scope_line, module_scope)
+                    Expr.IndexN(head, arguments, _):
+                        true return if thread_type_contains_nonstatic_reference(head, table, callbacks, visited, depth + 1.usize(), static_context, generic_scope_line, module_scope)
+                        for argument in arguments:
+                            true return if thread_type_contains_nonstatic_reference(argument, table, callbacks, visited, depth + 1.usize(), false, generic_scope_line, module_scope)
+                        return false
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _):
+                        for element in elements:
+                            true return if thread_type_contains_nonstatic_reference(element, table, callbacks, visited, depth + 1.usize(), false, generic_scope_line, module_scope)
+                        return false
+                    Expr.Paren(inner, _):
+                        return thread_type_contains_nonstatic_reference(inner, table, callbacks, visited, depth + 1.usize(), static_context, generic_scope_line, module_scope)
+                    Expr.Scope(module_expression, name, _):
+                        module_scope_for_type: mutable sview = ""
+                        can Global{Read,Write}:
+                            module_scope_for_type <- thread_scope_module_name(module_expression, callbacks, table)
+                        true return if module_scope_for_type == ""
+                        return thread_named_type_contains_nonstatic_reference(name, module_scope_for_type, table, callbacks, visited, depth + 1.usize(), static_context, generic_scope_line)
+                    Expr.Ident(name, _):
+                        return thread_named_type_contains_nonstatic_reference(name, module_scope, table, callbacks, visited, depth + 1.usize(), static_context, generic_scope_line)
+                    _:
+                        return false
+
+
+        def thread_generic_name_at_line(table: SymbolTable&, line: u32, name: sview) -> bool:
+            can Abort.Panic:
+                false return if line == 0 or line >= 2147483648
+                encoded_bound_line: u32 = line + 2147483648
+                for generic_index in 0..<table.generic_param_lines.count |line, name, table, encoded_bound_line|:
+                    true return if generic_index < table.generic_param_names.count and table.generic_param_names[generic_index] == name and (table.generic_param_lines[generic_index] == line or table.generic_param_lines[generic_index] == encoded_bound_line)
+                return false
+
+
+        def thread_builtin_struct_name(name: sview) -> bool:
+            can Abort.Panic:
+                return name in {"ArenaFreeBlock", "Thread", "Task", "ThreadPool", "TaskGroup", "Mutex", "MutexGuard", "CondVar", "atomic", "Region", "Arena", "ArenaMark", "PackedStoreAllocResult", "PackedStoreIndexAllocResult", "StringView", "DynArray", "DynArrayView", "SplitView", "EnumerateView", "TreeKindFilteredView", "ChunksExactView", "TreeChildren", "TreeAttributeSeq", "NodeKey", "NodeTable", "DictBucket", "DynDict", "SetBucket", "DynSet", "darray", "dict", "set", "array", "view"}
+
+
+        def thread_alias_row_contains_nonstatic_reference(alias_index: usize, name: sview, module_scope: sview, table: SymbolTable&, callbacks: mutable ThreadCallbackIndex&, visited: mutable ThreadTypeVisitSet&, depth: usize, static_context: bool) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                false return if alias_index >= table.type_alias_name.count
+                false return if table.type_alias_name[alias_index] != name
+                true return if alias_index >= table.type_alias_target.count or alias_index >= table.type_alias_module.count
+                false return if table.type_alias_module[alias_index] != module_scope
+                # Alias rows, declarations, and symbols are appended together. The declaration
+                # id is the exact symbol row. Always inspect the full target AST because the
+                # bare projection erases references and their static qualifier.
+                true return if alias_index >= table.type_alias_declarations.count
+                alias: TypeAliasDeclaration = table.type_alias_declarations[alias_index]
+                true return if alias.module_owner != table.type_alias_module[alias_index]
+                symbol_index: usize = alias.declaration_id.value.usize()
+                true return if symbol_index >= table.symbols.count
+                symbol: Symbol = table.symbols[symbol_index]
+                true return if symbol.id.value != alias.declaration_id.value or symbol.name != name
+                return thread_type_contains_nonstatic_reference(alias.target, table, callbacks, visited, depth + 1.usize(), static_context, alias.pos.line, module_scope)
+
+
+        def thread_type_declaration_contains_nonstatic_reference(declaration: Ast::Decl, table: SymbolTable&, callbacks: mutable ThreadCallbackIndex&, visited: mutable ThreadTypeVisitSet&, depth: usize, generic_scope_line: u32, module_scope: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                match declaration:
+                    Decl.Struct(_, members, _, _, _, _, _):
+                        for member in members:
+                            true return if thread_type_contains_nonstatic_reference(member.type_expression, table, callbacks, visited, depth + 1.usize(), false, generic_scope_line, module_scope)
+                        return false
+                    Decl.Enum(_, variants, _, _, _):
+                        for variant in variants:
+                            for field_type in variant.fields:
+                                true return if thread_type_contains_nonstatic_reference(field_type, table, callbacks, visited, depth + 1.usize(), false, generic_scope_line, module_scope)
+                        return false
+                    _:
+                        # Declaration rows are created only for structs and enums. If the
+                        # source projection is inconsistent, fail closed on a possible borrow.
+                        return true
+
+
+        def thread_named_type_contains_nonstatic_reference(name: sview, module_scope: sview, table: SymbolTable&, callbacks: mutable ThreadCallbackIndex&, visited: mutable ThreadTypeVisitSet&, depth: usize, static_context: bool, generic_scope_line: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                true return if depth > 16.usize()
+                false return if name == ""
+                true return if (name == "view" or name == "sview") and not static_context
+                false return if name == "sview" and static_context
+                # A generic member type is substituted by the arguments already walked at
+                # its use site. Scope this exemption to the declaration that owns the member;
+                # generic names elsewhere in the file must not shadow a concrete type here.
+                false return if thread_generic_name_at_line(table, generic_scope_line, name)
+                if not static_context:
+                    false return if thread_type_visit_contains(visited, module_scope, name)
+                    thread_type_visit_add(visited, module_scope, name)
+                # The name index selects candidate aliases; the full target AST preserves
+                # reference qualifiers and is checked for every same-name candidate.
+                found_exact_alias: mutable bool = false
+                if thread_alias_name_index_is_valid(table):
+                    alias_hash: u64 = name_hash(name)
+                    alias_row: mutable u32 = THREAD_ALIAS_INDEX_NONE
+                    expected_alias_count: mutable u32 = 0
+                    expected_alias_tail: mutable u32 = THREAD_ALIAS_INDEX_NONE
+                    can Global{Read,Write}:
+                        alias_row <- row if table.thread_alias_name_heads.get(alias_hash) is row
+                        expected_alias_count <- count if table.thread_alias_name_counts.get(alias_hash) is count
+                        expected_alias_tail <- tail_row if table.thread_alias_name_tails.get(alias_hash) is tail_row
+                    has_alias_head: bool = alias_row != THREAD_ALIAS_INDEX_NONE
+                    has_alias_tail: bool = expected_alias_tail != THREAD_ALIAS_INDEX_NONE
+                    true return if expected_alias_count == 0 and (has_alias_head or has_alias_tail)
+                    true return if expected_alias_count > 0 and (not has_alias_head or not has_alias_tail)
+                    true return if expected_alias_count.usize() > table.type_alias_name.count
+                    alias_steps: mutable usize = 0.usize()
+                    last_alias_row: mutable u32 = THREAD_ALIAS_INDEX_NONE
+                    while alias_row != THREAD_ALIAS_INDEX_NONE and alias_steps < expected_alias_count.usize() |alias_row, alias_hash, name, table, callbacks, visited, depth, alias_steps, last_alias_row|:
+                        alias_index: usize = alias_row.usize()
+                        true return if alias_index >= table.type_alias_name.count or alias_index >= table.type_alias_target.count or alias_index >= table.type_alias_module.count or alias_index >= table.type_alias_declarations.count or alias_index >= table.thread_alias_name_next.count
+                        true return if alias_steps > 0 and alias_row <= last_alias_row
+                        true return if name_hash(table.type_alias_name[alias_index]) != alias_hash
+                        found_exact_alias <- true if alias_index < table.type_alias_module.count and table.type_alias_name[alias_index] == name and table.type_alias_module[alias_index] == module_scope
+                        true return if thread_alias_row_contains_nonstatic_reference(alias_index, name, module_scope, table, callbacks, visited, depth, static_context)
+                        last_alias_row <- alias_row
+                        alias_row <- table.thread_alias_name_next[alias_index]
+                        alias_steps <- alias_steps + 1.usize()
+                    true return if alias_row != THREAD_ALIAS_INDEX_NONE or alias_steps != expected_alias_count.usize() or last_alias_row != expected_alias_tail
+                else:
+                    for alias_index in 0..<table.type_alias_name.count |alias_index, name, table, callbacks, visited, depth|:
+                        found_exact_alias <- true if alias_index < table.type_alias_module.count and table.type_alias_name[alias_index] == name and table.type_alias_module[alias_index] == module_scope
+                        true return if thread_alias_row_contains_nonstatic_reference(alias_index, name, module_scope, table, callbacks, visited, depth, static_context)
+                # Source AST declaration rows include positional struct fields and enum
+                # payloads while preserving reference qualifiers erased by type interning.
+                # Synthetic function-local enum payloads remain expression rows.
+                true return if callbacks.type_owners.count != callbacks.type_owner_modules.count or callbacks.type_owners.count != callbacks.type_owner_lines.count or callbacks.type_owners.count != callbacks.type_sources.count or callbacks.type_owners.count != callbacks.type_next.count
+                type_hash: u64 = name_hash(name)
+                expected_count: mutable u32 = 0
+                expected_tail: mutable u32 = THREAD_CALLBACK_INDEX_NONE
+                type_head_row: mutable u32 = THREAD_CALLBACK_INDEX_NONE
+                can Global{Read,Write}:
+                    expected_count <- count if callbacks.type_counts.get(type_hash) is count
+                    expected_tail <- tail_row if callbacks.type_tails.get(type_hash) is tail_row
+                    type_head_row <- head_row if callbacks.type_heads.get(type_hash) is head_row
+                has_head: bool = type_head_row != THREAD_CALLBACK_INDEX_NONE
+                has_tail: bool = expected_tail != THREAD_CALLBACK_INDEX_NONE
+                true return if expected_count == 0 and (has_head or has_tail)
+                true return if expected_count > 0 and (not has_head or not has_tail)
+                type_row: mutable u32 = type_head_row
+                type_steps: mutable usize = 0.usize()
+                last_type_row: mutable u32 = THREAD_CALLBACK_INDEX_NONE
+                found_exact_type: mutable bool = false
+                while type_row != THREAD_CALLBACK_INDEX_NONE and type_steps < callbacks.type_owners.count |type_row, name, table, callbacks, visited, depth, type_steps|:
+                    type_index: usize = type_row.usize()
+                    true return if type_index >= callbacks.type_owners.count or type_index >= callbacks.type_owner_modules.count or type_index >= callbacks.type_owner_lines.count or type_index >= callbacks.type_sources.count or type_index >= callbacks.type_next.count
+                    if callbacks.type_owners[type_index] == name:
+                        if callbacks.type_owner_modules[type_index] == module_scope:
+                            found_exact_type <- true
+                            match callbacks.type_sources[type_index]:
+                                ThreadTypeSource.Declaration(declaration):
+                                    true return if thread_type_declaration_contains_nonstatic_reference(declaration, table, callbacks, visited, depth + 1.usize(), callbacks.type_owner_lines[type_index], callbacks.type_owner_modules[type_index])
+                                ThreadTypeSource.Expression(expression):
+                                    true return if thread_type_contains_nonstatic_reference(expression, table, callbacks, visited, depth + 1.usize(), false, callbacks.type_owner_lines[type_index], callbacks.type_owner_modules[type_index])
+                    last_type_row <- type_row
+                    type_row <- callbacks.type_next[type_index]
+                    type_steps <- type_steps + 1.usize()
+                true return if type_row != THREAD_CALLBACK_INDEX_NONE or type_steps != expected_count.usize() or last_type_row != expected_tail
+                field_row: mutable u32 = struct_field_owner_head(table, name)
+                while field_row != SYMBOL_INDEX_ROW_NONE |field_row, name, table, callbacks, visited, depth|:
+                    field_index: usize = field_row.usize()
+                    if table.struct_field_owner[field_index] == name and field_index < table.private_field_types.count and field_index < table.struct_field_module.count and table.struct_field_module[field_index] == module_scope:
+                        true return if thread_type_contains_nonstatic_reference(table.private_field_types[field_index], table, callbacks, visited, depth + 1.usize(), false, 0, module_scope)
+                    field_row <- table.struct_field_owner_next[field_index]
+                symbol_row: mutable u32 = symbol_chain_head(table, name)
+                symbol_steps: mutable usize = 0.usize()
+                while symbol_row != SYMBOL_INDEX_ROW_NONE and symbol_steps < table.symbols.count |symbol_row, name, table, symbol_steps|:
+                    symbol_index: usize = symbol_row.usize()
+                    true return if symbol_index >= table.symbols.count or symbol_index >= table.symbol_name_next.count
+                    if symbol_index < table.symbols.count and table.symbols[symbol_index].name == name:
+                        kind: SymbolKind = table.symbols[symbol_index].kind
+                        if kind == SymbolKind.Struct or kind == SymbolKind.Enum:
+                            return false if found_exact_type or thread_builtin_struct_name(name)
+                            return true
+                        if kind == SymbolKind.Alias:
+                            return false if found_exact_alias
+                            return true
+                        return false if is_builtin_type_name(name) or name == "cstr" or name == "dstr"
+                    symbol_row <- table.symbol_name_next[symbol_index]
+                    symbol_steps <- symbol_steps + 1.usize()
+                true return if symbol_row != SYMBOL_INDEX_ROW_NONE
+                # An unresolved or non-type symbol may represent a generic/imported
+                # aggregate whose members are not represented in this file.
+                return true
+
+
+        def thread_type_may_contain_nonstatic_reference(type_expression: Ast::Expr, table: SymbolTable&, callbacks: mutable ThreadCallbackIndex&, module_scope: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                visited: mutable ThreadTypeVisitSet = ThreadTypeVisitSet{names: [], modules: [], slots: []}
+                return thread_type_contains_nonstatic_reference(type_expression, table, callbacks, visited, 0.usize(), false, 0, module_scope)
+
+
         def thread_submit_expr_type_name(expression: Ast::Expr, table: SymbolTable&) -> sview:
             can Abort.Panic:
                 match expression:
@@ -106,11 +627,11 @@ extend Semantic:
                 return binding_mutable
 
 
-        def thread_validate_submit_pool(annotations: darray[Ast::EnumAnnotation]&, line: u32, names: darray[sview]&, pool_types: darray[sview]&, pool_mutability: darray[bool]&, table: lmut SymbolTable) -> void:
+        def thread_validate_submit_pool(annotations: darray[Ast::EnumAnnotation]&, offset: u32, line: u32, names: darray[sview]&, pool_types: darray[sview]&, pool_mutability: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 validated: mutable bool = false
                 for annotation in annotations |table|:
-                    if annotation.name == "__submit_pool" and annotation.line == line and not validated:
+                    if annotation.name == "__submit_pool" and annotation.offset == offset and not validated:
                         validated <- true
                         name: sview = annotation.owner
                         found: mutable usize = names.count
@@ -141,36 +662,59 @@ extend Semantic:
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, line: line, expected: "mutable ThreadPool", actual: "ThreadPool"})
 
 
-        def type_iterable_element_may_reference(type_expression: Ast::Expr) -> bool:
-            can Abort.Panic:
+        def type_iterable_element_may_reference(type_expression: Ast::Expr, table: SymbolTable&, callbacks: mutable ThreadCallbackIndex&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                module_scope: sview = table.current_module
                 match type_expression:
                     Expr.Unary(operator, operand, _) if operator == TokenKind.Ampersand or operator == TokenKind.Lmut:
-                        return type_iterable_element_may_reference(operand)
-                    Expr.Index(element_type, _, _) | Expr.Refinement(element_type, _, _):
-                        return type_is_nonstatic_reference(element_type)
-                    Expr.IndexN(element_type, _, _):
-                        return type_is_nonstatic_reference(element_type)
+                        return type_iterable_element_may_reference(operand, table, callbacks)
+                    Expr.Index(_, element_type, _) | Expr.Refinement(element_type, _, _):
+                        return thread_type_may_contain_nonstatic_reference(element_type, table, callbacks, module_scope)
+                    Expr.IndexN(_, element_types, _):
+                        for element_type in element_types |callbacks, table|:
+                            true return if thread_type_may_contain_nonstatic_reference(element_type, table, callbacks, module_scope)
+                        return false
                     Expr.Paren(inner, _):
-                        return type_iterable_element_may_reference(inner)
+                        return type_iterable_element_may_reference(inner, table, callbacks)
                     _:
                         return true
 
 
-        def thread_expression_may_reference(expression: Ast::Expr, names: darray[sview]&, flags: darray[bool]&) -> bool:
-            can Abort.Panic:
+        def thread_expression_may_reference(expression: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
                 match expression:
                     Expr.Ident(name, _):
                         return thread_flag_for_name(names, flags, name)
                     Expr.Unary(operator, _, _):
                         return operator == TokenKind.Ampersand or operator == TokenKind.Lmut
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
-                        return thread_expression_may_reference(inner, names, flags)
+                        return thread_expression_may_reference(inner, names, flags, callbacks, table)
                     Expr.Binary(_, operator, _, _) if operator == TokenKind.RangeLt or operator == TokenKind.RangeLe:
                         return false
                     Expr.Array(elements, _) | Expr.Tuple(elements, _):
                         for element in elements:
-                            true return if thread_expression_may_reference(element, names, flags)
+                            true return if thread_expression_may_reference(element, names, flags, callbacks, table)
                         return false
+                    Expr.Construct(_, fields, _):
+                        for field in fields:
+                            true return if thread_expression_may_reference(field.value, names, flags, callbacks, table)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        true return if thread_expression_may_reference(base, names, flags, callbacks, table)
+                        for field in fields:
+                            true return if thread_expression_may_reference(field.value, names, flags, callbacks, table)
+                        return false
+                    Expr.Call(Expr.Ident(name, _), _, _, _):
+                        module_scope: sview = table.current_module
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Call(Expr.Scope(module_expression, name, _), _, _, _):
+                        module_scope: mutable sview = ""
+                        can Global{Read,Write}:
+                            module_scope <- thread_scope_module_name(module_expression, callbacks, table)
+                        true return if module_scope == ""
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Call(_, _, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                        return true
                     Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _) | Expr.CharLit(_, _) | Expr.StringLit(_, _) | Expr.Absent:
                         return false
                     _:
@@ -179,8 +723,8 @@ extend Semantic:
                         return true
 
 
-        def thread_iterable_binder_may_reference(iterable: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, element_flags: darray[bool]&) -> bool:
-            can Abort.Panic:
+        def thread_iterable_binder_may_reference(iterable: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, element_flags: darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
                 match iterable:
                     Expr.Binary(_, operator, _, _) if operator == TokenKind.RangeLt or operator == TokenKind.RangeLe:
                         return false
@@ -188,7 +732,7 @@ extend Semantic:
                         return thread_flag_for_name(names, element_flags, name)
                     Expr.Array(elements, _) | Expr.Tuple(elements, _):
                         for element in elements:
-                            true return if thread_expression_may_reference(element, names, flags)
+                            true return if thread_expression_may_reference(element, names, flags, callbacks, table)
                         return false
                     _:
                         return true
@@ -202,131 +746,300 @@ extend Semantic:
                 return false
 
 
-        def thread_callback_has_nonstatic_ref_result(callback_names: darray[sview]&, callback_flags: darray[bool]&, expression: Ast::Expr) -> bool:
-            can Abort.Panic:
+        def thread_callback_row_may_reference(callbacks: mutable ThreadCallbackIndex&, row: usize, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                true return if row >= callbacks.modules.count or row >= callbacks.return_types.count or row >= callbacks.flags.count or row >= callbacks.classified.count
+                if not callbacks.classified[row]:
+                    return_type: Ast::Expr = callbacks.return_types[row]
+                    may_reference: bool = (type_is_nonstatic_reference(return_type) or thread_type_may_contain_nonstatic_reference(return_type, table, callbacks, callbacks.modules[row])) if return_type is not Ast::Expr.Absent and return_type is not Ast::Expr.Invalid else false
+                    callbacks.flags[row] <- may_reference
+                    callbacks.classified[row] <- true
+                return callbacks.flags[row]
+
+
+        def thread_function_result_may_reference(callbacks: mutable ThreadCallbackIndex&, name: sview, module_scope: sview, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
+                # A large callback set earns a hash table only once some expression
+                # actually asks for a function result. Cache failed attempts too; malformed
+                # table state takes the conservative linear path below without rebuilding.
+                if not callbacks.index_attempted:
+                    callbacks.index_attempted <- true
+                    thread_build_callback_name_index(callbacks) if callbacks.names.count >= THREAD_CALLBACK_INDEX_MIN_ROWS
+                if callbacks.index_built and callbacks.names.count == callbacks.modules.count and callbacks.names.count == callbacks.flags.count and callbacks.names.count == callbacks.return_types.count and callbacks.names.count == callbacks.classified.count and callbacks.names.count == callbacks.duplicate_next.count and callbacks.slots.count > 0.usize():
+                    capacity: usize = callbacks.slots.count
+                    callback_hash: u64 = name_hash(name)
+                    slot: mutable usize = callback_hash.usize() % capacity
+                    probes: mutable usize = 0.usize()
+                    while probes < capacity |slot, probes, callbacks, capacity, callback_hash, name, table|:
+                        row: u32 = callbacks.slots[slot]
+                        if row == THREAD_CALLBACK_INDEX_NONE:
+                            # Unknown direct or indirect callback identities stay fail-closed.
+                            return true
+                        if row.usize() >= callbacks.names.count:
+                            break
+                        if callbacks.names[row.usize()] == name:
+                            all_result: mutable bool = false
+                            module_result: mutable bool = false
+                            found_same: mutable bool = false
+                            found_module: mutable bool = false
+                            candidate: mutable u32 = row
+                            seen: mutable usize = 0.usize()
+                            while candidate != THREAD_CALLBACK_INDEX_NONE and seen < callbacks.names.count |candidate, seen, callbacks, all_result, module_result, found_same, found_module, table, module_scope|:
+                                candidate_row: usize = candidate.usize()
+                                true return if candidate_row >= callbacks.names.count or candidate_row >= callbacks.modules.count
+                                found_same <- true
+                                all_result <- true if thread_callback_row_may_reference(callbacks, candidate_row, table)
+                                if callbacks.modules[candidate_row] == module_scope:
+                                    found_module <- true
+                                    module_result <- true if thread_callback_row_may_reference(callbacks, candidate_row, table)
+                                candidate <- callbacks.duplicate_next[candidate_row]
+                                seen <- seen + 1.usize()
+                            true return if candidate != THREAD_CALLBACK_INDEX_NONE
+                            return module_result if found_module
+                            return all_result if found_same
+                            return true
+                        slot <- slot + 1.usize()
+                        slot <- 0.usize() if slot >= capacity
+                        probes <- probes + 1.usize()
+                # Keep a conservative slow path for malformed or unavailable index state.
+                # If the caller's module has no matching declaration (for example an import
+                # is unresolved here), combine same-spelling rows conservatively.
+                found_same: mutable bool = false
+                found_module: mutable bool = false
+                all_result: mutable bool = false
+                module_result: mutable bool = false
+                for index in 0..<callbacks.names.count |found_same, found_module, all_result, module_result, name, module_scope, callbacks, table|:
+                    if index < callbacks.return_types.count and index < callbacks.modules.count and callbacks.names[index] == name:
+                        found_same <- true
+                        all_result <- true if thread_callback_row_may_reference(callbacks, index, table)
+                        if callbacks.modules[index] == module_scope:
+                            found_module <- true
+                            module_result <- true if thread_callback_row_may_reference(callbacks, index, table)
+                return module_result if found_module
+                return all_result if found_same
+                return true
+
+
+        def thread_callback_has_nonstatic_ref_result(callbacks: mutable ThreadCallbackIndex&, expression: Ast::Expr, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Global{Read,Write}:
                 match expression:
                     Expr.Ident(name, line):
-                        return thread_flag_for_name(callback_names, callback_flags, name)
+                        # The callback table is flat across modules and may contain overloads.
+                        # Aggregate every same-named candidate, and keep unknown indirect
+                        # callback identities fail-closed like direct call-result provenance.
+                        module_scope: sview = table.current_module
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Scope(module_expression, name, line):
+                        module_scope: mutable sview = ""
+                        can Global{Read,Write}:
+                            module_scope <- thread_scope_module_name(module_expression, callbacks, table)
+                        true return if module_scope == ""
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
                     Expr.Paren(inner, line):
-                        return thread_callback_has_nonstatic_ref_result(callback_names, callback_flags, inner)
+                        return thread_callback_has_nonstatic_ref_result(callbacks, inner, table)
                     _:
                         return false
 
 
-        def report_thread_callback_result(call_name: sview, callback: Ast::Expr, line: u32, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadResultNotShareable, name: call_name, line: line, expected: "", actual: "reference"}) if thread_callback_has_nonstatic_ref_result(callback_names, callback_flags, callback)
+        def report_thread_callback_result(call_name: sview, callback: Ast::Expr, line: u32, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                should_report: bool = thread_callback_has_nonstatic_ref_result(callbacks, callback, table)
+                if should_report:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadResultNotShareable, name: call_name, line: line, expected: "", actual: "reference"})
 
 
         # `&count` / `lmut count` of a caller local or parameter: a stack reference handed to
         # another thread (stage0: "stack mutable i64&"). A task joined later may still race the
         # owner's frame, and a pool may outlive it, so such a borrow is never shareable.
-        def thread_payload_borrows_local(payload: Ast::Expr, names: darray[sview]&) -> bool:
+        def thread_payload_borrows_local(payload: Ast::Expr, names: darray[sview]&, flags: darray[bool]&) -> bool:
             can Abort.Panic:
                 match payload:
-                    Expr.Paren(inner, _):
-                        return thread_payload_borrows_local(inner, names)
+                    Expr.Ident(name, _):
+                        return thread_flag_for_name(names, flags, name)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return thread_payload_borrows_local(inner, names, flags)
                     Expr.Unary(operator, operand, _):
-                        return (operator == TokenKind.Ampersand or operator == TokenKind.Lmut) and affine_root(operand) != "" and any name in names where name == affine_root(operand)
+                        if operator == TokenKind.Ampersand or operator == TokenKind.Lmut:
+                            return (affine_root(operand) != "" and any name in names where name == affine_root(operand)) or thread_payload_borrows_local(operand, names, flags)
+                        # `!x` is Elisa's volatile read and preserves x's value type. Other
+                        # unary operators produce a value; do not mistake their source
+                        # operand's borrow for a borrow in the result.
+                        return thread_payload_borrows_local(operand, names, flags) if operator == TokenKind.Bang
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            true return if thread_payload_borrows_local(element, names, flags)
+                        return false
+                    # A call's result is independent of the provenance of each argument
+                    # unless its declared result type says otherwise. The result-type walk
+                    # below handles direct calls and fails closed for unresolved callees.
+                    Expr.Call(_, _, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                        return false
+                    Expr.Field(object, _, _) | Expr.Index(object, _, _):
+                        return thread_payload_borrows_local(object, names, flags)
+                    Expr.IndexN(object, indices, _):
+                        true return if thread_payload_borrows_local(object, names, flags)
+                        for index in indices:
+                            true return if thread_payload_borrows_local(index, names, flags)
+                        return false
+                    Expr.Construct(_, fields, _):
+                        for field in fields:
+                            true return if thread_payload_borrows_local(field.value, names, flags)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        true return if thread_payload_borrows_local(base, names, flags)
+                        for field in fields:
+                            true return if thread_payload_borrows_local(field.value, names, flags)
+                        return false
                     _:
                         return false
 
-        def report_thread_payload(call_name: sview, payload: Ast::Expr, line: u32, names: darray[sview]&, flags: darray[bool]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
+        def thread_expression_type_contains_nonstatic_reference(expression: Ast::Expr, callbacks: mutable ThreadCallbackIndex&, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match expression:
+                    Expr.Construct(type_expression, fields, _):
+                        module_scope: sview = table.current_module
+                        true return if thread_type_may_contain_nonstatic_reference(type_expression, table, callbacks, module_scope)
+                        for field in fields:
+                            true return if thread_expression_type_contains_nonstatic_reference(field.value, callbacks, table)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        true return if thread_expression_type_contains_nonstatic_reference(base, callbacks, table)
+                        for field in fields:
+                            true return if thread_expression_type_contains_nonstatic_reference(field.value, callbacks, table)
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            true return if thread_expression_type_contains_nonstatic_reference(element, callbacks, table)
+                        return false
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return thread_expression_type_contains_nonstatic_reference(inner, callbacks, table)
+                    Expr.Call(Expr.Ident(name, _), _, _, _):
+                        # Return provenance comes from the declaration AST because TypeId
+                        # interning erases `static`. Generic and region-parameterized results
+                        # retain their source qualifiers; unresolved overloads combine all
+                        # same-named candidates conservatively.
+                        module_scope: sview = table.current_module
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Call(Expr.Scope(module_expression, name, _), _, _, _):
+                        module_scope: mutable sview = ""
+                        can Global{Read,Write}:
+                            module_scope <- thread_scope_module_name(module_expression, callbacks, table)
+                        true return if module_scope == ""
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Call(_, _, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                        # Method, indirect, and effect calls lack a resolved return row here.
+                        # Keep them shareability-safe until result provenance is available.
+                        return true
+                    _:
+                        return false
+
+
+        def report_thread_payload(call_name: sview, payload: Ast::Expr, line: u32, names: darray[sview]&, flags: darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 payload_name: sview = affine_root(payload)
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadArgumentNotShareable, name: call_name, line: line, expected: "", actual: "reference"}) if (payload_name != "" and thread_flag_for_name(names, flags, payload_name)) or thread_payload_borrows_local(payload, names)
+                should_report: mutable bool = payload_name != "" and thread_flag_for_name(names, flags, payload_name)
+                if not should_report:
+                    should_report <- thread_payload_borrows_local(payload, names, flags)
+                if not should_report:
+                    should_report <- thread_expression_type_contains_nonstatic_reference(payload, callbacks, table)
+                if should_report:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadArgumentNotShareable, name: call_name, line: line, expected: "", actual: "reference"})
 
 
-        def check_thread_boundary_call(callee: Ast::Expr, arguments: darray[Ast::Expr]&, line: u32, names: darray[sview]&, flags: darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
+        def check_thread_boundary_call(callee: Ast::Expr, arguments: darray[Ast::Expr]&, line: u32, names: darray[sview]&, flags: darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 call_name: sview = match callee:
                     Expr.Ident(name, call_line): name
                     _: ""
                 return if call_name != "spawn1" and call_name != "pool_submit1" and call_name != "spawn_daemon"
                 callback_index: usize = 0 if call_name == "spawn1" or call_name == "spawn_daemon" else 1
-                table <- report_thread_callback_result(call_name, arguments[callback_index], line, callback_names, callback_flags, table) if callback_index < arguments.count
-                table <- report_thread_payload(call_name, arguments[arguments.count - 1], line, names, flags, table) if arguments.count > 0
+                if callback_index < arguments.count:
+                    table <- report_thread_callback_result(call_name, arguments[callback_index], line, callbacks, table)
+                if arguments.count > 0:
+                    table <- report_thread_payload(call_name, arguments[arguments.count - 1], line, names, flags, callbacks, table)
 
 
-        def walk_thread_shareability_expression(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, pool_types: mutable darray[sview]&, pool_mutability: mutable darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
+        def walk_thread_shareability_expression(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, pool_types: mutable darray[sview]&, pool_mutability: mutable darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
-                        table <- check_thread_boundary_call(callee, arguments, line.line, names, flags, callback_names, callback_flags, table)
-                        table <- walk_thread_shareability_expression(callee, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- check_thread_boundary_call(callee, arguments, line.line, names, flags, callbacks, table)
+                        table <- walk_thread_shareability_expression(callee, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         for argument in arguments |table|:
-                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.StaticEffectCall(_, _, _, arguments, _, _):
                         for argument in arguments |table|:
-                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(argument, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.Field(object, _, _):
-                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.Index(object, index, _) | Expr.Binary(object, _, index, _) | Expr.Refinement(object, index, _):
-                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                        table <- walk_thread_shareability_expression(index, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                        table <- walk_thread_shareability_expression(index, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.IndexN(object, indices, _):
-                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         for index in indices |table|:
-                            table <- walk_thread_shareability_expression(index, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(index, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.Slice(object, low, high, _):
-                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                        table <- walk_thread_shareability_expression(low, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                        table <- walk_thread_shareability_expression(high, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(object, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                        table <- walk_thread_shareability_expression(low, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                        table <- walk_thread_shareability_expression(high, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.Unary(operator, operand, _) | Expr.Move(operand, _) | Expr.RegionNew(operand, _, _) | Expr.Paren(operand, _):
-                        table <- walk_thread_shareability_expression(operand, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(operand, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
                         for element in elements |table|:
-                            table <- walk_thread_shareability_expression(element, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(element, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.DictLit(entries, _):
                         for entry in entries |table|:
-                            table <- walk_thread_shareability_expression(entry.key, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_expression(entry.value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(entry.key, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            table <- walk_thread_shareability_expression(entry.value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.Construct(_, fields, _):
                         for field in fields |table|:
-                            table <- walk_thread_shareability_expression(field.value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(field.value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.RecordUpdate(base, fields, _):
-                        table <- walk_thread_shareability_expression(base, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(base, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         for field in fields |table|:
-                            table <- walk_thread_shareability_expression(field.value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(field.value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                     Expr.If(condition, then_value, else_value, _):
-                        table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         names_before: usize = names.count
-                        table <- walk_thread_shareability_expression(then_value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(then_value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
-                        table <- walk_thread_shareability_expression(else_value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(else_value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     Expr.Match(scrutinee, arms, _):
-                        table <- walk_thread_shareability_expression(scrutinee, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(scrutinee, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         for arm in arms |table, names, flags, element_flags, pool_types, pool_mutability|:
                             names_before: usize = names.count
-                            thread_push_arm_binders(arm, thread_expression_may_reference(scrutinee, names, flags), names, flags, element_flags, pool_types, pool_mutability)
-                            table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            thread_push_arm_binders(arm, thread_expression_may_reference(scrutinee, names, flags, callbacks, table), names, flags, element_flags, pool_types, pool_mutability)
+                            table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     Expr.Catch(guarded, arms, _):
-                        table <- walk_thread_shareability_expression(guarded, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(guarded, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         for arm in arms |table, names, flags, element_flags, pool_types, pool_mutability|:
                             names_before: usize = names.count
                             thread_push_arm_binders(arm, true, names, flags, element_flags, pool_types, pool_mutability)
-                            table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     Expr.Comprehension(variable, iterable, condition, body, _):
-                        table <- walk_thread_shareability_expression(iterable, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(iterable, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         names_before: usize = names.count
-                        comprehension_items_may_reference: bool = thread_iterable_binder_may_reference(iterable, names, flags, element_flags)
+                        comprehension_items_may_reference: mutable bool = false
+                        comprehension_items_may_reference <- thread_iterable_binder_may_reference(iterable, names, flags, element_flags, callbacks, table)
                         names.push(variable)
                         flags.push(comprehension_items_may_reference)
                         element_flags.push(comprehension_items_may_reference)
                         pool_types.push("")
                         pool_mutability.push(false)
-                        table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                        table <- walk_thread_shareability_expression(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                        table <- walk_thread_shareability_expression(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     Expr.GetElse(guarded, recovery, _):
-                        table <- walk_thread_shareability_expression(guarded, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_expression(guarded, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         names_before: usize = names.count
-                        table <- walk_thread_shareability_statements(recovery, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_statements(recovery, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     Expr.Lambda(parameters, body, _):
                         names_before: usize = names.count
@@ -336,24 +1049,24 @@ extend Semantic:
                             element_flags.push(true)
                             pool_types.push("")
                             pool_mutability.push(false)
-                        table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                        table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     # `submit f(a, b)` parses as a statement-less value block around the call and
                     # lowers to pool_submit1(pool, f, payload): every argument is a payload.
                     Expr.Block(block_statements, block_value, _, line):
                         if block_statements.count == 0 and thread_has_submit_marker(annotations, line):
-                            table <- thread_validate_submit_pool(annotations, line.line, names, pool_types, pool_mutability, table) if any submit_pool in annotations where submit_pool.name == "__submit_pool" and submit_pool.line == line.line
+                            table <- thread_validate_submit_pool(annotations, line.offset, line.line, names, pool_types, pool_mutability, table)
                             match block_value:
                                 Expr.Call(_, task_arguments, _, task_pos):
                                     for task_argument in task_arguments |table|:
-                                        table <- report_thread_payload("pool_submit1", task_argument, task_pos.line, names, flags, table)
-                                        table <- walk_thread_shareability_expression(task_argument, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                                        table <- report_thread_payload("pool_submit1", task_argument, task_pos.line, names, flags, callbacks, table)
+                                        table <- walk_thread_shareability_expression(task_argument, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                                 _:
                                     pass
                         else:
                             names_before: usize = names.count
-                            table <- walk_thread_shareability_statements(block_statements, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_expression(block_value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(block_statements, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            table <- walk_thread_shareability_expression(block_value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                     # `Scope` and `ShorthandMember` nodes contain type/member selectors,
                     # not evaluated values. Literals and identifiers have no children.
@@ -361,31 +1074,62 @@ extend Semantic:
                         pass
 
 
-        def walk_thread_shareability_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, pool_types: mutable darray[sview]&, pool_mutability: mutable darray[bool]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
+        def walk_thread_shareability_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, flags: mutable darray[bool]&, element_flags: mutable darray[bool]&, pool_types: mutable darray[sview]&, pool_mutability: mutable darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 for statement in statements |names, flags, element_flags, pool_types, pool_mutability, table|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                            declared_elements_may_reference: bool = thread_iterable_binder_may_reference(value, names, flags, element_flags) if (type_expression is Expr.Absent) or (type_expression is Expr.Invalid) else type_iterable_element_may_reference(type_expression)
+                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            declared_elements_may_reference: mutable bool = false
+                            if (type_expression is Expr.Absent) or (type_expression is Expr.Invalid):
+                                declared_elements_may_reference <- thread_iterable_binder_may_reference(value, names, flags, element_flags, callbacks, table)
+                            else:
+                                declared_elements_may_reference <- type_iterable_element_may_reference(type_expression, table, callbacks)
+                            declared_value_may_reference: mutable bool = type_is_nonstatic_reference(type_expression)
+                            if not declared_value_may_reference:
+                                module_scope: sview = table.current_module
+                                declared_value_may_reference <- thread_type_may_contain_nonstatic_reference(type_expression, table, callbacks, module_scope)
+                            if not declared_value_may_reference:
+                                declared_value_may_reference <- thread_expression_may_reference(value, names, flags, callbacks, table)
+                            if not declared_value_may_reference:
+                                declared_value_may_reference <- thread_payload_borrows_local(value, names, flags)
+                            if not declared_value_may_reference:
+                                declared_value_may_reference <- thread_expression_type_contains_nonstatic_reference(value, callbacks, table)
                             names.push(name)
-                            flags.push(type_is_nonstatic_reference(type_expression))
+                            flags.push(declared_value_may_reference)
                             element_flags.push(declared_elements_may_reference)
                             pool_types.push(thread_submit_type_name(type_expression, value, table))
                             pool_mutability.push(thread_submit_binding_writable(type_expression, local_binding_is_mutable(name, line.line, line.offset, type_expression, table)))
                         Stmt.Assign(target, operator, value, line):
-                            table <- walk_thread_shareability_expression(target, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(target, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                            if operator == TokenKind.Assign:
+                                match target:
+                                    Expr.Ident(name, _):
+                                        if not any bound_name in names where bound_name == name:
+                                            value_may_reference: mutable bool = thread_expression_may_reference(value, names, flags, callbacks, table)
+                                            if not value_may_reference:
+                                                value_may_reference <- thread_payload_borrows_local(value, names, flags)
+                                            if not value_may_reference:
+                                                value_may_reference <- thread_expression_type_contains_nonstatic_reference(value, callbacks, table)
+                                            names.push(name)
+                                            flags.push(value_may_reference)
+                                            element_flags.push(value_may_reference)
+                                            pool_types.push(thread_submit_type_name(Ast::Expr.Absent, value, table))
+                                            pool_mutability.push(thread_submit_binding_writable(Ast::Expr.Absent, local_binding_is_mutable(name, line.line, line.offset, Ast::Expr.Absent, table)))
+                                    _:
+                                        pass
                         Stmt.Expr(value, line):
-                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(value, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         Stmt.Return(value, line):
-                            table <- walk_thread_shareability_expression(returned, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table) if value is returned
+                            if value is returned:
+                                table <- walk_thread_shareability_expression(returned, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             names_before: usize = names.count
-                            table <- walk_thread_shareability_statements(then_body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(then_body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
-                            table <- walk_thread_shareability_statements(else_body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(else_body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                         Stmt.Block(kind, clause, binding, body, line):
                             names_before: usize = names.count
@@ -395,54 +1139,90 @@ extend Semantic:
                                 element_flags.push(false)
                                 pool_types.push("")
                                 pool_mutability.push(false)
-                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                         Stmt.While(condition, body, line):
-                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(condition, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             names_before: usize = names.count
-                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                         Stmt.For(_, variables, iterable, body, line):
-                            table <- walk_thread_shareability_expression(iterable, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(iterable, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             names_before: usize = names.count
-                            loop_items_may_reference: bool = thread_iterable_binder_may_reference(iterable, names, flags, element_flags)
+                            loop_items_may_reference: mutable bool = false
+                            loop_items_may_reference <- thread_iterable_binder_may_reference(iterable, names, flags, element_flags, callbacks, table)
                             for variable in variables |names, flags, element_flags, pool_types, pool_mutability|:
                                 names.push(variable)
                                 flags.push(loop_items_may_reference)
                                 element_flags.push(loop_items_may_reference)
                                 pool_types.push("")
                                 pool_mutability.push(false)
-                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- walk_thread_shareability_expression(scrutinee, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(scrutinee, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                             for arm in arms |names, flags, element_flags, pool_types, pool_mutability, table|:
                                 names_before: usize = names.count
-                                thread_push_arm_binders(arm, thread_expression_may_reference(scrutinee, names, flags), names, flags, element_flags, pool_types, pool_mutability)
-                                table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                                table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                                thread_push_arm_binders(arm, thread_expression_may_reference(scrutinee, names, flags, callbacks, table), names, flags, element_flags, pool_types, pool_mutability)
+                                table <- walk_thread_shareability_expression(arm.guard, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                                table <- walk_thread_shareability_statements(arm.body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                                 thread_restore_scope(names, flags, element_flags, pool_types, pool_mutability, names_before)
                         Stmt.Contract(_, expression, line):
-                            table <- walk_thread_shareability_expression(expression, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_expression(expression, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
                         _:
                             pass
 
 
-        def collect_thread_callbacks(declarations: darray[Ast::Decl], names: mutable darray[sview]&, flags: mutable darray[bool]&) -> void:
+        def collect_thread_callbacks(declarations: darray[Ast::Decl], file: Ast::File&, module_scope: sview, callbacks: mutable ThreadCallbackIndex&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |names, flags|:
+                for declaration in declarations |callbacks|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            names.push(name)
-                            flags.push(type_is_nonstatic_reference(return_expression) if return_type is return_expression else false)
-                        Decl.Module(name, body, line) | Decl.Scoped(body, line):
-                            collect_thread_callbacks(body, names, flags)
+                            callbacks.names <- callbacks.names.push(name)
+                            callbacks.modules <- callbacks.modules.push(module_scope)
+                            callbacks.return_types <- callbacks.return_types.push(return_expression if return_type is return_expression else Ast::Expr.Absent)
+                            callbacks.flags <- callbacks.flags.push(false)
+                            callbacks.classified <- callbacks.classified.push(false)
+                            callback_row: u32 = (callbacks.names.count - 1.usize()).u32()
+                            callbacks.duplicate_next <- callbacks.duplicate_next.push(THREAD_CALLBACK_INDEX_NONE)
+                            callbacks.duplicate_tail <- callbacks.duplicate_tail.push(callback_row)
+                        Decl.Struct(name, _, _, _, _, _, line):
+                            can Global{Read,Write}:
+                                thread_index_type_declaration(callbacks, name, module_scope, line.line, declaration)
+                        Decl.Enum(name, _, _, _, line):
+                            can Global{Read,Write}:
+                                thread_index_type_declaration(callbacks, name, module_scope, line.line, declaration)
+                        Decl.Module(name, body, line):
+                            can Global{Read,Write}:
+                                collect_thread_callbacks(body, file, name, callbacks)
+                        Decl.Scoped(body, line):
+                            can Global{Read,Write}:
+                                collect_thread_callbacks(body, file, module_scope, callbacks)
                         _:
                             pass
 
 
-        def check_thread_shareability_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, callback_names: darray[sview]&, callback_flags: darray[bool]&, table: lmut SymbolTable) -> void:
+        def thread_index_synthetic_payload_types(file: Ast::File&, callbacks: mutable ThreadCallbackIndex&) -> void:
             can Memory.Allocate, Abort.Panic:
+                # Function-local state/start enums are flattened by the parser because their
+                # nested declaration fields do not survive in `Decl`. Rejoin those exact AST
+                # expressions so their payloads receive the same qualifier-aware walk.
+                for enum_index in 0..<file.payload_enum_names.count |callbacks, file|:
+                    enum_name: sview = file.payload_enum_names[enum_index]
+                    enum_module: sview = file.payload_enum_owners[enum_index] if enum_index < file.payload_enum_owners.count else ""
+                    variant_start: usize = file.payload_enum_variant_starts[enum_index]
+                    variant_count: usize = file.payload_enum_variant_counts[enum_index]
+                    for variant_offset in 0..<variant_count |callbacks, file|:
+                        variant_slot: usize = variant_start + variant_offset
+                        field_start: usize = file.payload_enum_variant_field_starts[variant_slot]
+                        field_count: usize = file.payload_enum_variant_field_counts[variant_slot]
+                        for field_offset in 0..<field_count |callbacks, file|:
+                            can Global{Read,Write}:
+                                thread_index_type_expression(callbacks, enum_name, enum_module, 0, file.payload_enum_variant_fields[field_start + field_offset])
+
+
+        def check_thread_shareability_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 for declaration in declarations |table|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
@@ -453,25 +1233,41 @@ extend Semantic:
                             pool_mutability: mutable darray[bool] = []
                             for param in params |names, flags, element_flags, pool_types, pool_mutability, table|:
                                 names.push(param.name)
-                                flags.push(type_is_nonstatic_reference(param.type_expression))
-                                element_flags.push(type_iterable_element_may_reference(param.type_expression))
+                                param_may_reference: mutable bool = type_is_nonstatic_reference(param.type_expression)
+                                if not param_may_reference:
+                                    module_scope: sview = table.current_module
+                                    param_may_reference <- thread_type_may_contain_nonstatic_reference(param.type_expression, table, callbacks, module_scope)
+                                flags.push(param_may_reference)
+                                element_flags.push(type_iterable_element_may_reference(param.type_expression, table, callbacks))
                                 pool_types.push(thread_submit_type_name(param.type_expression, Ast::Expr.Absent, table))
                                 pool_mutability.push(thread_submit_binding_writable(param.type_expression, param.is_mutable))
-                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callback_names, callback_flags, table)
-                        Decl.Module(name, body, line) | Decl.Scoped(body, line):
-                            table <- check_thread_shareability_declarations(body, annotations, callback_names, callback_flags, table)
+                            table <- walk_thread_shareability_statements(body, annotations, names, flags, element_flags, pool_types, pool_mutability, callbacks, table)
+                        Decl.Module(name, body, line):
+                            outer_module: sview = table.current_module
+                            table.current_module <- name
+                            table <- check_thread_shareability_declarations(body, annotations, callbacks, table)
+                            table.current_module <- outer_module
+                        Decl.Scoped(body, line):
+                            table <- check_thread_shareability_declarations(body, annotations, callbacks, table)
                         _:
                             pass
 
     public:
-        def check_thread_shareability(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
-                callback_names: mutable darray[sview] = []
-                callback_flags: mutable darray[bool] = []
-                collect_thread_callbacks(declarations, callback_names, callback_flags)
+        def check_thread_shareability(declarations: darray[Ast::Decl], file: Ast::File&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                # For small alias sets the linear resolver is cheaper than building the
+                # per-pass maps. This threshold is a static allocation tradeoff and needs a
+                # compile-time scorecard before treating the index as a net performance win.
+                if table.type_alias_name.count >= THREAD_ALIAS_INDEX_MIN_ROWS:
+                    can Global{Read,Write}:
+                        table <- thread_build_alias_name_index(table)
+                callbacks: mutable ThreadCallbackIndex = new_thread_callback_index()
+                can Global{Read,Write}:
+                    collect_thread_callbacks(declarations, file, "", callbacks)
+                    thread_index_synthetic_payload_types(file, callbacks)
                 # Keep the submit markers, explicit pool selectors, and global mutability
                 # facts used by this boundary walk; discard the rest of the annotation table.
                 submit_markers: mutable darray[Ast::EnumAnnotation] = []
                 for annotation in annotations |submit_markers|:
                     submit_markers.push(annotation) if annotation.name == "__submit" or annotation.name == "__submit_pool" or annotation.name == "__global_mutable"
-                table <- check_thread_shareability_declarations(declarations, submit_markers, callback_names, callback_flags, table)
+                table <- check_thread_shareability_declarations(declarations, submit_markers, callbacks, table)

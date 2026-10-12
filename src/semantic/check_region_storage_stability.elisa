@@ -124,13 +124,13 @@ extend Semantic:
                         storage_view_collect_sources(expression, alias_names, alias_sources, alias_is_view, view_fns, out)
 
         def storage_view_existing_alias_is_view(name: sview, alias_names: darray[sview]&, alias_sources: darray[sview]&, alias_is_view: darray[bool]&) -> bool:
-            found: mutable bool = false
             # A "[held]"-marked row (a view stored INTO the container) does not make the
-            # container itself a view.
-            for index in 0..<alias_names.count |found, alias_names, alias_sources, alias_is_view, name|:
+            # container itself a view. The result is existential, so a qualifying row can
+            # return immediately instead of scanning the remaining alias history.
+            for index in 0..<alias_names.count |alias_names, alias_sources, alias_is_view, name|:
                 held_row: bool = index > 0 and alias_names[index - 1] == name and index - 1 < alias_sources.count and alias_sources[index - 1] == "[held]"
-                found <- true if alias_names[index] == name and index < alias_is_view.count and alias_is_view[index] and not held_row
-            return found
+                true return if alias_names[index] == name and index < alias_is_view.count and alias_is_view[index] and not held_row
+            return false
 
         def storage_view_expr_carries_borrow(expression: Ast::Expr, alias_names: darray[sview]&, alias_sources: darray[sview]&, alias_is_view: darray[bool]&) -> bool:
             can Memory.Allocate, Abort.Panic:
@@ -228,7 +228,9 @@ extend Semantic:
         def storage_view_type_is_scalar_copy(type_expression: Ast::Expr) -> bool:
             can Abort.Panic:
                 name: sview = ident_name_of(type_expression)
-                return name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "isize" or name == "usize" or name == "f32" or name == "f64" or name == "bool" or name == "char"
+                return when name:
+                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" | "f32" | "f64" | "bool" | "char" -> true
+                    _ -> false
 
         def storage_view_record_typed_alias(name: sview, type_expression: Ast::Expr, value: Ast::Expr, alias_names: mutable darray[sview]&, alias_sources: mutable darray[sview]&, alias_is_view: mutable darray[bool]&, view_fns: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -1263,18 +1265,28 @@ extend Semantic:
         # Whether CALLEE's positional parameter POSITION is a `mutable T&` borrow whose type can
         # hold relocatable storage. Only a scalar pointee is known not to: a darray, a struct
         # with a darray field or a generic may be grown by the callee through the borrow.
-        def storage_callee_param_may_relocate(table: SymbolTable&, callee: sview, position: usize) -> bool:
+        # Advance a call-local cursor to POSITION in CALLEE's flattened parameter rows.
+        # Callers ask for positions in ascending order, so one invocation continues where
+        # the previous one stopped instead of restarting the same-hash chain per argument.
+        def storage_callee_param_may_relocate_at(table: SymbolTable&, callee: sview, position: usize, cur: mutable u32&, seen: mutable usize&) -> bool:
             can Abort.Panic:
-                seen: mutable usize = 0
-                result: mutable bool = false
-                cur: mutable u32 = function_param_chain_head(table, callee)
                 while cur != 4294967295:
                     row: usize = cur.usize()
-                    if table.function_param_owner[row] == callee:
-                        result <- table.function_param_mutable_ref[row] and not storage_scalar_pointee(table.function_param_type_id[row], table) if seen == position
-                        seen <- seen + 1
                     cur <- table.function_param_name_next[row]
-                return result
+                    if table.function_param_owner[row] == callee:
+                        if seen == position:
+                            seen <- seen + 1
+                            return table.function_param_mutable_ref[row] and not storage_scalar_pointee(table.function_param_type_id[row], table)
+                        seen <- seen + 1
+                return false
+
+        # One-shot query for callers that do not visit positions sequentially. Ordered
+        # argument walkers keep a cursor and use the helper above to avoid rescanning.
+        def storage_callee_param_may_relocate(table: SymbolTable&, callee: sview, position: usize) -> bool:
+            can Abort.Panic:
+                cur: mutable u32 = function_param_chain_head(table, callee)
+                seen: mutable usize = 0
+                return storage_callee_param_may_relocate_at(table, callee, position, cur, seen)
 
         # Whether TYPE_ID, seen through reference/optional layers, is a scalar. Unknown (0) is
         # NOT scalar: an unmodeled parameter type must keep invalidating. Optional scalar
@@ -1296,22 +1308,35 @@ extend Semantic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
                         callee_name: sview = ident_name_of(callee)
-                        for argument in arguments |position: usize = 0, out, callee_name, table|:
+                        param_cursor: mutable u32 = 4294967295
+                        param_cursor_ready: mutable bool = false
+                        seen_params: mutable usize = 0
+                        for argument in arguments |position: usize = 0, out, callee_name, table, param_cursor, param_cursor_ready, seen_params|:
                             callee_relocation_targets(argument, table, out) can Global{Read,Write}
                             root: sview = storage_view_place_root(argument) if callee_name != "" else ""
-                            callee_relocation_summarised(root, argument, callee_name, position, table, out) can Global{Read,Write} if root != "" and storage_callee_param_may_relocate(table, callee_name, position)
+                            may_relocate: mutable bool = false
+                            if root != "" and callee_name != "":
+                                if not param_cursor_ready:
+                                    param_cursor <- function_param_chain_head(table, callee_name)
+                                    param_cursor_ready <- true
+                                may_relocate <- storage_callee_param_may_relocate_at(table, callee_name, position, param_cursor, seen_params)
+                            callee_relocation_summarised(root, argument, callee_name, position, table, out) can Global{Read,Write} if root != "" and may_relocate
                             position <- position + 1
                         # Receiver form `xs.grow()` / `b.add(v)`: the receiver is the callee's
                         # first parameter, so the arguments shift by one.
                         match callee:
                             Expr.Field(receiver, method, field_line):
                                 if callee_name == "" and function_param_chain_head(table, method) != 4294967295:
+                                    method_cursor: mutable u32 = function_param_chain_head(table, method)
+                                    method_seen: mutable usize = 0
                                     callee_relocation_targets(receiver, table, out) can Global{Read,Write}
                                     receiver_root: sview = storage_view_place_root(receiver)
-                                    callee_relocation_summarised(receiver_root, receiver, method, 0, table, out) can Global{Read,Write} if receiver_root != "" and storage_callee_param_may_relocate(table, method, 0)
-                                    for argument in arguments |shifted: usize = 1, out, method, table|:
+                                    receiver_may_relocate: bool = storage_callee_param_may_relocate_at(table, method, 0, method_cursor, method_seen) if receiver_root != "" else false
+                                    callee_relocation_summarised(receiver_root, receiver, method, 0, table, out) can Global{Read,Write} if receiver_root != "" and receiver_may_relocate
+                                    for argument in arguments |shifted: usize = 1, out, method, table, method_cursor, method_seen|:
                                         argument_root: sview = storage_view_place_root(argument)
-                                        callee_relocation_summarised(argument_root, argument, method, shifted, table, out) can Global{Read,Write} if argument_root != "" and storage_callee_param_may_relocate(table, method, shifted)
+                                        argument_may_relocate: bool = storage_callee_param_may_relocate_at(table, method, shifted, method_cursor, method_seen) if argument_root != "" else false
+                                        callee_relocation_summarised(argument_root, argument, method, shifted, table, out) can Global{Read,Write} if argument_root != "" and argument_may_relocate
                                         shifted <- shifted + 1
                             _:
                                 pass
@@ -2061,11 +2086,19 @@ extend Semantic:
         def check_storage_view_loop_back_edge(body: darray[Ast::Stmt], condition: Ast::Expr, has_condition: bool, loop_line: u32, before: darray[sview]&, alias_names: darray[sview]&, alias_sources: darray[sview]&, alias_is_view: darray[bool]&, invalidated: darray[sview]&, invalidated_by: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if storage_view_body_leaves(body)
-                for index in 0..<invalidated.count |table, body, condition, before, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by|:
+                # Each probe retains only its first read, so reuse the scratch arrays and
+                # truncate the two result columns before scanning the next invalidated name.
+                probe: mutable darray[sview] = []
+                found_pos: mutable darray[Ast::Pos] = []
+                found_line: mutable darray[u32] = []
+                for index in 0..<invalidated.count |table, body, condition, before, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, probe, found_pos, found_line|:
                     if not fresh_wrapper_name_exists(before, invalidated[index]):
-                        probe: mutable darray[sview] = [invalidated[index]]
-                        found_pos: mutable darray[Ast::Pos] = []
-                        found_line: mutable darray[u32] = []
+                        if probe.count == 0:
+                            probe.push(invalidated[index])
+                        else:
+                            probe[0] <- invalidated[index]
+                        found_pos.truncate(0)
+                        found_line.truncate(0)
                         found: u8 = storage_view_loop_use(condition, probe, loop_line, found_pos, found_line) if has_condition else 0
                         rest: u8 = storage_view_loop_first_use(body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) if found == 0 else 0
                         by: sview = invalidated_by[index] if index < invalidated_by.count else ""
@@ -2241,7 +2274,13 @@ extend Semantic:
                             invalidate_growth_aliases(growth_call_target(target), growth_call_target_field(target), field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) can Global{Read,Write}
                             invalidate_growth_aliases(growth_call_target(value), growth_call_target_field(value), field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) can Global{Read,Write}
                             invalidate_callee_relocations(value, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, table) can Global{Read,Write}
-                            invalidate_growth_aliases(growth_call_target(collection_append_call(target, value, line)), growth_call_target_field(collection_append_call(target, value, line)), field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) can Global{Read,Write} if operator == TokenKind.PlusEq
+                            if operator == TokenKind.PlusEq:
+                                # The analysis-only push call has `target` as its receiver;
+                                # derive the same root and direct field without constructing
+                                # that wrapper twice and walking it twice.
+                                append_target: sview = storage_view_place_root(target)
+                                append_target_field: sview = storage_view_direct_field(target)
+                                invalidate_growth_aliases(append_target, append_target_field, field_elems, function_line, line.line, annotations, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by) can Global{Read,Write}
                             rebound: sview = storage_view_rebind_target(target, operator, value, alias_names, alias_sources, alias_is_view)
                             # `<-` into a local declared with a non-reference type (`name: mutable
                             # cstr`) always rebinds it: there is no referent to write through, so a
