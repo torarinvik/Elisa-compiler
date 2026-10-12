@@ -82,6 +82,21 @@ class ShardCacheTests(unittest.TestCase):
         for restored, name in ((self.output, "object"), (self.out, "stdout"), (self.err, "stderr")):
             self.assertEqual(restored.stat().st_mode & 0o777, expected_modes[name])
 
+    def test_deferred_restore_without_receipt_succeeds(self):
+        self.publish()
+        staged = []
+        directories = []
+        self.assertTrue(shard.restore(
+            self.cache, self.ticket, self.output, self.out, self.err,
+            _verify_copies=False, _deferred_staged=staged, _deferred_directories=directories,
+        ))
+        self.assertEqual(len(staged), 3)
+        self.assertFalse(self.output.exists())
+        for path in staged:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            path.unlink()
+        shard.remove_empty_directories(directories)
+
     def test_options_and_actual_artifacts_invalidate(self):
         for key in shard.FIELDS - {"logical_shards", "logical_shard", "opt_pipeline", "codegen_opt", "producer_discovery_version", "llvm_discovery_version", "resolved_output_policy", "coverage_policy", "pgo_policy"}:
             options = dict(self.options)

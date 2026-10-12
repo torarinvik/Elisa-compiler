@@ -363,7 +363,7 @@ def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket
                 transferred = True
                 if _receipt is not None:
                     _receipt.update({name: dict(manifest[name]) for name in ("object", "stdout", "stderr")})
-                _receipt["modes"] = dict(manifest["modes"])
+                    _receipt["modes"] = dict(manifest["modes"])
                 return True
             # Object commits last; publication errors are fatal, never a cold retry
             # following partially published diagnostics.
