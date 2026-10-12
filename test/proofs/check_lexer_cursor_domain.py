@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,7 +55,7 @@ if manifest.get("compile_mode") != "strict":
 
 stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
-INPUTS = [BIN, MANIFEST, MANIFEST_CHECKSUM, COMPILER_PIN, stage1_product,
+INPUTS = [*source_include_closure([POSITIVE, NEGATIVE]), BIN, MANIFEST, MANIFEST_CHECKSUM, COMPILER_PIN, stage1_product,
           stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
           POSITIVE, NEGATIVE, HELPER, CORE, FACADE, TOKEN_SOURCE]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in INPUTS}

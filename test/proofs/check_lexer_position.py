@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +44,7 @@ if stale_sources:
 inputs = [BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
           PROVER / "ELISA_COMPILER_REV", Path(__file__).with_name("proof_product_gate.py"),
           Path(__file__), *SOURCES]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 

@@ -10,8 +10,10 @@ include "./lexer_position.elisa"
 include "./lexer_position_step.elisa"
 include "./lexer_token_span.elisa"
 include "./lexer_token.elisa"
+include "./lexer_comment_scan.elisa"
 include "./source_view.elisa"
 include "./lexer_character_access.elisa"
+include "./lexer_utf8_codepoint.elisa"
 include "./lexer_core.elisa"
 include "./lexer_unicode_ranges.elisa"
 include "./lexer_strings.elisa"
@@ -62,14 +64,12 @@ extend Lexer:
                 (line_map_cached_original_line(flat_line) can Global.Read) return if (line_map_cache_ready() can Global{Read,Write})
                 return source_original_line_from_map(flat_line)
 
-        # True when `flat_line` of a driver-expanded unit comes from a runtime stdlib file
-        # (a path under `elisacore_std/`), or when the whole unit is compiled as the runtime
-        # stdlib (ELISA_STAGE1_RUNTIME_STD). This is declaration PROVENANCE, not a name
-        # check: it lets the backend tell the runtime's own API from a same-spelled
-        # user declaration.
+        # True when `flat_line` comes from this compiler installation's runtime stdlib.
+        # The source path must be beneath the root derived from the OS-reported executable; an ambient
+        # environment flag or a user path that merely contains `elisacore_std/` is not proof.
+        # Missing or ambiguous identity fails closed so the backend treats the declaration as
+        # user code.
         def source_line_is_runtime_std(flat_line: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            flag_storage: mutable darray[u8] = []
-            true return if source_line_map_value("ELISA_STAGE1_RUNTIME_STD", &flag_storage)
             (line_map_cached_is_runtime_std(flat_line) can Global.Read) return if (line_map_cache_ready() can Global{Read,Write})
             return source_line_is_runtime_std_from_map(flat_line)
 
@@ -78,6 +78,142 @@ extend Lexer:
         const SOURCE_LINE_MAP_SEPARATOR: u8 = 58
         const SOURCE_LINE_MAP_NEWLINE: u8 = 10
         const SOURCE_LINE_MAP_DIGIT_ZERO: u8 = 48
+        const SOURCE_LINE_MAP_PATH_SEPARATOR: u8 = 47
+
+        static if ELISA_TARGET_OS_LINUX:
+            @link_name("realpath")
+            extern lexer_realpath(path: cstr, resolved: void&?) -> u8&?
+            @link_name("readlink")
+            extern lexer_readlink(path: cstr, buffer: u8&, size: usize) -> isize
+        static else:
+            static if ELISA_TARGET_OS_MACOS:
+                @link_name("realpath")
+                extern lexer_realpath(path: cstr, resolved: void&?) -> u8&?
+                @link_name("_NSGetExecutablePath")
+                extern lexer_get_executable_path(buffer: cstr, size: u32&) -> i32
+            static else:
+                static if ELISA_TARGET_OS_FREEBSD:
+                    @link_name("realpath")
+                    extern lexer_realpath(path: cstr, resolved: void&?) -> u8&?
+
+        def source_runtime_std_executable_path(path: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            path.resize(8192.usize())
+            static if ELISA_TARGET_OS_LINUX:
+                amount: isize = lexer_readlink("/proc/self/exe", &path[0], path.count)
+                false return if amount <= 0 or amount.usize() >= path.count
+                path.resize(amount.usize())
+                path.push(0)
+                return true
+            static else:
+                static if ELISA_TARGET_OS_MACOS:
+                    path_cstr: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+                    path_capacity: mutable u32 = path.count.u32()
+                    false return if lexer_get_executable_path(path_cstr, &path_capacity) != 0
+                    path_length: mutable usize = 0.usize()
+                    while path_length < path.count |path_length, path|:
+                        break if path[path_length] == 0
+                        path_length <- path_length + 1.usize()
+                    false return if path_length == path.count
+                    path.resize(path_length + 1.usize())
+                    return true
+                static else:
+                    return false
+
+        # Derive the only trusted stdlib root from the executable the driver actually ran.
+        # Installed snapshots and checkout builds both keep the product at ROOT/bin/..., with
+        # the bundled runtime at ROOT/elisacore_std/.
+        def source_runtime_std_root_prefix(prefix: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            static if ELISA_TARGET_OS_WINDOWS:
+                return false
+            static else:
+                static if ELISA_TARGET_OS_WASM:
+                    return false
+                static else:
+                    self_storage: mutable darray[u8] = []
+                    false return if not source_runtime_std_executable_path(&self_storage)
+                    self_cstr: cstr = (&self_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    self_buffer: mutable darray[u8] = []
+                    self_buffer.resize(8192.usize())
+                    self_buffer_ref: void& = (&self_buffer[0]).cast[void&] can Unsafe.PointerCast
+                    false return if lexer_realpath(self_cstr, self_buffer_ref) is null
+                    self_length: mutable usize = 0.usize()
+                    while self_length < self_buffer.count |self_length, self_buffer|:
+                        break if self_buffer[self_length] == 0
+                        self_length <- self_length + 1.usize()
+                    false return if self_length == self_buffer.count
+                    bin_start: mutable usize = self_length
+                    index: mutable usize = 0
+                    while index + 5.usize() <= self_length |index, bin_start, self_buffer|:
+                        if self_buffer[index] == SOURCE_LINE_MAP_PATH_SEPARATOR and self_buffer[index + 1.usize()] == 98 and self_buffer[index + 2.usize()] == 105 and self_buffer[index + 3.usize()] == 110 and self_buffer[index + 4.usize()] == SOURCE_LINE_MAP_PATH_SEPARATOR:
+                            bin_start <- index
+                        index <- index + 1.usize()
+                    false return if bin_start == self_length
+                    for root_index in 0..<bin_start |prefix, self_buffer|:
+                        prefix.push(self_buffer[root_index])
+                    trusted_suffix: sview = "/elisacore_std/"
+                    for suffix_index in 0..<sview_len(trusted_suffix) |prefix, trusted_suffix|:
+                        prefix.push(sview_at(trusted_suffix, suffix_index))
+                    # Resolve the configured root too. A symlinked checkout may have a different
+                    # spelling in the source map; comparing canonical paths handles that safely.
+                    root_path: mutable darray[u8] = []
+                    for root_index in 0..<(prefix.count - 1.usize()) |root_path, prefix|:
+                        root_path.push(prefix[root_index])
+                    root_path.push(0)
+                    root_buffer: mutable darray[u8] = []
+                    root_buffer.resize(8192.usize())
+                    root_cstr: cstr = (&root_path[0]).cast[cstr] can Unsafe.PointerCast
+                    root_buffer_ref: void& = (&root_buffer[0]).cast[void&] can Unsafe.PointerCast
+                    false return if lexer_realpath(root_cstr, root_buffer_ref) is null
+                    prefix.truncate(0)
+                    root_length: mutable usize = 0.usize()
+                    while root_length < root_buffer.count |root_length, root_buffer|:
+                        break if root_buffer[root_length] == 0
+                        prefix.push(root_buffer[root_length])
+                        root_length <- root_length + 1.usize()
+                    false return if root_length == root_buffer.count or prefix.count == 0.usize()
+                    prefix.push(SOURCE_LINE_MAP_PATH_SEPARATOR)
+                    return prefix.count > 0.usize()
+
+        def source_line_map_path_has_runtime_std_component(map_storage: darray[u8]&, path_start: usize, path_stop: usize) -> bool can[Abort.Panic]:
+            false return if path_stop <= path_start
+            marker: sview = "elisacore_std/"
+            marker_length: usize = sview_len(marker)
+            marker_start: mutable usize = path_start
+            while marker_start <= path_stop and path_stop - marker_start >= marker_length |marker_start, map_storage, marker, marker_length, path_start, path_stop|:
+                matched: mutable bool = true
+                for marker_offset in 0..<marker_length |matched, map_storage, marker_start, marker|:
+                    matched <- false if map_storage[marker_start + marker_offset] != sview_at(marker, marker_offset)
+                true return if matched and marker_start > path_start and map_storage[marker_start - 1.usize()] == SOURCE_LINE_MAP_PATH_SEPARATOR
+                marker_start <- marker_start + 1.usize()
+            return false
+
+
+        def source_line_map_path_is_runtime_std(map_storage: darray[u8]&, path_start: usize, path_stop: usize, trusted_prefix: darray[u8]&, realpath_buffer: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            static if ELISA_TARGET_OS_WINDOWS:
+                return false
+            static else:
+                static if ELISA_TARGET_OS_WASM:
+                    return false
+                static else:
+                    false return if path_stop <= path_start or path_stop - path_start > 8191.usize()
+                    # Most compiler map entries are `src/` or user files. This cheap component scan
+                    # skips filesystem resolution for them; it is only a prefilter, never proof.
+                    false return if not source_line_map_path_has_runtime_std_component(map_storage, path_start, path_stop)
+                    path_storage: mutable darray[u8] = []
+                    for path_index in path_start..<path_stop |path_storage, map_storage|:
+                        path_storage.push(map_storage[path_index])
+                    path_storage.push(0)
+                    path_cstr: cstr = (&path_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    realpath_buffer_ref: void& = (&realpath_buffer[0]).cast[void&] can Unsafe.PointerCast
+                    false return if lexer_realpath(path_cstr, realpath_buffer_ref) is null
+                    resolved_length: mutable usize = 0.usize()
+                    while resolved_length < realpath_buffer.count |resolved_length, realpath_buffer|:
+                        break if realpath_buffer[resolved_length] == 0
+                        resolved_length <- resolved_length + 1.usize()
+                    false return if resolved_length == realpath_buffer.count or resolved_length <= trusted_prefix.count
+                    for prefix_index in 0..<trusted_prefix.count |realpath_buffer, trusted_prefix|:
+                        false return if realpath_buffer[prefix_index] != trusted_prefix[prefix_index]
+                    return true
 
         # The lexer is also compiled as a standalone frontend unit by the breadth reporter.
         # Keep this tiny environment reader local instead of depending on the command-line
@@ -103,15 +239,17 @@ extend Lexer:
 
         # The map is `FLAT:ORIG:PATH` lines; the owning entry is the greatest FLAT <= flat_line.
         def source_line_is_runtime_std_from_map(flat_line: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            flag_storage: mutable darray[u8] = []
-            true return if source_line_map_value("ELISA_STAGE1_RUNTIME_STD", &flag_storage)
             map_storage: mutable darray[u8] = []
             false return if not source_line_map_value("ELISA_STAGE1_LINE_MAP", &map_storage)
+            trusted_prefix: mutable darray[u8] = []
+            false return if not source_runtime_std_root_prefix(&trusted_prefix)
+            realpath_buffer: mutable darray[u8] = []
+            realpath_buffer.resize(8192.usize())
             best_flat: mutable u32 = 0
             best_path_start: mutable usize = 0.usize()
             best_path_stop: mutable usize = 0.usize()
             cursor: mutable usize = 0.usize()
-            while cursor < map_storage.count |cursor, best_flat, best_path_start, best_path_stop, map_storage, flat_line|:
+            while cursor < map_storage.count |cursor, best_flat, best_path_start, best_path_stop, map_storage, flat_line, realpath_buffer|:
                 entry_stop: mutable usize = cursor
                 while entry_stop < map_storage.count |entry_stop, map_storage|:
                     break if map_storage[entry_stop] == SOURCE_LINE_MAP_NEWLINE
@@ -134,16 +272,7 @@ extend Lexer:
                     best_path_stop <- entry_stop
                 cursor <- entry_stop + 1.usize()
             false return if best_flat == 0
-            marker: sview = "elisacore_std/"
-            marker_len: usize = sview_len(marker)
-            start: mutable usize = best_path_start
-            while start + marker_len <= best_path_stop |start, map_storage, marker, marker_len|:
-                matched: mutable bool = true
-                for offset in 0..<marker_len |matched, map_storage, start, marker|:
-                    matched <- false if map_storage[start + offset] != sview_at(marker, offset)
-                true return if matched
-                start <- start + 1.usize()
-            return false
+            return source_line_map_path_is_runtime_std(map_storage, best_path_start, best_path_stop, trusted_prefix, realpath_buffer)
 
         # Translate a buffer line from a driver-expanded unit to the original source line.
         # The driver publishes the compact text map before tokenization. Reading that map here

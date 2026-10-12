@@ -10,6 +10,7 @@
 # malformed maps (see lexer.elisa). A map with more entries than the table holds keeps the
 # per-call parse.
 const LEXER_LINE_MAP_CAPACITY: usize = 65536
+const LEXER_LINE_MAP_PATH_CACHE_CAPACITY: usize = 8192
 # getenv pointer the tables were built from; 0 = nothing cached.
 global mutable lexer_line_map_key: uintptr
 # 1 = tables valid for lexer_line_map_key, 2 = the map overflowed the tables.
@@ -17,8 +18,13 @@ global mutable lexer_line_map_state: u8
 global mutable lexer_line_map_count: usize
 global mutable lexer_line_map_flat: array[u32, 65536]
 global mutable lexer_line_map_orig: array[u32, 65536]
-# 1 when the entry's PATH contains `elisacore_std/`.
+# 1 when the entry's PATH is beneath the active compiler's bundled stdlib root.
 global mutable lexer_line_map_std: array[u8, 65536]
+global mutable lexer_line_map_path_cache_used: array[u8, 8192]
+global mutable lexer_line_map_path_cache_hash: array[u64, 8192]
+global mutable lexer_line_map_path_cache_start: array[usize, 8192]
+global mutable lexer_line_map_path_cache_stop: array[usize, 8192]
+global mutable lexer_line_map_path_cache_std: array[u8, 8192]
 # A malformed FLAT field (or an entry without a separator) makes every original-line lookup
 # answer the flat line and every runtime-std lookup answer false.
 global mutable lexer_line_map_flat_bad: bool
@@ -35,11 +41,18 @@ extend Lexer:
         def line_map_suspend(storage: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             storage.truncate(0)
             false return if not source_line_map_value("ELISA_STAGE1_LINE_MAP", storage)
+            can Global.Write:
+                line_map_clear()
+            return true
+
+
+        # Discard caller-provided state before a new request publishes its own include map.
+        # Reset the cache key too: getenv may reuse the same address for the next value.
+        def line_map_clear() -> void can[Abort.Panic, Global.Write]:
             _ = lexer_unsetenv("ELISA_STAGE1_LINE_MAP")
             can Global.Write:
                 lexer_line_map_key <- 0
                 lexer_line_map_state <- 0
-            return true
 
         # Put back a map taken by line_map_suspend.
         def line_map_resume(storage: mutable darray[u8]&, suspended: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -52,6 +65,18 @@ extend Lexer:
                 lexer_line_map_state <- 0
 
     private:
+        def line_map_cache_path_hash(map_storage: darray[u8]&, path_start: usize, path_stop: usize) -> u64 can[Abort.Panic]:
+            hash: mutable u64 = 14695981039346656037
+            for path_index in path_start..<path_stop |hash, map_storage|:
+                hash <- (hash ^ map_storage[path_index].u64()) * 1099511628211
+            return hash
+
+        def line_map_cache_paths_equal(map_storage: darray[u8]&, left_start: usize, left_stop: usize, right_start: usize, right_stop: usize) -> bool can[Abort.Panic]:
+            false return if left_stop < left_start or right_stop < right_start or left_stop - left_start != right_stop - right_start
+            for path_offset in 0..<(left_stop - left_start) |map_storage, left_start, right_start|:
+                false return if map_storage[left_start + path_offset] != map_storage[right_start + path_offset]
+            return true
+
         # Whether the tables describe the current map (building them if needed). False when
         # there is no map or it does not fit: callers then take the per-call parse.
         def line_map_cache_ready() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -68,16 +93,21 @@ extend Lexer:
         def line_map_cache_build() -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             map_storage: mutable darray[u8] = []
             _ = source_line_map_value("ELISA_STAGE1_LINE_MAP", &map_storage)
+            trusted_prefix: mutable darray[u8] = []
+            _ = source_runtime_std_root_prefix(&trusted_prefix)
+            realpath_buffer: mutable darray[u8] = []
+            realpath_buffer.resize(8192.usize())
             can Global.Write:
-                lexer_line_map_state <- 1
+                for cache_index in 0..<LEXER_LINE_MAP_PATH_CACHE_CAPACITY:
+                    lexer_line_map_path_cache_used[cache_index] <- 0
+            can Global.Write:
+                lexer_line_map_state <- 2
                 lexer_line_map_count <- 0
                 lexer_line_map_flat_bad <- false
                 lexer_line_map_orig_bad <- false
                 lexer_line_map_sorted <- true
-            marker: sview = "elisacore_std/"
-            marker_len: usize = sview_len(marker)
             cursor: mutable usize = 0.usize()
-            while cursor < map_storage.count |cursor, map_storage, marker, marker_len|:
+            while cursor < map_storage.count |cursor, map_storage, trusted_prefix, realpath_buffer|:
                 entry_stop: mutable usize = cursor
                 while entry_stop < map_storage.count |entry_stop, map_storage|:
                     break if map_storage[entry_stop] == SOURCE_LINE_MAP_NEWLINE
@@ -109,18 +139,40 @@ extend Lexer:
                     can Global.Write:
                         lexer_line_map_orig_bad <- true
                 is_std: mutable u8 = 0
-                start: mutable usize = scan + 1.usize()
-                while start + marker_len <= entry_stop |start, is_std, map_storage, marker, marker_len|:
-                    matched: mutable bool = true
-                    for offset in 0..<marker_len |matched, map_storage, start, marker|:
-                        matched <- false if map_storage[start + offset] != sview_at(marker, offset)
-                    if matched:
-                        is_std <- 1
-                        break
-                    start <- start + 1.usize()
+                path_start: usize = scan + 1.usize()
+                path_stop: usize = entry_stop
+                if trusted_prefix.count > 0.usize() and path_start < path_stop and path_stop - path_start <= 8191.usize() and source_line_map_path_has_runtime_std_component(map_storage, path_start, path_stop):
+                    path_hash: u64 = line_map_cache_path_hash(map_storage, path_start, path_stop)
+                    path_cache_slot: mutable usize = (path_hash % LEXER_LINE_MAP_PATH_CACHE_CAPACITY.u64()).usize()
+                    path_cache_probes: mutable usize = 0.usize()
+                    path_cache_found: mutable bool = false
+                    while path_cache_probes < LEXER_LINE_MAP_PATH_CACHE_CAPACITY |path_cache_slot, path_cache_probes, path_cache_found, path_hash, path_start, path_stop, is_std, map_storage, trusted_prefix, realpath_buffer|:
+                        if lexer_line_map_path_cache_used[path_cache_slot] != 0 can Global.Read:
+                            if lexer_line_map_path_cache_hash[path_cache_slot] == path_hash can Global.Read:
+                                old_start: usize = lexer_line_map_path_cache_start[path_cache_slot] can Global.Read
+                                old_stop: usize = lexer_line_map_path_cache_stop[path_cache_slot] can Global.Read
+                                if line_map_cache_paths_equal(map_storage, path_start, path_stop, old_start, old_stop):
+                                    is_std <- lexer_line_map_path_cache_std[path_cache_slot] can Global.Read
+                                    path_cache_found <- true
+                                    break
+                            path_cache_slot <- path_cache_slot + 1.usize()
+                            path_cache_slot <- 0.usize() if path_cache_slot >= LEXER_LINE_MAP_PATH_CACHE_CAPACITY
+                            path_cache_probes <- path_cache_probes + 1.usize()
+                        else:
+                            if source_line_map_path_is_runtime_std(map_storage, path_start, path_stop, trusted_prefix, realpath_buffer):
+                                is_std <- 1
+                            can Global{Read,Write}:
+                                lexer_line_map_path_cache_used[path_cache_slot] <- 1
+                                lexer_line_map_path_cache_hash[path_cache_slot] <- path_hash
+                                lexer_line_map_path_cache_start[path_cache_slot] <- path_start
+                                lexer_line_map_path_cache_stop[path_cache_slot] <- path_stop
+                                lexer_line_map_path_cache_std[path_cache_slot] <- is_std
+                            path_cache_found <- true
+                            break
+                    if not path_cache_found:
+                        if source_line_map_path_is_runtime_std(map_storage, path_start, path_stop, trusted_prefix, realpath_buffer):
+                            is_std <- 1
                 if lexer_line_map_count >= LEXER_LINE_MAP_CAPACITY can Global.Read:
-                    can Global.Write:
-                        lexer_line_map_state <- 2
                     return
                 if lexer_line_map_count > 0 and entry_flat < lexer_line_map_flat[lexer_line_map_count - 1] can Global.Read:
                     can Global.Write:
@@ -131,6 +183,8 @@ extend Lexer:
                     lexer_line_map_std[lexer_line_map_count] <- is_std
                     lexer_line_map_count <- lexer_line_map_count + 1
                 cursor <- entry_stop + 1.usize()
+            can Global.Write:
+                lexer_line_map_state <- 1
 
         # The entry the per-call parse settles on for FLAT_LINE: the greatest FLAT <= FLAT_LINE,
         # the last such entry on ties; -1 when there is none or that FLAT is 0.
