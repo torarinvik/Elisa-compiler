@@ -150,12 +150,12 @@ separator_condition = "LexerNumberClassification::is_decimal_digit(previous) and
 hex_condition = "LexerNumberClassification::is_hex_digit(previous) and LexerNumberClassification::is_hex_digit(following)"
 expected_separator_model = compact(
     "def numeric_separator_model(previous: char, following: char) -> LexerNumberClassification::NumberClass: "
-    f"ensure result == (LexerNumberClassification::NumberClass.DecimalSeparator if {separator_condition} "
-    f"else LexerNumberClassification::NumberClass.HexSeparator if {hex_condition} "
-    "else LexerNumberClassification::NumberClass.Other) "
-    f"return LexerNumberClassification::NumberClass.DecimalSeparator if {separator_condition} "
-    f"else LexerNumberClassification::NumberClass.HexSeparator if {hex_condition} "
-    "else LexerNumberClassification::NumberClass.Other"
+    f"ensure ({separator_condition}) implies result == LexerNumberClassification::NumberClass.DecimalSeparator "
+    f"ensure (not ({separator_condition}) and {hex_condition}) implies result == LexerNumberClassification::NumberClass.HexSeparator "
+    f"ensure (not ({separator_condition}) and not ({hex_condition})) implies result == LexerNumberClassification::NumberClass.Other "
+    f"if {separator_condition}: return LexerNumberClassification::NumberClass.DecimalSeparator "
+    f"if {hex_condition}: return LexerNumberClassification::NumberClass.HexSeparator "
+    "return LexerNumberClassification::NumberClass.Other"
 )
 if separator_model != expected_separator_model:
     raise SystemExit("underscore proof model no longer has the decimal-first/hex-second decision table")
