@@ -1,12 +1,13 @@
 """Admit the EASM register/ABI mask proof against a strict Elisa-proof product."""
 import hashlib
+from itertools import combinations
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,31 @@ if 'include "easm_register_masks.elisa"' not in ENV.read_text():
     raise SystemExit("backend environment no longer imports the canonical EASM register masks")
 if 'include "../../src/backend/easm_register_masks.elisa"' not in POSITIVE.read_text():
     raise SystemExit("proof no longer imports the production register masks")
+
+positive_text = POSITIVE.read_text()
+negative_text = NEGATIVE.read_text()
+pairwise_start = positive_text.find("def low_seven_register_masks_are_pairwise_disjoint() -> bool:")
+if pairwise_start < 0:
+    raise SystemExit("proof no longer states low-register pairwise disjointness")
+pairwise_end = positive_text.find("\ndef ", pairwise_start + 1)
+pairwise_body = positive_text[pairwise_start:pairwise_end if pairwise_end >= 0 else len(positive_text)]
+pairwise_compact = "".join(pairwise_body.split())
+low_registers = ("RAX", "RCX", "RDX", "RBX", "RSI", "RDI", "RBP")
+expected_disjoint_pairs = {
+    f"(EasmRegisterMasks::{left}&EasmRegisterMasks::{right})==0"
+    for left, right in combinations(low_registers, 2)
+}
+actual_disjoint_pairs = set(re.findall(
+    r"\(EasmRegisterMasks::(R[A-Z0-9]+)&EasmRegisterMasks::(R[A-Z0-9]+)\)==0",
+    pairwise_compact,
+))
+actual_disjoint_pairs = {f"(EasmRegisterMasks::{left}&EasmRegisterMasks::{right})==0" for left, right in actual_disjoint_pairs}
+if actual_disjoint_pairs != expected_disjoint_pairs:
+    raise SystemExit("pairwise-disjointness theorem no longer covers exactly every low-register pair")
+if pairwise_compact.count("EasmRegisterMasks::") != 2 * len(expected_disjoint_pairs):
+    raise SystemExit("pairwise-disjointness theorem contains an untracked register-mask reference")
+if "def rax_and_rcx_masks_overlap() -> bool:" not in negative_text or "(EasmRegisterMasks::RAX & EasmRegisterMasks::RCX) != 0" not in negative_text:
+    raise SystemExit("rejected proof no longer challenges the RAX/RCX collision claim")
 
 model = MODEL.read_text()
 register_bit_body = model.split("def easm_register_bit(register: sview) -> i64:", 1)[1].split(
@@ -55,6 +81,36 @@ for register, aliases in register_aliases.items():
     expected = f"if {condition}:\n                return EasmRegisterMasks::{register}"
     if expected not in register_bit_body:
         raise SystemExit(f"EASM register aliases for {register} no longer map to its proved bit")
+
+operand_mask = model.split("def easm_operand_register_mask(operand: sview) -> i64:", 1)[1].split(
+    "def easm_instruction_register_mask(", 1
+)[0]
+if "easm_register_bit(easm_register_operand(operand))" not in operand_mask:
+    raise SystemExit("operand register scanning no longer normalizes direct aliases through the proved register-bit map")
+for helper in ("easm_memory_base_register(operand)", "easm_memory_index_register(operand)"):
+    if helper not in operand_mask:
+        raise SystemExit(f"operand register scanning no longer includes address component {helper}")
+
+instruction_mask = model.split("def easm_instruction_register_mask(instruction: Instruction) -> i64:", 1)[1].split(
+    "def easm_written_mask(", 1
+)[0]
+if "easm_operand_register_mask(easm_substitute_operand(easm_first_operand(instruction.text), instruction))" not in instruction_mask:
+    raise SystemExit("instruction masks no longer include source aliases from parsed operands")
+if "easm_operand_register_mask(easm_substitute_operand(easm_last_operand(instruction.text), instruction))" not in instruction_mask:
+    raise SystemExit("instruction masks no longer include destination address aliases from parsed operands")
+if "easm_operand_register_mask(substitution.replacement)" not in instruction_mask:
+    raise SystemExit("instruction masks no longer include aliases introduced by operand substitutions")
+
+read_mask = model.split("def easm_read_mask(instruction: Instruction) -> i64:", 1)[1].split(
+    "def easm_label_name(", 1
+)[0]
+for fragment in (
+    "return 0 if easm_self_zeroing(instruction)",
+    "return easm_operand_register_mask(source) | destination_reads",
+    "return 0 if easm_register_operand(destination) != \"\" else easm_operand_register_mask(destination)",
+):
+    if fragment not in read_mask:
+        raise SystemExit(f"EASM read-mask transfer is missing required alias/read behavior: {fragment}")
 
 register_scan = model.split("def easm_register_mask(text: sview) -> i64:", 1)[1].split(
     "def easm_substitution_at(", 1
@@ -111,6 +167,7 @@ inputs = [
     MODEL,
     MEMORY,
 ]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
@@ -139,6 +196,7 @@ expected = {
     "cpuid_write_mask",
     "rdtsc_write_mask",
     "every_register_has_its_canonical_one_hot_bit",
+    "low_seven_register_masks_are_pairwise_disjoint",
     "call_clobber_mask_is_exactly_the_caller_saved_union",
     "call_invalidation_mask_is_exactly_the_non_result_caller_saved_union",
     "callee_saved_gpr_mask_is_exactly_the_callee_saved_register_union",
@@ -148,11 +206,12 @@ assert expected <= verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-assert negative["summary"]["proven"] + 1 == negative["summary"]["obligations"]
-assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
-    ("ensure-unproven", "call_preserves_rcx")
-]
-assert "call_preserves_rcx" not in {
+assert negative["summary"]["proven"] + 2 == negative["summary"]["obligations"]
+assert {(finding["kind"], finding["name"]) for finding in negative["findings"]} == {
+    ("ensure-unproven", "call_preserves_rcx"),
+    ("ensure-unproven", "rax_and_rcx_masks_overlap"),
+}
+assert not {"call_preserves_rcx", "rax_and_rcx_masks_overlap"} & {
     row["name"] for row in negative["declaration_details"] if row.get("verified")
 }
 
@@ -161,9 +220,9 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "EASM register identity bits, ABI call clobbers, and implicit CPU register effects",
+    "scope": "low-seven EASM register-mask disjointness, ABI call clobbers, and implicit CPU register effects",
     "positive_obligations": positive["summary"]["proven"],
-    "false_claims_rejected": ["call_preserves_rcx"],
+    "false_claims_rejected": ["call_preserves_rcx", "rax_and_rcx_masks_overlap"],
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
     "proof_revision": manifest["proof"].get("head"),
     "compiler_revision": manifest["compiler"].get("source_revision"),

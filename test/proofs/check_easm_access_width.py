@@ -3,9 +3,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,11 +54,37 @@ match_table = (
 if compact(f"return when op: {match_table}") not in helper_text:
     raise SystemExit("production classifier no longer uses the reviewed exact opcode match table")
 proof_text = compact(POSITIVE.read_text())
-for opcode, width in width_cases:
-    if compact(f'if op == "{opcode}": return EasmAccessWidth::access_width(op) == {width}') not in proof_text:
-        raise SystemExit("universal width proof no longer covers every production opcode partition case")
-if compact("return EasmAccessWidth::access_width(op) == 0") not in proof_text:
-    raise SystemExit("universal width proof no longer covers unclassified opcode tokens")
+effectful_proofs = (
+    "def access_width_matches_the_exact_opcode_partition(op: sview) -> bool can[Abort.Panic]:",
+    "def byte_access_opcodes_have_width_one() -> bool can[Abort.Panic]:",
+    "def word_access_opcodes_have_width_two() -> bool can[Abort.Panic]:",
+    "def dword_access_opcodes_have_width_four() -> bool can[Abort.Panic]:",
+    "def qword_access_opcodes_have_width_eight() -> bool can[Abort.Panic]:",
+    "def nonsized_opcodes_and_prefix_lookalikes_have_no_memory_access_width() -> bool can[Abort.Panic]:",
+)
+if any(compact(signature) not in proof_text for signature in effectful_proofs):
+    raise SystemExit("proof callers no longer declare the production classifier's Abort.Panic effect")
+proof_source = POSITIVE.read_text()
+for signature in effectful_proofs:
+    name = re.search(r"def ([A-Za-z_][A-Za-z0-9_]*)\(", signature).group(1)
+    start = re.search(rf"(?m)^def {re.escape(name)}\(", proof_source)
+    following = re.search(r"(?m)^def [A-Za-z_][A-Za-z0-9_]*\(", proof_source[start.end():])
+    end = start.end() + following.start() if following else len(proof_source)
+    body = compact(proof_source[start.end():end])
+    grant = body.find("canAbort.Panic:")
+    call = body.find("EasmAccessWidth::access_width(")
+    if grant < 0 or call < 0 or grant > call:
+        raise SystemExit(f"{name} must locally grant Abort.Panic before calling the production classifier")
+proof_dispatch = (
+    'return match op: '
+    '"movb" | "xchgb": EasmAccessWidth::access_width(op) == 1 '
+    '"movw" | "xchgw": EasmAccessWidth::access_width(op) == 2 '
+    '"movl" | "xchgl": EasmAccessWidth::access_width(op) == 4 '
+    '"movq" | "xchgq": EasmAccessWidth::access_width(op) == 8 '
+    '_: EasmAccessWidth::access_width(op) == 0'
+)
+if compact(proof_dispatch) not in proof_text:
+    raise SystemExit("universal width proof no longer matches every production opcode partition case")
 
 environment = ENV.read_text()
 if 'include "easm_access_width.elisa"' not in environment:
@@ -110,6 +137,7 @@ inputs = [
     MEMORY,
     FUNCTIONS,
 ]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 

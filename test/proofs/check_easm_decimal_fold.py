@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,29 +31,32 @@ if parser_signature not in parser_text:
 parser_body = parser_text.split(parser_signature, 1)[1].split(
     "\n        def easm_parse_i64(text: sview) -> i64:", 1
 )[0]
+if "return EasmCheckedDecimal::parse_signed(text)" not in parser_body:
+    raise SystemExit("production checked decimal wrapper no longer delegates to the verified parser")
+parser_impl = helper_text.split("def parse_signed(text: sview)", 1)[1]
 if 'include "../../src/backend/easm_checked_decimal.elisa"' not in positive_text:
     raise SystemExit("sequence proof no longer includes the production checked-digit helper")
 for helper in ("append_positive_digit", "append_negative_digit"):
     if f"def {helper}(" not in helper_text or f"EasmCheckedDecimal::{helper}(value, digit)" not in positive_text:
         raise SystemExit(f"sequence fold no longer uses the production {helper} helper")
-loop_start = parser_body.find("while position < sview_len(text)")
-loop_end = parser_body.find("return (true, value)", loop_start)
+loop_start = parser_impl.find("while position < sview_len(text)")
+loop_end = parser_impl.find("return (true, value)", loop_start)
 if loop_start < 0 or loop_end < 0:
-    raise SystemExit("signed decimal parser no longer has a bounded digit loop")
-loop_body = parser_body[loop_start:loop_end]
-if "EasmCheckedDecimal::append_positive_digit(value, digit)" not in loop_body:
+    raise SystemExit("source-linked signed decimal parser no longer has a bounded digit loop")
+loop_body = parser_impl[loop_start:loop_end]
+if "append_positive_digit(value, digit)" not in loop_body:
     raise SystemExit("positive parser path no longer uses the proved checked-digit helper")
-if "EasmCheckedDecimal::append_negative_digit(value, digit)" not in loop_body:
+if "append_negative_digit(value, digit)" not in loop_body:
     raise SystemExit("negative parser path no longer uses the proved checked-digit helper")
 for fragment in (
     "byte: u8 = sview_at(text, position)",
-    "return (false, 0) if byte < EasmCheckedDecimal::ASCII_DIGIT_ZERO or byte > EasmCheckedDecimal::ASCII_DIGIT_NINE",
-    "digit: i64 = (byte - EasmCheckedDecimal::ASCII_DIGIT_ZERO).i64()",
+    "return (false, 0) if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE",
+    "digit: i64 = (byte - ASCII_DIGIT_ZERO).i64()",
 ):
     if fragment not in loop_body:
         raise SystemExit(f"parser digit loop no longer matches the checked-fold model: {fragment}")
 for helper in ("append_positive_digit", "append_negative_digit"):
-    call = f"EasmCheckedDecimal::{helper}(value, digit)"
+    call = f"{helper}(value, digit)"
     call_at = loop_body.index(call)
     reject_at = loop_body.index("return (false, 0) if not step.valid", call_at)
     update_at = loop_body.index("value <- step.value", reject_at)
@@ -128,6 +131,7 @@ inputs = [
     HELPER,
     PARSER,
 ]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 

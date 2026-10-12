@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,13 +28,24 @@ if environment.index('include "easm_memstate_domain.elisa"') > environment.index
     raise SystemExit("EASM memory-state domain is imported after its consumers")
 if 'include "../../src/backend/easm_memstate_domain.elisa"' not in POSITIVE.read_text():
     raise SystemExit("proof no longer imports the production memory-state domain")
-if "".join("ensure result == (need <= left and need <= right)".split()) not in "".join(HELPER.read_text().split()):
+helper = HELPER.read_text()
+if "".join("ensure result >= left".split()) not in "".join(helper.split()) or \
+        "".join("ensure result >= right".split()) not in "".join(helper.split()):
+    raise SystemExit("production maximum operation no longer exposes both lower-bound monotonicity guarantees")
+if "".join("ensure result == (need <= left and need <= right)".split()) not in "".join(helper.split()):
     raise SystemExit("production joined read guard no longer states the exact two-predecessor safety condition")
 
 memory = MEMORY.read_text()
 lower_bound_body = memory.split("def easm_size_guard_lower_bound(", 1)[1].split("\n\n        def ", 1)[0]
 if "".join("greatest <- EasmMemStateDomain::greatest_bound(greatest, value)".split()) not in "".join(lower_bound_body.split()):
     raise SystemExit("production size-fact lower-bound fold no longer uses the proved maximum operation")
+lower_bound_compact = "".join(lower_bound_body.split())
+if "ensureresult>=0" not in lower_bound_compact or \
+        "whileindex<facts.count|index,facts,greatest|:" not in lower_bound_compact or \
+        "decreasesfacts.count-index" not in lower_bound_compact or \
+        "invariantindex<=facts.count" not in lower_bound_compact or \
+        "invariantgreatest>=0" not in lower_bound_compact:
+    raise SystemExit("production size-fact fold no longer proves its accumulator stays a nonnegative lower bound")
 wrappers = {
     "easm_memstate_join_min": "EasmMemStateDomain::join_min(left, right)",
     "easm_memstate_read_well_typed": "EasmMemStateDomain::read_well_typed(need, known_min)",
@@ -71,6 +82,7 @@ inputs = [
     ENV,
     MEMORY,
 ]
+inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
@@ -142,7 +154,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "EASM path-minimum and same-path-maximum composition with the production overlay-read predicate",
+    "scope": "EASM path-minimum and same-path-maximum composition, nonnegative production size-fact fold, and production overlay-read predicate",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(false_claims),
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
