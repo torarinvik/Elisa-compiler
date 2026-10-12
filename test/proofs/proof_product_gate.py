@@ -9,13 +9,15 @@ from typing import Optional
 
 
 MANIFEST_SCHEMA = "elisa-proof-build-manifest-v1"
-STAGE1_SCHEMA = "elisa-stage1-provenance-v1"
+STAGE1_SCHEMA = "elisa-stage1-provenance-v5"
 STAGE1_SOURCE_DIRS = ("src", "elisacore_std")
 STAGE1_BUILD_RECIPES = (
+    "scripts/platform.sh",
     "scripts/elisac_stage1.sh",
     "scripts/stage1_object_cache.py",
     "scripts/elisac_stage1_seed.sh",
     "scripts/assert_stage0_fresh.sh",
+    "scripts/assert_stage1_fresh.sh",
     "scripts/process_rss.sh",
     "scripts/build_runtime_object.sh",
     "scripts/write_profiler_hook_fallbacks.sh",
