@@ -47,38 +47,133 @@ if 'include "easm_text_scan.elisa"' not in ENV.read_text():
     raise SystemExit("backend environment does not import the verified EASM text scanner")
 if "returnEasmTextScan::first_space(text).usize()" not in compact(function_section(PARSER.read_text(), "easm_first_space")):
     raise SystemExit("production EASM whitespace helper no longer delegates to the verified scanner")
-for caller in (PARSER.read_text(), PROVENANCE.read_text(), EASM_PARSE.read_text()):
+for caller in (PARSER.read_text(), EASM_PARSE.read_text()):
     if "easm_first_space(" not in caller:
         raise SystemExit("an EASM parser source lost its use of the verified whitespace helper")
+for caller in (PARSER.read_text(), PROVENANCE.read_text(), EASM_PARSE.read_text()):
+    if "easm_find(" not in caller:
+        raise SystemExit("an EASM parser source lost its use of the verified substring helper")
 required_source = (
+    "constASCII_SPACE:u8=32",
+    "constASCII_TAB:u8=9",
+    "constBYTE_INDEX_STEP:usize=1",
+    "constSIGNED_INDEX_STEP:i64=1",
     "ensureresult>=0",
-    "ensuretext.length<0impliesresult==0",
-    "ensuretext.length>=0impliesresult<=text.length",
-    "text.length<0orresult==text.lengthor(result<text.lengthand(text[result]==32ortext[result]==9))",
-    "ensure(forallprefix_indexin0..<result:text.length<0orprefix_index>=text.lengthor(text[prefix_index]!=32andtext[prefix_index]!=9))",
-    "whileindex<text.length|index,text|",
-    "decreasestext.length-index",
+    "ensuretext.len<0impliesresult==0",
+    "ensuretext.len>=0impliesresult<=text.len",
+    "text.len<0orresult==text.lenor(result<text.lenand(text[result]==ASCII_SPACEortext[result]==ASCII_TAB))",
+    "ensure(forallprefix_indexin0..<result:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=ASCII_SPACEandtext[prefix_index]!=ASCII_TAB))",
+    "whileindex<text.len|index,text|",
+    "decreasestext.len-index",
     "invariantindex>=0",
-    "invarianttext.length<0impliesindex==0",
-    "invarianttext.length>=0impliesindex<=text.length",
-    "invariantforallprefix_indexin0..<index:text.length<0orprefix_index>=text.lengthor(text[prefix_index]!=32andtext[prefix_index]!=9)",
-    "returnindexiftext[index]==32ortext[index]==9",
-    "index<-index+1",
+    "invarianttext.len<0impliesindex==0",
+    "invarianttext.len>=0impliesindex<=text.len",
+    "invariantforallprefix_indexin0..<index:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=ASCII_SPACEandtext[prefix_index]!=ASCII_TAB)",
+    "returnindexiftext[index]==ASCII_SPACEortext[index]==ASCII_TAB",
+    "index<-index+SIGNED_INDEX_STEP",
 )
 if not all(fragment in source_compact for fragment in required_source):
     raise SystemExit("production EASM scanner lost its first-match contract or loop invariant")
+expected_find = """
+def find(text: sview, needle: sview) -> usize:
+    ensure result <= sview_len(text)
+    ensure (sview_len(needle) == 0 or sview_len(text) < sview_len(needle)) implies result == sview_len(text)
+    ensure result < sview_len(text) implies (
+        sview_len(needle) > 0 and
+        sview_len(needle) <= sview_len(text) and
+        result <= sview_len(text) - sview_len(needle) and
+        text[result:result + sview_len(needle)] == needle
+    )
+    ensure (forall candidate in 0..<result:
+        sview_len(needle) == 0 or
+        sview_len(needle) > sview_len(text) - candidate or
+        text[candidate:candidate + sview_len(needle)] != needle
+    )
+    text_length: usize = sview_len(text)
+    needle_length: usize = sview_len(needle)
+    assert text_length == sview_len(text)
+    assert needle_length == sview_len(needle)
+    if needle_length == 0 or text_length < needle_length:
+        return text_length
+    search_limit: usize = text_length - needle_length + BYTE_INDEX_STEP
+    index: mutable usize = 0
+    while index < search_limit |index, search_limit, text, needle, needle_length, text_length|:
+        decreases search_limit - index
+        invariant index <= search_limit
+        invariant (forall candidate in 0..<index:
+            needle_length <= text_length - candidate and
+            text[candidate:candidate + needle_length] != needle
+        )
+        if text[index:index + needle_length] == needle:
+            return index
+        index <- index + BYTE_INDEX_STEP
+    return text_length
+"""
+if compact(function_section(source_text, "find")) != compact(expected_find):
+    raise SystemExit("production EASM substring search no longer implements the verified first-match scan")
+expected_memory_delimiter = """
+def contains_memory_address_delimiter(has_parenthesis: bool, has_square_bracket: bool) -> bool:
+    ensure result == (has_parenthesis or has_square_bracket)
+    return has_parenthesis or has_square_bracket
+"""
+if compact(function_section(source_text, "contains_memory_address_delimiter")) != compact(expected_memory_delimiter):
+    raise SystemExit("production EASM memory-delimiter classifier no longer matches its proved boolean policy")
 if 'include "../../src/backend/easm_text_scan.elisa"' not in POSITIVE.read_text():
     raise SystemExit("positive proof no longer includes the production EASM scanner")
+if "returnEasmTextScan::find(text,needle)" not in compact(function_section(PARSER.read_text(), "easm_find")):
+    raise SystemExit("production EASM substring search wrapper no longer uses the verified scanner")
+expected_memory_operand = """
+def easm_memory_operand(operand: sview) -> bool:
+    return EasmTextScan::contains_memory_address_delimiter(
+        easm_find(operand, "(") < sview_len(operand),
+        easm_find(operand, "[") < sview_len(operand)
+    )
+"""
+if compact(function_section(PROVENANCE.read_text(), "easm_memory_operand")) != compact(expected_memory_operand):
+    raise SystemExit("production memory-operand classifier no longer delegates delimiter presence to the proved scan policy")
 positive_compact = compact(POSITIVE.read_text())
+positive_names = {
+    "memory_operand_classification_matches_delimiter_presence",
+    "parenthesized_memory_operand_delimiter_is_found",
+    "bracketed_memory_operand_delimiter_is_found",
+    "find_contract_holds",
+    "find_returns_the_first_duplicate_match",
+    "find_returns_text_length_when_absent",
+    "find_returns_text_length_for_an_empty_needle",
+    "find_accepts_a_match_at_the_last_legal_start",
+    "first_space_contract_holds",
+}
+negative_names = {
+    "false_claim_scanner_skips_the_first_separator",
+    "false_claim_find_returns_a_later_duplicate_match",
+    "false_claim_missing_needle_returns_zero",
+    "false_claim_empty_needle_returns_zero",
+    "false_claim_delimiter_free_operand_is_memory",
+}
+if set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", POSITIVE.read_text())) != positive_names:
+    raise SystemExit("positive EASM scanner proof inventory changed")
+if set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", NEGATIVE.read_text())) != negative_names:
+    raise SystemExit("negative EASM scanner proof inventory changed")
 required_positive_claims = (
+    "defmemory_operand_classification_matches_delimiter_presence(has_parenthesis:bool,has_square_bracket:bool)->bool:",
+    "returnEasmTextScan::contains_memory_address_delimiter(has_parenthesis,has_square_bracket)==(has_parenthesisorhas_square_bracket)",
+    'returnEasmTextScan::find("8(%rax)","(")==1',
+    'returnEasmTextScan::find("[rax+8]","[")==0',
+    "deffind_contract_holds(text:sview,needle:sview)->bool:",
+    "position:usize=EasmTextScan::find(text,needle)",
+    "needle_length==0orneedle_length>text_length-candidateortext[candidate:candidate+needle_length]!=needle",
+    'returnEasmTextScan::find("ababa","ba")==1',
+    'returnEasmTextScan::find("abc","z")==3',
+    'returnEasmTextScan::find("abc","")==3',
+    'returnEasmTextScan::find("ab","b")==1',
     "deffirst_space_contract_holds(text:sview)->bool:",
     "ensureresult==true",
     "position:i64=EasmTextScan::first_space(text)",
     "position>=0",
-    "text.length<0orposition==0",
-    "text.length<0orposition<=text.length",
-    "text.length<0orposition==text.lengthor(",
-    "forallprefix_indexin0..<position:text.length<0orprefix_index>=text.lengthor(text[prefix_index]!=32andtext[prefix_index]!=9)",
+    "text.len<0orposition==0",
+    "text.len<0orposition<=text.len",
+    "text.len<0orposition==text.lenor(",
+    "forallprefix_indexin0..<position:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=EasmTextScan::ASCII_SPACEandtext[prefix_index]!=EasmTextScan::ASCII_TAB)",
 )
 if not all(fragment in positive_compact for fragment in required_positive_claims):
     raise SystemExit("positive proof no longer states the production scanner's complete postcondition")
@@ -86,6 +181,15 @@ if 'include "./easm_text_scan.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative control no longer includes the positive EASM scanner proof")
 if "EasmTextScan::first_space(\"a b\")" not in NEGATIVE.read_text():
     raise SystemExit("negative control no longer challenges first-separator behavior")
+negative_compact = compact(NEGATIVE.read_text())
+required_negative_claims = (
+    'returnEasmTextScan::find("ababa","ba")==3',
+    'returnEasmTextScan::find("abc","z")==0',
+    'returnEasmTextScan::find("abc","")==0',
+    "returnEasmTextScan::contains_memory_address_delimiter(false,false)",
+)
+if not all(fragment in negative_compact for fragment in required_negative_claims):
+    raise SystemExit("negative controls no longer challenge first-match, absent, and empty-needle behavior")
 
 try:
     product = require_current_product(BIN, PROVER)
@@ -135,19 +239,20 @@ assert positive == run(POSITIVE)[1], "EASM scanner proof report changed across r
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
 assert negative["summary"]["semantic_errors"] == 0
-assert negative["summary"]["proven"] + 1 == negative["summary"]["obligations"]
-assert [finding["name"] for finding in negative["findings"]] == ["false_claim_scanner_skips_the_first_separator"]
+assert negative["summary"]["proven"] + len(negative_names) == negative["summary"]["obligations"]
+assert {finding["name"] for finding in negative["findings"]} == negative_names
 assert all(finding["kind"] == "ensure-unproven" for finding in negative["findings"])
-assert not any(row.get("verified") and row.get("name") == "false_claim_scanner_skips_the_first_separator"
-               for row in negative["declaration_details"])
+assert not negative_names & {
+    row["name"] for row in negative["declaration_details"] if row.get("verified")
+}
 
 assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 assert require_current_product(BIN, PROVER) == product, "proof-product provenance changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "production EASM scanner returns the first ASCII space or tab and proves all prior bytes are not separators",
+    "scope": "production EASM first-match substring search and first ASCII space/tab scanning",
     "positive_obligations": positive["summary"]["proven"],
-    "false_claim_rejected": negative["findings"][0]["name"],
+    "false_claims_rejected": sorted(negative_names),
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
     "proof_revision": product["proof"].get("head"),
     "compiler_revision": product["compiler"].get("source_revision"),
