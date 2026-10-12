@@ -47,6 +47,7 @@ from scripts.wasm_export_scan_client import (
     run_export_scan,
     run_flatten_source,
 )
+from scripts import elisa_platform
 from scripts.wasm_facade import js_bindings, type_declaration
 
 # Re-exported so `from scripts.wasm_build import ...` keeps working for the unit test and
@@ -124,7 +125,7 @@ def write_text_if_changed(path: Path, contents: str) -> bool:
 
 def find_wasm_ld(explicit: str | None) -> str:
     candidates = [explicit, os.environ.get("WASM_LD")]
-    llvm_config = os.environ.get("LLVM_CONFIG") or shutil.which("llvm-config") or "/opt/homebrew/opt/llvm/bin/llvm-config"
+    llvm_config = os.environ.get("LLVM_CONFIG") or elisa_platform.LLVM_CONFIG
     if Path(llvm_config).is_file():
         try:
             bindir = subprocess.check_output([llvm_config, "--bindir"], text=True).strip()

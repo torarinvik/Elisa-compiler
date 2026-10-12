@@ -56,7 +56,7 @@ if [[ -z "${LLVM_CONFIG:-}" ]]; then
         LLVM_CONFIG="$_ep_llvm_prefix/bin/llvm-config"
     else
         LLVM_CONFIG="$(command -v llvm-config 2>/dev/null || true)"
-        [[ -n "$LLVM_CONFIG" ]] || LLVM_CONFIG="$(command -v llvm-config-21 2>/dev/null || echo llvm-config)"
+        [[ -n "$LLVM_CONFIG" ]] || LLVM_CONFIG="llvm-config"
     fi
     unset _ep_brew _ep_llvm_prefix
 fi
@@ -66,10 +66,32 @@ export LLVM_CONFIG
 if [[ -z "${ELISA_LLVM_BIN_DIR:-}" && "$LLVM_CONFIG" == */* && -x "${LLVM_CONFIG%/*}/clang" && -x "${LLVM_CONFIG%/*}/opt" ]]; then
     ELISA_LLVM_BIN_DIR="${LLVM_CONFIG%/*}"
 fi
-export ELISA_LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$("$LLVM_CONFIG" --bindir 2>/dev/null || echo /opt/homebrew/opt/llvm/bin)}"
-export ELISA_LLVM_LIBDIR="${ELISA_LLVM_LIBDIR:-$("$LLVM_CONFIG" --libdir 2>/dev/null || echo /opt/homebrew/opt/llvm/lib)}"
-# Bare `clang` in the scripts: make the LLVM toolchain reachable when PATH lacks one.
-command -v clang >/dev/null 2>&1 || export PATH="$PATH:$ELISA_LLVM_BIN_DIR"
+_ep_llvm_bindir="$("$LLVM_CONFIG" --bindir 2>/dev/null || true)"
+_ep_llvm_libdir="$("$LLVM_CONFIG" --libdir 2>/dev/null || true)"
+if [[ -z "${ELISA_LLVM_BIN_DIR:-}" && -z "$_ep_llvm_bindir" ]]; then
+    echo "Unable to query LLVM bindir from $LLVM_CONFIG; set ELISA_LLVM_BIN_DIR explicitly" >&2
+    return 2
+fi
+if [[ -z "${ELISA_LLVM_LIBDIR:-}" && -z "$_ep_llvm_libdir" ]]; then
+    echo "Unable to query LLVM libdir from $LLVM_CONFIG; set ELISA_LLVM_LIBDIR explicitly" >&2
+    return 2
+fi
+export ELISA_LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$_ep_llvm_bindir}"
+export ELISA_LLVM_LIBDIR="${ELISA_LLVM_LIBDIR:-$_ep_llvm_libdir}"
+# Keep bare host builds on the selected LLVM toolchain. Preserve a configured Linux shim
+# first so it can translate the suite's Darwin-style linker flags before invoking that clang.
+if [[ -n "${ELISA_TOOL_SHIM_DIR:-}" ]]; then
+    case "$PATH" in
+        "$ELISA_TOOL_SHIM_DIR:$ELISA_LLVM_BIN_DIR:"*) ;;
+        *) PATH="$ELISA_TOOL_SHIM_DIR:$ELISA_LLVM_BIN_DIR:$PATH" ;;
+    esac
+else
+    case "$PATH" in
+        "$ELISA_LLVM_BIN_DIR:"*) ;;
+        *) PATH="$ELISA_LLVM_BIN_DIR:$PATH" ;;
+    esac
+fi
+export PATH
 
 if [[ -z "${ELISA_LLVM_LIBS:-}" ]]; then
     _ep_major="$("$LLVM_CONFIG" --version 2>/dev/null | cut -d. -f1)"
@@ -86,6 +108,7 @@ if [[ -z "${ELISA_LLVM_LIBS:-}" ]]; then
     unset _ep_major
 fi
 export ELISA_LLVM_LIBS
+unset _ep_llvm_bindir _ep_llvm_libdir
 
 if [[ "$ELISA_HOST_OS" == Darwin ]]; then
     export ELISA_LD_DEAD_STRIP="-Wl,-dead_strip"

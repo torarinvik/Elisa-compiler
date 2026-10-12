@@ -42,7 +42,7 @@ def _llvm_config() -> str:
                 "Homebrew LLVM is missing llvm-config; set LLVM_CONFIG to override"
             )
         return candidate
-    return shutil.which("llvm-config") or shutil.which("llvm-config-21") or "llvm-config"
+    return shutil.which("llvm-config") or "llvm-config"
 
 
 LLVM_CONFIG = _llvm_config()
@@ -62,8 +62,11 @@ def _env(name: str, default) -> str:
 
 LD_DEAD_STRIP = _env("ELISA_LD_DEAD_STRIP", "-Wl,-dead_strip" if DARWIN else "-Wl,--gc-sections").split()
 LINK_EXE_FLAGS = _env("ELISA_LINK_EXE_FLAGS", "" if DARWIN else "-no-pie -Wl,--unresolved-symbols=ignore-all").split()
-LLVM_LIBDIR = _env("ELISA_LLVM_LIBDIR", lambda: _query("--libdir", "/opt/homebrew/opt/llvm/lib"))
-LLVM_BIN_DIR = _env("ELISA_LLVM_BIN_DIR", lambda: _query("--bindir", "/opt/homebrew/opt/llvm/bin"))
+LLVM_LIBDIR = _env("ELISA_LLVM_LIBDIR", lambda: _query("--libdir", ""))
+LLVM_BIN_DIR = _env("ELISA_LLVM_BIN_DIR", lambda: _query("--bindir", ""))
+if not LLVM_LIBDIR or not LLVM_BIN_DIR:
+    raise RuntimeError(f"could not read LLVM bin/lib directories from {LLVM_CONFIG}; set ELISA_LLVM_BIN_DIR and ELISA_LLVM_LIBDIR to override")
+LLVM_CLANG = os.environ.get("ELISA_CLANG") or os.path.join(LLVM_BIN_DIR, "clang")
 # platform.sh's static-archive fallback is not repeated here: a harness that needs it runs
 # under a shell driver, which exports ELISA_LLVM_LIBS.
 LLVM_LIBS = _env("ELISA_LLVM_LIBS", "-lLLVM").split()
