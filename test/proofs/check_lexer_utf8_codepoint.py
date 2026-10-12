@@ -166,8 +166,8 @@ if 'def is_latin1_letter_codepoint(value: int) -> bool:' not in core_text:
 
 identifier_start = function_body(core_text, "unicode_identifier_start_width", "unicode_identifier_char_width")
 identifier_char = function_body(core_text, "unicode_identifier_char_width", "starts_unicode_identifier")
-two_byte_latin1 = "lexer_decode_utf8_two(first.i64(), second.i64()).int().is_latin1_letter_codepoint()"
-two_byte_letter = "lexer_decode_utf8_two(first.i64(), second.i64()).int().is_unicode2_letter_codepoint()"
+two_byte_latin1 = "two_byte_codepoint.is_latin1_letter_codepoint()"
+two_byte_letter = "two_byte_codepoint.is_unicode2_letter_codepoint()"
 if two_byte_latin1 not in identifier_start or two_byte_letter not in identifier_start:
     raise SystemExit("two-byte identifier paths no longer use the proved scalar decoder")
 two_byte_guard = (
@@ -175,17 +175,28 @@ two_byte_guard = (
     "first.i64() <= UTF8_TWO_BYTE_LEAD_MAX and second.is_utf8_continuation():"
 )
 two_byte_decode = "two_byte_codepoint: int = lexer_decode_utf8_two(first.i64(), second.i64()).int()"
+if (two_byte_guard not in identifier_start or identifier_start.count(two_byte_decode) != 1 or
+        identifier_start.index(two_byte_guard) > identifier_start.index(two_byte_decode)):
+    raise SystemExit("two-byte identifier-start path no longer uses one guarded scalar decode")
 if (two_byte_guard not in identifier_char or identifier_char.count(two_byte_decode) != 1 or
         "two_byte_codepoint.is_unicode2_digit_codepoint()" not in identifier_char):
     raise SystemExit("two-byte digit path no longer uses the proved scalar decoder")
 if not all(fragment in identifier_start for fragment in (
     "first.i64() >= UTF8_TWO_BYTE_LEAD_MIN",
+    "first.i64() <= UTF8_TWO_BYTE_LEAD_MAX",
     "first.i64() <= UTF8_TWO_BYTE_LATIN1_LEAD_MAX",
     "second.is_utf8_continuation()",
-    "first.i64() >= UTF8_TWO_BYTE_UNICODE2_LEAD_MIN",
-    "first.i64() <= UTF8_TWO_BYTE_LEAD_MAX",
 )):
     raise SystemExit("two-byte identifier paths no longer enforce lead and continuation bounds")
+if int(helper_constants["UTF8_TWO_BYTE_LATIN1_LEAD_MAX"], 16) + 1 != int(
+        helper_constants["UTF8_TWO_BYTE_UNICODE2_LEAD_MIN"], 16):
+    raise SystemExit("two-byte identifier branch boundary no longer partitions Latin-1 and Unicode-2 leads")
+if not (identifier_start.index(two_byte_guard) < identifier_start.index(two_byte_decode) <
+        identifier_start.index("if first.i64() <= UTF8_TWO_BYTE_LATIN1_LEAD_MAX:") <
+        identifier_start.index(two_byte_latin1) <
+        identifier_start.index("else:", identifier_start.index("if first.i64() <= UTF8_TWO_BYTE_LATIN1_LEAD_MAX:")) <
+        identifier_start.index(two_byte_letter)):
+    raise SystemExit("two-byte identifier-start classification no longer follows its guarded scalar decode")
 if not all(fragment in identifier_char for fragment in (
     "first.i64() >= UTF8_TWO_BYTE_ARABIC_DIGIT_LEAD_MIN",
     "first.i64() <= UTF8_TWO_BYTE_LEAD_MAX",
@@ -206,8 +217,8 @@ identifier_start_returns = tuple(
 )
 expected_identifier_start_returns = (
     "0 return if lexer.position >= lexer.source_length",
-    "2 return if has_second and first.i64() >= UTF8_TWO_BYTE_LEAD_MIN and first.i64() <= UTF8_TWO_BYTE_LATIN1_LEAD_MAX and second.is_utf8_continuation() and lexer_decode_utf8_two(first.i64(), second.i64()).int().is_latin1_letter_codepoint()",
-    "2 return if has_second and first.i64() >= UTF8_TWO_BYTE_UNICODE2_LEAD_MIN and first.i64() <= UTF8_TWO_BYTE_LEAD_MAX and second.is_utf8_continuation() and lexer_decode_utf8_two(first.i64(), second.i64()).int().is_unicode2_letter_codepoint()",
+    "2 return if two_byte_codepoint.is_latin1_letter_codepoint()",
+    "2 return if two_byte_codepoint.is_unicode2_letter_codepoint()",
     "3 return if first.i64() >= UTF8_THREE_BYTE_LEAD_MIN and first.i64() <= UTF8_THREE_BYTE_LEAD_MAX and lexer.three_byte_codepoint_at_cursor().is_unicode_letter_codepoint()",
     "4 return if first.i64() >= UTF8_FOUR_BYTE_LEAD_MIN and first.i64() <= UTF8_FOUR_BYTE_LEAD_MAX and lexer.four_byte_codepoint_at_cursor().is_unicode_letter_codepoint()",
     "1 return if first.int().is_latin1_letter_codepoint() and not lexer.starts_valid_utf8_sequence()",
@@ -248,6 +259,23 @@ if not (identifier_char.index("0 return if lexer.position >= lexer.source_length
         identifier_char.index("has_second: bool = remaining > 1") <
         identifier_char.index("second: u8 = lexer.source[lexer.position + 1] if has_second else 0")):
     raise SystemExit("Unicode identifier-character width must guard its cursor before byte loads")
+
+advance_identifier = function_body(core_text, "advance_latin1_identifier_char", "valid_suffix")
+advance_identifier_compact = "".join(advance_identifier.split())
+expected_advance_identifier = "".join("".join((
+    "lexer: lmut Lexer):",
+    "width: u8 = lexer.unicode_identifier_char_width()",
+    "match width:",
+    "0:",
+    "pass",
+    "1:",
+    "lexer <- lexer.advance_char()",
+    "_:",
+    "lexer <- lexer.advance_chars(width)",
+)).split())
+if not advance_identifier_compact.endswith("@inline(always)") or \
+        advance_identifier_compact[:-len("@inline(always)")] != expected_advance_identifier:
+    raise SystemExit("Unicode identifier advancement no longer consumes exactly the classified byte width")
 
 three = function_body(core_text, "three_byte_codepoint_at_cursor", "four_byte_codepoint_at_cursor")
 four = function_body(core_text, "four_byte_codepoint_at_cursor", "is_utf8_continuation")

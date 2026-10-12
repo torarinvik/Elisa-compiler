@@ -153,6 +153,16 @@ if newline_branch not in advance_body:
 if "lexer.line <- lexer.line + 1 if is_newline" in advance_body or "lexer.column <- 1 if is_newline" in advance_body:
     raise SystemExit("Lexer.advance_char has bypassed the verified transition")
 
+advance_many = compact(function_section(facade, "advance_chars"))
+expected_advance_many = compact(
+    "def advance_chars(lexer: lmut Lexer, count: u8): "
+    "machine over lexer for _ in count..>0 -> lexer: "
+    "state Advance start Advance Advance, _: "
+    "lexer <- lexer.advance_char() -> Advance"
+)
+if advance_many != expected_advance_many:
+    raise SystemExit("Lexer.advance_chars no longer repeats only the proved one-character transition")
+
 try:
     manifest = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

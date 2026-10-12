@@ -17,6 +17,7 @@ POSITIVE = HERE / "lexer_token.elisa"
 NEGATIVE = HERE / "lexer_token_rejected.elisa"
 MODEL = HERE / "lexer_token_proof_model.elisa"
 FACADE = ROOT / "src/lexer/lexer.elisa"
+CORE = ROOT / "src/lexer/lexer_core.elisa"
 TOKEN_SOURCE = ROOT / "src/lexer/tokens.elisa"
 POSITION_SOURCE = ROOT / "src/lexer/lexer_position.elisa"
 IMPLEMENTATION = ROOT / "src/lexer/lexer_token.elisa"
@@ -138,6 +139,8 @@ for required in (
         raise AssertionError(f"production or proof no longer includes the source contract: {required}")
 if facade.index('include "./lexer_token_span.elisa"') > facade.index('include "./lexer_token.elisa"'):
     raise AssertionError("TokenSpan contract must be included before Token construction")
+if 'include "./lexer_core.elisa"' not in facade:
+    raise AssertionError("production lexer no longer imports its identifier scanner")
 span_implementation_text = SPAN_IMPLEMENTATION.read_text()
 required_contracts = (
     "ensure result.line == line",
@@ -167,6 +170,29 @@ if function_body_statements(IMPLEMENTATION, "def Token(kind: TokenKind, position
     "return Token(kind, position, start, text_end, text_end)",
 ]:
     raise AssertionError("default Token constructor no longer delegates with an empty suffix span")
+identifier_scan_body = function_body_statements(CORE, "def read_identifier(lexer: lmut Lexer) -> Token:")
+expected_identifier_scan_body = [
+    "position: LexerPosition = lexer.cursor_position()",
+    "start: usize = lexer.position",
+    "machine over lexer.current_char() while not lexer.is_end_of_source():",
+    "state ScanIdentifier",
+    "start ScanIdentifier",
+    "ScanIdentifier, character if is_identifier_char(character):",
+    "lexer <- lexer.advance_char()",
+    "-> ScanIdentifier",
+    "ScanIdentifier, _ if lexer.continues_unicode_identifier():",
+    "lexer <- lexer.advance_latin1_identifier_char()",
+    "-> ScanIdentifier",
+    "ScanIdentifier, _:",
+    "break",
+    "text: sview = source_view_or_empty(lexer.source, lexer.source_length, start, lexer.position)",
+    "kind: TokenKind = frontend_lookup_keyword(text)",
+    "lexer.pending_grouped_block <- false",
+    "lexer.pending_grouped_block <- true if kind == TokenKind.Ident and is_immediate_grouped_block_introducer(text)",
+    "return Token(kind, position, start, lexer.position)",
+]
+if identifier_scan_body != expected_identifier_scan_body:
+    raise AssertionError("identifier scanner no longer preserves its proved cursor-to-token-span path")
 for declaration in (
     "token_span_preserves_line", "token_span_preserves_column",
     "token_span_preserves_start", "token_span_preserves_text_length",
@@ -183,7 +209,7 @@ except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError
 stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, MODEL,
-           FACADE, TOKEN_SOURCE, POSITION_SOURCE, IMPLEMENTATION, SPAN_IMPLEMENTATION]
+           FACADE, CORE, TOKEN_SOURCE, POSITION_SOURCE, IMPLEMENTATION, SPAN_IMPLEMENTATION]
 INPUTS = [*source_include_closure([POSITIVE, NEGATIVE]), BIN, MANIFEST, MANIFEST_CHECKSUM, COMPILER_PIN, stage1_product,
           stage1_provenance, *SOURCES]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in INPUTS}
@@ -229,7 +255,7 @@ assert require_current_product(BIN, PROVER) == manifest, "proof-product provenan
 hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in INPUTS}
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({"admitted": True,
-                  "scope": "pure lexer TokenSpan arithmetic, source-constructor linkage, and false-claim rejection",
+                  "scope": "pure lexer TokenSpan arithmetic, identifier scan-to-token-span linkage, source-constructor linkage, and false-claim rejection",
                   "positive_obligations": positive["summary"]["proven"],
                   "independently_replayed": positive["replay"]["replayed"],
                   "false_claims_rejected": ["token_line_is_column"],
