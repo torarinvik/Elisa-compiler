@@ -70,8 +70,8 @@ wrapper = compact(function_body(RUNTIME_WRAPPER.read_text(), "ctx_string_view_in
 required_inline = (
     'i64_type:LLVMTypeRef=LLVMInt64TypeInContext(ctx)',
     'length:LLVMValueRef=LLVMBuildExtractValue(builder,view,1,"sview.idx.len")',
-    'length_ok:LLVMValueRef=LLVMBuildICmp(builder,39,length,zero,"sview.idx.len.ok")',
-    'index_ok:LLVMValueRef=LLVMBuildICmp(builder,36,index,length,"sview.idx.in")',
+    'length_ok:LLVMValueRef=LLVMBuildICmp(builder,LLVM_INT_PREDICATE_SGE,length,zero,"sview.idx.len.ok")',
+    'index_ok:LLVMValueRef=LLVMBuildICmp(builder,LLVM_INT_PREDICATE_ULT,index,length,"sview.idx.in")',
     'in_range:LLVMValueRef=LLVMBuildAnd(builder,length_ok,index_ok,"sview.idx.ok")',
     '_=LLVMBuildStore(builder,zero,slot)',
     '_=LLVMBuildCondBr(builder,in_range,read_block,join_block)',
@@ -82,9 +82,22 @@ required_inline = (
 if not all(fragment in inline for fragment in required_inline):
     raise SystemExit("inline StringView indexing no longer guards and zero-extends the byte load")
 llvm_predicates = compact(LLVM_BINDINGS.read_text())
-if "LLVMIntPredicate:EQ=32,NE=33,UGT=34,UGE=35,ULT=36,ULE=37" not in llvm_predicates or \
-        "SGT=38,SGE=39,SLT=40,SLE=41" not in llvm_predicates:
+predicate_values = {
+    "LLVM_INT_PREDICATE_EQ": 32,
+    "LLVM_INT_PREDICATE_NE": 33,
+    "LLVM_INT_PREDICATE_UGT": 34,
+    "LLVM_INT_PREDICATE_UGE": 35,
+    "LLVM_INT_PREDICATE_ULT": 36,
+    "LLVM_INT_PREDICATE_ULE": 37,
+    "LLVM_INT_PREDICATE_SGT": 38,
+    "LLVM_INT_PREDICATE_SGE": 39,
+    "LLVM_INT_PREDICATE_SLT": 40,
+    "LLVM_INT_PREDICATE_SLE": 41,
+}
+if any(f"const{name}:i32={value}" not in llvm_predicates for name, value in predicate_values.items()):
     raise SystemExit("LLVM comparison predicate assignments changed without updating the proof binding")
+if 'LLVMBuildICmp(builder,LLVM_INT_PREDICATE_NE,flags_hit,LLVMConstInt(flags_llvm,0,0),"flags.has")' not in index_emitter:
+    raise SystemExit("flags.has lowering no longer uses the named NE predicate")
 read_block = inline.split('LLVMPositionBuilderAtEnd(builder,read_block)', 1)
 if len(read_block) != 2 or read_block[1].find('LLVMBuildGEP2(') < 0 or \
         read_block[1].find('LLVMBuildLoad2(') < read_block[1].find('LLVMBuildGEP2(') or \
@@ -162,6 +175,7 @@ positive_names = {
     "accepted_index_is_strictly_inside_the_view",
 }
 negative_names = {
+    "false_claim_accepts_a_negative_length",
     "false_claim_accepts_a_negative_index",
     "false_claim_accepts_the_one_past_end_index",
     "false_claim_accepts_an_unrepresentable_length",
@@ -180,24 +194,28 @@ if declaration_names(NEGATIVE) != negative_names or \
     raise SystemExit("StringView bounds negative controls changed")
 
 positive_text = compact(POSITIVE.read_text())
+if "defsview_index_guard(length:i64,index:i64,length_usize:usize,index_usize:usize)->bool:" not in positive_text or \
+        "length_fits_usize" in positive_text or "index_fits_usize" in positive_text:
+    raise SystemExit("StringView index model must use concrete usize conversion values")
 required_models = (
-    "ensure result == (length >= 0 and length_fits_usize and index >= 0 and index_fits_usize and index < length) return length >= 0 and length_fits_usize and index >= 0 and index_fits_usize and index < length",
-    "requires length > 0 and index == 0 and length_fits_usize and index_fits_usize ensure result == true return length >= 0 and length_fits_usize and index >= 0 and index_fits_usize and index < length",
+    "ensure result == (length >= 0 and length_usize.i64() == length and index >= 0 and index < length and index_usize.i64() == index) return length >= 0 and length_usize.i64() == length and index >= 0 and index < length and index_usize.i64() == index",
+    "requires length > 0 and index == 0 and length_usize.i64() == length and index_usize.i64() == index ensure result == true return sview_index_guard(length, index, length_usize, index_usize)",
     "requires length > 0 and index == 0 ensure result == true return index >= 0 and index < length",
-    "requires index < 0 ensure result == true return not sview_index_guard(length, index, length_fits_usize, index_fits_usize)",
-    "requires length >= 0 ensure result == true return not sview_index_guard(length, length, length_fits_usize, index_fits_usize)",
-    "requires not length_fits_usize ensure result == true return not sview_index_guard(length, index, length_fits_usize, index_fits_usize)",
-    "requires not index_fits_usize ensure result == true return not sview_index_guard(length, index, length_fits_usize, index_fits_usize)",
-    "requires sview_index_guard(length, index, length_fits_usize, index_fits_usize) ensure result == true return length >= 0 and length_fits_usize and index >= 0 and index_fits_usize and index < length",
+    "requires length >= 0 and length_usize.i64() == length and index < 0 ensure result == true return not sview_index_guard(length, index, length_usize, index_usize)",
+    "requires length >= 0 and length_usize.i64() == length ensure result == true return not sview_index_guard(length, length, length_usize, length_usize)",
+    "requires length >= 0 and length_usize.i64() != length requires index >= 0 and index < length and index_usize.i64() == index ensure result == true return not sview_index_guard(length, index, length_usize, index_usize)",
+    "requires length >= 0 and length_usize.i64() == length requires index >= 0 and index < length requires index_usize.i64() != index ensure result == true return not sview_index_guard(length, index, length_usize, index_usize)",
+    "requires sview_index_guard(length, index, length_usize, index_usize) ensure result == true return length >= 0 and length_usize.i64() == length and index >= 0 and index < length and index_usize.i64() == index",
 )
 if not all(compact(model) in positive_text for model in required_models):
     raise SystemExit("StringView bounds proofs no longer establish their stated arithmetic guards")
 negative_text = compact(NEGATIVE.read_text())
 required_false_claims = (
-    "requires index < 0 ensure result == true return sview_index_guard(length, index, length_fits_usize, index_fits_usize)",
-    "requires length >= 0 ensure result == true return sview_index_guard(length, length, length_fits_usize, index_fits_usize)",
-    "requires not length_fits_usize ensure result == true return sview_index_guard(length, index, length_fits_usize, index_fits_usize)",
-    "requires not index_fits_usize ensure result == true return sview_index_guard(length, index, length_fits_usize, index_fits_usize)",
+    "requires length < 0 ensure result == true return sview_index_guard(length, index, length_usize, index_usize)",
+    "requires length >= 0 and length_usize.i64() == length and index < 0 ensure result == true return sview_index_guard(length, index, length_usize, index_usize)",
+    "requires length >= 0 and length_usize.i64() == length ensure result == true return sview_index_guard(length, length, length_usize, length_usize)",
+    "requires length >= 0 and length_usize.i64() != length requires index >= 0 and index < length and index_usize.i64() == index ensure result == true return sview_index_guard(length, index, length_usize, index_usize)",
+    "requires length >= 0 and length_usize.i64() == length requires index >= 0 and index < length and index_usize.i64() != index ensure result == true return sview_index_guard(length, index, length_usize, index_usize)",
 )
 if not all(compact(model) in negative_text for model in required_false_claims):
     raise SystemExit("StringView bounds negative controls no longer challenge the boundary laws")
@@ -262,8 +280,9 @@ assert {row["name"] for row in positive["declaration_details"] if row.get("verif
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
 assert negative["summary"]["declarations"] == len(positive_names) + len(negative_names)
-assert negative["summary"]["obligations"] == 24 and negative["summary"]["proven"] == 20
+assert negative["summary"]["obligations"] == 26 and negative["summary"]["proven"] == 21
 assert {(finding["kind"], finding["name"]) for finding in negative["findings"]} == {
+    ("ensure-unproven", "false_claim_accepts_a_negative_length"),
     ("ensure-unproven", "false_claim_accepts_a_negative_index"),
     ("ensure-unproven", "false_claim_accepts_the_one_past_end_index"),
     ("ensure-unproven", "false_claim_accepts_an_unrepresentable_length"),

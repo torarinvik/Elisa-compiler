@@ -28,7 +28,7 @@ def compact(text: str) -> str:
     return "".join(text.split())
 
 
-def function_body(source: str, name: str) -> str:
+def raw_function_body(source: str, name: str) -> str:
     matches = list(re.finditer(rf"(?m)^[ \t]*def {re.escape(name)}\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
@@ -37,7 +37,11 @@ def function_body(source: str, name: str) -> str:
     tail = source[match.end():]
     following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", tail)
     end = match.end() + following.start() if following else len(source)
-    section = source[match.start():end]
+    return source[match.start():end]
+
+
+def function_body(source: str, name: str) -> str:
+    section = raw_function_body(source, name)
     return "\n".join(line for line in section.splitlines()
                      if not line.lstrip().startswith("#"))
 
@@ -51,6 +55,9 @@ def declarations(path: Path) -> set[str]:
 
 
 constructor = function_body(SOURCE.read_text(), "make_source_view")
+backing_assumption = "The caller supplies the readable byte extent for this pointer."
+if backing_assumption not in SOURCE.read_text():
+    raise SystemExit("source-view proof scope must identify source_length as a caller-supplied readable extent")
 constructor_text = compact(constructor)
 guards = (
     "def make_source_view(source: u8&, source_length: usize, start: usize, end: usize) -> sview?:",
@@ -73,12 +80,38 @@ if not re.search(
 ):
     raise SystemExit("source-view fallback no longer routes through the bounded constructor")
 for path, function, expected in (
-    (TOKENS, "text", "return make_source_view(source, end, start, end)"),
-    (TOKENS, "suffix", "return make_source_view(source, end, start, end)"),
+    (TOKENS, "text", "return make_source_view(source, source_length, start, end)"),
+    (TOKENS, "suffix", "return make_source_view(source, source_length, start, end)"),
     (LEXER_TOKENS, "view", "return make_source_view(lexer.source, lexer.source_length, start, end)"),
 ):
     if compact(expected) not in compact(source_file_function(path, function)):
         raise SystemExit(f"Lexer.{function} no longer routes source slicing through make_source_view")
+
+# Both public Token accessors must receive the caller-supplied source extent and
+# validate their requested spans against it. Check their explanatory comments in
+# raw source; function_body intentionally strips comments for code-shape checks.
+token_raw_source = TOKENS.read_text()
+extent_comment = "The caller supplies the readable byte extent for this source."
+token_bound_comment = "A token's computed end is only a requested span; it is never used as the bound."
+identity_comments = (
+    "The source pointer and length must be the same ones used to tokenize",
+    "this stream. Extent validation alone cannot establish source/token identity.",
+)
+for name in ("text", "suffix"):
+    token_accessor = source_file_function(TOKENS, name)
+    if f"def {name}(token: Token&, source: u8&, source_length: usize)" not in token_accessor:
+        raise SystemExit(f"Token.{name} must accept the actual source length")
+    if compact("return make_source_view(source, source_length, start, end)") not in compact(token_accessor):
+        raise SystemExit(f"Token.{name} no longer validates against the caller-supplied source extent")
+    raw_accessor = raw_function_body(token_raw_source, name)
+    if extent_comment not in raw_accessor or token_bound_comment not in raw_accessor or \
+            any(comment not in raw_accessor for comment in identity_comments):
+        raise SystemExit(f"Token.{name} must document source extent and token-source identity in raw source")
+
+text_or_empty = source_file_function(TOKENS, "text_or_empty")
+if "def text_or_empty(token: Token&, source: u8&, source_length: usize)" not in text_or_empty or \
+        compact("token.text(source, source_length)") not in compact(text_or_empty):
+    raise SystemExit("Token.text_or_empty must pass the caller-supplied source extent to Token.text")
 
 raw_slices = []
 for path in (ROOT / "src/lexer").glob("*.elisa"):
@@ -93,17 +126,26 @@ if len(raw_slices) != 1 or raw_slices[0][0] != SOURCE.resolve() or \
 positive_names = {
     "source_view_guard_accepts",
     "valid_nonempty_source_span_is_admitted",
+    "accepted_source_span_extent_fits_remaining_bytes",
+    "token_self_bound_does_not_prove_backing_extent",
     "empty_source_span_is_rejected",
     "reversed_source_span_is_rejected",
     "source_span_past_end_is_rejected",
 }
 negative_names = {
+    "accepted_source_span_can_exceed_remaining_bytes",
+    "token_self_bound_guarantees_backing_extent",
     "empty_source_span_can_be_admitted",
     "reversed_source_span_can_be_admitted",
     "source_span_past_end_can_be_admitted",
 }
 if declarations(POSITIVE) != positive_names or declarations(NEGATIVE) != negative_names:
     raise SystemExit("source-view proof declaration inventory changed")
+proof_backing_assumption = "arithmetic model assumes source points to at least source_length readable bytes."
+if proof_backing_assumption not in POSITIVE.read_text():
+    raise SystemExit("source-view proof must state its backing-storage assumption")
+if "Token.text and Token.suffix do not establish that assumption" not in POSITIVE.read_text():
+    raise SystemExit("source-view proof must exclude the self-bounded public Token accessors")
 
 positive_claims = {
     "source_view_guard_accepts": (
@@ -117,6 +159,16 @@ positive_claims = {
         "def valid_nonempty_source_span_is_admitted(start: usize, end: usize, source_length: usize) -> bool: "
         "requires start < end and end <= source_length ensure result == true "
         "return not (start > end or end > source_length) and not (end <= start)"
+    ),
+    "accepted_source_span_extent_fits_remaining_bytes": (
+        "def accepted_source_span_extent_fits_remaining_bytes(start: usize, end: usize, source_length: usize) -> bool: "
+        "requires source_view_guard_accepts(start, end, source_length) ensure result == true "
+        "return start < source_length and end - start > 0 and end - start <= source_length - start"
+    ),
+    "token_self_bound_does_not_prove_backing_extent": (
+        "def token_self_bound_does_not_prove_backing_extent(requested_end: usize, token_end: usize, backing_length: usize) -> bool: "
+        "requires requested_end == token_end and token_end > backing_length ensure result == false "
+        "return requested_end <= backing_length"
     ),
     "empty_source_span_is_rejected": (
         "def empty_source_span_is_rejected(start: usize, source_length: usize) -> bool: "
@@ -141,6 +193,14 @@ for name, expected in positive_claims.items():
         raise SystemExit(f"{name} no longer proves its intended source-span condition")
 
 negative_claims = {
+    "accepted_source_span_can_exceed_remaining_bytes":
+        "def accepted_source_span_can_exceed_remaining_bytes(start: usize, end: usize, source_length: usize) -> bool: "
+        "requires source_view_guard_accepts(start, end, source_length) ensure result == true "
+        "return end - start > source_length - start",
+    "token_self_bound_guarantees_backing_extent":
+        "def token_self_bound_guarantees_backing_extent(requested_end: usize, token_end: usize, backing_length: usize) -> bool: "
+        "requires requested_end == token_end and token_end > backing_length ensure result == true "
+        "return requested_end <= backing_length",
     "empty_source_span_can_be_admitted":
         "def empty_source_span_can_be_admitted(start: usize, source_length: usize) -> bool: ensure result == true return not (start > start or start > source_length) and not (start <= start)",
     "reversed_source_span_can_be_admitted":
@@ -182,13 +242,13 @@ def run(path: Path) -> tuple[int, dict]:
 
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 11
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 15
 assert not positive["findings"]
 assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == positive_names
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-assert negative["summary"]["obligations"] == 6 and negative["summary"]["proven"] == 3
+assert negative["summary"]["obligations"] == 10 and negative["summary"]["proven"] == 5
 assert {(row["kind"], row["name"]) for row in negative["findings"]} == {
     ("ensure-unproven", name) for name in negative_names
 }
@@ -198,7 +258,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "lexer source-view guard equivalence, bounds, empty/reversed span rejection, and raw-slice ordering",
+    "scope": "source-view guard arithmetic relative to caller-supplied source_length, assuming that extent is readable; Token.text and Token.suffix self-bounds are explicitly not certified",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_revision": product["proof"].get("head"),
