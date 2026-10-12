@@ -16,6 +16,7 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 CORE = ROOT / "src/lexer/lexer_core.elisa"
+TYPE_SUFFIX = ROOT / "src/lexer/lexer_type_suffix.elisa"
 NUMBERS = ROOT / "src/lexer/lexer_numbers.elisa"
 TOKEN = ROOT / "src/lexer/lexer_token.elisa"
 POSITIVE = HERE / "lexer_suffix_probe_bound.elisa"
@@ -41,15 +42,20 @@ def function_section(source: str, name: str) -> str:
 
 
 core_text = CORE.read_text()
+type_suffix_text = TYPE_SUFFIX.read_text()
 numbers_text = NUMBERS.read_text()
 token_text = TOKEN.read_text()
 
 valid_suffix = function_section(core_text, "valid_suffix")
+if 'include "./lexer_type_suffix.elisa"' not in core_text or \
+        compact("return LexerTypeSuffix::is_valid_type_suffix(view)") not in compact(valid_suffix):
+    raise SystemExit("lexer suffix wrapper no longer delegates to the shared exact grammar")
+suffix_grammar = function_section(type_suffix_text, "is_valid_type_suffix")
 expected_suffixes = (
     '"u" | "u8" | "u16" | "u32" | "u64" | "usize" | '
     '"i8" | "i16" | "i32" | "i64" | "isize" | "f32" | "f64" -> true'
 )
-if compact(expected_suffixes) not in compact(valid_suffix):
+if compact(expected_suffixes) not in compact(suffix_grammar):
     raise SystemExit("lexer suffix whitelist changed; revisit the suffix-width bound")
 
 suffix_wrapper = function_section(core_text, "read_type_suffix")
@@ -59,6 +65,8 @@ if compact(suffix_wrapper) != compact(
     raise SystemExit("numeric suffix wrapper no longer calls the bounded source scanner")
 
 reader = function_section(core_text, "read_type_suffix_at")
+if compact("valid: bool = Lexer::valid_suffix(suffix)") not in compact(reader):
+    raise SystemExit("bounded suffix reader no longer delegates validation to the shared grammar")
 initial_probe = list(re.finditer(r"probe\s*:\s*mutable\s+usize\s*=\s*start\s*\+\s*1", reader))
 if len(initial_probe) != 1:
     raise SystemExit("suffix reader no longer includes exactly one initial probe byte")
@@ -122,7 +130,7 @@ except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError
 if manifest.get("compile_mode") != "strict":
     raise SystemExit("lexer suffix bound requires a strict proof build")
 
-inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, Path(__file__), CORE, NUMBERS, TOKEN, POSITIVE, NEGATIVE]
+inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, Path(__file__), CORE, TYPE_SUFFIX, NUMBERS, TOKEN, POSITIVE, NEGATIVE]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
