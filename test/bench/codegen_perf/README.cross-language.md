@@ -319,16 +319,20 @@ they do not isolate helpers compiled at an identical optimization level.
 
 ## Paired compiler A/B runs
 
-Use `paired_cross_language.sh REFERENCE_STAGE1 CANDIDATE_STAGE1 [OUTPUT_DIR]` to compare two
-Stage1 compiler binaries against the same cross-language workloads. The runner first performs
-an untimed exact-correctness preflight with each compiler and requires identical canonical
-workload fingerprints before it starts any timed pair. It then runs full suites in A-B-B-A
-order for each block. Set `PAIRED_BLOCKS` to repeat that order; the ordinary `REPEAT` and
-`BUILD_REPEAT` settings control samples inside each suite.
+Use `paired_cross_language.sh REFERENCE_STAGE1 REFERENCE_SOURCE_ROOT CANDIDATE_STAGE1
+CANDIDATE_SOURCE_ROOT [OUTPUT_DIR]` to compare two Stage1 compiler binaries against the same
+cross-language workloads. Each binary is checked exactly against its own source root, while both
+arms use the same benchmark checkout, corpus, host, and comparator toolchains. The runner first
+performs an untimed exact-correctness preflight with each compiler and requires identical
+canonical workload fingerprints before it starts any timed pair. It then runs full suites in
+A-B-B-A order for each block while holding one host benchmark lock. Set `PAIRED_BLOCKS` to a
+value from 1 through 99 to repeat that order; the ordinary `REPEAT` and `BUILD_REPEAT` settings
+control samples inside each suite.
 
 `paired_ab_summary.csv` reports candidate/reference ratios for Elisa compile, executable-build,
 and (unless `COMPILE_ONLY=1`) runtime wall and child CPU samples. Values below 1.0 mean the
 candidate was faster. `paired_ab_pairs.csv` keeps each A/B block's per-workload medians, and
 `paired_ab_report.json` records the fingerprints and run order. The individual suite directories
-retain raw samples and their host, source, toolchain, and compiler manifests. An aborted or
-incomplete suite prevents a paired report from being written.
+retain raw samples and their host, shared-harness, toolchain, and compiler manifests. Paired
+metadata records each compiler source root and its source manifest. An aborted or incomplete
+suite prevents a paired report from being written.

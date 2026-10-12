@@ -42,7 +42,7 @@ unset ELISA_NPROC ELISA_BREW_BIN ELISA_PYTHON314_BIN ELISA_PYTHON314_CONFIG
 unset ELISA_PYTHON312_BIN ELISA_PYTHON312_CONFIG
 for env_name in "${!ELISA_STAGE1_@}"; do
   case "$env_name" in
-    ELISA_STAGE1_BIN|ELISA_STAGE1_TRIPLE|ELISA_STAGE1_CACHE|ELISA_STAGE1_JOBS) ;;
+    ELISA_STAGE1_BIN|ELISA_STAGE1_TRIPLE|ELISA_STAGE1_CACHE|ELISA_STAGE1_JOBS|ELISA_STAGE1_PROVENANCE_ROOT) ;;
     *) unset "$env_name" ;;
   esac
 done
@@ -110,6 +110,17 @@ except (OSError, ValueError) as error:
     raise SystemExit(f"invalid inherited benchmark lock: {error}")
 if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
     raise SystemExit("inherited benchmark lock does not refer to the configured host lock")
+probe_fd = os.open(sys.argv[2], os.O_RDWR)
+try:
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        raise SystemExit("the inherited benchmark lock has no active parent lease")
+finally:
+    os.close(probe_fd)
 try:
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except OSError as error:
@@ -349,6 +360,8 @@ case "$BENCH_PROFILE" in
 esac
 
 ELISA_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+ELISA_PROVENANCE_ROOT="${ELISA_STAGE1_PROVENANCE_ROOT:-$ROOT}"
+ELISA_PROVENANCE_ROOT="$(cd -- "$ELISA_PROVENANCE_ROOT" && pwd -P)"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 RUNTIME_BUILD_DESCRIPTION="selected runtime object (overflow mode not inferred)"
 RUNTIME_PROFILE_MODE="selected-runtime-object"
@@ -391,8 +404,8 @@ if [[ "$(uname -s)" == Darwin ]]; then
   export ELISA_BENCH_LD64_LLD="$LD64_LLD"
 fi
 export ELISA_CLANG="$CLANG"
-python3 "$ROOT/scripts/stage1_provenance.py" check-exact "$ROOT" "$ELISA_BIN" || {
-  echo "Stage1 product does not match the compiler sources or selected LLVM toolchain; reseed it from this checkout" >&2
+python3 "$ROOT/scripts/stage1_provenance.py" check-exact "$ELISA_PROVENANCE_ROOT" "$ELISA_BIN" || {
+  echo "Stage1 product does not match its declared compiler source root or the selected LLVM toolchain" >&2
   exit 2
 }
 if [[ "$BENCH_PROFILE" == safe ]]; then
@@ -725,7 +738,8 @@ elif [[ -r /proc/cpuinfo ]]; then
   CPU_MODEL="${CPU_MODEL:-unknown}"
 fi
 
-GIT_REV="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+BENCHMARK_GIT_REV="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+ELISA_SOURCE_GIT_REV="$(git -C "$ELISA_PROVENANCE_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 ELISA_SHA="$(shasum -a 256 "$ELISA_BIN" 2>/dev/null | awk '{print $1}' || sha256sum "$ELISA_BIN" | awk '{print $1}')"
 RUNTIME_SHA="$(shasum -a 256 "$RUNTIME" 2>/dev/null | awk '{print $1}' || sha256sum "$RUNTIME" | awk '{print $1}')"
 ELISA_PROVENANCE="$ELISA_BIN.provenance.json"
@@ -735,7 +749,7 @@ if [[ -f "$ELISA_LLVM_LIBRARY_REALPATH" ]]; then
   ELISA_LLVM_LIBRARY_SHA="$(tool_sha256 "$ELISA_LLVM_LIBRARY_REALPATH")"
 fi
 {
-  echo "repository_revision=$GIT_REV"
+  echo "benchmark_repository_revision=$BENCHMARK_GIT_REV"
   echo "host=$(uname -s) $HOST_ARCH"
   echo "host_qualification=$HOST_QUALIFICATION"
   echo "host_qualification_result=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["qualified"], d["reason"])' "$HOST_QUALIFICATION")"
@@ -746,9 +760,11 @@ fi
   echo "release_flags=Elisa -O3 $ELISA_OVERFLOW_FLAG (host CPU); C clang -O3 ${CLANG_CPU_FLAGS[*]}; Rust --edition=2021 -C opt-level=3 (default codegen units) -C target-cpu=native -C overflow-checks=$RUST_OVERFLOW_CHECKS; Zig -O $ZIG_OPTIMIZE -mcpu=native -lc"
   echo "elisa_link_dead_strip_flags=${ELISA_LD_DEAD_STRIP:-<unset>}"
   echo "elisa_link_executable_flags=${ELISA_LINK_EXE_FLAGS:-<none>}"
-  echo "elisa_version=stage1 product at repository revision $GIT_REV (identified by binary SHA-256 below)"
+  echo "elisa_source_repository_revision=$ELISA_SOURCE_GIT_REV"
+  echo "elisa_version=stage1 product built from compiler source root revision $ELISA_SOURCE_GIT_REV (identified by binary SHA-256 and provenance below)"
   echo "elisa_product=$ELISA_BIN"
   echo "elisa_product_sha256=$ELISA_SHA"
+  echo "elisa_provenance_source_root=$ELISA_PROVENANCE_ROOT"
   echo "elisa_provenance=$ELISA_PROVENANCE"
   echo "elisa_provenance_sha256=$ELISA_PROVENANCE_SHA"
   echo "elisa_linked_llvm_library=$ELISA_LLVM_LIBRARY"
@@ -1057,6 +1073,7 @@ def parity_environment_input_hashes(environment):
         "ELISA_STAGE1_BIN": "<stage1-binary>",
         "ELISA_STAGE1_SELF": "<stage1-binary>",
         "ELISA_STAGE1_ROOT": "<stage1-source-root>",
+        "ELISA_STAGE1_PROVENANCE_ROOT": "<stage1-provenance-source-root>",
         "ELISA_RUNTIME_OBJ": "<runtime-object>",
     }
     projected = run_environment_input_hashes(environment)
@@ -1870,6 +1887,12 @@ print(f"Ratios:   {out / 'compile_ratios.csv'}, {out / 'build_ratios.csv'}, {run
 print(f"Samples:  {samples_path}")
 print(f"Results:  {result_path}")
 PY
+write_source_manifest "$OUT/sources.after-run.sha256"
+if ! cmp -s "$OUT/sources.sha256" "$OUT/sources.after-run.sha256"; then
+  echo "benchmark or compiler sources changed during runtime sampling; refusing to report results" >&2
+  exit 2
+fi
+rm -f "$OUT/sources.after-run.sha256"
 write_tool_manifest "$OUT/toolchain.after-run.sha256" "${toolchain_inputs[@]}"
 if ! cmp -s "$OUT/toolchain.before.sha256" "$OUT/toolchain.after-run.sha256"; then
   echo "compiler or toolchain binaries changed during measurement; results are invalid" >&2
