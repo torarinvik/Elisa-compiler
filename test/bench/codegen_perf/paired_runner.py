@@ -136,6 +136,79 @@ def preflight_record(directory: Path, compiler: Path, source_root: Path) -> dict
     return record
 
 
+def read_metadata(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    return values
+
+
+def stable_toolchain_identity(
+    fingerprint: dict[str, object],
+    pair_metadata: dict[str, object],
+    run_metadata: dict[str, str],
+) -> list[dict[str, str]]:
+    provenance = fingerprint.get("run_provenance")
+    rows = provenance.get("toolchain_manifest") if isinstance(provenance, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("run provenance has no toolchain manifest")
+    compiler_paths = {
+        str(Path(str(pair_metadata[key])).resolve())
+        for key in ("reference_binary", "candidate_binary")
+        if key in pair_metadata
+    }
+    if len(compiler_paths) != 2:
+        raise ValueError("paired metadata is missing a reference or candidate compiler path")
+    runtime_path = run_metadata.get("elisa_runtime_object")
+    if not runtime_path:
+        raise ValueError("preflight metadata has no runtime object path")
+    compiler_paths.add(str(Path(runtime_path).resolve()))
+    stable = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("sha256"), str):
+            raise ValueError("run provenance has a malformed toolchain manifest")
+        path = str(Path(row["path"]).resolve())
+        if path in compiler_paths or path.endswith(".provenance.json"):
+            continue
+        stable.append({"path": path, "sha256": row["sha256"]})
+    return sorted(stable, key=lambda row: (row["path"], row["sha256"]))
+
+
+def paired_input_identity(
+    fingerprint: dict[str, object],
+    pair_metadata: dict[str, object],
+    run_metadata: dict[str, str],
+) -> dict[str, object]:
+    payload = fingerprint.get("payload")
+    provenance = fingerprint.get("run_provenance")
+    if not isinstance(payload, dict) or not isinstance(provenance, dict):
+        raise ValueError("preflight fingerprint has no payload or run provenance")
+    source_hash = provenance.get("source_manifest_sha256")
+    if not isinstance(source_hash, str) or len(source_hash) != 64 or any(c not in "0123456789abcdef" for c in source_hash.lower()):
+        raise ValueError("preflight has no valid source manifest hash")
+    comparator = payload.get("comparator_toolchain")
+    if not isinstance(comparator, list) or not comparator:
+        raise ValueError("preflight has no comparator toolchain identity")
+    shared_runtime = provenance.get("shared_runtime_source_manifest")
+    if not isinstance(shared_runtime, dict) or not isinstance(shared_runtime.get("files"), list):
+        raise ValueError("preflight has no shared runtime source manifest")
+    runtime_rows = shared_runtime["files"]
+    runtime_manifest = json.dumps(runtime_rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if shared_runtime.get("sha256") != hashlib.sha256(runtime_manifest).hexdigest():
+        raise ValueError("preflight shared runtime source manifest hash is invalid")
+    runtime_hash = provenance.get("runtime_artifact_sha256")
+    if not isinstance(runtime_hash, str) or len(runtime_hash) != 64 or any(c not in "0123456789abcdef" for c in runtime_hash.lower()):
+        raise ValueError("preflight has no valid runtime artifact hash")
+    return {
+        "source_manifest_sha256": source_hash,
+        "stable_toolchain_manifest": stable_toolchain_identity(fingerprint, pair_metadata, run_metadata),
+        "comparator_toolchain": comparator,
+        "shared_runtime_source_manifest": shared_runtime,
+    }
+
+
 def main(arguments: list[str]) -> int:
     if len(arguments) not in (4, 5):
         raise SystemExit(
@@ -222,6 +295,26 @@ def main(arguments: list[str]) -> int:
             or reference_fingerprint.get("payload") != candidate_fingerprint.get("payload")
         ):
             raise RuntimeError("reference and candidate canonical workload fingerprints differ; no timed pairs were started")
+
+        preflight_pair_metadata = {
+            "reference_binary": str(reference_bin),
+            "candidate_binary": str(candidate_bin),
+        }
+        try:
+            reference_identity = paired_input_identity(
+                reference_fingerprint,
+                preflight_pair_metadata,
+                read_metadata(reference_preflight_dir / "metadata.txt"),
+            )
+            candidate_identity = paired_input_identity(
+                candidate_fingerprint,
+                preflight_pair_metadata,
+                read_metadata(candidate_preflight_dir / "metadata.txt"),
+            )
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"invalid paired preflight identity: {error}; no timed pairs were started") from error
+        if reference_identity != candidate_identity:
+            raise RuntimeError("reference and candidate preflight source or comparator toolchain identities differ; no timed pairs were started")
 
         paired_metadata = {
             "schema": "paired-cross-language-v1",

@@ -13,7 +13,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from paired_runner import source_manifest
+from paired_runner import paired_input_identity, source_manifest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BENCHMARK_ROOT = SCRIPT_DIR.parents[2]
@@ -222,33 +222,6 @@ def geometric_mean(values: list[float]) -> float:
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
-def stable_toolchain_identity(
-    fingerprint: dict[str, object],
-    pair_metadata: dict[str, object],
-    run_metadata: dict[str, str],
-) -> list[dict[str, str]]:
-    provenance = fingerprint.get("run_provenance")
-    rows = provenance.get("toolchain_manifest") if isinstance(provenance, dict) else None
-    if not isinstance(rows, list):
-        fail("run provenance has no toolchain manifest")
-    compiler_paths = {
-        str(Path(str(pair_metadata[key])).resolve())
-        for key in ("reference_binary", "candidate_binary")
-    }
-    runtime_path = run_metadata.get("elisa_runtime_object")
-    if runtime_path:
-        compiler_paths.add(str(Path(runtime_path).resolve()))
-    stable = []
-    for row in rows:
-        if not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("sha256"), str):
-            fail("run provenance has a malformed toolchain manifest")
-        path = str(Path(row["path"]).resolve())
-        if path in compiler_paths or path.endswith(".provenance.json"):
-            continue
-        stable.append({"path": path, "sha256": row["sha256"]})
-    return sorted(stable, key=lambda row: (row["path"], row["sha256"]))
-
-
 def main(arguments: list[str]) -> int:
     if len(arguments) != 1:
         fail("usage: paired_report.py OUTPUT_DIR")
@@ -332,13 +305,11 @@ def main(arguments: list[str]) -> int:
     ) -> None:
         nonlocal common_input_identity
         verify_run_artifacts(out / run_name, fingerprint, run_meta)
+        try:
+            identity = paired_input_identity(fingerprint, pair_metadata, run_meta)
+        except ValueError as error:
+            fail(str(error))
         provenance = fingerprint["run_provenance"]
-        identity: dict[str, object] = {
-            "source_manifest_sha256": provenance.get("source_manifest_sha256"),
-            "stable_toolchain_manifest": stable_toolchain_identity(fingerprint, pair_metadata, run_meta),
-            "comparator_toolchain": fingerprint.get("payload", {}).get("comparator_toolchain"),
-            "shared_runtime_source_manifest": provenance.get("shared_runtime_source_manifest"),
-        }
         if common_input_identity is None:
             common_input_identity = identity
         elif identity != common_input_identity:
