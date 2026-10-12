@@ -58,18 +58,47 @@ def declarations(path: Path) -> set[str]:
 zip_map = compact(function_section(SOURCE.read_text(), "emit_call_named"))
 zip_steps = (
     'ifcallee_name=="zip_map"andarguments.count==4:',
+    'zip_dst_data:LLVMValueRef=LLVMBuildExtractValue(builder,zip_dst,0,"zip_map.dst.data")',
+    'zip_src1_data:LLVMValueRef=LLVMBuildExtractValue(builder,zip_src1,0,"zip_map.src1.data")',
+    'zip_src2_data:LLVMValueRef=LLVMBuildExtractValue(builder,zip_src2,0,"zip_map.src2.data")',
     'zip_total:LLVMValueRef=darray_size_value_i64(LLVMBuildExtractValue(builder,zip_dst,1,"zip_map.total.raw"),ctx,builder,"zip_map.total")',
     'zip_src1_total:LLVMValueRef=darray_size_value_i64(LLVMBuildExtractValue(builder,zip_src1,1,"zip_map.src1.total.raw"),ctx,builder,"zip_map.src1.total")',
     'zip_src2_total:LLVMValueRef=darray_size_value_i64(LLVMBuildExtractValue(builder,zip_src2,1,"zip_map.src2.total.raw"),ctx,builder,"zip_map.src2.total")',
     'emit_required_count_available_guard(zip_total,zip_src1_total,m,ctx,builder)',
     'emit_required_count_available_guard(zip_total,zip_src2_total,m,ctx,builder)',
+    'zip_index:LLVMValueRef=build_entry_alloca(builder,zip_i64,"zip_map.i")',
+    '_=LLVMBuildStore(builder,LLVMConstInt(zip_i64,0,0),zip_index)',
+    'zip_function:LLVMValueRef=LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))',
+    'zip_cond:LLVMBasicBlockRef=LLVMAppendBasicBlockInContext(ctx,zip_function,"zip_map.cond")',
+    'zip_body:LLVMBasicBlockRef=LLVMAppendBasicBlockInContext(ctx,zip_function,"zip_map.body")',
+    'zip_end:LLVMBasicBlockRef=LLVMAppendBasicBlockInContext(ctx,zip_function,"zip_map.end")',
+    '_=LLVMBuildBr(builder,zip_cond)',
+    'LLVMPositionBuilderAtEnd(builder,zip_cond)',
     'zip_at:LLVMValueRef=LLVMBuildLoad2(builder,zip_i64,zip_index,"zip_map.index")',
     'LLVMBuildCondBr(builder,LLVMBuildICmp(builder,36,zip_at,zip_total,"zip_map.has_more"),zip_body,zip_end)',
-    'LLVMBuildGEP2(builder,zip_elem_llvm,zip_src1_data,zip_off1_pointer,1,"zip_map.src1.ptr")',
-    'LLVMBuildGEP2(builder,zip_elem_llvm,zip_src2_data,zip_off2_pointer,1,"zip_map.src2.ptr")',
+    'LLVMPositionBuilderAtEnd(builder,zip_body)',
+    'zip_off1:mutabledarray[LLVMValueRef]=[zip_at]',
+    'zip_off1_pointer:void&=(&zip_off1[0]).cast[void&]canUnsafe.PointerCast',
+    'zip_a_slot:LLVMValueRef=build_entry_alloca(builder,zip_elem_llvm,"zip_map.a")',
+    '_=LLVMBuildStore(builder,LLVMBuildLoad2(builder,zip_elem_llvm,LLVMBuildGEP2(builder,zip_elem_llvm,zip_src1_data,zip_off1_pointer,1,"zip_map.src1.ptr"),"zip_map.src1.elem"),zip_a_slot)',
+    'zip_off2:mutabledarray[LLVMValueRef]=[zip_at]',
+    'zip_off2_pointer:void&=(&zip_off2[0]).cast[void&]canUnsafe.PointerCast',
+    'zip_b_slot:LLVMValueRef=build_entry_alloca(builder,zip_elem_llvm,"zip_map.b")',
+    '_=LLVMBuildStore(builder,LLVMBuildLoad2(builder,zip_elem_llvm,LLVMBuildGEP2(builder,zip_elem_llvm,zip_src2_data,zip_off2_pointer,1,"zip_map.src2.ptr"),"zip_map.src2.elem"),zip_b_slot)',
+    'zip_off3:mutabledarray[LLVMValueRef]=[zip_at]',
+    'zip_off3_pointer:void&=(&zip_off3[0]).cast[void&]canUnsafe.PointerCast',
+    '_=LLVMBuildStore(builder,zip_value,LLVMBuildGEP2(builder,zip_elem_llvm,zip_dst_data,zip_off3_pointer,1,"zip_map.dst.ptr"))',
+    'LLVMBuildStore(builder,LLVMBuildAdd(builder,LLVMBuildLoad2(builder,zip_i64,zip_index,"zip_map.index.cur"),LLVMConstInt(zip_i64,1,0),"zip_map.index.next"),zip_index)',
+    '_=LLVMBuildBr(builder,zip_cond)',
 )
-positions = [zip_map.find(step) for step in zip_steps]
-if any(position < 0 for position in positions) or positions != sorted(positions):
+positions: list[int] = []
+cursor = 0
+for step in zip_steps:
+    position = zip_map.find(step, cursor)
+    positions.append(position)
+    if position >= 0:
+        cursor = position + len(step)
+if any(position < 0 for position in positions):
     raise SystemExit("zip_map must normalize all counts and guard both sources before its loop and source GEPs")
 if zip_map.count("emit_required_count_available_guard(zip_total,") != 2:
     raise SystemExit("zip_map must guard both source views against the destination count")
