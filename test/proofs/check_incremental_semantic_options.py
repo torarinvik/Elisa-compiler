@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, source_include_closure
 
 root = Path(__file__).resolve().parents[2]
 prover = root.parent / "elisa-proof"
@@ -37,6 +37,7 @@ inputs = [binary, manifest, manifest_checksum, prover / "ELISA_COMPILER_REV",
           here / "proof_product_gate.py", Path(__file__), types_source, module_source,
           source_view_source, token_model_source,
           probe_source, incremental_driver_source, positive_source, negative_source]
+inputs.extend(source_include_closure([positive_source, negative_source]))
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 types_text = types_source.read_text()
