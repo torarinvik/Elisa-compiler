@@ -6,7 +6,16 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPILER="${1:?compiler binary required}"
 OUT="${2:?output directory required}"
 mkdir -p "$OUT"
-OUT="$(cd -- "$OUT" && pwd)"
+OUT="$(cd -P -- "$OUT" && pwd)"
+if [[ -n "$(find "$OUT" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "output directory is not empty: $OUT (choose a fresh directory)" >&2
+    exit 2
+fi
+source "$ROOT/scripts/benchmark_host_lock.sh"
+elisa_benchmark_lock_acquire "$OUT"
+trap elisa_benchmark_finish EXIT
+elisa_benchmark_host_qualification "$ROOT" "$OUT"
+elisa_benchmark_load_check "before compiler and workload builds" 1
 python3 - "$OUT" <<'PY'
 from pathlib import Path
 import sys
@@ -49,6 +58,7 @@ for policy in helper reserve stack; do
         clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT/$policy-$variant" "$OUT/$policy-$variant.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
     done
 done
+elisa_benchmark_load_check "after compiler and workload builds"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 for policy in helper reserve stack; do
@@ -65,7 +75,11 @@ for variant in ('oracle','baseline','candidate'):
 assert results[0]==results[1]==results[2],(name,results)
 (out/f'{name}-oracle.txt').write_bytes(results[0][0])
 PY_ORACLE
+    elisa_benchmark_load_check "after $policy correctness oracle"
+    elisa_benchmark_load_check "before $policy runtime samples"
     python3 "$ROOT/../elisa-profiler/scripts/benchmark-native.py" \
         --baseline "$OUT/$policy-baseline" --candidate "$OUT/$policy-candidate" \
         --repeat "${ELISA_BENCH_REPEAT:-15}" --warmup 2 --timeout 120 --output "$OUT/$policy-timing.json"
+    elisa_benchmark_load_check "after $policy runtime samples"
 done
+date -u '+completed_at_utc=%Y-%m-%dT%H:%M:%SZ' >"$OUT/AUXILIARY_COMPLETE"

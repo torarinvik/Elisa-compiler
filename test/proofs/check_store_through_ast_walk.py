@@ -396,6 +396,8 @@ HOLDER_WALK_STATEMENT_EDGES = (
     ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("Stmt.Contract(_, expression, _):", "table <- chv_walk_expression(expression, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "flow.may_owned_view[assigned_index] <- assigned_alias"),
 )
 
 HOLDER_WALK_EXPRESSION_EDGES = (
@@ -412,17 +414,21 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Field(object, _, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Scope(base, _, _):", "table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Index(object, index, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Index(object, index, _):", "table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not index_receiver_is_type_application(object)"),
+    ("Expr.Index(object, index, _):", "if not index_receiver_is_type_application(object):"),
+    ("if not index_receiver_is_type_application(object):", "table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 0),
     ("Expr.Slice(object, low, high, _):", "table <- chv_walk_expression(low, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Slice(object, low, high, _):", "table <- chv_walk_expression(high, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.IndexN(object, arguments, _):", "for argument in arguments |table| -> table:"),
+    ("Expr.IndexN(object, arguments, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.IndexN(object, arguments, _):", "if not index_receiver_is_type_application(object):"),
+    ("if not index_receiver_is_type_application(object):", "for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", 1),
+    ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, _, right, _):", "table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, _, right, _):", "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, _, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
     ("Expr.Binary(left, _, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
     ("Expr.Binary(left, _, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
     ("Expr.Binary(left, _, right, _):", "chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
-    ("Expr.Unary(_, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Move(operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.RegionNew(operand, _, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Paren(inner, _):", "table <- chv_walk_expression(inner, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
@@ -458,6 +464,52 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Lambda(parameters, body, _):", "table <- chv_walk_statements(body, in_region, lambda_ref_params, lambda_binders, lambda_owned, lambda_view_names, lambda_view_values, lambda_flow, summary, table)"),
     ("Expr.Block(block_statements, block_value, _, _):", "table <- chv_walk_statements(block_statements, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Block(block_statements, block_value, _, _):", "table <- chv_walk_expression(block_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+)
+
+CONSTRUCT_VIEW_TAINT_EDGES = (
+    ("Expr.Construct(_, fields, _):", "for field in fields |table, aggregate_may_be_owned_view| -> table:"),
+    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.Construct(_, fields, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
+)
+
+RECORD_UPDATE_VIEW_TAINT_EDGES = (
+    ("Expr.RecordUpdate(base, fields, _):", "table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.RecordUpdate(base, fields, _):", "aggregate_may_be_owned_view: mutable bool = flow.last_value_may_be_owned_view"),
+    ("Expr.RecordUpdate(base, fields, _):", "for field in fields |table, aggregate_may_be_owned_view| -> table:"),
+    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.RecordUpdate(base, fields, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
+)
+
+FIELD_PROJECTION_VIEW_TAINT_EDGES = (
+    ("Expr.Field(_, _, _):", "root_name: sview = chv_place_root(argument)"),
+    ("Expr.Field(_, _, _):", "index: usize = chv_flow_latest(flow, root_name) if root_name != \"\" else flow.names.count"),
+    ("Expr.Field(_, _, _):", "return index < flow.names.count and flow.may_owned_view[index]"),
+)
+
+ARRAY_VIEW_TAINT_EDGES = (
+    ("Expr.Array(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
+    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.Array(elements, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
+    ("Expr.Tuple(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
+    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 1),
+    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view", 1),
+    ("Expr.Tuple(elements, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
+    ("Expr.SetLit(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
+    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 2),
+    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view", 2),
+    ("Expr.SetLit(elements, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
+)
+
+DICT_VIEW_TAINT_EDGES = (
+    ("Expr.DictLit(entries, _):", "for entry in entries |table, aggregate_may_be_owned_view| -> table:"),
+    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.DictLit(entries, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
 )
 
 EFFECT_CANDIDATE_EDGES = (
@@ -509,10 +561,6 @@ INDEX_VIEW_RESULT_EDGES = (
 
 UNARY_NEGATION_EDGES = (
     ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Unary(operator, operand, _):", "operand_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("Expr.Unary(operator, operand, _):", "operand_may_alias_ref: bool = chv_expression_may_alias_ref(operand, ref_params, flow, 0)"),
-    ("Expr.Unary(operator, operand, _):", "if operator == TokenKind.Minus:"),
-    ("if operator == TokenKind.Minus:", "chv_check_unknown_call([operand], [operand_may_be_owned_view], [operand_may_alias_ref], ref_params, binders, owned, view_names, view_values, flow, table)"),
     ("Expr.Unary(operator, operand, _):", "flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)"),
 )
 
@@ -780,6 +828,21 @@ theorem_routes = {
         "left_branch_may_own": VIEW_FLOW_MERGE_EDGES,
         "right_branch_may_own": VIEW_FLOW_MERGE_EDGES,
     },
+    "proof_chv_aggregate_construct_keeps_field_view_taint": {
+        "field_walked": (CONSTRUCT_VIEW_TAINT_EDGES[0], CONSTRUCT_VIEW_TAINT_EDGES[1]),
+        "field_taint_joined": (CONSTRUCT_VIEW_TAINT_EDGES[2],),
+        "aggregate_taint_set": (CONSTRUCT_VIEW_TAINT_EDGES[3],),
+    },
+    "proof_chv_record_update_keeps_base_and_field_view_taint": {
+        "base_taint_kept": (RECORD_UPDATE_VIEW_TAINT_EDGES[0], RECORD_UPDATE_VIEW_TAINT_EDGES[1]),
+        "field_walked": (RECORD_UPDATE_VIEW_TAINT_EDGES[2], RECORD_UPDATE_VIEW_TAINT_EDGES[3]),
+        "field_taint_joined": (RECORD_UPDATE_VIEW_TAINT_EDGES[4],),
+        "aggregate_taint_set": (RECORD_UPDATE_VIEW_TAINT_EDGES[5],),
+    },
+    "proof_chv_aggregate_field_projection_requires_tainted_root": {
+        "root_is_known": FIELD_PROJECTION_VIEW_TAINT_EDGES[:2],
+        "aggregate_may_contain_view": (FIELD_PROJECTION_VIEW_TAINT_EDGES[2],),
+    },
     "proof_chv_reference_alias_join_preserves_either_path": {
         "left_path_may_alias": REF_ALIAS_FLOW_MERGE_EDGES,
         "right_path_may_alias": REF_ALIAS_FLOW_MERGE_EDGES,
@@ -791,9 +854,9 @@ theorem_routes = {
         "projection_fallback": (REF_ALIAS_HELPER_EDGES[4],),
     },
     "proof_chv_binary_operator_checks_both_operands": {
-        "receiver_checked": (HOLDER_WALK_EXPRESSION_EDGES[15],),
-        "operand_checked": (HOLDER_WALK_EXPRESSION_EDGES[16],),
-        "fallback_checked": (HOLDER_WALK_EXPRESSION_EDGES[20],),
+        "receiver_checked": (HOLDER_WALK_EXPRESSION_EDGES[21],),
+        "operand_checked": (HOLDER_WALK_EXPRESSION_EDGES[22],),
+        "fallback_checked": (HOLDER_WALK_EXPRESSION_EDGES[26],),
     },
     "proof_chv_binary_operator_result_tracks_reference_operands": {
         "left_alias": (REF_ALIAS_HELPER_EDGES[3],),
@@ -818,9 +881,8 @@ theorem_routes = {
     "proof_chv_unary_negation_tracks_reference_operand": {
         "operand_alias_checked": REF_ALIAS_ADDRESS_EDGES,
     },
-    "proof_chv_unary_negation_checks_operator_operand": {
+    "proof_chv_unary_negation_visits_operand": {
         "operand_checked": (UNARY_NEGATION_EDGES[0],),
-        "fallback_checked": (UNARY_NEGATION_EDGES[3], UNARY_NEGATION_EDGES[4]),
     },
     "proof_chv_unary_negation_tracks_view_operand": {
         "operand_may_be_view": UNARY_VIEW_RESULT_EDGES,
@@ -889,6 +951,13 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_view_alias_join_preserves_owned_fact":
         proof_source = function_section(holder_text, "chv_flow_set_merge")
         proof_edges = VIEW_FLOW_MERGE_EDGES
+    elif name == "proof_chv_aggregate_construct_keeps_field_view_taint":
+        proof_source, proof_edges = holder_walk_expressions, CONSTRUCT_VIEW_TAINT_EDGES
+    elif name == "proof_chv_record_update_keeps_base_and_field_view_taint":
+        proof_source, proof_edges = holder_walk_expressions, RECORD_UPDATE_VIEW_TAINT_EDGES
+    elif name == "proof_chv_aggregate_field_projection_requires_tainted_root":
+        proof_source = function_section(holder_text, "chv_is_owned_view")
+        proof_edges = FIELD_PROJECTION_VIEW_TAINT_EDGES
     elif name == "proof_chv_reference_alias_join_preserves_either_path":
         proof_source = function_section(holder_text, "chv_flow_set_merge")
         proof_edges = REF_ALIAS_FLOW_MERGE_EDGES
@@ -901,7 +970,7 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_unary_negation_tracks_reference_operand":
         proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
         proof_edges = REF_ALIAS_ADDRESS_EDGES
-    elif name == "proof_chv_unary_negation_checks_operator_operand":
+    elif name == "proof_chv_unary_negation_visits_operand":
         proof_source, proof_edges = holder_walk_expressions, UNARY_NEGATION_EDGES
     elif name == "proof_chv_unary_negation_tracks_view_operand":
         proof_source = function_section(holder_text, "chv_is_owned_view")
@@ -955,6 +1024,12 @@ for name, routes in theorem_routes.items():
         validate_exact_boolean_theorem(positive_text, name, routes, "reference_target_checked and owned_view_checked", proof_source, proof_edges)
     elif name == "proof_chv_view_alias_join_preserves_owned_fact":
         validate_exact_boolean_theorem(positive_text, name, routes, "left_branch_may_own or right_branch_may_own", proof_source, proof_edges)
+    elif name == "proof_chv_aggregate_construct_keeps_field_view_taint":
+        validate_exact_boolean_theorem(positive_text, name, routes, "field_walked and field_taint_joined and aggregate_taint_set", proof_source, proof_edges)
+    elif name == "proof_chv_record_update_keeps_base_and_field_view_taint":
+        validate_exact_boolean_theorem(positive_text, name, routes, "base_taint_kept and field_walked and field_taint_joined and aggregate_taint_set", proof_source, proof_edges)
+    elif name == "proof_chv_aggregate_field_projection_requires_tainted_root":
+        validate_exact_boolean_theorem(positive_text, name, routes, "root_is_known and aggregate_may_contain_view", proof_source, proof_edges)
     elif name == "proof_chv_reference_alias_join_preserves_either_path":
         validate_exact_boolean_theorem(positive_text, name, routes, "left_path_may_alias or right_path_may_alias", proof_source, proof_edges)
     elif name == "proof_chv_reference_targets_cover_alias_routes":
@@ -973,8 +1048,8 @@ for name, routes in theorem_routes.items():
         validate_exact_boolean_theorem(positive_text, name, routes, "operand_alias_checked", proof_source, proof_edges)
     elif name == "proof_chv_unary_negation_tracks_reference_operand":
         validate_exact_boolean_theorem(positive_text, name, routes, "operand_alias_checked", proof_source, proof_edges)
-    elif name == "proof_chv_unary_negation_checks_operator_operand":
-        validate_exact_boolean_theorem(positive_text, name, routes, "operand_checked and fallback_checked", proof_source, proof_edges)
+    elif name == "proof_chv_unary_negation_visits_operand":
+        validate_exact_boolean_theorem(positive_text, name, routes, "operand_checked", proof_source, proof_edges)
     elif name == "proof_chv_unary_negation_tracks_view_operand":
         validate_exact_boolean_theorem(positive_text, name, routes, "operand_may_be_view", proof_source, proof_edges)
     elif name == "proof_chv_projection_fallback_requires_caller_reference":
@@ -1025,7 +1100,7 @@ if "inner(id_holder(out), owned_view)" not in positive_text or "local_holder.slo
     raise SystemExit("reference alias proof must document call-result and projection cases")
 if "&local_holder" not in positive_text:
     raise SystemExit("reference alias proof must document the local address-of control")
-unary_alias_arm = match_arm_body(reference_alias_source, "match argument:", "Expr.Unary(operator, operand, _):")
+unary_alias_arm = match_arm_body(reference_alias_source, "match argument:", "Expr.Unary(_, operand, _):")
 if unary_alias_arm is None or compact_code(unary_alias_arm) != compact_code("return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)"):
     raise SystemExit("unary operands must retain their own reference provenance")
 named_argument_detector = function_section(holder_text, "chv_call_has_named_arguments")

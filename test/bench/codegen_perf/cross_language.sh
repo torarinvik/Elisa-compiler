@@ -76,7 +76,7 @@ ROOT="$(cd -- "$HERE/../../.." && pwd)"
 
 OUT="${1:-${OUTDIR:-$ROOT/build/codegen-perf-cross-language}}"
 mkdir -p "$OUT"
-OUT="$(cd -- "$OUT" && pwd)"
+OUT="$(cd -- "$OUT" && pwd -P)"
 if [[ -n "$(find "$OUT" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   echo "output directory is not empty: $OUT (choose a fresh directory so failed runs cannot leave stale result CSVs)" >&2
   exit 2
@@ -94,7 +94,7 @@ mark_incomplete_run() {
   return "$status"
 }
 trap mark_incomplete_run EXIT
-BENCH_LOCK_PATH="${TMPDIR:-/tmp}/elisa-cross-language-benchmark.lock"
+BENCH_LOCK_PATH="${ELISA_BENCH_LOCK_PATH:-/tmp/elisa-cross-language-benchmark.lock}"
 BENCH_LOCK_READY="$OUT/.benchmark-lock-ready"
 mkfifo "$BENCH_LOCK_READY"
 python3 - "$BENCH_LOCK_PATH" "$$" <<'PY' >"$BENCH_LOCK_READY" &
@@ -133,6 +133,7 @@ RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 HOST_QUALIFICATION="$OUT/host_qualification.json"
 python3 - "$HOST_QUALIFICATION" "$(uname -s)" <<'PY'
 import json
+import hashlib
 import os
 import platform
 import re
@@ -148,6 +149,9 @@ result = {
     "allowed_cpu_count": None,
     "effective_cgroup_cpu_quota": None,
     "cgroup_quota_sources": [],
+    "cgroup_membership_lines": [],
+    "cgroup_mountinfo_sha256": None,
+    "cgroup_namespace": None,
     "reason": "Mac timing is exploratory; the project qualification target is a 64-core x86_64 Linux host",
 }
 
@@ -174,7 +178,9 @@ if system == "Linux":
 
     memberships = []
     try:
-        for line in Path("/proc/self/cgroup").read_text().splitlines():
+        membership_lines = Path("/proc/self/cgroup").read_text().splitlines()
+        result["cgroup_membership_lines"] = membership_lines
+        for line in membership_lines:
             _, controllers, path = line.split(":", 2)
             if not controllers:
                 memberships.append(("v2", path))
@@ -185,7 +191,9 @@ if system == "Linux":
 
     mounts = []
     try:
-        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        mountinfo_text = Path("/proc/self/mountinfo").read_text()
+        result["cgroup_mountinfo_sha256"] = hashlib.sha256(mountinfo_text.encode()).hexdigest()
+        for line in mountinfo_text.splitlines():
             if " - " not in line:
                 continue
             before, after = line.split(" - ", 1)
@@ -205,6 +213,7 @@ if system == "Linux":
     try:
         self_cgroup_ns = os.readlink("/proc/self/ns/cgroup")
         init_cgroup_ns = os.readlink("/proc/1/ns/cgroup")
+        result["cgroup_namespace"] = {"self": self_cgroup_ns, "init": init_cgroup_ns}
         if self_cgroup_ns != init_cgroup_ns:
             issues.append("the process is in a separate cgroup namespace, so outer CPU quotas may be hidden")
     except OSError as error:
@@ -281,7 +290,7 @@ if system == "Linux" and not result["qualified"]:
     print(f"Linux host is not eligible for a qualified comparison: {result['reason']}", file=sys.stderr)
     raise SystemExit(2)
 PY
-if ! python3 "$ROOT/scripts/bench_load_gate.py" preflight "$OUT" "$HOST_QUALIFICATION" "$(uname -s)"; then
+if ! python3 "$ROOT/scripts/bench_load_gate.py" preflight "$OUT" "$HOST_QUALIFICATION" "$(uname -s)" --require-live; then
   exit 2
 fi
 REPEAT="${REPEAT:-5}"
@@ -767,7 +776,7 @@ fi
 
 python3 - "$OUT" "$BUILD_REPEAT" "$BENCH_TIMEOUT_SECONDS" "$HERE" "$ROOT" \
   "$ELISA_BIN" "$RUNTIME" "$CLANG" "$RUSTC" "$ZIG" "$RUN_ID" \
-  "$EXPECTED_CANONICAL_FINGERPRINT" \
+  "$EXPECTED_CANONICAL_FINGERPRINT" "$COMPILE_ONLY" \
   "$ELISA_OVERFLOW_FLAG" "$RUST_OVERFLOW_CHECKS" "$ZIG_OPTIMIZE" \
   "$RUNTIME_PROFILE_MODE" "$RUNTIME_PROFILE_OPT_LEVEL" "$RUNTIME_PROFILE_OVERFLOW" \
   "${#CLANG_CPU_FLAGS[@]}" "${CLANG_CPU_FLAGS[@]}" "${benches[@]}" <<'PY'
@@ -797,11 +806,12 @@ elisa_bin, runtime, clang, rustc, zig = sys.argv[6:11]
 elisa_bin, runtime, clang, rustc, zig = (str(Path(path).resolve()) for path in (elisa_bin, runtime, clang, rustc, zig))
 run_id = sys.argv[11]
 expected_fingerprint_path = sys.argv[12]
-elisa_overflow_flag, rust_overflow_checks, zig_optimize = sys.argv[13:16]
-runtime_profile_mode, runtime_profile_opt_level, runtime_profile_overflow = sys.argv[16:19]
-cpu_flag_count = int(sys.argv[19])
-cpu_flags = sys.argv[20:20 + cpu_flag_count]
-benches = sys.argv[20 + cpu_flag_count:]
+compile_only = sys.argv[13] == "1"
+elisa_overflow_flag, rust_overflow_checks, zig_optimize = sys.argv[14:17]
+runtime_profile_mode, runtime_profile_opt_level, runtime_profile_overflow = sys.argv[17:20]
+cpu_flag_count = int(sys.argv[20])
+cpu_flags = sys.argv[21:21 + cpu_flag_count]
+benches = sys.argv[21 + cpu_flag_count:]
 variants = ("elisa", "c", "rust", "zig")
 dead_strip = shlex.split(os.environ.get("ELISA_LD_DEAD_STRIP", ""))
 link_flags = shlex.split(os.environ.get("ELISA_LINK_EXE_FLAGS", ""))
@@ -833,7 +843,7 @@ times = {
 
 def enforce_load_gate(load, stage):
     try:
-        check_load_gate(load, stage, out, platform.system(), out / "host_qualification.json")
+        check_load_gate(load, stage, out, platform.system(), out / "host_qualification.json", require_live_linux=True)
     except LoadGateError as error:
         raise SystemExit(str(error)) from error
 
@@ -912,6 +922,11 @@ def host_platform_identity():
             pass
     if not models and platform.processor():
         models.add(platform.processor())
+    qualification = json.loads((out / "host_qualification.json").read_text())
+    try:
+        allowed_cpu_ids = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed_cpu_ids = None
     return {
         "system": host.system,
         "machine": host.machine,
@@ -919,6 +934,43 @@ def host_platform_identity():
         "os_version": host.version,
         "cpu_models": sorted(models) or ["unknown"],
         "cpu_features": sorted(features),
+        "benchmark_cpu_entitlement": {
+            "logical_cpu_count": os.cpu_count(),
+            "allowed_cpu_count": qualification.get("allowed_cpu_count"),
+            "allowed_cpu_ids": allowed_cpu_ids,
+            "effective_cgroup_cpu_quota": qualification.get("effective_cgroup_cpu_quota"),
+        },
+    }
+
+def comparator_toolchain_identity():
+    """Hash comparator tools while excluding candidate-specific compiler/runtime products."""
+    candidate_products = {
+        str(Path(elisa_bin).resolve()),
+        str(Path(f"{elisa_bin}.provenance.json").resolve()),
+        str(Path(runtime).resolve()),
+    }
+    rows = []
+    for line in (out / "toolchain.before.sha256").read_text().splitlines():
+        digest, separator, raw_path = line.partition("  ")
+        if not separator or len(digest) != 64:
+            raise RuntimeError("malformed toolchain.before.sha256 manifest")
+        raw_path_obj = Path(raw_path)
+        if str(raw_path_obj.resolve()) in candidate_products or raw_path_obj.name.endswith(".provenance.json"):
+            continue
+        rows.append({"name": Path(raw_path).name, "sha256": digest})
+    if not rows:
+        raise RuntimeError("toolchain manifest contains no pinned comparator tools")
+    return sorted(rows, key=lambda row: (row["name"], row["sha256"]))
+
+def benchmark_helper_hashes():
+    paths = (
+        root / "scripts" / "bench_load_gate.py",
+        root / "scripts" / "platform.sh",
+        root / "scripts" / "stage1_provenance.py",
+    )
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in paths
     }
 
 def write_canonical_workload_fingerprint(observed_results):
@@ -943,8 +995,11 @@ def write_canonical_workload_fingerprint(observed_results):
             },
         })
     payload = {
-        "schema": "canonical-codegen-workloads-v3",
+        "schema": "canonical-codegen-workloads-v4",
+        "scope": "compile_only" if compile_only else "full_runtime",
         "runner_sha256": hashlib.sha256((source_dir / "cross_language.sh").read_bytes()).hexdigest(),
+        "benchmark_helper_sha256": benchmark_helper_hashes(),
+        "comparator_toolchain": comparator_toolchain_identity(),
         "platform": host_platform_identity(),
         "compile_profile": {
             "elisa": {"opt": "-O3", "overflow": elisa_overflow_flag},
@@ -978,6 +1033,21 @@ def write_canonical_workload_fingerprint(observed_results):
             reference = json.loads(reference_path.read_text())
         except (OSError, json.JSONDecodeError) as error:
             mark_aborted("canonical workload fingerprint check failed", f"cannot read {reference_path}: {error}")
+        reference_payload = reference.get("payload") if isinstance(reference, dict) else None
+        reference_scope = reference_payload.get("scope") if isinstance(reference_payload, dict) else None
+        completion_marker = "COMPILE_COMPLETE" if reference_scope == "compile_only" else "COMPLETE"
+        reference_directory = reference_path.resolve().parent
+        marker_path = reference_directory / completion_marker
+        if (reference_directory / "ABORTED.txt").exists() or not marker_path.is_file() or not marker_path.read_text().strip():
+            mark_aborted(
+                "canonical workload fingerprint check failed",
+                f"reference {reference_path} has no successful {completion_marker} marker",
+            )
+        if reference_scope != payload["scope"]:
+            mark_aborted(
+                "canonical workload fingerprint scope mismatch",
+                f"candidate scope {payload['scope']} does not match reference scope {reference_scope!r}",
+            )
         if (
             not isinstance(reference, dict)
             or reference.get("schema") != record["schema"]
@@ -1020,13 +1090,16 @@ def correctness_preflight(stage):
         except RuntimeError as error:
             mark_aborted("correctness preflight failed", f"{stage}: {error}")
         statuses = {variant: result[0] for variant, result in observed.items()}
-        outputs = {variant: result[1] or result[2] for variant, result in observed.items()}
-        if len(set(statuses.values())) != 1 or len(set(outputs.values())) != 1:
-            printable = {variant: (code, (stdout or stderr).decode("utf-8", errors="replace")) for variant, (code, stdout, stderr) in observed.items()}
-            mark_aborted("correctness preflight failed", f"{stage}: full-checksum mismatch for {bench}: {printable}")
+        streams = {variant: (result[1], result[2]) for variant, result in observed.items()}
+        if len(set(statuses.values())) != 1 or len(set(streams.values())) != 1:
+            printable = {
+                variant: (code, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"))
+                for variant, (code, stdout, stderr) in observed.items()
+            }
+            mark_aborted("correctness preflight failed", f"{stage}: status/stdout/stderr mismatch for {bench}: {printable}")
         expected_output = f"{expected_checksums[bench]}\n".encode()
-        if outputs["elisa"] != expected_output or statuses["elisa"] != expected_exit_statuses[bench]:
-            actual = (outputs["elisa"].decode("utf-8", errors="replace"), statuses["elisa"])
+        if streams["elisa"] != (expected_output, b"") or statuses["elisa"] != expected_exit_statuses[bench]:
+            actual = (streams["elisa"][0].decode("utf-8", errors="replace"), streams["elisa"][1].decode("utf-8", errors="replace"), statuses["elisa"])
             mark_aborted("correctness preflight failed", f"{stage}: independent checksum mismatch for {bench}: expected {(expected_checksums[bench], expected_exit_statuses[bench])}, got {actual}")
         results[bench] = {"checksum": expected_output.decode("utf-8"), "exit_status": statuses["elisa"]}
     return results
@@ -1334,7 +1407,7 @@ exit_statuses = {}
 
 def enforce_load_gate(load, stage):
     try:
-        check_load_gate(load, stage, out, platform.system(), out / "host_qualification.json")
+        check_load_gate(load, stage, out, platform.system(), out / "host_qualification.json", require_live_linux=True)
     except LoadGateError as error:
         raise SystemExit(str(error)) from error
 
@@ -1435,7 +1508,7 @@ for bench in benches:
             enforce_load_gate(load_after, f"after runtime sample {bench}/{variant}/{sample + 1}")
             if proc.returncode != exit_statuses[bench]:
                 raise RuntimeError(f"timed status changed: {bench}/{variant} returned {proc.returncode}")
-            if (stdout and stderr) or (stdout or stderr) != checksums[bench]:
+            if stdout != checksums[bench] or stderr:
                 raise RuntimeError(f"timed full checksum changed: {bench}/{variant}")
             verify_artifact(bench, variant, f"after runtime sample {bench}/{variant}/{sample + 1}")
             cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)

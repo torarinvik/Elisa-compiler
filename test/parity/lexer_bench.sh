@@ -27,6 +27,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+WORK="$(mktemp -d)"
+source "$REPO_ROOT/scripts/benchmark_host_lock.sh"
+trap 'elisa_benchmark_lock_release; rm -rf "$WORK"' EXIT INT TERM HUP
+elisa_benchmark_lock_acquire "$WORK"
+elisa_benchmark_host_qualification "$REPO_ROOT" "$WORK"
+elisa_benchmark_load_check "before resolving or building the compiler" 1
 
 # Always bench a freshly built compiler (sets ELISACORE_BIN).
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
@@ -40,9 +46,6 @@ ITERS="${ITERS:-4000}"
 
 command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
 [[ -f "$INPUT" ]] || { echo "error: input not found: $INPUT" >&2; exit 2; }
-
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 cat > "$WORK/bench_harness.elisa" <<EOF
 include "$FIXTURE"
@@ -109,6 +112,7 @@ EOF
 
 "$ELISACORE_BIN" -emit header -o "$WORK/bench_harness.h" "$WORK/bench_harness.elisa" >/dev/null
 "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/bench_harness.o" "$WORK/bench_harness.elisa" >/dev/null
+elisa_benchmark_load_check "after lexer harness build"
 
 # The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. These
 # links use -undefined,dynamic_lookup, which turns a missing one into a NULL
@@ -124,4 +128,6 @@ link_flags=(-O2 -I "$WORK" "$WORK/bench_driver.c" "$WORK/bench_harness.o" "${ELI
 clang "${link_flags[@]}"
 
 echo "lexer bench: input=$(basename "$INPUT") ($(wc -l <"$INPUT" | tr -d ' ') lines), iters=$ITERS" >&2
+elisa_benchmark_load_check "before lexer runtime samples"
 "$WORK/bench" "$INPUT" "$ITERS"
+elisa_benchmark_load_check "after lexer runtime samples"

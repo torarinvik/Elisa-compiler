@@ -18,6 +18,16 @@ MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 SOURCE = ROOT / "src/semantic/region_annotation_order.elisa"
 INTEGRATION = ROOT / "src/semantic/semantic.elisa"
 PIPELINE_SOURCE = ROOT / "src/semantic/semantic_api.elisa"
+LOOP_VIEW = ROOT / "src/semantic/semantic_loop_view.elisa"
+PARSER_ENTRY = ROOT / "src/parser/parser_types_entry.elisa"
+PARSER_MUTATION_SOURCES = {
+    ROOT / "src/parser/parser_core_cursor.elisa",
+    ROOT / "src/parser/parser_func_params.elisa",
+    ROOT / "src/parser/parser_stmt_contextual.elisa",
+    ROOT / "src/parser/parser_stmt_control.elisa",
+    ROOT / "src/parser/parser_stmt_control_blocks.elisa",
+    ROOT / "src/parser/parser_types_function.elisa",
+}
 DESTROYED = ROOT / "src/semantic/check_destroyed_region.elisa"
 HANDLER = ROOT / "src/semantic/check_handler_capture_escape.elisa"
 AUTO_REGION = ROOT / "src/semantic/auto_region_wrap.elisa"
@@ -47,6 +57,8 @@ def function_chunk(text: str, name: str) -> str:
 source = SOURCE.read_text()
 integration = INTEGRATION.read_text()
 pipeline_source = PIPELINE_SOURCE.read_text()
+loop_view = LOOP_VIEW.read_text()
+parser_entry = PARSER_ENTRY.read_text()
 destroyed = DESTROYED.read_text()
 handler = HANDLER.read_text()
 auto_region = AUTO_REGION.read_text()
@@ -144,6 +156,43 @@ if "region_annotation_window_start(annotations, line)" not in handler or \
     raise SystemExit("handler-capture safety analysis no longer uses the proved range endpoints")
 if "region_annotation_line_window(annotations, line)" not in auto_region:
     raise SystemExit("auto-region wrapping no longer uses the proved line window")
+
+# The memo is safe for a file lifetime only if semantic consumers cannot mutate the
+# annotation rows after the reset. Keep the construction/copy boundary and every
+# production write source-bound; the parser's later scope-closure writes preserve line.
+constructor_sites = set()
+annotation_writes = []
+for source_path in sorted((ROOT / "src").rglob("*.elisa")):
+    relative = source_path.relative_to(ROOT / "src")
+    for line_number, raw_line in enumerate(source_path.read_text().splitlines(), start=1):
+        code = raw_line.split("#", 1)[0]
+        if "Ast::File{" in code:
+            constructor_sites.add(relative)
+        if re.search(r"\blocal_region_annotations(?:\s*\[[^]]+\])?\s*<-", code):
+            annotation_writes.append((relative, line_number, code.strip()))
+            if relative not in {path.relative_to(ROOT / "src") for path in PARSER_MUTATION_SOURCES}:
+                raise SystemExit(f"production annotation mutation escaped the parser: {relative}:{line_number}")
+if constructor_sites != {
+    Path("parser/parser_types_entry.elisa"),
+    Path("semantic/semantic_loop_view.elisa"),
+}:
+    raise SystemExit(f"Ast::File construction surface changed: {sorted(map(str, constructor_sites))}")
+if not annotation_writes or any(
+    "local_region_annotations[" in code and "line:" not in code
+    for _, _, code in annotation_writes
+):
+    raise SystemExit("parser annotation updates must preserve each row's source line")
+if "local_region_annotations: parser.local_region_annotations" not in parser_entry:
+    raise SystemExit("parsed Ast::File no longer receives the parser's append-ordered annotation table")
+if "local_region_annotations: file.local_region_annotations" not in loop_view:
+    raise SystemExit("semantic loop view no longer preserves the parsed annotation table")
+for path, function_name, fragment in (
+    (ROOT / "src/parser/parser_core_cursor.elisa", "close_arena_local_region_annotations", "line: region_annotation.line"),
+    (ROOT / "src/parser/parser_stmt_control_blocks.elisa", "prefixed_block_statement", "line: line"),
+    (ROOT / "src/parser/parser_types_function.elisa", "function_declaration", "line: region_annotation.line"),
+):
+    if compact(fragment) not in compact(function_chunk(path.read_text(), function_name)):
+        raise SystemExit(f"parser scope closure no longer preserves annotation order in {path.name}")
 
 # A future pipeline reorder must not silently put an auto-region query before the
 # per-file cache reset. Check the rejection path with a one-step source mutation.
@@ -254,9 +303,27 @@ stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=Tr
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 inputs = [*source_include_closure([POSITIVE, NEGATIVE]), BIN, MANIFEST, MANIFEST_CHECKSUM,
           PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance, Path(__file__),
-          HERE / "proof_product_gate.py", SOURCE, INTEGRATION, PIPELINE_SOURCE, DESTROYED, HANDLER, AUTO_REGION,
+          HERE / "proof_product_gate.py", SOURCE, INTEGRATION, PIPELINE_SOURCE, LOOP_VIEW,
+          PARSER_ENTRY, *sorted(PARSER_MUTATION_SOURCES), DESTROYED, HANDLER, AUTO_REGION,
           POSITIVE, NEGATIVE]
-hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+
+
+def compiler_source_tree_hash() -> str:
+    digest = hashlib.sha256()
+    for path in sorted((ROOT / "src").rglob("*.elisa")):
+        digest.update(str(path.relative_to(ROOT)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def input_hashes() -> dict[str, str]:
+    hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+    hashes["compiler-src-tree"] = compiler_source_tree_hash()
+    return hashes
+
+
+hashes_before = input_hashes()
 
 
 def run(path: Path) -> tuple[int, dict]:
@@ -288,11 +355,11 @@ assert [(row["kind"], row["name"]) for row in negative["findings"]] == [
     ("ensure-unproven", "false_retreat_does_not_shrink_the_interval"),
     ("ensure-unproven", "false_same_cache_identity_preserves_sort_order"),
 ]
-assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+assert hashes_before == input_hashes()
 assert require_current_product(BIN, PROVER) == manifest, "proof product provenance changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "scalar lower/upper-bound interval arithmetic, unsorted full-range fallback, conditional memo-key collision witness, and semantic safety-consumer bindings",
+    "scope": "lower/upper-bound interval arithmetic, unsorted full-range fallback, memo-key collision witness, parser-preserved annotation lines, per-file memo lifetime, and semantic safety-consumer bindings",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": [row["name"] for row in negative["findings"]],
     "proof_revision": manifest["proof"].get("head"),

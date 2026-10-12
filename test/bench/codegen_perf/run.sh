@@ -10,7 +10,7 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/../../.." && pwd)"
 OUT="${1:?outdir}"; shift
-mkdir -p "$OUT"; OUT="$(cd -- "$OUT" && pwd)"
+mkdir -p "$OUT"; OUT="$(cd -- "$OUT" && pwd -P)"
 if [[ -n "$(find "$OUT" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   echo "output directory is not empty: $OUT (choose a fresh directory to prevent stale results)" >&2
   exit 2
@@ -43,7 +43,7 @@ mark_incomplete_run() {
     wait "$BENCH_LOCK_PID" 2>/dev/null || true
     unset BENCH_LOCK_PID
   fi
-  if (( status != 0 )) && [[ ! -f "$OUT/ABORTED.txt" ]] && [[ ! -f "$OUT/COMPLETE" ]]; then
+  if (( status != 0 )) && [[ ! -f "$OUT/ABORTED.txt" ]] && [[ ! -f "$OUT/AUXILIARY_COMPLETE" ]]; then
     printf 'ABORTED — runner exited with status %d before completion.\nAny partial measurements are unusable.\n' "$status" >"$OUT/ABORTED.txt" || true
   fi
   return "$status"
@@ -51,7 +51,7 @@ mark_incomplete_run() {
 trap mark_incomplete_run EXIT
 
 # Share the host lease with cross_language.sh and incremental_fact_lookup/paired.py.
-BENCH_LOCK_PATH="${TMPDIR:-/tmp}/elisa-cross-language-benchmark.lock"
+BENCH_LOCK_PATH="${ELISA_BENCH_LOCK_PATH:-/tmp/elisa-cross-language-benchmark.lock}"
 BENCH_LOCK_READY="$OUT/.benchmark-lock-ready"
 mkfifo "$BENCH_LOCK_READY"
 python3 - "$BENCH_LOCK_PATH" "$$" <<'PY' >"$BENCH_LOCK_READY" &
@@ -163,7 +163,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
 from bench_load_gate import LoadGateError, check_load_gate, load_average
 try:
-    check_load_gate(load_average(), sys.argv[5], Path(sys.argv[2]), sys.argv[4], Path(sys.argv[3]))
+    check_load_gate(load_average(), sys.argv[5], Path(sys.argv[2]), sys.argv[4], Path(sys.argv[3]), require_live_linux=True)
 except LoadGateError as error:
     print(f"timing load gate failed: {error}", file=sys.stderr)
     raise SystemExit(2)
@@ -232,7 +232,7 @@ from bench_load_gate import LoadGateError, check_load_gate, load_average
 variant = Path(executable).name.rsplit(".", 1)[-1]
 variant_expected = expected["variants"][variant]
 def gate(stage):
-    try: check_load_gate(load_average(), stage, out, system, qualification)
+    try: check_load_gate(load_average(), stage, out, system, qualification, require_live_linux=True)
     except LoadGateError as error: raise SystemExit(f"timing load gate failed: {error}") from error
 def run(command):
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -318,5 +318,5 @@ for b in "${benches[@]}"; do
     printf '%-14s %-8s %10s %6s %14s\n' "$b" "$v" "${r% *}" "${r#* }" "$ir"
   done
 done
-date -u '+completed_at_utc=%Y-%m-%dT%H:%M:%SZ' >"$OUT/COMPLETE"
-echo "Generated-code runtime comparison complete: $OUT"
+date -u '+completed_at_utc=%Y-%m-%dT%H:%M:%SZ' >"$OUT/AUXILIARY_COMPLETE"
+echo "Auxiliary generated-code runtime comparison complete: $OUT"

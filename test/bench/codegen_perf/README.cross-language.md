@@ -53,7 +53,9 @@ each run. `ELISA_RUNTIME_OPT_LEVEL` selects the safe profile's separately built 
 (`-O0` through `-O3`, default `-O2`). `COMPLETE` is written only after checksums and final
 toolchain hashes pass.
 On macOS, the runner checks `load1 / logical_CPU <= 0.20`; on Linux it divides by the minimum
-of CPUs allowed by affinity and the effective cgroup CPU quota. It checks this
+of CPUs allowed by affinity and the effective cgroup CPU quota. On every Linux gate check, it
+also revalidates the qualified affinity count, cgroup membership and namespace, mount layout,
+and quota files against the initial host qualification; any change fails closed. It checks this
 limit before starting preflight builds, so a closed gate does not launch the benchmark build
 matrix. This admission check does not establish correctness: exact correctness preflight is
 still required before timing. The runner then checks the same limit before the first and every
@@ -100,18 +102,21 @@ Edits to manifest inputs during initial builds or repeated compiler/build sample
 the run.
 
 `canonical_workload_fingerprint.json` records every workload's four source hashes, fixed
-expected checksum/status, observed preflight checksum/status, the runner hash, host OS release
-and build, CPU model and features, and compile profile. Its Elisa runtime profile records
-whether the runtime was selected or rebuilt and, for the safe profile, the runtime optimization
-level and checked overflow mode. The JSON record also carries the runtime object's SHA-256 as
-per-run provenance outside the fingerprint payload. The safe profile rebuilds that object with
-the selected Stage1 compiler, so candidate-generated runtime bytes may differ while workload
-and profile parity still match. The compiler implementation sources and runtime artifact hash
-are omitted from the parity payload so fingerprints can match across candidate revisions; the
-same-host identity and runtime build settings remain gated. To require candidate parity before
-any timed compiler sample, set
-`ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT` to the primary run's fingerprint file. The candidate
-run aborts before timing if a workload, profile, checksum, or status differs.
+expected checksum/status, observed preflight checksum/status, runner and benchmark-helper
+hashes, host OS release and build, CPU model and features, CPU entitlement, compile profile,
+and run scope (`full_runtime` or `compile_only`). Its comparator-toolchain list hashes Clang,
+Rust, Zig, LLVM, and explicitly selected linkers while excluding the candidate Stage1 product,
+its provenance file, and runtime object. Those candidate artifact hashes remain recorded in the
+run outputs. The Elisa runtime profile records whether the runtime was selected or rebuilt and,
+for the safe profile, the runtime optimization level and checked overflow mode. The safe profile
+rebuilds that object with the selected Stage1 compiler, so candidate-generated runtime bytes may
+differ while workload and profile parity still match. Candidate and reference runs must use the
+same scope, benchmark helpers, comparator toolchain, host identity, and CPU entitlement. A
+reference fingerprint is accepted only when its run directory has the matching nonempty
+`COMPLETE` or `COMPILE_COMPLETE` marker and no `ABORTED.txt`. To require candidate parity before
+any timed compiler sample, set `ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT` to the primary run's
+fingerprint file. The candidate run aborts before timing if the reference is incomplete or a
+workload, profile, scope, comparator toolchain, checksum, output stream, or status differs.
 
 `compile_samples.csv` stores each rotated object-only compile wall time, waited-child CPU time
 (user plus system), and host load averages before and after the sample; `compile_results.csv`

@@ -34,7 +34,7 @@ if args.pairs < 1: parser.error("pairs must be positive")
 if args.timeout_seconds < 1: parser.error("timeout-seconds must be positive")
 # Share the cross-language runner's host lease so independent timing suites cannot
 # overlap while both individually pass the load gate.
-host_lock_path = Path(os.environ.get("TMPDIR") or "/tmp") / "elisa-cross-language-benchmark.lock"
+host_lock_path = Path(os.environ.get("ELISA_BENCH_LOCK_PATH") or "/tmp/elisa-cross-language-benchmark.lock")
 host_lock_fd = os.open(host_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
 try:
     fcntl.flock(host_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
