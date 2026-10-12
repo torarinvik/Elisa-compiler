@@ -50,10 +50,10 @@ helper_text = HELPER.read_text()
 core_text = CORE.read_text()
 lexer_text = LEXER.read_text()
 helper = compact(function_section(helper_text, "is_valid_type_suffix"))
-exact_predicate = " or ".join(f'suffix == "{spelling}"' for spelling in SUPPORTED)
-if compact(f"ensure result == ({exact_predicate})") not in helper:
-    raise SystemExit("production suffix contract no longer characterizes the complete accepted set")
 match_patterns = " | ".join(f'"{spelling}"' for spelling in SUPPORTED)
+match_contract = f"when suffix: {match_patterns} -> true _ -> false"
+if compact(f"ensure result == ({match_contract})") not in helper:
+    raise SystemExit("production suffix contract no longer pattern-matches the complete accepted set")
 match_decision = f"return match suffix: {match_patterns}: true _: false"
 if compact(match_decision) not in helper:
     raise SystemExit("production suffix decision no longer pattern-matches the exact closed set")
@@ -83,11 +83,11 @@ if "valid:bool=when suffix:" in reader:
 positive_text = POSITIVE.read_text()
 exact_proof = (
     f"def type_suffix_predicate_is_exact(suffix: sview) -> bool: "
-    f"ensure result == ({exact_predicate}) "
+    f"ensure result == ({match_contract}) "
     "return LexerTypeSuffix::is_valid_type_suffix(suffix)"
 )
 if compact(function_section(positive_text, "type_suffix_predicate_is_exact")) != compact(exact_proof):
-    raise SystemExit("universal proof no longer states the exact production suffix grammar")
+    raise SystemExit("universal proof no longer states the exact production suffix match")
 accepted_calls = " and ".join(f'LexerTypeSuffix::is_valid_type_suffix("{spelling}")' for spelling in SUPPORTED)
 accepted_proof = (
     "def every_supported_type_suffix_is_accepted() -> bool: "
