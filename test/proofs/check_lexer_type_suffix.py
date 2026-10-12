@@ -53,8 +53,10 @@ helper = compact(function_section(helper_text, "is_valid_type_suffix"))
 exact_predicate = " or ".join(f'suffix == "{spelling}"' for spelling in SUPPORTED)
 if compact(f"ensure result == ({exact_predicate})") not in helper:
     raise SystemExit("production suffix contract no longer characterizes the complete accepted set")
-if compact(f"return ({exact_predicate})") not in helper:
-    raise SystemExit("production suffix decision expression differs from the exact contract")
+match_patterns = " | ".join(f'"{spelling}"' for spelling in SUPPORTED)
+match_decision = f"return match suffix: {match_patterns}: true _: false"
+if compact(match_decision) not in helper:
+    raise SystemExit("production suffix decision no longer pattern-matches the exact closed set")
 if 'include "./lexer_type_suffix.elisa"' not in core_text:
     raise SystemExit("lexer core no longer imports the proved suffix grammar")
 if 'include "./lexer_core.elisa"' not in lexer_text:
