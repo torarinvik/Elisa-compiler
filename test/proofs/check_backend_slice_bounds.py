@@ -20,6 +20,11 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 GUARDS = ROOT / "src/backend/codegen_guards.elisa"
 CALL = ROOT / "src/backend/codegen_call.elisa"
 SLICES = ROOT / "src/backend/codegen_expr_slice.elisa"
+SIZE_TYPES = ROOT / "src/backend/codegen_interned_types.elisa"
+LLVM_TYPES = ROOT / "src/backend/codegen_llvm_types.elisa"
+STRUCT_TABLE = ROOT / "src/backend/codegen_struct_table.elisa"
+COLLECTIONS = ROOT / "elisacore_std/collections.elisa"
+LLVM_C = ROOT / "src/backend/llvm_c.elisa"
 POSITIVE = HERE / "backend_slice_bounds.elisa"
 NEGATIVE = HERE / "backend_slice_bounds_rejected.elisa"
 LLVM_CONFIG = shutil.which(os.environ.get("LLVM_CONFIG", "llvm-config"))
@@ -28,6 +33,8 @@ POSITIVE_NAMES = {
     "slice_start_clamp",
     "slice_end_clamp",
     "slice_count_from_clamped_start",
+    "clamped_slice_window_fits_source",
+    "bounded_slice_count_fits_target_size",
     "high_select_subtraction_matches_empty_or_difference",
     "inverted_slice_is_empty",
     "slice_start_at_extent_has_no_remaining_count",
@@ -39,6 +46,8 @@ NEGATIVE_NAMES = {
     "false_claim_inverted_slice_has_positive_count",
     "false_claim_negative_string_start_is_nonzero",
     "false_claim_negative_string_end_becomes_zero",
+    "false_claim_clamped_slice_window_crosses_extent",
+    "false_claim_slice_count_fits_undersized_target",
 }
 
 if not __debug__:
@@ -105,59 +114,64 @@ if 'include "./backend_slice_bounds.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the admitted slice bounds model")
 
 predicates = llvm_integer_predicates()
-for name, expected in {
+slice_predicates = {
     "LLVMIntUGT": 34,
     "LLVMIntUGE": 35,
     "LLVMIntULT": 36,
     "LLVMIntSGT": 38,
     "LLVMIntSGE": 39,
-}.items():
+}
+for name, expected in slice_predicates.items():
     if predicates.get(name) != expected:
         raise SystemExit(f"LLVM predicate {name} changed from the proved value {expected}")
+llvm_bindings = compact(LLVM_C.read_text())
+for name, expected in {key.removeprefix("LLVMInt"): value for key, value in slice_predicates.items()}.items():
+    if f"{name}:i32={expected}" not in llvm_bindings:
+        raise SystemExit(f"LLVM C binding {name} no longer matches LLVMIntPredicate::{name}")
 
 guards = GUARDS.read_text()
 start = compact(function_section(guards, "emit_slice_clamp_start"))
 require_ordered(start, (
     "wide_length:LLVMValueRef=slice_bound_width(length,start,builder)",
-    'start_over:LLVMValueRef=LLVMBuildICmp(builder,34,start,wide_length,"slice.start.over")',
+    'start_over:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::UGT,start,wide_length,"slice.start.over")',
     'returnLLVMBuildSelect(builder,start_over,wide_length,start,"slice.start.clamped")',
 ), "slice start clamp")
 
 count = compact(function_section(guards, "emit_slice_clamp_count"))
 require_ordered(count, (
     "wide_length:LLVMValueRef=slice_bound_width(length,end,builder)",
-    'end_over:LLVMValueRef=LLVMBuildICmp(builder,34,end,wide_length,"slice.end.over")',
+    'end_over:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::UGT,end,wide_length,"slice.end.over")',
     'clamped_end:LLVMValueRef=LLVMBuildSelect(builder,end_over,wide_length,end,"slice.end.clamped")',
-    'end_after_start:LLVMValueRef=LLVMBuildICmp(builder,35,clamped_end,clamped_start,"slice.end.after.start")',
+    'end_after_start:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::UGE,clamped_end,clamped_start,"slice.end.after.start")',
     'high:LLVMValueRef=LLVMBuildSelect(builder,end_after_start,clamped_end,clamped_start,"slice.hi")',
     'returnLLVMBuildSub(builder,high,clamped_start,"slice.count")',
 ), "slice count clamp")
 
 normalise_start = compact(function_section(guards, "emit_string_slice_normalise_start"))
 require_ordered(normalise_start, (
-    'start_positive:LLVMValueRef=LLVMBuildICmp(builder,38,start,zero,"strslice.start.positive")',
+    'start_positive:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::SGT,start,zero,"strslice.start.positive")',
     'returnLLVMBuildSelect(builder,start_positive,start,zero,"strslice.start")',
 ), "signed string start normalisation")
 
 normalise_end = compact(function_section(guards, "emit_string_slice_normalise_end"))
 require_ordered(normalise_end, (
     "wide_length:LLVMValueRef=slice_bound_width(length,end,builder)",
-    'end_given:LLVMValueRef=LLVMBuildICmp(builder,39,end,zero,"strslice.end.given")',
+    'end_given:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::SGE,end,zero,"strslice.end.given")',
     'returnLLVMBuildSelect(builder,end_given,end,wide_length,"strslice.end")',
 ), "signed string end normalisation")
 
 call = compact(function_section(CALL.read_text(), "emit_sview_from_parts"))
 require_ordered(call, (
     'sview_source_len:LLVMValueRef=LLVMBuildZExt(builder,sview_strlen_value,sview_i64,"sview.srclen.i64")iftarget_bits==32elsesview_strlen_value',
-    'sview_start_positive:LLVMValueRef=LLVMBuildICmp(builder,38,start,sview_zero,"sview.start.pos")',
-    'sview_start_over:LLVMValueRef=LLVMBuildICmp(builder,34,start,sview_source_len,"sview.start.over")',
+    'sview_start_positive:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::SGT,start,sview_zero,"sview.start.pos")',
+    'sview_start_over:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::UGT,start,sview_source_len,"sview.start.over")',
     'sview_start_clamped:LLVMValueRef=LLVMBuildSelect(builder,sview_start_over,sview_source_len,start,"sview.start.clamped")',
     'sview_lo:LLVMValueRef=LLVMBuildSelect(builder,sview_start_positive,sview_start_clamped,sview_zero,"sview.lo")',
-    'sview_end_bounded:LLVMValueRef=LLVMBuildICmp(builder,39,end,sview_zero,"sview.end.bounded")',
-    'sview_end_over:LLVMValueRef=LLVMBuildICmp(builder,34,end,sview_source_len,"sview.end.over")',
+    'sview_end_bounded:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::SGE,end,sview_zero,"sview.end.bounded")',
+    'sview_end_over:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::UGT,end,sview_source_len,"sview.end.over")',
     'sview_end_clamped:LLVMValueRef=LLVMBuildSelect(builder,sview_end_over,sview_source_len,end,"sview.end.clamped")',
     'sview_hi_raw:LLVMValueRef=LLVMBuildSelect(builder,sview_end_bounded,sview_end_clamped,sview_source_len,"sview.hi.raw")',
-    'sview_hi_under:LLVMValueRef=LLVMBuildICmp(builder,36,sview_hi_raw,sview_lo,"sview.hi.under")',
+    'sview_hi_under:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::ULT,sview_hi_raw,sview_lo,"sview.hi.under")',
     'sview_hi:LLVMValueRef=LLVMBuildSelect(builder,sview_hi_under,sview_lo,sview_hi_raw,"sview.hi")',
     'sview_gep_indices:mutabledarray[LLVMValueRef]=[sview_lo]',
     'sview_data:LLVMValueRef=LLVMBuildGEP2(builder,LLVMInt8TypeInContext(ctx),sview_src,sview_gep_pointer,1,"sview.data")',
@@ -168,14 +182,43 @@ if call.count('LLVMBuildSub(builder,sview_hi,sview_lo,"sview.len")') != 1:
 
 slices = compact(function_section(SLICES.read_text(), "emit_expression_slice"))
 consumer_patterns = (
-    ("darray view", 'view_clamped_start:LLVMValueRef=emit_slice_clamp_start(view_slice_start,source_count,ctx,builder)', 'view_indices:mutabledarray[LLVMValueRef]=[view_clamped_start]', 'view_data:LLVMValueRef=LLVMBuildGEP2(builder,element_llvm,source_items,view_indices_pointer,1,"view.slice.data")', 'view_len:LLVMValueRef=emit_slice_clamp_count(view_clamped_start,view_slice_end,source_count,ctx,builder)', 'view_result<-LLVMBuildInsertValue(builder,view_result,view_len,1,"view.slice.ins1")'),
-    ("fixed-array reference view", 'ref_clamped_start:LLVMValueRef=emit_slice_clamp_start(ref_slice_start,ref_slice_extent,ctx,builder)', 'ref_slice_indices:mutabledarray[LLVMValueRef]=[LLVMConstInt(LLVMInt64TypeInContext(ctx),0,0),ref_clamped_start]', 'ref_slice_data:LLVMValueRef=LLVMBuildGEP2(builder,ref_slice_llvm,ref_slice_base,ref_slice_indices_pointer,2,"arrayslice.ref.data")', 'ref_slice_len:LLVMValueRef=emit_slice_clamp_count(ref_clamped_start,ref_slice_end,ref_slice_extent,ctx,builder)', 'ref_slice_result<-LLVMBuildInsertValue(builder,ref_slice_result,ref_slice_len,1,"arrayslice.ref.ins1")'),
-    ("fixed-array view", 'array_clamped_start:LLVMValueRef=emit_slice_clamp_start(array_slice_start,array_slice_extent,ctx,builder)', 'array_slice_indices:mutabledarray[LLVMValueRef]=[LLVMConstInt(LLVMInt64TypeInContext(ctx),0,0),array_clamped_start]', 'array_slice_data:LLVMValueRef=LLVMBuildGEP2(builder,array_slice_llvm,array_slice_slot,array_slice_indices_pointer,2,"arrayslice.data")', 'array_slice_len:LLVMValueRef=emit_slice_clamp_count(array_clamped_start,array_slice_end,array_slice_extent,ctx,builder)', 'array_slice_result<-LLVMBuildInsertValue(builder,array_slice_result,array_slice_len,1,"arrayslice.ins1")'),
+    ("darray view", 'view_clamped_start:LLVMValueRef=emit_slice_clamp_start(view_slice_start,source_count,ctx,builder)', 'view_indices:mutabledarray[LLVMValueRef]=[view_clamped_start]', 'view_data:LLVMValueRef=LLVMBuildGEP2(builder,element_llvm,source_items,view_indices_pointer,1,"view.slice.data")', 'view_len:LLVMValueRef=emit_slice_clamp_count(view_clamped_start,view_slice_end,source_count,ctx,builder)', 'view_result<-LLVMBuildInsertValue(builder,view_result,darray_size_value_target(view_len,ctx,builder,"view.slice.len.target",structs.target.target_pointer_bits),1,"view.slice.ins1")'),
+    ("fixed-array reference view", 'ref_clamped_start:LLVMValueRef=emit_slice_clamp_start(ref_slice_start,ref_slice_extent,ctx,builder)', 'ref_slice_indices:mutabledarray[LLVMValueRef]=[LLVMConstInt(LLVMInt64TypeInContext(ctx),0,0),ref_clamped_start]', 'ref_slice_data:LLVMValueRef=LLVMBuildGEP2(builder,ref_slice_llvm,ref_slice_base,ref_slice_indices_pointer,2,"arrayslice.ref.data")', 'ref_slice_len:LLVMValueRef=emit_slice_clamp_count(ref_clamped_start,ref_slice_end,ref_slice_extent,ctx,builder)', 'ref_slice_result<-LLVMBuildInsertValue(builder,ref_slice_result,darray_size_value_target(ref_slice_len,ctx,builder,"arrayslice.ref.len.target",structs.target.target_pointer_bits),1,"arrayslice.ref.ins1")'),
+    ("fixed-array view", 'array_clamped_start:LLVMValueRef=emit_slice_clamp_start(array_slice_start,array_slice_extent,ctx,builder)', 'array_slice_indices:mutabledarray[LLVMValueRef]=[LLVMConstInt(LLVMInt64TypeInContext(ctx),0,0),array_clamped_start]', 'array_slice_data:LLVMValueRef=LLVMBuildGEP2(builder,array_slice_llvm,array_slice_slot,array_slice_indices_pointer,2,"arrayslice.data")', 'array_slice_len:LLVMValueRef=emit_slice_clamp_count(array_clamped_start,array_slice_end,array_slice_extent,ctx,builder)', 'array_slice_result<-LLVMBuildInsertValue(builder,array_slice_result,darray_size_value_target(array_slice_len,ctx,builder,"arrayslice.len.target",structs.target.target_pointer_bits),1,"arrayslice.ins1")'),
     ("sview slice", 'sview_clamped_start:LLVMValueRef=emit_slice_clamp_start(emit_string_slice_normalise_start(sview_slice_start,ctx,builder),sview_source_len,ctx,builder)', 'sview_slice_len:LLVMValueRef=emit_slice_clamp_count(sview_clamped_start,emit_string_slice_normalise_end(sview_slice_end,sview_source_len,ctx,builder),sview_source_len,ctx,builder)', 'sview_slice_indices:mutabledarray[LLVMValueRef]=[sview_clamped_start]', 'sview_slice_data_at:LLVMValueRef=LLVMBuildGEP2(builder,LLVMInt8TypeInContext(ctx),sview_slice_data,sview_slice_indices_pointer,1,"byteslice.data")', 'sview_slice_result<-LLVMBuildInsertValue(builder,sview_slice_result,sview_slice_len,1,"byteslice.ins1")'),
-    ("view slice", 'view_clamped_slice_start:LLVMValueRef=emit_slice_clamp_start(view_slice_start,view_source_len,ctx,builder)', 'view_slice_len:LLVMValueRef=emit_slice_clamp_count(view_clamped_slice_start,view_slice_end,view_source_len,ctx,builder)', 'view_slice_indices:mutabledarray[LLVMValueRef]=[view_clamped_slice_start]', 'view_slice_data_at:LLVMValueRef=LLVMBuildGEP2(builder,llvm_type_of(view_slice_element,structs,ctx),view_slice_data,view_slice_indices_pointer,1,"view.slice.data.at")', 'view_slice_result<-LLVMBuildInsertValue(builder,view_slice_result,view_slice_len,1,"view.slice.ins1")'),
+    ("view slice", 'view_clamped_slice_start:LLVMValueRef=emit_slice_clamp_start(view_slice_start,view_source_len,ctx,builder)', 'view_slice_len:LLVMValueRef=emit_slice_clamp_count(view_clamped_slice_start,view_slice_end,view_source_len,ctx,builder)', 'view_slice_indices:mutabledarray[LLVMValueRef]=[view_clamped_slice_start]', 'view_slice_data_at:LLVMValueRef=LLVMBuildGEP2(builder,llvm_type_of(view_slice_element,structs,ctx),view_slice_data,view_slice_indices_pointer,1,"view.slice.data.at")', 'view_slice_result<-LLVMBuildInsertValue(builder,view_slice_result,darray_size_value_target(view_slice_len,ctx,builder,"view.slice.len.target",structs.target.target_pointer_bits),1,"view.slice.ins1")'),
 )
 for label, *steps in consumer_patterns:
     require_ordered(slices, tuple(steps), f"{label} consumer")
+
+target_size_conversion = compact(function_section(SIZE_TYPES.read_text(), "darray_size_value_target"))
+require_ordered(target_size_conversion, (
+    "target_type:LLVMTypeRef=darray_size_type(ctx,target_bits)",
+    "source_type:LLVMTypeRef=LLVMTypeOf(value)",
+    "target_width:u32=target_bits",
+    "source_width:u32=LLVMGetIntTypeWidth(source_type)",
+    "ifsource_width>target_width:",
+    "returnLLVMBuildTrunc(builder,value,target_type,name)",
+    "ifsource_width<target_width:",
+    "returnLLVMBuildZExt(builder,value,target_type,name)",
+    "returnvalue",
+), "slice view target-usize length conversion")
+
+darray_size_type = compact(function_section(SIZE_TYPES.read_text(), "darray_size_type"))
+if "LLVMInt32TypeInContext(ctx)returniftarget_bits==32" not in darray_size_type or \
+        "returnLLVMInt64TypeInContext(ctx)" not in darray_size_type:
+    raise SystemExit("slice source and result counts must use the target usize width")
+darray_layout = compact(function_section(SIZE_TYPES.read_text(), "darray_llvm_type"))
+if "size_type:LLVMTypeRef=darray_size_type(ctx,structs.target.target_pointer_bits)" not in darray_layout or \
+        "fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),size_type,size_type]" not in darray_layout:
+    raise SystemExit("slice darray source count must be stored as target usize")
+view_layout = compact(function_section(LLVM_TYPES.read_text(), "llvm_type_of"))
+if "view_fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),runtime_size_llvm_type(ctx,structs.target.target_pointer_bits)]" not in view_layout:
+    raise SystemExit("slice view source count must use target usize")
+if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(COLLECTIONS.read_text()):
+    raise SystemExit("slice view source declaration must retain usize length")
+if "array_extents:mutabledarray[u32]=[]" not in compact(STRUCT_TABLE.read_text()):
+    raise SystemExit("fixed-array slice extents must remain representable in the recorded u32 domain")
 
 cstr_dispatch = (
     'emit_sview_from_parts(slice_base,slice_start,slice_end,sview_llvm,m,ctx,builder,structs.target.target_pointer_bits)returnifslice_receiver_type.kind==TypeKind.CStr',
@@ -188,6 +231,8 @@ expected_positive = {
     "slice_start_clamp": "def slice_start_clamp(start: u64, length: u64) -> u64:\n    ensure result == (length if start > length else start)\n    ensure result <= length\n    return length if start > length else start",
     "slice_end_clamp": "def slice_end_clamp(end: u64, length: u64) -> u64:\n    ensure result == (length if end > length else end)\n    ensure result <= length\n    return length if end > length else end",
     "slice_count_from_clamped_start": "def slice_count_from_clamped_start(start: u64, end: u64, length: u64) -> u64:\n    requires start <= length\n    ensure result == ((length if end > length else end) - start if (length if end > length else end) >= start else 0)\n    ensure result <= length - start\n    return (length if end > length else end) - start if (length if end > length else end) >= start else 0",
+    "clamped_slice_window_fits_source": "def clamped_slice_window_fits_source(start: u64, end: u64, length: u64) -> bool:\n    requires start <= length\n    ensure result == true\n    count: u64 = slice_count_from_clamped_start(start, end, length)\n    return count <= length - start and start + count <= length",
+    "bounded_slice_count_fits_target_size": "def bounded_slice_count_fits_target_size(count: u64, source_length: u64, target_max: u64) -> bool:\n    requires source_length <= target_max\n    requires count <= source_length\n    ensure result == true\n    return count <= target_max",
     "high_select_subtraction_matches_empty_or_difference": "def high_select_subtraction_matches_empty_or_difference(start: u64, end_clamped: u64) -> bool:\n    ensure result == true\n    return (end_clamped if end_clamped >= start else start) - start == (end_clamped - start if end_clamped >= start else 0)",
     "inverted_slice_is_empty": "def inverted_slice_is_empty(start: u64, end: u64, length: u64) -> bool:\n    requires start <= length and end < start\n    ensure result == true\n    return slice_count_from_clamped_start(start, end, length) == 0",
     "slice_start_at_extent_has_no_remaining_count": "def slice_start_at_extent_has_no_remaining_count(end: u64, length: u64) -> bool:\n    ensure result == true\n    return slice_count_from_clamped_start(length, end, length) == 0",
@@ -199,10 +244,12 @@ for name, expected in expected_positive.items():
         raise SystemExit(f"slice-bounds theorem {name} changed its statement or model")
 
 expected_negative = {
-    "false_claim_clamped_start_can_exceed_extent": "def false_claim_clamped_start_can_exceed_extent() -> bool:\n    ensure result == true\n    start: u64 = 9\n    length: u64 = 4\n    clamped_start: u64 = 4\n    return clamped_start > length",
-    "false_claim_inverted_slice_has_positive_count": "def false_claim_inverted_slice_has_positive_count() -> bool:\n    ensure result == true\n    start: u64 = 4\n    end: u64 = 3\n    length: u64 = 6\n    count: u64 = 0\n    return count > 0",
-    "false_claim_negative_string_start_is_nonzero": "def false_claim_negative_string_start_is_nonzero() -> bool:\n    ensure result == true\n    start: i64 = -1\n    normalised_start: u64 = 0\n    return normalised_start > 0",
-    "false_claim_negative_string_end_becomes_zero": "def false_claim_negative_string_end_becomes_zero() -> bool:\n    ensure result == true\n    end: i64 = -1\n    length: u64 = 2\n    normalised_end: u64 = 2\n    return normalised_end == 0",
+    "false_claim_clamped_start_can_exceed_extent": "def false_claim_clamped_start_can_exceed_extent() -> bool:\n    ensure result == true\n    start: u64 = 9\n    length: u64 = 4\n    clamped_start: u64 = slice_start_clamp(start, length)\n    return clamped_start > length",
+    "false_claim_inverted_slice_has_positive_count": "def false_claim_inverted_slice_has_positive_count() -> bool:\n    ensure result == true\n    start: u64 = 4\n    end: u64 = 3\n    length: u64 = 6\n    count: u64 = slice_count_from_clamped_start(start, end, length)\n    return count > 0",
+    "false_claim_negative_string_start_is_nonzero": "def false_claim_negative_string_start_is_nonzero() -> bool:\n    ensure result == true\n    start: i64 = -1\n    normalised_start: u64 = string_slice_normalise_start(start)\n    return normalised_start > 0",
+    "false_claim_negative_string_end_becomes_zero": "def false_claim_negative_string_end_becomes_zero() -> bool:\n    ensure result == true\n    end: i64 = -1\n    length: u64 = 2\n    normalised_end: u64 = string_slice_normalise_end(end, length)\n    return normalised_end == 0",
+    "false_claim_clamped_slice_window_crosses_extent": "def false_claim_clamped_slice_window_crosses_extent() -> bool:\n    ensure result == true\n    start: u64 = 4\n    end: u64 = 9\n    length: u64 = 6\n    count: u64 = slice_count_from_clamped_start(start, end, length)\n    return start + count > length",
+    "false_claim_slice_count_fits_undersized_target": "def false_claim_slice_count_fits_undersized_target() -> bool:\n    ensure result == true\n    count: u64 = 4294967296\n    source_length: u64 = 4294967296\n    target_max: u64 = 4294967295\n    return count <= target_max",
 }
 negative_text = NEGATIVE.read_text()
 for name, expected in expected_negative.items():
@@ -221,6 +268,7 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", LLVM_HEADER, GUARDS, CALL, SLICES,
+    SIZE_TYPES, LLVM_TYPES, STRUCT_TABLE, COLLECTIONS, LLVM_C,
     POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE]),
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
