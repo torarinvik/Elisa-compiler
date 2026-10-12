@@ -48,30 +48,44 @@ def proof_body(source: str, name: str) -> str:
 
 
 policy = POLICY.read_text()
-classes = {
+classifier_groups = {
     "is_zero_operand_instruction": (
-        "ret", "retq", "cpuid", "cld", "std", "lfence", "rdtsc", "pause", "yield", "isb",
-        "emms", "vzeroall", "trap",
+        ("ret", "retq", "cpuid", "cld", "std"),
+        ("lfence", "rdtsc", "pause", "yield", "isb"),
+        ("emms", "vzeroall", "trap"),
     ),
     "is_one_operand_instruction": (
-        "push", "pushq", "pop", "popq", "inc", "incq", "dec", "decq", "neg", "negq", "not", "notq",
-        "call", "callq", "jmp", "jmpq", "je", "jz", "jne", "jnz", "jl", "jle", "jg", "jge",
-        "jb", "jbe", "ja", "jae", "fldcw", "fnstcw", "stmxcsr", "ldmxcsr",
+        ("push", "pushq", "pop", "popq"),
+        ("inc", "incq", "dec", "decq", "neg", "negq", "not", "notq"),
+        ("call", "callq", "jmp", "jmpq"),
+        ("je", "jz", "jne", "jnz", "jl", "jle", "jg", "jge", "jb", "jbe", "ja", "jae"),
+        ("fldcw", "fnstcw", "stmxcsr", "ldmxcsr"),
     ),
     "is_two_operand_instruction": (
-        "mov", "movq", "movb", "movw", "movl", "movsx", "movsxd", "movsbw", "movsbl", "movsbq",
-        "movswl", "movswq", "movslq", "movzx", "movzbw", "movzbl", "movzbq", "movzwl", "movzwq",
-        "lea", "leaq", "xchg", "xchgl", "xchgq", "add", "addq", "sub", "subq", "and", "andq",
-        "or", "orq", "xor", "xorq", "cmp", "cmpq", "test", "testq", "mrs",
+        ("mov", "movq", "movb", "movw", "movl"),
+        ("movsx", "movsxd", "movsbw", "movsbl", "movsbq", "movswl", "movswq", "movslq"),
+        ("movzx", "movzbw", "movzbl", "movzbq", "movzwl", "movzwq"),
+        ("lea", "leaq", "xchg", "xchgl", "xchgq"),
+        ("add", "addq", "sub", "subq"),
+        ("and", "andq", "or", "orq", "xor", "xorq"),
+        ("cmp", "cmpq", "test", "testq", "mrs"),
     ),
-    "is_shift_instruction": ("shl", "shlq", "sal", "salq", "shr", "shrq", "sar", "sarq"),
+    "is_shift_instruction": (("shl", "shlq", "sal", "salq", "shr", "shrq", "sar", "sarq"),),
 }
-for name, mnemonics in classes.items():
+classes = {name: tuple(mnemonic for group in groups for mnemonic in group) for name, groups in classifier_groups.items()}
+for name, groups in classifier_groups.items():
+    mnemonics = classes[name]
     expression = " or ".join(f'op == "{mnemonic}"' for mnemonic in mnemonics)
+    match_rows = "\n".join(
+        "                " + " | ".join(f'"{mnemonic}"' for mnemonic in group) + ": true"
+        for group in groups
+    )
     expected = f"""
 def {name}(op: sview) -> bool:
     ensure result == ( {expression} )
-    return ({expression})
+    return match op:
+{match_rows}
+                _: false
 """
     if compact(function_section(policy, name)) != compact(expected):
         raise SystemExit(f"{name} changed from its specified closed opcode set")

@@ -73,65 +73,46 @@ def needs_arity_rejection(operand_count: usize) -> bool:
 if compact(function_section(policy, "needs_arity_rejection")) != compact(expected_arity):
     raise SystemExit("operand arity policy no longer rejects exactly counts above the modeled limit")
 
-expected_one_operand_classifier = """
-def is_one_operand_instruction(op: sview) -> bool:
-    ensure result == (
-        op == "push" or op == "pushq" or op == "pop" or op == "popq" or
-        op == "inc" or op == "incq" or op == "dec" or op == "decq" or
-        op == "neg" or op == "negq" or op == "not" or op == "notq" or
-        op == "call" or op == "callq" or op == "jmp" or op == "jmpq" or
-        op == "je" or op == "jz" or op == "jne" or op == "jnz" or
-        op == "jl" or op == "jle" or op == "jg" or op == "jge" or
-        op == "jb" or op == "jbe" or op == "ja" or op == "jae" or
-        op == "fldcw" or op == "fnstcw" or op == "stmxcsr" or op == "ldmxcsr"
+classifier_groups = {
+    "is_zero_operand_instruction": (
+        ("ret", "retq", "cpuid", "cld", "std"),
+        ("lfence", "rdtsc", "pause", "yield", "isb"),
+        ("emms", "vzeroall", "trap"),
+    ),
+    "is_one_operand_instruction": (
+        ("push", "pushq", "pop", "popq"),
+        ("inc", "incq", "dec", "decq", "neg", "negq", "not", "notq"),
+        ("call", "callq", "jmp", "jmpq"),
+        ("je", "jz", "jne", "jnz", "jl", "jle", "jg", "jge", "jb", "jbe", "ja", "jae"),
+        ("fldcw", "fnstcw", "stmxcsr", "ldmxcsr"),
+    ),
+    "is_two_operand_instruction": (
+        ("mov", "movq", "movb", "movw", "movl"),
+        ("movsx", "movsxd", "movsbw", "movsbl", "movsbq", "movswl", "movswq", "movslq"),
+        ("movzx", "movzbw", "movzbl", "movzbq", "movzwl", "movzwq"),
+        ("lea", "leaq", "xchg", "xchgl", "xchgq"),
+        ("add", "addq", "sub", "subq"),
+        ("and", "andq", "or", "orq", "xor", "xorq"),
+        ("cmp", "cmpq", "test", "testq", "mrs"),
+    ),
+    "is_shift_instruction": (("shl", "shlq", "sal", "salq", "shr", "shrq", "sar", "sarq"),),
+}
+for name, groups in classifier_groups.items():
+    mnemonics = tuple(mnemonic for group in groups for mnemonic in group)
+    expression = " or ".join(f'op == "{mnemonic}"' for mnemonic in mnemonics)
+    match_rows = "\n".join(
+        "                " + " | ".join(f'"{mnemonic}"' for mnemonic in group) + ": true"
+        for group in groups
     )
-    return (op == "push" or op == "pushq" or op == "pop" or op == "popq" or
-        op == "inc" or op == "incq" or op == "dec" or op == "decq" or
-        op == "neg" or op == "negq" or op == "not" or op == "notq" or
-        op == "call" or op == "callq" or op == "jmp" or op == "jmpq" or
-        op == "je" or op == "jz" or op == "jne" or op == "jnz" or
-        op == "jl" or op == "jle" or op == "jg" or op == "jge" or
-        op == "jb" or op == "jbe" or op == "ja" or op == "jae" or
-        op == "fldcw" or op == "fnstcw" or op == "stmxcsr" or op == "ldmxcsr")
+    expected = f"""
+def {name}(op: sview) -> bool:
+    ensure result == ( {expression} )
+    return match op:
+{match_rows}
+                _: false
 """
-if compact(function_section(policy, "is_one_operand_instruction")) != compact(expected_one_operand_classifier):
-    raise SystemExit("one-operand opcode policy no longer matches the closed EASM inventory")
-
-expected_two_operand_classifier = """
-def is_two_operand_instruction(op: sview) -> bool:
-    ensure result == (
-        op == "mov" or op == "movq" or op == "movb" or op == "movw" or op == "movl" or
-        op == "movsx" or op == "movsxd" or op == "movsbw" or op == "movsbl" or op == "movsbq" or
-        op == "movswl" or op == "movswq" or op == "movslq" or op == "movzx" or op == "movzbw" or
-        op == "movzbl" or op == "movzbq" or op == "movzwl" or op == "movzwq" or
-        op == "lea" or op == "leaq" or op == "xchg" or op == "xchgl" or op == "xchgq" or
-        op == "add" or op == "addq" or op == "sub" or op == "subq" or
-        op == "and" or op == "andq" or op == "or" or op == "orq" or op == "xor" or op == "xorq" or
-        op == "cmp" or op == "cmpq" or op == "test" or op == "testq" or op == "mrs"
-    )
-    return (op == "mov" or op == "movq" or op == "movb" or op == "movw" or op == "movl" or
-        op == "movsx" or op == "movsxd" or op == "movsbw" or op == "movsbl" or op == "movsbq" or
-        op == "movswl" or op == "movswq" or op == "movslq" or op == "movzx" or op == "movzbw" or
-        op == "movzbl" or op == "movzbq" or op == "movzwl" or op == "movzwq" or
-        op == "lea" or op == "leaq" or op == "xchg" or op == "xchgl" or op == "xchgq" or
-        op == "add" or op == "addq" or op == "sub" or op == "subq" or
-        op == "and" or op == "andq" or op == "or" or op == "orq" or op == "xor" or op == "xorq" or
-        op == "cmp" or op == "cmpq" or op == "test" or op == "testq" or op == "mrs")
-"""
-if compact(function_section(policy, "is_two_operand_instruction")) != compact(expected_two_operand_classifier):
-    raise SystemExit("two-operand opcode policy no longer matches the closed EASM inventory")
-
-expected_shift_classifier = """
-def is_shift_instruction(op: sview) -> bool:
-    ensure result == (
-        op == "shl" or op == "shlq" or op == "sal" or op == "salq" or
-        op == "shr" or op == "shrq" or op == "sar" or op == "sarq"
-    )
-    return (op == "shl" or op == "shlq" or op == "sal" or op == "salq" or
-        op == "shr" or op == "shrq" or op == "sar" or op == "sarq")
-"""
-if compact(function_section(policy, "is_shift_instruction")) != compact(expected_shift_classifier):
-    raise SystemExit("shift opcode policy no longer matches the closed EASM inventory")
+    if compact(function_section(policy, name)) != compact(expected):
+        raise SystemExit(f"{name} changed from its specified closed opcode set")
 
 expected_operand_arity = """
 def operand_arity_supported(op: sview, operand_count: usize) -> bool:
@@ -153,25 +134,8 @@ def operand_arity_supported(op: sview, operand_count: usize) -> bool:
 """
 if compact(function_section(policy, "operand_arity_supported")) != compact(expected_operand_arity):
     raise SystemExit("instruction operand arity no longer matches the closed operation inventory")
-
-expected_zero_operand_classifier = """
-def is_zero_operand_instruction(op: sview) -> bool:
-    ensure result == (
-        op == "ret" or op == "retq" or op == "cpuid" or op == "cld" or op == "std" or
-        op == "lfence" or op == "rdtsc" or op == "pause" or op == "yield" or op == "isb" or
-        op == "emms" or op == "vzeroall" or op == "trap"
-    )
-    return (op == "ret" or op == "retq" or op == "cpuid" or op == "cld" or op == "std" or
-        op == "lfence" or op == "rdtsc" or op == "pause" or op == "yield" or op == "isb" or
-        op == "emms" or op == "vzeroall" or op == "trap")
-"""
-if compact(function_section(policy, "is_zero_operand_instruction")) != compact(expected_zero_operand_classifier):
-    raise SystemExit("zero-operand opcode policy no longer matches the closed EASM inventory")
+zero_operand_mnemonics = tuple(mnemonic for group in classifier_groups["is_zero_operand_instruction"] for mnemonic in group)
 known_op = compact(function_section(PROVENANCE.read_text(), "easm_known_op"))
-zero_operand_mnemonics = (
-    "ret", "retq", "cpuid", "cld", "std", "lfence", "rdtsc", "pause", "yield", "isb",
-    "emms", "vzeroall", "trap",
-)
 if any(f'easm_equal(op, "{mnemonic}")' not in known_op for mnemonic in zero_operand_mnemonics):
     raise SystemExit("zero-operand classifier includes an opcode outside the production known-op set")
 
@@ -378,7 +342,7 @@ role_source = FUNCTION.read_text()
 role_expectations = {
     "easm_operand_is_direct_register": "return sview_len(operand) > 0 and sview_at(operand, 0) == EasmOperandScan::ASCII_PERCENT and EasmOperandScan::exact_register_form(operand, register) and easm_register_bit(register) != 0",
     "easm_operand_is_segment_register": 'return operand == "%fs" or operand == "%gs"',
-    "easm_operand_is_supported_memory": 'base_supported: bool = base == "" or base == "rip" or easm_register_bit(base) != 0 index_supported: bool = index == "" or easm_register_bit(index) != 0 return base_supported and index_supported',
+    "easm_operand_is_supported_memory": 'base_supported: bool = base == "" or base == "rip" or easm_register_bit(base) != 0 index_supported: bool = index == "" or (easm_register_bit(index) != 0 and easm_register_bit(index) != EasmRegisterMasks::RSP) return base_supported and index_supported',
     "easm_operand_is_data_source": "return easm_operand_is_direct_register(operand) or easm_operand_is_supported_memory(operand) or easm_operand_is_immediate(operand)",
     "easm_operand_is_writable": "return easm_operand_is_direct_register(operand) or easm_operand_is_supported_memory(operand)",
     "easm_move_operand_roles_supported": "false return if source_segment and destination_segment if source_segment: return easm_operand_is_writable(destination) if destination_segment: return (easm_operand_is_direct_register(source) or easm_operand_is_supported_memory(source)) and not easm_operand_is_immediate(source) return easm_operand_is_data_source(source) and easm_operand_is_writable(destination)",
@@ -439,7 +403,7 @@ memory_code = compact(memory_roles)
 memory_arity = "operand_scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(instruction.text) continue if not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)"
 if memory_arity not in memory_code:
     raise SystemExit("memory provenance scan must skip unsupported operand shapes before checking first/last operands")
-if memory_code.index("needs_arity_rejection(operand_scan.count)") > memory_code.index("for operand_index in 0..<EasmMemoryBasePolicy::MEMORY_ADDRESS_OPERAND_COUNT"):
+if memory_code.index("needs_arity_rejection(operand_scan.count)") > memory_code.index("for operand_index in 0..<operand_scan.count"):
     raise SystemExit("memory-address validation must fail closed before using first/last operand projections")
 if "operand: sview = easm_substitute_operand(raw_operand, instruction)" not in memory_code:
     raise SystemExit("memory-base and layout checks must inspect fragment-substituted operands")
