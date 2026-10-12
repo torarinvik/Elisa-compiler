@@ -54,7 +54,7 @@ trap mark_incomplete_run EXIT
 BENCH_LOCK_PATH="${TMPDIR:-/tmp}/elisa-cross-language-benchmark.lock"
 BENCH_LOCK_READY="$OUT/.benchmark-lock-ready"
 mkfifo "$BENCH_LOCK_READY"
-python3 - "$BENCH_LOCK_PATH" <<'PY' >"$BENCH_LOCK_READY" &
+python3 - "$BENCH_LOCK_PATH" "$$" <<'PY' >"$BENCH_LOCK_READY" &
 import fcntl
 import os
 import sys
@@ -67,8 +67,9 @@ except BlockingIOError:
     print("busy", flush=True)
     raise SystemExit(3)
 print("locked", flush=True)
-while True:
-    time.sleep(3600)
+parent_pid = int(sys.argv[2])
+while os.getppid() == parent_pid:
+    time.sleep(0.5)
 PY
 BENCH_LOCK_PID=$!
 if ! IFS= read -r BENCH_LOCK_STATUS <"$BENCH_LOCK_READY"; then
@@ -192,6 +193,8 @@ for variant in variants:
         raise SystemExit(f"correctness preflight exceeded {timeout}s timeout: {executable}") from error
     if proc.returncode < 0:
         raise SystemExit(f"correctness preflight terminated by signal {-proc.returncode}: {executable}")
+    if proc.returncode != 0:
+        raise SystemExit(f"correctness preflight exited with status {proc.returncode}: {executable}")
     observed[variant] = (proc.returncode, stdout, stderr)
     (out / f"{benchmark}.{variant}.stdout").write_bytes(stdout)
     (out / f"{benchmark}.{variant}.stderr").write_bytes(stderr)

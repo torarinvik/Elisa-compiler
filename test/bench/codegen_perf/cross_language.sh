@@ -97,7 +97,7 @@ trap mark_incomplete_run EXIT
 BENCH_LOCK_PATH="${TMPDIR:-/tmp}/elisa-cross-language-benchmark.lock"
 BENCH_LOCK_READY="$OUT/.benchmark-lock-ready"
 mkfifo "$BENCH_LOCK_READY"
-python3 - "$BENCH_LOCK_PATH" <<'PY' >"$BENCH_LOCK_READY" &
+python3 - "$BENCH_LOCK_PATH" "$$" <<'PY' >"$BENCH_LOCK_READY" &
 import fcntl
 import os
 import sys
@@ -110,8 +110,9 @@ except BlockingIOError:
     print("busy", flush=True)
     raise SystemExit(3)
 print("locked", flush=True)
-while True:
-    time.sleep(3600)
+parent_pid = int(sys.argv[2])
+while os.getppid() == parent_pid:
+    time.sleep(0.5)
 PY
 BENCH_LOCK_PID=$!
 BENCH_LOCK_STATUS=""
