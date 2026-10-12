@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import re
 import shlex
@@ -401,7 +402,15 @@ def selected_external_linker(clang, clang_artifact, config_libdir, link_flags, p
             if not argv or Path(argv[0]).name not in linker_names:
                 continue
             linker_command = argv[0]
-            linker_argv = argv
+            # Clang compiles the probe's empty C input to a fresh temporary object
+            # (`<tmp>/null-<random>.o`) on every run. Record a stable placeholder so
+            # the toolchain fingerprint taken before and after a seed can match.
+            linker_argv = [
+                "<linker-probe-object>"
+                if re.fullmatch(r"null-[0-9a-zA-Z]+\.o", Path(arg).name) and Path(arg).parent != Path(".")
+                else arg
+                for arg in argv
+            ]
             break
         if linker_command is None:
             diagnostic = (result.stderr or result.stdout).strip().splitlines()
