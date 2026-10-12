@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 
-SCHEMA = "elisa-stage1-provenance-v4"
+SCHEMA = "elisa-stage1-provenance-v5"
 SOURCE_DIRS = ("src", "elisacore_std")
 BUILD_RECIPES = (
     "scripts/platform.sh",
@@ -124,7 +124,7 @@ def toolchain_content_view(value):
         return {
             key: toolchain_content_view(item)
             for key, item in value.items()
-            if key not in stat_fields
+            if key not in stat_fields and key != "linker_probe_cache_key"
         }
     if isinstance(value, list):
         return [toolchain_content_view(item) for item in value]
@@ -177,15 +177,7 @@ def seed_configuration_fingerprint(previous=None, exact=False):
             if expected_runtime_sha:
                 raise RuntimeError("ELISA_STAGE1_SEED_RUNTIME_SHA256 was set without a runtime object")
             runtime_artifact = None
-        host_os = os.uname().sysname
-        if host_os == "Linux":
-            seed_link_flags = ["-no-pie", "-Wl,--gc-sections"]
-            profiler_hook_mode = "--host-callbacks"
-        elif host_os == "Darwin":
-            seed_link_flags = ["-Wl,-dead_strip", "-Wl,-stack_size,0x20000000"]
-            profiler_hook_mode = ""
-        else:
-            raise RuntimeError(f"unsupported Stage1 seed host OS: {host_os}")
+        host_os, seed_link_flags, profiler_hook_mode = stage1_seed_link_recipe()
         clang_path = (
             os.environ.get("ELISA_STAGE1_SEED_CLANG")
             or os.environ.get("ELISA_CLANG")
@@ -290,6 +282,129 @@ def fingerprint_artifact(path, previous=None, exact=False, description="artifact
     return {"path": str(path), **identity, "sha256": digest}
 
 
+def stage1_seed_link_recipe():
+    host_os = os.uname().sysname
+    if host_os == "Linux":
+        return host_os, ["-no-pie", "-Wl,--gc-sections"], "--host-callbacks"
+    if host_os == "Darwin":
+        # Make the directory precedence used for -l resolution explicit. The
+        # provenance resolver uses the same left-to-right rule below.
+        return host_os, ["-Wl,-dead_strip", "-Wl,-stack_size,0x20000000", "-Wl,-search_paths_first"], ""
+    raise RuntimeError(f"unsupported Stage1 seed host OS: {host_os}")
+
+
+def effective_developer_dir(host_os):
+    raw = os.environ.get("DEVELOPER_DIR", "")
+    if not raw and host_os == "Darwin" and Path("/Library/Developer/CommandLineTools").is_dir():
+        raw = "/Library/Developer/CommandLineTools"
+    return str(Path(raw).expanduser().resolve()) if raw else None
+
+
+def selected_external_linker(clang, clang_artifact, config_libdir, link_flags, previous=None, exact=False):
+    previous = previous if isinstance(previous, dict) else {}
+    host_os, seed_link_flags, _ = stage1_seed_link_recipe()
+    developer_dir = effective_developer_dir(host_os)
+    executable_link_flags = os.environ.get("ELISA_LINK_EXE_FLAGS", "")
+    path_env = os.environ.get("PATH", "")
+    probe_environment = {
+        "host_os": host_os,
+        "developer_dir": developer_dir,
+        "path": path_env,
+        "sdk_root": os.environ.get("SDKROOT", ""),
+        "deployment_target": os.environ.get("MACOSX_DEPLOYMENT_TARGET", ""),
+        "clang_path": str(clang),
+        "clang_artifact_sha256": clang_artifact["sha256"],
+        "config_libdir": str(config_libdir),
+        "seed_link_flags": seed_link_flags,
+        "llvm_link_flags": link_flags,
+        "executable_link_flags": executable_link_flags,
+    }
+    probe_cache_key = hashlib.sha256(
+        json.dumps(probe_environment, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    cached = previous.get("external_linker")
+    if (
+        not exact
+        and isinstance(cached, dict)
+        and cached.get("linker_probe_cache_key") == probe_cache_key
+        and cached.get("clang_artifact_sha256") == clang_artifact["sha256"]
+        and isinstance(cached.get("path"), str)
+        and isinstance(cached.get("command"), str)
+        and isinstance(cached.get("link_command"), list)
+        and isinstance(cached.get("artifact"), dict)
+    ):
+        linker_command = cached.get("command")
+        linker_argv = cached.get("link_command")
+        linker_path = Path(cached["path"]).resolve()
+    else:
+        probe_args = [
+            str(clang), "-###", "-fno-builtin", *seed_link_flags,
+            "-o", os.devnull, "-x", "c", os.devnull,
+            f"-L{config_libdir}", *shlex.split(link_flags),
+            *shlex.split(executable_link_flags), f"-Wl,-rpath,{config_libdir}",
+        ]
+        probe_env = os.environ.copy()
+        if developer_dir:
+            probe_env["DEVELOPER_DIR"] = developer_dir
+        else:
+            probe_env.pop("DEVELOPER_DIR", None)
+        try:
+            result = subprocess.run(
+                probe_args, capture_output=True, text=True, env=probe_env, check=True
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"could not resolve the Stage1 external linker with {clang}: {error}") from error
+        linker_argv = None
+        linker_command = None
+        linker_names = {"ld", "ld64", "ld64.lld", "ld.lld", "ld.gold", "ld.bfd", "ld.mold"}
+        for line in result.stderr.splitlines():
+            try:
+                argv = shlex.split(line)
+            except ValueError:
+                continue
+            if not argv or Path(argv[0]).name not in linker_names:
+                continue
+            linker_command = argv[0]
+            linker_argv = argv
+            break
+        if linker_command is None:
+            diagnostic = (result.stderr or result.stdout).strip().splitlines()
+            excerpt = diagnostic[-1] if diagnostic else "no linker command in Clang -### output"
+            raise RuntimeError(f"could not identify the Stage1 external linker: {excerpt}")
+        resolved_command = shutil.which(linker_command, path=path_env) or linker_command
+        linker_path = Path(resolved_command).expanduser().resolve()
+    if not linker_path.is_file() or not os.access(linker_path, os.X_OK):
+        raise RuntimeError(f"selected Stage1 external linker is not executable: {linker_path}")
+    linker_artifact = fingerprint_artifact(
+        linker_path,
+        cached.get("artifact") if isinstance(cached, dict) and cached.get("path") == str(linker_path) else None,
+        exact=exact,
+        description="Stage1 external linker",
+    )
+    version = ""
+    for argument in ("-v", "--version"):
+        try:
+            version_result = subprocess.run(
+                [str(linker_path), argument], capture_output=True, text=True
+            )
+        except OSError:
+            continue
+        lines = (version_result.stdout + "\n" + version_result.stderr).splitlines()
+        version = next((line.strip() for line in lines if line.strip()), "")
+        if version:
+            break
+    return {
+        "command": linker_command,
+        "path": str(linker_path),
+        "artifact": linker_artifact,
+        "version": version,
+        "developer_dir": developer_dir,
+        "link_command": linker_argv,
+        "clang_artifact_sha256": clang_artifact["sha256"],
+        "linker_probe_cache_key": probe_cache_key,
+    }
+
+
 def llvm_toolchain_fingerprint(previous=None, exact=False):
     previous = previous if isinstance(previous, dict) else {}
     raw_config = os.environ.get("LLVM_CONFIG") or previous.get("llvm_config_path")
@@ -306,6 +421,11 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
             for artifact in artifacts:
                 if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
                     previous_artifacts[artifact["path"]] = artifact
+    previous_linker = previous.get("external_linker")
+    if isinstance(previous_linker, dict):
+        artifact = previous_linker.get("artifact")
+        if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
+            previous_artifacts[artifact["path"]] = artifact
 
     def artifact_record(path):
         path = Path(path).resolve()
@@ -360,6 +480,10 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
     if not raw_libdir:
         raw_libdir = previous.get("llvm_libdir") if config_unchanged else None
     libdir = resolved_directory(raw_libdir or llvm_config("--libdir"), "library directory")
+    raw_config_libdir = previous.get("llvm_config_libdir") if config_unchanged and not exact else None
+    config_libdir = resolved_directory(
+        raw_config_libdir or llvm_config("--libdir"), "llvm-config library directory"
+    )
     raw_clang = (
         os.environ.get("ELISA_CLANG")
         or os.environ.get("ELISA_STAGE1_SEED_CLANG")
@@ -389,93 +513,111 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
         link_flags = os.environ["ELISA_LLVM_LIBS"]
     else:
         link_flags = previous.get("link_flags", "") if config_unchanged else ""
+    external_linker = selected_external_linker(
+        clang,
+        clang_artifact,
+        config_libdir,
+        link_flags,
+        previous,
+        exact=exact,
+    )
     link_tokens = shlex.split(link_flags)
-    link_search_dirs = [Path(libdir)]
+    executable_link_tokens = shlex.split(os.environ.get("ELISA_LINK_EXE_FLAGS", ""))
+    all_link_tokens = [*link_tokens, *executable_link_tokens]
+    link_search_dirs = [Path(config_libdir)]
     llvm_library_names = []
     direct_link_libraries = []
-    token_index = 0
-    while token_index < len(link_tokens):
-        token = link_tokens[token_index]
-        if token == "-L" and token_index + 1 < len(link_tokens):
-            link_search_dirs.append(Path(link_tokens[token_index + 1]))
-            token_index += 2
-            continue
-        if token.startswith("-L") and len(token) > 2:
-            link_search_dirs.append(Path(token[2:]))
-        if token.startswith("-lLLVM"):
-            llvm_library_names.append(token[2:])
-        elif token.endswith((".dylib", ".so", ".a", ".lib")) or ".so." in token:
-            candidate = Path(token)
+    def add_search_directory(raw_path):
+        path = Path(raw_path).expanduser()
+        link_search_dirs.append(path if path.is_absolute() else (Path.cwd() / path).resolve())
+
+    def add_search_paths(tokens):
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "-L" and index + 1 < len(tokens):
+                add_search_directory(tokens[index + 1])
+                index += 2
+                continue
+            if token.startswith("-L") and len(token) > 2:
+                add_search_directory(token[2:])
+            elif token.startswith("-Wl,"):
+                forwarded = token[4:].split(",")
+                for part_index, part in enumerate(forwarded):
+                    if part == "-L" and part_index + 1 < len(forwarded):
+                        add_search_directory(forwarded[part_index + 1])
+                    elif part.startswith("-L") and len(part) > 2:
+                        add_search_directory(part[2:])
+            index += 1
+
+    add_search_paths(all_link_tokens)
+    index = 0
+    while index < len(all_link_tokens):
+        token = all_link_tokens[index]
+        if token == "-l" and index + 1 < len(all_link_tokens):
+            library_name = all_link_tokens[index + 1]
+            index += 2
+        elif token.startswith("-l") and len(token) > 2:
+            library_name = token[2:]
+            index += 1
+        else:
+            library_name = None
+            index += 1
+        if library_name and (library_name.startswith("LLVM") or library_name.startswith(":libLLVM")):
+            llvm_library_names.append(library_name)
+        elif token.endswith((".dylib", ".tbd", ".so", ".a", ".lib")) or ".so." in token:
+            candidate = Path(token).expanduser()
             if candidate.is_file():
                 direct_link_libraries.append(candidate.resolve())
-        token_index += 1
-    link_library_paths = set(direct_link_libraries)
-    if sys.platform == "darwin":
-        library_suffixes = (".dylib", ".tbd", ".a")
-    else:
-        library_suffixes = (".so", ".a")
-    for library_name in llvm_library_names:
-        if library_name.startswith(":"):
-            candidate_names = [library_name[1:]]
-        else:
-            candidate_names = [f"lib{library_name}{suffix}" for suffix in library_suffixes]
-            candidate_names.extend(f"lib{library_name}.so.*" for _ in (0,) if sys.platform != "darwin")
-        for directory in link_search_dirs:
-            for candidate_name in candidate_names:
-                candidates = directory.glob(candidate_name)
-                for candidate in candidates:
-                    if candidate.is_file():
-                        link_library_paths.add(candidate.resolve())
-    link_libraries = [artifact_record(path) for path in sorted(link_library_paths)]
+
     static_link = any(
         "start-group" in token or "-Bstatic" in token or token in ("-static",)
         or token.endswith((".a", ".lib"))
-        for token in link_tokens
+        for token in all_link_tokens
     )
-    dynamic_link = any(token == "-lLLVM" or token.startswith("-lLLVM-") for token in link_tokens)
+    dynamic_link = bool(llvm_library_names) or any(
+        Path(path).name.startswith("libLLVM")
+        and (str(path).endswith((".dylib", ".tbd", ".so")) or ".so." in str(path))
+        for path in direct_link_libraries
+    )
     link_mode = "static" if static_link else ("dynamic" if dynamic_link else "unknown")
     if link_mode == "unknown":
         raise RuntimeError("ELISA_LLVM_LIBS does not identify whether Stage1 links LLVM statically or dynamically")
-    static_archives = []
-    dynamic_libraries = []
-    reuse_link_inputs = (
-        config_unchanged
-        and previous.get("link_flags") == link_flags
-        and previous.get("link_mode") == link_mode
-    )
-    if link_mode == "static":
-        prior_archives = previous.get("static_archives") if reuse_link_inputs else None
-        if isinstance(prior_archives, list) and prior_archives:
-            archive_paths = sorted({item["path"] for item in prior_archives if isinstance(item, dict) and "path" in item})
+
+    def resolve_library_name(library_name):
+        if library_name.startswith(":"):
+            candidate_names = [library_name[1:]]
         else:
-            archive_tokens = shlex.split(llvm_config("--link-static", "--libfiles"))
-            archive_tokens.extend(token for token in link_tokens if token.endswith((".a", ".lib")))
-            archive_paths = sorted({str(Path(token).resolve()) for token in archive_tokens})
-        if not archive_paths:
-            raise RuntimeError(f"static LLVM link selected, but {config} reported no archive files")
-        for raw_path in archive_paths:
-            archive = Path(raw_path)
-            if not archive.is_file():
-                raise RuntimeError(f"static LLVM archive is missing: {archive}")
-            static_archives.append(artifact_record(archive))
-    elif link_mode == "dynamic":
-        prior_libraries = previous.get("dynamic_libraries") if reuse_link_inputs else None
-        if isinstance(prior_libraries, list) and prior_libraries:
-            library_paths = sorted({item["path"] for item in prior_libraries if isinstance(item, dict) and "path" in item})
-        else:
-            library_tokens = shlex.split(llvm_config("--link-shared", "--libfiles"))
-            library_paths = sorted({
-                str(Path(token).resolve())
-                for token in library_tokens
-                if token.endswith((".dylib", ".so")) or ".so." in token
-            })
-        if not library_paths:
-            raise RuntimeError(f"dynamic LLVM link selected, but {config} reported no shared LLVM library")
-        for raw_path in library_paths:
-            library = Path(raw_path)
-            if not library.is_file():
-                raise RuntimeError(f"dynamic LLVM library is missing: {library}")
-            dynamic_libraries.append(artifact_record(library))
+            if static_link:
+                suffixes = (".a", ".lib")
+            elif sys.platform == "darwin":
+                suffixes = (".dylib", ".tbd", ".a")
+            else:
+                suffixes = (".so", ".a")
+            candidate_names = [f"lib{library_name}{suffix}" for suffix in suffixes]
+        # The Stage1 seed passes llvm-config --libdir before ELISA_LLVM_LIBS.
+        # On Darwin, -search_paths_first makes this per-directory suffix order
+        # the same one the selected linker uses.
+        for directory in link_search_dirs:
+            for candidate_name in candidate_names:
+                candidate = directory / candidate_name
+                if candidate.is_file():
+                    return candidate.resolve()
+        raise RuntimeError(
+            f"could not resolve linked LLVM library -l{library_name} using Stage1 link search order"
+        )
+
+    link_library_paths = set(direct_link_libraries)
+    for library_name in llvm_library_names:
+        link_library_paths.add(resolve_library_name(library_name))
+    link_libraries = [artifact_record(path) for path in sorted(link_library_paths)]
+    static_archives = [
+        artifact for artifact in link_libraries if artifact["path"].endswith((".a", ".lib"))
+    ]
+    dynamic_libraries = [
+        artifact for artifact in link_libraries
+        if artifact["path"].endswith((".dylib", ".tbd", ".so")) or ".so." in artifact["path"]
+    ]
 
     return {
         "llvm_config_path": str(config),
@@ -483,9 +625,11 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
         "llvm_version": version,
         "llvm_bindir": bindir,
         "llvm_libdir": libdir,
+        "llvm_config_libdir": config_libdir,
         "clang_path": str(clang),
         "clang_artifact": clang_artifact,
         "clang_version": clang_version,
+        "external_linker": external_linker,
         "link_mode": link_mode,
         "link_flags": link_flags,
         "dynamic_libraries": dynamic_libraries,

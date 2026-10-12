@@ -258,7 +258,7 @@ seed_build() {
       seed_hook_mode=--host-callbacks
       ;;
     Darwin)
-      seed_link_flags=(-Wl,-dead_strip -Wl,-stack_size,0x20000000)
+      seed_link_flags=(-Wl,-dead_strip -Wl,-stack_size,0x20000000 -Wl,-search_paths_first)
       seed_hook_mode=""
       ;;
     *)

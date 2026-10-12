@@ -111,8 +111,25 @@ with tempfile.TemporaryDirectory() as directory:
     library.write_bytes(b"llvm-test-library-v1")
     custom_library = custom_libdir / ("libLLVM.dylib" if sys.platform == "darwin" else "libLLVM.so")
     custom_library.write_bytes(b"custom-llvm-library-v1")
+    linker = bindir / "ld"
+    linker.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "print('test external linker 1.0')\n"
+    )
+    linker.chmod(0o755)
     clang = bindir / "clang"
-    clang.write_text(f"#!{sys.executable}\nprint('clang version test')\n")
+    clang.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args:\n"
+        "    print('clang version test')\n"
+        "elif '-###' in args:\n"
+        f"    print({str(linker)!r} + ' -o /dev/null', file=sys.stderr)\n"
+        "else:\n"
+        "    raise SystemExit(2)\n"
+    )
     clang.chmod(0o755)
     llvm_config = bindir / "llvm-config"
     llvm_config.write_text(
@@ -155,6 +172,20 @@ with tempfile.TemporaryDirectory() as directory:
             unchanged = stage1_provenance.llvm_toolchain_fingerprint(original)
         assert unchanged == original
 
+        alternate_linker = bindir / "ld64"
+        alternate_linker.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "print('test alternate external linker 1.0')\n"
+        )
+        alternate_linker.chmod(0o755)
+        clang_source = clang.read_text()
+        clang.write_text(clang_source.replace(str(linker), str(alternate_linker)))
+        clang_modified = stage1_provenance.llvm_toolchain_fingerprint(original)
+        assert clang_modified["external_linker"]["path"] == str(alternate_linker.resolve())
+        assert clang_modified["external_linker"]["clang_artifact_sha256"] == clang_modified["clang_artifact"]["sha256"]
+        clang.write_text(clang_source)
+
         custom_before = custom_library.stat()
         custom_library.write_bytes(b"custom-llvm-library-v2")
         os.utime(custom_library, ns=(custom_before.st_atime_ns, custom_before.st_mtime_ns))
@@ -172,18 +203,20 @@ with tempfile.TemporaryDirectory() as directory:
         assert after.st_size == before.st_size
         assert after.st_mtime_ns == before.st_mtime_ns
         assert after.st_ctime_ns != before.st_ctime_ns
-        changed = stage1_provenance.llvm_toolchain_fingerprint(original)
-        assert changed["dynamic_libraries"][0]["sha256"] != original["dynamic_libraries"][0]["sha256"]
+        unselected_changed = stage1_provenance.llvm_toolchain_fingerprint(original)
+        assert unselected_changed["dynamic_libraries"] == custom_changed["dynamic_libraries"]
+        assert unselected_changed["link_libraries"] == custom_changed["link_libraries"]
+        changed = unselected_changed
 
         damaged_previous = json.loads(json.dumps(changed))
         damaged_previous["dynamic_libraries"][0]["sha256"] = "not-a-sha256"
         repaired = stage1_provenance.llvm_toolchain_fingerprint(damaged_previous)
-        assert repaired["dynamic_libraries"][0]["sha256"] == hashlib.sha256(library.read_bytes()).hexdigest()
+        assert repaired["dynamic_libraries"][0]["sha256"] == hashlib.sha256(custom_library.read_bytes()).hexdigest()
 
         forged_previous = json.loads(json.dumps(changed))
         forged_previous["dynamic_libraries"][0]["sha256"] = "0" * 64
         exact = stage1_provenance.llvm_toolchain_fingerprint(forged_previous, exact=True)
-        assert exact["dynamic_libraries"][0]["sha256"] == hashlib.sha256(library.read_bytes()).hexdigest()
+        assert exact["dynamic_libraries"][0]["sha256"] == hashlib.sha256(custom_library.read_bytes()).hexdigest()
 
         with patch.object(stage1_provenance, "source_revision", lambda _root: "test-toolchain-revision"):
             project = root / "project"
