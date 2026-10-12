@@ -215,7 +215,9 @@ assert require_current_product(BIN, PROVER) == product
 
 print(json.dumps({
     "admitted": True,
-    "scope": "production owner-bucket hash byte-fold correctness, equal-owner bucket consistency, and exact candidate identity checks",
+    "kernel_scope": "production owner hash equals its recursive FNV-1a byte-fold specification; equal owner strings therefore share a bucket",
+    "source_shape_checks": "the production lookup selects the hash bucket, traverses its owner chain, and compares exact owner/name fields before accepting a row",
+    "not_yet_proven": "owner-chain construction invariant, cache freshness/lifetime, and equivalence of indexed lookup to a full annotation scan",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_refused": [row["name"] for row in negative["findings"]],
     "proof_revision": product["proof"].get("head"),
