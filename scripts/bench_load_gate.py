@@ -176,6 +176,8 @@ def effective_cpu_capacity(
     allowed = qualification.get("allowed_cpu_count")
     if not isinstance(allowed, int) or isinstance(allowed, bool) or allowed <= 0:
         raise LoadGateError(f"Linux host qualification has an invalid affinity CPU count: {allowed!r}")
+    if allowed < 64:
+        raise LoadGateError(f"Linux host qualification permits only {allowed} affinity CPUs; at least 64 are required")
     details["allowed_cpu_count"] = allowed
     candidates = [float(allowed)]
 
@@ -186,6 +188,8 @@ def effective_cpu_capacity(
         quota_value = float(quota)
         if not math.isfinite(quota_value) or quota_value <= 0:
             raise LoadGateError(f"Linux host qualification has an invalid cgroup CPU quota: {quota!r}")
+        if quota_value < 64:
+            raise LoadGateError(f"Linux host qualification permits only {quota_value:.2f} cgroup CPUs; at least 64 are required")
         details["cgroup_cpu_quota"] = quota_value
         candidates.append(quota_value)
 

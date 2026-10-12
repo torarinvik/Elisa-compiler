@@ -79,6 +79,15 @@ Box timings are noisy (other agents share it): the same `-emit ast` run measured
 Record these costs with the next controlled stage1 compile-speed run before changing the
 static cutoffs or making the source-AST owner index lazy:
 
+The shared backend name/line-chain helper keeps registries below 32 rows on the linear
+path. Indexed registries use power-of-two bucket and tail arrays sized to at least the
+indexed row count times `NAME_CHAIN_BUCKETS_PER_ROW` (currently 1, with a minimum of 16);
+growth across a capacity boundary rebuilds the indexed prefix, and a stale indexed prefix
+larger than the source column rebuilds from the minimum. The dynamic tables replace the
+former fixed 4096-bucket allocation. Record indexed rows, bucket capacity, rebuild count and
+cost, lookup work, and peak RSS; compare the 1x, 2x, and 4x capacity settings on small,
+self-hosting, and enum-heavy inputs before claiming a compile-time gain.
+
 | index | current build policy | cost to record | follow-up decision |
 |---|---|---|---|
 | Type-alias name chains | built per pass when there are at least 8 aliases | pass CPU/wall time and peak RSS on small and self-hosting inputs | keep the cutoff only if the lookup savings cover map/chain construction and memory |
@@ -90,8 +99,8 @@ static cutoffs or making the source-AST owner index lazy:
 | Active enum payload discovery | lazily builds exact `(owner, name)` hash chains on the first zeroed aggregate type query; rows contain only the first (zero-tag) variant's payload expressions | pass CPU/wall time, index-build cost, payload-row count, and active-payload queries on enum-heavy inputs and inputs without an invalid zeroed/omitted initializer | preserve declaration order across duplicate enum fragments, module/scope lookup, and first-variant-only semantics; compare eager scan and lazy index before keeping |
 | Backend submit-presence scans | lazily open-addressed per-function memo for nested statement lists | codegen CPU/wall time and memo allocations on nested-submit inputs, plus flat functions in files that contain submit annotations | keep only if saved subtree walks outweigh hashing and table growth costs |
 | Region-forwarding named-call mapping | compute source-argument positions and the callee fact row once per named call | callgrind/helper counts and temporary allocations for named, positional, duplicate, unknown, and receiver calls; stage1 IR-generation CPU | keep only if repeated mapping work saved exceeds per-call map construction; preserve partial mappings before an invalid argument |
-| Mutable-global name chains | build after 32 rows, then extend on each append; small registries keep the linear path | codegen CPU/wall time, mutable-global lookup counts, peak RSS, and bucket allocations on small and self-hosting inputs | keep the cutoff/index only if lookup savings cover the fixed bucket allocation; preserve owner priority and declaration-order fallback |
-| Packed-enum name chains | build after 32 rows, then extend on each placeholder/final-row append; smaller registries keep the linear path | codegen CPU/wall time, packed-enum lookup counts, candidate rows visited, peak RSS, and bucket allocations on self-hosting and enum-heavy inputs | keep only if owner and qualified-scope scan savings cover index costs; preserve owner precedence, ambiguity rules, scope ranking, and source-order ties |
+| Mutable-global name chains | build after 32 rows with geometric power-of-two capacity; extend on each append and rebuild on capacity growth or source truncation | codegen CPU/wall time, mutable-global lookup counts, indexed rows, bucket capacities, rebuild work, and peak RSS on small and self-hosting inputs | keep only if lookup savings cover dynamic table initialization and rebuild work; preserve owner priority and declaration-order fallback |
+| Packed-enum name chains | build after 32 rows with geometric power-of-two capacity; extend on each placeholder/final-row append and rebuild on capacity growth or source truncation | codegen CPU/wall time, packed-enum lookup counts, candidate rows visited, indexed rows, bucket capacities, rebuild work, and peak RSS on self-hosting and enum-heavy inputs | keep only if owner and qualified-scope scan savings cover dynamic table initialization, rebuild work, and memory; preserve owner precedence, ambiguity rules, scope ranking, and source-order ties |
 | Packed owner-membership cache | build batch-work-gated name chains for packed-name gating and relevant annotation candidates, classify each enum declaration and payload row once, and reuse flags for placeholder reservation and payload-registration rounds | IR-generation CPU/wall time, packed-name probes, candidate annotation rows visited, index and flag-table memory on self-hosting and enum-heavy inputs | keep only if repeated metadata scans saved exceed index and classification costs; preserve module ownership and interface-only fallback |
 | Packed variant-path lookup | hash the final enum-name slice, compute the maximum matching scope rank in one candidate pass, then visit tied rows in source order | codegen CPU/wall time, path queries, same-name candidates, and bytes hashed on nested-module and enum-heavy inputs | keep only if narrower candidate walks offset path-slice hashing; preserve qualified owner matching, lexical precedence, variant order, and rank ties |
 | Payload-enum name chains | build after payload finalization when there are at least 32 live rows; registration and smaller tables keep the linear path | codegen CPU/wall time, qualified enum lookup counts, peak RSS, and bucket allocations on enum-heavy and self-hosting inputs | keep only if saved owner/rank scans exceed index construction and memory; preserve owner precedence, alias fallback, and declaration-order ties |
@@ -242,6 +251,11 @@ invalid backend IR in an object build prints numbered values instead of names.
   fixed-row reads in unoptimized builds. Compare optimized self-host object runtime and
   instructions, plus compile-time codegen cost and parity for compiler AST and fixed-store
   workloads; these direct-reader changes have not been built or measured.
+- `ctx_aos_store_record_side_words_at` and `ctx_aos_store_read_side_word` now derive chunk and
+  in-chunk indices from `PACKED_AOS_CHUNK_RECORDS` instead of loading `state.chunk_records`;
+  constructors initialize that field to the same constant. Generated code calls these helpers
+  for packed side-table writes and reads. Compare self-host `-emit check` CPU/wall and
+  cross-language generated-runtime ratios separately, along with helper instruction counts.
 
 ## Round 4 (claude/s1-perf-r4: 0cdb5c72, bd9fdb13, 341f72ba, ddbc803d)
 

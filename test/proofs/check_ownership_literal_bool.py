@@ -120,6 +120,31 @@ def require_match_arm_structure(source, function_name, arm_header, expected, lab
         raise SystemExit(f"{label} changed its branch body or nesting")
 
 
+def direct_function_children(source, function_name):
+    """Return normalized statements at the function body's direct indentation."""
+    lines = source_function_raw(source, function_name).splitlines()
+    definition = next((line for line in lines if line.lstrip().startswith("def ")), None)
+    if definition is None:
+        raise SystemExit(f"function definition is missing: {function_name}")
+    function_indent = len(definition) - len(definition.lstrip(" "))
+    child_indent = function_indent + 4
+    children = []
+    for line in lines:
+        code = line.split("#", 1)[0].rstrip()
+        if not code.strip() or len(code) - len(code.lstrip(" ")) != child_indent:
+            continue
+        children.append(compact_source(code))
+    return children
+
+
+def require_direct_function_children(source, function_name, expected, label):
+    actual = direct_function_children(source, function_name)
+    positions = [actual.index(compact_source(anchor)) if compact_source(anchor) in actual else -1
+                 for anchor in expected]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise SystemExit(f"{label} changed direct function-body nesting or order")
+
+
 def nest_match_arm_under_guard(source, function_name, arm_header, guard):
     """Mutation fixture: wrap the complete arm body without changing its tokens."""
     function = source_function_raw(source, function_name)
@@ -139,6 +164,21 @@ def nest_match_arm_under_guard(source, function_name, arm_header, guard):
         rewritten.extend("    " + row if row.strip() else row for row in lines[index + 1:end])
         return "\n".join(lines[:index] + rewritten + lines[end:])
     raise SystemExit(f"mutation fixture could not find {function_name}: {arm_header}")
+
+
+def nest_function_tail_under_guard(source, function_name, start_line, guard):
+    """Mutation fixture: guard every statement from START_LINE to function end."""
+    function = source_function_raw(source, function_name)
+    lines = function.splitlines()
+    for index, line in enumerate(lines):
+        code = line.split("#", 1)[0].rstrip()
+        if compact_source(code) != compact_source(start_line):
+            continue
+        indent = len(code) - len(code.lstrip(" "))
+        rewritten = [lines[index][:indent] + guard]
+        rewritten.extend("    " + row if row.strip() else row for row in lines[index:])
+        return "\n".join(lines[:index] + rewritten)
+    raise SystemExit(f"mutation fixture could not find {function_name}: {start_line}")
 
 
 start = flow_source.find("def ownership_literal_bool(")
@@ -432,6 +472,150 @@ literal_if_arms = (
 )
 for source, function_name, arm_header, label, expected in literal_if_arms:
     require_match_arm_structure(source, function_name, arm_header, expected, label)
+
+# The loop fixed-point transfer remains a direct part of the loop analysis. In
+# particular, literal conditions still analyze the body before proving that an
+# infinite loop has no fallthrough frontier.
+require_direct_function_children(flow_source, "ownership_flow_loop", (
+    "literal = ownership_literal_bool(condition)",
+    "for iteration in 0..<OWNERSHIP_FLOW_LOOP_FIXED_POINT_LIMIT |head, flow, work|:",
+    "work.occurrences <- work.occurrences.truncate(occurrence_mark)",
+    "ownership_frontier_copy(flow, &head)",
+    "flow.reachable <- entry.reachable",
+    "ownership_flow_unknown(flow)",
+), "ownership loop fixed-point transfer")
+require_match_arm_structure(flow_source, "ownership_flow_loop",
+    "for iteration in 0..<OWNERSHIP_FLOW_LOOP_FIXED_POINT_LIMIT |head, flow, work|:",
+    """for iteration in 0..<OWNERSHIP_FLOW_LOOP_FIXED_POINT_LIMIT |head, flow, work|:
+    work.occurrences <- work.occurrences.truncate(occurrence_mark)
+    tested: mutable OwnershipFrontier = ownership_flow_clone(&head)
+    ownership_flow_expression(condition, owner, table, &tested, work, depth + 1)
+    back: mutable OwnershipFrontier = ownership_flow_clone(&tested)
+    back.reachable <- back.reachable and literal.value if literal.known
+    ownership_for_bindings(variables, position, owner, table, &back) if back.reachable
+    ownership_flow_statements(body, owner, table, &back, work, depth + 1)
+    next: mutable OwnershipFrontier = ownership_flow_clone(&entry)
+    ownership_flow_join(&next, &entry, &back)
+    if ownership_frontiers_equal(&head, &next):
+        ownership_frontier_copy(flow, &tested)
+        if not back.coverage_complete:
+            ownership_flow_unknown(flow)
+        elif literal.known and literal.value:
+            flow.reachable <- false
+        return
+    ownership_frontier_copy(&head, &next)""",
+    "ownership loop fixed-point body")
+
+# Preserve this bypass as a regression: all old token, count, order, and flow
+# write checks still accept it, while the direct-child structure gate rejects it.
+mutated_ownership_loop = nest_function_tail_under_guard(
+    flow_source,
+    "ownership_flow_loop",
+    "literal = ownership_literal_bool(condition)",
+    "if not (condition is Expr.BoolLit(_, _)):",
+)
+mutated_ownership_loop_body = source_function(mutated_ownership_loop, "ownership_flow_loop")
+if mutated_ownership_loop_body.count("ownership_literal_bool(") != 1 or \
+        len(re.findall(r"(?:literal|literal_guard)\.value", mutated_ownership_loop_body)) != 2 or \
+        len(re.findall(r"(?:literal|literal_guard)\.known", mutated_ownership_loop_body)) != 2:
+    raise SystemExit("ownership loop mutation no longer preserves legacy call-site and field-use counts")
+if source_field_lines(mutated_ownership_loop, "ownership_flow_loop", "known") != [
+        "back.reachable<-back.reachableandliteral.valueifliteral.known",
+        "elifliteral.knownandliteral.value:"] or \
+        source_reachability_writes(mutated_ownership_loop, "ownership_flow_loop") != [
+            "back.reachable<-back.reachableandliteral.valueifliteral.known",
+            "flow.reachable<-false",
+            "flow.reachable<-entry.reachable"] or \
+        source_control_transfer_lines(mutated_ownership_loop, "ownership_flow_loop") != expected_flow_control_transfers["ownership_flow_loop"]:
+    raise SystemExit("ownership loop mutation no longer preserves legacy field, write, and transfer inventories")
+require_ordered(mutated_ownership_loop_body, (
+    "literal=ownership_literal_bool(condition)",
+    "foriterationin0..<OWNERSHIP_FLOW_LOOP_FIXED_POINT_LIMIT|head,flow,work|:",
+    "ownership_flow_expression(condition,owner,table,&tested,work,depth+1)",
+    "back.reachable<-back.reachableandliteral.valueifliteral.known",
+    "ownership_flow_statements(body,owner,table,&back,work,depth+1)",
+    "ifownership_frontiers_equal(&head,&next):",
+    "flow.reachable<-entry.reachable",
+), "mutated ownership loop")
+try:
+    require_direct_function_children(mutated_ownership_loop, "ownership_flow_loop", (
+        "literal = ownership_literal_bool(condition)",
+        "for iteration in 0..<OWNERSHIP_FLOW_LOOP_FIXED_POINT_LIMIT |head, flow, work|:",
+        "work.occurrences <- work.occurrences.truncate(occurrence_mark)",
+        "ownership_frontier_copy(flow, &head)",
+        "flow.reachable <- entry.reachable",
+        "ownership_flow_unknown(flow)",
+    ), "mutated ownership loop")
+except SystemExit:
+    pass
+else:
+    raise SystemExit("ownership literal-bool source gate accepted the nested loop-analysis bypass")
+
+# Match-arm guard facts must control that arm's branch frontier and join.
+require_match_arm_structure(derived_source, "derived_source_walk", "Stmt.Match(value, arms, _):",
+    """Stmt.Match(value, arms, _):
+    derived_source_effects(value, owner, table, flow)
+    for arm in arms |flow|:
+        derived_source_effects(arm.guard, owner, table, flow)
+    joined: mutable DerivedSourceFrontier = derived_source_clone(flow)
+    joined.reachable <- false
+    for arm in arms |joined, fuel, table|:
+        branch: mutable DerivedSourceFrontier = derived_source_clone(flow)
+        literal_guard = ownership_literal_bool(arm.guard)
+        branch.reachable <- false if literal_guard.known and not literal_guard.value
+        table <- derived_source_walk(&arm.body, expected, scope, owner, rules, &branch, fuel, table, depth + 1, report)
+        next: mutable DerivedSourceFrontier = derived_source_clone(flow)
+        derived_source_join(&next, &joined, &branch)
+        joined <- next
+    entry: mutable DerivedSourceFrontier = derived_source_clone(flow)
+    derived_source_join(flow, &entry, &joined)""",
+    "derived-source match-arm guard transfer")
+
+# A literal guard must not bypass branch processing just because the arm is
+# being traversed. The structural signature rejects this nested mutation.
+mutated_derived_match = nest_match_arm_under_guard(
+    derived_source,
+    "derived_source_walk",
+    "for arm in arms |joined, fuel, table|:",
+    "if not (arm.guard is Expr.BoolLit(_, _)):",
+)
+mutated_derived_match_body = source_function(mutated_derived_match, "derived_source_walk")
+if mutated_derived_match_body.count("ownership_literal_bool(") != derived_sites["derived_source_walk"][0] or \
+        len(re.findall(r"(?:literal|literal_guard)\.value", mutated_derived_match_body)) != derived_sites["derived_source_walk"][1] or \
+        len(re.findall(r"(?:literal|literal_guard)\.known", mutated_derived_match_body)) != derived_sites["derived_source_walk"][2]:
+    raise SystemExit("derived match mutation no longer preserves legacy call-site and field-use counts")
+if source_field_lines(mutated_derived_match, "derived_source_walk", "known") != expected_derived_known_lines["derived_source_walk"] or \
+        source_reachability_writes(mutated_derived_match, "derived_source_walk") != expected_derived_reachability_writes["derived_source_walk"] or \
+        source_control_transfer_lines(mutated_derived_match, "derived_source_walk") != expected_derived_control_transfers["derived_source_walk"]:
+    raise SystemExit("derived match mutation no longer preserves legacy field, write, and transfer inventories")
+require_ordered(mutated_derived_match_body, derived_sites["derived_source_walk"][3], "mutated derived-source match")
+try:
+    require_match_arm_structure(
+        mutated_derived_match,
+        "derived_source_walk",
+        "Stmt.Match(value, arms, _):",
+        """Stmt.Match(value, arms, _):
+        derived_source_effects(value, owner, table, flow)
+        for arm in arms |flow|:
+            derived_source_effects(arm.guard, owner, table, flow)
+        joined: mutable DerivedSourceFrontier = derived_source_clone(flow)
+        joined.reachable <- false
+        for arm in arms |joined, fuel, table|:
+            branch: mutable DerivedSourceFrontier = derived_source_clone(flow)
+            literal_guard = ownership_literal_bool(arm.guard)
+            branch.reachable <- false if literal_guard.known and not literal_guard.value
+            table <- derived_source_walk(&arm.body, expected, scope, owner, rules, &branch, fuel, table, depth + 1, report)
+            next: mutable DerivedSourceFrontier = derived_source_clone(flow)
+            derived_source_join(&next, &joined, &branch)
+            joined <- next
+        entry: mutable DerivedSourceFrontier = derived_source_clone(flow)
+        derived_source_join(flow, &entry, &joined)""",
+        "mutated derived-source match-arm guard transfer",
+    )
+except SystemExit:
+    pass
+else:
+    raise SystemExit("ownership literal-bool source gate accepted the nested match-arm bypass")
 
 # This reproduces the bypass discovered in the coverage audit. Compact token
 # counts remain unchanged by the wrapper; the structural gate above must refuse

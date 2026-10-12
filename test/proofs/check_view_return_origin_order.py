@@ -43,6 +43,7 @@ required_source = (
     "ghost def vro_text_compare_prefix_preserves(",
     "requires position <= sview_len(left) and position <= sview_len(right)",
     "decreases (sview_len(left) if sview_len(left) < sview_len(right) else sview_len(right)) - position",
+    "ensure vro_text_compare_reference_from(left, right, 0) == vro_text_compare_reference_from(left, right, position)",
     "-1 return if left[position] < right[position]",
     "1 return if left[position] > right[position]",
     "ensure result == vro_text_compare_reference_from(left, right, 0)",
