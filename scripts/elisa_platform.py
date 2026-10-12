@@ -18,10 +18,31 @@ def _llvm_config() -> str:
     env = os.environ.get("LLVM_CONFIG")
     if env:
         return env
-    found = shutil.which("llvm-config")
-    if found:
-        return found
-    return "/opt/homebrew/opt/llvm/bin/llvm-config"
+    if DARWIN:
+        # Match platform.sh: don't let an older llvm-config earlier on PATH override
+        # Homebrew's current LLVM formula. The brew prefix query is read-only and must
+        # not trigger a formula update while resolving the compiler toolchain.
+        brew = shutil.which("brew")
+        if not brew:
+            raise RuntimeError(
+                "Homebrew is required to select LLVM on macOS; set LLVM_CONFIG to override"
+            )
+        brew_env = os.environ.copy()
+        brew_env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+        result = subprocess.run(
+            [brew, "--prefix", "llvm"], capture_output=True, text=True, env=brew_env
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Homebrew LLVM is not installed; set LLVM_CONFIG to override"
+            )
+        candidate = os.path.join(result.stdout.strip(), "bin", "llvm-config")
+        if not os.access(candidate, os.X_OK):
+            raise RuntimeError(
+                "Homebrew LLVM is missing llvm-config; set LLVM_CONFIG to override"
+            )
+        return candidate
+    return shutil.which("llvm-config") or shutil.which("llvm-config-21") or "llvm-config"
 
 
 LLVM_CONFIG = _llvm_config()
