@@ -2,7 +2,8 @@
 # Verify the backend's Darwin/POSIX compatibility predicates in emitted code.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-OBJDUMP="${LLVM_OBJDUMP:-/opt/homebrew/opt/llvm/bin/llvm-objdump}"
+source "$ROOT/scripts/platform.sh"
+OBJDUMP="${LLVM_OBJDUMP:-$ELISA_LLVM_BIN_DIR/llvm-objdump}"
 [[ -x "$OBJDUMP" ]] || { echo "set LLVM_OBJDUMP to LLVM's object disassembler" >&2; exit 2; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-apple-predicates.XXXXXX")"
 trap 'rm -rf -- "$WORK"' EXIT

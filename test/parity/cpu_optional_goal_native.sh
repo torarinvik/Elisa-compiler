@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+source scripts/platform.sh
 out="${ELISA_CPU_PROBE_OUTPUT:?set an isolated output directory}"
 mkdir -p "$out"
 producer="${ELISA_CPU_PROBE_PRODUCER:?set explicit compiler producer}"
 hooks="${ELISA_CPU_PROBE_HOOKS:?set source-runtime fallback hooks only}"
+clang="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 : "${ELISA_CORE:?set matching core source/runtime identity}"
 sha256sum "$producer" "$hooks" test/repro/cpu_optional_goal_allocation_probe.* > "$out/inputs.sha256"
 source scripts/process_rss.sh
 exec 9>/tmp/elisac-stage1-global-seed.lock
 flock -w 180 9
 ulimit -s 524288
-/usr/lib/llvm-21/bin/clang -c test/repro/cpu_optional_goal_allocation_probe.c -o "$out/oracle.o"
+"$clang" -c test/repro/cpu_optional_goal_allocation_probe.c -o "$out/oracle.o"
 for opt in 0 2; do
  GOMAXPROCS=2 ELISACORE_CODEGEN_JOBS=1 ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1 "$producer" -emit obj -target-triple x86_64-unknown-linux-gnu -O"$opt" -o "$out/probe-O$opt.o" test/repro/cpu_optional_goal_allocation_probe.elisa > "$out/compile-O$opt.stdout" 2> "$out/compile-O$opt.stderr" &
  child=$!
@@ -31,7 +33,7 @@ for opt in 0 2; do
  printf '%s\n' "$status" > "$out/compile-O$opt.status"
  printf '%s\n' "$peak" > "$out/compile-O$opt.peak-rss-kb"
  [[ "$status" == 0 ]] || exit "$status"
- /usr/lib/llvm-21/bin/clang -no-pie "$out/probe-O$opt.o" "$out/oracle.o" "$hooks" -L/usr/lib/llvm-21/lib -Wl,-rpath,/usr/lib/llvm-21/lib -lLLVM -lm -lpthread -ldl -Wl,-z,stack-size=536870912 -Wl,--no-undefined -o "$out/probe-O$opt.exe" > "$out/link-O$opt.log" 2>&1
+ "$clang" -no-pie "$out/probe-O$opt.o" "$out/oracle.o" "$hooks" -L"$ELISA_LLVM_LIBDIR" -Wl,-rpath,"$ELISA_LLVM_LIBDIR" $ELISA_LLVM_LIBS -lm -lpthread -ldl -Wl,-z,stack-size=536870912 -Wl,--no-undefined -o "$out/probe-O$opt.exe" > "$out/link-O$opt.log" 2>&1
  set +e
  "$out/probe-O$opt.exe" > "$out/run-O$opt.stdout" 2> "$out/run-O$opt.stderr"; status=$?
  set -e

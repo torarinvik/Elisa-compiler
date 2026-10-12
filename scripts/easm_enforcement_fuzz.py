@@ -116,7 +116,7 @@ def ensure_driver(elisac: str, llvm_config: str) -> pathlib.Path:
             with fallback.open("w", encoding="utf-8") as fh:
                 subprocess.run(["bash", str(profiler_script)], stdout=fh, check=True)
             subprocess.check_call(
-                ["clang", "-o", str(DRIVER), str(obj), str(fallback), f"-L{libdir}", *elisa_platform.LLVM_LIBS, *elisa_platform.LINK_EXE_FLAGS, f"-Wl,-rpath,{libdir}"],
+                [elisa_platform.LLVM_CLANG, "-o", str(DRIVER), str(obj), str(fallback), f"-L{libdir}", *elisa_platform.LLVM_LIBS, *elisa_platform.LINK_EXE_FLAGS, f"-Wl,-rpath,{libdir}"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

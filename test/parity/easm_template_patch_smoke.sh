@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
 LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
     echo "easm_template_patch_smoke FAIL: stage0 compiler or llvm-config not found" >&2
     exit 1
@@ -20,7 +21,7 @@ fi
 # the profiler ABI unconditionally), which is what kept this gate red.
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$ROOT/build" "$ROOT"
-if ! clang -o "$ROOT/build/easm_template_patch_smoke" "$ROOT/build/easm_template_patch_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$("$LLVM_CONFIG" --libdir)" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+if ! "$CLANG" -o "$ROOT/build/easm_template_patch_smoke" "$ROOT/build/easm_template_patch_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$("$LLVM_CONFIG" --libdir)" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_template_patch_smoke FAILED: could not link patch test"
     exit 1
 fi
