@@ -21,10 +21,13 @@ Run only after the candidate passes `test/parity/incremental_prior_key_index_gat
 python3 test/bench/incremental_fact_lookup/paired.py PARENT_ROOT PARENT_BIN CANDIDATE_ROOT CANDIDATE_BIN /absolute/corpus /absolute/results --pairs 7
 ```
 
-Before starting the compiler-heavy correctness preflight, the Mac runner checks
-`load1 / logical_CPU <= 0.20`; a closed gate writes `ABORTED.txt` without launching the
-preflight builds. Passing this admission check does not authorize timing. Before any timed
-pair, the runner still uses isolated cache directories to verify exact parent/candidate
+The paired runner is exploratory and macOS-only. Before starting the compiler-heavy
+correctness preflight, it uses the shared benchmark load gate and requires
+`load1 / logical_CPU <= 0.20`. Use `cross_language.sh` for qualified Linux timing. A closed
+gate writes `ABORTED.txt` without launching the preflight builds. The runner also holds the
+shared cross-language benchmark lock, so compiler timing suites cannot overlap on the host.
+Passing admission does not authorize timing. Before any timed pair, the runner still uses
+isolated cache directories to verify exact parent/candidate
 stdout and diagnostics for both the original-source priming compile and the body edit,
 along with reuse reports and prior snapshot hashes for every workload. It then alternates arm
 order, primes each product on the original source, and times the body edit at the same absolute
@@ -33,10 +36,10 @@ construction, cache loading, current-source validation and publication. Separate
 directories prevent cross-product writes.
 
 Each pair must have identical prior snapshot bytes, diagnostics and reuse counts.
-Product/provenance/LLVM/source/corpus hashes are checked before timing, after correctness
-preflight, and after all pairs. On macOS, timing proceeds only when `load1 / logical_CPU <=
-0.20`; the runner checks after preflight and before and after priming and timed samples, and
-marks failed runs `ABORTED.txt`. Raw samples include CPU time and host load. Saved prior
+Product/provenance/LLVM/source/corpus and benchmark-harness hashes are checked before timing,
+after correctness preflight, and after all pairs. The load gate runs before and after each
+preflight compile, then before and after priming and timed samples; a failure writes
+`ABORTED.txt`. Raw samples include CPU time and host load. Saved prior
 snapshots allow admission inputs to be inspected afterward. `COMPLETE` marks a fully written
 summary; unexpected exits write `ABORTED.txt` when possible. The runner uses the newest
 installed Homebrew LLVM and does not invoke `brew update`.

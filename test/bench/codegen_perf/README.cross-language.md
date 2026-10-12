@@ -52,14 +52,15 @@ implementation targets the host. The output directory must be empty; use a fresh
 each run. `ELISA_RUNTIME_OPT_LEVEL` selects the safe profile's separately built runtime level
 (`-O0` through `-O3`, default `-O2`). `COMPLETE` is written only after checksums and final
 toolchain hashes pass.
-On macOS, the runner first checks `load1 / logical_CPU <= 0.20` before starting preflight
-builds, so a closed gate does not launch the benchmark build matrix. This admission check does
-not establish correctness or authorize timing: exact correctness preflight is still required
-before timing. The runner then checks the same limit before the first and every later compile,
-build, and runtime sample, and again after each sample finishes. A pre-sample
+On macOS, the runner checks `load1 / logical_CPU <= 0.20`; on Linux it divides by the minimum
+of CPUs allowed by affinity and the effective cgroup CPU quota. It checks this
+limit before starting preflight builds, so a closed gate does not launch the benchmark build
+matrix. This admission check does not establish correctness: exact correctness preflight is
+still required before timing. The runner then checks the same limit before the first and every
+later compile, build, and runtime sample, and again after each sample finishes. A pre-sample
 violation starts no sample; a post-sample violation lets the in-flight sample finish, writes
 `ABORTED.txt`, and prevents either completion marker from being written. Treat every partial
-artifact from that run as unusable. This exploratory Mac gate does not change the separate
+artifact from that run as unusable. The load gate does not change the separate
 64-core x86_64 Linux qualification.
 
 Release flags are recorded in `metadata.txt`. The default fast profile uses Elisa

@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """Exploratory paired full-process warm incremental checks; never cold compile timing."""
-import argparse, atexit, csv, hashlib, json, math, os, platform, re, resource, signal, statistics, subprocess, sys, tempfile, time
+import argparse
+import atexit
+import csv
+import fcntl
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import resource
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -16,6 +32,15 @@ parser.add_argument("--timeout-seconds", type=int, default=900,
 args = parser.parse_args()
 if args.pairs < 1: parser.error("pairs must be positive")
 if args.timeout_seconds < 1: parser.error("timeout-seconds must be positive")
+# Share the cross-language runner's host lease so independent timing suites cannot
+# overlap while both individually pass the load gate.
+host_lock_path = Path(os.environ.get("TMPDIR") or "/tmp") / "elisa-cross-language-benchmark.lock"
+host_lock_fd = os.open(host_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(host_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    os.close(host_lock_fd)
+    parser.error(f"another compiler benchmark holds the host lock at {host_lock_path}")
 args.output = args.output.resolve()
 args.output.mkdir(parents=True, exist_ok=True)
 if any(args.output.iterdir()):
@@ -77,6 +102,24 @@ pins, fingerprints, libraries = {}, {}, {}
 # Resolve one Homebrew toolchain from the benchmark checkout. The parent source tree may
 # carry an older platform.sh, but both products must be checked against the same current LLVM.
 benchmark_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(benchmark_root / "scripts"))
+from bench_load_gate import LoadGateError, check_load_gate, load_average
+
+system = platform.system()
+host_qualification = args.output / "host_qualification.json"
+if system == "Darwin":
+    host_qualification.write_text(json.dumps({
+        "system": "Darwin",
+        "machine": platform.machine(),
+        "qualified": False,
+        "reason": "macOS paired timings are exploratory",
+    }, indent=2, sort_keys=True) + "\n")
+else:
+    parser.error(
+        f"the paired incremental runner is exploratory macOS-only; use "
+        f"cross_language.sh for qualified Linux timing (current platform: {system})"
+    )
+
 selected_toolchain_env = platform_environment(benchmark_root)
 toolchain_envs = {arm: selected_toolchain_env.copy() for arm in products}
 for arm, (root, binary) in products.items():
@@ -84,7 +127,8 @@ for arm, (root, binary) in products.items():
     fingerprints[arm] = inputs(root, toolchain_envs[arm], binary)
     libraries[arm] = linked_llvm(binary)
     for path in [binary, Path(str(binary) + ".provenance.json")]: pins[str(path)] = digest(path)
-assert libraries['parent'] == libraries['candidate'], libraries
+if libraries['parent'] != libraries['candidate']:
+    raise RuntimeError(f"parent/candidate LLVM libraries differ: {libraries}")
 pins[str(libraries['parent'])] = digest(libraries['parent'])
 manifest = json.loads((args.corpus / "manifest.json").read_text())
 pins[str((args.corpus / 'manifest.json').resolve())] = digest(args.corpus / 'manifest.json')
@@ -92,15 +136,30 @@ for workload in manifest['workloads']:
     for filename in workload['sha256']:
         path = (args.corpus / workload['directory'] / filename).resolve()
         pins[str(path)] = digest(path)
+for path in {
+    Path(__file__).resolve(),
+    benchmark_root / "scripts/platform.sh",
+    benchmark_root / "scripts/bench_load_gate.py",
+    benchmark_root / "scripts/stage1_provenance.py",
+    host_qualification,
+    *(root / "scripts/platform.sh" for root, _ in products.values()),
+    *(root / "scripts/stage1_provenance.py" for root, _ in products.values()),
+}:
+    resolved = path.resolve()
+    pins[str(resolved)] = digest(resolved)
 metadata = {
-    "status": "exploratory shared-Mac opt-in warm semantic-cache only",
+    "status": "exploratory paired full-process warm incremental checks; not cold compile timing",
     "platform": platform.platform(),
     "pairs": args.pairs,
+    "benchmark_host_lock": str(host_lock_path),
+    "host_qualification": str(host_qualification),
+    "host_qualification_sha256": digest(host_qualification),
+    "runner_sha256": digest(Path(__file__).resolve()),
     "compiler_process_timeout_seconds": args.timeout_seconds,
     "elisa_force_contracts_inherited": "set" if "ELISACORE_FORCE_CONTRACTS" in os.environ else "unset",
     "elisa_force_contracts_effective": "unset for prime and measured invocations",
     "source_inputs": fingerprints,
-    "product_and_llvm_hashes": pins,
+    "pinned_input_sha256": pins,
     "corpus": manifest,
 }
 (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -126,41 +185,22 @@ def run_compiler(command, env, cwd):
 
 rows = []
 report_pattern = re.compile(r"^incremental-ga-cache:.*$", re.MULTILINE)
-logical_cpu_count = os.cpu_count()
-load1_limit = 0.20 * logical_cpu_count if logical_cpu_count else None
 
-def enforce_load_gate(stage):
-    if platform.system() != "Darwin":
-        return os.getloadavg()
+def enforce_load_gate(stage, *, preflight=False):
+    load = load_average()
     try:
-        load = os.getloadavg()
-    except (AttributeError, OSError) as error:
-        load = (None, None, None)
-        detail = f"could not read load averages: {error}"
-    else:
-        detail = f"load1={load[0]!r}, logical_cpus={logical_cpu_count!r}"
-    if load1_limit is not None and load[0] is not None and load[0] <= load1_limit:
-        return load
-    threshold = "unavailable" if load1_limit is None else f"{load1_limit:.2f}"
-    reason = f"Mac timing load gate failed {stage}: {detail}; required load1 <= {threshold}"
-    (args.output / "ABORTED.txt").write_text(
-        "ABORTED — Mac timing load gate failed.\n"
-        f"{reason}\n"
-        "Any partial artifacts and measurements from this run are unusable.\n"
-    )
-    raise SystemExit(reason)
+        check_load_gate(
+            load, stage, args.output, system, host_qualification,
+            preflight=preflight,
+        )
+    except LoadGateError as error:
+        raise SystemExit(str(error)) from error
+    return load
 
 # This correctness preflight invokes both compiler products on every workload. A passing
 # admission check only permits that preparation to begin; exact parity and a second load
 # check are still required before any timed pair.
-preflight_load = enforce_load_gate("before correctness preflight builds")
-(args.output / "preflight_load_admission.json").write_text(json.dumps({
-    "stage": "before correctness preflight builds",
-    "load1": preflight_load[0] if preflight_load else None,
-    "logical_cpus": logical_cpu_count,
-    "load1_limit": load1_limit,
-    "passed": True,
-}, indent=2, sort_keys=True) + "\n")
+enforce_load_gate("before correctness preflight builds", preflight=True)
 
 def correctness_evidence(workload, source, original, edited, cache_directory, arm):
     root, binary = products[arm]
@@ -171,7 +211,9 @@ def correctness_evidence(workload, source, original, edited, cache_directory, ar
     env['ELISA_STAGE1_INCREMENTAL_CACHE_REPORT'] = '1'
     command = [str(binary), '-emit', 'check', str(source)]
     source.write_bytes(original)
+    enforce_load_gate(f"before correctness prime {workload['directory']}/{arm}")
     primed = run_compiler(command, env, root)
+    enforce_load_gate(f"after correctness prime {workload['directory']}/{arm}")
     prime_stderr = primed.stderr.decode()
     prime_reports = report_pattern.findall(prime_stderr)
     prime_clean = report_pattern.sub('', prime_stderr)
@@ -180,7 +222,9 @@ def correctness_evidence(workload, source, original, edited, cache_directory, ar
         raise RuntimeError(f"expected one semantic cache snapshot for {arm}, found {prior_files}")
     prior_hash = hashlib.sha256(prior_files[0].read_bytes()).hexdigest()
     source.write_bytes(edited)
+    enforce_load_gate(f"before correctness sample {workload['directory']}/{arm}")
     result = run_compiler(command, env, root)
+    enforce_load_gate(f"after correctness sample {workload['directory']}/{arm}")
     stderr = result.stderr.decode()
     reports = report_pattern.findall(stderr)
     if len(reports) != 1 or 'prior=valid' not in reports[0] or 'published=yes' not in reports[0]:
@@ -294,18 +338,25 @@ for workload in manifest['workloads']:
             load_after = enforce_load_gate(f"after timed sample {name}/{arm}/{pair + 1}")
             stderr = result.stderr.decode()
             reports = report_pattern.findall(stderr)
-            assert len(reports) == 1 and 'prior=valid' in reports[0] and 'published=yes' in reports[0], reports
+            if len(reports) != 1 or 'prior=valid' not in reports[0] or 'published=yes' not in reports[0]:
+                raise RuntimeError(f"{name}/{arm} timed cache report mismatch: {reports}")
             expected_matches = 1 if 'supported_helpers' in workload else workload['helpers']
-            assert re.search(r' matched=' + str(expected_matches) + r' visited=' + str(workload['functions']) + r' ', reports[0]), reports
+            if not re.search(r' matched=' + str(expected_matches) + r' visited=' + str(workload['functions']) + r' ', reports[0]):
+                raise RuntimeError(f"{name}/{arm} timed cache coverage mismatch: {reports}")
             clean = report_pattern.sub('', stderr)
             evidence[arm] = (result.stdout, clean, reports, prior_hash)
             (directory / f'{arm}-{pair}.stderr').write_bytes(result.stderr)
             (directory / f'{arm}-{pair}.stdout').write_bytes(result.stdout)
             rows.append({"workload": name, "pair": pair, "arm": arm, "wall_seconds": wall, "cpu_seconds": after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime, "load_before": load_before[0], "load_after": load_after[0], "report": reports[0], "prior_snapshot_sha256": prior_hash})
-        assert evidence['parent'] == evidence['candidate'], evidence
+        if evidence['parent'] != evidence['candidate']:
+            raise RuntimeError(f"parent/candidate timed evidence mismatch for {name}, pair {pair + 1}: {evidence}")
     print('completed ' + name, flush=True)
-for path, expected in pins.items(): assert digest(Path(path)) == expected, path
-for arm, (root, binary) in products.items(): assert inputs(root, toolchain_envs[arm]) == fingerprints[arm], arm
+for path, expected in pins.items():
+    if digest(Path(path)) != expected:
+        raise RuntimeError(f"pinned input changed during timing: {path}")
+for arm, (root, binary) in products.items():
+    if inputs(root, toolchain_envs[arm]) != fingerprints[arm]:
+        raise RuntimeError(f"Stage1 source or toolchain inputs changed during timing: {arm}")
 with (args.output / 'samples.csv').open('w', newline='') as stream:
     writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
 summaries = {}

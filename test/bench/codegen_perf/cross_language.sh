@@ -128,47 +128,6 @@ if [[ "$BENCH_LOCK_STATUS" != locked ]]; then
   echo "another cross-language benchmark holds the host lock; retry after it completes" >&2
   exit 2
 fi
-if [[ "$(uname -s)" == Darwin ]]; then
-  if ! python3 - "$OUT" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-output = Path(sys.argv[1])
-try:
-    load1 = os.getloadavg()[0]
-except (AttributeError, OSError):
-    load1 = None
-logical_cpus = os.cpu_count()
-limit = 0.20 * logical_cpus if logical_cpus else None
-passed = load1 is not None and limit is not None and load1 <= limit
-record = {
-    "stage": "before benchmark preflight builds",
-    "load1": load1,
-    "logical_cpus": logical_cpus,
-    "load1_limit": limit,
-    "passed": passed,
-}
-(output / "preflight_load_admission.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-if not passed:
-    reason = (
-        f"load1={load1!r}, logical_cpus={logical_cpus!r}, required load1 <= "
-        f"{limit:.2f}" if limit is not None else
-        f"load1={load1!r}, logical_cpus={logical_cpus!r}, required load1 <= unavailable"
-    )
-    (output / "ABORTED.txt").write_text(
-        "ABORTED — Mac timing load gate failed before benchmark preflight.\n"
-        f"{reason}\n"
-        "No benchmark builds or timed samples were started.\n"
-    )
-    print(f"macOS load gate failed before benchmark preflight: {reason}", file=sys.stderr)
-    raise SystemExit(2)
-PY
-  then
-    exit 2
-  fi
-fi
 RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 HOST_QUALIFICATION="$OUT/host_qualification.json"
 python3 - "$HOST_QUALIFICATION" "$(uname -s)" <<'PY'
@@ -321,6 +280,9 @@ if system == "Linux" and not result["qualified"]:
     print(f"Linux host is not eligible for a qualified comparison: {result['reason']}", file=sys.stderr)
     raise SystemExit(2)
 PY
+if ! python3 "$ROOT/scripts/bench_load_gate.py" preflight "$OUT" "$HOST_QUALIFICATION" "$(uname -s)"; then
+  exit 2
+fi
 REPEAT="${REPEAT:-5}"
 [[ "$REPEAT" =~ ^[1-9][0-9]*$ ]] || { echo "REPEAT must be a positive integer" >&2; exit 2; }
 BUILD_REPEAT="${BUILD_REPEAT:-$REPEAT}"
@@ -790,7 +752,7 @@ fi
   echo "repeat=$REPEAT (best and median wall and child user+system CPU seconds; correctness preflight is untimed)"
   echo "build_repeat=$BUILD_REPEAT (object-only and end-to-end build samples; variants rotated per metric/sample)"
   echo "compile_only=$COMPILE_ONLY (timed runtime samples skipped when set to 1; exact checksum preflight retained)"
-  echo "mac_load_gate=load1/logical_cpu <= 0.20; admission checked before preflight builds and load checked before/after every timed sample; a violation writes ABORTED.txt and suppresses completion markers"
+  echo "load_gate=load1/effective_cpu_capacity <= 0.20; Mac uses logical CPUs and Linux uses the minimum of affinity CPUs and cgroup quota; admission checked before preflight builds and load checked before/after every timed sample; violations write ABORTED.txt"
   echo "benchmark_host_lock=$BENCH_LOCK_PATH (held until run exit; concurrent runs on this host are rejected)"
   echo "source_manifest_sha256=$(tool_sha256 "$OUT/sources.sha256")"
   echo "canonical_workload_fingerprint=canonical_workload_fingerprint.json (workload-only source/checksum/status fingerprint)"
@@ -828,6 +790,8 @@ repeat = int(sys.argv[2])
 timeout_seconds = int(sys.argv[3])
 source_dir = Path(sys.argv[4])
 root = Path(sys.argv[5])
+sys.path.insert(0, str(root / "scripts"))
+from bench_load_gate import LoadGateError, check_load_gate, load_average
 elisa_bin, runtime, clang, rustc, zig = sys.argv[6:11]
 elisa_bin, runtime, clang, rustc, zig = (str(Path(path).resolve()) for path in (elisa_bin, runtime, clang, rustc, zig))
 run_id = sys.argv[11]
@@ -866,34 +830,11 @@ times = {
     for metric in ("compile", "build")
 }
 
-def load_average():
-    try:
-        return os.getloadavg()
-    except (AttributeError, OSError):
-        return (None, None, None)
-
-mac_load_gate = sys.platform == "darwin"
-logical_cpu_count = os.cpu_count()
-load1_limit = 0.20 * logical_cpu_count if logical_cpu_count else None
-
 def enforce_load_gate(load, stage):
-    if not mac_load_gate:
-        return
-    load1 = load[0] if load else None
-    if logical_cpu_count and logical_cpu_count > 0 and load1 is not None and load1 <= load1_limit:
-        return
-    threshold = "unavailable" if load1_limit is None else f"{load1_limit:.2f}"
-    reason = (
-        f"macOS load gate failed {stage}: load1={load1!r}, logical_cpus={logical_cpu_count!r}, "
-        f"required load1 <= {threshold}"
-    )
-    (out / "ABORTED.txt").write_text(
-        "ABORTED — Mac timing load gate failed.\n"
-        f"{reason}\n"
-        "Any partial outputs and measurements in this run are unusable. "
-        "An in-flight sample was allowed to finish before the post-sample check.\n"
-    )
-    raise SystemExit(reason)
+    try:
+        check_load_gate(load, stage, out, platform.system(), out / "host_qualification.json")
+    except LoadGateError as error:
+        raise SystemExit(str(error)) from error
 
 expected_checksums = {
     "matmul": "-432360",
@@ -1364,12 +1305,13 @@ if [[ "$COMPILE_ONLY" == 1 ]]; then
   exit 0
 fi
 
-python3 - "$OUT" "$REPEAT" "$BENCH_TIMEOUT_SECONDS" "${benches[@]}" <<'PY'
+python3 - "$OUT" "$REPEAT" "$BENCH_TIMEOUT_SECONDS" "$ROOT" "${benches[@]}" <<'PY'
 import csv
 import hashlib
 import json
 import math
 import os
+import platform
 import resource
 import signal
 import statistics
@@ -1381,39 +1323,19 @@ from pathlib import Path
 out = Path(sys.argv[1])
 repeat = int(sys.argv[2])
 timeout_seconds = int(sys.argv[3])
-benches = sys.argv[4:]
+root = Path(sys.argv[4])
+sys.path.insert(0, str(root / "scripts"))
+from bench_load_gate import LoadGateError, check_load_gate, load_average
+benches = sys.argv[5:]
 variants = ("elisa", "c", "rust", "zig")
 checksums = {}
 exit_statuses = {}
 
-mac_load_gate = sys.platform == "darwin"
-logical_cpu_count = os.cpu_count()
-load1_limit = 0.20 * logical_cpu_count if logical_cpu_count else None
-
-def load_average():
-    try:
-        return os.getloadavg()
-    except (AttributeError, OSError):
-        return (None, None, None)
-
 def enforce_load_gate(load, stage):
-    if not mac_load_gate:
-        return
-    load1 = load[0] if load else None
-    if logical_cpu_count and logical_cpu_count > 0 and load1 is not None and load1 <= load1_limit:
-        return
-    threshold = "unavailable" if load1_limit is None else f"{load1_limit:.2f}"
-    reason = (
-        f"macOS load gate failed {stage}: load1={load1!r}, logical_cpus={logical_cpu_count!r}, "
-        f"required load1 <= {threshold}"
-    )
-    (out / "ABORTED.txt").write_text(
-        "ABORTED — Mac timing load gate failed.\n"
-        f"{reason}\n"
-        "Any partial outputs and measurements in this run are unusable. "
-        "An in-flight sample was allowed to finish before the post-sample check.\n"
-    )
-    raise SystemExit(reason)
+    try:
+        check_load_gate(load, stage, out, platform.system(), out / "host_qualification.json")
+    except LoadGateError as error:
+        raise SystemExit(str(error)) from error
 
 preflight_path = out / "correctness_preflight.json"
 try:
