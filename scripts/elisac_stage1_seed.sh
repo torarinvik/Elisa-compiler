@@ -115,19 +115,25 @@ seed_build() {
   }
   trap cleanup_seed_lock EXIT INT TERM HUP
   libdir="$("$LLVM_CONFIG" --libdir)"
-  if [[ ! -x "$STAGE0_BIN" ]]; then
-    echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$STAGE0_BIN" >&2
+  if [[ ! -x "$BOOTSTRAP_BIN" ]]; then
+    echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$BOOTSTRAP_BIN" >&2
     exit 2
   fi
   # The bootstrap compiler discharges the compiler's own contracts with an external z3. Without one on PATH
   # it does not say so: it reports the std's min/max/clamp ensures as unprovable and fails
   # minutes into the seed. Refuse up front with the actual cause.
   if ! command -v z3 >/dev/null 2>&1; then
-    echo "seed: no z3 on PATH; bootstrap compiler $STAGE0_BIN needs an SMT solver to prove the compiler's contracts (install z3 >= 5, e.g. \`pip install z3-solver\`)" >&2
+    echo "seed: no z3 on PATH; bootstrap compiler $BOOTSTRAP_BIN needs an SMT solver to prove the compiler's contracts (install z3 >= 5, e.g. \`pip install z3-solver\`)" >&2
     exit 2
   fi
-  seed_bootstrap_kind=stage0
-  if [[ "$(basename "$STAGE0_BIN")" == "elisac-stage1" ]]; then seed_bootstrap_kind=stage1; fi
+  seed_bootstrap_kind="${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}"
+  if [[ -z "$seed_bootstrap_kind" ]]; then
+    seed_bootstrap_kind="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+  fi
+  case "$seed_bootstrap_kind" in
+    stage0|stage1) ;;
+    *) echo "seed: invalid bootstrap compiler kind: $seed_bootstrap_kind" >&2; exit 2 ;;
+  esac
   # A Stage1 bootstrap may be built from compiler sources that import helpers from
   # native_runtime_support. The caller supplies a matching, SHA-256-pinned runtime
   # for this one link; the new product still rebuilds its runtime below.
@@ -170,8 +176,8 @@ seed_build() {
   fi
   # A filename is not compiler provenance: copied products may be renamed.
   # Identify the exact executable without guessing its implementation stage.
-  echo "seed: building Stage1 product with bootstrap compiler $STAGE0_BIN" >&2
-  echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$STAGE0_BIN" | awk '{print $1}')" >&2
+  echo "seed: building Stage1 product with $seed_bootstrap_kind bootstrap compiler $BOOTSTRAP_BIN" >&2
+  echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$BOOTSTRAP_BIN" | awk '{print $1}')" >&2
   # The compiler itself is a large input. A duplicated seed can consume the whole
   # workstation before either invocation reports an error, so bound one seed by default.
   # The 5.5 GiB freeze came from two worktrees seeding at once; the host-wide global seed lock
@@ -188,7 +194,7 @@ seed_build() {
       exit 2
       ;;
   esac
-  "$STAGE0_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
+  "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
   seed_peak_rss_kb=0
   while kill -0 "$seed_pid" 2>/dev/null; do
@@ -227,9 +233,9 @@ seed_build() {
   set -e
   if [[ "$seed_status" -ne 0 ]]; then
     if [[ "$seed_status" -gt 128 ]]; then
-      echo "seed: bootstrap compiler $STAGE0_BIN terminated with status $seed_status (signal $((seed_status - 128)))" >&2
+      echo "seed: $seed_bootstrap_kind bootstrap compiler $BOOTSTRAP_BIN terminated with status $seed_status (signal $((seed_status - 128)))" >&2
     else
-      echo "seed: bootstrap compiler $STAGE0_BIN failed with status $seed_status" >&2
+      echo "seed: $seed_bootstrap_kind bootstrap compiler $BOOTSTRAP_BIN failed with status $seed_status" >&2
     fi
     exit "$seed_status"
   fi

@@ -21,13 +21,14 @@ BIN="${1:-${ELISACORE_BIN:-}}"
 # Stage0 does not understand language features used by the compiler sources. Its
 # provenance manifest fingerprints the exact Elisa sources and build recipes, so
 # validate it with the checker from the product's own checkout before accepting it.
-if [ "$(basename "$BIN")" = "elisac-stage1" ]; then
+if [ "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" = stage1 ] || [ "$(basename "$BIN")" = "elisac-stage1" ]; then
     STAGE1_ROOT="$(cd "$(dirname "$BIN")/.." 2>/dev/null && pwd || true)"
     STAGE1_PROVENANCE="${STAGE1_ROOT:+$STAGE1_ROOT/scripts/stage1_provenance.py}"
     if [ -z "$STAGE1_ROOT" ] || [ ! -f "$STAGE1_PROVENANCE" ]; then
         echo "cannot verify Stage1 bootstrap provenance for $BIN" >&2
         exit 2
     fi
+    . "$STAGE1_ROOT/scripts/platform.sh"
     if ! command -v python3 >/dev/null 2>&1; then
         echo "cannot verify Stage1 bootstrap provenance: python3 is unavailable (binary: $BIN)" >&2
         exit 2

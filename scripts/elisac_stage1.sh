@@ -51,6 +51,9 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
+if [[ -x "$ELISA_CLANG_TOOL" ]]; then
+  export ELISA_CLANG="$ELISA_CLANG_TOOL"
+fi
 # `ELISA_RUNTIME_OBJ=none` is an explicit product-link mode: emit only the
 # module object so a dependency graph can provide one shared Elisa runtime
 # archive. An unset value retains the normal standalone archive behavior.
@@ -73,25 +76,25 @@ fi
 # wrong for `elisa-compiler-worktrees/profiler`. Callers can still select an
 # explicit compiler with ELISACORE_BIN.
 if [[ -n "${ELISACORE_BIN:-}" ]]; then
-  STAGE0_BIN="$ELISACORE_BIN"
+  BOOTSTRAP_BIN="$ELISACORE_BIN"
 else
-  STAGE0_BIN=""
+  BOOTSTRAP_BIN=""
   # Inside a linked worktree (.claude/worktrees/*) the relative paths below miss; the main
   # checkout is the parent of the shared git dir.
   # Installed snapshots intentionally omit .git. Treat that as the standalone
   # compiler root instead of letting set -e abort the product launcher.
   main_checkout="$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
   main_checkout="${main_checkout%/.git}"
-  for stage0_candidate in \
+  for bootstrap_candidate in \
       "${main_checkout:-$ROOT}/../../Go projects/Elisa-core/compiler/bin/elisac" \
       "$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac" \
       "$ROOT/../../../Go projects/Elisa-core/compiler/bin/elisac"; do
-    if [[ -x "$stage0_candidate" ]]; then
-      STAGE0_BIN="$stage0_candidate"
+    if [[ -x "$bootstrap_candidate" ]]; then
+      BOOTSTRAP_BIN="$bootstrap_candidate"
       break
     fi
   done
-  STAGE0_BIN="${STAGE0_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+  BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 fi
 # Host predicates for the product's `static if ELISA_TARGET_OS_*` / `PLATFORM_*` consts and
 # the project system's platform key (see register_target_consts / host_platform_name). stage0
@@ -171,7 +174,11 @@ source "$ROOT/scripts/process_rss.sh"
 source "$ROOT/scripts/elisac_stage1_seed.sh"
 
 if [[ "${1:-}" == "--seed" ]]; then
-  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0_BIN"
+  export ELISA_STAGE1_SEED_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
+  ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+  export ELISA_STAGE1_SEED_BOOTSTRAP_KIND
+  export ELISA_STAGE1_SEED_CLANG="$ELISA_CLANG_TOOL"
+  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN"
   seed_input_fingerprint="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT")"
   ELISA_STAGE1_SEED_INPUTS="$seed_input_fingerprint"
   seed_build
@@ -186,19 +193,6 @@ fi
 
 # Provenance is a driver diagnostic, not part of the emitted program/report.
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" >&2
-
-# A product binary generated from older compiler sources is not a compatible cache.
-# In particular, parser/lowering changes can make the stale product misread a newer
-# flattened driver and grow without bound instead of producing a useful diagnostic.
-# Refuse that state up front: it turns a multi-gigabyte OS kill into a deterministic,
-# actionable error. The escape hatch is intentionally explicit for compiler archaeology.
-stale_stage1_source="$(find "$ROOT/src" "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) -newer "$BIN" -print -quit)"
-if [[ -n "$stale_stage1_source" && "${ELISA_ALLOW_STALE_STAGE1:-0}" != 1 ]]; then
-  echo "stage1 product binary is stale: $stale_stage1_source is newer than $BIN" >&2
-  echo "run: $0 --seed" >&2
-  echo "set ELISA_ALLOW_STALE_STAGE1=1 only when intentionally testing an older product" >&2
-  exit 2
-fi
 
 run_stage1_driver_guarded() {
   local driver_pid driver_rss driver_peak=0 driver_rc=0
