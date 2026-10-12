@@ -362,7 +362,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
     def test_fstring_interpolation_calls_remain_visible_to_the_audit(self):
         masked = audit.mask_string_literals(
-            'rendered: sview = f"literal unknown_side_effect() {mutate(table)}"'
+            'rendered: sview = f"literal unknown_side_effect() {1}{mutate(table)}"'
         )
         calls = list(audit.call_sites(masked))
         self.assertIn(("mutate", None, ["table"]), calls)
@@ -379,35 +379,11 @@ class SemanticParallelAuditTest(unittest.TestCase):
             "root": [definition(
                 "table: lmut SymbolTable",
                 'def root(table: lmut SymbolTable):\n'
-                '    rendered: sview = f"{mutate(table)}"\n',
+                '    rendered: sview = f"{1}{mutate(table)}"\n',
             )],
         })
 
-        self.assertFalse(audit.append_only(info, "root")[0])
-
-    def test_fstring_interpolation_calls_remain_visible_to_the_audit(self):
-        masked = audit.mask_string_literals(
-            'rendered: sview = f"literal unknown_side_effect() {mutate(table)}"'
-        )
-        calls = list(audit.call_sites(masked))
-        self.assertIn(("mutate", None, ["table"]), calls)
-        self.assertNotIn("unknown_side_effect", [call[0] for call in calls])
-
-    def test_fstring_interpolation_helper_effect_reaches_the_root(self):
-        info = analyze({
-            "mutate": [definition(
-                "table: mutable SymbolTable",
-                "def mutate(table: mutable SymbolTable) -> usize:\n"
-                "    table.duplicates <- table.duplicates + 1\n"
-                "    return 1\n",
-            )],
-            "root": [definition(
-                "table: lmut SymbolTable",
-                'def root(table: lmut SymbolTable):\n'
-                '    rendered: sview = f"{mutate(table)}"\n',
-            )],
-        })
-
+        self.assertIn("mutate", info["root"][2])
         self.assertFalse(audit.append_only(info, "root")[0])
 
     def test_raw_address_integer_copy_remains_tainted(self):
