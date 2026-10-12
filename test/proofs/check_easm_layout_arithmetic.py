@@ -38,16 +38,20 @@ layout_body = provenance.split("def layout_size_checked(layout: Layout)", 1)[1].
     "def layout_field_width(", 1
 )[0]
 required_layout_fragments = [
+    "EasmLayoutArithmetic::include_field_extent(largest, field.offset, field.width)",
+    "return (false, 0) if not next_extent.valid",
+    "largest <- next_extent.value",
     "EasmLayoutArithmetic::declared_size(layout.size, layout.stride)",
-    "EasmLayoutArithmetic::field_extent_checked(field.offset, field.width)",
-    "return (false, 0) if not extent.valid",
     "return (true, declared) if declared > 0",
     "return (true, largest)",
 ]
 if not all(fragment in layout_body for fragment in required_layout_fragments):
-    raise SystemExit("EASM layout sizing no longer uses the proved precedence and max-extent rules")
-if "largest <- extent if extent > largest" in layout_body:
-    raise SystemExit("EASM layout sizing bypasses the proved max-extent transition")
+    raise SystemExit("EASM layout sizing no longer uses the proved checked extent-accumulation transition")
+layout_positions = [layout_body.index(fragment) for fragment in required_layout_fragments]
+if layout_positions != sorted(layout_positions):
+    raise SystemExit("EASM layout sizing reordered or bypassed the checked extent-accumulation transition")
+if "field_extent_checked(field.offset, field.width)" in layout_body or "keep_larger(largest" in layout_body:
+    raise SystemExit("EASM layout sizing bypasses the proved checked extent-accumulation transition")
 helper = HELPER.read_text()
 required_extent_fragments = (
     "const I64_MAX: i64 = 9223372036854775807",
@@ -59,6 +63,27 @@ required_extent_fragments = (
 )
 if not all(fragment in helper for fragment in required_extent_fragments):
     raise SystemExit("EASM field extent helper no longer checks representability before addition")
+required_accumulator_fragments = (
+    "def include_field_extent(current: i64, offset: i64, width: i64)",
+    "ensure result.valid == field_extent_checked(offset, width).valid",
+    "ensure not result.valid implies result.value == 0",
+    "ensure result.valid implies result.value == keep_larger(current, field_extent_checked(offset, width).value)",
+    "ensure result.valid implies result.value >= current",
+    "ensure result.valid implies result.value >= field_extent_checked(offset, width).value",
+    "return (false, 0) if not extent.valid",
+    "return (true, keep_larger(current, extent.value))",
+)
+if not all(fragment in helper for fragment in required_accumulator_fragments):
+    raise SystemExit("EASM field extent accumulator no longer proves fail-closed max-bound preservation")
+accumulator_body = helper.split("def include_field_extent(current: i64, offset: i64, width: i64)", 1)[1]
+ordered_accumulator_fragments = (
+    "extent: (valid: bool, value: i64) = field_extent_checked(offset, width)",
+    "return (false, 0) if not extent.valid",
+    "return (true, keep_larger(current, extent.value))",
+)
+accumulator_positions = [accumulator_body.index(fragment) for fragment in ordered_accumulator_fragments]
+if accumulator_positions != sorted(accumulator_positions):
+    raise SystemExit("EASM field extent accumulator no longer checks validity before updating the maximum")
 checked_extent_body = helper.split("def field_extent_checked(offset: i64, width: i64)", 1)[1].split(
     "def keep_larger(", 1
 )[0]
@@ -169,6 +194,7 @@ expected = {
     "declared_size",
     "field_extent_checked",
     "keep_larger",
+    "include_field_extent",
     "positive_explicit_size_precedes_stride",
     "positive_stride_is_used_when_size_is_not_positive",
     "nonpositive_size_and_stride_have_no_declared_extent",
@@ -179,17 +205,21 @@ expected = {
     "exact_i64_max_field_extent_is_valid",
     "i64_max_offset_plus_u64_width_is_rejected",
     "i64_max_minus_three_offset_plus_u64_width_is_rejected",
+    "successful_field_accumulation_dominates_both_inputs",
+    "maximum_offset_overflow_is_rejected_by_accumulation",
 }
 assert expected <= verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-assert negative["summary"]["proven"] + 2 == negative["summary"]["obligations"]
+assert negative["summary"]["proven"] + 3 == negative["summary"]["obligations"]
 assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
     ("ensure-unproven", "stride_overrides_a_positive_explicit_size"),
     ("ensure-unproven", "overflowing_field_extent_is_accepted"),
+    ("ensure-unproven", "a_valid_small_field_can_shrink_the_existing_layout_bound"),
 ]
-assert {"stride_overrides_a_positive_explicit_size", "overflowing_field_extent_is_accepted"}.isdisjoint({
+assert {"stride_overrides_a_positive_explicit_size", "overflowing_field_extent_is_accepted",
+        "a_valid_small_field_can_shrink_the_existing_layout_bound"}.isdisjoint({
     row["name"] for row in negative["declaration_details"] if row.get("verified")
 })
 
@@ -198,9 +228,10 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "EASM layout-size precedence and overflow-checked field extents",
+    "scope": "EASM layout-size precedence, overflow-checked extents, and max-bound accumulation",
     "positive_obligations": positive["summary"]["proven"],
-    "false_claims_rejected": ["stride_overrides_a_positive_explicit_size", "overflowing_field_extent_is_accepted"],
+    "false_claims_rejected": ["stride_overrides_a_positive_explicit_size", "overflowing_field_extent_is_accepted",
+                              "a_valid_small_field_can_shrink_the_existing_layout_bound"],
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
     "proof_revision": manifest["proof"].get("head"),
     "compiler_revision": manifest["compiler"].get("source_revision"),
