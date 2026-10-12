@@ -22,9 +22,16 @@ class CacheIntegrityTest(unittest.TestCase):
         self.source.write_bytes(b"object payload" * 100)
         self.output.write_bytes(b"previous valid output")
 
-    def cache_key(self, compiler, source):
-        root = Path(__file__).resolve().parent.parent
-        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+    def cache_project(self, name="project"):
+        root = self.source.parent / name
+        (root / "bin").mkdir(parents=True)
+        (root / "elisacore_std").mkdir()
+        (root / "elisacore_std" / "runtime.elisa").write_text("# fixture\n")
+        return root
+
+    def run_cache_key(self, compiler, source, *, root=None, allow_stale=False):
+        repo_root = Path(__file__).resolve().parent.parent
+        wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
         self.assertIsNotNone(function)
         script = (
@@ -37,12 +44,18 @@ class CacheIntegrityTest(unittest.TestCase):
         )
         env = dict(
             os.environ,
-            ROOT=str(root),
+            ROOT=str(root if root is not None else compiler.parent.parent),
             BIN=str(compiler),
             ELISA_STAGE1_CACHE="1",
             SOURCE_INPUT=str(source),
         )
-        result = subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
+        if allow_stale:
+            env["ELISA_ALLOW_STALE_STAGE1"] = "1"
+        return subprocess.run(["bash", "-c", script], env=env, check=False, capture_output=True)
+
+    def cache_key(self, compiler, source, *, root=None):
+        result = self.run_cache_key(compiler, source, root=root)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
         return result.stdout
 
     def fake_dependency_compiler(self, compiler, source):
@@ -99,11 +112,12 @@ class CacheIntegrityTest(unittest.TestCase):
                 self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
 
     def test_unreadable_dependency_refuses_cache_identity(self):
-        root = Path(__file__).resolve().parent.parent
-        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        repo_root = Path(__file__).resolve().parent.parent
+        wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
         self.assertIsNotNone(function)
-        compiler = self.source.parent / "fake-compiler"
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
         compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$MISSING_DEPENDENCY" > "$4"\n')
         compiler.chmod(0o755)
         Path(f"{compiler}.provenance.json").write_text('{"schema":"elisa-stage1-provenance-v5"}\n')
@@ -114,14 +128,15 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertIn(b"missing.elisa", result.stderr)
 
     def test_profile_content_participates_in_cache_identity(self):
-        root = Path(__file__).resolve().parent.parent
-        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        repo_root = Path(__file__).resolve().parent.parent
+        wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
         self.assertIsNotNone(function)
-        compiler = self.source.parent / "fake-compiler"
-        self.fake_dependency_compiler(compiler, self.source.parent / "source.elisa")
-        source = self.source.parent / "source.elisa"
-        profile = self.source.parent / "profile.elisa"
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        profile = root / "profile.elisa"
         script = 'set -uo pipefail\ndriver_args=("$SOURCE_INPUT" -o output.o -fprofile-use "$PROFILE_INPUT")\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
         env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", SOURCE_INPUT=str(source), PROFILE_INPUT=str(profile))
         ordinary_script = script.replace(' -fprofile-use "$PROFILE_INPUT"', '')
@@ -137,10 +152,11 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode, 7)
 
     def test_same_path_llvm_replacement_changes_cache_identity(self):
-        compiler = self.source.parent / "fake-compiler"
-        source = self.source.parent / "source.elisa"
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
         self.fake_dependency_compiler(compiler, source)
-        library = self.source.parent / "libLLVM.dylib"
+        library = root / "libLLVM.dylib"
         library.write_bytes(b"LLVM shared library v1")
         manifest = Path(f"{compiler}.provenance.json")
 
@@ -154,7 +170,8 @@ class CacheIntegrityTest(unittest.TestCase):
             manifest.write_text(json.dumps({"schema": "elisa-stage1-provenance-v5", "llvm_toolchain": toolchain}))
 
         record_toolchain()
-        first_key = self.cache_key(compiler, source)
+        first_key = self.cache_key(compiler, source, root=root).decode()
+        self.assertTrue(cache.publish(self.entry, self.source, first_key))
         before = library.stat()
         library.write_bytes(b"LLVM shared library v2")
         os.utime(library, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -163,8 +180,32 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
         self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
         record_toolchain()
-        second_key = self.cache_key(compiler, source)
+        second_key = self.cache_key(compiler, source, root=root).decode()
         self.assertNotEqual(first_key, second_key)
+        self.assertFalse(cache.restore(self.entry, self.output, second_key))
+        self.assertEqual(self.output.read_bytes(), b"previous valid output")
+
+    def test_cache_skips_unattested_products(self):
+        root = self.cache_project()
+        source = root / "source.elisa"
+        compiler = root / "bin" / "fake-compiler"
+        self.fake_dependency_compiler(compiler, source)
+        self.assertEqual(self.run_cache_key(compiler, source, root=root).returncode, 0)
+        stale = self.run_cache_key(compiler, source, root=root, allow_stale=True)
+        self.assertEqual(stale.returncode, 7)
+
+        external = root / "external" / "bin" / "fake-compiler"
+        external.parent.mkdir(parents=True)
+        self.fake_dependency_compiler(external, source)
+        outside_root = self.run_cache_key(external, source, root=root)
+        self.assertEqual(outside_root.returncode, 7)
+        path_traversal = root / "bin" / ".." / "external" / "bin" / "fake-compiler"
+        traversal_result = self.run_cache_key(path_traversal, source, root=root)
+        self.assertEqual(traversal_result.returncode, 7)
+        symlink = root / "bin" / "external-compiler"
+        symlink.symlink_to(external)
+        symlink_result = self.run_cache_key(symlink, source, root=root)
+        self.assertEqual(symlink_result.returncode, 7)
 
     def test_contract_override_participates_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent

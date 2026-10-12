@@ -269,6 +269,8 @@ driver_args=("$@")
 # and stores the object plus diagnostics. The product provenance manifest is
 # part of the key because it attests the exact LLVM toolchain artifacts; a
 # reseed after an in-place LLVM update must not reuse objects from the old ABI.
+# Products outside this tree and explicit stale-product runs skip the cache because
+# assert_stage1_fresh.sh cannot attest their manifest.
 # Integrity metadata is mandatory;
 # legacy, partial, or corrupted entries take the ordinary compile path.
 stage1_cache_key=""
@@ -278,6 +280,15 @@ stage1_cache_environment() {
 }
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
+  [[ "${ELISA_ALLOW_STALE_STAGE1:-0}" != 1 ]] || return 1
+  [[ ! -L "$BIN" ]] || return 1
+  local normalized_bin normalized_root
+  normalized_bin="$(cd -- "$(dirname -- "$BIN")" 2>/dev/null && pwd -P)/$(basename -- "$BIN")" || return 1
+  normalized_root="$(cd -- "$ROOT" 2>/dev/null && pwd -P)" || return 1
+  case "$normalized_bin" in
+    "$normalized_root/bin/"*) ;;
+    *) return 1 ;;
+  esac
   local index=0 count=${#driver_args[@]} arg emit="obj" source=""
   local provenance_file="${BIN}.provenance.json"
   local -a normalized=() auxiliary_inputs=()
