@@ -5,9 +5,12 @@ Usage:
     python3 scripts/profile_retired_instructions.py [--trace /tmp/run.trace] -- \
         bin/elisac-stage1 -emit ir -O2 test/bench/example.elisa
 
-The executable is copied beside its original and ad-hoc signed with
-com.apple.security.get-task-allow so Processor Trace can attach. The copy, trace
-and exported XML are removed after the run unless --trace is supplied.
+Pass target-only environment variables before `--`, repeating `--env NAME=VALUE`
+as needed (for example, for a dynamic-library search path).
+
+The executable is copied into a private temporary directory and ad-hoc signed
+with com.apple.security.get-task-allow so Processor Trace can attach. The copy,
+trace and exported XML are removed after the run unless --trace is supplied.
 The count covers the launched process; child processes are excluded. Prefer a
 single-process compiler mode such as `-emit check` for compiler comparisons.
 """
@@ -18,6 +21,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -145,10 +149,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", type=Path, help="keep the .trace bundle at this path")
     parser.add_argument("--time-limit", default="30m", help="maximum trace duration (default: 30m)")
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="set an environment variable for the traced process (repeatable)",
+    )
     args, remainder = parser.parse_known_args()
     command = remainder[1:] if remainder and remainder[0] == "--" else remainder
     if not command:
         parser.error("provide an executable and its arguments after --")
+    for assignment in args.env:
+        name, separator, _ = assignment.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            parser.error(f"invalid --env assignment {assignment!r}; expected NAME=VALUE")
     executable = Path(command[0]).expanduser().resolve(strict=True)
     if not executable.is_file():
         parser.error(f"executable is not a file: {executable}")
@@ -160,7 +175,7 @@ def main() -> int:
         parser.error(str(error))
 
     profile_dir = Path(tempfile.mkdtemp(prefix="elisa-processor-trace-"))
-    signed_executable = executable.with_name(f".{executable.name}.trace-{os.getpid()}")
+    signed_executable = profile_dir / executable.name
     trace = args.trace.expanduser().resolve() if args.trace else profile_dir / "run.trace"
     toc_path = profile_dir / "toc.xml"
     intervals_path = profile_dir / "intervals.xml"
@@ -168,7 +183,10 @@ def main() -> int:
     trace.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        shutil.copy2(executable, signed_executable)
+        # Avoid inheriting restrictive file flags/xattrs and do not write beside
+        # the original (which may live in a protected directory such as /usr/bin).
+        shutil.copyfile(executable, signed_executable)
+        signed_executable.chmod(0o700)
         entitlement_path.write_text(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
@@ -190,22 +208,29 @@ def main() -> int:
             ],
             stdout=subprocess.DEVNULL,
         )
-        recorded = subprocess.run(
+        record_command = [
+            "xcrun",
+            "xctrace",
+            "record",
+            "--template",
+            "Processor Trace",
+            "--time-limit",
+            args.time_limit,
+            "--output",
+            str(trace),
+        ]
+        for assignment in args.env:
+            record_command.extend(["--env", assignment])
+        record_command.extend(
             [
-                "xcrun",
-                "xctrace",
-                "record",
-                "--template",
-                "Processor Trace",
-                "--time-limit",
-                args.time_limit,
-                "--output",
-                str(trace),
                 "--launch",
                 "--",
                 str(signed_executable),
                 *command[1:],
-            ],
+            ]
+        )
+        recorded = subprocess.run(
+            record_command,
             check=False,
         )
         export_trace(trace, toc_path, toc=True)
