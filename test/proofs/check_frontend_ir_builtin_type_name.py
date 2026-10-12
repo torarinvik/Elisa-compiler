@@ -57,10 +57,32 @@ def match_names(block, description):
 
 
 def require_spec_closed_set(text, description):
-    literal_set = "or".join(f'name=="{name}"' for name in names)
-    contract = "ensureresult==(" + literal_set + ")"
-    if contract not in "".join(text.split()):
-        raise SystemExit(f"{description} must specify the exact closed builtin set")
+    contract = re.search(
+        r"(?m)^\s*ensure result == \(when name:\s*\n(.*?)^\s*\)",
+        text,
+        re.DOTALL,
+    )
+    if not contract:
+        raise SystemExit(f"{description} must specify the builtin set with pattern matching")
+    arms = []
+    for line in contract.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        arm = re.fullmatch(r'("[^"\\]+"(?:\s*\|\s*"[^"\\]+")*|_)\s*->\s*(true|false)', stripped)
+        if not arm:
+            raise SystemExit(f"{description} contains a malformed builtin match arm")
+        pattern, result = arm.groups()
+        arms.append((pattern, result))
+    if not arms or arms[-1] != ("_", "false"):
+        raise SystemExit(f"{description} lost its false fallback")
+    found_names = []
+    for pattern, result in arms[:-1]:
+        if result != "true":
+            raise SystemExit(f"{description} contains a non-true builtin match arm")
+        found_names.extend(re.findall(r'"([^"\\]+)"', pattern))
+    if found_names != list(names):
+        raise SystemExit(f"{description} match arms differ from the ordered closed set")
 
 
 require_spec_closed_set(source_text, "production classifier contract")
