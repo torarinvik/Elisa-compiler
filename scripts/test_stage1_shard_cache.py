@@ -70,8 +70,17 @@ class ShardCacheTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), self.files["object"].read_bytes())
         self.assertEqual(self.err.read_bytes(), b"optimization remark\n")
         self.assertEqual(self.out.read_bytes(), b"")
-        for restored in (self.output, self.out, self.err):
-            self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+        for restored, source in ((self.output, self.files["object"]), (self.out, self.files["stdout"]), (self.err, self.files["stderr"])):
+            self.assertEqual(restored.stat().st_mode & 0o777, source.stat().st_mode & 0o777)
+
+    def test_restore_preserves_published_modes(self):
+        expected_modes = {"object": 0o640, "stdout": 0o604, "stderr": 0o600}
+        for name, mode in expected_modes.items():
+            self.files[name].chmod(mode)
+        self.publish()
+        self.assertTrue(self.restore())
+        for restored, name in ((self.output, "object"), (self.out, "stdout"), (self.err, "stderr")):
+            self.assertEqual(restored.stat().st_mode & 0o777, expected_modes[name])
 
     def test_options_and_actual_artifacts_invalidate(self):
         for key in shard.FIELDS - {"logical_shards", "logical_shard", "opt_pipeline", "codegen_opt", "producer_discovery_version", "llvm_discovery_version", "resolved_output_policy", "coverage_policy", "pgo_policy"}:
@@ -120,6 +129,9 @@ class ShardCacheTests(unittest.TestCase):
         mutations = (
             ("missing stream", lambda value: value.pop("stdout")),
             ("unknown field", lambda value: value.update(extra="unknown")),
+            ("missing modes", lambda value: value.pop("modes")),
+            ("boolean mode", lambda value: value["modes"].update(object=True)),
+            ("oversized mode", lambda value: value["modes"].update(object=0o1000)),
             ("boolean size", lambda value: value["object"].update(size=True)),
             ("malformed checksum", lambda value: value["stderr"].update(sha256="A" * 64)),
         )
@@ -304,6 +316,8 @@ class ShardCacheTests(unittest.TestCase):
         with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
             self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
             self.assertEqual(len(list(self.root.glob("*.incoming-*"))), 3)
+            for staged in batch.outputs[0][1]:
+                self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
             fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
             batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
             self.files["llvm"].write_bytes(b"changed during batch")
@@ -312,6 +326,19 @@ class ShardCacheTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.assertFalse((self.cache / fresh["key"]).exists())
         self.assertFalse(list(self.cache.glob(".batch-*")))
+
+    def test_batch_restore_keeps_staging_private_then_publishes_original_modes(self):
+        expected_modes = {"object": 0o640, "stdout": 0o604, "stderr": 0o600}
+        for name, mode in expected_modes.items():
+            self.files[name].chmod(mode)
+        self.publish()
+        with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
+            self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
+            for staged in batch.outputs[0][1]:
+                self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+            batch.finish()
+        for restored, name in ((self.output, "object"), (self.out, "stdout"), (self.err, "stderr")):
+            self.assertEqual(restored.stat().st_mode & 0o777, expected_modes[name])
 
     def test_batch_cli_miss_publish_hit_and_fatal(self):
         helper = Path(shard.__file__)

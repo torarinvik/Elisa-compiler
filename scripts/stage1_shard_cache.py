@@ -15,7 +15,7 @@ import shutil
 import stat
 import tempfile
 
-SCHEMA = "elisac-preopt-shard-cache-v1"
+SCHEMA = "elisac-preopt-shard-cache-v2"
 MAX_BYTES = 2 * 1024**3
 MAX_STREAM = 64 * 1024**2
 FIELDS = {
@@ -261,12 +261,17 @@ def read_bundle_manifest(entry, ticket):
             return False
         manifest = json.loads(raw)
         if not isinstance(manifest, dict) or set(manifest) != {
-            "schema", "key", "recipe_digest", "snapshot", "object", "stdout", "stderr"
+            "schema", "key", "recipe_digest", "snapshot", "object", "stdout", "stderr", "modes"
         }:
             return False
         if manifest["schema"] != SCHEMA or manifest["key"] != ticket["key"]:
             return False
         if manifest["recipe_digest"] != digest(canonical(ticket["recipe"])) or manifest["snapshot"] != ticket["snapshot"]["identity"]:
+            return False
+        modes = manifest["modes"]
+        if not isinstance(modes, dict) or set(modes) != {"object", "stdout", "stderr"}:
+            return False
+        if any(type(mode) is not int or mode < 0 or mode > 0o777 for mode in modes.values()):
             return False
         for name, limit, allow_empty in (("object", MAX_BYTES, False), ("stdout", MAX_STREAM, True), ("stderr", MAX_STREAM, True)):
             identity = manifest[name]
@@ -289,14 +294,18 @@ def publish(cache, ticket, obj, stdout, stderr, *, _validator=validate_ticket):
     stage = Path(tempfile.mkdtemp(prefix=".incoming-", dir=cache))
     retired = None
     try:
-        manifest = {"schema": SCHEMA, "key": ticket["key"], "recipe_digest": digest(canonical(ticket["recipe"])), "snapshot": ticket["snapshot"]["identity"]}
+        manifest = {"schema": SCHEMA, "key": ticket["key"], "recipe_digest": digest(canonical(ticket["recipe"])), "snapshot": ticket["snapshot"]["identity"], "modes": {}}
         for name, source in (("object", obj), ("stdout", stdout), ("stderr", stderr)):
             limit = MAX_BYTES if name == "object" else MAX_STREAM
+            source_mode = stat.S_IMODE(os.stat(source).st_mode) & 0o777
             identity = fingerprint(source, allow_empty=name != "object", limit=limit)
             synced_copy(source, stage / name, limit)
             manifest[name] = fingerprint(stage / name, allow_empty=name != "object", limit=limit)
             if identity != manifest[name] or fingerprint(source, allow_empty=name != "object", limit=limit) != identity:
                 raise ValueError("emitted payload changed during publication")
+            if (stat.S_IMODE(os.stat(source).st_mode) & 0o777) != source_mode:
+                raise ValueError("emitted payload mode changed during publication")
+            manifest["modes"][name] = source_mode
         with (stage / "manifest.json").open("xb") as stream:
             stream.write(canonical(manifest))
             stream.flush()
@@ -354,14 +363,18 @@ def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket
                 transferred = True
                 if _receipt is not None:
                     _receipt.update({name: dict(manifest[name]) for name in ("object", "stdout", "stderr")})
+                _receipt["modes"] = dict(manifest["modes"])
                 return True
             # Object commits last; publication errors are fatal, never a cold retry
             # following partially published diagnostics.
             for index in (1, 2, 0):
+                name = ("object", "stdout", "stderr")[index]
+                os.chmod(staged[index][0], manifest["modes"][name])
                 os.replace(*staged[index])
             committed = True
             if _receipt is not None:
                 _receipt.update({name: dict(manifest[name]) for name in ("object", "stdout", "stderr")})
+                _receipt["modes"] = dict(manifest["modes"])
             return True
     finally:
         if not transferred and not committed:
@@ -564,8 +577,10 @@ class BatchInvocation:
             for name, source in zip(("object", "stdout", "stderr"), staged):
                 if fingerprint(source, allow_empty=name != "object", limit=MAX_BYTES if name == "object" else MAX_STREAM) != expected[name]:
                     raise ValueError("private restored hit changed before destination commit")
-        for _, staged, targets, _, _ in self.outputs:
+        for _, staged, targets, expected, _ in self.outputs:
             for index in (1, 2, 0):
+                name = ("object", "stdout", "stderr")[index]
+                os.chmod(staged[index], expected["modes"][name])
                 os.replace(staged[index], targets[index])
         self.finished = True
         return dict(self.metrics)
