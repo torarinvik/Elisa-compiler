@@ -83,9 +83,14 @@ if len("arena_dict_") != 11 or len("arena_set_") != 10:
 
 prefix_body = compact(function_section(VARIANT_PATHS.read_text(), "sview_matches_prefix"))
 prefix_steps = (
-    'falsereturnif(end-start)!=sview_len(candidate).i64()',
+    'path_length:usize=sview_len(path)',
+    'candidate_length:usize=sview_len(candidate)',
+    'falsereturnifpath.len<0orcandidate.len<0',
+    'falsereturnifpath_length.i64()!=path.lenorcandidate_length.i64()!=candidate.len',
+    'falsereturnifstart<0orend<startorend>path.len',
+    'falsereturnifend-start!=candidate.len',
     'matched:mutablebool=true',
-    'forindexin0..<sview_len(candidate)|matched,path,candidate,start|',
+    'forindexin0..<candidate_length|matched,path,candidate,start|',
     'matched<-falseifsview_at(path,(start+index.i64()).usize())!=sview_at(candidate,index)',
     'returnmatched',
 )
