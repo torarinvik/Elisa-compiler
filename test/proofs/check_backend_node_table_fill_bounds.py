@@ -25,6 +25,7 @@ POLICY = ROOT / "src/backend/codegen_cstr_terminator_policy.elisa"
 POSITIVE = HERE / "backend_node_table_fill_bounds.elisa"
 NEGATIVE = HERE / "backend_node_table_fill_bounds_rejected.elisa"
 POSITIVE_NAMES = {
+    "admitted_count_roundtrips_through_target_usize",
     "wasm32_count_guard_rejects_first_unrepresentable_count",
     "admitted_node_count_fits_target_usize",
     "zero_stride_allocation_size_is_zero",
@@ -33,6 +34,7 @@ POSITIVE_NAMES = {
     "nonempty_node_table_has_the_requested_view_length",
 }
 NEGATIVE_NAMES = {
+    "false_claim_first_unrepresentable_count_roundtrips",
     "false_claim_wasm32_accepts_first_unrepresentable_count",
     "false_claim_u32_allocation_product_fits",
     "false_claim_empty_node_table_takes_the_fill_branch",
@@ -125,6 +127,7 @@ require_ordered(checked_binary, (
 call = compact(function_section(CALL.read_text(), "emit_call"))
 node_table_steps = (
     'ifntf_name=="node_table_fill"andntf_type_args.count==2andarguments.count==3:',
+    'if(emit_expression(arguments[2],ntf_element,local_scope,fns,structs,generics,runtime,m,ctx,builder)canGlobal{Read,Write})isntf_init:',
     'ntf_size_type:LLVMTypeRef=runtime_size_llvm_type(ctx,structs.target.target_pointer_bits)',
     'ntf_count_type:LLVMTypeRef=LLVMFunctionType(ntf_size_type,ntf_count_params_ptr,1,0)',
     'ntf_count_native:LLVMValueRef=LLVMBuildCall2(builder,ntf_count_type,ntf_count_fn,ntf_count_args_ptr,1,"node.table.count")',
@@ -145,6 +148,8 @@ node_table_steps = (
     'ntf_data:LLVMValueRef=LLVMBuildCall2(builder,ntf_alloc_type,ntf_alloc_fn,ntf_alloc_args_ptr,2,"node.table.alloc")',
     'ntf_view<-LLVMBuildInsertValue(builder,ntf_view,darray_size_value_target(ntf_checked_count,ctx,builder,"node.table.view.len.target",structs.target.target_pointer_bits),1,"node.table.view.len")',
     'ntf_fill_type:LLVMTypeRef=LLVMFunctionType(LLVMVoidTypeInContext(ctx),ntf_fill_params_ptr,2,0)',
+    'ntf_fill_fn:LLVMValueRef=declare_or_get_named(m,"arena_da_fill",ntf_fill_type)',
+    'ntf_fill_args:mutabledarray[LLVMValueRef]=[ntf_view,ntf_init]',
     '_=LLVMBuildCall2(builder,ntf_fill_type,ntf_fill_fn,ntf_fill_args_ptr,2,"")',
     '_=LLVMBuildStore(builder,ntf_view,ntf_result_slot)',
     '_=LLVMBuildBr(builder,ntf_done_block)',
@@ -152,6 +157,8 @@ node_table_steps = (
     'returnLLVMBuildLoad2(builder,ntf_view_type,ntf_result_slot,"node.table.result.value")',
 )
 require_ordered(call, node_table_steps, "node_table_fill checked allocation lowering")
+if call.count('emit_expression(arguments[2],ntf_element,local_scope,fns,structs,generics,runtime,m,ctx,builder)') != 1:
+    raise SystemExit("node_table_fill initializer must be evaluated exactly once before the empty/nonempty branch")
 
 runtime_size = compact(function_section(RUNTIME_DECL.read_text(), "runtime_size_llvm_type"))
 if "LLVMInt32TypeInContext(ctx)returniftarget_bits==32" not in runtime_size or \
@@ -163,6 +170,18 @@ if 'returnLLVMBuildTrunc(builder,value,size_type,"runtime.usize")iftarget_bits==
 count_normalizer = compact(function_section(INTERNED_TYPES.read_text(), "darray_size_value_i64"))
 if "returnLLVMBuildZExt(builder,value,size_type,name)ifLLVMGetIntTypeWidth(source_type)<64elsevalue" not in count_normalizer:
     raise SystemExit("node_table_fill native usize count must be zero-extended before its i64 check")
+target_size_conversion = compact(function_section(INTERNED_TYPES.read_text(), "darray_size_value_target"))
+require_ordered(target_size_conversion, (
+    "target_type:LLVMTypeRef=darray_size_type(ctx,target_bits)",
+    "source_type:LLVMTypeRef=LLVMTypeOf(value)",
+    "target_width:u32=target_bits",
+    "source_width:u32=LLVMGetIntTypeWidth(source_type)",
+    "ifsource_width>target_width:",
+    "returnLLVMBuildTrunc(builder,value,target_type,name)",
+    "ifsource_width<target_width:",
+    "returnLLVMBuildZExt(builder,value,target_type,name)",
+    "returnvalue",
+), "node_table_fill result view usize conversion")
 
 llvm_bindings = compact(LLVM_C.read_text())
 if "NE:i32=33" not in llvm_bindings or "UGT:i32=34" not in llvm_bindings:
@@ -182,12 +201,13 @@ if 'include "../../src/backend/codegen_cstr_terminator_policy.elisa"' not in POS
 
 positive_text = POSITIVE.read_text()
 expected_positive = {
+    "admitted_count_roundtrips_through_target_usize": "def admitted_count_roundtrips_through_target_usize(count:u64,pointer_bits:u32)->bool:\nrequires pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32 or pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_64\nrequires count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)\nensure result==true\nreturn (count%(BackendCStrTerminatorPolicy::U32_MAX+1)==count)ifpointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32elsecount==count",
     "wasm32_count_guard_rejects_first_unrepresentable_count": "def wasm32_count_guard_rejects_first_unrepresentable_count()->bool:\nensure result==true\ncount:u64=BackendCStrTerminatorPolicy::U32_MAX+1\nreturnnot(count<=BackendCStrTerminatorPolicy::target_size_max(BackendCStrTerminatorPolicy::POINTER_BITS_32))",
     "admitted_node_count_fits_target_usize": "def admitted_node_count_fits_target_usize(count:u64,pointer_bits:u32)->bool:\nrequires pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32 or pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_64\nrequires count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)\nensure result==true\nreturn count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)",
     "zero_stride_allocation_size_is_zero": "def zero_stride_allocation_size_is_zero(count:u64,pointer_bits:u32)->bool:\nrequires pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32 or pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_64\nrequires count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)\nensure result==true\nreturn count*0<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)",
     "positive_stride_allocation_size_fits_target": "def positive_stride_allocation_size_fits_target(count:u64,stride:u64,pointer_bits:u32)->bool:\nrequires pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32 or pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_64\nrequires count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)\nrequires stride>0 and stride<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)\nrequires count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)/stride\nensure result==true\nreturn count*stride<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)",
     "empty_node_table_skips_the_fill_branch": "def empty_node_table_skips_the_fill_branch(count:u64)->bool:\nrequires count==0\nensure result==true\nreturnnot(count!=0)",
-    "nonempty_node_table_has_the_requested_view_length": "def nonempty_node_table_has_the_requested_view_length(count:u64,view_length:u64)->bool:\nrequires count>0 and view_length==count\nensure result==true\nreturn view_length>0 and view_length==count",
+    "nonempty_node_table_has_the_requested_view_length": "def nonempty_node_table_has_the_requested_view_length(count:u64,pointer_bits:u32)->bool:\nrequires pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32 or pointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_64\nrequires count>0 and count<=BackendCStrTerminatorPolicy::target_size_max(pointer_bits)\nensure result==true\nview_length:u64=(count%(BackendCStrTerminatorPolicy::U32_MAX+1))ifpointer_bits==BackendCStrTerminatorPolicy::POINTER_BITS_32elsecount\nreturn view_length>0 and view_length==count",
 }
 for name, expected in expected_positive.items():
     if compact(function_section(positive_text, name)) != compact(expected):
@@ -195,6 +215,7 @@ for name, expected in expected_positive.items():
 
 negative_text = NEGATIVE.read_text()
 expected_negative = {
+    "false_claim_first_unrepresentable_count_roundtrips": "def false_claim_first_unrepresentable_count_roundtrips()->bool:\nensure result==true\ncount:u64=BackendCStrTerminatorPolicy::U32_MAX+1\nreturncount%(BackendCStrTerminatorPolicy::U32_MAX+1)==count",
     "false_claim_wasm32_accepts_first_unrepresentable_count": "def false_claim_wasm32_accepts_first_unrepresentable_count()->bool:\nensure result==true\ncount:u64=BackendCStrTerminatorPolicy::U32_MAX+1\nreturncount<=BackendCStrTerminatorPolicy::target_size_max(BackendCStrTerminatorPolicy::POINTER_BITS_32)",
     "false_claim_u32_allocation_product_fits": "def false_claim_u32_allocation_product_fits()->bool:\nensure result==true\ncount:u64=65536\nstride:u64=65536\nreturncount*stride<=BackendCStrTerminatorPolicy::U32_MAX",
     "false_claim_empty_node_table_takes_the_fill_branch": "def false_claim_empty_node_table_takes_the_fill_branch()->bool:\nensure result==true\ncount:u64=0\nreturncount!=0",
