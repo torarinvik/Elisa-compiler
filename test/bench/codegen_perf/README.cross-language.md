@@ -146,6 +146,10 @@ and after each runtime sample. Waited-child CPU includes compiler/linker subproc
 reaped by their parent. Each compiler process group has a timeout so a stuck frontend, linker,
 or child worker is killed with its parent.
 
+Completed timing runs write `timing_samples.sha256` and bind its hash into the run fingerprint.
+The manifest covers the raw sample CSVs consumed by the paired reporter, which verifies their
+hashes before reading timing values. Preflight-only runs have no timing manifest.
+
 `compile_ratios.csv`, `build_ratios.csv`, and `runtime_ratios.csv` report Elisa's median time
 divided by Rust's and Zig's median time for each comparison workload, with wall time and child CPU
 kept separate. A ratio below `1.0` means Elisa is faster. Each file ends with an unweighted

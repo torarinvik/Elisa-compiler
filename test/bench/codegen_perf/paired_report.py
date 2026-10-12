@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -13,11 +14,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from paired_runner import paired_input_identity, source_manifest
+from paired_runner import paired_input_identity, source_manifest, verified_timing_sample_bytes, verify_run_artifacts
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BENCHMARK_ROOT = SCRIPT_DIR.parents[2]
-VERIFIED_FILE_HASHES: dict[str, str] = {}
 
 
 def fail(message: str) -> None:
@@ -31,91 +31,6 @@ def metadata(path: Path) -> dict[str, str]:
         if separator:
             result[key] = value
     return result
-
-
-def verify_file_hash(path: Path, expected_hash: object, label: str) -> None:
-    path = path.resolve()
-    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
-        fail(f"{label} has an invalid SHA-256")
-    if not path.is_file():
-        fail(f"{label} is missing: {path}")
-    actual_hash = VERIFIED_FILE_HASHES.get(str(path))
-    if actual_hash is None:
-        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        VERIFIED_FILE_HASHES[str(path)] = actual_hash
-    if actual_hash != expected_hash:
-        fail(f"{label} changed: {path}")
-
-
-def verify_run_artifacts(directory: Path, fingerprint: dict[str, object], run_metadata: dict[str, str]) -> None:
-    provenance = fingerprint.get("run_provenance")
-    if not isinstance(provenance, dict):
-        fail(f"{directory} has no run provenance")
-
-    source_manifest_path = directory / "sources.sha256"
-    verify_file_hash(
-        source_manifest_path,
-        provenance.get("source_manifest_sha256"),
-        f"{directory.name} source manifest",
-    )
-    for line in source_manifest_path.read_text().splitlines():
-        expected, separator, relative = line.partition("  ")
-        if not separator:
-            fail(f"{directory.name} has a malformed source manifest")
-        verify_file_hash(BENCHMARK_ROOT / relative, expected, f"{directory.name} source input")
-
-    toolchain_path = directory / "toolchain.before.sha256"
-    verify_file_hash(
-        toolchain_path,
-        provenance.get("toolchain_manifest_sha256"),
-        f"{directory.name} toolchain manifest",
-    )
-    parsed_toolchain = []
-    for line in toolchain_path.read_text().splitlines():
-        expected, separator, raw_path = line.partition("  ")
-        if not separator or not raw_path:
-            fail(f"{directory.name} has a malformed toolchain manifest")
-        path = Path(raw_path).resolve()
-        verify_file_hash(path, expected, f"{directory.name} toolchain input")
-        parsed_toolchain.append({"path": str(path), "sha256": expected.lower()})
-    parsed_toolchain.sort(key=lambda row: (row["path"], row["sha256"]))
-    if parsed_toolchain != provenance.get("toolchain_manifest"):
-        fail(f"{directory.name} toolchain manifest differs from run provenance")
-
-    verify_file_hash(
-        directory / "metadata.txt",
-        provenance.get("metadata_sha256"),
-        f"{directory.name} metadata",
-    )
-    verify_file_hash(
-        directory / "host_qualification.json",
-        provenance.get("host_qualification_sha256"),
-        f"{directory.name} host qualification",
-    )
-    runtime_path = run_metadata.get("elisa_runtime_object")
-    if not runtime_path:
-        fail(f"{directory.name} metadata has no runtime object path")
-    verify_file_hash(
-        Path(runtime_path),
-        provenance.get("runtime_artifact_sha256"),
-        f"{directory.name} runtime artifact",
-    )
-
-    shared_runtime = provenance.get("shared_runtime_source_manifest")
-    if not isinstance(shared_runtime, dict) or not isinstance(shared_runtime.get("files"), list):
-        fail(f"{directory.name} has no shared runtime source manifest")
-    runtime_rows = shared_runtime["files"]
-    runtime_manifest_bytes = json.dumps(runtime_rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if shared_runtime.get("sha256") != hashlib.sha256(runtime_manifest_bytes).hexdigest():
-        fail(f"{directory.name} shared runtime source manifest hash is invalid")
-    for row in runtime_rows:
-        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
-            fail(f"{directory.name} has a malformed shared runtime source row")
-        verify_file_hash(
-            BENCHMARK_ROOT / row["path"],
-            row.get("sha256"),
-            f"{directory.name} shared runtime source",
-        )
 
 
 def check_fingerprint_record(directory: Path, fingerprint: dict[str, object], scope: str) -> None:
@@ -153,10 +68,16 @@ def check_complete(directory: Path, scope: str) -> dict[str, object]:
 
 
 def read_elisa_samples(path: Path) -> dict[str, dict[int, tuple[float, float]]]:
-    if not path.is_file():
-        fail(f"missing sample file: {path}")
+    try:
+        sample_bytes = verified_timing_sample_bytes(path)
+    except (OSError, ValueError) as error:
+        fail(str(error))
     result: dict[str, dict[int, tuple[float, float]]] = defaultdict(dict)
-    with path.open(newline="") as stream:
+    try:
+        sample_text = sample_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(f"{path} is not valid UTF-8")
+    with io.StringIO(sample_text, newline="") as stream:
         reader = csv.DictReader(stream)
         required = {"benchmark", "sample", "variant", "wall_seconds", "child_cpu_seconds"}
         if not required.issubset(reader.fieldnames or ()):
@@ -304,10 +225,10 @@ def main(arguments: list[str]) -> int:
         fingerprint: dict[str, object], run_name: str, role: str, run_meta: dict[str, str]
     ) -> None:
         nonlocal common_input_identity
-        verify_run_artifacts(out / run_name, fingerprint, run_meta)
         try:
+            verify_run_artifacts(out / run_name, fingerprint, run_meta)
             identity = paired_input_identity(fingerprint, pair_metadata, run_meta)
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             fail(str(error))
         provenance = fingerprint["run_provenance"]
         if common_input_identity is None:

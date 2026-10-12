@@ -30,6 +30,8 @@ PROVENANCE_INPUTS = (
     "scripts/write_profiler_hook_fallbacks.sh",
     "scripts/stage1_provenance.py",
 )
+VERIFIED_FILE_HASHES: dict[str, str] = {}
+VERIFIED_TIMING_SAMPLE_BYTES: dict[str, bytes] = {}
 
 
 def digest(path: Path) -> str:
@@ -143,6 +145,136 @@ def read_metadata(path: Path) -> dict[str, str]:
         if separator:
             values[key] = value
     return values
+
+
+def verify_file_hash(path: Path, expected_hash: object, label: str) -> None:
+    path = path.resolve()
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise ValueError(f"{label} has an invalid SHA-256")
+    if not path.is_file():
+        raise ValueError(f"{label} is missing: {path}")
+    actual_hash = VERIFIED_FILE_HASHES.get(str(path))
+    if actual_hash is None:
+        actual_hash = digest(path)
+        VERIFIED_FILE_HASHES[str(path)] = actual_hash
+    if actual_hash != expected_hash:
+        raise ValueError(f"{label} changed: {path}")
+
+
+def verified_timing_sample_bytes(path: Path) -> bytes:
+    resolved = str(path.resolve())
+    content = VERIFIED_TIMING_SAMPLE_BYTES.get(resolved)
+    if content is None:
+        raise ValueError(f"timing sample bytes were not verified: {resolved}")
+    return content
+
+
+def verify_run_artifacts(
+    directory: Path,
+    fingerprint: dict[str, object],
+    run_metadata: dict[str, str],
+) -> None:
+    provenance = fingerprint.get("run_provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError(f"{directory} has no run provenance")
+
+    source_manifest_path = directory / "sources.sha256"
+    verify_file_hash(
+        source_manifest_path,
+        provenance.get("source_manifest_sha256"),
+        f"{directory.name} source manifest",
+    )
+    for line in source_manifest_path.read_text().splitlines():
+        expected, separator, relative = line.partition("  ")
+        if not separator:
+            raise ValueError(f"{directory.name} has a malformed source manifest")
+        verify_file_hash(ROOT / relative, expected, f"{directory.name} source input")
+
+    toolchain_path = directory / "toolchain.before.sha256"
+    verify_file_hash(
+        toolchain_path,
+        provenance.get("toolchain_manifest_sha256"),
+        f"{directory.name} toolchain manifest",
+    )
+    parsed_toolchain = []
+    for line in toolchain_path.read_text().splitlines():
+        expected, separator, raw_path = line.partition("  ")
+        if not separator or not raw_path:
+            raise ValueError(f"{directory.name} has a malformed toolchain manifest")
+        path = Path(raw_path).resolve()
+        verify_file_hash(path, expected, f"{directory.name} toolchain input")
+        parsed_toolchain.append({"path": str(path), "sha256": expected.lower()})
+    parsed_toolchain.sort(key=lambda row: (row["path"], row["sha256"]))
+    if parsed_toolchain != provenance.get("toolchain_manifest"):
+        raise ValueError(f"{directory.name} toolchain manifest differs from run provenance")
+
+    verify_file_hash(
+        directory / "metadata.txt",
+        provenance.get("metadata_sha256"),
+        f"{directory.name} metadata",
+    )
+    verify_file_hash(
+        directory / "host_qualification.json",
+        provenance.get("host_qualification_sha256"),
+        f"{directory.name} host qualification",
+    )
+    runtime_path = run_metadata.get("elisa_runtime_object")
+    if not runtime_path:
+        raise ValueError(f"{directory.name} metadata has no runtime object path")
+    verify_file_hash(
+        Path(runtime_path),
+        provenance.get("runtime_artifact_sha256"),
+        f"{directory.name} runtime artifact",
+    )
+
+    timing_manifest_path = directory / "timing_samples.sha256"
+    timing_manifest_hash = provenance.get("timing_samples_manifest_sha256")
+    if timing_manifest_hash is None:
+        if not (directory / "PREFLIGHT_COMPLETE").is_file() or timing_manifest_path.exists():
+            raise ValueError(f"{directory.name} has no timing sample manifest")
+    else:
+        if not isinstance(timing_manifest_hash, str) or len(timing_manifest_hash) != 64:
+            raise ValueError(f"{directory.name} timing sample manifest has an invalid SHA-256")
+        timing_manifest_bytes = timing_manifest_path.read_bytes()
+        if hashlib.sha256(timing_manifest_bytes).hexdigest() != timing_manifest_hash:
+            raise ValueError(f"{directory.name} timing sample manifest changed: {timing_manifest_path}")
+        expected_timing_names = {"build_samples.csv", "compile_samples.csv"}
+        if provenance.get("scope") == "full_runtime":
+            expected_timing_names.add("samples.csv")
+        elif provenance.get("scope") != "compile_only":
+            raise ValueError(f"{directory.name} has an invalid timing sample scope")
+        timing_rows: dict[str, str] = {}
+        try:
+            timing_manifest_text = timing_manifest_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{directory.name} timing sample manifest is not valid UTF-8") from error
+        for line in timing_manifest_text.splitlines():
+            expected, separator, relative = line.partition("  ")
+            if not separator or relative in timing_rows:
+                raise ValueError(f"{directory.name} has a malformed timing sample manifest")
+            if Path(relative).name != relative or relative not in expected_timing_names:
+                raise ValueError(f"{directory.name} has an unexpected timing sample path: {relative}")
+            timing_rows[relative] = expected
+        if set(timing_rows) != expected_timing_names:
+            raise ValueError(f"{directory.name} timing sample manifest has incomplete coverage")
+        for relative, expected in timing_rows.items():
+            sample_path = (directory / relative).resolve()
+            sample_bytes = sample_path.read_bytes()
+            if hashlib.sha256(sample_bytes).hexdigest() != expected:
+                raise ValueError(f"{directory.name} timing sample changed: {sample_path}")
+            VERIFIED_TIMING_SAMPLE_BYTES[str(sample_path)] = sample_bytes
+
+    shared_runtime = provenance.get("shared_runtime_source_manifest")
+    if not isinstance(shared_runtime, dict) or not isinstance(shared_runtime.get("files"), list):
+        raise ValueError(f"{directory.name} has no shared runtime source manifest")
+    runtime_rows = shared_runtime["files"]
+    runtime_manifest_bytes = json.dumps(runtime_rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if shared_runtime.get("sha256") != hashlib.sha256(runtime_manifest_bytes).hexdigest():
+        raise ValueError(f"{directory.name} shared runtime source manifest hash is invalid")
+    for row in runtime_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            raise ValueError(f"{directory.name} has a malformed shared runtime source row")
+        verify_file_hash(ROOT / row["path"], row.get("sha256"), f"{directory.name} shared runtime source")
 
 
 def stable_toolchain_identity(
@@ -301,15 +433,19 @@ def main(arguments: list[str]) -> int:
             "candidate_binary": str(candidate_bin),
         }
         try:
+            reference_preflight_metadata = read_metadata(reference_preflight_dir / "metadata.txt")
+            candidate_preflight_metadata = read_metadata(candidate_preflight_dir / "metadata.txt")
+            verify_run_artifacts(reference_preflight_dir, reference_fingerprint, reference_preflight_metadata)
+            verify_run_artifacts(candidate_preflight_dir, candidate_fingerprint, candidate_preflight_metadata)
             reference_identity = paired_input_identity(
                 reference_fingerprint,
                 preflight_pair_metadata,
-                read_metadata(reference_preflight_dir / "metadata.txt"),
+                reference_preflight_metadata,
             )
             candidate_identity = paired_input_identity(
                 candidate_fingerprint,
                 preflight_pair_metadata,
-                read_metadata(candidate_preflight_dir / "metadata.txt"),
+                candidate_preflight_metadata,
             )
         except (OSError, ValueError) as error:
             raise RuntimeError(f"invalid paired preflight identity: {error}; no timed pairs were started") from error
