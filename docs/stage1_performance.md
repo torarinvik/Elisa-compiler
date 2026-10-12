@@ -271,6 +271,12 @@ invalid backend IR in an object build prints numbered values instead of names.
   generated code for packed AoS enum common fields. The current cross-language runtime kernels
   do not cover that feature. Add a recursive AoS enum/common-field workload with C, Rust, and Zig
   equivalents before claiming a runtime gain; keep compiler-throughput measurements separate.
+- Module function declaration and body emission now collect `__impl_scope` and
+  `__handler_scope` tags in one annotation-table traversal per nested scoped declaration, while
+  preserving the exact owner/line checks and impl-before-handler processing order. This removes
+  one complete annotation scan at each such site but leaves the scopes-by-annotations bound
+  unchanged. Record annotation probes and codegen CPU on self-hosting and module-heavy inputs
+  before claiming a gain; this fusion is unmeasured.
 
 ## Round 4 (claude/s1-perf-r4: 0cdb5c72, bd9fdb13, 341f72ba, ddbc803d)
 
