@@ -15,6 +15,124 @@ const ARENA_BACKEND_WASM_HEAPBASE = 3
 # stage0 sees this conservative false value and keeps compiling the host stdlib.
 const ELISA_TARGET_OS_WASM: bool = false
 
+# Allocation-hook negotiation is fixed for ABI v1, so cache its supported /
+# unsupported result once per process. Keep this state in the arena layer: the
+# profiler declarations are also included by the runtime prelude, which does not
+# include the atomics module. WASI sets POSIX for its runtime ABI, but this
+# WebAssembly target is single-threaded and must use the ordinary access path.
+global mutable __elisa_profile_allocation_status_cell: AtomicCell[i32] = zeroed
+global mutable __elisa_profile_allocation_lock_cell: AtomicCell[i32] = zeroed
+
+@internal
+def arena_profile_allocation_status_load() -> i32:
+    result: mutable i32 = 0
+    static if ELISA_TARGET_OS_WASM:
+        trusted Unsafe.MutableGlobal:
+            can Global.Read:
+                result <- __elisa_profile_allocation_status_cell.slot.value
+    static elif ELISA_TARGET_OS_POSIX:
+        trusted Unsafe.MutableGlobal:
+            can Global.Read:
+                can Atomics.Load:
+                    result <- atomic_load_acquire(&__elisa_profile_allocation_status_cell)
+    static elif ELISA_TARGET_OS_WINDOWS:
+        trusted Unsafe.MutableGlobal:
+            can Global.Read:
+                can Atomics.Load:
+                    result <- atomic_load_acquire(&__elisa_profile_allocation_status_cell)
+    static else:
+        trusted Unsafe.MutableGlobal:
+            can Global.Read:
+                result <- __elisa_profile_allocation_status_cell.slot.value
+    return result
+
+@internal
+def arena_profile_allocation_status_store(status: i32):
+    static if ELISA_TARGET_OS_WASM:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                __elisa_profile_allocation_status_cell.slot.value <- status
+    static elif ELISA_TARGET_OS_POSIX:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                can Atomics.Store:
+                    atomic_store_release(&__elisa_profile_allocation_status_cell, status)
+    static elif ELISA_TARGET_OS_WINDOWS:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                can Atomics.Store:
+                    atomic_store_release(&__elisa_profile_allocation_status_cell, status)
+    static else:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                __elisa_profile_allocation_status_cell.slot.value <- status
+
+@internal
+def arena_profile_allocation_lock_acquire():
+    static if ELISA_TARGET_OS_WASM:
+        pass
+    static elif ELISA_TARGET_OS_POSIX:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                can Atomics.Exchange:
+                    while atomic_exchange_acqrel(&__elisa_profile_allocation_lock_cell, 1) != 0:
+                        pass
+    static elif ELISA_TARGET_OS_WINDOWS:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                can Atomics.Exchange:
+                    while atomic_exchange_acqrel(&__elisa_profile_allocation_lock_cell, 1) != 0:
+                        pass
+    static else:
+        pass
+
+@internal
+def arena_profile_allocation_lock_release():
+    static if ELISA_TARGET_OS_WASM:
+        pass
+    static elif ELISA_TARGET_OS_POSIX:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                can Atomics.Store:
+                    atomic_store_release(&__elisa_profile_allocation_lock_cell, 0)
+    static elif ELISA_TARGET_OS_WINDOWS:
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                can Atomics.Store:
+                    atomic_store_release(&__elisa_profile_allocation_lock_cell, 0)
+    static else:
+        pass
+
+@internal
+def arena_profile_allocation_supported() -> bool:
+    cached: mutable i32 = (arena_profile_allocation_status_load() can Global.Read, Atomics.Load)
+    if cached != 0:
+        return cached == 2
+
+    # The bundled profiler initializes shared state during negotiation, so only
+    # one thread may enter it. Keep the initialized event path to one atomic load.
+    (arena_profile_allocation_lock_acquire() can Global{Read,Write}, Atomics.Exchange)
+    cached <- (arena_profile_allocation_status_load() can Global.Read, Atomics.Load)
+    if cached == 0:
+        negotiated: mutable u32 = 0.u32()
+        can Unsafe.RawExtern:
+            negotiated <- elisa_profile_allocation_negotiate(ELISA_PROFILE_ALLOCATION_ABI_V1)
+        cached <- 1 if negotiated != ELISA_PROFILE_ALLOCATION_ABI_V1 else 2
+        (arena_profile_allocation_status_store(cached) can Global{Read,Write}, Atomics.Store)
+    (arena_profile_allocation_lock_release() can Global{Read,Write}, Atomics.Store)
+    return cached == 2
+
+# Public runtime seam used by allocation sites and by the backend's explicit
+# region-create emission. The shared profiler include declares only the host
+# ABI; this wrapper lives here so its cache can use the arena atomics layer.
+def arena_profile_allocation_event(
+    kind: u32, address: uintptr, size: usize, old_address: uintptr,
+    old_size: usize, arena: uintptr, region: usize
+) -> void:
+    return if not (arena_profile_allocation_supported() can Global{Read,Write}, Atomics{Exchange,Load,Store})
+    can Unsafe.RawExtern:
+        elisa_profile_allocation_event_v1(kind, address, size, old_address, old_size, arena, region)
+
 # Backend chosen by target OS so the arena never depends on host libc malloc on the
 # platforms the emulator targets: POSIX (macOS/Linux/FreeBSD) -> mmap, Windows ->
 # VirtualAlloc. This matters because on the x86_64-under-Rosetta substrate, libc malloc
@@ -2051,9 +2169,9 @@ def collection_stack_acquire(a: mutable Arena&, live_table: void&?, needed_slots
 # remains pooled for reuse, but the profiler must see the logical retirement so
 # allocation pressure and retained table capacity are not understated.
 def collection_stack_profile_release(a: mutable Arena&, table: void&?) -> void:
-    can Atomics{Exchange,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}:
+    can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}:
         return if table == null
-        return if elisa_profile_allocation_negotiate(ELISA_PROFILE_ALLOCATION_ABI_V1) != 1.u32()
+        return if not (arena_profile_allocation_supported() can Global{Read,Write}, Atomics{Exchange,Load,Store})
         old_table: void& = table
         old_backing: mutable heap Region&? = (collection_stack_of_table(a, old_table) can Global{Read,Write})
         if old_backing != null:
