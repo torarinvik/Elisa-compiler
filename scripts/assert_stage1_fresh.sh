@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Refuse a stage1 product older than the sources it claims to have been built from.
+# Refuse a stage1 product whose recorded compiler inputs no longer match the source tree.
 #
 # scripts/elisac_stage1.sh already does this for every check that drives the compiler
 # through the WRAPPER. Most parity checks invoke `bin/elisac-stage1` directly, so they used
@@ -31,6 +31,11 @@ case "$BIN" in
     *) exit 0 ;;
 esac
 
+# The Stage1 manifest includes the selected LLVM toolchain. Resolve the same defaults used
+# by builds before checking it; many parity scripts invoke this guard without sourcing the
+# shared platform setup themselves.
+. "$ROOT/scripts/platform.sh"
+
 if ! command -v python3 >/dev/null 2>&1; then
   echo "cannot verify stage1 source provenance: python3 is unavailable" >&2
   exit 2
@@ -42,11 +47,4 @@ if [[ "$provenance_status" -ne 0 ]]; then
   echo "set ELISA_ALLOW_STALE_STAGE1=1 only when intentionally testing an older product" >&2
   exit "$provenance_status"
 fi
-
-newer="$(find "$ROOT/src" "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) -newer "$BIN" -print -quit 2>/dev/null)"
-[ -n "$newer" ] || exit 0
-
-echo "stage1 product binary is stale: $newer is newer than $BIN" >&2
-echo "run: $ROOT/scripts/elisac_stage1.sh --seed" >&2
-echo "set ELISA_ALLOW_STALE_STAGE1=1 only when intentionally testing an older product" >&2
-exit 2
+exit 0
