@@ -873,6 +873,19 @@ for name, routes in theorem_routes.items():
         proof_edges = EFFECT_CANDIDATE_EDGES
     elif name == "proof_chv_comprehension_scope_masks_shadowed_reference":
         proof_source, proof_edges = holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES
+    elif name == "proof_chv_binary_operator_checks_both_operands":
+        proof_source, proof_edges = holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES
+    elif name == "proof_chv_binary_operator_result_tracks_reference_operands":
+        proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
+        proof_edges = REF_ALIAS_HELPER_EDGES
+    elif name == "proof_chv_binary_operator_result_tracks_view_operands":
+        proof_source = function_section(holder_text, "chv_is_owned_view")
+        proof_edges = VIEW_ALIAS_BINARY_EDGES
+    elif name == "proof_chv_index_overloads_check_receiver_and_keys":
+        proof_source, proof_edges = holder_walk_expressions, INDEX_OPERATOR_EDGES
+    elif name == "proof_chv_index_result_tracks_receiver_view":
+        proof_source = function_section(holder_text, "chv_is_owned_view")
+        proof_edges = INDEX_VIEW_RESULT_EDGES
     elif name == "proof_chv_view_alias_join_preserves_owned_fact":
         proof_source = function_section(holder_text, "chv_flow_set_merge")
         proof_edges = VIEW_FLOW_MERGE_EDGES
@@ -885,6 +898,14 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_address_of_uses_operand_reference_provenance":
         proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
         proof_edges = REF_ALIAS_ADDRESS_EDGES
+    elif name == "proof_chv_unary_negation_tracks_reference_operand":
+        proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
+        proof_edges = REF_ALIAS_ADDRESS_EDGES
+    elif name == "proof_chv_unary_negation_checks_operator_operand":
+        proof_source, proof_edges = holder_walk_expressions, UNARY_NEGATION_EDGES
+    elif name == "proof_chv_unary_negation_tracks_view_operand":
+        proof_source = function_section(holder_text, "chv_is_owned_view")
+        proof_edges = UNARY_VIEW_RESULT_EDGES
     elif name == "proof_chv_projection_fallback_requires_caller_reference":
         proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
         proof_edges = REF_ALIAS_HELPER_EDGES
@@ -938,8 +959,24 @@ for name, routes in theorem_routes.items():
         validate_exact_boolean_theorem(positive_text, name, routes, "left_path_may_alias or right_path_may_alias", proof_source, proof_edges)
     elif name == "proof_chv_reference_targets_cover_alias_routes":
         validate_exact_boolean_theorem(positive_text, name, routes, "direct_parameter and local_alias and call_result and projection_fallback", proof_source, proof_edges)
+    elif name == "proof_chv_binary_operator_checks_both_operands":
+        validate_exact_boolean_theorem(positive_text, name, routes, "receiver_checked and operand_checked and fallback_checked", proof_source, proof_edges)
+    elif name == "proof_chv_binary_operator_result_tracks_reference_operands":
+        validate_exact_boolean_theorem(positive_text, name, routes, "left_alias or right_alias", proof_source, proof_edges)
+    elif name == "proof_chv_binary_operator_result_tracks_view_operands":
+        validate_exact_boolean_theorem(positive_text, name, routes, "left_may_be_view or right_may_be_view", proof_source, proof_edges)
+    elif name == "proof_chv_index_overloads_check_receiver_and_keys":
+        validate_exact_boolean_theorem(positive_text, name, routes, "receiver_checked and key_checked and call_checked and type_application_skipped", proof_source, proof_edges)
+    elif name == "proof_chv_index_result_tracks_receiver_view":
+        validate_exact_boolean_theorem(positive_text, name, routes, "receiver_may_be_view", proof_source, proof_edges)
     elif name == "proof_chv_address_of_uses_operand_reference_provenance":
         validate_exact_boolean_theorem(positive_text, name, routes, "operand_alias_checked", proof_source, proof_edges)
+    elif name == "proof_chv_unary_negation_tracks_reference_operand":
+        validate_exact_boolean_theorem(positive_text, name, routes, "operand_alias_checked", proof_source, proof_edges)
+    elif name == "proof_chv_unary_negation_checks_operator_operand":
+        validate_exact_boolean_theorem(positive_text, name, routes, "operand_checked and fallback_checked", proof_source, proof_edges)
+    elif name == "proof_chv_unary_negation_tracks_view_operand":
+        validate_exact_boolean_theorem(positive_text, name, routes, "operand_may_be_view", proof_source, proof_edges)
     elif name == "proof_chv_projection_fallback_requires_caller_reference":
         validate_exact_boolean_theorem(positive_text, name, routes, "caller_reference_exists", proof_source, proof_edges)
     elif name == "proof_chv_summary_calls_check_reference_aliases":
@@ -989,8 +1026,8 @@ if "inner(id_holder(out), owned_view)" not in positive_text or "local_holder.slo
 if "&local_holder" not in positive_text:
     raise SystemExit("reference alias proof must document the local address-of control")
 unary_alias_arm = match_arm_body(reference_alias_source, "match argument:", "Expr.Unary(operator, operand, _):")
-if unary_alias_arm is None or compact_code(unary_alias_arm) != compact_code("if operator == TokenKind.Ampersand:\n    return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)\nreturn ref_params.count > 0"):
-    raise SystemExit("address-of operands must retain their own reference provenance")
+if unary_alias_arm is None or compact_code(unary_alias_arm) != compact_code("return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)"):
+    raise SystemExit("unary operands must retain their own reference provenance")
 named_argument_detector = function_section(holder_text, "chv_call_has_named_arguments")
 if compact_code(named_argument_detector) != compact_code("can Abort.Panic:\n    return any argument_name in argument_names where argument_name != \"\""):
     raise SystemExit("holder-view named-argument detection must recognize every nonempty label")
@@ -1002,6 +1039,10 @@ callee_dispatch_source = function_section(holder_text, "chv_check_named_callee")
 validate_edge_set(callee_dispatch_source, CALLEE_DISPATCH_EDGES, "holder-view callee dispatch")
 validate_edge_set(function_section(holder_text, "chv_check_named_call"), NAMED_CALL_EDGES, "holder-view named-call resolution")
 validate_edge_set(function_section(holder_text, "chv_check_unknown_call"), UNKNOWN_CALL_EDGES, "holder-view indirect-call fallback")
+validate_edge_set(holder_walk_expressions, INDEX_OPERATOR_EDGES, "holder-view overloaded index fallback")
+validate_edge_set(holder_walk_expressions, UNARY_NEGATION_EDGES, "holder-view unary negation fallback")
+validate_edge_set(function_section(holder_text, "chv_is_owned_view"), INDEX_VIEW_RESULT_EDGES, "holder-view index result provenance")
+validate_edge_set(function_section(holder_text, "chv_is_owned_view"), UNARY_VIEW_RESULT_EDGES, "holder-view unary result provenance")
 
 if "if owned.count > 0" in compact_code(function_section(holder_text, "chv_walk_declarations")):
     raise SystemExit("holder-view walk must visit reference functions to reach nested lambda scopes")
