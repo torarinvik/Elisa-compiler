@@ -1403,49 +1403,60 @@ extend Backend:
             return false
 
 
-        # Resolve a one-argument submit like an ordinary direct call: source-order first among
-        # typed matches. A module member shadows a top-level declaration. ABI checks happen
-        # after selection, so an unsupported first match declines instead of falling through to
-        # a later overload that ordinary calls would not select.
-        def submit_worker_resolve_owner(owner: sview, name: sview, argument: Expr, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, local_scope: mutable Scope&, out_candidate_count: mutable usize&, out_selected_index: mutable i64&) -> void can[Abort.Panic, Memory.Allocate]:
-            can Abort.Panic, Memory.Allocate:
-                out_candidate_count <- 0.usize()
-                out_selected_index <- -1
-                argument_type_ready: mutable bool = false
-                argument_type: mutable ValueType = unmodeled_type()
-                index_cursor: mutable i64 = first_function_named(fns, name)
-                while index_cursor >= 0 and out_selected_index < 0 |index_cursor, fns, owner, name, argument, structs, generics, local_scope, out_candidate_count, out_selected_index, argument_type_ready, argument_type|:
-                    index: usize = index_cursor.usize()
-                    index_cursor <- next_function_named(fns, name, index_cursor)
-                    continue if index >= fns.names.count or index >= fns.owners.count or index >= fns.param_count.count
-                    continue if fns.names[index] != name or fns.owners[index] != owner or fns.param_count[index] != 1.usize()
-                    out_candidate_count <- out_candidate_count + 1.usize()
-                    if not argument_type_ready:
-                        argument_type <- expression_type(argument, local_scope, fns, structs, generics)
-                        argument_type_ready <- true
-                    # Direct calls choose the first source-ordered type match. Keep the
-                    # same rule for submit while caching the one argument's inferred type.
-                    out_selected_index <- index.i64() if out_selected_index < 0 and overload_candidate_matches_argument(index, 0.usize(), argument, argument_type, fns, structs)
+        # Explicitly-instantiated generic submits do not yet validate labels against the
+        # generic declaration's formal parameters. Keep that path positional-only. Monomorphic
+        # workers use the same label-aware resolver as ordinary direct calls below.
+        def submit_call_has_only_positional_arguments(argument_count: usize, argument_names: darray[sview]) -> bool can[Abort.Panic]:
+            return false if argument_names.count != 0 and argument_names.count != argument_count
+            for argument_name in argument_names:
+                return false if argument_name != ""
+            return true
 
 
-        def submit_worker_index(name: sview, argument: Expr, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, local_scope: mutable Scope&) -> i64 can[Abort.Panic, Memory.Allocate]:
-            owner: sview = structs.visibility.current_owner
-            if owner != "":
-                owner_candidates: mutable usize = 0
-                selected: mutable i64 = -1
-                submit_worker_resolve_owner(owner, name, argument, fns, structs, generics, local_scope, owner_candidates, selected)
-                if owner_candidates > 0.usize():
-                    return selected if selected >= 0
-                    # Match emit_direct_call's source-order arity fallback when no exact
-                    # overload matches. The submit call site rechecks semantic identity or
-                    # performs an allowed numeric/contextual conversion before emitting the
-                    # callback ABI; LLVM type equality alone is not sufficient.
-                    return function_index_of_arity(fns, owner, name, 1.usize())
-            top_candidates: mutable usize = 0
-            selected_top: mutable i64 = -1
-            submit_worker_resolve_owner("", name, argument, fns, structs, generics, local_scope, top_candidates, selected_top)
-            return selected_top if selected_top >= 0
-            return function_index_of_arity(fns, "", name, 1.usize()) if top_candidates > 0.usize()
+        def submit_worker_row_has_pool_submit1_arity(index: i64, fns: FnTable&) -> bool can[Abort.Panic]:
+            false return if index < 0 or index.usize() >= fns.param_count.count or index.usize() >= fns.is_variadic.count
+            row: usize = index.usize()
+            return fns.param_count[row] == 1.usize() and not fns.is_variadic[row]
+
+
+        def submit_worker_index(name: sview, argument: Expr, argument_names: darray[sview]&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, local_scope: mutable Scope&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            return -1 if argument_names.count != 0 and argument_names.count != 1.usize()
+            worker_arguments: mutable darray[Expr] = [argument]
+            argument_name: sview = argument_names[0] if argument_names.count == 1.usize() else ""
+            current_owner: sview = structs.visibility.current_owner
+            # Match emit_call_named: a shape-compatible enclosing-module member shadows an
+            # inferred generic and top-level declarations. The typed resolver chooses among
+            # same-owner overloads; the shape fallback is only used when exactly one row can
+            # accept the labels/defaults but the argument's type is contextual or convertible.
+            if current_owner != "":
+                worker_row: i64 = overload_index_for_one_call_arg(fns, current_owner, name, argument, argument_name, local_scope, structs, generics)
+                if worker_row >= 0:
+                    return worker_row if submit_worker_row_has_pool_submit1_arity(worker_row, fns)
+                    return -1
+                # A typed match already proves the call shape. Scan shape separately only
+                # on typed miss, where it preserves contextual fallback and owner shadowing.
+                if function_has_call_shape(fns, current_owner, name, worker_arguments, argument_names):
+                    worker_row <- function_index_of_unique_call_shape(fns, current_owner, name, worker_arguments, argument_names)
+                    return worker_row if submit_worker_row_has_pool_submit1_arity(worker_row, fns)
+                    return -1
+            # An uninstantiated generic worker is not lowered by this dedicated submit path.
+            # If ordinary call resolution would take that generic fallback, fail closed rather
+            # than accidentally submitting a same-named monomorphic function.
+            return -1 if generic_index_of(generics, name) >= 0 and not exact_overload_exists_for_call_args(fns, name, worker_arguments, argument_names, local_scope, structs, generics, 0)
+            # Bare calls prefer a top-level declaration when one exists. Otherwise apply the
+            # same unique-owner policy used by ordinary calls, including call-shape filtering
+            # when several module owners define this name.
+            if function_index_of(fns, "", name) >= 0:
+                worker_row: i64 = overload_index_for_one_call_arg(fns, "", name, argument, argument_name, local_scope, structs, generics)
+                worker_row <- function_index_of_unique_call_shape(fns, "", name, worker_arguments, argument_names) if worker_row < 0
+                return worker_row if submit_worker_row_has_pool_submit1_arity(worker_row, fns)
+                return -1
+            owner_row: i64 = function_index_for_unique_call_owner(fns, name, worker_arguments, argument_names)
+            return -1 if owner_row < 0
+            selected_owner: sview = fns.owners[owner_row.usize()]
+            worker_row: i64 = overload_index_for_one_call_arg(fns, selected_owner, name, argument, argument_name, local_scope, structs, generics)
+            worker_row <- function_index_of_unique_call_shape(fns, selected_owner, name, worker_arguments, argument_names) if worker_row < 0
+            return worker_row if submit_worker_row_has_pool_submit1_arity(worker_row, fns)
             return -1
 
         # True when this direct worker row requires the caller's packed store. This is

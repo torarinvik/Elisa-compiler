@@ -11,7 +11,23 @@ if ! elisa_run_timeout 300 env -u ELISA_STAGE1_RUNTIME_STD "$STAGE1" -emit llvm 
     cat "$WORK/build-llvm.log" >&2
     exit 1
 fi
+named_log="$WORK/named-submit.log"
+if elisa_run_timeout 300 env -u ELISA_STAGE1_RUNTIME_STD "$STAGE1" -emit obj -O0 -o "$WORK/named-submit.o" "$ROOT/test/parity/submit_named_argument_decline.elisa" >"$named_log" 2>&1; then
+    echo "submit store capture: silently accepted a worker argument with an unknown label" >&2
+    exit 1
+fi
+[[ ! -e "$WORK/named-submit.o" ]] || { echo "submit store capture: wrote an object for the invalid named worker argument" >&2; exit 1; }
+grep -qi 'declin\|unsupported\|unmodeled\|argument\|parameter\|label' "$named_log" || {
+    cat "$named_log" >&2
+    echo "submit store capture: named-argument refusal had no useful diagnostic" >&2
+    exit 1
+}
 awk '/^define .*@main\(/,/^}/' "$WORK/control.ll" >"$WORK/main.ll"
+if ! grep -Eq 'call .*@pool_submit1[^;]*@plain_overloaded_submit_worker\.1[^,;]*, i32' "$WORK/main.ll"; then
+    echo "named submit did not lower to the i32 overload selected by its value: label" >&2
+    grep -n 'call .*@pool_submit1\|@plain_overloaded_submit_worker' "$WORK/main.ll" >&2 || true
+    exit 1
+fi
 secondary_pool_submits=$(grep -Ec 'call .*@pool_submit1[^;]*ptr %[^, )]*secondary_workers' "$WORK/main.ll" || true)
 if [[ "$secondary_pool_submits" -ne 2 ]]; then
     echo "same-line selector lowering used secondary_workers $secondary_pool_submits times; expected 2" >&2
