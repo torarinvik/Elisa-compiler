@@ -206,6 +206,9 @@ def copy_fingerprint_sibling(source, target, *, allow_empty=False, limit=MAX_BYT
             identity = copy_fingerprint(source, temporary, allow_empty=allow_empty, limit=limit)
         except FileExistsError:
             continue
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         return temporary, identity
     raise FileExistsError(f"could not allocate a unique staging path beside {target}")
 

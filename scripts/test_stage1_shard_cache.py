@@ -159,6 +159,19 @@ class ShardCacheTests(unittest.TestCase):
             self.assertFalse(self.restore())
         self.assertEqual(self.output.read_bytes(), b"prior")
 
+    def test_restore_copy_failure_removes_unregistered_sibling(self):
+        self.publish()
+        real_copy = shard.copy_fingerprint
+
+        def fail_after_copy(src, dst, *, allow_empty=False, limit=shard.MAX_BYTES):
+            real_copy(src, dst, allow_empty=allow_empty, limit=limit)
+            raise OSError("injected failure after staging bytes")
+
+        with patch.object(shard, "copy_fingerprint", side_effect=fail_after_copy):
+            with self.assertRaisesRegex(OSError, "after staging"):
+                self.restore()
+        self.assertFalse(list(self.root.glob("*.incoming-*")))
+
     def test_staged_copy_corruption_and_oversized_manifest(self):
         self.publish()
         self.output.write_bytes(b"prior")
