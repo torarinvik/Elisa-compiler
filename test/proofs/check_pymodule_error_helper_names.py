@@ -110,6 +110,14 @@ proved_pairs = set(re.findall(
 ))
 if proved_pairs != set(EXPECTED):
     raise SystemExit("positive proof no longer covers every accepted classifier mapping exactly")
+unsupported_names = set(re.findall(
+    r'PymoduleErrorHelperNames::nested_darray_helper_suffix\("([^"\\]*)"\)\s*==\s*""',
+    positive_text,
+))
+if unsupported_names != {
+    "", "i128", "u128", "String", "cstr??", "py::Object??", "u128?", "Object", "darray[i64]",
+}:
+    raise SystemExit("positive proof no longer covers the fail-closed unsupported leaf cases")
 negative_text = NEGATIVE.read_text()
 rejected_claims = set(re.findall(
     r'PymoduleErrorHelperNames::nested_darray_helper_suffix\("([^"\\]+)"\)\s*==\s*"([^"\\]+)"',
