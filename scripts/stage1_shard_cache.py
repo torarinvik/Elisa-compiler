@@ -197,6 +197,45 @@ def copy_fingerprint(source, target, *, allow_empty=False, limit=MAX_BYTES):
     return {"sha256": digest_state.hexdigest(), "size": size}
 
 
+def copy_fingerprint_sibling(source, target, *, allow_empty=False, limit=MAX_BYTES):
+    """Copy to one exclusive random sibling, returning its path and identity."""
+    target = Path(target)
+    for _ in range(16):
+        temporary = target.with_name(f".{target.name}.incoming-{os.urandom(16).hex()}")
+        try:
+            identity = copy_fingerprint(source, temporary, allow_empty=allow_empty, limit=limit)
+        except FileExistsError:
+            continue
+        return temporary, identity
+    raise FileExistsError(f"could not allocate a unique staging path beside {target}")
+
+
+def ensure_parent_directories(parent, created):
+    parent = Path(parent)
+    missing = []
+    while not parent.exists():
+        missing.append(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
+        else:
+            created.append(directory)
+
+
+def remove_empty_directories(directories):
+    for directory in reversed(directories):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def read_bundle_manifest(entry, ticket):
     try:
         with (entry / "manifest.json").open("rb") as stream:
@@ -263,11 +302,17 @@ def publish(cache, ticket, obj, stdout, stderr, *, _validator=validate_ticket):
             shutil.rmtree(retired, ignore_errors=True)
 
 
-def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket, _receipt=None, _verify_copies=True):
+def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket, _receipt=None,
+            _verify_copies=True, _deferred_staged=None, _deferred_directories=None):
     _validator(ticket)
     if len({str(Path(path).resolve()) for path in (output, stdout, stderr)}) != 3:
         raise ValueError("restore output paths must be distinct")
+    if (_deferred_staged is None) != (_deferred_directories is None):
+        raise ValueError("deferred restore requires both staging result lists")
     staged = []
+    created_directories = []
+    committed = False
+    transferred = False
     try:
         with locked(cache, ticket["key"], False) as entry:
             manifest = read_bundle_manifest(entry, ticket)
@@ -275,28 +320,37 @@ def restore(cache, ticket, output, stdout, stderr, *, _validator=validate_ticket
                 return False
             for name, target in (("object", output), ("stdout", stdout), ("stderr", stderr)):
                 target = Path(target)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                fd, temporary = tempfile.mkstemp(prefix=target.name + ".incoming-", dir=target.parent)
-                os.close(fd)
-                Path(temporary).unlink()
-                staged.append((Path(temporary), target))
+                ensure_parent_directories(target.parent, created_directories)
                 limit = MAX_BYTES if name == "object" else MAX_STREAM
-                copied = copy_fingerprint(entry / name, temporary, allow_empty=name != "object", limit=limit)
+                temporary, copied = copy_fingerprint_sibling(
+                    entry / name, target, allow_empty=name != "object", limit=limit
+                )
+                staged.append((temporary, target))
                 if copied != manifest[name]:
                     return False
                 if _verify_copies and fingerprint(temporary, allow_empty=name != "object", limit=limit) != manifest[name]:
                     return False
             _validator(ticket)
+            if _deferred_staged is not None:
+                _deferred_staged.extend(source for source, _ in staged)
+                _deferred_directories.extend(created_directories)
+                transferred = True
+                if _receipt is not None:
+                    _receipt.update({name: dict(manifest[name]) for name in ("object", "stdout", "stderr")})
+                return True
             # Object commits last; publication errors are fatal, never a cold retry
             # following partially published diagnostics.
             for index in (1, 2, 0):
                 os.replace(*staged[index])
+            committed = True
             if _receipt is not None:
                 _receipt.update({name: dict(manifest[name]) for name in ("object", "stdout", "stderr")})
             return True
     finally:
-        for source, _ in staged:
-            source.unlink(missing_ok=True)
+        if not transferred and not committed:
+            for source, _ in staged:
+                source.unlink(missing_ok=True)
+            remove_empty_directories(created_directories)
 
 
 
@@ -424,30 +478,15 @@ class BatchInvocation:
         created_directories = []
         retained = False
         try:
-            # Stage directly beside each destination. The cache restore writes
-            # each payload once; finish() attests these private files before any
-            # publication, then commits them with same-filesystem renames.
-            for target in targets:
-                missing = []
-                parent = target.parent
-                while not parent.exists():
-                    missing.append(parent)
-                    if parent == parent.parent:
-                        break
-                    parent = parent.parent
-                for directory in reversed(missing):
-                    try:
-                        directory.mkdir()
-                    except FileExistsError:
-                        if not directory.is_dir():
-                            raise
-                    else:
-                        created_directories.append(directory)
-                fd, temporary = tempfile.mkstemp(prefix=target.name + ".incoming-", dir=target.parent)
-                os.close(fd)
-                staged.append(Path(temporary))
             expected = {}
-            hit = restore(self.cache, ticket, *staged, _validator=self.validate, _receipt=expected, _verify_copies=False)
+            # Defer restore's atomic commit so finish() can validate every hit and
+            # publish all batch outputs together. The restore helper writes directly
+            # to unique destination-side siblings; misses create no output files.
+            hit = restore(
+                self.cache, ticket, *targets, _validator=self.validate, _receipt=expected,
+                _verify_copies=False, _deferred_staged=staged,
+                _deferred_directories=created_directories,
+            )
             if hit:
                 self.outputs.append((ticket, staged, targets, expected, created_directories))
                 retained = True
@@ -457,11 +496,7 @@ class BatchInvocation:
             if not retained:
                 for path in staged:
                     path.unlink(missing_ok=True)
-                for directory in reversed(created_directories):
-                    try:
-                        directory.rmdir()
-                    except OSError:
-                        pass
+                remove_empty_directories(created_directories)
 
     def publish(self, ticket, obj, stdout, stderr):
         self._open()
@@ -523,11 +558,7 @@ class BatchInvocation:
         for _, staged, _, _, created_directories in self.outputs:
             for path in staged:
                 path.unlink(missing_ok=True)
-            for directory in reversed(created_directories):
-                try:
-                    directory.rmdir()
-                except OSError:
-                    pass
+            remove_empty_directories(created_directories)
         shutil.rmtree(self.work, ignore_errors=True)
 
     def __enter__(self):

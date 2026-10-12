@@ -288,6 +288,7 @@ class ShardCacheTests(unittest.TestCase):
         self.publish()
         with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
             self.assertTrue(batch.restore(self.ticket, self.output, self.out, self.err))
+            self.assertEqual(len(list(self.root.glob("*.incoming-*"))), 3)
             fresh = batch.prepare(self.files["snapshot"], dict(self.options, logical_shard=2))
             batch.publish(fresh, self.files["object"], self.files["stdout"], self.files["stderr"])
             self.files["llvm"].write_bytes(b"changed during batch")
@@ -363,6 +364,8 @@ class ShardCacheTests(unittest.TestCase):
         with shard.BatchInvocation(self.cache, self.files["producer"], self.files["llvm"], self.files["runtime"], [self.files["profile"]]) as batch:
             ticket = batch.prepare(self.files["snapshot"], self.options)
             self.assertFalse(batch.restore(ticket, output, str(output) + ".out", str(output) + ".err"))
+            self.assertFalse(output.parent.parent.exists())
+            self.assertFalse(list(self.root.glob("*.incoming-*")))
             self.assertTrue(batch.finish())
         self.assertFalse(output.parent.parent.exists())
         self.assertFalse(list(self.root.glob("*.incoming-*")))
