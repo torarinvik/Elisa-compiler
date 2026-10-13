@@ -128,15 +128,62 @@ class CacheIntegrityTest(unittest.TestCase):
         logs.mkdir()
         (logs / "stdout").write_bytes(b"compile result\n")
         (logs / "stderr").write_bytes(b"compile warning\n")
-        script = function.group() + '\nstage1_cache_prepare() { stage1_cache_key="$TEST_NEXT_KEY"; return "$TEST_PREPARE_RC"; }\nstage1_cache_publish_if_unchanged\n'
-        for index, (next_key, prepare_rc, admitted) in enumerate((("key", 0, True), ("edited", 0, False), ("key", 1, False))):
-            with self.subTest(next_key=next_key, prepare_rc=prepare_rc):
+        script = function.group() + '\nstage1_cache_prepare() { stage1_cache_key="$TEST_NEXT_KEY"; stage1_cache_dependency_identity="$TEST_NEXT_IDENTITY"; return "$TEST_PREPARE_RC"; }\nstage1_cache_publish_if_unchanged\n'
+        cases = (
+            ("key", "identity", 0, True),
+            ("edited", "identity", 0, False),
+            ("key", "replaced", 0, False),
+            ("key", "identity", 1, False),
+        )
+        for index, (next_key, next_identity, prepare_rc, admitted) in enumerate(cases):
+            with self.subTest(next_key=next_key, next_identity=next_identity, prepare_rc=prepare_rc):
                 entry = self.entry.with_name(f"publication-{index}.o")
-                env = dict(os.environ, ROOT=str(root), stage1_cache_key="key", stage1_cache_entry=str(entry), stage1_cache_out=str(self.source), stage1_cache_logs=str(logs), TEST_NEXT_KEY=next_key, TEST_PREPARE_RC=str(prepare_rc))
+                env = dict(os.environ, ROOT=str(root), stage1_cache_key="key", stage1_cache_dependency_identity="identity", stage1_cache_entry=str(entry), stage1_cache_out=str(self.source), stage1_cache_logs=str(logs), TEST_NEXT_KEY=next_key, TEST_NEXT_IDENTITY=next_identity, TEST_PREPARE_RC=str(prepare_rc))
                 subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
                 self.assertEqual(entry.exists(), admitted)
                 self.assertEqual(Path(str(entry) + ".json").exists(), admitted)
                 self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
+
+    def test_wrapper_hit_rechecks_inputs_before_publishing_object_or_diagnostics(self):
+        root = self.cache_project()
+        wrapper = (Path(__file__).resolve().parent.parent / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_restore_if_unchanged\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        entry = root / "cache" / "key.o"
+        output = root / "output.o"
+        stdout = self.source.parent / "cached.stdout"
+        stderr = self.source.parent / "cached.stderr"
+        stdout.write_bytes(b"cached output\n")
+        stderr.write_bytes(b"cached warning\n")
+        self.assertTrue(cache.publish(entry, self.source, "key", stdout, stderr))
+        script = (
+            'set -uo pipefail\n'
+            + function.group()
+            + '\nstage1_cache_prepare() { stage1_cache_key="$TEST_NEXT_KEY"; stage1_cache_dependency_identity="$TEST_NEXT_IDENTITY"; return 0; }\n'
+            + 'stage1_cache_restore_if_unchanged\n'
+        )
+
+        output.write_bytes(b"prior output")
+        same = subprocess.run(
+            ["bash", "-c", script],
+            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="identity"),
+            capture_output=True,
+        )
+        self.assertEqual(same.returncode, 0, same.stderr.decode())
+        self.assertEqual(output.read_bytes(), self.source.read_bytes())
+        self.assertEqual(same.stdout, b"cached output\n")
+        self.assertEqual(same.stderr, b"cached warning\n")
+
+        output.write_bytes(b"prior output")
+        changed = subprocess.run(
+            ["bash", "-c", script],
+            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="replaced"),
+            capture_output=True,
+        )
+        self.assertEqual(changed.returncode, 1)
+        self.assertEqual(output.read_bytes(), b"prior output")
+        self.assertEqual(changed.stdout, b"")
+        self.assertEqual(changed.stderr, b"")
 
     def test_unreadable_dependency_refuses_cache_identity(self):
         root = self.cache_project()
@@ -164,10 +211,17 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(second, first)
         self.assertEqual(log.read_text(), "x")
 
+        replacement = root / "replacement.elisa"
+        replacement.write_bytes(dependency.read_bytes())
+        os.replace(replacement, dependency)
+        same_content = self.cache_key(compiler, source, root=root, extra_env=environment)
+        self.assertEqual(same_content, first)
+        self.assertEqual(log.read_text(), "xx")
+
         dependency.write_text("const VALUE: i64 = 2\n")
         third = self.cache_key(compiler, source, root=root, extra_env=environment)
         self.assertNotEqual(third, first)
-        self.assertEqual(log.read_text(), "xx")
+        self.assertEqual(log.read_text(), "xxx")
 
     def test_dependency_index_tracks_symlink_retargeting(self):
         root = self.source.parent
@@ -188,6 +242,40 @@ class CacheIntegrityTest(unittest.TestCase):
         link.unlink()
         link.symlink_to(second)
         self.assertIsNone(cache.read_dependencies(index, "base", source))
+
+    def test_dependency_index_invalidates_same_content_replacement(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        dependency = root / "included.elisa"
+        replacement = root / "replacement.elisa"
+        report = root / "deps.txt"
+        index = root / "deps.json"
+        source.write_text("source\n")
+        dependency.write_text("const VALUE: i64 = 1\n")
+        report.write_text(f"{source}\n{dependency}\n")
+        graph = cache.store_dependencies(index, "base", report, source)
+        self.assertEqual(cache.read_dependencies(index, "base", source), graph)
+
+        # Model an editor rewriting a file during compilation, then restoring its
+        # original bytes before the postflight check. Content alone cannot detect it.
+        replacement.write_bytes(dependency.read_bytes())
+        os.replace(replacement, dependency)
+        self.assertIsNone(cache.read_dependencies(index, "base", source))
+
+    def test_oversized_dependency_index_still_returns_current_digests(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        report = root / "deps.txt"
+        index = root / "deps.json"
+        source.write_text("source\n")
+        report.write_text(f"{source}\n")
+
+        with patch.object(cache, "MAX_DEPENDENCY_INDEX_BYTES", 1):
+            graph, identity = cache.store_dependencies(index, "base", report, source)
+
+        self.assertRegex(graph, r"^[0-9a-f]{64}$")
+        self.assertRegex(identity, r"^[0-9a-f]{64}$")
+        self.assertFalse(index.exists())
 
     def test_dependency_index_supports_relative_paths_in_the_same_directory(self):
         root = self.source.parent

@@ -275,6 +275,7 @@ driver_args=("$@")
 # legacy, partial, or corrupted entries take the ordinary compile path.
 stage1_cache_key=""
 stage1_cache_base_key=""
+stage1_cache_dependency_identity=""
 stage1_cache_dir=""
 stage1_cache_out=""
 stage1_cache_environment() {
@@ -334,7 +335,7 @@ stage1_cache_prepare() {
   stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
   stage1_cache_base_key="$(
     {
-      printf 'elisac-stage1-object-cache v5\n'
+      printf 'elisac-stage1-object-cache v6\n'
       printf 'cwd=%s\0' "$(pwd -P)" || exit 1
       shasum -a 256 "$BIN" "$provenance_file" | cut -d' ' -f1 || exit 1
       shasum -a 256 "$ROOT/scripts/elisac_stage1.sh" "$ROOT/scripts/stage1_object_cache.py" "$ROOT/scripts/platform.sh" | cut -d' ' -f1 || exit 1
@@ -350,9 +351,12 @@ stage1_cache_prepare() {
   [[ "$stage1_cache_base_key" =~ ^[0-9a-f]{64}$ ]] || return 1
 
   local dependency_index="$stage1_cache_dir/dependencies/$stage1_cache_base_key.json"
-  local dependency_graph=""
-  dependency_graph="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-key "$dependency_index" "$stage1_cache_base_key" "$source" 2>/dev/null)" || dependency_graph=""
-  if [[ ! "$dependency_graph" =~ ^[0-9a-f]{64}$ ]]; then
+  local dependency_state="" dependency_graph="" dependency_identity=""
+  dependency_state="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-key "$dependency_index" "$stage1_cache_base_key" "$source" 2>/dev/null)" || dependency_state=""
+  if [[ "$dependency_state" =~ ^([0-9a-f]{64})[[:space:]]([0-9a-f]{64})$ ]]; then
+    dependency_graph="${BASH_REMATCH[1]}"
+    dependency_identity="${BASH_REMATCH[2]}"
+  else
     local deps_file emit_seen=0
     deps_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps.XXXXXX")" || return 1
     index=0
@@ -379,26 +383,61 @@ stage1_cache_prepare() {
       rm -f "$deps_file"
       return 1
     fi
-    dependency_graph="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-store "$dependency_index" "$stage1_cache_base_key" "$deps_file" "$source" 2>/dev/null)" || dependency_graph=""
+    dependency_state="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-store "$dependency_index" "$stage1_cache_base_key" "$deps_file" "$source" 2>/dev/null)" || dependency_state=""
     rm -f "$deps_file"
+    if [[ "$dependency_state" =~ ^([0-9a-f]{64})[[:space:]]([0-9a-f]{64})$ ]]; then
+      dependency_graph="${BASH_REMATCH[1]}"
+      dependency_identity="${BASH_REMATCH[2]}"
+    fi
   fi
-  [[ "$dependency_graph" =~ ^[0-9a-f]{64}$ ]] || return 1
-  stage1_cache_key="$(printf '%s\0%s\0%s' 'elisac-stage1-object-cache-key-v5' "$stage1_cache_base_key" "$dependency_graph" | shasum -a 256 | cut -d' ' -f1)" || return 1
+  [[ "$dependency_graph" =~ ^[0-9a-f]{64}$ && "$dependency_identity" =~ ^[0-9a-f]{64}$ ]] || return 1
+  stage1_cache_dependency_identity="$dependency_identity"
+  stage1_cache_key="$(printf '%s\0%s\0%s' 'elisac-stage1-object-cache-key-v6' "$stage1_cache_base_key" "$dependency_graph" | shasum -a 256 | cut -d' ' -f1)" || return 1
   [[ -n "$stage1_cache_key" ]]
 }
 stage1_cache_publish_if_unchanged() {
-  local compiled_key="$stage1_cache_key"
+  local compiled_key="$stage1_cache_key" compiled_identity="$stage1_cache_dependency_identity"
   # A successful compile can overlap an editor save or dependency regeneration.
   # Keep its output, but publish only under the exact inputs observed at admission.
   stage1_cache_prepare || return 0
-  [[ "$stage1_cache_key" == "$compiled_key" ]] || return 0
+  [[ "$stage1_cache_key" == "$compiled_key" && "$stage1_cache_dependency_identity" == "$compiled_identity" ]] || return 0
   python3 "$ROOT/scripts/stage1_object_cache.py" publish "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" "$stage1_cache_logs/stdout" "$stage1_cache_logs/stderr" || true
+}
+stage1_cache_restore_if_unchanged() {
+  local admitted_key="$stage1_cache_key"
+  local admitted_identity="$stage1_cache_dependency_identity"
+  local restore_template="$stage1_cache_out.cache.XXXXXX"
+  local staged_object staged_stdout staged_stderr restore_rc=0 destination="$stage1_cache_out"
+  # Keep the staged object beside the requested output so the final rename is atomic.
+  # Prefix relative paths so an output beginning with '-' is not parsed as an option.
+  case "$restore_template" in /*|./*|../*) ;; *) restore_template="./$restore_template" ;; esac
+  case "$destination" in /*|./*|../*) ;; *) destination="./$destination" ;; esac
+  staged_object="$(mktemp "$restore_template" 2>/dev/null)" || return 1
+  staged_stdout="${staged_object}.stdout"
+  staged_stderr="${staged_object}.stderr"
+  python3 "$ROOT/scripts/stage1_object_cache.py" restore "$stage1_cache_entry" "$staged_object" "$admitted_key" >"$staged_stdout" 2>"$staged_stderr" || restore_rc=$?
+  if [[ "$restore_rc" -ne 0 ]]; then
+    rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
+    return "$restore_rc"
+  fi
+  if ! stage1_cache_prepare || [[ "$stage1_cache_key" != "$admitted_key" || "$stage1_cache_dependency_identity" != "$admitted_identity" ]]; then
+    rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
+    return 1
+  fi
+  if ! mv -f "$staged_object" "$destination"; then
+    rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
+    return 1
+  fi
+  cat "$staged_stderr" >&2
+  cat "$staged_stdout"
+  rm -f "$staged_stdout" "$staged_stderr"
+  return 0
 }
 if stage1_cache_prepare; then
   stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
   stage1_cache_entry="$stage1_cache_dir/$stage1_cache_key.o"
   stage1_cache_restore_rc=0
-  python3 "$ROOT/scripts/stage1_object_cache.py" restore "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" || stage1_cache_restore_rc=$?
+  stage1_cache_restore_if_unchanged || stage1_cache_restore_rc=$?
   [[ "$stage1_cache_restore_rc" == 0 ]] && exit 0
   [[ "$stage1_cache_restore_rc" == 1 ]] || exit "$stage1_cache_restore_rc"
   stage1_cache_logs="$(mktemp -d "${TMPDIR:-/tmp}/elisac-stage1-cache-logs.XXXXXX")"

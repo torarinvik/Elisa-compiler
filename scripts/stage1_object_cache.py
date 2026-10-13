@@ -12,7 +12,7 @@ import tempfile
 SCHEMA = "elisac-stage1-object-integrity-v3"
 MAX_OBJECT_BYTES = 2 * 1024**3
 MAX_DIAGNOSTIC_BYTES = 64 * 1024**2
-DEPENDENCY_INDEX_SCHEMA = "elisac-stage1-dependency-index-v1"
+DEPENDENCY_INDEX_SCHEMA = "elisac-stage1-dependency-index-v2"
 MAX_DEPENDENCY_INDEX_BYTES = 16 * 1024**2
 MAX_DEPENDENCIES = 100_000
 
@@ -32,7 +32,17 @@ def fingerprint(path):
     identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
     if identity_before != identity_after or size != after.st_size:
         raise OSError("dependency changed while it was being hashed")
-    return {"size": size, "sha256": digest.hexdigest()}
+    # Keep stable identity alongside content. Cache keys use content alone, while
+    # the separate postflight identity snapshot catches a file that changed during
+    # compilation and was restored to identical bytes before publication.
+    return {
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
+        "size": size,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def canonical_json(value):
@@ -62,7 +72,23 @@ def dependency_records(paths, root):
 
 
 def dependency_graph_digest(root, records):
-    return hashlib.sha256(canonical_json({"root": root, "dependencies": records})).hexdigest()
+    # Cache identity is content-addressed: touching or replacing a source with
+    # identical bytes should still permit a previously compiled object to hit.
+    dependencies = [
+        {key: record[key] for key in ("path", "resolved_path", "size", "sha256")}
+        for record in records
+    ]
+    return hashlib.sha256(canonical_json({"root": root, "dependencies": dependencies})).hexdigest()
+
+
+def dependency_identity_digest(root, records):
+    # The post-compile guard also needs to know if a source changed and was
+    # restored to its original bytes while the compiler was running.
+    dependencies = [
+        {key: record[key] for key in ("path", "resolved_path", "device", "inode", "mtime_ns", "ctime_ns")}
+        for record in records
+    ]
+    return hashlib.sha256(canonical_json({"root": root, "dependencies": dependencies})).hexdigest()
 
 
 def dependencies_from_output(path, root):
@@ -90,7 +116,7 @@ def read_dependencies(index, base_key, root):
             return None
         manifest = json.loads(raw)
         if not isinstance(manifest, dict) or set(manifest) != {
-            "schema", "base_key", "root", "dependencies", "graph_sha256"
+            "schema", "base_key", "root", "dependencies", "graph_sha256", "identity_sha256"
         }:
             return None
         expected_root = str(Path(root).resolve(strict=True))
@@ -100,16 +126,23 @@ def read_dependencies(index, base_key, root):
             return None
         paths = []
         for record in manifest["dependencies"]:
-            if not isinstance(record, dict) or set(record) != {"path", "resolved_path", "size", "sha256"}:
+            if not isinstance(record, dict) or set(record) != {
+                "path", "resolved_path", "device", "inode", "mtime_ns", "ctime_ns", "size", "sha256"
+            }:
                 return None
             if not isinstance(record["path"], str):
                 return None
             paths.append(record["path"])
         root_value, records = dependency_records(paths, root)
         graph_sha256 = dependency_graph_digest(root_value, records)
-        if records != manifest["dependencies"] or graph_sha256 != manifest["graph_sha256"]:
+        identity_sha256 = dependency_identity_digest(root_value, records)
+        if (
+            records != manifest["dependencies"]
+            or graph_sha256 != manifest["graph_sha256"]
+            or identity_sha256 != manifest["identity_sha256"]
+        ):
             return None
-        return graph_sha256
+        return graph_sha256, identity_sha256
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
 
@@ -122,11 +155,15 @@ def store_dependencies(index, base_key, report, root):
         "root": root_value,
         "dependencies": records,
         "graph_sha256": dependency_graph_digest(root_value, records),
+        "identity_sha256": dependency_identity_digest(root_value, records),
     }
     index = Path(index)
     payload = canonical_json(manifest)
     if len(payload) > MAX_DEPENDENCY_INDEX_BYTES:
-        return manifest["graph_sha256"]
+        # The current invocation can still use the dependency digests it just
+        # computed. Skipping the persisted index only costs another `-emit deps`
+        # pass next time; it must not silently disable object caching now.
+        return manifest["graph_sha256"], manifest["identity_sha256"]
     index.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(prefix=index.name + ".incoming.", dir=index.parent)
     try:
@@ -137,7 +174,7 @@ def store_dependencies(index, base_key, report, root):
         os.replace(temporary_path, index)
     finally:
         Path(temporary_path).unlink(missing_ok=True)
-    return manifest["graph_sha256"]
+    return manifest["graph_sha256"], manifest["identity_sha256"]
 
 
 def copy_digest(source, target, *, allow_empty=False, limit=None):
@@ -254,14 +291,14 @@ if __name__ == "__main__":
     try:
         if operation == "dependency-key":
             index, base_key, root = arguments
-            graph = read_dependencies(index, base_key, root)
-            if graph is None:
+            state = read_dependencies(index, base_key, root)
+            if state is None:
                 sys.exit(1)
-            print(graph)
+            print(*state, sep="\t")
             sys.exit(0)
         elif operation == "dependency-store":
             index, base_key, report, root = arguments
-            print(store_dependencies(index, base_key, report, root))
+            print(*store_dependencies(index, base_key, report, root), sep="\t")
             sys.exit(0)
         elif operation == "restore":
             entry, output, key, *streams = arguments

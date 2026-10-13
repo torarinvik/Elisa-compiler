@@ -155,15 +155,25 @@ extend Easm:
                         return easm_param_type(fn, easm_binding_name(input))
             return ""
 
+        def easm_provenance_registers_equal(left: sview, right: sview) -> bool:
+            left_bit: i64 = easm_register_bit(left)
+            return left_bit != 0 and left_bit == easm_register_bit(right)
+
         def easm_provenance_type(states: mutable darray[MemoryProvenance]&, register: sview) -> sview:
             for state in states:
-                if easm_equal(state.register, register):
+                if easm_provenance_registers_equal(state.register, register):
                     return state.type_name
             return ""
 
+        def easm_provenance_has_register(states: mutable darray[MemoryProvenance]&, register: sview) -> bool:
+            for state in states:
+                if easm_provenance_registers_equal(state.register, register):
+                    return true
+            return false
+
         def easm_provenance_set_parameter(states: mutable darray[MemoryProvenance]&, register: sview, type_name: sview, parameter: sview) -> void:
             for index in 0..<states.count |index, states, register, type_name|:
-                if easm_equal(states[index].register, register):
+                if easm_provenance_registers_equal(states[index].register, register):
                     states[index] <- MemoryProvenance{register: register, type_name: type_name, parameter: parameter}
                     return
             states.push(MemoryProvenance{register: register, type_name: type_name, parameter: parameter})
@@ -173,23 +183,37 @@ extend Easm:
 
         def easm_provenance_parameter(states: mutable darray[MemoryProvenance]&, register: sview) -> sview:
             for state in states:
-                if easm_equal(state.register, register):
+                if easm_provenance_registers_equal(state.register, register):
                     return state.parameter
             return ""
 
         # Carry a pointer carrier through the register-preserving address operations recognized by
         # stage0. A move/lea does not turn a raw scalar into a typed pointer, and add/sub/inc/dec
-        # preserve the carrier while changing its displacement. Other register writes erase the
-        # proof instead of allowing a stale type to justify a later dereference.
+        # preserve the carrier while changing its displacement. Calls erase caller-saved facts;
+        # CPUID/RDTSC erase their implicit result registers. Other register writes erase their
+        # destination proof instead of allowing stale provenance to justify a later dereference.
         def easm_update_memory_provenance(states: mutable darray[MemoryProvenance]&, instruction: Instruction) -> void:
             if instruction.pseudo:
+                return
+            implicit_writes: mutable i64 = easm_implicit_write_mask(instruction.op)
+            if easm_starts(instruction.op, "call"):
+                implicit_writes <- EasmRegisterMasks::call_clobber_mask()
+            if implicit_writes != 0:
+                for index in 0..<states.count |index, states, implicit_writes|:
+                    bit: i64 = easm_register_bit(states[index].register)
+                    if bit != 0 and (implicit_writes & bit) != 0:
+                        states[index] <- MemoryProvenance{register: states[index].register, type_name: "", parameter: ""}
                 return
             destination_operand: sview = easm_substitute_operand(easm_last_operand(instruction.text), instruction)
             source_operand: sview = easm_substitute_operand(easm_first_operand(instruction.text), instruction)
             destination: sview = easm_register_operand(destination_operand)
             source: sview = easm_register_operand(source_operand)
+            op: sview = instruction.op
+            destination_width: i64 = EasmAddressWidthPolicy::address_register_width(destination)
+            source_width: i64 = EasmAddressWidthPolicy::address_register_width(source)
             if easm_starts(instruction.op, "xchg"):
-                if source != "" and destination != "":
+                full_width_exchange: bool = destination_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64 and source_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64 and (op == "xchgq" or op == "xchg")
+                if full_width_exchange and source != "" and destination != "":
                     source_type: sview = easm_provenance_type(states, source)
                     source_parameter: sview = easm_provenance_parameter(states, source)
                     destination_type: sview = easm_provenance_type(states, destination)
@@ -202,17 +226,17 @@ extend Easm:
                 return
             if destination == "":
                 return
-            op: sview = instruction.op
             inherited: mutable sview = ""
             inherited_parameter: mutable sview = ""
-            if easm_starts(op, "mov"):
+            if (op == "mov" or op == "movq") and destination_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64 and (source == "" or source_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64):
                 inherited <- easm_provenance_type(states, source)
                 inherited_parameter <- easm_provenance_parameter(states, source)
-            elif easm_starts(op, "lea"):
+            elif (op == "lea" or op == "leaq") and destination_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64:
                 source_register: sview = easm_memory_base_register(source_operand)
-                inherited <- easm_provenance_type(states, source_register)
-                inherited_parameter <- easm_provenance_parameter(states, source_register)
-            elif easm_starts(op, "add") or easm_starts(op, "sub") or easm_starts(op, "inc") or easm_starts(op, "dec"):
+                if EasmAddressWidthPolicy::address_register_width(source_register) == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64:
+                    inherited <- easm_provenance_type(states, source_register)
+                    inherited_parameter <- easm_provenance_parameter(states, source_register)
+            elif (op == "add" or op == "addq" or op == "sub" or op == "subq" or op == "inc" or op == "incq" or op == "dec" or op == "decq") and destination_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64:
                 inherited <- easm_provenance_type(states, destination)
                 inherited_parameter <- easm_provenance_parameter(states, destination)
             easm_provenance_set_parameter(states, destination, inherited, inherited_parameter)
@@ -286,12 +310,13 @@ extend Easm:
                         base: sview = easm_memory_base_register(operand)
                         continue if base == "" or easm_equal(base, "rsp") or easm_equal(base, "rip")
                         type_name: mutable sview = easm_provenance_type(states, base)
-                        if type_name == "":
+                        if not easm_provenance_has_register(states, base):
                             type_name <- easm_input_type_for_register(fn, base)
-                            # An untraced base has no established pointer provenance, even when
-                            # its value came from an immediate or another untyped instruction.
-                            if EasmMemoryBasePolicy::rejects_untraced_raw_base(type_name != "", easm_contract_has_word(fn.requires, "memory.base.untyped")):
-                                issues.push(Issue{severity: Severity.Error, code: "raw-memory-base", line: instruction.line, message: "memory base provenance was not established from a typed carrier"})
+                        # A present but empty fact records a prior clobber or untyped write. Do not
+                        # recover the original input type for that register: the carrier is no longer
+                        # established at this instruction.
+                        if EasmMemoryBasePolicy::rejects_untraced_raw_base(type_name != "", easm_contract_has_word(fn.requires, "memory.base.untyped")):
+                            issues.push(Issue{severity: Severity.Error, code: "raw-memory-base", line: instruction.line, message: "memory base provenance was not established from a typed carrier"})
                         can Abort.Panic:
                             if EasmMemoryBasePolicy::rejects_raw_address_type_without_opt_in(type_name, easm_contract_has_word(fn.requires, "memory.base.untyped")):
                                 issues.push(Issue{severity: Severity.Error, code: "raw-memory-base", line: instruction.line, message: "raw scalar register used as a memory base; use a typed pointer carrier or require memory.base.untyped"})
@@ -572,11 +597,8 @@ extend Easm:
             return 0
 
         def easm_implicit_write_mask(op: sview) -> i64:
-            if easm_equal(op, "cpuid"):
-                return EasmRegisterMasks::cpuid_write_mask()
-            if easm_equal(op, "rdtsc"):
-                return EasmRegisterMasks::rdtsc_write_mask()
-            return 0
+            ensure result == EasmRegisterMasks::implicit_result_write_mask(op)
+            return EasmRegisterMasks::implicit_result_write_mask(op)
 
         def easm_immediate_operand_after_dollar_checked(operand: sview) -> (valid: bool, value: i64):
             dollar: usize = easm_find(operand, "$")

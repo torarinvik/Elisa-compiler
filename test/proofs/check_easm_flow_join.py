@@ -23,6 +23,8 @@ POSITIVE = HERE / "easm_flow_join.elisa"
 NEGATIVE = HERE / "easm_flow_join_rejected.elisa"
 MASKS = ROOT / "src/backend/easm_register_masks.elisa"
 MODEL = ROOT / "src/backend/easm_model.elisa"
+MEMORY = ROOT / "src/backend/easm_verify_memory.elisa"
+WIDTH_POLICY = ROOT / "src/backend/easm_address_width_policy.elisa"
 PROVENANCE = ROOT / "src/backend/easm_verify_provenance.elisa"
 VERIFY_FUNCTION = ROOT / "src/backend/easm_verify_function.elisa"
 REGISTER_NAMES = ("RAX", "RCX", "RDX", "RBX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15")
@@ -64,6 +66,11 @@ EXPECTED_DECLARATIONS = {
     "a_first_provenance_predecessor_installs_the_production_state",
     "duplicate_provenance_predecessor_is_state_idempotent",
     "production_xchg_swaps_provenance_and_ambiguity",
+    "production_call_clears_clobbered_provenance_and_ambiguity",
+    "production_implicit_results_clear_written_provenance_and_ambiguity",
+    "production_full_width_move_copies_provenance",
+    "production_partial_move_clears_destination_provenance",
+    "production_partial_exchange_clears_both_carriers",
 }
 FALSE_CLAIMS = {
     "one_sided_fact_survives_a_join",
@@ -80,6 +87,10 @@ FALSE_CLAIMS = {
     "a_first_provenance_predecessor_can_leave_the_empty_entry",
     "a_duplicate_provenance_predecessor_can_change_the_state",
     "production_xchg_can_keep_the_old_carriers_in_place",
+    "production_call_can_keep_a_clobbered_carrier",
+    "production_cpuid_can_keep_rax_provenance",
+    "production_partial_move_can_copy_a_pointer_carrier",
+    "production_partial_exchange_can_preserve_old_carriers",
 }
 
 if not __debug__:
@@ -180,6 +191,75 @@ register_masks = {
 }
 if register_masks != EXPECTED_MASKS:
     raise SystemExit("flow-join proof requires the exact, distinct canonical 16-bit register fact domain")
+width_policy = WIDTH_POLICY.read_text()
+expected_width_policy = """ensure when register:
+        "rax" | "rcx" | "rdx" | "rbx" | "rsi" | "rdi" | "rbp" | "rsp" | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15" -> result == ADDRESS_REGISTER_WIDTH_64
+        "eax" | "ecx" | "edx" | "ebx" | "esi" | "edi" | "ebp" | "esp" | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d" -> result == ADDRESS_REGISTER_WIDTH_32
+        _ -> result == ADDRESS_REGISTER_WIDTH_UNKNOWN
+    return match register:
+        "rax" | "rcx" | "rdx" | "rbx" | "rsi" | "rdi" | "rbp" | "rsp" | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15": ADDRESS_REGISTER_WIDTH_64
+        "eax" | "ecx" | "edx" | "ebx" | "esi" | "edi" | "ebp" | "esp" | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d": ADDRESS_REGISTER_WIDTH_32
+        _: ADDRESS_REGISTER_WIDTH_UNKNOWN"""
+if compact(source_body(width_policy, "def address_register_width(register: sview) -> i64:")) != compact(expected_width_policy):
+    raise SystemExit("provenance-width proof requires the canonical exact 32/64/unknown register partition")
+for declaration in (
+    "const ADDRESS_REGISTER_WIDTH_UNKNOWN: i64 = 0",
+    "const ADDRESS_REGISTER_WIDTH_32: i64 = 32",
+    "const ADDRESS_REGISTER_WIDTH_64: i64 = 64",
+):
+    if compact(declaration) not in compact(width_policy):
+        raise SystemExit(f"provenance-width proof requires the exact width tag {declaration}")
+register_bit_source = compact(source_body(mask_source, "def register_bit(register: sview) -> i64:"))
+for alias_group, bit in (("\"rax\" | \"eax\" | \"ax\" | \"al\"", "RAX"), ("\"rcx\" | \"ecx\" | \"cx\" | \"cl\"", "RCX")):
+    if f"{alias_group} -> result == {bit}" not in register_bit_source or f"{alias_group}: {bit}" not in register_bit_source:
+        raise SystemExit(f"partial-register provenance proof requires canonical {bit} alias identity")
+slot_map = compact(source_body(MODEL.read_text(), "def easm_provenance_slot(register: sview) -> i64:"))
+expected_slot_map = """bit: i64 = easm_register_bit(register)
+    return match bit:
+        1: 0
+        2: 1
+        4: 2
+        8: 3
+        16: 4
+        32: 5
+        64: 6
+        128: 7
+        256: 8
+        512: 9
+        1024: 10
+        2048: 11
+        4096: 12
+        8192: 13
+        16384: 14
+        32768: 15
+        _: -1"""
+if compact(slot_map) != compact(expected_slot_map):
+    raise SystemExit("partial-register transfer proof requires the production alias-to-slot projection")
+call_clobber_body = source_body(mask_source, "def call_clobber_mask() -> i64:")
+expected_call_clobber_body = "ensure result == (RAX | RCX | RDX | RSI | RDI | R8 | R9 | R10 | R11)\nreturn RAX | RCX | RDX | RSI | RDI | R8 | R9 | R10 | R11"
+if compact(call_clobber_body) != compact(expected_call_clobber_body):
+    raise SystemExit("call provenance proof requires the production caller-saved register mask")
+for helper, expression in (
+    ("cpuid_write_mask", "RAX | RBX | RCX | RDX"),
+    ("rdtsc_write_mask", "RAX | RDX"),
+):
+    body = source_body(mask_source, f"def {helper}() -> i64:")
+    expected = f"ensure result == ({expression})\nreturn {expression}"
+    if compact(body) != compact(expected):
+        raise SystemExit(f"implicit-result provenance proof requires the exact {helper} register mask")
+implicit_result_body = source_body(mask_source, "def implicit_result_write_mask(op: sview) -> i64:")
+expected_implicit_result_body = """
+ensure op == "cpuid" implies result == cpuid_write_mask()
+ensure op == "rdtsc" implies result == rdtsc_write_mask()
+ensure op != "cpuid" and op != "rdtsc" implies result == 0
+if op == "cpuid":
+    return cpuid_write_mask()
+if op == "rdtsc":
+    return rdtsc_write_mask()
+return 0
+"""
+if compact(implicit_result_body) != compact(expected_implicit_result_body):
+    raise SystemExit("defined-result mask must agree with the proved CPUID/RDTSC write sets and be empty otherwise")
 
 model_source = MODEL.read_text()
 propagate = source_body(
@@ -267,15 +347,29 @@ provenance_transfer = source_body(
 xchg_transfer_prefix = provenance_transfer.split("out return if destination_slot < 0", 1)[0]
 expected_xchg_transfer_prefix = """
 out: mutable ProvenanceFlow = incoming
-out return if easm_starts(instruction.op, "cmp") or easm_starts(instruction.op, "test") or easm_starts(instruction.op, "push") or easm_starts(instruction.op, "call") or easm_starts(instruction.op, "jmp") or easm_starts(instruction.op, "ret")
+implicit_clobbers: mutable i64 = EasmRegisterMasks::implicit_result_write_mask(instruction.op)
+if easm_starts(instruction.op, "call"):
+    implicit_clobbers <- EasmRegisterMasks::call_clobber_mask()
+if implicit_clobbers != 0:
+    for slot in 0..<out.types.count |slot, out, implicit_clobbers|:
+        bit: i64 = 1 << slot.i64()
+        if (implicit_clobbers & bit) != 0:
+            out.types[slot] <- ""
+    out.ambiguous <- out.ambiguous & (~implicit_clobbers)
+    return out
+out return if easm_starts(instruction.op, "cmp") or easm_starts(instruction.op, "test") or easm_starts(instruction.op, "push") or easm_starts(instruction.op, "jmp") or easm_starts(instruction.op, "ret")
 destination_operand: sview = easm_substitute_operand(easm_last_operand(instruction.text), instruction)
 source: sview = easm_substitute_operand(easm_first_operand(instruction.text), instruction)
 destination: sview = easm_register_operand(destination_operand)
 source_register: sview = easm_register_operand(source)
 destination_slot: i64 = easm_provenance_slot(destination)
 source_slot: i64 = easm_provenance_slot(source_register)
+op: sview = instruction.op
+destination_width: i64 = EasmAddressWidthPolicy::address_register_width(destination)
+source_width: i64 = EasmAddressWidthPolicy::address_register_width(source_register)
 if easm_starts(instruction.op, "xchg"):
-    if source_slot >= 0 and destination_slot >= 0:
+    full_width_exchange: bool = destination_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64 and source_width == EasmAddressWidthPolicy::ADDRESS_REGISTER_WIDTH_64 and (op == "xchgq" or op == "xchg")
+    if full_width_exchange and source_slot >= 0 and destination_slot >= 0:
         source_type: sview = out.types[source_slot.usize()]
         destination_type: sview = out.types[destination_slot.usize()]
         source_ambiguous: bool = (out.ambiguous & (1 << source_slot)) != 0
@@ -287,16 +381,147 @@ if easm_starts(instruction.op, "xchg"):
         out.ambiguous <- out.ambiguous & (~(source_mask | destination_mask))
         out.ambiguous <- out.ambiguous | source_mask if destination_ambiguous
         out.ambiguous <- out.ambiguous | destination_mask if source_ambiguous
-    elif source_slot >= 0:
-        out.types[source_slot.usize()] <- ""
-        out.ambiguous <- out.ambiguous & (~(1 << source_slot))
-    elif destination_slot >= 0:
-        out.types[destination_slot.usize()] <- ""
-        out.ambiguous <- out.ambiguous & (~(1 << destination_slot))
+    else:
+        if source_slot >= 0:
+            out.types[source_slot.usize()] <- ""
+            out.ambiguous <- out.ambiguous & (~(1 << source_slot))
+        if destination_slot >= 0:
+            out.types[destination_slot.usize()] <- ""
+            out.ambiguous <- out.ambiguous & (~(1 << destination_slot))
     return out
 """
 if compact(xchg_transfer_prefix) != compact(expected_xchg_transfer_prefix):
     raise SystemExit("provenance xchg transfer must snapshot then swap both carrier types and ambiguity bits")
+
+expected_production_call = """
+requires incoming.valid == true and incoming.types.count == 16
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "callq",
+    text: "target",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+call_clobbers: i64 = EasmRegisterMasks::call_clobber_mask()
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return (
+    out.valid == incoming.valid and
+    out.types.count == incoming.types.count and
+    out.ambiguous == (incoming.ambiguous & (~call_clobbers)) and
+    (forall slot in 0..<16:
+        (((call_clobbers & (1 << slot.i64())) != 0) implies
+            out.types[slot] == "" and (out.ambiguous & (1 << slot.i64())) == 0) and
+        (((call_clobbers & (1 << slot.i64())) == 0) implies
+            out.types[slot] == incoming.types[slot] and
+                (out.ambiguous & (1 << slot.i64())) == (incoming.ambiguous & (1 << slot.i64())))
+    )
+)
+"""
+if compact(proof_body(positive_text, "production_call_clears_clobbered_provenance_and_ambiguity")) != compact(expected_production_call):
+    raise SystemExit("production call theorem must check every clobbered and preserved carrier and ambiguity slot")
+expected_implicit_results = """
+requires incoming.valid == true and incoming.types.count == 16
+requires op == "cpuid" or op == "rdtsc"
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: op,
+    text: "",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+implicit_writes: i64 = EasmRegisterMasks::cpuid_write_mask() if op == "cpuid" else EasmRegisterMasks::rdtsc_write_mask()
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return (
+    out.valid == incoming.valid and
+    out.types.count == incoming.types.count and
+    out.ambiguous == (incoming.ambiguous & (~implicit_writes)) and
+    (forall slot in 0..<16:
+        (((implicit_writes & (1 << slot.i64())) != 0) implies
+            out.types[slot] == "" and (out.ambiguous & (1 << slot.i64())) == 0) and
+        (((implicit_writes & (1 << slot.i64())) == 0) implies
+            out.types[slot] == incoming.types[slot] and
+                (out.ambiguous & (1 << slot.i64())) == (incoming.ambiguous & (1 << slot.i64())))
+    )
+)
+"""
+if compact(proof_body(positive_text, "production_implicit_results_clear_written_provenance_and_ambiguity")) != compact(expected_implicit_results):
+    raise SystemExit("production CPUID/RDTSC theorem must check all defined implicit result slots")
+
+expected_full_width_move = """
+requires incoming.valid == true and incoming.types.count == 16
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "movq",
+    text: "%rax, %rcx",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return (
+    out.valid == incoming.valid and
+    out.types.count == incoming.types.count and
+    out.types[1] == incoming.types[0] and
+    out.ambiguous == ((incoming.ambiguous & (~EasmRegisterMasks::RCX)) | (EasmRegisterMasks::RCX if (incoming.ambiguous & EasmRegisterMasks::RAX) != 0 else 0)) and
+    (forall slot in 0..<16:
+        (slot == 1 or out.types[slot] == incoming.types[slot]) and
+        (slot == 1 or (out.ambiguous & (1 << slot.i64())) == (incoming.ambiguous & (1 << slot.i64())))
+    )
+)
+"""
+if compact(proof_body(positive_text, "production_full_width_move_copies_provenance")) != compact(expected_full_width_move):
+    raise SystemExit("full-width move theorem must quantify over all carriers and ambiguity bits")
+expected_partial_move = expected_full_width_move.replace('op: "movq"', 'op: "movl"').replace('text: "%rax, %rcx"', 'text: "%eax, %ecx"').replace(
+    "out.types[1] == incoming.types[0]", 'out.types[1] == ""'
+).replace(
+    "out.ambiguous == ((incoming.ambiguous & (~EasmRegisterMasks::RCX)) | (EasmRegisterMasks::RCX if (incoming.ambiguous & EasmRegisterMasks::RAX) != 0 else 0))",
+    "out.ambiguous == (incoming.ambiguous & (~EasmRegisterMasks::RCX))",
+)
+if compact(proof_body(positive_text, "production_partial_move_clears_destination_provenance")) != compact(expected_partial_move):
+    raise SystemExit("partial move theorem must clear only the destination carrier and ambiguity")
+expected_partial_exchange = """
+requires incoming.valid == true and incoming.types.count == 16
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "xchgl",
+    text: "%eax, %ecx",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+cleared: i64 = EasmRegisterMasks::RAX | EasmRegisterMasks::RCX
+return (
+    out.valid == incoming.valid and
+    out.types.count == incoming.types.count and
+    out.types[0] == "" and out.types[1] == "" and
+    out.ambiguous == (incoming.ambiguous & (~cleared)) and
+    (forall slot in 2..<16:
+        out.types[slot] == incoming.types[slot] and
+        (out.ambiguous & (1 << slot.i64())) == (incoming.ambiguous & (1 << slot.i64()))
+    )
+)
+"""
+if compact(proof_body(positive_text, "production_partial_exchange_clears_both_carriers")) != compact(expected_partial_exchange):
+    raise SystemExit("partial exchange theorem must clear both affected aliases and preserve other slots")
 
 flow_equal = source_body(model_source, "def easm_flow_equal(a: FlowState, b: FlowState) -> bool:")
 expected_flow_equal = "return a.valid == b.valid and a.live == b.live and a.stack_delta == b.stack_delta and a.stack_mod16 == b.stack_mod16 and a.stack_known == b.stack_known and a.flags_live == b.flags_live"
@@ -937,6 +1162,84 @@ return out.types[0] == "i64*" and out.types[1] == "f64*" and out.ambiguous == 1
 """
 if compact(proof_body(negative_text, "production_xchg_can_keep_the_old_carriers_in_place")) != compact(expected_production_xchg_control):
     raise SystemExit("production xchg false control must challenge swapping the old carriers")
+expected_production_call_control = """
+requires incoming.valid == true and incoming.types.count == 16 and incoming.types[0] != ""
+requires (incoming.ambiguous & EasmRegisterMasks::RAX) == 0
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "callq",
+    text: "target",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return out.types[0] == incoming.types[0]
+"""
+if compact(proof_body(negative_text, "production_call_can_keep_a_clobbered_carrier")) != compact(expected_production_call_control):
+    raise SystemExit("production call false control must challenge clobbering the incoming RAX carrier")
+expected_cpuid_control = """
+requires incoming.valid == true and incoming.types.count == 16 and incoming.types[0] != ""
+requires (incoming.ambiguous & EasmRegisterMasks::RAX) == 0
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "cpuid",
+    text: "",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return out.types[0] == incoming.types[0]
+"""
+if compact(proof_body(negative_text, "production_cpuid_can_keep_rax_provenance")) != compact(expected_cpuid_control):
+    raise SystemExit("CPUID false control must challenge clearing its implicit RAX result")
+expected_partial_move_control = """
+requires incoming.valid == true and incoming.types.count == 16 and incoming.types[0] != ""
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "movl",
+    text: "%eax, %ecx",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return out.types[1] == incoming.types[0]
+"""
+if compact(proof_body(negative_text, "production_partial_move_can_copy_a_pointer_carrier")) != compact(expected_partial_move_control):
+    raise SystemExit("partial move false control must challenge pointer copying from a 32-bit alias")
+expected_partial_exchange_control = """
+requires incoming.valid == true and incoming.types.count == 16 and incoming.types[0] != "" and incoming.types[1] != ""
+ensure result == true
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "xchgl",
+    text: "%eax, %ecx",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+out: Easm::ProvenanceFlow = Easm::easm_provenance_flow_transfer(instruction, incoming)
+return out.types[0] == incoming.types[0] and out.types[1] == incoming.types[1]
+"""
+if compact(proof_body(negative_text, "production_partial_exchange_can_preserve_old_carriers")) != compact(expected_partial_exchange_control):
+    raise SystemExit("partial exchange false control must challenge invalidation of both 32-bit aliases")
 if 'include "../../src/backend/easm_model.elisa"' not in positive_text or \
         'include "./easm_flow_join.elisa"' not in negative_text:
     raise SystemExit("flow-equality theorems must include the production model and its bound control fixture")
@@ -1040,7 +1343,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POSITIVE, NEGATIVE, MASKS, MODEL, PROVENANCE, VERIFY_FUNCTION,
+    POSITIVE, NEGATIVE, MASKS, MODEL, MEMORY, WIDTH_POLICY, PROVENANCE, VERIFY_FUNCTION,
 ]
 inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
@@ -1067,12 +1370,14 @@ assert verified == EXPECTED_DECLARATIONS
 
 negative_code, negative = run(NEGATIVE)
 assert negative_code == 1 and negative["status"] == "failed"
-assert negative["summary"]["unproven"] == 1
+assert negative["summary"]["unproven"] == len(FALSE_CLAIMS)
 assert negative == run(NEGATIVE)[1], "flow-join false-claim report changed across repeated runs"
-assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
-    ("ensure-unproven", "one_sided_fact_survives_a_join")
-]
-one_sided_finding = negative["findings"][0]
+findings_by_name = {finding["name"]: finding for finding in negative["findings"]}
+assert set(findings_by_name) == FALSE_CLAIMS
+assert all(finding["kind"] == "ensure-unproven" and finding["status"] in {"unknown", "disproved"}
+           for finding in findings_by_name.values())
+assert not FALSE_CLAIMS & {row["name"] for row in negative["declaration_details"] if row.get("verified")}
+one_sided_finding = findings_by_name["one_sided_fact_survives_a_join"]
 assert one_sided_finding["status"] == "disproved"
 assert one_sided_finding["counterexample_found"]
 counterexample = one_sided_finding["counterexample"]
@@ -1099,7 +1404,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "register liveness, flag facts, stack alignment, and stack deltas at EASM control-flow joins",
+    "scope": "register liveness, flag facts, stack alignment, and call-clobbered provenance at EASM control-flow joins",
     "positive_obligations": positive["summary"]["proven"],
     "false_claim_rejected_with_counterexample": "one_sided_fact_survives_a_join",
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),

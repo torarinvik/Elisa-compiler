@@ -1,4 +1,5 @@
-"""Admit the EASM address-register width proof against the production verifier."""
+"""Admit the EASM address-register width proof against production source and a strict product."""
+import argparse
 import hashlib
 import json
 import os
@@ -12,7 +13,11 @@ from proof_product_gate import require_current_product, source_include_closure
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true",
+                    help="check source and fixture bindings without invoking Elisa-Proof")
+ARGS = parser.parse_args()
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "easm_address_width_policy.elisa"
 NEGATIVE = HERE / "easm_address_width_policy_rejected.elisa"
@@ -42,11 +47,10 @@ def function_section(source: str, name: str) -> str:
 policy = POLICY.read_text()
 expected_policy = """
 def address_register_width(register: sview) -> i64:
-    ensure result == (when register:
-        "rax" | "rcx" | "rdx" | "rbx" | "rsi" | "rdi" | "rbp" | "rsp" | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15" -> ADDRESS_REGISTER_WIDTH_64
-        "eax" | "ecx" | "edx" | "ebx" | "esi" | "edi" | "ebp" | "esp" | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d" -> ADDRESS_REGISTER_WIDTH_32
-        _ -> ADDRESS_REGISTER_WIDTH_UNKNOWN
-    )
+    ensure when register:
+        "rax" | "rcx" | "rdx" | "rbx" | "rsi" | "rdi" | "rbp" | "rsp" | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15" -> result == ADDRESS_REGISTER_WIDTH_64
+        "eax" | "ecx" | "edx" | "ebx" | "esi" | "edi" | "ebp" | "esp" | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d" -> result == ADDRESS_REGISTER_WIDTH_32
+        _ -> result == ADDRESS_REGISTER_WIDTH_UNKNOWN
     return match register:
         "rax" | "rcx" | "rdx" | "rbx" | "rsi" | "rdi" | "rbp" | "rsp" | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15": ADDRESS_REGISTER_WIDTH_64
         "eax" | "ecx" | "edx" | "ebx" | "esi" | "edi" | "ebp" | "esp" | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d": ADDRESS_REGISTER_WIDTH_32
@@ -154,6 +158,16 @@ for name, expected in expected_negative.items():
     if proof_body(negative_text, name) != compact(expected):
         raise SystemExit(f"negative address-width claim changed: {name}")
 
+source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_theorems": len(positive_names),
+        "false_claim_controls": len(negative_names),
+        "source_closure_files": len(source_closure),
+    }, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     manifest = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
@@ -172,7 +186,7 @@ inputs = [
     compiler_product, compiler_provenance, Path(__file__), HERE / "proof_product_gate.py",
     POSITIVE, NEGATIVE, POLICY, ENV, FUNCTION,
 ]
-inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
+inputs.extend(source_closure)
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
