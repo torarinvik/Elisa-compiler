@@ -140,13 +140,13 @@ ordered(container, "emit_darray_push", (
     "if cursor_slot is updated_cursor_slot:",
     "_ = LLVMBuildStore(builder, needed, updated_cursor_slot)",
 ))
-ordered(shapes, "emit_statement_for_iterable_shapes", (
-    'final_count: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), fast_push_cursor.cursor_slot, "fill.count.final")',
-    "darray_store_size(builder, final_count, fast_push_cursor.count_pointer, ctx, structs.target.target_pointer_bits)",
-))
 ordered(LOOPS.read_text(), "emit_statement_loops", (
     "fast_push_cursor_mark: usize = structs.memory.memory_fast_push_cursors.count",
     "emit_loop_prereserve(for_variables, for_iterable, for_body",
+    'emit_statement_for_iterable_shapes(for_bind, for_variables, for_iterable, for_body',
+    "if for_shape_matched and for_shape_value == EmitStatus.Open:",
+    'final_count: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), fast_push_cursor.cursor_slot, "fill.count.final")',
+    "darray_store_size(builder, final_count, fast_push_cursor.count_pointer, ctx, structs.target.target_pointer_bits)",
     "while structs.memory.memory_fast_push_cursors.count > fast_push_cursor_mark:",
     "_ = structs.memory.memory_fast_push_cursors.pop()",
 ))
