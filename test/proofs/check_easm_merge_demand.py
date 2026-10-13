@@ -328,20 +328,13 @@ if compact(function_section(memory_text, "easm_implicit_write_mask")) != compact
 mask_text = REGISTER_MASKS.read_text()
 for index, name in enumerate(register_order):
     exactly_contains(mask_text, f"const {name}: i64 = {1 << index}", f"canonical EASM register bit changed: {name}")
-register_aliases = {
-    "RAX": ("rax", "eax", "ax", "al"), "RCX": ("rcx", "ecx", "cx", "cl"),
-    "RDX": ("rdx", "edx", "dx", "dl"), "RBX": ("rbx", "ebx", "bx", "bl"),
-    "RSI": ("rsi", "esi", "si", "sil"), "RDI": ("rdi", "edi", "di", "dil"),
-    "RBP": ("rbp", "ebp", "bp", "bpl"), "RSP": ("rsp", "esp", "sp", "spl"),
-    **{f"R{i}": (f"r{i}", f"r{i}d", f"r{i}w", f"r{i}b") for i in range(8, 16)},
-}
-expected_register_bit = "def easm_register_bit(register: sview) -> i64:\n" + "\n".join(
-    "    if " + " or ".join(f'easm_equal(register, "{alias}")' for alias in aliases) +
-    f":\n        return EasmRegisterMasks::{register}"
-    for register, aliases in register_aliases.items()
-) + "\n    return 0"
+expected_register_bit = """
+def easm_register_bit(register: sview) -> i64:
+    ensure result == EasmRegisterMasks::register_bit(register)
+    return EasmRegisterMasks::register_bit(register)
+"""
 if compact(function_section(model_text, "easm_register_bit")) != compact(expected_register_bit):
-    raise SystemExit("narrow and wide register spellings must share their canonical one-hot mask")
+    raise SystemExit("EASM register-bit lookup must delegate exactly to the canonical alias map")
 
 expected_register_operand = """
 def easm_register_operand(operand: sview) -> sview:
