@@ -274,6 +274,8 @@ driver_args=("$@")
 # Integrity metadata is mandatory;
 # legacy, partial, or corrupted entries take the ordinary compile path.
 stage1_cache_key=""
+stage1_cache_base_key=""
+stage1_cache_dir=""
 stage1_cache_out=""
 stage1_cache_environment() {
   env | LC_ALL=C grep -E '^(ELISA_|ELISACORE_FORCE_CONTRACTS=)' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
@@ -289,14 +291,17 @@ stage1_cache_prepare() {
     "$normalized_root/bin/"*) ;;
     *) return 1 ;;
   esac
-  local index=0 count=${#driver_args[@]} arg emit="obj" source=""
+  local index=0 count=${#driver_args[@]} arg emit="obj" source="" source_count=0 emit_count=0 output_count=0
   local provenance_file="${BIN}.provenance.json"
-  local -a normalized=() auxiliary_inputs=()
+  local -a normalized=() auxiliary_inputs=() dependency_args=()
   while (( index < count )); do
     arg="${driver_args[index]}"
     case "$arg" in
       -o)
+        (( output_count += 1 ))
+        (( index + 1 < count )) || return 1
         stage1_cache_out="${driver_args[index + 1]:-}"
+        [[ -n "$stage1_cache_out" ]] || return 1
         normalized+=("-o" "@OUT@")
         index=$((index + 2))
         continue
@@ -309,38 +314,76 @@ stage1_cache_prepare() {
         continue
         ;;
       -emit)
+        (( emit_count += 1 ))
+        (( index + 1 < count )) || return 1
         emit="${driver_args[index + 1]:-}"
+        normalized+=("$arg" "$emit")
+        index=$((index + 2))
+        continue
         ;;
       *.elisa|*.elisai)
         source="$arg"
+        (( source_count += 1 ))
         ;;
     esac
     normalized+=("$arg")
     index=$((index + 1))
   done
-  [[ "$emit" == obj && -n "$stage1_cache_out" && -n "$source" ]] || return 1
+  [[ "$emit" == obj && "$emit_count" -le 1 && "$output_count" == 1 && "$source_count" == 1 && -n "$source" ]] || return 1
   [[ -f "$provenance_file" && -r "$provenance_file" ]] || return 1
-  local deps_file
-  deps_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps.XXXXXX")"
-  if ! "$BIN" -emit deps -o "$deps_file" "$source" </dev/null >/dev/null 2>&1; then
-    rm -f "$deps_file"
-    return 1
-  fi
-  stage1_cache_key="$(
+  stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
+  stage1_cache_base_key="$(
     {
-      printf 'elisac-stage1-object-cache v3\n'
+      printf 'elisac-stage1-object-cache v5\n'
+      printf 'cwd=%s\0' "$(pwd -P)" || exit 1
       shasum -a 256 "$BIN" "$provenance_file" | cut -d' ' -f1 || exit 1
+      shasum -a 256 "$ROOT/scripts/elisac_stage1.sh" "$ROOT/scripts/stage1_object_cache.py" "$ROOT/scripts/platform.sh" | cut -d' ' -f1 || exit 1
       printf '%s\0' "${normalized[@]}"
       printf '\n'
       stage1_cache_environment || true
       if (( ${#auxiliary_inputs[@]} > 0 )); then
         shasum -a 256 "${auxiliary_inputs[@]}" || exit 1
       fi
-      tr '\n' '\0' <"$deps_file" | xargs -0 shasum -a 256 || exit 1
       (cd "$ROOT" && find elisacore_std -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256) || exit 1
     } | shasum -a 256 | cut -d' ' -f1
-  )" || { rm -f "$deps_file"; return 1; }
-  rm -f "$deps_file"
+  )" || return 1
+  [[ "$stage1_cache_base_key" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  local dependency_index="$stage1_cache_dir/dependencies/$stage1_cache_base_key.json"
+  local dependency_graph=""
+  dependency_graph="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-key "$dependency_index" "$stage1_cache_base_key" "$source" 2>/dev/null)" || dependency_graph=""
+  if [[ ! "$dependency_graph" =~ ^[0-9a-f]{64}$ ]]; then
+    local deps_file emit_seen=0
+    deps_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps.XXXXXX")" || return 1
+    index=0
+    while (( index < count )); do
+      arg="${driver_args[index]}"
+      case "$arg" in
+        -o)
+          dependency_args+=("-o" "$deps_file")
+          index=$((index + 2))
+          continue
+          ;;
+        -emit)
+          dependency_args+=("-emit" "deps")
+          emit_seen=1
+          index=$((index + 2))
+          continue
+          ;;
+      esac
+      dependency_args+=("$arg")
+      index=$((index + 1))
+    done
+    (( emit_seen )) || dependency_args+=("-emit" "deps")
+    if ! "$BIN" "${dependency_args[@]}" </dev/null >/dev/null 2>&1; then
+      rm -f "$deps_file"
+      return 1
+    fi
+    dependency_graph="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-store "$dependency_index" "$stage1_cache_base_key" "$deps_file" "$source" 2>/dev/null)" || dependency_graph=""
+    rm -f "$deps_file"
+  fi
+  [[ "$dependency_graph" =~ ^[0-9a-f]{64}$ ]] || return 1
+  stage1_cache_key="$(printf '%s\0%s\0%s' 'elisac-stage1-object-cache-key-v5' "$stage1_cache_base_key" "$dependency_graph" | shasum -a 256 | cut -d' ' -f1)" || return 1
   [[ -n "$stage1_cache_key" ]]
 }
 stage1_cache_publish_if_unchanged() {

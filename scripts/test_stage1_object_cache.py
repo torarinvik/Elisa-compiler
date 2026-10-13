@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -27,9 +28,12 @@ class CacheIntegrityTest(unittest.TestCase):
         (root / "bin").mkdir(parents=True)
         (root / "elisacore_std").mkdir()
         (root / "elisacore_std" / "runtime.elisa").write_text("# fixture\n")
+        (root / "scripts").mkdir()
+        helper = Path(__file__).resolve().parent / "stage1_object_cache.py"
+        shutil.copyfile(helper, root / "scripts" / helper.name)
         return root
 
-    def run_cache_key(self, compiler, source, *, root=None, allow_stale=False):
+    def run_cache_key(self, compiler, source, *, root=None, allow_stale=False, extra_env=None):
         repo_root = Path(__file__).resolve().parent.parent
         wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
@@ -47,19 +51,41 @@ class CacheIntegrityTest(unittest.TestCase):
             ROOT=str(root if root is not None else compiler.parent.parent),
             BIN=str(compiler),
             ELISA_STAGE1_CACHE="1",
+            ELISA_STAGE1_CACHE_DIR=str(self.source.parent / "object-cache"),
             SOURCE_INPUT=str(source),
+            COMPILER_CALL_LOG=str(self.source.parent / "dependency-compiler-calls"),
         )
+        if extra_env:
+            env.update(extra_env)
         if allow_stale:
             env["ELISA_ALLOW_STALE_STAGE1"] = "1"
         return subprocess.run(["bash", "-c", script], env=env, check=False, capture_output=True)
 
-    def cache_key(self, compiler, source, *, root=None):
-        result = self.run_cache_key(compiler, source, root=root)
+    def cache_key(self, compiler, source, *, root=None, extra_env=None):
+        result = self.run_cache_key(compiler, source, root=root, extra_env=extra_env)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         return result.stdout
 
     def fake_dependency_compiler(self, compiler, source):
-        compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$SOURCE_INPUT" > "$4"\n')
+        compiler.write_text(
+            "#!/bin/bash\n"
+            'printf x >> "${COMPILER_CALL_LOG:-/dev/null}"\n'
+            'out=""; emit="obj"\n'
+            'while (($#)); do\n'
+            '  case "$1" in\n'
+            '    -o) out="$2"; shift 2 ;;\n'
+            '    -emit) emit="$2"; shift 2 ;;\n'
+            '    *) shift ;;\n'
+            '  esac\n'
+            'done\n'
+            'if [[ "$emit" == deps ]]; then\n'
+            '  if [[ -n "${INCLUDED_DEPENDENCY:-}" ]]; then\n'
+            '    printf "%s\\n%s\\n" "$SOURCE_INPUT" "$INCLUDED_DEPENDENCY" > "$out"\n'
+            '  else\n'
+            '    printf "%s\\n" "$SOURCE_INPUT" > "$out"\n'
+            '  fi\n'
+            'fi\n'
+        )
         compiler.chmod(0o755)
         source.write_text("def main() -> i64: return 42\n")
         Path(f"{compiler}.provenance.json").write_text('{"schema":"elisa-stage1-provenance-v5"}\n')
@@ -112,20 +138,86 @@ class CacheIntegrityTest(unittest.TestCase):
                 self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
 
     def test_unreadable_dependency_refuses_cache_identity(self):
-        repo_root = Path(__file__).resolve().parent.parent
-        wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
-        function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
-        self.assertIsNotNone(function)
         root = self.cache_project()
         compiler = root / "bin" / "fake-compiler"
-        compiler.write_text('#!/bin/bash\nprintf "%s\\n" "$MISSING_DEPENDENCY" > "$4"\n')
-        compiler.chmod(0o755)
-        Path(f"{compiler}.provenance.json").write_text('{"schema":"elisa-stage1-provenance-v5"}\n')
-        script = 'set -uo pipefail\ndriver_args=(source.elisa -o output.o)\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nif stage1_cache_prepare; then exit 9; fi\n'
-        env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", MISSING_DEPENDENCY=str(self.source.parent / "missing.elisa"))
-        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
-        self.assertIn(b"missing.elisa", result.stderr)
+        source = root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        missing = self.source.parent / "missing.elisa"
+        result = self.run_cache_key(compiler, source, root=root, extra_env={"INCLUDED_DEPENDENCY": str(missing)})
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse(list((self.source.parent / "object-cache").rglob("*.json")))
+
+    def test_dependency_index_reuses_graph_and_invalidates_changed_files(self):
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        dependency = root / "included.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        dependency.write_text("const VALUE: i64 = 1\n")
+        log = self.source.parent / "dependency-compiler-calls"
+        environment = {"INCLUDED_DEPENDENCY": str(dependency)}
+
+        first = self.cache_key(compiler, source, root=root, extra_env=environment)
+        self.assertEqual(log.read_text(), "x")
+        second = self.cache_key(compiler, source, root=root, extra_env=environment)
+        self.assertEqual(second, first)
+        self.assertEqual(log.read_text(), "x")
+
+        dependency.write_text("const VALUE: i64 = 2\n")
+        third = self.cache_key(compiler, source, root=root, extra_env=environment)
+        self.assertNotEqual(third, first)
+        self.assertEqual(log.read_text(), "xx")
+
+    def test_dependency_index_tracks_symlink_retargeting(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        first = root / "first.elisa"
+        second = root / "second.elisa"
+        link = root / "included.elisa"
+        report = root / "deps.txt"
+        index = root / "deps.json"
+        source.write_text("def main() -> i64: return 0\n")
+        first.write_text("const VALUE: i64 = 1\n")
+        second.write_text("const VALUE: i64 = 2\n")
+        link.symlink_to(first)
+        report.write_text(f"{source}\n{link}\n")
+        graph = cache.store_dependencies(index, "base", report, source)
+        self.assertEqual(cache.read_dependencies(index, "base", source), graph)
+
+        link.unlink()
+        link.symlink_to(second)
+        self.assertIsNone(cache.read_dependencies(index, "base", source))
+
+    def test_dependency_index_supports_relative_paths_in_the_same_directory(self):
+        root = self.source.parent
+        source = root / "relative-root.elisa"
+        dependency = root / "relative-include.elisa"
+        report = root / "relative-deps.txt"
+        index = root / "relative-deps.json"
+        source.write_text("source\n")
+        dependency.write_text("dependency\n")
+        report.write_text(f"{source.name}\n{dependency.name}\n")
+        with patch("os.getcwd", return_value=str(root)):
+            graph = cache.store_dependencies(index, "base", report, source.name)
+            self.assertEqual(cache.read_dependencies(index, "base", source.name), graph)
+            self.assertIsNone(cache.read_dependencies(index, "base", "missing/../relative-root.elisa"))
+
+    def test_dependency_index_rejects_bad_root_and_corruption(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        other = root / "other.elisa"
+        report = root / "deps.txt"
+        index = root / "deps.json"
+        source.write_text("source\n")
+        other.write_text("other\n")
+        report.write_text(f"{other}\n{source}\n")
+        with self.assertRaisesRegex(ValueError, "does not begin with its root"):
+            cache.store_dependencies(index, "base", report, source)
+
+        report.write_text(f"{source}\n")
+        cache.store_dependencies(index, "base", report, source)
+        index.write_text("{")
+        self.assertIsNone(cache.read_dependencies(index, "base", source))
 
     def test_profile_content_participates_in_cache_identity(self):
         repo_root = Path(__file__).resolve().parent.parent

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
@@ -271,5 +272,41 @@ with tempfile.TemporaryDirectory() as directory:
             manifest["llvm_toolchain"]["dynamic_libraries"][0]["sha256"] = "0" * 64
             manifest_path.write_text(json.dumps(manifest))
             assert stage1_provenance.check(project, product, exact=True) == 2
+
+# Reusing a verified Stage1 from another checkout must validate its recorded build
+# inputs, even while ELISACORE_BIN selects it as the next build's bootstrap.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory) / "compiler"
+    scripts = root / "scripts"
+    binary = root / "bin" / "elisac-stage1"
+    scripts.mkdir(parents=True)
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    (scripts / "platform.sh").write_text("#!/usr/bin/env bash\n:\n")
+    (scripts / "stage1_provenance.py").write_text(
+        "import os, sys\n"
+        "assert sys.argv[1] == 'check'\n"
+        "assert not any(os.environ.get(name) for name in (\n"
+        "    'ELISA_STAGE1_SEED_BOOTSTRAP_BIN', 'ELISA_STAGE1_SEED_STAGE0_BIN',\n"
+        "    'BOOTSTRAP_BIN', 'STAGE0_BIN', 'ELISACORE_BIN'))\n"
+    )
+    environment = os.environ.copy()
+    environment.update({
+        "ELISA_STAGE1_SEED_BOOTSTRAP_KIND": "stage1",
+        "ELISA_STAGE1_SEED_BOOTSTRAP_BIN": "/selected/new-bootstrap",
+        "ELISA_STAGE1_SEED_STAGE0_BIN": "/selected/new-stage0",
+        "BOOTSTRAP_BIN": "/selected/legacy-bootstrap",
+        "STAGE0_BIN": "/selected/legacy-stage0",
+        "ELISACORE_BIN": "/selected/elisa-core",
+    })
+    check = subprocess.run(
+        ["bash", str(Path(__file__).resolve().with_name("assert_stage0_fresh.sh")), str(binary)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr
 
 print("stage1 provenance: exact source, recipe and product fingerprints verified")

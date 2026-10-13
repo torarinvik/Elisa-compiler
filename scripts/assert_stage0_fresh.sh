@@ -33,7 +33,16 @@ if [ "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" = stage1 ] || [ "$(basename "$BIN")
         echo "cannot verify Stage1 bootstrap provenance: python3 is unavailable (binary: $BIN)" >&2
         exit 2
     fi
-    python3 "$STAGE1_PROVENANCE" check "$STAGE1_ROOT" "$BIN" || {
+    # Check the Stage1 product's recorded bootstrap inputs, not the compiler currently
+    # selected to build the next product. In a Stage1-seeded build ELISACORE_BIN points
+    # at this very bootstrap, which would otherwise be mistaken for the configuration
+    # that originally produced it and make a valid cross-worktree Stage1 look stale.
+    env -u ELISA_STAGE1_SEED_BOOTSTRAP_BIN \
+        -u ELISA_STAGE1_SEED_STAGE0_BIN \
+        -u BOOTSTRAP_BIN \
+        -u STAGE0_BIN \
+        -u ELISACORE_BIN \
+        python3 "$STAGE1_PROVENANCE" check "$STAGE1_ROOT" "$BIN" || {
         echo "Stage1 bootstrap product is stale or unverifiable: $BIN" >&2
         exit 2
     }
