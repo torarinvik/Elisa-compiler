@@ -97,11 +97,11 @@ if {"sview_len", "sview_at"} & declarations(runtime_text):
 # The ergonomic source syntax used by the checked-decimal parser is an alias
 # for the same StringView extent and bounded byte read specified above.
 inference_text = compact(TYPE_INFERENCE.read_text())
-if compact('"len" -> true') not in inference_text or \
+if compact('"len" | "length" -> true') not in inference_text or \
         compact('InferType{kind: SemTypeKind.Int, name: "i64"} return if object_type.kind == SemTypeKind.String and object_type.name == "sview" and is_sview_size_field') not in inference_text:
     raise SystemExit("sview .len no longer resolves to the signed StringView extent")
 field_lowering = compact(function_section(FIELD_LOWERING.read_text(), "emit_expression_field_read"))
-if compact('"data" | "len" -> true') not in field_lowering or \
+if compact('"data" | "len" | "length" -> true') not in field_lowering or \
         compact('return LLVMBuildExtractValue(builder, sview_value, 1, "sview.len")') not in field_lowering:
     raise SystemExit("sview .len no longer reads the signed extent from its runtime pair")
 index_lowering = compact(function_section(INDEX_LOWERING.read_text(), "emit_inline_sview_index"))

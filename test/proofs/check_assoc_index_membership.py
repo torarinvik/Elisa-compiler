@@ -62,7 +62,9 @@ negative_text = NEGATIVE.read_text()
 expected_model = '''
 ghost def method_unproven_from(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview, remaining: usize) -> bool:
     decreases remaining
-    return false if remaining == 0 or remaining > method_names.count
+    return false if:
+        remaining == 0
+        remaining > method_names.count
     return (
         method_names[method_names.count - remaining] == method
         and not (method_names.count - remaining < method_refined.count and method_refined[method_names.count - remaining])

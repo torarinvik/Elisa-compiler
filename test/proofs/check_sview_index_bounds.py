@@ -133,16 +133,16 @@ if any(position < 0 for position in short_positions) or short_positions != sorte
 
 # Pin the source-level alias to the actual StringView length member, its inferred
 # and backend scalar type, and the aggregate field extracted by code generation.
-if '"len"->true' not in infer_source or \
+if '"len"|"length"->true' not in infer_source or \
         'InferType{kind:SemTypeKind.Int,name:"i64"}returnifobject_type.kind==SemTypeKind.Stringandobject_type.name=="sview"andis_sview_size_field' not in infer_source:
     raise SystemExit("semantic inference no longer types StringView.len as i64")
-if '"len"->true' not in place_type or \
+if '"len"|"length"->true' not in place_type or \
         'ValueType{kind:TypeKind.Signed,bits:64}returnifindexed_type.kind==TypeKind.CStrorindexed_type.kind==TypeKind.SView' not in place_type:
     raise SystemExit("backend expression typing no longer exposes StringView.len as signed i64")
-if '"data"|"len"->true' not in field_emitter or \
+if '"data"|"len"|"length"->true' not in field_emitter or \
         'LLVMBuildExtractValue(builder,sview_value,1,"sview.len")' not in field_emitter:
     raise SystemExit("StringView.len no longer reads the length field from its runtime pair")
-if '"StringView"->whenfield:"data"|"len"->true' not in unknown_fields:
+if '"StringView"->whenfield:"data"|"len"|"length"->true' not in unknown_fields:
     raise SystemExit("unknown-field validation no longer recognizes StringView.len")
 
 runtime_decl = compact(RUNTIME_DECL.read_text())
