@@ -116,13 +116,10 @@ if any(guard not in helper for guard in required_guards):
 if helper.find("returnemptyifstart>norcount>n-start") > helper.find("trustedUnsafe.PointerCast"):
     raise SystemExit("requested byte extent must be checked before the helper constructs its pointer")
 
-sview_at = compact(function_section(runtime_text, "sview_at"))
-required_sview_at_contracts = (
-    "ensure not string_view_index_request_valid(view, index.i64()) implies result == 0",
-    "ensure string_view_index_request_valid(view, index.i64()) implies result == view.data[index]",
-    "return string_view_index(view, index.i64()).u8()",
-)
-if any(compact(contract) not in sview_at for contract in required_sview_at_contracts):
+if {"sview_len", "sview_at"} & declarations(runtime_text):
+    raise SystemExit("legacy sview length/index wrappers remain in the runtime")
+checked_index = compact(function_section(runtime_text, "string_view_index"))
+if "return view.data[index_usize].i64()" not in checked_index:
     raise SystemExit("bounded-view composition no longer reaches the guarded production byte reader")
 
 positive_names = {
