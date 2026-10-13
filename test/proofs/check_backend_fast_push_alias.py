@@ -86,6 +86,35 @@ if compact("return value is Expr.IntLit(_, _) or value is Expr.FloatLit(_, _) or
 if "returnfalseifdeclared_name==name" not in survives:
     raise SystemExit("a same-name declaration must invalidate the tracked binding before shadowing")
 
+self_loop = compact(function(prereserve_source, "prereserve_self_loop_rebind"))
+for required in (
+    "Stmt.Assign(Expr.Ident(target,_),operator,Expr.Block(block_statements,Expr.Ident(yielded,_),captures,_),_)",
+    "target!=nameoroperator!=TokenKind.LArroworyielded!=name",
+    "captures.count==0orcaptures.count>PRERESERVE_MAX_SCOPE_NAMESorblock_statements.count!=1",
+    "capture_name==name",
+    "receiver_captures!=1.usize()",
+    "notloop_scratch_scalar_type(lookup_type(local_scope,capture_name))",
+    "Stmt.For(bind,_,_,_,_):returnbind==\"\"",
+):
+    if required not in self_loop:
+        raise SystemExit(f"captured-loop freshness proof lost a required guard: {required}")
+prepare_with_capture = compact(function(prereserve_source, "prepare_prereserve_unaliased_facts"))
+if "prereserve_self_loop_rebind(statement,local_name,local_scope)" not in prepare_with_capture:
+    raise SystemExit("captured-loop freshness proof must use the current local capture types")
+parser_source = (ROOT / "src/parser/parser_core_blocks.elisa").read_text()
+header_parser = compact(function(parser_source, "parse_loop_header"))
+for required in (
+    "name_captured:bool=anycaptured_nameincaptureswherecaptured_name==name_text",
+    "LoopHeaderCaptureTwice",
+    "ifnotaccepted_assignandname_captured",
+    "captures.push(name_text)ifnotaccepted_assign",
+):
+    if required not in header_parser:
+        raise SystemExit(f"captured-loop proof relies on parser duplicate-capture rejection: {required}")
+count_sum_fixture = (ROOT / "test/bench/codegen_perf/darray_count_sum.elisa").read_text()
+if "s: mutable u64 = 12345" not in count_sum_fixture or "xs <- for i in 0..<4000000 |xs, s| -> xs:" not in count_sum_fixture:
+    raise SystemExit("captured-loop freshness proof must retain the DArray plus scalar accumulator benchmark shape")
+
 emit_loop = compact(function(prereserve_source, "emit_loop_prereserve"))
 if "notlocal_darray_backing_is_unaliased(local_scope,receiver)" not in emit_loop:
     raise SystemExit("the pre-reserve path must require an unaliased backing")
@@ -143,6 +172,8 @@ if min(loop_reserve, loop_clear, loop_body) < 0 or not (loop_reserve < loop_clea
 fixture_steps = (
     "xs: mutable darray[i64] = [10, 11, 12, 13]",
     "alias: mutable darray[i64] = xs",
+    "blocker: mutable darray[i64] = []",
+    "blocker.reserve(1)",
     "alias.push(99)",
     "alias.count <- 4",
     "xs <- for i in 0..<300 |xs| -> xs:",
