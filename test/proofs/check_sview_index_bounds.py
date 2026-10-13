@@ -1,4 +1,5 @@
 """Admit the proved StringView index guard against runtime and LLVM lowering."""
+import argparse
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ from proof_product_gate import require_current_product
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "sview_index_bounds.elisa"
 NEGATIVE = HERE / "sview_index_bounds_rejected.elisa"
@@ -29,6 +30,11 @@ EASM_PARSER = ROOT / "src/backend/easm_verify_function.elisa"
 EASM_DECIMAL = ROOT / "src/backend/easm_checked_decimal.elisa"
 RUNTIME_STRINGS = ROOT / "elisacore_std/elisacore_runtime_strings.elisa"
 RUNTIME_WRAPPER = ROOT / "elisacore_std/runtime.elisa"
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true",
+                    help="check source and fixture bindings without invoking Elisa-Proof")
+ARGS = parser.parse_args()
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -70,8 +76,8 @@ wrapper = compact(function_body(RUNTIME_WRAPPER.read_text(), "ctx_string_view_in
 required_inline = (
     'i64_type:LLVMTypeRef=LLVMInt64TypeInContext(ctx)',
     'length:LLVMValueRef=LLVMBuildExtractValue(builder,view,1,"sview.idx.len")',
-    'length_ok:LLVMValueRef=LLVMBuildICmp(builder,LLVM_INT_PREDICATE_SGE,length,zero,"sview.idx.len.ok")',
-    'index_ok:LLVMValueRef=LLVMBuildICmp(builder,LLVM_INT_PREDICATE_ULT,index,length,"sview.idx.in")',
+    'length_ok:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::SGE,length,zero,"sview.idx.len.ok")',
+    'index_ok:LLVMValueRef=LLVMBuildICmp(builder,LLVMIntPredicate::ULT,index,length,"sview.idx.in")',
     'in_range:LLVMValueRef=LLVMBuildAnd(builder,length_ok,index_ok,"sview.idx.ok")',
     '_=LLVMBuildStore(builder,zero,slot)',
     '_=LLVMBuildCondBr(builder,in_range,read_block,join_block)',
@@ -83,20 +89,21 @@ if not all(fragment in inline for fragment in required_inline):
     raise SystemExit("inline StringView indexing no longer guards and zero-extends the byte load")
 llvm_predicates = compact(LLVM_BINDINGS.read_text())
 predicate_values = {
-    "LLVM_INT_PREDICATE_EQ": 32,
-    "LLVM_INT_PREDICATE_NE": 33,
-    "LLVM_INT_PREDICATE_UGT": 34,
-    "LLVM_INT_PREDICATE_UGE": 35,
-    "LLVM_INT_PREDICATE_ULT": 36,
-    "LLVM_INT_PREDICATE_ULE": 37,
-    "LLVM_INT_PREDICATE_SGT": 38,
-    "LLVM_INT_PREDICATE_SGE": 39,
-    "LLVM_INT_PREDICATE_SLT": 40,
-    "LLVM_INT_PREDICATE_SLE": 41,
+    "EQ": 32,
+    "NE": 33,
+    "UGT": 34,
+    "UGE": 35,
+    "ULT": 36,
+    "ULE": 37,
+    "SGT": 38,
+    "SGE": 39,
+    "SLT": 40,
+    "SLE": 41,
 }
-if any(f"const{name}:i32={value}" not in llvm_predicates for name, value in predicate_values.items()):
+if "constmoduleLLVMIntPredicate:" not in llvm_predicates or \
+        any(f"{name}:i32={value}" not in llvm_predicates for name, value in predicate_values.items()):
     raise SystemExit("LLVM comparison predicate assignments changed without updating the proof binding")
-if 'LLVMBuildICmp(builder,LLVM_INT_PREDICATE_NE,flags_hit,LLVMConstInt(flags_llvm,0,0),"flags.has")' not in index_emitter:
+if 'LLVMBuildICmp(builder,LLVMIntPredicate::NE,flags_hit,LLVMConstInt(flags_llvm,0,0),"flags.has")' not in index_emitter:
     raise SystemExit("flags.has lowering no longer uses the named NE predicate")
 read_block = inline.split('LLVMPositionBuilderAtEnd(builder,read_block)', 1)
 if len(read_block) != 2 or read_block[1].find('LLVMBuildGEP2(') < 0 or \
@@ -146,7 +153,7 @@ if 'sview_fields:mutabledarray[LLVMTypeRef]=[pointer_type,int64_type]' not in ru
 # The compiler's checked-decimal parser exercises the exact `.length` and `[0]`
 # syntax whose bounds are proved here. The fallback wrapper must preserve the
 # production runtime index helper's semantics.
-if 'iftext.length>0andtext[0]==ASCII_MINUS:' not in decimal_parser or \
+if 'iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
         'returnEasmCheckedDecimal::parse_signed(text)' not in parser:
     raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.length")
 runtime_steps = (
@@ -219,6 +226,11 @@ required_false_claims = (
 )
 if not all(compact(model) in negative_text for model in required_false_claims):
     raise SystemExit("StringView bounds negative controls no longer challenge the boundary laws")
+
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "positive": len(positive_names),
+                      "false_claim_controls": len(negative_names)}, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)
