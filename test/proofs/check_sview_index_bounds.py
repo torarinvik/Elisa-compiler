@@ -132,17 +132,17 @@ if any(position < 0 for position in short_positions) or short_positions != sorte
 
 # Pin the source-level alias to the actual StringView length member, its inferred
 # and backend scalar type, and the aggregate field extracted by code generation.
-if '"len"|"length"->true' not in infer_source or \
+if '"len"->true' not in infer_source or \
         'InferType{kind:SemTypeKind.Int,name:"i64"}returnifobject_type.kind==SemTypeKind.Stringandobject_type.name=="sview"andis_sview_size_field' not in infer_source:
-    raise SystemExit("semantic inference no longer types StringView.length as i64")
-if '"len"|"length"->true' not in place_type or \
+    raise SystemExit("semantic inference no longer types StringView.len as i64")
+if '"len"->true' not in place_type or \
         'ValueType{kind:TypeKind.Signed,bits:64}returnifindexed_type.kind==TypeKind.CStrorindexed_type.kind==TypeKind.SView' not in place_type:
-    raise SystemExit("backend expression typing no longer exposes StringView.length as signed i64")
-if '"data"|"len"|"length"->true' not in field_emitter or \
+    raise SystemExit("backend expression typing no longer exposes StringView.len as signed i64")
+if '"data"|"len"->true' not in field_emitter or \
         'LLVMBuildExtractValue(builder,sview_value,1,"sview.len")' not in field_emitter:
-    raise SystemExit("StringView.length no longer reads the length field from its runtime pair")
-if '"StringView"->whenfield:"data"|"len"|"length"->true' not in unknown_fields:
-    raise SystemExit("unknown-field validation no longer recognizes StringView.length")
+    raise SystemExit("StringView.len no longer reads the length field from its runtime pair")
+if '"StringView"->whenfield:"data"|"len"->true' not in unknown_fields:
+    raise SystemExit("unknown-field validation no longer recognizes StringView.len")
 
 runtime_decl = compact(RUNTIME_DECL.read_text())
 if 'sview_fields:mutabledarray[LLVMTypeRef]=[pointer_type,int64_type]' not in runtime_decl or \
@@ -150,12 +150,12 @@ if 'sview_fields:mutabledarray[LLVMTypeRef]=[pointer_type,int64_type]' not in ru
         'sview_index_type:LLVMTypeRef=LLVMFunctionType(int64_type,sview_index_pointer,2,0)' not in runtime_decl:
     raise SystemExit("StringView runtime layout/index ABI no longer uses pointer-plus-i64 and an i64 index")
 
-# The compiler's checked-decimal parser exercises the exact `.length` and `[0]`
+# The compiler's checked-decimal parser exercises the exact `.len` and `[0]`
 # syntax whose bounds are proved here. The fallback wrapper must preserve the
 # production runtime index helper's semantics.
-if 'iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
+if 'iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
         'returnEasmCheckedDecimal::parse_signed(text)' not in parser:
-    raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.length")
+    raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.len")
 runtime_steps = (
     '0returnifview.len<0',
     'view_len:usize=view.len.usize()',
