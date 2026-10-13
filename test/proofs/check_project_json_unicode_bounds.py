@@ -78,7 +78,7 @@ for name, first_name in (("json_parse_string", "first"), ("json_push_string_entr
     ordered = (
         f"{first_name}:i64=json_hex4(data,cursor.position)",
         f"code:i64=json_unicode_escape_scalar(data,cursor,{first_name})",
-        "json_push_utf8(&out,code.u32())" if name == "json_parse_string" else "scalar:u32=code.u32()",
+        "json_push_utf8(&out,code.u32())" if name == "json_parse_string" else "json_push_utf8(&list.data,code.u32())",
     )
     positions = [decoder.find(fragment) for fragment in ordered]
     if any(position < 0 for position in positions) or positions != sorted(positions):
