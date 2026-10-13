@@ -553,6 +553,16 @@ class CacheIntegrityTest(unittest.TestCase):
             values.append(result.stdout)
         self.assertNotEqual(*values)
 
+    def test_codegen_env_flags_participate_in_cache_identity(self):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_environment\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        for name, value in (("ELISACORE_FAST_MATH", "1"), ("ELISACORE_STRICT_FP", "1"), ("ELISACORE_NOALIAS_MUTABLE_REFS", "1"), ("ELISACORE_FORCE_BOUNDS_CHECK", "1"), ("ELISACORE_OVERFLOW", "wrap"), ("ELISACORE_TARGET_CPU", "generic")):
+            env = {"PATH": os.environ["PATH"], name: value}
+            result = subprocess.run(["bash", "-c", function.group() + "\nstage1_cache_environment\n"], env=env, check=True, capture_output=True)
+            self.assertEqual(result.stdout, f"{name}={value}\n".encode(), name)
+
     def test_corruption_and_truncation(self):
         for payload in (b"corrupt", b"", b"x" * self.source.stat().st_size):
             with self.subTest(payload_size=len(payload)):

@@ -284,8 +284,11 @@ stage1_cache_base_key=""
 stage1_cache_dependency_identity=""
 stage1_cache_dir=""
 stage1_cache_out=""
+# Every ELISACORE_* too: codegen reads ELISACORE_FAST_MATH, _STRICT_FP, _NOALIAS_MUTABLE_REFS,
+# _FORCE_BOUNDS_CHECK, _OVERFLOW, _TARGET_CPU, ... from the environment, and a caller may set
+# them directly instead of through the CLI flags that are already in the argument vector.
 stage1_cache_environment() {
-  env | LC_ALL=C grep -E '^(ELISA_|ELISACORE_FORCE_CONTRACTS=)' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
+  env | LC_ALL=C grep -E '^(ELISA_|ELISACORE_)' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
 }
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
