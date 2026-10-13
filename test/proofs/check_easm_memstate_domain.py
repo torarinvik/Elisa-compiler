@@ -34,6 +34,28 @@ if "".join("ensure result >= left".split()) not in "".join(helper.split()) or \
     raise SystemExit("production maximum operation no longer exposes both lower-bound monotonicity guarantees")
 if "".join("ensure result == (need <= left and need <= right)".split()) not in "".join(helper.split()):
     raise SystemExit("production joined read guard no longer states the exact two-predecessor safety condition")
+lower_law = helper.split("ghost def join_min_obeys_greatest_lower_bound_law(", 1)[1].split(
+    "\n\n        # Facts about one path", 1
+)[0]
+lower_law_compact = "".join(lower_law.split())
+if "requireslower<=leftandlower<=right" not in lower_law_compact or \
+        "ensureresult==true" not in lower_law_compact or \
+        "minimum:i64=join_min(left,right)" not in lower_law_compact or \
+        "ifleft<right:assertminimum==leftreturnlower<=minimum" not in lower_law_compact or \
+        "assertminimum==rightreturnlower<=minimum" not in lower_law_compact or \
+        "EasmMemStateDomain::join_min_obeys_greatest_lower_bound_law(left,right,lower)" not in "".join(POSITIVE.read_text().split()):
+    raise SystemExit("the minimum-domain greatest-lower-bound theorem is no longer proved and consumed")
+lub_theorem = helper.split("ghost def greatest_bound_obeys_least_upper_bound_law(", 1)[1].split(
+    "\n\n        def read_well_typed(", 1
+)[0]
+lub_theorem_compact = "".join(lub_theorem.split())
+if "requiresleft<=upperandright<=upper" not in lub_theorem_compact or \
+        "ensureresult==true" not in lub_theorem_compact or \
+        "maximum:i64=greatest_bound(left,right)" not in lub_theorem_compact or \
+        "ifleft>right:assertmaximum==leftreturnmaximum<=upper" not in lub_theorem_compact or \
+        "assertmaximum==rightreturnmaximum<=upper" not in lub_theorem_compact or \
+        "EasmMemStateDomain::greatest_bound_obeys_least_upper_bound_law(left,right,upper)" not in "".join(POSITIVE.read_text().split()):
+    raise SystemExit("the max-domain least-upper-bound theorem is no longer proved and consumed by the source-linked suite")
 
 memory = MEMORY.read_text()
 lower_bound_body = memory.split("def easm_size_guard_lower_bound(", 1)[1].split("\n\n        def ", 1)[0]
@@ -44,8 +66,38 @@ if "ensureresult>=0" not in lower_bound_compact or \
         "whileindex<facts.count|index,facts,greatest|:" not in lower_bound_compact or \
         "decreasesfacts.count-index" not in lower_bound_compact or \
         "invariantindex<=facts.count" not in lower_bound_compact or \
-        "invariantgreatest>=0" not in lower_bound_compact:
-    raise SystemExit("production size-fact fold no longer proves its accumulator stays a nonnegative lower bound")
+        "invariantgreatest>=0" not in lower_bound_compact or \
+        "ensureresult==easm_size_guard_lower_bound_from(facts,0.usize(),0)" not in lower_bound_compact or \
+        "ensure(forallfact_indexin0..<facts.count:" not in lower_bound_compact or \
+        "invarianteasm_size_guard_lower_bound_from(facts,index,greatest)==easm_size_guard_lower_bound_from(facts,0.usize(),0)" not in lower_bound_compact:
+    raise SystemExit("production size-fact fold no longer proves its exact recursive-fold result and nonnegative accumulator")
+fold_spec = memory.split("ghost def easm_size_guard_lower_bound_from(", 1)[1].split(
+    "\n\n        def easm_memory_reads(", 1
+)[0]
+fold_spec_compact = "".join(fold_spec.split())
+required_fold_fragments = (
+    "facts:darray[sview]&,index:usize,greatest:i64)->i64:",
+    "requiresindex<=facts.countandgreatest>=0",
+    "decreasesfacts.count-index",
+    "ensureresult>=greatest",
+    "ensure(forallfact_indexinindex..<facts.count:",
+    "returngreatestifindex==facts.count",
+    'fact:sview=facts[index]marker:usize=easm_find(fact,"size>=")',
+    "ifmarker<sview_len(fact):",
+    "value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():sview_len(fact)]))",
+    "returneasm_size_guard_lower_bound_from(facts,index+1,EasmMemStateDomain::greatest_bound(greatest,value))",
+    "returneasm_size_guard_lower_bound_from(facts,index+1,greatest)",
+)
+if not all(fragment in fold_spec_compact for fragment in required_fold_fragments):
+    raise SystemExit("recursive size-fact fold specification changed without updating its production proof")
+covered_fact = (
+    'easm_find(facts[fact_index],"size>=")>=sview_len(facts[fact_index])or'
+    'result>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():sview_len(facts[fact_index])]))'
+)
+if f"ensure(forallfact_indexinindex..<facts.count:{covered_fact}" not in fold_spec_compact:
+    raise SystemExit("recursive size-fact spec no longer proves every recognized fact is covered")
+if f"ensure(forallfact_indexin0..<facts.count:{covered_fact}" not in lower_bound_compact:
+    raise SystemExit("production size-fact fold no longer exports its per-fact coverage guarantee")
 wrappers = {
     "easm_memstate_join_min": "EasmMemStateDomain::join_min(left, right)",
     "easm_memstate_read_well_typed": "EasmMemStateDomain::read_well_typed(need, known_min)",
@@ -105,20 +157,25 @@ assert positive == run(POSITIVE)[1], "proof report changed across repeated runs"
 verified = {row["name"] for row in positive["declaration_details"] if row.get("verified")}
 expected = {
     "join_min",
+    "join_min_obeys_greatest_lower_bound_law",
     "greatest_bound",
+    "greatest_bound_obeys_least_upper_bound_law",
     "read_well_typed",
     "guard_join",
     "minimum_join_never_exceeds_left_bound",
     "minimum_join_never_exceeds_right_bound",
     "minimum_join_selects_an_incoming_bound",
+    "minimum_join_computes_the_exact_weaker_predecessor",
     "minimum_join_is_idempotent",
     "greatest_bound_never_falls_below_left_fact",
     "greatest_bound_never_falls_below_right_fact",
     "greatest_bound_selects_an_incoming_fact",
+    "greatest_bound_computes_the_exact_stronger_fact",
     "greatest_bound_is_idempotent",
     "greatest_bound_is_commutative",
     "greatest_bound_is_associative",
     "greatest_bound_is_monotone_in_both_facts",
+    "greatest_bound_is_the_least_common_upper_bound",
     "joined_path_read_accepts_exactly_when_each_path_has_a_covering_fact",
     "joined_read_guard_is_the_minimum_bound_read",
     "minimum_read_acceptance_implies_each_predecessor",
@@ -136,10 +193,12 @@ assert expected <= verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-assert negative["summary"]["proven"] + 3 == negative["summary"]["obligations"]
+assert negative["summary"]["proven"] + 5 == negative["summary"]["obligations"]
 false_claims = {
     "join_guard_accepts_a_read_missing_from_one_branch",
+    "a_shared_lower_bound_can_exceed_the_minimum",
     "greatest_bound_discards_the_stronger_fact",
+    "a_common_upper_bound_can_be_smaller_than_the_maximum",
     "joined_path_accepts_without_a_covering_fact_on_the_right",
 }
 assert {(finding["kind"], finding["name"]) for finding in negative["findings"]} == {
