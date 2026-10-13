@@ -302,12 +302,11 @@ extend Backend:
                         EmitStatus.Declined return if element_type.kind == TypeKind.Unmodeled
                         header: LLVMTypeRef = darray_llvm_type(structs, ctx)
                         int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                        pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
                         count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, header, container_slot, 1, "for.darray.count.ptr")
                         count_value: LLVMValueRef = darray_load_size_i64(count_ptr, ctx, builder, "for.darray.count", structs.target.target_pointer_bits)
                         items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, header, container_slot, 0, "for.darray.items.ptr")
-                        items_value: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_ptr, "for.darray.items")
-                        index_slot: LLVMValueRef = build_entry_alloca(builder, int64_type, "for.darray.i")
-                        _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), index_slot)
+                        items_value: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, items_ptr, "for.darray.items")
                         # `for x in move xs:` DRAINS xs: the loop owns each element, so a
                         # `__drop__` element that the body does not move on is dropped — the
                         # binder at the end of every iteration (and on `continue`/`break`/
@@ -318,6 +317,24 @@ extend Backend:
                                 drains <- for_bind == ""
                             _:
                                 pass
+                        # Scalar forward iteration cannot invalidate the saved data pointer:
+                        # the semantic iterator check rejects replacing or growing the source
+                        # in an ordinary loop. Walk that snapshot with a cursor and remaining
+                        # count, so an empty/null darray never needs pointer arithmetic. Keep
+                        # reverse, mutable, draining, and aggregate iteration on the indexed
+                        # path, where their existing cleanup and binding rules are explicit.
+                        pointer_walk: bool = for_bind == "" and not for_reversed and not drains and loop_scratch_scalar_type(element_type)
+                        index_slot: LLVMValueRef = LLVMConstNull(pointer_type)
+                        cursor_slot: LLVMValueRef = LLVMConstNull(pointer_type)
+                        remaining_slot: LLVMValueRef = LLVMConstNull(pointer_type)
+                        if pointer_walk:
+                            cursor_slot <- build_entry_alloca(builder, pointer_type, "for.darray.cursor")
+                            remaining_slot <- build_entry_alloca(builder, int64_type, "for.darray.remaining")
+                            _ = LLVMBuildStore(builder, items_value, cursor_slot)
+                            _ = LLVMBuildStore(builder, count_value, remaining_slot)
+                        else:
+                            index_slot <- build_entry_alloca(builder, int64_type, "for.darray.i")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), index_slot)
                         tail_mark: usize = local_scope.deferred.count
                         drains_tail: bool = drains and register_drain_tail_cleanup(container_slot, container_type, element_type, index_slot, for_reversed, for_line.line, local_scope, structs)
                         loop_name_storage: mutable darray[u8] = []
@@ -331,19 +348,29 @@ extend Backend:
                         exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.exit")
                         _ = LLVMBuildBr(builder, head_block)
                         LLVMPositionBuilderAtEnd(builder, head_block)
-                        current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.cur")
-                        keep_going: LLVMValueRef = LLVMBuildICmp(builder, 36, current, count_value, "for.darray.cmp")
+                        current: mutable LLVMValueRef = LLVMConstNull(int64_type)
+                        keep_going: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0)
+                        if pointer_walk:
+                            remaining_cur: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, remaining_slot, "for.darray.remaining.cur")
+                            keep_going <- LLVMBuildICmp(builder, 33, remaining_cur, LLVMConstInt(int64_type, 0, 0), "for.darray.remaining.nonzero")
+                        else:
+                            current <- LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.cur")
+                            keep_going <- LLVMBuildICmp(builder, 36, current, count_value, "for.darray.cmp")
                         _ = LLVMBuildCondBr(builder, keep_going, body_block, exit_block)
                         LLVMPositionBuilderAtEnd(builder, body_block)
-                        # REVERSED: walk the same 0..<count counter but read the mirrored
-                        # element, `count - 1 - i`. Keeping the counter forward means the
-                        # bound check, the step and the exit edge are all unchanged.
-                        effective_index: mutable LLVMValueRef = current
-                        if for_reversed:
-                            effective_index <- LLVMBuildSub(builder, LLVMBuildSub(builder, count_value, LLVMConstInt(int64_type, 1, 0), "for.darray.last"), current, "for.darray.mirror")
-                        indices: mutable darray[LLVMValueRef] = [effective_index]
-                        indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
-                        element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items_value, indices_pointer, 1, "for.darray.elem.ptr")
+                        element_pointer: mutable LLVMValueRef = LLVMConstNull(pointer_type)
+                        if pointer_walk:
+                            element_pointer <- LLVMBuildLoad2(builder, pointer_type, cursor_slot, "for.darray.elem.ptr")
+                        else:
+                            # REVERSED: walk the same 0..<count counter but read the mirrored
+                            # element, `count - 1 - i`. Keeping the counter forward means the
+                            # bound check, the step and the exit edge are all unchanged.
+                            effective_index: mutable LLVMValueRef = current
+                            if for_reversed:
+                                effective_index <- LLVMBuildSub(builder, LLVMBuildSub(builder, count_value, LLVMConstInt(int64_type, 1, 0), "for.darray.last"), current, "for.darray.mirror")
+                            indices: mutable darray[LLVMValueRef] = [effective_index]
+                            indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                            element_pointer <- LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items_value, indices_pointer, 1, "for.darray.elem.ptr")
                         if for_bind == "mutable":
                             element_slot <- element_pointer
                             declare_local(local_scope, for_variable, element_slot, element_type)
@@ -368,8 +395,18 @@ extend Backend:
                         EmitStatus.Declined return if body_status == EmitStatus.Declined
                         branch_if_open(body_status, builder, step_block)
                         LLVMPositionBuilderAtEnd(builder, step_block)
-                        next_index: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.next.cur"), LLVMConstInt(int64_type, 1, 0), "for.darray.next")
-                        _ = LLVMBuildStore(builder, next_index, index_slot)
+                        if pointer_walk:
+                            cursor: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, cursor_slot, "for.darray.cursor.cur")
+                            cursor_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(int64_type, 1, 0)]
+                            cursor_indices_pointer: void& = (&cursor_indices[0]).cast[void&] can Unsafe.PointerCast
+                            cursor_next: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), cursor, cursor_indices_pointer, 1, "for.darray.cursor.next")
+                            _ = LLVMBuildStore(builder, cursor_next, cursor_slot)
+                            remaining_step: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, remaining_slot, "for.darray.remaining.step")
+                            remaining_next: LLVMValueRef = LLVMBuildSub(builder, remaining_step, LLVMConstInt(int64_type, 1, 0), "for.darray.remaining.next")
+                            _ = LLVMBuildStore(builder, remaining_next, remaining_slot)
+                        else:
+                            next_index: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.next.cur"), LLVMConstInt(int64_type, 1, 0), "for.darray.next")
+                            _ = LLVMBuildStore(builder, next_index, index_slot)
                         _ = LLVMBuildBr(builder, head_block)
                         LLVMPositionBuilderAtEnd(builder, exit_block)
                         if drains_tail:
