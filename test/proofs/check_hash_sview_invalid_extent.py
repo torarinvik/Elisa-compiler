@@ -112,8 +112,10 @@ if any(position < 0 for position in step_positions) or step_positions != sorted(
 if hash_body.rfind(compact("return h")) < step_positions[-1]:
     raise SystemExit("hash_sview no longer returns the accumulated FNV state after its byte scan")
 if "canUnsafe.UncheckedIndex" in hash_body or hash_body.count("value[i].u8()") != 1 \
-        or "string_view_index(value," in hash_body or "sview_at(value," in hash_body:
+        or "string_view_index(value," in hash_body:
     raise SystemExit("hash_sview no longer uses the guarded StringView index syntax for each bounded byte")
+if {"sview_len", "sview_at"} & declarations(runtime_text):
+    raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 
 collection_hash_body = compact(function_section(collections_text, "ctx_hash_sview"))
 collection_required_steps = (
@@ -176,8 +178,8 @@ requirements = {
     "every_view_hash_matches_the_recursive_fnv1a_fold": "",
     "collection_and_runtime_view_hashes_agree": "",
     "an_empty_view_hash_is_the_fnv1a_offset_basis": "requires view.len == 0",
-    "a_one_byte_view_hash_applies_one_fnv1a_step": "requires view.length == 1 and view.length.usize().i64() == view.length",
-    "a_two_byte_view_hash_preserves_byte_order": "requires view.length == 2 and view.length.usize().i64() == view.length",
+    "a_one_byte_view_hash_applies_one_fnv1a_step": "requires view.len == 1 and view.len.usize().i64() == view.len",
+    "a_two_byte_view_hash_preserves_byte_order": "requires view.len == 2 and view.len.usize().i64() == view.len",
     "an_invalid_hash_extent_can_change_the_fnv_seed": f"requires view.len <= 0 or view.len.usize().i64() != view.len",
     "a_nonpositive_hash_extent_can_change_the_fnv_seed": "requires view.len <= 0",
     "a_valid_empty_view_hash_can_be_zero": "requires view.len == 0",
