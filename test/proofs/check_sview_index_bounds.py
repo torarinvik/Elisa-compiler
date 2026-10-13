@@ -154,9 +154,9 @@ if 'sview_fields:mutabledarray[LLVMTypeRef]=[pointer_type,int64_type]' not in ru
 # The compiler's checked-decimal parser exercises the exact `.length` and `[0]`
 # syntax whose bounds are proved here. The fallback wrapper must preserve the
 # production runtime index helper's semantics.
-if 'iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
+if 'iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
         'returnEasmCheckedDecimal::parse_signed(text)' not in parser:
-    raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.len")
+    raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.length")
 runtime_steps = (
     '0returnifview.len<0',
     'view_len:usize=view.len.usize()',
