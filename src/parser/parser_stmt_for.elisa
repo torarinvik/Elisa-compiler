@@ -17,6 +17,55 @@ extend Parser:
             return false
 
 
+        # The first `by interleave(N)` prototype deliberately accepts only the plain
+        # range forms that the range-loop emitter handles directly. A stepped range has
+        # an outer bare `..` node and remains outside this opt-in path.
+        def for_iterable_is_plain_range(expression: Ast::Expr) -> bool:
+            match expression:
+                Expr.Paren(inner, _):
+                    return for_iterable_is_plain_range(inner)
+                Expr.Binary(_, operator, _, _):
+                    return operator == TokenKind.RangeLt or operator == TokenKind.RangeLe or operator == TokenKind.RangeGt
+                _:
+                    return false
+            return false
+
+
+        # Parse the intentionally small decimal factor set for `by interleave(N)`.
+        # Returning zero means the spelling was malformed or unsupported; errors are
+        # retained on the parser, so no backend hint row can be emitted for it.
+        def parse_for_interleave_count(parser: lmut Parser) -> u32:
+            rebind opened: bool, parser = parser.accept(TokenKind.LParen)
+            if not opened:
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor())
+                while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof and parser.peek() != TokenKind.Colon |parser|:
+                    parser.position <- parser.position + 1
+                return 0
+
+            count: mutable u32 = 0
+            if parser.peek() == TokenKind.IntLit:
+                count_token: Token = parser.cursor()
+                count_text: sview = Lexer::text_or_empty(count_token, parser.source, parser.source_length)
+                count <- 8 if count_text == "8" else 16 if count_text == "16" else 0
+                parser, _ <- parser.advance()
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, count_token) if count == 0
+            else:
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor())
+
+            if count > 0 and parser.peek() != TokenKind.RParen:
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor())
+                count <- 0
+            # Consume an invalid argument tail up to its close paren so the ordinary
+            # header recovery does not report the same malformed clause a second time.
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof and parser.peek() != TokenKind.Colon |parser|:
+                parser.position <- parser.position + 1
+            rebind closed: bool, parser = parser.accept(TokenKind.RParen)
+            if not closed:
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if count > 0
+                return 0
+            return count
+
+
         # Whether the current `region ...` line has a top-level trailing `:` and
         # therefore opens the older scoped-block form. Capacity parentheses may
         # contain nested tokens; only a depth-zero colon selects the block grammar.
@@ -146,7 +195,10 @@ extend Parser:
                 rebind filter_token: Token, parser = parser.advance()
                 rebind filter_expression: Ast::Expr, parser = get parser.expression() can Global{Read,Write}
                 iterable_expression <- (Ast::Expr.Refinement(iterable_expression, filter_expression, Ast::pos_of_token(filter_token)))
-            # Range execution marker `by par` is part of the header, not the iterable.
+            # Range execution options `by par` and `by interleave(N)` are header clauses,
+            # not part of the iterable expression.
+            interleave_count: mutable u32 = 0
+            interleave_token: mutable Token = parser.cursor()
             by_token: Token = parser.cursor()
             if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(by_token, parser.source, parser.source_length) == "by":
                 parser, _ <- parser.advance()
@@ -154,7 +206,12 @@ extend Parser:
                 # Preserve the data-parallel execution marker in the same binder slot used by
                 # `parallel for`. The backend can then lower both spellings through the runtime
                 # structured-parallel path instead of silently treating `by par` as sequential.
-                bind <- "parallel" if Lexer::text_or_empty(by_mode_token, parser.source, parser.source_length) == "par"
+                by_mode: sview = Lexer::text_or_empty(by_mode_token, parser.source, parser.source_length)
+                bind <- "parallel" if by_mode == "par"
+                if by_mode == "interleave":
+                    interleave_token <- by_mode_token
+                    rebind parsed_interleave_count: u32, parser = parser.parse_for_interleave_count()
+                    interleave_count <- parsed_interleave_count
             # docs/119 §3: optional loop-expression header `|acc = init, …| [-> yield]`.
             header_declarations: mutable darray[Ast::Stmt] = []
             header_captures: mutable darray[sview] = []
@@ -162,6 +219,15 @@ extend Parser:
             header_has_yield: mutable bool = false
             header_present: bool = parser.loop_header_at()
             header_yield, parser <- parser.parse_loop_header(header_declarations, header_captures, header_has_yield) can Global{Read,Write} if header_present
+            if interleave_count > 0:
+                # Header wrappers retain the nested Stmt.For's source position, so the
+                # backend can still tag its range latch. The hint remains advisory and
+                # carries no alias or legality claim.
+                supported_interleave_loop: bool = bind == "" and variables_buffer.count == 1.usize() and for_iterable_is_plain_range(iterable_expression)
+                if supported_interleave_loop:
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__for_interleave", name: "8" if interleave_count == 8 else "16", line: for_token.line, offset: for_token.start, pos: Ast::pos_of_token(for_token)})
+                else:
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, interleave_token)
             # Chained `for a in A for b in B: body` == nested loops: the inner `for`
             # becomes the single body statement of the outer loop.
             chain_token: Token = parser.cursor()
