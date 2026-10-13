@@ -72,25 +72,30 @@ negative_text = NEGATIVE.read_text()
 
 expected_resolved_classifier = '''
 def is_unhashable_resolved_key_spelling(key_spelling: sview) -> bool:
-    ensure result == (
-        key_spelling == "sview" or key_spelling == "dstr" or
-        key_spelling == "f32" or key_spelling == "f64"
-    )
+    ensure when key_spelling:
+        "sview" | "dstr" | "f32" | "f64" -> result
+        _ -> not result
     return match key_spelling:
         "sview" | "dstr" | "f32" | "f64": true
         _: false
 '''
 expected_declared_classifier = '''
 def requires_declared_key_spelling_check(key_spelling: sview) -> bool:
-    ensure result == (key_spelling == "sview" or key_spelling == "dstr")
+    ensure when key_spelling:
+        "sview" | "dstr" -> result
+        _ -> not result
     return match key_spelling:
         "sview" | "dstr": true
         _: false
 '''
 expected_display = '''
 def diagnostic_spelling(declared_spelling: sview) -> sview:
-    ensure result == ("darray[u8]" if declared_spelling == "dstr" else declared_spelling)
-    return "darray[u8]" if declared_spelling == "dstr" else declared_spelling
+    ensure when declared_spelling:
+        "dstr" -> result == "darray[u8]"
+        _ -> result == declared_spelling
+    return match declared_spelling:
+        "dstr": "darray[u8]"
+        _: declared_spelling
 '''
 if "moduleSemanticRuntimeDictKeyPolicy:" not in compact(policy_text):
     raise SystemExit("runtime dictionary-key policy module is missing")
@@ -218,8 +223,6 @@ positive_names = {
     "resolved_key_classifier_is_exact",
     "declared_spelling_check_is_exact",
     "diagnostic_spelling_is_exact_for_every_input",
-    "resolved_and_declared_checks_cover_distinct_normalization_cases",
-    "dstr_uses_its_lowered_type_in_both_diagnostic_slots",
 }
 negative_names = {
     "false_claim_cstr_is_an_unhashable_resolved_key",
@@ -233,19 +236,6 @@ positive_claims = {
     "resolved_key_classifier_is_exact": 'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling(spelling)==(spelling=="sview"orspelling=="dstr"orspelling=="f32"orspelling=="f64")',
     "declared_spelling_check_is_exact": 'SemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check(spelling)==(spelling=="sview"orspelling=="dstr")',
     "diagnostic_spelling_is_exact_for_every_input": 'SemanticRuntimeDictKeyPolicy::diagnostic_spelling(spelling)==("darray[u8]"ifspelling=="dstr"elsespelling)',
-    "resolved_and_declared_checks_cover_distinct_normalization_cases": (
-        'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling("sview")and'
-        'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling("dstr")and'
-        'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling("f32")and'
-        'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling("f64")and'
-        'SemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check("sview")and'
-        'SemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check("dstr")and'
-        'notSemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check("f32")and'
-        'notSemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check("f64")and'
-        'notSemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling("cstr")and'
-        'notSemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling("i64")'
-    ),
-    "dstr_uses_its_lowered_type_in_both_diagnostic_slots": 'SemanticRuntimeDictKeyPolicy::diagnostic_spelling("dstr")=="darray[u8]"andSemanticRuntimeDictKeyPolicy::diagnostic_spelling("sview")=="sview"andSemanticRuntimeDictKeyPolicy::diagnostic_spelling("cstr")=="cstr"andSemanticRuntimeDictKeyPolicy::diagnostic_spelling("i64")=="i64"',
 }
 for name, claim in positive_claims.items():
     section = compact(function_section(positive_text, name))

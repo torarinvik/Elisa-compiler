@@ -231,6 +231,7 @@ positive_overflow = compact(function_section(arithmetic_text, "positive_boundary
 negative_boundary = compact(function_section(arithmetic_text, "negative_boundary_digit_eight_is_safe"))
 negative_underflow = compact(function_section(arithmetic_text, "negative_boundary_digit_nine_is_rejected"))
 positive_classification = compact(function_section(arithmetic_text, "positive_final_digit_classification_is_exact"))
+negative_classification = compact(function_section(arithmetic_text, "negative_final_digit_classification_is_exact"))
 positive_range = compact(function_section(arithmetic_text, "positive_boundary_accumulation_stays_representable"))
 negative_range = compact(function_section(arithmetic_text, "negative_boundary_accumulation_stays_representable"))
 if "return(922337203685477580<922337203685477580or(922337203685477580==922337203685477580and7<=7))and922337203685477580*10+7==9223372036854775807" not in positive_boundary or \
@@ -238,7 +239,11 @@ if "return(922337203685477580<922337203685477580or(922337203685477580==922337203
         "return(0-922337203685477580>0-922337203685477580or(0-922337203685477580==0-922337203685477580and8<=8))and(0-922337203685477580)*10-8==0-9223372036854775807-1" not in negative_boundary or \
         "returnnot(0-922337203685477580>0-922337203685477580or(0-922337203685477580==0-922337203685477580and9<=8))" not in negative_underflow or \
         "requiresdigit>=0anddigit<=9" not in positive_classification or \
-        "return(922337203685477580<922337203685477580or(922337203685477580==922337203685477580anddigit<=7))==(digit<=7)" not in positive_classification or \
+        "guard:bool=922337203685477580<922337203685477580or(922337203685477580==922337203685477580anddigit<=7)" not in positive_classification or \
+        "returnguardifdigit<=7elsenotguard" not in positive_classification or \
+        "requiresdigit>=0anddigit<=9" not in negative_classification or \
+        "guard:bool=0-922337203685477580>0-922337203685477580or(0-922337203685477580==0-922337203685477580anddigit<=8)" not in negative_classification or \
+        "returnguardifdigit<=8elsenotguard" not in negative_classification or \
         "requiresdigit>=0anddigit<=7" not in positive_range or \
         "return922337203685477580*10+digit>=0and922337203685477580*10+digit<=9223372036854775807" not in positive_range or \
         "requiresdigit>=0anddigit<=8" not in negative_range or \
@@ -259,6 +264,7 @@ arithmetic_names = {
     "negative_boundary_digit_eight_is_safe",
     "negative_boundary_digit_nine_is_rejected",
     "positive_final_digit_classification_is_exact",
+    "negative_final_digit_classification_is_exact",
     "positive_boundary_accumulation_stays_representable",
     "negative_boundary_accumulation_stays_representable",
 }

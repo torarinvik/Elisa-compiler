@@ -24,8 +24,8 @@ SIZE_TYPES = ROOT / "src/backend/codegen_interned_types.elisa"
 LLVM_C = ROOT / "src/backend/llvm_c.elisa"
 POSITIVE = HERE / "backend_darray_push_bounds.elisa"
 NEGATIVE = HERE / "backend_darray_push_bounds_rejected.elisa"
-POSITIVE_NAMES = {"guarded_count_increment_fits_capacity", "full_capacity_guard_rejects_the_store_path", "guarded_count_increment_fits_target_limit", "push_growth_capacity_covers_needed", "push_growth_overflow_fallback_selects_needed", "empty_push_growth_keeps_seed_when_it_fits", "empty_push_growth_uses_needed_above_seed", "append_growth_step_increases_capacity", "append_growth_overflow_step_meets_bound"}
-NEGATIVE_NAMES = {"false_full_capacity_has_a_spare_slot", "false_guarded_increment_exceeds_target_capacity", "false_guarded_increment_exceeds_target_limit", "false_push_growth_capacity_may_fall_short", "false_push_growth_overflow_keeps_wrapped_double", "false_empty_push_growth_seed_is_not_eight"}
+POSITIVE_NAMES = {"guarded_count_increment_fits_capacity", "full_capacity_guard_rejects_the_store_path", "guarded_count_increment_fits_target_limit", "push_growth_capacity_covers_needed", "push_growth_overflow_fallback_selects_needed", "empty_push_growth_keeps_seed_when_it_fits", "empty_push_growth_uses_needed_above_seed", "append_growth_step_increases_capacity", "append_growth_overflow_step_meets_bound", "normal_growth_selects_double_when_it_covers_needed", "normal_growth_selects_needed_when_double_is_too_small"}
+NEGATIVE_NAMES = {"false_full_capacity_has_a_spare_slot", "false_guarded_increment_exceeds_target_capacity", "false_guarded_increment_exceeds_target_limit", "false_push_growth_capacity_may_fall_short", "false_push_growth_overflow_keeps_wrapped_double", "false_empty_push_growth_seed_is_not_eight", "false_normal_growth_selects_needed_when_double_covers", "false_normal_growth_selects_double_when_double_is_small"}
 PROOF_HASHES = {
     "guarded_count_increment_fits_capacity": "e9a40dae00344a7bc9ad3a15c74184bd959560ae617bd72e6049d29e0d2d0dd2",
     "full_capacity_guard_rejects_the_store_path": "7df7845e15540ae20add2dff2421f5ce987d74ef0cbcb13590db4546aa4fed08",
@@ -42,6 +42,10 @@ PROOF_HASHES = {
     "append_growth_step_increases_capacity": "8c034f07afee40b41a3f955e73622f6110f2ebc55a9c7e6ede6b68969a0c8102",
     "append_growth_overflow_step_meets_bound": "6c549cf093726e100fdfe2c60422190aefac60b1367482bc0d14975eac738786",
     "false_empty_push_growth_seed_is_not_eight": "739a89856ccdecf4d06711619a0715c648061f14e1eca1c991332d4219b3ecbf",
+    "normal_growth_selects_double_when_it_covers_needed": "299f6717a53cbb0285af3f4b5dacb1f29cc88ad01b3d1b954d84e53943e251ef",
+    "normal_growth_selects_needed_when_double_is_too_small": "57a958d53c303fc1423477c5eb8eea16aa82c407b9391eaaf840d84d05a63cf1",
+    "false_normal_growth_selects_needed_when_double_covers": "98c25c38ae95c557d1262f5e15431ccc6eb84ad42b741b95b07c34f818f2c5bd",
+    "false_normal_growth_selects_double_when_double_is_small": "978913ff98c25b0bec8ed67bddee15a1705478e92faffec7efef1e46ce3db12d",
 }
 
 

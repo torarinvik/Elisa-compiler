@@ -1,6 +1,7 @@
 """Admit source-bound proof that zip_map validates each source extent before indexing."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -10,11 +11,14 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true", help="check source and theorem bindings without proof-product replay")
+args = parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not args.source_only)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 SOURCE = ROOT / "src/backend/codegen_call_named.elisa"
 GUARDS = ROOT / "src/backend/codegen_guards.elisa"
 INTERNED_TYPES = ROOT / "src/backend/codegen_interned_types.elisa"
@@ -137,6 +141,7 @@ if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIV
     raise SystemExit("zip_map bounds proof inventory changed")
 positive_text = POSITIVE.read_text()
 expected_positive = {
+    "zip_index_is_inside_every_view": "def zip_index_is_inside_every_view(index:u64,destination_count:u64,source1_count:u64,source2_count:u64)->bool:\nrequires index<destination_count\nrequires destination_count<=source1_count and destination_count<=source2_count\nensure result==true\nreturn index<destination_count and index<source1_count and index<source2_count",
     "zip_loop_initial_index_is_within_destination": "def zip_loop_initial_index_is_within_destination(destination_count:u64)->bool:\nensure result==true\nreturn 0<=destination_count",
     "zip_loop_step_preserves_all_view_bounds": "def zip_loop_step_preserves_all_view_bounds(index:u64,destination_count:u64,source1_count:u64,source2_count:u64)->bool:\nrequires index<destination_count\nrequires destination_count<=source1_count and destination_count<=source2_count\nensure result==true\nreturn index+1<=destination_count and index+1<=source1_count and index+1<=source2_count",
 }
@@ -149,6 +154,10 @@ if compact(function_section(negative_text, "false_claim_zip_loop_step_stays_stri
     raise SystemExit("zip_map loop-step negative control changed")
 if 'include "./backend_zip_map_bounds.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the admitted zip_map bounds proof")
+
+if args.source_only:
+    print(json.dumps({"source_bound": True, "positive": len(POSITIVE_NAMES), "false_controls": len(NEGATIVE_NAMES)}))
+    raise SystemExit(0)
 
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":

@@ -92,6 +92,21 @@ positive_names = {
     "name_set_ninth_entry_doubles_initial_capacity",
     "name_set_probe_step_stays_in_initial_table",
     "ninth_name_rehash_keeps_twenty_three_slots_empty",
+    "name_set_capacity_thirty_two_covers_next_eight_insertions",
+    "name_set_seventeenth_entry_doubles_capacity",
+    "name_set_capacity_sixty_four_covers_next_sixteen_insertions",
+    "name_set_thirty_third_entry_doubles_capacity",
+    "name_set_capacity_one_twenty_eight_covers_next_thirty_two_insertions",
+    "name_set_sixty_fifth_entry_doubles_capacity",
+    "seventeenth_name_rehash_keeps_forty_seven_slots_empty",
+    "thirty_third_name_rehash_keeps_ninety_five_slots_empty",
+    "sixty_fifth_name_rehash_keeps_one_hundred_ninety_one_slots_empty",
+    "name_set_one_hundred_twenty_ninth_entry_doubles_capacity",
+    "one_hundred_twenty_ninth_name_rehash_keeps_three_hundred_eighty_three_slots_empty",
+    "name_set_two_hundred_fifty_seventh_entry_doubles_capacity",
+    "two_hundred_fifty_seventh_name_rehash_keeps_seven_hundred_sixty_seven_slots_empty",
+    "name_set_five_hundred_thirteenth_entry_doubles_capacity",
+    "five_hundred_thirteenth_name_rehash_keeps_one_thousand_five_hundred_thirty_five_slots_empty",
 }
 if not positive_names <= set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", positive_text)):
     raise SystemExit("NameSet capacity proof is missing a required theorem")
@@ -100,13 +115,52 @@ proof_hashes = {
     "name_set_ninth_entry_doubles_initial_capacity": "f7505f7756bafc685ad212b1823e241d1338fb5f09c6150da2e68f606f9290f2",
     "name_set_probe_step_stays_in_initial_table": "cb109ff96e03081d270b95df01a018c02b3aa312781fc7ee82aa3af59baae7fc",
     "ninth_name_rehash_keeps_twenty_three_slots_empty": "977a1b5a2ff790412df624818a49e0919269c5c0a7ba04a7e23afa6ce2f096b8",
+    "name_set_capacity_thirty_two_covers_next_eight_insertions": "9e7d801dfaf2613754d0e4adaf0925443db97779fa422a582f1ca9c74d4265ae",
+    "name_set_seventeenth_entry_doubles_capacity": "fe204ac4f29a11c577b8c790617bad6df5bb1a88f57b471d966707e96faaead6",
+    "name_set_capacity_sixty_four_covers_next_sixteen_insertions": "3e863519090c0833b9b4fc941be8b516051d3e79ed547e6d27707e2a7bfa35f9",
+    "name_set_thirty_third_entry_doubles_capacity": "16c60f25282b8cdac575f6193068a5fd441afe44e3875e2020884fb5a1fb1e30",
+    "name_set_capacity_one_twenty_eight_covers_next_thirty_two_insertions": "857956bf7e7cfcd1cdf059d73288fc9ee81915f398a0986bdcb1d0ef766a58a5",
+    "name_set_sixty_fifth_entry_doubles_capacity": "1f13244f88296fa413b134bc8d5a743816c346a85ca040cff027c36a610d6a26",
+    "seventeenth_name_rehash_keeps_forty_seven_slots_empty": "c596217c3b900e8b69ca7fd27e74e9de09537c7f30bc2362652e7d387c960709",
+    "thirty_third_name_rehash_keeps_ninety_five_slots_empty": "eddba8882643781b6106ead93090f857425042bc6d0c002cc386dab5a93a3758",
+    "sixty_fifth_name_rehash_keeps_one_hundred_ninety_one_slots_empty": "0f2879c8ac3cb39312fc9d0f16d3844b796d1a698f3bffd295fcff1ba64cc63f",
+    "name_set_one_hundred_twenty_ninth_entry_doubles_capacity": "bcd37e78b9e2c30acb4b43201a986c8032e95fabf53e5bafbc35731d2bffd031",
+    "one_hundred_twenty_ninth_name_rehash_keeps_three_hundred_eighty_three_slots_empty": "b1b90006db928b677cb279e4cd74cba7e362a18dff8d001fe826bbce212b8fb4",
+    "name_set_two_hundred_fifty_seventh_entry_doubles_capacity": "eb68e53ba6dedc41449a92cd235f2750490b504fb576047f807c4a0e82764040",
+    "two_hundred_fifty_seventh_name_rehash_keeps_seven_hundred_sixty_seven_slots_empty": "5a6e9b0bbf73aa36a8fb00fd72e619b9cfa938a7bb0b546bb0063701864618a1",
+    "name_set_five_hundred_thirteenth_entry_doubles_capacity": "a68ae2043927cef1436601a62b1d9af6fcf1092ef42ed4af9a44ce2b05195b43",
+    "five_hundred_thirteenth_name_rehash_keeps_one_thousand_five_hundred_thirty_five_slots_empty": "34d8b3c6d6f9dde3f6f089617645de417bdf6fcd390b197f109a66a0de5577a4",
 }
 for proof_name, expected_hash in proof_hashes.items():
     digest = hashlib.sha256(compact(function_section(positive_text, proof_name)).encode()).hexdigest()
     if digest != expected_hash:
         raise SystemExit(f"NameSet boundary theorem {proof_name} changed since source binding")
-if "def exact_growth_threshold_leaves_an_extra_empty_slot(" not in negative_text:
-    raise SystemExit("NameSet boundary counterexample is missing")
+negative_names = {
+    "exact_growth_threshold_leaves_an_extra_empty_slot": "broad existing boundary control",
+    "false_thirty_two_slots_cover_the_seventeenth_entry": "a full 32-slot table must grow before insertion",
+    "false_sixty_four_slots_cover_the_thirty_third_entry": "a full 64-slot table must grow before insertion",
+    "false_one_twenty_eight_slots_cover_the_sixty_fifth_entry": "a full 128-slot table must grow before insertion",
+    "false_five_hundred_twelve_slots_cover_the_two_hundred_fifty_seventh_entry": "a full 512-slot table must grow before insertion",
+    "false_one_thousand_twenty_four_slots_cover_the_five_hundred_thirteenth_entry": "a full 1024-slot table must grow before insertion",
+}
+for false_name in negative_names:
+    if f"def {false_name}(" not in negative_text:
+        raise SystemExit(f"NameSet boundary counterexample is missing: {false_name}")
+false_hash = hashlib.sha256(compact(function_section(negative_text, "false_thirty_two_slots_cover_the_seventeenth_entry")).encode()).hexdigest()
+if false_hash != "a74cbcf77dd791e53f4b9ccb160f0034cfe8e3311c8c5200fba63812f4f756c0":
+    raise SystemExit("seventeenth-entry false control changed since source binding")
+false_hash = hashlib.sha256(compact(function_section(negative_text, "false_sixty_four_slots_cover_the_thirty_third_entry")).encode()).hexdigest()
+if false_hash != "be81f35295393a021866fbb968fc8b9b3f7768fe6d2906c82144518860d32735":
+    raise SystemExit("thirty-third-entry false control changed since source binding")
+false_hash = hashlib.sha256(compact(function_section(negative_text, "false_one_twenty_eight_slots_cover_the_sixty_fifth_entry")).encode()).hexdigest()
+if false_hash != "b48248d7544ad56a9367ecd15df8a57fb88c595170703b66af00f18a9ca5d97e":
+    raise SystemExit("sixty-fifth-entry false control changed since source binding")
+false_hash = hashlib.sha256(compact(function_section(negative_text, "false_five_hundred_twelve_slots_cover_the_two_hundred_fifty_seventh_entry")).encode()).hexdigest()
+if false_hash != "050fb5c6f6403a2801ded70a97c6cdccfffd1f4c638cc04922660f55f23ced16":
+    raise SystemExit("two-hundred-fifty-seventh-entry false control changed since source binding")
+false_hash = hashlib.sha256(compact(function_section(negative_text, "false_one_thousand_twenty_four_slots_cover_the_five_hundred_thirteenth_entry")).encode()).hexdigest()
+if false_hash != "95ec63f59f07b6106c29200ee15e3b282322986ae5c82c0a8cc59904fb78c617":
+    raise SystemExit("five-hundred-thirteenth-entry false control changed since source binding")
 if "name_count <= 7" not in positive_text:
     raise SystemExit("initial-capacity theorem no longer covers the exact eight-entry range")
 
@@ -144,12 +198,17 @@ code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
 assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
     ("ensure-unproven", "exact_growth_threshold_leaves_an_extra_empty_slot"),
+    ("ensure-unproven", "false_thirty_two_slots_cover_the_seventeenth_entry"),
+    ("ensure-unproven", "false_sixty_four_slots_cover_the_thirty_third_entry"),
+    ("ensure-unproven", "false_one_twenty_eight_slots_cover_the_sixty_fifth_entry"),
+    ("ensure-unproven", "false_five_hundred_twelve_slots_cover_the_two_hundred_fifty_seventh_entry"),
+    ("ensure-unproven", "false_one_thousand_twenty_four_slots_cover_the_five_hundred_thirteenth_entry"),
 ]
 
 assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 assert require_current_product(BIN, PROVER) == manifest, "proof product provenance changed during replay"
 print(json.dumps({"admitted": True,
-                  "scope": "initial NameSet capacity threshold for eight entries and insertion-count behavior",
+                  "scope": "NameSet growth thresholds through the sixty-fifth insertion and initial-table probe-step bounds",
                   "positive_obligations": positive["summary"]["proven"],
                   "false_claim_rejected": negative["findings"][0]["name"],
                   "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),

@@ -281,7 +281,7 @@ STATEMENT_COLLECTOR_EDGES = (
 )
 
 STATEMENT_UNIFIER_EDGES = (
-    ("Stmt.VarDecl(declared_name, _, declared_value, _):", "sts_unify_bound(declared_name, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.VarDecl(declared_name, declared_type, declared_value, _):", "sts_unify_bound(declared_name, declared_type, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_collect_names(assign_target, assign_names)"),
     ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_collect_names(assign_value, assign_names)"),
     ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_all(classes, assign_names)"),
@@ -296,7 +296,7 @@ STATEMENT_UNIFIER_EDGES = (
     ("Stmt.While(condition, loop_body, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.While(condition, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "for loop_variable in loop_variables |classes, reference_sites|:"),
-    ("for loop_variable in loop_variables |classes, reference_sites|:", "sts_unify_bound(loop_variable, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("for loop_variable in loop_variables |classes, reference_sites|:", "sts_unify_bound(loop_variable, Expr.Invalid, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_unify_calls(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Block(_, _, _, block_body, _):", "sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
@@ -806,6 +806,7 @@ collect_source = function_section(summary_text, "sts_collect_names")
 statement_collect_source = function_section(summary_text, "sts_collect_statement_names")
 unifier_source = function_section(summary_text, "sts_unify_calls")
 statements_source = function_section(summary_text, "sts_statements")
+bound_unifier_source = function_section(summary_text, "sts_unify_bound")
 holder_scan_statements = function_section(holder_text, "chv_scan_locals")
 holder_scan_expressions = function_section(holder_text, "chv_scan_expression_locals")
 holder_walk_expressions = function_section(holder_text, "chv_walk_expression")
@@ -840,6 +841,19 @@ validate_edge_set(collect_source, EXPRESSION_EDGES, "expression name collector")
 validate_edge_set(statement_collect_source, STATEMENT_COLLECTOR_EDGES, "nested statement name collector")
 validate_edge_set(unifier_source, EXPRESSION_UNIFIER_EDGES, "expression call unifier")
 validate_edge_set(statements_source, STATEMENT_UNIFIER_EDGES, "statement call unifier")
+expected_bound_unifier = compact_code("""can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+declared_type_id: u32 = annotation_type_id(declared_type, table) can Global{Read,Write}
+bound_type_is_reference_free: mutable bool = false
+can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+    bound_type_is_reference_free <- bam_type_is_proven_reference_free_cached(declared_type_id, reference_sites, table) if declared_type_id != 0
+if not bound_type_is_reference_free:
+    bound_names: mutable darray[sview] = []
+    bound_names.push(name) if name != ""
+    sts_collect_names(value, bound_names)
+    sts_unify_all(classes, bound_names)
+sts_unify_calls(value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)""")
+if compact_code(bound_unifier_source) != expected_bound_unifier:
+    raise SystemExit("store-through binding union must be skipped only for proven reference-free types while preserving call summaries")
 for fallback_child in ("sts_collect_names(expression, hidden_names)", "sts_unify_all(classes, hidden_names)"):
     if not direct_child(unifier_source, "_:", fallback_child, 2):
         raise SystemExit(f"store-through wildcard fallback is missing {fallback_child}")
