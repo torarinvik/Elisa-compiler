@@ -81,6 +81,7 @@ theorems = {
     "decimal_above_i64_max_reinterprets_as_i64_min",
     "hexadecimal_u64_max_reinterprets_as_i64_minus_one",
     "hexadecimal_u64_overflow_saturates_to_i64_minus_one",
+    "decimal_u64_overflow_saturates_to_i64_minus_one",
     "hexadecimal_separators_preserve_the_value",
     "every_single_ascii_decimal_digit_decodes_exactly",
     "every_two_ascii_decimal_digits_decode_exactly",
@@ -89,10 +90,25 @@ theorems = {
     "every_hex_decimal_digit_decodes_exactly",
     "every_lowercase_hex_letter_decodes_exactly",
     "every_uppercase_hex_letter_decodes_exactly",
+    "proof_saturated_suffix_from",
 }
 for name in theorems:
     if f"def {name}(" not in positive_text:
         raise AssertionError(f"positive boundary proof missing: {name}")
+saturation_lemma = positive_text.split("ghost def proof_saturated_suffix_from(", 1)[1].split("\n\n", 1)[0]
+for fragment in (
+    "requires index <= sview_len(text)",
+    "requires (forall suffix_index in index..<sview_len(text):",
+    "decreases sview_len(text) - index",
+    "ensure parse_int_literal_reference_from(text, index, is_hex, 18446744073709551615u64) == 18446744073709551615u64",
+    "return proof_saturated_suffix_from(text, index + 1, is_hex) if byte == 95",
+    "assert maximum > (maximum - digit.u64()) / base",
+):
+    if fragment not in saturation_lemma:
+        raise AssertionError(f"saturation theorem lost its universal suffix induction: {fragment}")
+if "decimal_u64_overflow_saturates_to_i64_minus_one" not in positive_text or \
+        "decimal_u64_overflow_wraps_to_zero" not in negative_text:
+    raise AssertionError("decimal u64 saturation lacks its positive theorem or false wraparound control")
 hex_digit_spec = positive_text.split("def proof_hex_digit_value(", 1)[1].split("\ndef ", 1)[0]
 for fragment in ("byte - 48", "byte - 87", "byte - 55"):
     if fragment not in hex_digit_spec:
@@ -159,10 +175,11 @@ assert "parse_int_literal_value" in verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
-assert negative["summary"]["proven"] + 7 == negative["summary"]["obligations"]
+assert negative["summary"]["proven"] + 8 == negative["summary"]["obligations"]
 assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
     ("ensure-unproven", "hexadecimal_u64_max_is_signed_i64_max"),
     ("ensure-unproven", "decimal_above_i64_max_remains_i64_max"),
+    ("ensure-unproven", "decimal_u64_overflow_wraps_to_zero"),
     ("ensure-unproven", "ascii_zero_decodes_as_one"),
     ("ensure-unproven", "hexadecimal_lowercase_a_decodes_as_eleven"),
     ("ensure-unproven", "decimal_zero_pair_decodes_as_one"),
@@ -179,6 +196,7 @@ print(json.dumps({"admitted": True, "scope": "all-input production-loop refineme
                   "positive_obligations": positive["summary"]["proven"],
                   "false_claims_rejected": ["hexadecimal_u64_max_is_signed_i64_max",
                                             "decimal_above_i64_max_remains_i64_max",
+                                            "decimal_u64_overflow_wraps_to_zero",
                                             "ascii_zero_decodes_as_one",
                                             "hexadecimal_lowercase_a_decodes_as_eleven",
                                             "decimal_zero_pair_decodes_as_one",
