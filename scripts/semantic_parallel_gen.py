@@ -56,7 +56,7 @@ MUTATORS = (
 # read-only conversions/lookups. Any other unresolved receiver method is treated as
 # an effectful call below; source-defined methods still use their formal modes.
 READ_ONLY_TABLE_METHODS = {"get", "as_sview"}
-READ_ONLY_TABLE_CALLS = {"sview_len", "sview_at"}
+READ_ONLY_TABLE_CALLS: set[str] = set()
 BUILTIN_NUMERIC_CAST_METHODS = {
     "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
     "isize", "usize", "int", "uintptr", "char", "f32", "f64",
@@ -68,7 +68,7 @@ NON_CALL_KEYWORDS = {
 }
 # Source-language intrinsics without ordinary source definitions. Keep this list
 # narrow: an unresolved free call is an unknown effect unless explicitly known pure.
-PURE_FREE_CALLS = {"sview", "sview_len", "sview_at", "getenv"}
+PURE_FREE_CALLS = {"sview", "getenv"}
 # Ghost definitions are verification-only, but their bodies are still useful to the
 # audit when a proof contract calls them. Analyzing their real call graph avoids
 # misclassifying a known pure ghost helper as an unknown runtime effect.

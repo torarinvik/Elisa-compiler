@@ -34,7 +34,7 @@ class CacheIntegrityTest(unittest.TestCase):
             shutil.copyfile(scripts / name, root / "scripts" / name)
         return root
 
-    def run_cache_key(self, compiler, source, *, root=None, allow_stale=False, extra_env=None):
+    def run_cache_key(self, compiler, source, *, root=None, cwd=None, allow_stale=False, extra_env=None):
         repo_root = Path(__file__).resolve().parent.parent
         wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
@@ -60,7 +60,7 @@ class CacheIntegrityTest(unittest.TestCase):
             env.update(extra_env)
         if allow_stale:
             env["ELISA_ALLOW_STALE_STAGE1"] = "1"
-        return subprocess.run(["bash", "-c", script], env=env, check=False, capture_output=True)
+        return subprocess.run(["bash", "-c", script], cwd=cwd, env=env, check=False, capture_output=True)
 
     def cache_key(self, compiler, source, *, root=None, extra_env=None):
         result = self.run_cache_key(compiler, source, root=root, extra_env=extra_env)
@@ -201,6 +201,20 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertFalse(list((self.source.parent / "object-cache").rglob("*.json")))
 
+    def test_symlink_loop_dependency_falls_back_without_cache_identity(self):
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        loop = root / "include-loop.elisa"
+        loop.symlink_to(loop)
+
+        result = self.run_cache_key(compiler, source, root=root, extra_env={"INCLUDED_DEPENDENCY": str(loop)})
+
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual((self.source.parent / "dependency-compiler-calls").read_text(), "x")
+        self.assertFalse(list((self.source.parent / "object-cache").rglob("*.json")))
+
     def test_wrapper_rejects_dependency_graph_changes_between_discovery_passes(self):
         root = self.cache_project()
         compiler = root / "bin" / "fake-compiler"
@@ -254,6 +268,31 @@ class CacheIntegrityTest(unittest.TestCase):
         third = self.cache_key(compiler, source, root=root, extra_env=environment)
         self.assertNotEqual(third, first)
         self.assertEqual(log.read_text(), "xxxxxx")
+
+    def test_relative_dependency_paths_reuse_index_and_invalidate_changes(self):
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        dependency = root / "included.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        dependency.write_text("const VALUE: i64 = 1\n")
+        log = self.source.parent / "dependency-compiler-calls"
+        environment = {"INCLUDED_DEPENDENCY": dependency.name}
+
+        first = self.run_cache_key(compiler, source.name, root=root, cwd=root, extra_env=environment)
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.assertEqual(log.read_text(), "xx")
+
+        second = self.run_cache_key(compiler, source.name, root=root, cwd=root, extra_env=environment)
+        self.assertEqual(second.returncode, 0, second.stderr.decode())
+        self.assertEqual(second.stdout, first.stdout)
+        self.assertEqual(log.read_text(), "xx")
+
+        dependency.write_text("const VALUE: i64 = 2\n")
+        third = self.run_cache_key(compiler, source.name, root=root, cwd=root, extra_env=environment)
+        self.assertEqual(third.returncode, 0, third.stderr.decode())
+        self.assertNotEqual(third.stdout, first.stdout)
+        self.assertEqual(log.read_text(), "xxxx")
 
     def test_dependency_index_tracks_symlink_retargeting(self):
         root = self.source.parent
