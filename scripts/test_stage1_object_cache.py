@@ -29,8 +29,9 @@ class CacheIntegrityTest(unittest.TestCase):
         (root / "elisacore_std").mkdir()
         (root / "elisacore_std" / "runtime.elisa").write_text("# fixture\n")
         (root / "scripts").mkdir()
-        helper = Path(__file__).resolve().parent / "stage1_object_cache.py"
-        shutil.copyfile(helper, root / "scripts" / helper.name)
+        scripts = Path(__file__).resolve().parent
+        for name in ("elisac_stage1.sh", "stage1_object_cache.py", "platform.sh"):
+            shutil.copyfile(scripts / name, root / "scripts" / name)
         return root
 
     def run_cache_key(self, compiler, source, *, root=None, allow_stale=False, extra_env=None):
