@@ -44,7 +44,7 @@ NEGATIVE_NAMES = {
 }
 FUNCTION_SHA256 = {
     "hex_escape_value": "02657188556db09219fdf99c77c9d8c91e54383fedd21ec4f2c2be0fe3d6bf19",
-    "utf16_surrogate_pair_codepoint": "efd83178d036eac52fcac8943a452d570f2d5cb32113db59ce0bbf944ceb079c",
+    "utf16_surrogate_pair_codepoint": "6fe1cf69636c6389de24bbd7d0c07093d8e0f8f40197c287ca9f6090568e4eef",
     "decode_string_escapes": "e4dd1e99810e574d447f0fe9fb00d41af2c9846a90789c513de16491ee9fe49a",
     "decoded_literal_byte_count": "87bb5014f767f76c4f29333d19356897e91e31705875189b8b72aa37fd78ec41",
     "string_pattern_content_cstr": "e478082e1381286ea6a815ab6b94021ad55e9390800c2190e04b833b5bf78d7a",
@@ -215,8 +215,7 @@ ordered_steps(source_text, "hex_escape_value", (
 ordered_steps(source_text, "utf16_surrogate_pair_codepoint", (
     "requires low_escape_start <= text.len",
     "remaining: usize = text.len - low_escape_start",
-    "return -1 if remaining < 6",
-    "return -1 if text[low_escape_start] != 92 or text[low_escape_start + 1.usize()] != 117",
+    "return -1 if: remaining < 6 text[low_escape_start] != 92 or text[low_escape_start + 1.usize()] != 117",
     "low: i64 = hex_escape_value(text, low_escape_start + 2.usize(), 4.usize())",
     "return -1 if low < 56320 or low > 57343",
     "return 65536 + (high - 55296) * 1024 + (low - 56320)",

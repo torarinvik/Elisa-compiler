@@ -24,13 +24,24 @@ SIZE_TYPES = ROOT / "src/backend/codegen_interned_types.elisa"
 LLVM_C = ROOT / "src/backend/llvm_c.elisa"
 POSITIVE = HERE / "backend_darray_push_bounds.elisa"
 NEGATIVE = HERE / "backend_darray_push_bounds_rejected.elisa"
-POSITIVE_NAMES = {"guarded_count_increment_fits_capacity", "full_capacity_guard_rejects_the_store_path"}
-NEGATIVE_NAMES = {"false_full_capacity_has_a_spare_slot", "false_guarded_increment_exceeds_target_capacity"}
+POSITIVE_NAMES = {"guarded_count_increment_fits_capacity", "full_capacity_guard_rejects_the_store_path", "guarded_count_increment_fits_target_limit", "push_growth_capacity_covers_needed", "push_growth_overflow_fallback_selects_needed", "empty_push_growth_keeps_seed_when_it_fits", "empty_push_growth_uses_needed_above_seed", "append_growth_step_increases_capacity", "append_growth_overflow_step_meets_bound"}
+NEGATIVE_NAMES = {"false_full_capacity_has_a_spare_slot", "false_guarded_increment_exceeds_target_capacity", "false_guarded_increment_exceeds_target_limit", "false_push_growth_capacity_may_fall_short", "false_push_growth_overflow_keeps_wrapped_double", "false_empty_push_growth_seed_is_not_eight"}
 PROOF_HASHES = {
     "guarded_count_increment_fits_capacity": "e9a40dae00344a7bc9ad3a15c74184bd959560ae617bd72e6049d29e0d2d0dd2",
     "full_capacity_guard_rejects_the_store_path": "7df7845e15540ae20add2dff2421f5ce987d74ef0cbcb13590db4546aa4fed08",
+    "guarded_count_increment_fits_target_limit": "a74105f83c28dd35f47abeaa5b59584864ae0b249dffae58588aa3288443b5f6",
     "false_full_capacity_has_a_spare_slot": "bc2b7f499fb6640853e768345ae0c7e179bd304a58fbd2ada1033d8c8080de66",
     "false_guarded_increment_exceeds_target_capacity": "e07b9421c6f3f9edc504893442921a7a1bfa6468cd1788457de7c16f3a2de114",
+    "false_guarded_increment_exceeds_target_limit": "4197d3b5b1fff30d5dfe8084f81659ea857b6e7b2b6ea826bb0cd8e6bfdc2fc3",
+    "push_growth_capacity_covers_needed": "2216c4cec7ab2ad27892474e60371777b15e4e548996d9f9266a64a72b60ab0e",
+    "false_push_growth_capacity_may_fall_short": "bb70caee9dd58586ed7cffe67dbbd456d0be0896f655e7f682863f057794ba9f",
+    "push_growth_overflow_fallback_selects_needed": "bd26da2b2a4a0a24f23dcc927c9ba8e17744f9e04c5cd58a41ebe8e89a0cb457",
+    "false_push_growth_overflow_keeps_wrapped_double": "aca0b5605a31db1f742ab30ec5b3d81fe14a1c3fc65cfd5304e87c28d4dd244f",
+    "empty_push_growth_keeps_seed_when_it_fits": "1cb199e3ef23359940d21bbf62c0b9e5fd6ef9d19f930268ee35be5fa512d4fa",
+    "empty_push_growth_uses_needed_above_seed": "3ceacf01a12e39ff1d12a3bfb0f742d3ed8fba13afa76b912bdcc3c96b0887b6",
+    "append_growth_step_increases_capacity": "8c034f07afee40b41a3f955e73622f6110f2ebc55a9c7e6ede6b68969a0c8102",
+    "append_growth_overflow_step_meets_bound": "6c549cf093726e100fdfe2c60422190aefac60b1367482bc0d14975eac738786",
+    "false_empty_push_growth_seed_is_not_eight": "739a89856ccdecf4d06711619a0715c648061f14e1eca1c991332d4219b3ecbf",
 }
 
 
@@ -84,6 +95,22 @@ ordered(container, "emit_darray_push", (
     "indices: mutable darray[LLVMValueRef] = [count]",
     'slot: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items, indices_pointer, 1, "push.slot")',
     "_ = LLVMBuildStore(builder, pushed_value, slot)",
+))
+ordered(container, "emit_darray_grow_body", (
+    "if append_policy:",
+    "if emit_overflow_binary(current, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder, structs.target.target_pointer_bits) is step_doubled:",
+    'step_safe: LLVMValueRef = LLVMBuildSelect(builder, step_doubled.overflow, needed, step_doubled.value, "grow.cap.double.safe")',
+    'step_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, current, LLVMConstInt(int64_type, 0, 0), "grow.cap.zero")',
+    'step_next: LLVMValueRef = LLVMBuildSelect(builder, step_empty, LLVMConstInt(int64_type, 8, 0), step_safe, "grow.cap.base")',
+    'LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 36, step_next, needed, "grow.cap.short"), step_block, sized_block)',
+))
+ordered(container, "emit_darray_grow_body", (
+    "if emit_overflow_binary(capacity, LLVMConstInt(int64_type, 2, 0), true, m, ctx, builder, structs.target.target_pointer_bits) is doubled_result:",
+    'doubled: LLVMValueRef = LLVMBuildSelect(builder, doubled_result.overflow, needed, doubled_result.value, "push.cap.double.safe")',
+    'is_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, capacity, LLVMConstInt(int64_type, 0, 0), "push.cap.zero")',
+    'base: LLVMValueRef = LLVMBuildSelect(builder, is_empty, LLVMConstInt(int64_type, 8, 0), doubled, "push.cap.base")',
+    'too_small: LLVMValueRef = LLVMBuildICmp(builder, 36, base, needed, "push.cap.lt")',
+    'new_capacity <- LLVMBuildSelect(builder, too_small, needed, base, "push.cap.new")',
 ))
 ordered(prereserve, "emit_loop_prereserve", (
     "if bound is Expr.IntLit(limit, _) and limit > 0 and limit.u64() <= PRERESERVE_CAP:",

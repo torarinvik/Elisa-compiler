@@ -36,6 +36,10 @@ EXPECTED_SIDE_TABLE_FIELDS = {
     "FieldInit": tuple("name:sview value:Expr is_copy_base:bool".split()),
     "StaticEffectCandidate": tuple("effect_type:Expr callee:sview captures:darray[Expr] effect_identity_id:u32 handler_identity_id:u32 callee_owner:sview".split()),
 }
+CHV_FLOW_NAMES = (
+    "flow", "then_flow", "else_flow", "merged_flow", "arm_flow", "guarded_flow",
+    "entry_flow", "recovery_flow", "comprehension_flow", "lambda_flow", "loop_flow",
+)
 
 
 def compact(text: str) -> str:
@@ -112,6 +116,14 @@ def match_arm_body(source: str, match_line: str, arm_text: str) -> str | None:
     return "\n".join(lines[arm_index + 1:end])
 
 
+def source_route(line: str) -> str:
+    # Explicit `&flow` and the implicit mutable-place borrow identify the same
+    # CHVViewFlow row for this source-bound dataflow check.
+    for flow_name in CHV_FLOW_NAMES:
+        line = re.sub(rf"([,(])(\s*)&{flow_name}\b", rf"\1\2{flow_name}", line)
+    return line.strip()
+
+
 def direct_child(source: str, parent: str, child: str, occurrence: int = 0) -> bool:
     lines = source.splitlines()
     parents = [index for index, line in enumerate(lines) if line.strip() == parent]
@@ -126,7 +138,7 @@ def direct_child(source: str, parent: str, child: str, occurrence: int = 0) -> b
             break
         end += 1
     children = [index for index in range(parent_index + 1, end)
-                if (lines[index].strip() == child or lines[index].strip().startswith(child))
+                if (source_route(lines[index]) == child or source_route(lines[index]).startswith(child))
                 and len(lines[index]) - len(lines[index].lstrip(" \t")) == parent_indent + 4]
     return len(children) == 1
 
@@ -153,7 +165,7 @@ def wrap_direct_child_block(source: str, parent: str, child: str, occurrence: in
             break
         end += 1
     children = [index for index in range(parent_index + 1, end)
-                if (lines[index].strip() == child or lines[index].strip().startswith(child))
+                if (source_route(lines[index]) == child or source_route(lines[index]).startswith(child))
                 and len(lines[index]) - len(lines[index].lstrip(" \t")) == parent_indent + 4]
     if len(children) != 1:
         return source
@@ -548,7 +560,7 @@ CALLABLE_VIEW_RESULT_EDGES = (
 )
 
 CALL_RESULT_VIEW_TAINT_EDGES = (
-    ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: bool = chv_is_owned_view(expression, flow, 0)"),
+    ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: mutable bool = chv_is_owned_view(expression, flow, 0)"),
     ("for argument in arguments |table| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Call(callee, arguments, _, _):", "flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view"),
 )
@@ -646,11 +658,12 @@ SUMMARY_CALL_EDGES = (
 )
 
 OVERLOAD_SUMMARY_EDGES = (
-    ("for function in functions |summary, summarised|:", "match function:"),
-    ("Decl.Func(function_name, function_parameters, _, _, _, _, _):", "for parameter in function_parameters |position, writable_found, summary|:"),
-    ("Decl.Func(function_name, function_parameters, _, _, _, _, _):", "summarised.push(function) if writable_found and function_parameters.count > 1"),
-    ("for function in summarised |more_rows, summary|:", "match function:"),
-    ("Decl.Func(function_name, function_parameters, _, function_body, _, _, _):", "more_rows <- true if (sts_summarise_function(function_name, function_parameters, function_body, summary) can Global{Read,Write})"),
+    ("for function in functions |summary, summarised, summarised_unreadable, function_owners, table|:", "match function:"),
+    ("match function:", "Decl.Func(function_name, function_parameters, _, function_body, _, _, function_pos):"),
+    ("if writable_found and function_parameters.count > 1:", "summarised.push(function)"),
+    ("for function_index in 0..<summarised.count |function_index, more_rows, summary, summarised, summarised_unreadable, function_owners, reference_sites, table|:", "match summarised[function_index]:"),
+    ("match summarised[function_index]:", "Decl.Func(function_name, function_parameters, _, function_body, _, _, _):"),
+    ("Decl.Func(function_name, function_parameters, _, function_body, _, _, _):", "more_rows <- true if (sts_summarise_function(function_name, function_parameters, function_body, summarised_unreadable[function_index], function_owners[function_index], reference_sites, table, summary) can Global{Read,Write})"),
 )
 
 CALLEE_DISPATCH_EDGES = (
@@ -1267,7 +1280,7 @@ if "if owned.count > 0" in compact_code(function_section(holder_text, "chv_walk_
 holder_entry_source = function_section(holder_text, "check_call_holder_view_store")
 if "returnifsummary.writable_function.count==0" in compact_code(holder_entry_source):
     raise SystemExit("unknown-call holder checks must run even when no named callee summary rows exist")
-holder_summary_setup = compact("summary: StoreThroughSummary = chv_build_summary(file.top_decls, holders) can Global{Read,Write}")
+holder_summary_setup = compact("summary: StoreThroughSummary = chv_build_summary(file.top_decls, holders, reference_sites, table) can Global{Read,Write}")
 holder_walk_setup = compact("table <- chv_walk_declarations(file.top_decls, summary, table)")
 if holder_summary_setup not in compact_code(holder_entry_source) or holder_walk_setup not in compact_code(holder_entry_source) or compact_code(holder_entry_source).find(holder_walk_setup) < compact_code(holder_entry_source).find(holder_summary_setup):
     raise SystemExit("holder-view call walk is no longer reached after summary construction")

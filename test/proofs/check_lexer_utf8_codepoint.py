@@ -298,8 +298,7 @@ def check_decoder(body: str, *, indices: tuple[str, ...], lead_guard: str,
         "-1 return if lexer.position >= lexer.source_length",
         f"-1 return if remaining <= {indices[-1]}",
         lead_guard,
-        *continuations,
-        *special_guards,
+        "return -1 if:",
         helper_call,
     )
     observed_returns = tuple(
@@ -308,6 +307,19 @@ def check_decoder(body: str, *, indices: tuple[str, ...], lead_guard: str,
     )
     if observed_returns != expected_returns:
         raise SystemExit("UTF-8 decoder has an unexpected or unguarded return")
+    lines = body.splitlines()
+    guard_index = next((index for index, line in enumerate(lines) if line.strip() == "return -1 if:"), -1)
+    if guard_index < 0:
+        raise SystemExit("UTF-8 decoder is missing its invalid-byte guard block")
+    guard_indent = len(lines[guard_index]) - len(lines[guard_index].lstrip(" \t"))
+    guard_conditions = []
+    for line in lines[guard_index + 1:]:
+        if line.strip() and len(line) - len(line.lstrip(" \t")) <= guard_indent:
+            break
+        if line.strip():
+            guard_conditions.append(line.strip())
+    if tuple(guard_conditions) != (*continuations, *special_guards):
+        raise SystemExit("UTF-8 decoder invalid-byte guard expressions changed")
     if observed_returns[-1] != helper_call:
         raise SystemExit("UTF-8 helper call must be the decoder's final return")
 
@@ -318,6 +330,7 @@ def check_decoder(body: str, *, indices: tuple[str, ...], lead_guard: str,
         "first: u8 = lexer.source[lexer.position]",
         lead_guard,
         *[f"lexer.source[lexer.position + {index}]" for index in indices],
+        "return -1 if:",
         *continuations,
         *special_guards,
         helper_call,
@@ -335,10 +348,10 @@ check_decoder(
     three,
     indices=("second_byte_index", "third_byte_index"),
     lead_guard="-1 return if first.i64() < UTF8_THREE_BYTE_LEAD_MIN or first.i64() > UTF8_THREE_BYTE_LEAD_MAX",
-    continuations=("-1 return if second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX",),
+    continuations=("second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX",),
     special_guards=(
-        "-1 return if first.i64() == UTF8_THREE_BYTE_LEAD_MIN and second.i64() < UTF8_E0_SECOND_MIN",
-        "-1 return if first.i64() == UTF8_SURROGATE_LEAD and second.i64() > UTF8_ED_SECOND_MAX",
+        "first.i64() == UTF8_THREE_BYTE_LEAD_MIN and second.i64() < UTF8_E0_SECOND_MIN",
+        "first.i64() == UTF8_SURROGATE_LEAD and second.i64() > UTF8_ED_SECOND_MAX",
     ),
     helper_call="return lexer_decode_utf8_three(first.i64() - UTF8_THREE_BYTE_LEAD_MIN, second.i64() - UTF8_CONTINUATION_MIN, third.i64() - UTF8_CONTINUATION_MIN).int()",
 )
@@ -347,11 +360,11 @@ check_decoder(
     indices=("second_byte_index", "third_byte_index", "fourth_byte_index"),
     lead_guard="-1 return if first.i64() < UTF8_FOUR_BYTE_LEAD_MIN or first.i64() > UTF8_FOUR_BYTE_LEAD_MAX",
     continuations=(
-        "-1 return if second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX or fourth.i64() < UTF8_CONTINUATION_MIN or fourth.i64() > UTF8_CONTINUATION_MAX",
+        "second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX or fourth.i64() < UTF8_CONTINUATION_MIN or fourth.i64() > UTF8_CONTINUATION_MAX",
     ),
     special_guards=(
-        "-1 return if first.i64() == UTF8_FOUR_BYTE_LEAD_MIN and second.i64() < UTF8_F0_SECOND_MIN",
-        "-1 return if first.i64() == UTF8_FOUR_BYTE_LEAD_MAX and second.i64() > UTF8_F4_SECOND_MAX",
+        "first.i64() == UTF8_FOUR_BYTE_LEAD_MIN and second.i64() < UTF8_F0_SECOND_MIN",
+        "first.i64() == UTF8_FOUR_BYTE_LEAD_MAX and second.i64() > UTF8_F4_SECOND_MAX",
     ),
     helper_call="return lexer_decode_utf8_four(first.i64() - UTF8_FOUR_BYTE_LEAD_MIN, second.i64() - UTF8_CONTINUATION_MIN, third.i64() - UTF8_CONTINUATION_MIN, fourth.i64() - UTF8_CONTINUATION_MIN).int()",
 )
@@ -740,9 +753,10 @@ if "def an_unchecked_ed_a0_sequence_decodes_to_a_surrogate() -> bool:" not in th
 four_byte_source = function_body(core_text, "four_byte_codepoint_at_cursor", "is_utf8_continuation")
 four_byte_source_guards = (
     "-1 return if first.i64() < UTF8_FOUR_BYTE_LEAD_MIN or first.i64() > UTF8_FOUR_BYTE_LEAD_MAX",
-    "-1 return if second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX or fourth.i64() < UTF8_CONTINUATION_MIN or fourth.i64() > UTF8_CONTINUATION_MAX",
-    "-1 return if first.i64() == UTF8_FOUR_BYTE_LEAD_MIN and second.i64() < UTF8_F0_SECOND_MIN",
-    "-1 return if first.i64() == UTF8_FOUR_BYTE_LEAD_MAX and second.i64() > UTF8_F4_SECOND_MAX",
+    "return -1 if:",
+    "second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX or fourth.i64() < UTF8_CONTINUATION_MIN or fourth.i64() > UTF8_CONTINUATION_MAX",
+    "first.i64() == UTF8_FOUR_BYTE_LEAD_MIN and second.i64() < UTF8_F0_SECOND_MIN",
+    "first.i64() == UTF8_FOUR_BYTE_LEAD_MAX and second.i64() > UTF8_F4_SECOND_MAX",
 )
 if any(four_byte_source.count(fragment) != 1 for fragment in four_byte_source_guards):
     raise SystemExit("four-byte scalar proof's byte ranges or F0/F4 boundaries no longer match the production decoder")

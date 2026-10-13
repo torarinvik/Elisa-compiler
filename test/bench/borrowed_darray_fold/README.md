@@ -11,41 +11,62 @@ Run from the repository root. Use a current Stage1 product for Elisa; LLVM IR ou
 older product does not validate current source lowering.
 
 ```sh
+OUT=build/ir-probes/borrowed-darray-fold-current-20261013
+mkdir -p "$OUT"
+
 ELISA_STAGE1_BIN=bin/elisac-stage1 \
   scripts/elisac_stage1.sh -emit llvm -O3 -foverflow=wrap \
-  -o /tmp/borrowed-darray-elisa.ll test/bench/borrowed_darray_fold/sum.elisa
+  -o "$OUT/borrowed-darray-elisa.ll" test/bench/borrowed_darray_fold/sum.elisa
 ELISA_STAGE1_BIN=bin/elisac-stage1 \
   scripts/elisac_stage1.sh -emit llvm -O3 -foverflow=wrap \
-  -o /tmp/borrowed-darray-interleave8.ll test/bench/borrowed_darray_fold/sum_interleave8.elisa
+  -o "$OUT/borrowed-darray-interleave8.ll" test/bench/borrowed_darray_fold/sum_interleave8.elisa
+ELISA_STAGE1_BIN=bin/elisac-stage1 \
+  scripts/elisac_stage1.sh -emit llvm -O3 -foverflow=wrap \
+  -o "$OUT/borrowed-darray-interleave16.ll" test/bench/borrowed_darray_fold/sum_interleave16.elisa
+ELISA_STAGE1_BIN=bin/elisac-stage1 \
+  scripts/elisac_stage1.sh -emit llvm -O3 -foverflow=wrap \
+  -o "$OUT/borrowed-darray-darray-interleave8.ll" test/bench/borrowed_darray_fold/sum_darray_interleave8.elisa
+ELISA_STAGE1_BIN=bin/elisac-stage1 \
+  scripts/elisac_stage1.sh -emit llvm -O3 -foverflow=wrap \
+  -o "$OUT/borrowed-darray-darray-interleave16.ll" test/bench/borrowed_darray_fold/sum_darray_interleave16.elisa
 
 rustc test/bench/borrowed_darray_fold/sum.rs --edition=2021 \
   -C opt-level=3 -C target-cpu=native -C overflow-checks=off \
-  --emit=llvm-ir=/tmp/borrowed-darray-rust.ll
+  --emit=llvm-ir="$OUT/borrowed-darray-rust.ll"
 rustc test/bench/borrowed_darray_fold/sum.rs --edition=2021 \
   -C opt-level=3 -C target-cpu=native -C overflow-checks=off \
-  --emit=asm=/tmp/borrowed-darray-rust.s
+  --emit=asm="$OUT/borrowed-darray-rust.s"
 
 zig build-exe test/bench/borrowed_darray_fold/sum.zig -O ReleaseFast \
-  -mcpu=native -lc -femit-llvm-ir=/tmp/borrowed-darray-zig.ll \
-  -femit-asm=/tmp/borrowed-darray-zig.s \
-  -femit-bin=/tmp/borrowed-darray-zig
+  -mcpu=native -lc -femit-llvm-ir="$OUT/borrowed-darray-zig.ll" \
+  -femit-asm="$OUT/borrowed-darray-zig.s" \
+  -femit-bin="$OUT/borrowed-darray-zig"
 ```
+
+Keep compiler logs, benchmark output, and timing captures under the same ignored `$OUT` directory.
 
 The cross-language flags correspond to the fast profile used by
 `test/bench/codegen_perf/cross_language.sh`: Elisa O3 with wrapping arithmetic, Rust O3 with
 native CPU features and overflow checks off, and Zig ReleaseFast for the native CPU. Capture
 compiler versions, host CPU, repository revision, and source hashes alongside any later IR or
-timing result. The five files in this directory are the complete probe inputs; `SHA256SUMS`
-pins their contents. Timing requires a separate qualified benchmark run with equivalent
+timing result. All source fixtures are the probe inputs; `SHA256SUMS` pins them and this README. Timing requires a separate qualified benchmark run with equivalent
 correctness preflight and host controls.
 
 The baseline Elisa function takes `darray[i64]&` explicitly and iterates with `for value in xs`;
-Rust uses `&[i64]` and `for &value in xs`; Zig uses `[]const i64` and `for (xs)`. The optional
-`sum_interleave8.elisa` keeps the same data and checksum but spells the reduction as an indexed
-ascending range with `by interleave(8)`. It tests the current LLVM loop hint against the baseline;
-8 is a candidate because synthetic LLVM shows it can target 16 `i64`s per backedge, matching
-Zig's native loop width. This remains a code-shape hypothesis until current Stage1 output is
-available. Main's allocation and fill stay outside the fold helper.
+Rust uses `&[i64]` and `for &value in xs`; Zig uses `[]const i64` and `for (xs)`. The optional `sum_interleave8.elisa` and `sum_interleave16.elisa` keep the same data and checksum
+but spell the reduction as an indexed ascending range with the corresponding LLVM loop hint. The
+`sum_darray_interleave8.elisa` and `sum_darray_interleave16.elisa` variants apply the hint directly
+to `for value in xs`, exercising the borrowed DArray latch. Compare these paths separately: the
+range variants test indexed lowering, while the direct variants test the new DArray loop metadata.
+A separate manual-metadata experiment on a minimized wrapping reduction produced 16 and 32
+`i64` values per backedge for factors 8 and 16 respectively. It was an LLVM counterfactual, not
+output from the new source syntax or a current Stage1 compiler. Factor 8 matches Zig's native
+ReleaseFast loop width; factor 16 matches the wider Zig loop after the common LLVM optimization
+pipeline. An isolated LLVM-MCA model gives factor 16 slightly fewer model cycles per element
+than factor 8 (0.181 vs. 0.200), but factor 16 adds callee-save work in the standalone helper,
+and MCA is not a runtime measurement. Keep both factors as measurement candidates; do not infer
+a speedup from loop width or the model. Current Stage1 output is still needed to verify the hint
+path. Main's allocation and fill stay outside the fold helper.
 
 ## Probe provenance
 

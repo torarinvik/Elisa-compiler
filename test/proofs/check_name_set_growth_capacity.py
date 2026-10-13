@@ -88,9 +88,23 @@ positive_names = {
     "initial_capacity_covers_small_sets",
     "add_preserves_count_for_duplicate_name",
     "a_fresh_name_increments_the_count_once",
+    "name_set_capacity_stays_initial_through_eighth_entry",
+    "name_set_ninth_entry_doubles_initial_capacity",
+    "name_set_probe_step_stays_in_initial_table",
+    "ninth_name_rehash_keeps_twenty_three_slots_empty",
 }
 if not positive_names <= set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", positive_text)):
     raise SystemExit("NameSet capacity proof is missing a required theorem")
+proof_hashes = {
+    "name_set_capacity_stays_initial_through_eighth_entry": "96c3a518f6499846828e4905264d8d4126f08ec6b25f82523cf2e8189c5d133a",
+    "name_set_ninth_entry_doubles_initial_capacity": "f7505f7756bafc685ad212b1823e241d1338fb5f09c6150da2e68f606f9290f2",
+    "name_set_probe_step_stays_in_initial_table": "cb109ff96e03081d270b95df01a018c02b3aa312781fc7ee82aa3af59baae7fc",
+    "ninth_name_rehash_keeps_twenty_three_slots_empty": "977a1b5a2ff790412df624818a49e0919269c5c0a7ba04a7e23afa6ce2f096b8",
+}
+for proof_name, expected_hash in proof_hashes.items():
+    digest = hashlib.sha256(compact(function_section(positive_text, proof_name)).encode()).hexdigest()
+    if digest != expected_hash:
+        raise SystemExit(f"NameSet boundary theorem {proof_name} changed since source binding")
 if "def exact_growth_threshold_leaves_an_extra_empty_slot(" not in negative_text:
     raise SystemExit("NameSet boundary counterexample is missing")
 if "name_count <= 7" not in positive_text:
