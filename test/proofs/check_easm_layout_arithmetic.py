@@ -28,10 +28,19 @@ if not __debug__:
     raise SystemExit("run without Python -O")
 if 'include "easm_layout_arithmetic.elisa"' not in ENV.read_text():
     raise SystemExit("backend environment no longer imports the proved EASM layout arithmetic")
+if ENV.read_text().index('include "easm_memstate_domain.elisa"') > ENV.read_text().index('include "easm_layout_arithmetic.elisa"'):
+    raise SystemExit("EASM layout arithmetic is imported before the shared greatest-bound domain")
 if ENV.read_text().index('include "easm_layout_arithmetic.elisa"') > ENV.read_text().index('include "easm_model.elisa"'):
     raise SystemExit("EASM layout arithmetic is imported after the model that uses it")
 if 'include "../../src/backend/easm_layout_arithmetic.elisa"' not in POSITIVE.read_text():
     raise SystemExit("proof no longer imports the production layout arithmetic")
+for proof_source in (POSITIVE, NEGATIVE):
+    proof_text = proof_source.read_text()
+    domain_import = 'include "../../src/backend/easm_memstate_domain.elisa"'
+    layout_import = 'include "../../src/backend/easm_layout_arithmetic.elisa"'
+    if domain_import not in proof_text or layout_import not in proof_text or \
+            proof_text.index(domain_import) > proof_text.index(layout_import):
+        raise SystemExit(f"{proof_source.name} must import the shared max domain before layout arithmetic")
 
 provenance = PROVENANCE.read_text()
 layout_body = provenance.split("def layout_size_checked(layout: Layout)", 1)[1].split(
@@ -59,10 +68,19 @@ required_extent_fragments = (
     "return (false, 0) if offset < 0 or width < 0",
     "return (false, 0) if width > I64_MAX - offset",
     "return (true, offset + width)",
+    "ensure offset >= 0 and width >= 0 implies result.valid == (width <= I64_MAX - offset)",
+    "ensure result.valid implies result.value == offset + width",
     "ensure not result.valid implies result.value == 0",
 )
 if not all(fragment in helper for fragment in required_extent_fragments):
     raise SystemExit("EASM field extent helper no longer checks representability before addition")
+if "return EasmMemStateDomain::greatest_bound(current, candidate)" not in helper:
+    raise SystemExit("EASM layout bound no longer delegates to the proved greatest-bound domain")
+max_body = helper.split("def keep_larger(current: i64, candidate: i64)", 1)[1].split(
+    "# Fold one checked field extent", 1
+)[0]
+if "ensure result >= current" not in max_body or "ensure result >= candidate" not in max_body:
+    raise SystemExit("EASM layout maximum no longer exports both upper-bound guarantees")
 required_accumulator_fragments = (
     "def include_field_extent(current: i64, offset: i64, width: i64)",
     "ensure result.valid == field_extent_checked(offset, width).valid",
@@ -200,26 +218,34 @@ expected = {
     "nonpositive_size_and_stride_have_no_declared_extent",
     "max_extent_keeps_a_bound_at_least_as_large_as_each_input",
     "max_extent_is_one_of_the_two_inputs",
+    "layout_max_uses_the_proved_greatest_bound",
     "valid_field_extent_is_nonnegative",
     "ordinary_field_extent_is_exact",
     "exact_i64_max_field_extent_is_valid",
+    "nonnegative_field_extent_matches_i64_representability",
+    "negative_field_extent_inputs_are_rejected",
     "i64_max_offset_plus_u64_width_is_rejected",
     "i64_max_minus_three_offset_plus_u64_width_is_rejected",
     "successful_field_accumulation_dominates_both_inputs",
+    "successful_field_accumulation_is_the_least_common_upper_bound",
     "maximum_offset_overflow_is_rejected_by_accumulation",
 }
 assert expected <= verified
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-assert negative["summary"]["proven"] + 3 == negative["summary"]["obligations"]
+assert negative["summary"]["proven"] + 5 == negative["summary"]["obligations"]
 assert [(finding["kind"], finding["name"]) for finding in negative["findings"]] == [
     ("ensure-unproven", "stride_overrides_a_positive_explicit_size"),
     ("ensure-unproven", "overflowing_field_extent_is_accepted"),
+    ("ensure-unproven", "first_unrepresentable_field_extent_is_accepted"),
     ("ensure-unproven", "a_valid_small_field_can_shrink_the_existing_layout_bound"),
+    ("ensure-unproven", "a_common_upper_bound_can_be_smaller_than_a_successful_field_accumulation"),
 ]
 assert {"stride_overrides_a_positive_explicit_size", "overflowing_field_extent_is_accepted",
-        "a_valid_small_field_can_shrink_the_existing_layout_bound"}.isdisjoint({
+        "first_unrepresentable_field_extent_is_accepted",
+        "a_valid_small_field_can_shrink_the_existing_layout_bound",
+        "a_common_upper_bound_can_be_smaller_than_a_successful_field_accumulation"}.isdisjoint({
     row["name"] for row in negative["declaration_details"] if row.get("verified")
 })
 
@@ -228,10 +254,12 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "EASM layout-size precedence, overflow-checked extents, and max-bound accumulation",
+    "scope": "EASM layout-size precedence, exact checked extents, and shared least-upper-bound accumulation",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": ["stride_overrides_a_positive_explicit_size", "overflowing_field_extent_is_accepted",
-                              "a_valid_small_field_can_shrink_the_existing_layout_bound"],
+                              "first_unrepresentable_field_extent_is_accepted",
+                              "a_valid_small_field_can_shrink_the_existing_layout_bound",
+                              "a_common_upper_bound_can_be_smaller_than_a_successful_field_accumulation"],
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
     "proof_revision": manifest["proof"].get("head"),
     "compiler_revision": manifest["compiler"].get("source_revision"),
