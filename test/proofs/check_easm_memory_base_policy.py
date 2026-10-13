@@ -210,7 +210,7 @@ if "EasmTextScan::contains_memory_address_delimiter" not in memory_operand or \
     raise SystemExit("bracketed operands are no longer source-classified as memory by the verifier")
 
 bracket_gate = re.search(
-    r'(?m)^[ \t]*bracketed: bool = easm_find\(operand, "\["\) < sview_len\(operand\)\n'
+    r'(?m)^[ \t]*bracketed: bool = easm_find\(operand, "\["\) < operand\.len\n'
     r'(?P<indent>[ \t]*)if EasmMemoryBasePolicy::rejects_bracket_address_form\(bracketed\):\n'
     r'(?P=indent)[ \t]+issues\.push\(Issue\{severity: Severity\.Error, code: "unsupported-bracket-address"[^\n]*\}\)\n'
     r'(?P=indent)[ \t]+continue', roles)
