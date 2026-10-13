@@ -27,7 +27,28 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    for line in source.splitlines():
+        for character in line:
+            if in_string:
+                output.append(character)
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == "#":
+                break
+            if character == '"':
+                in_string = True
+                output.append(character)
+            elif not character.isspace():
+                output.append(character)
+    return "".join(output)
 
 
 def function_section(source: str, name: str) -> str:
@@ -43,10 +64,15 @@ def function_section(source: str, name: str) -> str:
 
 source_text = SOURCE.read_text()
 source_compact = compact(source_text)
-if 'include "easm_text_scan.elisa"' not in ENV.read_text():
+environment_text = ENV.read_text()
+if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
+if environment_text.index('include "easm_text_scan.elisa"') > environment_text.index('include "easm_verify_provenance.elisa"'):
+    raise SystemExit("backend environment imports the EASM trim wrapper before its verified scanner")
 if "returnEasmTextScan::first_space(text).usize()" not in compact(function_section(PARSER.read_text(), "easm_first_space")):
     raise SystemExit("production EASM whitespace helper no longer delegates to the verified scanner")
+if "returnEasmTextScan::trim(text)" not in compact(function_section(PROVENANCE.read_text(), "easm_trim")):
+    raise SystemExit("production EASM trim helper no longer delegates to the verified trim scanner")
 for caller in (PARSER.read_text(), EASM_PARSE.read_text()):
     if "easm_first_space(" not in caller:
         raise SystemExit("an EASM parser source lost its use of the verified whitespace helper")
@@ -71,9 +97,47 @@ required_source = (
     "invariantforallprefix_indexin0..<index:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=ASCII_SPACEandtext[prefix_index]!=ASCII_TAB)",
     "returnindexiftext[index]==ASCII_SPACEortext[index]==ASCII_TAB",
     "index<-index+SIGNED_INDEX_STEP",
+    "deftrim_bounds(text:sview)->(start:usize,end:usize):",
+    "ensureresult.start<=result.end",
+    "ensureresult.end<=sview_len(text)",
+    "forallprefix_indexin0..<result.start:sview_at(text,prefix_index)==ASCII_SPACEorsview_at(text,prefix_index)==ASCII_TAB",
+    "forallsuffix_indexinresult.end..<sview_len(text):sview_at(text,suffix_index)==ASCII_SPACEorsview_at(text,suffix_index)==ASCII_TAB",
+    "result.start==result.endor(",
+    "ensureresult.start!=result.endorresult.start==sview_len(text)",
+    "whilefirst<lastand(sview_at(text,first)==ASCII_SPACEorsview_at(text,first)==ASCII_TAB)",
+    "decreaseslast-first",
+    "invariantfirst<=last",
+    "invariantlast<=text_length",
+    "invariantforallprefix_indexin0..<first:sview_at(text,prefix_index)==ASCII_SPACEorsview_at(text,prefix_index)==ASCII_TAB",
+    "assertfirst==lastor(sview_at(text,first)!=ASCII_SPACEandsview_at(text,first)!=ASCII_TAB)",
+    "whilelast>firstand(sview_at(text,last-BYTE_INDEX_STEP)==ASCII_SPACEorsview_at(text,last-BYTE_INDEX_STEP)==ASCII_TAB)",
+    "invariantforallsuffix_indexinlast..<text_length:sview_at(text,suffix_index)==ASCII_SPACEorsview_at(text,suffix_index)==ASCII_TAB",
+    "assertlast==firstor(sview_at(text,last-BYTE_INDEX_STEP)!=ASCII_SPACEandsview_at(text,last-BYTE_INDEX_STEP)!=ASCII_TAB)",
+    "return(first,last)",
+    "defstarts_with(text:sview,prefix:sview)->bool:",
+    "ensureresultimpliessview_len(prefix)<=sview_len(text)",
+    "forallprefix_indexin0..<sview_len(prefix):prefix_index>=sview_len(text)orsview_at(text,prefix_index)==sview_at(prefix,prefix_index)",
+    "(sview_len(prefix)<=sview_len(text)and(forallprefix_indexin0..<sview_len(prefix):",
+    "text_length:usize=sview_len(text)",
+    "prefix_length:usize=sview_len(prefix)",
+    "returnfalseifprefix_length>text_length",
+    "whileindex<prefix_length|index,text,prefix,prefix_length|",
+    "decreasesprefix_length-index",
+    "invariantindex<=prefix_length",
+    "invariantforallmatched_indexin0..<index:sview_at(text,matched_index)==sview_at(prefix,matched_index)",
+    "returnfalseifsview_at(text,index)!=sview_at(prefix,index)",
+    "returntrue",
+    "defequal(a:sview,b:sview)->bool:",
+    "ensureresultimpliessview_len(a)==sview_len(b)",
+    "forallindexin0..<sview_len(a):index>=sview_len(b)orsview_at(a,index)==sview_at(b,index)",
+    "(sview_len(a)==sview_len(b)and(forallindexin0..<sview_len(a):",
+    "returnsview_len(a)==sview_len(b)andstarts_with(a,b)",
+    "deftrim(text:sview)->sview:",
+    "bounds:(start:usize,end:usize)=trim_bounds(text)",
+    "returntext[bounds.start:bounds.end]",
 )
 if not all(fragment in source_compact for fragment in required_source):
-    raise SystemExit("production EASM scanner lost its first-match contract or loop invariant")
+    raise SystemExit("production EASM scanner lost a source contract or loop invariant")
 expected_find = """
 def find(text: sview, needle: sview) -> usize:
     ensure result <= sview_len(text)
@@ -118,6 +182,34 @@ def contains_memory_address_delimiter(has_parenthesis: bool, has_square_bracket:
 """
 if compact(function_section(source_text, "contains_memory_address_delimiter")) != compact(expected_memory_delimiter):
     raise SystemExit("production EASM memory-delimiter classifier no longer matches its proved boolean policy")
+expected_trim = """
+def trim(text: sview) -> sview:
+    bounds: (start: usize, end: usize) = trim_bounds(text)
+    return text[bounds.start:bounds.end]
+"""
+if compact(function_section(source_text, "trim")) != compact(expected_trim):
+    raise SystemExit("production EASM trim no longer returns exactly the verified half-open span")
+expected_easm_trim = """
+def easm_trim(text: sview) -> sview:
+    ensure result == EasmTextScan::trim(text)
+    return EasmTextScan::trim(text)
+"""
+if compact(function_section(PROVENANCE.read_text(), "easm_trim")) != compact(expected_easm_trim):
+    raise SystemExit("production EASM trim wrapper no longer delegates to the source-linked implementation")
+expected_easm_starts = """
+def easm_starts(text: sview, prefix: sview) -> bool:
+    ensure result == EasmTextScan::starts_with(text, prefix)
+    return EasmTextScan::starts_with(text, prefix)
+"""
+if compact(function_section(PROVENANCE.read_text(), "easm_starts")) != compact(expected_easm_starts):
+    raise SystemExit("production EASM prefix helper no longer delegates to the source-linked scanner")
+expected_easm_equal = """
+def easm_equal(a: sview, b: sview) -> bool:
+    ensure result == EasmTextScan::equal(a, b)
+    return EasmTextScan::equal(a, b)
+"""
+if compact(function_section(PROVENANCE.read_text(), "easm_equal")) != compact(expected_easm_equal):
+    raise SystemExit("production EASM equality helper no longer delegates to the source-linked scanner")
 if 'include "../../src/backend/easm_text_scan.elisa"' not in POSITIVE.read_text():
     raise SystemExit("positive proof no longer includes the production EASM scanner")
 if "returnEasmTextScan::find(text,needle)" not in compact(function_section(PARSER.read_text(), "easm_find")):
@@ -141,14 +233,42 @@ positive_names = {
     "find_returns_text_length_when_absent",
     "find_returns_text_length_for_an_empty_needle",
     "find_accepts_a_match_at_the_last_legal_start",
+    "starts_with_contract_holds",
+    "starts_with_accepts_an_exact_prefix",
+    "starts_with_accepts_an_exact_full_view",
+    "starts_with_accepts_the_empty_prefix",
+    "starts_with_rejects_a_longer_prefix",
+    "starts_with_rejects_a_late_byte_mismatch",
+    "equal_contract_holds",
+    "equal_accepts_identical_instruction_text",
+    "equal_accepts_two_empty_views",
+    "equal_rejects_a_different_same_length_mnemonic",
+    "equal_rejects_a_shared_prefix_with_different_tail",
+    "equal_rejects_a_proper_prefix",
     "first_space_contract_holds",
+    "trim_bounds_contract_holds",
+    "trim_returns_the_exact_maximal_source_span",
+    "trim_removes_only_outer_spaces_and_tabs",
+    "trimming_all_whitespace_returns_the_empty_end_span",
+    "trimming_a_clean_view_preserves_the_whole_span",
 }
 negative_names = {
     "false_claim_scanner_skips_the_first_separator",
+    "false_claim_nonprefix_matches",
+    "false_claim_longer_prefix_matches",
+    "false_claim_late_prefix_mismatch_is_ignored",
+    "false_claim_empty_prefix_does_not_match",
+    "false_claim_different_mnemonics_are_equal",
+    "false_claim_a_proper_prefix_is_equal",
+    "false_claim_equal_length_text_ignores_the_last_byte",
     "false_claim_find_returns_a_later_duplicate_match",
     "false_claim_missing_needle_returns_zero",
     "false_claim_empty_needle_returns_zero",
     "false_claim_delimiter_free_operand_is_memory",
+    "false_claim_trim_keeps_a_leading_space",
+    "false_claim_trim_keeps_a_trailing_tab",
+    "false_claim_trim_discards_internal_whitespace",
+    "false_claim_trim_all_whitespace_returns_start",
 }
 if set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", POSITIVE.read_text())) != positive_names:
     raise SystemExit("positive EASM scanner proof inventory changed")
@@ -166,6 +286,26 @@ required_positive_claims = (
     'returnEasmTextScan::find("abc","z")==3',
     'returnEasmTextScan::find("abc","")==3',
     'returnEasmTextScan::find("ab","b")==1',
+    "defstarts_with_contract_holds(text:sview,prefix:sview)->bool:",
+    "matches:bool=EasmTextScan::starts_with(text,prefix)",
+    "matchesimpliesprefix_length<=text_length",
+    "matchesimplies(forallprefix_indexin0..<prefix_length:",
+    "prefix_length<=text_lengthand(forallprefix_indexin0..<prefix_length:",
+    'returnEasmTextScan::starts_with("movq %rax, %rbx","mov")',
+    'returnEasmTextScan::starts_with("ret","ret")',
+    'returnEasmTextScan::starts_with("ret","")',
+    'returnnotEasmTextScan::starts_with("x","xyz")',
+    'returnnotEasmTextScan::starts_with("movq","movx")',
+    "defequal_contract_holds(a:sview,b:sview)->bool:",
+    "matches:bool=EasmTextScan::equal(a,b)",
+    "matchesimpliesa_length==b_length",
+    "matchesimplies(forallindexin0..<a_length:",
+    "a_length==b_lengthand(forallindexin0..<a_length:",
+    'returnEasmTextScan::equal("movq %rax, %rbx","movq %rax, %rbx")',
+    'returnEasmTextScan::equal("","")',
+    'returnnotEasmTextScan::equal("movq","addq")',
+    'returnnotEasmTextScan::equal("movq","movx")',
+    'returnnotEasmTextScan::equal("mov","movq")',
     "deffirst_space_contract_holds(text:sview)->bool:",
     "ensureresult==true",
     "position:i64=EasmTextScan::first_space(text)",
@@ -174,6 +314,20 @@ required_positive_claims = (
     "text.len<0orposition<=text.len",
     "text.len<0orposition==text.lenor(",
     "forallprefix_indexin0..<position:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=EasmTextScan::ASCII_SPACEandtext[prefix_index]!=EasmTextScan::ASCII_TAB)",
+    "deftrim_bounds_contract_holds(text:sview)->bool:",
+    "bounds:(start:usize,end:usize)=EasmTextScan::trim_bounds(text)",
+    "bounds.start<=bounds.endandbounds.end<=text_length",
+    "forallprefix_indexin0..<bounds.start:",
+    "forallsuffix_indexinbounds.end..<text_length:",
+    "bounds.start!=bounds.endorbounds.start==text_length",
+    "deftrim_returns_the_exact_maximal_source_span(text:sview)->bool:",
+    "trimmed==text[bounds.start:bounds.end]",
+    "deftrim_removes_only_outer_spaces_and_tabs()->bool:",
+    'bounds.start==2andbounds.end==12andtrimmed=="left right"',
+    "deftrimming_all_whitespace_returns_the_empty_end_span()->bool:",
+    'EasmTextScan::trim(text)==""',
+    "deftrimming_a_clean_view_preserves_the_whole_span()->bool:",
+    "bounds.start==0andbounds.end==sview_len(text)andEasmTextScan::trim(text)==text",
 )
 if not all(fragment in positive_compact for fragment in required_positive_claims):
     raise SystemExit("positive proof no longer states the production scanner's complete postcondition")
@@ -187,9 +341,23 @@ required_negative_claims = (
     'returnEasmTextScan::find("abc","z")==0',
     'returnEasmTextScan::find("abc","")==0',
     "returnEasmTextScan::contains_memory_address_delimiter(false,false)",
+    'returnEasmTextScan::starts_with("add","mov")',
+    'returnEasmTextScan::starts_with("x","xyz")',
+    'returnEasmTextScan::starts_with("movq","movx")',
+    'EasmTextScan::starts_with("ret","")==false',
+    'returnEasmTextScan::equal("movq","addq")',
+    'returnEasmTextScan::equal("mov","movq")',
+    'returnEasmTextScan::equal("movq","movx")',
+    'trimmed:sview=EasmTextScan::trim(" x ")',
+    "sview_at(trimmed,0)==EasmTextScan::ASCII_SPACE",
+    'trimmed:sview=EasmTextScan::trim("x\\t")',
+    "sview_at(trimmed,sview_len(trimmed)-1.usize())==EasmTextScan::ASCII_TAB",
+    'EasmTextScan::trim("left right")=="leftright"',
+    'bounds:(start:usize,end:usize)=EasmTextScan::trim_bounds(" \\t ")',
+    "returnbounds.start==0andbounds.end==0",
 )
 if not all(fragment in negative_compact for fragment in required_negative_claims):
-    raise SystemExit("negative controls no longer challenge first-match, absent, and empty-needle behavior")
+    raise SystemExit("negative controls no longer cover scanner prefix, search, or trim boundaries")
 
 try:
     product = require_current_product(BIN, PROVER)
@@ -250,7 +418,7 @@ assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest(
 assert require_current_product(BIN, PROVER) == product, "proof-product provenance changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "production EASM first-match substring search and first ASCII space/tab scanning",
+    "scope": "production EASM first-match search, exact prefix and byte equality, whitespace scan, and maximal ASCII trim span",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
