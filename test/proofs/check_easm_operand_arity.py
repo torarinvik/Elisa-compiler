@@ -133,13 +133,13 @@ arity_policy = "unsupported_operands <- not EasmOperandScan::operand_arity_suppo
 role_policy = "unsupported_operands <- not easm_instruction_operand_roles_supported(inst.op, operand_scan.count, source_operand, destination_operand) if not unsupported_operands"
 known_gate = "if not unsupported_operands and easm_known_op(inst.op): unsupported_operands <- not EasmOperandScan::operand_arity_supported(inst.op, operand_scan.count) unsupported_operands <- not easm_instruction_operand_roles_supported(inst.op, operand_scan.count, source_operand, destination_operand) if not unsupported_operands"
 unsupported_handler = "if unsupported_operands: issues.push(Issue{severity: Severity.Error, code: \"unsupported-operands\", line: inst.line, message: \"instruction operand shape is outside the verified EASM model\"}) continue"
-safe_extraction = "if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT: source_end: usize = operand_scan.first_separator if operand_scan.first_separator < sview_len(inst.text) else sview_len(inst.text)"
+safe_extraction = "if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT: source_end: usize = operand_scan.first_separator if operand_scan.first_separator < inst.text.len else inst.text.len"
 if any(part not in instruction_code for part in (arity_guard, arity_policy, role_policy, known_gate, unsupported_handler, safe_extraction)):
     raise SystemExit("instruction verifier no longer rejects unsupported arities and operand roles")
 role_check_at = instruction_code.index("not easm_instruction_operand_roles_supported(inst.op, operand_scan.count, source_operand, destination_operand)")
 for extraction in (
     "source_operand <- easm_substitute_operand(easm_trim(inst.text[operand_scan.start:source_end]), inst)",
-    "destination_operand <- easm_substitute_operand(easm_trim(inst.text[destination_start:sview_len(inst.text)]), inst)",
+    "destination_operand <- easm_substitute_operand(easm_trim(inst.text[destination_start:inst.text.len]), inst)",
 ):
     if instruction_code.index(extraction) > role_check_at:
         raise SystemExit("operand-role validation reads slices before extracting them")

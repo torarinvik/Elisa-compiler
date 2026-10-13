@@ -59,10 +59,10 @@ block_binding_text = BLOCK_BINDING.read_text()
 parse_integer = compact(function_section(ops_text, "parse_int_literal"))
 separator_branch = (
     "ifbyte==95:"
-    "ifindex==startorsview_len(text)-index<=1:ok<-false"
+    "ifindex==startortext.len-index<=1:ok<-false"
     "else:"
-    "previous:u8=sview_at(text,index-1)"
-    "following:u8=sview_at(text,index+1)"
+    "previous:u8=text[index-1]"
+    "following:u8=text[index+1]"
     "ok<-falseifprevious<48orprevious>57orfollowing<48orfollowing>57"
 )
 if separator_branch not in parse_integer:
@@ -75,15 +75,15 @@ if parse_integer.count("accumulated<-accumulated*10.u64()+digit") != 1:
 
 capacity = compact(function_section(pattern_text, "capacity_span_parse_primary"))
 separator_scan = (
-    "elifbyte==95andcursor>startandsview_len(text)-cursor>1:"
-    "previous:u8=sview_at(text,cursor-1)"
-    "following:u8=sview_at(text,cursor+1)"
+    "elifbyte==95andcursor>startandtext.len-cursor>1:"
+    "previous:u8=text[cursor-1]"
+    "following:u8=text[cursor+1]"
     "breakifprevious<48orprevious>57orfollowing<48orfollowing>57"
     "cursor<-cursor+1"
 )
 if separator_scan not in capacity:
     raise SystemExit("capacity literal scan no longer admits only in-span, between-digit separators")
-if "falsereturnifcursor!=sview_len(text)" not in compact(function_section(pattern_text, "fold_const_capacity_text")):
+if "falsereturnifcursor!=text.len" not in compact(function_section(pattern_text, "fold_const_capacity_text")):
     raise SystemExit("capacity parser no longer rejects unconsumed malformed literal text")
 if 'include "./codegen_const_capacity.elisa"' not in struct_text or 'include "./codegen_struct_reg.elisa"' not in backend_text:
     raise SystemExit("backend facade no longer includes constant-capacity span parsing")

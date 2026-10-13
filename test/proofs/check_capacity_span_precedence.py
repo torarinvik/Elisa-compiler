@@ -81,18 +81,18 @@ for call_site in (
     if compact(call_site) not in block_emitter:
         raise SystemExit(f"region/with capacity lowering no longer uses the proved parser: {call_site}")
 expected_operator = compact("""def capacity_span_operator(text: sview, cursor: usize) -> (operator: TokenKind, width: usize, precedence: i32) can[Abort.Panic]:
-            length: usize = sview_len(text)
+            length: usize = text.len
             (TokenKind.Eof, 0, -1.i32()) return if cursor >= length
             if cursor + 1.usize() < length:
-                first: u8 = sview_at(text, cursor)
-                second: u8 = sview_at(text, cursor + 1.usize())
+                first: u8 = text[cursor]
+                second: u8 = text[cursor + 1.usize()]
                 (TokenKind.LShift, 2, BackendCapacityPrecedence::SHIFT) return if first == 60 and second == 60
                 (TokenKind.RShift, 2, BackendCapacityPrecedence::SHIFT) return if first == 62 and second == 62
                 (TokenKind.EqEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 61 and second == 61
                 (TokenKind.BangEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 33 and second == 61
                 (TokenKind.LtEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 60 and second == 61
                 (TokenKind.GtEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 62 and second == 61
-            return match sview_at(text, cursor):
+            return match text[cursor]:
                 60: (TokenKind.Lt, 1, BackendCapacityPrecedence::COMPARISON)
                 62: (TokenKind.Gt, 1, BackendCapacityPrecedence::COMPARISON)
                 124: (TokenKind.Pipe, 1, BackendCapacityPrecedence::BITWISE_OR)
@@ -116,7 +116,7 @@ if any(position < 0 for position in parser_steps) or parser_steps != sorted(pars
     raise SystemExit("capacity parser no longer uses the verified precedence-climbing threshold")
 fold_capacity = compact(function_section(CAPACITY.read_text(), "fold_const_capacity_text"))
 if "capacity_span_parse_binary(text,cursor,0)" not in fold_capacity or \
-        "falsereturnifcursor!=sview_len(text)" not in fold_capacity:
+        "falsereturnifcursor!=text.len" not in fold_capacity:
     raise SystemExit("capacity parser no longer begins at its lowest supported precedence")
 
 parser_precedence = compact(PARSER_PRECEDENCE.read_text())

@@ -42,7 +42,7 @@ def function_section(source: str, name: str) -> str:
 
 def production_mapping(source_text: str) -> dict[str, str]:
     body = function_section(source_text, "frontend_lookup_keyword")
-    if "text_length: usize = sview_len(text)" not in body:
+    if "text_length: usize = text.len" not in body:
         raise ValueError("keyword classifier no longer partitions on the text byte length")
     lines = body.splitlines()
     branch_headers = [(index, int(match.group(1))) for index, line in enumerate(lines)

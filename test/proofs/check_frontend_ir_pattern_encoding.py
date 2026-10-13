@@ -158,7 +158,7 @@ expected_pattern_branch_calls = {
         "return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::BINDING_PATTERN_NODE_TYPE_ID,fields,live)",
     ),
     "Literal": (
-        "sview_at(text,0)==FrontendIrPatternEncoding::STRING_PATTERN_QUOTE_BYTE",
+        "text[0]==FrontendIrPatternEncoding::STRING_PATTERN_QUOTE_BYTE",
         "ir_put_str(&fields,&live,FrontendIrPatternEncoding::STRING_LITERAL_PATTERN_VALUE_FIELD_ID,text)",
         "return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::STRING_LITERAL_PATTERN_NODE_TYPE_ID,fields,live)",
         "ir_put_node(&fields,&live,FrontendIrPatternEncoding::LITERAL_PATTERN_VALUE_FIELD_ID,value_id)",
@@ -193,9 +193,9 @@ literal_code = compact(literal_function)
 literal_calls = (
     '"true":ir_put_bool(&fields,&live,FrontendIrPatternEncoding::BOOL_LITERAL_VALUE_FIELD_ID,true)return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::BOOL_LITERAL_NODE_TYPE_ID,fields,live)',
     '"false":ir_put_bool(&fields,&live,FrontendIrPatternEncoding::BOOL_LITERAL_VALUE_FIELD_ID,false)return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::BOOL_LITERAL_NODE_TYPE_ID,fields,live)',
-    'sview_at(text,0)==FrontendIrPatternEncoding::CHAR_PATTERN_QUOTE_BYTE:ir_put_str(&fields,&live,FrontendIrPatternEncoding::CHAR_LITERAL_VALUE_FIELD_ID,text)return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::CHAR_LITERAL_NODE_TYPE_ID,fields,live)',
-    'sview_at(text,index)<FrontendIrPatternEncoding::ASCII_DIGIT_ZERO_BYTE',
-    'sview_at(text,index)>FrontendIrPatternEncoding::ASCII_DIGIT_NINE_BYTE',
+    'text[0]==FrontendIrPatternEncoding::CHAR_PATTERN_QUOTE_BYTE:ir_put_str(&fields,&live,FrontendIrPatternEncoding::CHAR_LITERAL_VALUE_FIELD_ID,text)return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::CHAR_LITERAL_NODE_TYPE_ID,fields,live)',
+    'text[index]<FrontendIrPatternEncoding::ASCII_DIGIT_ZERO_BYTE',
+    'text[index]>FrontendIrPatternEncoding::ASCII_DIGIT_NINE_BYTE',
     'ir_put_str(&fields,&live,FrontendIrPatternEncoding::INT_LITERAL_VALUE_FIELD_ID,text)return ir_emit_node(bodies,nodes,FrontendIrPatternEncoding::INT_LITERAL_NODE_TYPE_ID,fields,live)',
 )
 if any(compact(call) not in literal_code for call in literal_calls):

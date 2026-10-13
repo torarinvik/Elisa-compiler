@@ -889,7 +889,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
             "root": [definition(
                 "table: lmut SymbolTable",
                 "def root(table: lmut SymbolTable):\n"
-                "    length: usize = sview_len(table.symbol_name)\n",
+                "    length: usize = table.symbol_name.len\n",
             )],
         })
 

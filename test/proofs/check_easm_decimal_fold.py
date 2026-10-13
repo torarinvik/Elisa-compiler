@@ -39,7 +39,7 @@ if 'include "../../src/backend/easm_checked_decimal.elisa"' not in positive_text
 for helper in ("append_positive_digit", "append_negative_digit"):
     if f"def {helper}(" not in helper_text or f"EasmCheckedDecimal::{helper}(value, digit)" not in positive_text:
         raise SystemExit(f"sequence fold no longer uses the production {helper} helper")
-loop_start = parser_impl.find("while position < sview_len(text)")
+loop_start = parser_impl.find("while position < text.len")
 loop_end = parser_impl.find("return (true, value)", loop_start)
 if loop_start < 0 or loop_end < 0:
     raise SystemExit("source-linked signed decimal parser no longer has a bounded digit loop")
@@ -49,7 +49,7 @@ if "append_positive_digit(value, digit)" not in loop_body:
 if "append_negative_digit(value, digit)" not in loop_body:
     raise SystemExit("negative parser path no longer uses the proved checked-digit helper")
 for fragment in (
-    "byte: u8 = sview_at(text, position)",
+    "byte: u8 = text[position]",
     "return (false, 0) if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE",
     "digit: i64 = (byte - ASCII_DIGIT_ZERO).i64()",
 ):

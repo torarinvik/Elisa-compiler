@@ -145,7 +145,7 @@ for function_name, expected_sha256 in FUNCTION_SHA256.items():
 decoder = function_section(source_text, "decode_string_escapes")
 decoder_read_mutation = decoder.replace(
     "                if byte != 92 or remaining <= 1:\n",
-    "                next_index: usize = index + 1.usize()\n                next_byte: u8 = sview_at(text, next_index)\n                if byte != 92 or remaining <= 1:\n",
+    "                next_index: usize = index + 1.usize()\n                next_byte: u8 = text[next_index]\n                if byte != 92 or remaining <= 1:\n",
     1,
 )
 decoder_skip_mutation = decoder.replace(
@@ -155,8 +155,8 @@ decoder_skip_mutation = decoder.replace(
 )
 pattern = function_section(source_text, "string_pattern_content_cstr")
 pattern_guard_mutation = pattern.replace(
-    "quoted: bool = length >= 2 and sview_at(text, 0) == 34 and sview_at(text, length - 1) == 34",
-    "quoted: bool = sview_at(text, length - 1) == 34 and length >= 2 and sview_at(text, 0) == 34",
+    "quoted: bool = length >= 2 and text[0] == 34 and text[length - 1] == 34",
+    "quoted: bool = text[length - 1] == 34 and length >= 2 and text[0] == 34",
     1,
 )
 mutations = (
@@ -169,27 +169,27 @@ if any(mutated == original or function_fingerprint(mutated, name) == FUNCTION_SH
     raise SystemExit("literal decoder mutation control failed to detect a guard-order or scan-bypass change")
 ordered_steps(source_text, "decode_string_escapes", (
     "while index < length |index, storage, all_known|:",
-    "byte: u8 = sview_at(text, index)",
+    "byte: u8 = text[index]",
     "remaining: usize = length - index",
     "if byte != 92 or remaining <= 1:",
     "storage.push(byte)",
     "index <- index + 1.usize()",
     "continue",
     "next_index: usize = index + 1.usize()",
-    "next_byte: u8 = sview_at(text, next_index)",
+    "next_byte: u8 = text[next_index]",
     "hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()",
     "hex_start: usize = next_index + 1.usize()",
     "hex_available: usize = length - hex_start",
     "hex_ok: mutable bool = hex_digits <= hex_available",
     "while hex_index < hex_digits and hex_ok |hex_index, hex_value, hex_ok, text, hex_start, hex_digits|:",
-    "hex_at: i64 = hex_digit_value(sview_at(text, hex_start + hex_index))",
+    "hex_at: i64 = hex_digit_value(text[hex_start + hex_index])",
     "index <- hex_start + hex_digits",
     "storage.push(decoded)",
     "index <- next_index + 1.usize()",
 ), "escape decoder")
 ordered_steps(source_text, "decoded_literal_byte_count", (
     "while index < length |index, count, text, length|:",
-    "byte: u8 = sview_at(text, index)",
+    "byte: u8 = text[index]",
     "remaining: usize = length - index",
     "if byte != 92 or remaining <= 1:",
     "count return if stop_at_nul and byte == 0",
@@ -197,19 +197,19 @@ ordered_steps(source_text, "decoded_literal_byte_count", (
     "index <- index + 1.usize()",
     "continue",
     "next_index: usize = index + 1.usize()",
-    "next_byte: u8 = sview_at(text, next_index)",
+    "next_byte: u8 = text[next_index]",
     "hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()",
     "hex_start: usize = next_index + 1.usize()",
     "hex_available: usize = length - hex_start",
     "-1 return if hex_digits > hex_available",
     "while hex_index < hex_digits |hex_index, hex_value, text, hex_start|:",
-    "hex_at: i64 = hex_digit_value(sview_at(text, hex_start + hex_index))",
+    "hex_at: i64 = hex_digit_value(text[hex_start + hex_index])",
     "index <- hex_start + hex_digits",
     "index <- next_index + 1.usize()",
 ), "decoded literal byte counter")
 ordered_steps(source_text, "string_pattern_content_cstr", (
-    "length: usize = sview_len(text)",
-    "quoted: bool = length >= 2 and sview_at(text, 0) == 34 and sview_at(text, length - 1) == 34",
+    "length: usize = text.len",
+    "quoted: bool = length >= 2 and text[0] == 34 and text[length - 1] == 34",
     "start: usize = 1 if quoted else 0",
     "stop: usize = length - 1 if quoted else length",
     "inner: sview = text[start:stop]",

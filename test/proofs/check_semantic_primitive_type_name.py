@@ -97,7 +97,7 @@ if compact("ensure result == (byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_N
     raise SystemExit("ASCII digit helper no longer matches its closed byte interval")
 
 shape = compact(function_section(policy_text, "is_bit_width_int_shape"))
-shape_spec = "sview_len(name) >= MIN_INT_NAME_LENGTH and (sview_at(name, INT_LEAD_INDEX) == ASCII_LOWER_I or sview_at(name, INT_LEAD_INDEX) == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<sview_len(name): is_ascii_digit(sview_at(name, digit_index)))"
+shape_spec = "name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index]))"
 if compact("ensure result == (" + shape_spec + ")") not in shape or \
         compact("return (" + shape_spec + ")") not in shape:
     raise SystemExit("total width-name shape no longer provides a contract-safe lexical specification")

@@ -156,8 +156,8 @@ positive_claims = {
     "zero_width_range_at_end_is_empty": "view.len == 0",
     "range_crossing_the_buffer_end_fails_closed": "view.len == 0",
     "empty_buffer_produces_an_empty_view": "view.len == 0",
-    "a_bounded_range_view_reads_only_the_selected_bytes": "sview_at(view, 0.usize()) == 23 and sview_at(view, 1.usize()) == 37 and sview_at(view, 2.usize()) == 0",
-    "a_by_value_bounded_range_reads_only_the_selected_bytes": "sview_at(view, 0.usize()) == 23 and sview_at(view, 1.usize()) == 37 and sview_at(view, 2.usize()) == 0",
+    "a_bounded_range_view_reads_only_the_selected_bytes": "view[0.usize()] == 23 and view[1.usize()] == 37 and view[2.usize()] == 0",
+    "a_by_value_bounded_range_reads_only_the_selected_bytes": "view[0.usize()] == 23 and view[1.usize()] == 37 and view[2.usize()] == 0",
     "every_valid_nonempty_by_value_range_returns_its_exact_extent": "view.len == count.i64() and view.data == &bytes[start]",
     "every_well_formed_nonempty_buffer_produces_its_full_view": "view.len == bytes.count.i64() and view.data == &bytes[0.usize()]",
 }
@@ -178,8 +178,8 @@ negative_claims = {
     "valid_range_can_start_at_the_wrong_byte": "view.data == &bytes[0.usize()]",
     "valid_request_can_return_the_wrong_length": "view.len != count.i64()",
     "invalid_request_can_return_nonempty_view": "view.len > 0",
-    "a_bounded_range_view_can_expose_the_byte_after_its_extent": "sview_at(view, 2.usize()) == 41",
-    "a_by_value_range_can_expose_the_byte_after_its_extent": "sview_at(view, 2.usize()) == 41",
+    "a_bounded_range_view_can_expose_the_byte_after_its_extent": "view[2.usize()] == 41",
+    "a_by_value_range_can_expose_the_byte_after_its_extent": "view[2.usize()] == 41",
     "a_valid_by_value_range_can_return_the_wrong_extent": "view.len != count.i64() or view.data != &bytes[start]",
     "a_well_formed_nonempty_buffer_can_return_the_wrong_full_view": "view.len != bytes.count.i64() or view.data != &bytes[0.usize()]",
 }

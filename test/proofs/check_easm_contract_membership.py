@@ -46,8 +46,8 @@ expected_register_matcher = """
 return true if easm_contract_has_exact(values, register)
 for value in values:
     equals: usize = easm_find(value, "=")
-    if equals < sview_len(value):
-        declared: sview = easm_register_operand(value[equals + 1.usize():sview_len(value)])
+    if equals < value.len:
+        declared: sview = easm_register_operand(value[equals + 1.usize():value.len])
         if easm_equal(declared, register):
             return true
 return false
@@ -58,15 +58,15 @@ if compact(function_body(provenance, "easm_contract_has_register")) != compact(e
 expected_exact_matcher = """
 for value in values:
     cursor: mutable usize = 0
-    while cursor < sview_len(value) |cursor, value, needle|:
-        while cursor < sview_len(value) and (sview_at(value, cursor) == 32 or sview_at(value, cursor) == 9 or sview_at(value, cursor) == 44):
+    while cursor < value.len |cursor, value, needle|:
+        while cursor < value.len and (value[cursor] == 32 or value[cursor] == 9 or value[cursor] == 44):
             cursor <- cursor + 1
-        break if cursor >= sview_len(value)
+        break if cursor >= value.len
         end: mutable usize = cursor
-        while end < sview_len(value) and sview_at(value, end) != 44 |end, value|:
+        while end < value.len and value[end] != 44 |end, value|:
             end <- end + 1
         true return if easm_equal(easm_trim(value[cursor:end]), needle)
-        break if end >= sview_len(value)
+        break if end >= value.len
         cursor <- end + 1.usize()
 return false
 """

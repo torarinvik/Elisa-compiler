@@ -58,7 +58,7 @@ def function_body(source: str, name: str) -> str:
 
 
 source = HELPER.read_text()
-source_uppercase_arm = "_ -> sview_len(name) > 0 and sview_at(name, 0) >= GA_ASCII_UPPER_A and sview_at(name, 0) <= GA_ASCII_UPPER_Z"
+source_uppercase_arm = "_ -> name.len > 0 and name[0] >= GA_ASCII_UPPER_A and name[0] <= GA_ASCII_UPPER_Z"
 if "constGA_ASCII_UPPER_A:u8=65" not in compact(source):
     raise SystemExit("uppercase ASCII lower bound lost its named constant")
 if "constGA_ASCII_UPPER_Z:u8=90" not in compact(source):
@@ -90,7 +90,7 @@ match_arms(source_contract, source_uppercase_arm, "production cast-name contract
 body_match = re.search(r"return\s+when\s+name:\s*\n(.*)", function_body(source, "is_postfix_cast_name"), re.DOTALL)
 if not body_match:
     raise SystemExit("production cast-name classifier lost its exhaustive pattern match")
-match_arms(body_match.group(1), "_ -> sview_len(name) > 0 and sview_at(name, 0) >= GA_ASCII_UPPER_A and sview_at(name, 0) <= GA_ASCII_UPPER_Z", "production cast-name implementation")
+match_arms(body_match.group(1), "_ -> name.len > 0 and name[0] >= GA_ASCII_UPPER_A and name[0] <= GA_ASCII_UPPER_Z", "production cast-name implementation")
 
 consumer = compact(CONSUMER.read_text())
 if 'include"./global_authority_postfix_cast_name.elisa"' not in consumer:
@@ -101,7 +101,7 @@ if "notga_postfix_cast_name(target)" not in consumer:
     raise SystemExit("postfix conversion admission no longer consumes the proved classifier")
 
 proof_compact = compact(POSITIVE.read_text())
-proof_uppercase_arm = "_ -> sview_len(name) > 0 and sview_at(name, 0) >= GlobalAuthorityPostfixCastName::GA_ASCII_UPPER_A and sview_at(name, 0) <= GlobalAuthorityPostfixCastName::GA_ASCII_UPPER_Z"
+proof_uppercase_arm = "_ -> name.len > 0 and name[0] >= GlobalAuthorityPostfixCastName::GA_ASCII_UPPER_A and name[0] <= GlobalAuthorityPostfixCastName::GA_ASCII_UPPER_Z"
 proof_contract = contract_match(POSITIVE.read_text(), "positive cast-name proof contract")
 match_arms(proof_contract, proof_uppercase_arm, "positive cast-name proof contract")
 for name in CAST_NAMES:

@@ -553,7 +553,7 @@ illegal.elisa:95: warning: local `squares` is filled by a push loop and stays mu
   ```elisa
   buffer: darray[u8] = [104, 105]
   view: sview = view_of(buffer)
-  return sview_len(view)
+  return view.len
   ```
 
 - **Arenas.** A `region` frees what it allocates; do not wrap code whose allocations must

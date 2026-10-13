@@ -54,8 +54,8 @@ if "vro_sort_rows(origin_rows)" not in consumer:
 required_source = (
     "ghost def vro_text_compare_reference_from(",
     "ghost def vro_text_compare_prefix_preserves(",
-    "requires position <= sview_len(left) and position <= sview_len(right)",
-    "decreases (sview_len(left) if sview_len(left) < sview_len(right) else sview_len(right)) - position",
+    "requires position <= left.len and position <= right.len",
+    "decreases (left.len if left.len < right.len else right.len) - position",
     "ensure vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
     "VRO_COMPARE_LESS return if left[position] < right[position]",
     "VRO_COMPARE_GREATER return if left[position] > right[position]",

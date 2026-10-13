@@ -99,39 +99,39 @@ required_source = (
     "index<-index+SIGNED_INDEX_STEP",
     "deftrim_bounds(text:sview)->(start:usize,end:usize):",
     "ensureresult.start<=result.end",
-    "ensureresult.end<=sview_len(text)",
-    "forallprefix_indexin0..<result.start:sview_at(text,prefix_index)==ASCII_SPACEorsview_at(text,prefix_index)==ASCII_TAB",
-    "forallsuffix_indexinresult.end..<sview_len(text):sview_at(text,suffix_index)==ASCII_SPACEorsview_at(text,suffix_index)==ASCII_TAB",
+    "ensureresult.end<=text.len",
+    "forallprefix_indexin0..<result.start:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
+    "forallsuffix_indexinresult.end..<text.len:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
     "result.start==result.endor(",
-    "ensureresult.start!=result.endorresult.start==sview_len(text)",
-    "whilefirst<lastand(sview_at(text,first)==ASCII_SPACEorsview_at(text,first)==ASCII_TAB)",
+    "ensureresult.start!=result.endorresult.start==text.len",
+    "whilefirst<lastand(text[first]==ASCII_SPACEortext[first]==ASCII_TAB)",
     "decreaseslast-first",
     "invariantfirst<=last",
     "invariantlast<=text_length",
-    "invariantforallprefix_indexin0..<first:sview_at(text,prefix_index)==ASCII_SPACEorsview_at(text,prefix_index)==ASCII_TAB",
-    "assertfirst==lastor(sview_at(text,first)!=ASCII_SPACEandsview_at(text,first)!=ASCII_TAB)",
-    "whilelast>firstand(sview_at(text,last-BYTE_INDEX_STEP)==ASCII_SPACEorsview_at(text,last-BYTE_INDEX_STEP)==ASCII_TAB)",
-    "invariantforallsuffix_indexinlast..<text_length:sview_at(text,suffix_index)==ASCII_SPACEorsview_at(text,suffix_index)==ASCII_TAB",
-    "assertlast==firstor(sview_at(text,last-BYTE_INDEX_STEP)!=ASCII_SPACEandsview_at(text,last-BYTE_INDEX_STEP)!=ASCII_TAB)",
+    "invariantforallprefix_indexin0..<first:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
+    "assertfirst==lastor(text[first]!=ASCII_SPACEandtext[first]!=ASCII_TAB)",
+    "whilelast>firstand(text[last-BYTE_INDEX_STEP]==ASCII_SPACEortext[last-BYTE_INDEX_STEP]==ASCII_TAB)",
+    "invariantforallsuffix_indexinlast..<text_length:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
+    "assertlast==firstor(text[last-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[last-BYTE_INDEX_STEP]!=ASCII_TAB)",
     "return(first,last)",
     "defstarts_with(text:sview,prefix:sview)->bool:",
-    "ensureresultimpliessview_len(prefix)<=sview_len(text)",
-    "forallprefix_indexin0..<sview_len(prefix):prefix_index>=sview_len(text)orsview_at(text,prefix_index)==sview_at(prefix,prefix_index)",
-    "(sview_len(prefix)<=sview_len(text)and(forallprefix_indexin0..<sview_len(prefix):",
-    "text_length:usize=sview_len(text)",
-    "prefix_length:usize=sview_len(prefix)",
+    "ensureresultimpliesprefix.len<=text.len",
+    "forallprefix_indexin0..<prefix.len:prefix_index>=text.lenortext[prefix_index]==prefix[prefix_index]",
+    "(prefix.len<=text.lenand(forallprefix_indexin0..<prefix.len:",
+    "text_length:usize=text.len",
+    "prefix_length:usize=prefix.len",
     "returnfalseifprefix_length>text_length",
     "whileindex<prefix_length|index,text,prefix,prefix_length|",
     "decreasesprefix_length-index",
     "invariantindex<=prefix_length",
-    "invariantforallmatched_indexin0..<index:sview_at(text,matched_index)==sview_at(prefix,matched_index)",
-    "returnfalseifsview_at(text,index)!=sview_at(prefix,index)",
+    "invariantforallmatched_indexin0..<index:text[matched_index]==prefix[matched_index]",
+    "returnfalseiftext[index]!=prefix[index]",
     "returntrue",
     "defequal(a:sview,b:sview)->bool:",
-    "ensureresultimpliessview_len(a)==sview_len(b)",
-    "forallindexin0..<sview_len(a):index>=sview_len(b)orsview_at(a,index)==sview_at(b,index)",
-    "(sview_len(a)==sview_len(b)and(forallindexin0..<sview_len(a):",
-    "returnsview_len(a)==sview_len(b)andstarts_with(a,b)",
+    "ensureresultimpliesa.len==b.len",
+    "forallindexin0..<a.len:index>=b.lenora[index]==b[index]",
+    "(a.len==b.lenand(forallindexin0..<a.len:",
+    "returna.len==b.lenandstarts_with(a,b)",
     "deftrim(text:sview)->sview:",
     "bounds:(start:usize,end:usize)=trim_bounds(text)",
     "returntext[bounds.start:bounds.end]",
@@ -140,23 +140,23 @@ if not all(fragment in source_compact for fragment in required_source):
     raise SystemExit("production EASM scanner lost a source contract or loop invariant")
 expected_find = """
 def find(text: sview, needle: sview) -> usize:
-    ensure result <= sview_len(text)
-    ensure (sview_len(needle) == 0 or sview_len(text) < sview_len(needle)) implies result == sview_len(text)
-    ensure result < sview_len(text) implies (
-        sview_len(needle) > 0 and
-        sview_len(needle) <= sview_len(text) and
-        result <= sview_len(text) - sview_len(needle) and
-        text[result:result + sview_len(needle)] == needle
+    ensure result <= text.len
+    ensure (needle.len == 0 or text.len < needle.len) implies result == text.len
+    ensure result < text.len implies (
+        needle.len > 0 and
+        needle.len <= text.len and
+        result <= text.len - needle.len and
+        text[result:result + needle.len] == needle
     )
     ensure (forall candidate in 0..<result:
-        sview_len(needle) == 0 or
-        sview_len(needle) > sview_len(text) - candidate or
-        text[candidate:candidate + sview_len(needle)] != needle
+        needle.len == 0 or
+        needle.len > text.len - candidate or
+        text[candidate:candidate + needle.len] != needle
     )
-    text_length: usize = sview_len(text)
-    needle_length: usize = sview_len(needle)
-    assert text_length == sview_len(text)
-    assert needle_length == sview_len(needle)
+    text_length: usize = text.len
+    needle_length: usize = needle.len
+    assert text_length == text.len
+    assert needle_length == needle.len
     if needle_length == 0 or text_length < needle_length:
         return text_length
     search_limit: usize = text_length - needle_length + BYTE_INDEX_STEP
@@ -217,8 +217,8 @@ if "returnEasmTextScan::find(text,needle)" not in compact(function_section(PARSE
 expected_memory_operand = """
 def easm_memory_operand(operand: sview) -> bool:
     return EasmTextScan::contains_memory_address_delimiter(
-        easm_find(operand, "(") < sview_len(operand),
-        easm_find(operand, "[") < sview_len(operand)
+        easm_find(operand, "(") < operand.len,
+        easm_find(operand, "[") < operand.len
     )
 """
 if compact(function_section(PROVENANCE.read_text(), "easm_memory_operand")) != compact(expected_memory_operand):
@@ -327,7 +327,7 @@ required_positive_claims = (
     "deftrimming_all_whitespace_returns_the_empty_end_span()->bool:",
     'EasmTextScan::trim(text)==""',
     "deftrimming_a_clean_view_preserves_the_whole_span()->bool:",
-    "bounds.start==0andbounds.end==sview_len(text)andEasmTextScan::trim(text)==text",
+    "bounds.start==0andbounds.end==text.lenandEasmTextScan::trim(text)==text",
 )
 if not all(fragment in positive_compact for fragment in required_positive_claims):
     raise SystemExit("positive proof no longer states the production scanner's complete postcondition")
@@ -349,9 +349,9 @@ required_negative_claims = (
     'returnEasmTextScan::equal("mov","movq")',
     'returnEasmTextScan::equal("movq","movx")',
     'trimmed:sview=EasmTextScan::trim(" x ")',
-    "sview_at(trimmed,0)==EasmTextScan::ASCII_SPACE",
+    "trimmed[0]==EasmTextScan::ASCII_SPACE",
     'trimmed:sview=EasmTextScan::trim("x\\t")',
-    "sview_at(trimmed,sview_len(trimmed)-1.usize())==EasmTextScan::ASCII_TAB",
+    "trimmed[trimmed.len-1.usize()]==EasmTextScan::ASCII_TAB",
     'EasmTextScan::trim("left right")=="leftright"',
     'bounds:(start:usize,end:usize)=EasmTextScan::trim_bounds(" \\t ")',
     "returnbounds.start==0andbounds.end==0",

@@ -31,13 +31,13 @@ if signature not in project_text:
     raise SystemExit("production project suffix matcher is missing")
 matcher_body = project_text.split(signature, 1)[1].split("\n    def ", 1)[0]
 for fragment in (
-    "ensure sview_len(suffix).i64() >= 0 or result == false",
-    "want: i64 = sview_len(suffix).i64()",
+    "ensure suffix.len.i64() >= 0 or result == false",
+    "want: i64 = suffix.len.i64()",
     "false return if want < 0",
     "false return if value.count.i64() < want",
     "offset: usize = value.count - want.usize()",
     "for index in 0..<want |value, suffix, offset|",
-    "false return if value[offset + index.usize()] != sview_at(suffix, index)",
+    "false return if value[offset + index.usize()] != suffix[index]",
     "return true",
 ):
     if fragment not in matcher_body:

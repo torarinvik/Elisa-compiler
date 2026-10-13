@@ -83,16 +83,16 @@ required_fold_fragments = (
     "ensure(forallfact_indexinindex..<facts.count:",
     "returngreatestifindex==facts.count",
     'fact:sview=facts[index]marker:usize=easm_find(fact,"size>=")',
-    "ifmarker<sview_len(fact):",
-    "value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():sview_len(fact)]))",
+    "ifmarker<fact.len:",
+    "value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():fact.len]))",
     "returneasm_size_guard_lower_bound_from(facts,index+1,EasmMemStateDomain::greatest_bound(greatest,value))",
     "returneasm_size_guard_lower_bound_from(facts,index+1,greatest)",
 )
 if not all(fragment in fold_spec_compact for fragment in required_fold_fragments):
     raise SystemExit("recursive size-fact fold specification changed without updating its production proof")
 covered_fact = (
-    'easm_find(facts[fact_index],"size>=")>=sview_len(facts[fact_index])or'
-    'result>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():sview_len(facts[fact_index])]))'
+    'easm_find(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
+    'result>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():(facts[fact_index]).len]))'
 )
 if f"ensure(forallfact_indexinindex..<facts.count:{covered_fact}" not in fold_spec_compact:
     raise SystemExit("recursive size-fact spec no longer proves every recognized fact is covered")

@@ -66,26 +66,26 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
     can Abort.Panic:
         false return if from > count or count > names.count
         cursor: mutable usize = 0
-        candidate_length: usize = sview_len(candidate)
-        prefix_length: usize = sview_len(prefix)
+        candidate_length: usize = candidate.len
+        prefix_length: usize = prefix.len
         if prefix_length > 0:
             for offset in 0..<prefix_length |cursor, candidate, candidate_length, prefix|:
                 invariant cursor <= candidate_length
-                false return if cursor >= candidate_length or sview_at(candidate, cursor) != sview_at(prefix, offset)
+                false return if cursor >= candidate_length or candidate[cursor] != prefix[offset]
                 cursor <- cursor + 1.usize()
-            false return if cursor > candidate_length or candidate_length - cursor < 2 or sview_at(candidate, cursor) != 58 or sview_at(candidate, cursor + 1.usize()) != 58
+            false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
             cursor <- cursor + 2.usize()
         for index in from..<count |cursor, candidate, candidate_length, names, from|:
             invariant from <= index
             invariant index <= count
             invariant cursor <= candidate_length
             if index > from:
-                false return if cursor > candidate_length or candidate_length - cursor < 2 or sview_at(candidate, cursor) != 58 or sview_at(candidate, cursor + 1.usize()) != 58
+                false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
                 cursor <- cursor + 2.usize()
             segment: sview = names[index]
-            for offset in 0..<sview_len(segment) |cursor, candidate, candidate_length, segment|:
+            for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
                 invariant cursor <= candidate_length
-                false return if cursor >= candidate_length or sview_at(candidate, cursor) != sview_at(segment, offset)
+                false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
                 cursor <- cursor + 1.usize()
         return cursor == candidate_length
 '''
@@ -94,11 +94,11 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
     can Abort.Panic:
         false return if count == 0 or count > names.count
         path_length: mutable usize = 0
-        candidate_length: usize = sview_len(candidate)
+        candidate_length: usize = candidate.len
         false return if candidate_length < 3
         for index in 0..<count |path_length, names, candidate_length|:
             invariant path_length <= candidate_length
-            segment_length: usize = sview_len(names[index])
+            segment_length: usize = (names[index]).len
             false return if path_length > candidate_length or segment_length > candidate_length - path_length
             path_length <- path_length + segment_length
             if index + 1.usize() < count:
@@ -106,27 +106,27 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
                 path_length <- path_length + 2.usize()
         false return if path_length > candidate_length - 3.usize()
         ancestor_length: usize = candidate_length - path_length - 2.usize()
-        false return if sview_at(candidate, ancestor_length) != 58 or sview_at(candidate, ancestor_length + 1.usize()) != 58
-        enclosing_length: usize = sview_len(enclosing)
+        false return if candidate[ancestor_length] != 58 or candidate[ancestor_length + 1.usize()] != 58
+        enclosing_length: usize = enclosing.len
         false return if enclosing_length < ancestor_length
         if enclosing_length > ancestor_length:
             false return if enclosing_length - ancestor_length < 2
-            false return if sview_at(enclosing, ancestor_length) != 58 or sview_at(enclosing, ancestor_length + 1.usize()) != 58
+            false return if enclosing[ancestor_length] != 58 or enclosing[ancestor_length + 1.usize()] != 58
         for offset in 0..<ancestor_length |candidate, enclosing|:
             invariant ancestor_length <= candidate_length
             invariant ancestor_length <= enclosing_length
-            false return if sview_at(candidate, offset) != sview_at(enclosing, offset)
+            false return if candidate[offset] != enclosing[offset]
         cursor: mutable usize = ancestor_length + 2.usize()
         for index in 0..<count |cursor, candidate, candidate_length, names|:
             invariant cursor <= candidate_length
             invariant index <= count
             if index > 0:
-                false return if cursor > candidate_length or candidate_length - cursor < 2 or sview_at(candidate, cursor) != 58 or sview_at(candidate, cursor + 1.usize()) != 58
+                false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
                 cursor <- cursor + 2.usize()
             segment: sview = names[index]
-            for offset in 0..<sview_len(segment) |cursor, candidate, candidate_length, segment|:
+            for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
                 invariant cursor <= candidate_length
-                false return if cursor >= candidate_length or sview_at(candidate, cursor) != sview_at(segment, offset)
+                false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
                 cursor <- cursor + 1.usize()
         return cursor == candidate_length
 '''

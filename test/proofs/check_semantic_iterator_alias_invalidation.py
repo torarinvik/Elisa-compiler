@@ -21,13 +21,23 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MODULE = ROOT / "src/semantic/iterator_alias_resolution.elisa"
+POLICY = ROOT / "src/semantic/iterator_mutation_policy.elisa"
 CHECKER = ROOT / "src/semantic/check_mutate_while_iterating.elisa"
+CALL_LOWERING = ROOT / "src/backend/codegen_stmt_expr_calls.elisa"
 SEMANTIC_ROOT = ROOT / "src/semantic/semantic.elisa"
 SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
 POSITIVE = HERE / "semantic_iterator_alias_invalidation.elisa"
 NEGATIVE = HERE / "semantic_iterator_alias_invalidation_rejected.elisa"
 
 POSITIVE_SHAPES = {
+    "production_mutation_policy_matches_its_spec": """def production_mutation_policy_matches_its_spec(method: sview) -> bool:
+    ensure result == true
+    return SemanticIteratorMutationPolicy::forbidden_during_iteration(method) == SemanticIteratorMutationPolicy::forbidden_during_iteration_spec(method)
+""",
+    "resize_is_forbidden_during_iteration": """def resize_is_forbidden_during_iteration() -> bool:
+    ensure result == true
+    return SemanticIteratorMutationPolicy::forbidden_during_iteration("resize")
+""",
     "production_resolver_refines_its_recursive_spec": """def production_resolver_refines_its_recursive_spec(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> bool:
     ensure result == true
     return SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, name) == SemanticIteratorAliasResolution::resolve_from(alias_names, alias_targets, name, alias_names.count)
@@ -75,8 +85,25 @@ POSITIVE_SHAPES = {
     resolved: sview = SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, "alias")
     return SemanticIteratorAliasResolution::may_name(resolved, "xs")
 """,
+    "multiple_targets_for_one_alias_resolve_to_unknown": """def multiple_targets_for_one_alias_resolve_to_unknown() -> bool:
+    ensure result == true
+    alias_names: darray[sview] = ["alias", "alias"]
+    alias_targets: darray[sview] = ["ys", "xs"]
+    return SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, "alias") == ""
+""",
+    "an_ambiguous_alias_is_a_possible_iterator_source": """def an_ambiguous_alias_is_a_possible_iterator_source() -> bool:
+    ensure result == true
+    alias_names: darray[sview] = ["alias", "alias"]
+    alias_targets: darray[sview] = ["ys", "xs"]
+    resolved: sview = SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, "alias")
+    return SemanticIteratorAliasResolution::may_name(resolved, "xs")
+""",
 }
 NEGATIVE_SHAPES = {
+    "resize_is_allowed_during_iteration": """def resize_is_allowed_during_iteration() -> bool:
+    ensure result == true
+    return not SemanticIteratorMutationPolicy::forbidden_during_iteration("resize")
+""",
     "a_relocating_method_on_a_direct_alias_is_safe_during_the_source_walk": """def a_relocating_method_on_a_direct_alias_is_safe_during_the_source_walk() -> bool:
     ensure result == true
     alias_names: darray[sview] = ["alias"]
@@ -87,6 +114,13 @@ NEGATIVE_SHAPES = {
     ensure result == true
     alias_names: darray[sview] = ["alias", "other_alias"]
     alias_targets: darray[sview] = ["other_alias", "alias"]
+    resolved: sview = SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, "alias")
+    return not SemanticIteratorAliasResolution::may_name(resolved, "xs")
+""",
+    "an_ambiguous_alias_cannot_name_the_iterated_source": """def an_ambiguous_alias_cannot_name_the_iterated_source() -> bool:
+    ensure result == true
+    alias_names: darray[sview] = ["alias", "alias"]
+    alias_targets: darray[sview] = ["ys", "xs"]
     resolved: sview = SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, "alias")
     return not SemanticIteratorAliasResolution::may_name(resolved, "xs")
 """,
@@ -122,6 +156,8 @@ for path, shapes in ((POSITIVE, POSITIVE_SHAPES), (NEGATIVE, NEGATIVE_SHAPES)):
 
 if 'include "../../src/semantic/iterator_alias_resolution.elisa"' not in POSITIVE.read_text():
     raise SystemExit("iterator-alias proof no longer imports the production resolver")
+if 'include "../../src/semantic/iterator_mutation_policy.elisa"' not in POSITIVE.read_text():
+    raise SystemExit("iterator-alias proof no longer imports the production mutation policy")
 if 'include "./semantic_iterator_alias_invalidation.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("iterator-alias false control no longer inherits the positive claims")
 
@@ -142,9 +178,28 @@ expected_module = {
         return (true, alias_targets[index]) if index < alias_targets.count and alias_names[index] == name
     return (false, sview("", 0, 0))
 """,
+    "ambiguous_from": """ghost def ambiguous_from(alias_names: darray[sview]&, name: sview, index: usize, seen: bool) -> bool:
+    requires index <= alias_names.count
+    decreases alias_names.count - index
+    return false if index == alias_names.count
+    return true if alias_names[index] == name and seen
+    next_seen: bool = seen or alias_names[index] == name
+    return ambiguous_from(alias_names, name, index + 1, next_seen)
+""",
+    "ambiguous": """def ambiguous(alias_names: darray[sview]&, name: sview) -> bool:
+    ensure result == ambiguous_from(alias_names, name, 0, false)
+    found: mutable bool = false
+    for index in 0..<alias_names.count |index, found|:
+        invariant index <= alias_names.count
+        invariant ambiguous_from(alias_names, name, index, found) == ambiguous_from(alias_names, name, 0, false)
+        return true if alias_names[index] == name and found
+        found <- true if alias_names[index] == name
+    return false
+""",
     "resolve_from": """ghost def resolve_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, remaining: usize) -> sview:
     requires remaining <= alias_names.count
     decreases remaining
+    return sview("", 0, 0) if ambiguous_from(alias_names, name, 0, false)
     target: (found: bool, target: sview) = direct_target_from(alias_names, alias_targets, name, 0)
     return name if not target.found
     return sview("", 0, 0) if target.target == name or remaining == 0
@@ -157,12 +212,13 @@ expected_module = {
     while remaining > 0 |current, remaining, alias_names, alias_targets, name|:
         invariant remaining <= alias_names.count
         invariant resolve_from(alias_names, alias_targets, current, remaining) == resolve_from(alias_names, alias_targets, name, alias_names.count)
+        return sview("", 0, 0) if ambiguous(alias_names, current)
         target: (found: bool, target: sview) = direct_target(alias_names, alias_targets, current)
         return current if not target.found
         return sview("", 0, 0) if target.target == current
         current <- target.target
         remaining <- remaining - 1
-    return sview("", 0, 0) if direct_target(alias_names, alias_targets, current).found
+    return sview("", 0, 0) if ambiguous(alias_names, current) or direct_target(alias_names, alias_targets, current).found
     return current
 """,
     "may_name": """def may_name(resolved: sview, source: sview) -> bool:
@@ -178,18 +234,41 @@ checker_text = CHECKER.read_text()
 checker_compact = compact(checker_text)
 if checker_text.count('include "./iterator_alias_resolution.elisa"') != 1:
     raise SystemExit("iterator invalidation must include the proof-refined alias resolver exactly once")
+if checker_text.count('include "./iterator_mutation_policy.elisa"') != 1:
+    raise SystemExit("iterator invalidation must include the proof-refined mutation policy exactly once")
+policy_text = POLICY.read_text()
+policy_compact = compact(policy_text)
+if compact('ghost def forbidden_during_iteration_spec(method: sview) -> bool: return method == "push" or method == "extend" or method == "insert" or method == "append" or method == "reserve" or method == "clear" or method == "truncate" or method == "resize"') not in policy_compact:
+    raise SystemExit("iterator mutation specification lost a classified method")
+if compact('def forbidden_during_iteration(method: sview) -> bool: ensure result == forbidden_during_iteration_spec(method) return method == "push" or method == "extend" or method == "insert" or method == "append" or method == "reserve" or method == "clear" or method == "truncate" or method == "resize"') not in policy_compact:
+    raise SystemExit("production iterator mutation classifier no longer refines its independent specification")
+if declarations(POSITIVE) != set(POSITIVE_SHAPES):
+    raise SystemExit("iterator mutation theorem inventory changed")
+if declarations(NEGATIVE) != set(NEGATIVE_SHAPES):
+    raise SystemExit("iterator mutation false-control inventory changed")
 mutation = compact(function_section(checker_text, "iter_mutation_method"))
 for fragment in (
     "alias_names:darray[sview]&",
     "alias_targets:darray[sview]&",
-    'grows:bool=method_namein{"push","extend","insert","append","reserve","clear","truncate"}',
+    "forbidden:bool=SemanticIteratorMutationPolicy::forbidden_during_iteration(method_name)",
     "receiver_name:sview=ident_name_of(receiver)",
-    "resolved_receiver:sview=SemanticIteratorAliasResolution::resolve(alias_names,alias_targets,receiver_name)ifreceiver_name!=\"\"",
-    "receiver_is_place<-SemanticIteratorAliasResolution::may_name(resolved_receiver,container)ifreceiver_name!=\"\"",
-    "method_namereturnifgrowsandreceiver_is_place",
+    "ifreceiver_name!=\"\":resolved_receiver:sview=SemanticIteratorAliasResolution::resolve(alias_names,alias_targets,receiver_name)receiver_is_place<-SemanticIteratorAliasResolution::may_name(resolved_receiver,container)",
+    "method_namereturnifforbiddenandreceiver_is_place",
 ):
     if fragment not in mutation:
         raise SystemExit(f"production iterator check lost the proved alias-mutator path: {fragment}")
+
+resize_lowering = compact(function_section(CALL_LOWERING.read_text(), "emit_statement_expr_calls"))
+resize_start = resize_lowering.find('push_method=="resize"')
+resize_end = resize_lowering.find('push_method=="extend"', resize_start)
+resize_arm = resize_lowering[resize_start:resize_end] if resize_start >= 0 and resize_end > resize_start else ""
+if not all(fragment in resize_arm for fragment in (
+        "rz_more:LLVMValueRef=LLVMBuildICmp(builder,36,rz_cur,rz_n,\"resize.more\")",
+        "LLVMBuildCondBr(builder,rz_more,rz_push_block,rz_after)",
+        "emit_darray_push(rz_slot",
+        "LLVMBuildBr(builder,rz_cond)",
+)):
+    raise SystemExit("DArray resize no longer grows by the push path covered by iterator mutation policy")
 
 if "SemanticIteratorAliasResolution::resolve(alias_names,alias_targets,raw)" not in compact(function_section(checker_text, "iter_arg_container_name")):
     raise SystemExit("mutable-reference call detection no longer uses the proved alias resolver")
@@ -202,6 +281,11 @@ if "argument_root==containeroriter_arg_has_unresolved_alias(argument,alias_names
 alias_collection = compact(function_section(checker_text, "iter_collect_aliases"))
 if "Stmt.Match(scrutinee,arms,match_line):forarminarms|names,targets|:iter_collect_aliases(arm.body,names,targets)" not in alias_collection:
     raise SystemExit("aliases inside match arms are no longer collected for invalidation checks")
+if "Stmt.Assign(target,operator,value,line):alias_name:sview=ident_name_of(storage_view_strip_paren_move(target))iter_collect_alias_binding(alias_name,value,names,targets)ifoperator==TokenKind.Assignoroperator==TokenKind.LArrow" not in alias_collection:
+    raise SystemExit("rebinding assignments are no longer included in the conservative alias set")
+alias_binding = compact(function_section(checker_text, "iter_alias_value_target"))
+if compact("Expr.Ident(_, _):ident_name_of(stripped)") not in alias_binding:
+    raise SystemExit("bare reference-value copies are no longer included in the conservative alias set")
 if 'include "./check_mutate_while_iterating.elisa"' not in SEMANTIC_ROOT.read_text():
     raise SystemExit("semantic root no longer includes the iterator invalidation pass")
 if compact(SEMANTIC_API.read_text()).count("table<-check_mutate_while_iterating(loop_view,table)") != 1:

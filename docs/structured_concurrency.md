@@ -19,6 +19,8 @@ Start with `nursery:` to use the runtime's default worker count. Use
 `nursery workers(count):` when the workload calls for a fixed worker count. A
 `submit` inside a nursery returns no task handle; its worker is joined before the
 block exits. Unqualified submissions automatically use the nursery's pool.
+An explicit `submit[pool] work(arg)` remains a separate task handle, even when it names the
+nursery's pool; it is not joined by the nursery. Await that handle or add it to a `TaskGroup`.
 
 When a computation needs a value back, use a data-parallel helper such as
 `each`, `par_map`, or `reduce`. These helpers partition the input, run a nursery,
@@ -45,8 +47,10 @@ def submit_batch(pool: mutable ThreadPool&, count: usize) -> void:
 ```
 
 Use `TaskGroup` directly when you need to choose the group creation or wait point
-yourself. The pool's owner remains responsible for shutting it down after all
-borrowed-pool nurseries have finished.
+yourself. Adding a task consumes its handle, and `wait all` discards its result. Keep
+individual handles and await them after the batch when their results are needed; use
+`par_map` or `reduce` for common bulk-result patterns. The pool's owner remains
+responsible for shutting it down after all borrowed-pool nurseries have finished.
 
 Pass values that are safe to transfer to a worker. The compiler checks thread
 shareability and whether borrowed storage stays valid until the nursery or task

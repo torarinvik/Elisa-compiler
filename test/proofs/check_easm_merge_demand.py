@@ -188,7 +188,7 @@ def easm_instruction_register_mask(instruction: Instruction) -> i64:
     mask: mutable i64 = easm_register_mask(instruction.text) | easm_operand_register_mask(easm_substitute_operand(easm_first_operand(instruction.text), instruction)) | easm_operand_register_mask(easm_substitute_operand(easm_last_operand(instruction.text), instruction))
     for index in 0..<instruction.substitution_count.usize() |index, instruction, mask|:
         substitution: Substitution = easm_substitution_at(instruction, index.i64())
-        if easm_find(instruction.text, substitution.from) < sview_len(instruction.text):
+        if easm_find(instruction.text, substitution.from) < instruction.text.len:
             mask <- mask | easm_register_mask(substitution.replacement) | easm_operand_register_mask(substitution.replacement)
     return mask
 """
@@ -196,7 +196,7 @@ if compact(instruction_mask) != compact(expected_instruction_mask):
     raise SystemExit("instruction masks must include narrow aliases from each parsed operand and substitution")
 
 expected_register_scan = "def easm_register_mask(text: sview) -> i64:\n    mask: mutable i64 = 0\n" + "\n".join(
-    f'    mask <- mask | EasmRegisterMasks::{name} if easm_find(text, "%{name.lower()}") < sview_len(text)'
+    f'    mask <- mask | EasmRegisterMasks::{name} if easm_find(text, "%{name.lower()}") < text.len'
     for name in register_order
 ) + "\n    return mask"
 if compact(function_section(model_text, "easm_register_mask")) != compact(expected_register_scan):
@@ -339,10 +339,10 @@ if compact(function_section(model_text, "easm_register_bit")) != compact(expecte
 expected_register_operand = """
 def easm_register_operand(operand: sview) -> sview:
     value: sview = easm_trim(operand)
-    if sview_len(value) > 0 and sview_at(value, 0) == 37:
+    if value.len > 0 and value[0] == 37:
         end: mutable usize = 1
-        while end < sview_len(value) |end, value|:
-            byte: u8 = sview_at(value, end)
+        while end < value.len |end, value|:
+            byte: u8 = value[end]
             break if not ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95)
             end <- end + 1
         return value[1:end]
@@ -357,52 +357,52 @@ expected_operand_parsers = {
     "easm_first_operand": """
 def easm_first_operand(text: sview) -> sview:
     start: usize = easm_first_space(text)
-    if start >= sview_len(text):
+    if start >= text.len:
         return ""
-    rest: sview = easm_trim(text[start:sview_len(text)])
+    rest: sview = easm_trim(text[start:text.len])
     comma: usize = easm_find(rest, ",")
     return rest[0:comma]
 """,
     "easm_last_operand": """
 def easm_last_operand(text: sview) -> sview:
-    comma: mutable usize = sview_len(text)
-    for index in 0..<sview_len(text) |comma, text|:
-        comma <- index if sview_at(text, index) == 44
-    if comma >= sview_len(text):
+    comma: mutable usize = text.len
+    for index in 0..<text.len |comma, text|:
+        comma <- index if text[index] == 44
+    if comma >= text.len:
         start: usize = easm_first_space(text)
-        if start >= sview_len(text):
+        if start >= text.len:
             return ""
-        return easm_trim(text[start:sview_len(text)])
-    return easm_trim(text[comma + 1.usize():sview_len(text)])
+        return easm_trim(text[start:text.len])
+    return easm_trim(text[comma + 1.usize():text.len])
 """,
     "easm_trim": """
 def easm_trim(text: sview) -> sview:
     first: mutable usize = 0
-    last: mutable usize = sview_len(text)
-    while first < last and (sview_at(text, first) == 32 or sview_at(text, first) == 9) |first, text, last|:
+    last: mutable usize = text.len
+    while first < last and (text[first] == 32 or text[first] == 9) |first, text, last|:
         first <- first + 1
-    while last > first and (sview_at(text, last - 1.usize()) == 32 or sview_at(text, last - 1.usize()) == 9) |last, text, first|:
+    while last > first and (text[last - 1.usize()] == 32 or text[last - 1.usize()] == 9) |last, text, first|:
         last <- last - 1
     return text[first:last]
 """,
     "easm_find": """
 def easm_find(text: sview, needle: sview) -> usize:
-    if sview_len(needle) == 0 or sview_len(text) < sview_len(needle):
-        return sview_len(text)
-    for index in 0..<(sview_len(text) - sview_len(needle) + 1.usize()) |text, needle|:
-        if text[index:index + sview_len(needle)] == needle:
+    if needle.len == 0 or text.len < needle.len:
+        return text.len
+    for index in 0..<(text.len - needle.len + 1.usize()) |text, needle|:
+        if text[index:index + needle.len] == needle:
             return index
-    return sview_len(text)
+    return text.len
 """,
     "easm_equal": """
 def easm_equal(a: sview, b: sview) -> bool:
-    return sview_len(a) == sview_len(b) and easm_starts(a, b)
+    return a.len == b.len and easm_starts(a, b)
 """,
     "easm_starts": """
 def easm_starts(text: sview, prefix: sview) -> bool:
-    false return if sview_len(text) < sview_len(prefix)
-    for index in 0..<sview_len(prefix) |text, prefix|:
-        false return if sview_at(text, index) != sview_at(prefix, index)
+    false return if text.len < prefix.len
+    for index in 0..<prefix.len |text, prefix|:
+        false return if text[index] != prefix[index]
     return true
 """,
 }
@@ -416,10 +416,10 @@ for name, expected in expected_operand_parsers.items():
         raise SystemExit(f"EASM operand decoder changed: {name}")
 expected_first_space = """
 def easm_first_space(text: sview) -> usize:
-    for index in 0..<sview_len(text) |text|:
-        if sview_at(text, index) == 32 or sview_at(text, index) == 9:
+    for index in 0..<text.len |text|:
+        if text[index] == 32 or text[index] == 9:
             return index
-    return sview_len(text)
+    return text.len
 """
 if compact(function_section(VERIFY_FUNCTION.read_text(), "easm_first_space")) != compact(expected_first_space):
     raise SystemExit("EASM mnemonic/operand boundary scan changed")
@@ -428,32 +428,32 @@ expected_memory_helpers = {
     "easm_memory_base_register": """
 def easm_memory_base_register(operand: sview) -> sview:
     open: usize = easm_find(operand, "(")
-    if open >= sview_len(operand):
+    if open >= operand.len:
         return ""
-    close: usize = easm_find(operand[open:sview_len(operand)], ")") + open
+    close: usize = easm_find(operand[open:operand.len], ")") + open
     if close <= open:
         return ""
     inside: mutable sview = operand[open + 1.usize():close]
     comma: usize = easm_find(inside, ",")
-    if comma < sview_len(inside):
+    if comma < inside.len:
         inside <- inside[0:comma]
     return easm_register_operand(inside)
 """,
     "easm_memory_index_register": """
 def easm_memory_index_register(operand: sview) -> sview:
     open: usize = easm_find(operand, "(")
-    if open >= sview_len(operand):
+    if open >= operand.len:
         return ""
-    close: usize = easm_find(operand[open:sview_len(operand)], ")") + open
+    close: usize = easm_find(operand[open:operand.len], ")") + open
     if close <= open:
         return ""
     inside: sview = operand[open + 1.usize():close]
     comma: usize = easm_find(inside, ",")
-    if comma >= sview_len(inside):
+    if comma >= inside.len:
         return ""
-    rest: mutable sview = inside[comma + 1.usize():sview_len(inside)]
+    rest: mutable sview = inside[comma + 1.usize():inside.len]
     second_comma: usize = easm_find(rest, ",")
-    if second_comma < sview_len(rest):
+    if second_comma < rest.len:
         rest <- rest[0:second_comma]
     return easm_register_operand(rest)
 """,

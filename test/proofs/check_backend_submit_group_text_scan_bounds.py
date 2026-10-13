@@ -141,8 +141,8 @@ for function_name, expected_sha256 in FUNCTION_SHA256.items():
 # an indexed read moved before its guard, and a return that skips all scanning.
 classifier = function_section(source_text, "submit_group_ascii_identifier_char")
 classifier_mutation = classifier.replace(
-    "            return false if offset >= sview_len(text)\n",
-    "            character: u8 = sview_at(text, offset)\n            return false if offset >= sview_len(text)\n",
+    "            return false if offset >= text.len\n",
+    "            character: u8 = text[offset]\n            return false if offset >= text.len\n",
     1,
 )
 if classifier_mutation == classifier or function_fingerprint(classifier_mutation, "submit_group_ascii_identifier_char") == FUNCTION_SHA256["submit_group_ascii_identifier_char"]:
@@ -150,31 +150,31 @@ if classifier_mutation == classifier or function_fingerprint(classifier_mutation
 scanner = function_section(source_text, "submit_group_raw_text_mentions_name")
 scanner_mutations = (
     scanner.replace(
-        "            for offset in 0..<text_length:\n                return true if sview_at(text, offset) >= 128\n",
-        "            sview_at(text, text_length)\n            for offset in 0..<text_length:\n                return true if sview_at(text, offset) >= 128\n",
+        "            for offset in 0..<text_length:\n                return true if text[offset] >= 128\n",
+        "            text[text_length]\n            for offset in 0..<text_length:\n                return true if text[offset] >= 128\n",
         1,
     ),
     scanner.replace(
-        "            name_length: usize = sview_len(name)\n",
-        "            name_length: usize = sview_len(name)\n            return false\n",
+        "            name_length: usize = name.len\n",
+        "            name_length: usize = name.len\n            return false\n",
         1,
     ),
 )
 if any(mutated == scanner or function_fingerprint(mutated, "submit_group_raw_text_mentions_name") == FUNCTION_SHA256["submit_group_raw_text_mentions_name"] for mutated in scanner_mutations):
     raise SystemExit("scanner mutation control failed to detect an early out-of-bounds read or skipped scan")
 exact_steps(source_text, "submit_group_ascii_identifier_char", (
-    (4, "return false if offset >= sview_len(text)"),
-    (4, "character: u8 = sview_at(text, offset)"),
+    (4, "return false if offset >= text.len"),
+    (4, "character: u8 = text[offset]"),
     (4, "return character == 95 or character == 36 or character in 48..57 or character in 65..90 or character in 97..122"),
 ), "submit ASCII identifier-byte classifier")
 exact_steps(source_text, "submit_group_raw_text_mentions_name", (
     (4, 'return false if name == ""'),
-    (4, "text_length: usize = sview_len(text)"),
-    (4, "name_length: usize = sview_len(name)"),
+    (4, "text_length: usize = text.len"),
+    (4, "name_length: usize = name.len"),
     (4, "for offset in 0..<text_length:"),
-    (8, "return true if sview_at(text, offset) >= 128"),
+    (8, "return true if text[offset] >= 128"),
     (4, "for offset in 0..<name_length:"),
-    (8, "return true if sview_at(name, offset) >= 128"),
+    (8, "return true if name[offset] >= 128"),
     (4, "for offset in 0..<text_length:"),
     (8, "if name_length <= text_length - offset:"),
     (12, "end: usize = offset + name_length"),
@@ -217,7 +217,7 @@ source_bindings = {
     "offset": (
         "for offset in 0..<text_length:",
         "for offset in 0..<name_length:",
-        "return false if offset >= sview_len(text)",
+        "return false if offset >= text.len",
     ),
     "span": (
         "if name_length <= text_length - offset:",

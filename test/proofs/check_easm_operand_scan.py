@@ -151,24 +151,24 @@ def is_aarch64_mrs_form(result_register: sview, system_register: sview) -> bool:
     ensure result == (
         system_register == "cntvct_el0" and
         (result_register == "xzr" or
-            (sview_len(result_register) == 2 and sview_at(result_register, 0) == ASCII_X and
-                sview_at(result_register, 1) >= ASCII_ZERO and sview_at(result_register, 1) <= ASCII_NINE) or
-            (sview_len(result_register) == 3 and sview_at(result_register, 0) == ASCII_X and
-                (((sview_at(result_register, 1) == ASCII_ONE or sview_at(result_register, 1) == ASCII_TWO) and
-                    sview_at(result_register, 2) >= ASCII_ZERO and sview_at(result_register, 2) <= ASCII_NINE) or
-                    (sview_at(result_register, 1) == ASCII_THREE and sview_at(result_register, 2) == ASCII_ZERO)))
+            (result_register.len == 2 and result_register[0] == ASCII_X and
+                result_register[1] >= ASCII_ZERO and result_register[1] <= ASCII_NINE) or
+            (result_register.len == 3 and result_register[0] == ASCII_X and
+                (((result_register[1] == ASCII_ONE or result_register[1] == ASCII_TWO) and
+                    result_register[2] >= ASCII_ZERO and result_register[2] <= ASCII_NINE) or
+                    (result_register[1] == ASCII_THREE and result_register[2] == ASCII_ZERO)))
         )
     )
     if system_register != "cntvct_el0":
         return false
     if result_register == "xzr":
         return true
-    if sview_len(result_register) == 2 and sview_at(result_register, 0) == ASCII_X:
-        digit: u8 = sview_at(result_register, 1)
+    if result_register.len == 2 and result_register[0] == ASCII_X:
+        digit: u8 = result_register[1]
         return digit >= ASCII_ZERO and digit <= ASCII_NINE
-    if sview_len(result_register) == 3 and sview_at(result_register, 0) == ASCII_X:
-        tens: u8 = sview_at(result_register, 1)
-        ones: u8 = sview_at(result_register, 2)
+    if result_register.len == 3 and result_register[0] == ASCII_X:
+        tens: u8 = result_register[1]
+        ones: u8 = result_register[2]
         return ((tens == ASCII_ONE and ones >= ASCII_ZERO and ones <= ASCII_NINE) or
             (tens == ASCII_TWO and ones >= ASCII_ZERO and ones <= ASCII_NINE) or
             (tens == ASCII_THREE and ones == ASCII_ZERO))
@@ -206,22 +206,22 @@ def rejects_unresolved_conditional_target(is_conditional_jump: bool, target_is_l
 expected_exact_register = """
 def exact_register_form(operand: sview, register_name: sview) -> bool:
     ensure result == (
-        (sview_len(operand) == sview_len(register_name) + SCAN_STEP and
-            sview_len(operand) > 0 and sview_at(operand, 0) == ASCII_PERCENT and
-            operand[SCAN_STEP:sview_len(operand)] == register_name) or
-        (sview_len(operand) == sview_len(register_name) + INDIRECT_REGISTER_PREFIX_LENGTH and
-            sview_len(operand) >= INDIRECT_REGISTER_PREFIX_LENGTH and sview_at(operand, 0) == ASCII_STAR and
-            sview_at(operand, 1) == ASCII_PERCENT and
-            operand[INDIRECT_REGISTER_PREFIX_LENGTH:sview_len(operand)] == register_name)
+        (operand.len == register_name.len + SCAN_STEP and
+            operand.len > 0 and operand[0] == ASCII_PERCENT and
+            operand[SCAN_STEP:operand.len] == register_name) or
+        (operand.len == register_name.len + INDIRECT_REGISTER_PREFIX_LENGTH and
+            operand.len >= INDIRECT_REGISTER_PREFIX_LENGTH and operand[0] == ASCII_STAR and
+            operand[1] == ASCII_PERCENT and
+            operand[INDIRECT_REGISTER_PREFIX_LENGTH:operand.len] == register_name)
     )
     return (
-        (sview_len(operand) == sview_len(register_name) + SCAN_STEP and
-            sview_len(operand) > 0 and sview_at(operand, 0) == ASCII_PERCENT and
-            operand[SCAN_STEP:sview_len(operand)] == register_name) or
-        (sview_len(operand) == sview_len(register_name) + INDIRECT_REGISTER_PREFIX_LENGTH and
-            sview_len(operand) >= INDIRECT_REGISTER_PREFIX_LENGTH and sview_at(operand, 0) == ASCII_STAR and
-            sview_at(operand, 1) == ASCII_PERCENT and
-            operand[INDIRECT_REGISTER_PREFIX_LENGTH:sview_len(operand)] == register_name)
+        (operand.len == register_name.len + SCAN_STEP and
+            operand.len > 0 and operand[0] == ASCII_PERCENT and
+            operand[SCAN_STEP:operand.len] == register_name) or
+        (operand.len == register_name.len + INDIRECT_REGISTER_PREFIX_LENGTH and
+            operand.len >= INDIRECT_REGISTER_PREFIX_LENGTH and operand[0] == ASCII_STAR and
+            operand[1] == ASCII_PERCENT and
+            operand[INDIRECT_REGISTER_PREFIX_LENGTH:operand.len] == register_name)
     )
 """
 if compact(function_section(policy, "exact_register_form")) != compact(expected_exact_register):
@@ -229,17 +229,17 @@ if compact(function_section(policy, "exact_register_form")) != compact(expected_
 expected_direct_target = """
 def is_direct_control_target(op: sview, operand: sview, is_final_operand: bool) -> bool:
     ensure result == (
-        is_final_operand and sview_len(operand) > 0 and
-        sview_at(operand, 0) != ASCII_PERCENT and sview_at(operand, 0) != ASCII_DOLLAR and
-        sview_at(operand, 0) != ASCII_STAR and sview_at(operand, 0) != ASCII_LEFT_PAREN and
-        sview_at(operand, 0) != ASCII_LEFT_BRACKET and
-        EasmTextScan::find(operand, ":") == sview_len(operand) and
+        is_final_operand and operand.len > 0 and
+        operand[0] != ASCII_PERCENT and operand[0] != ASCII_DOLLAR and
+        operand[0] != ASCII_STAR and operand[0] != ASCII_LEFT_PAREN and
+        operand[0] != ASCII_LEFT_BRACKET and
+        EasmTextScan::find(operand, ":") == operand.len and
         (op == "call" or op == "callq" or op == "jmp" or op == "jmpq" or
             op == "je" or op == "jz" or op == "jne" or op == "jnz" or
             op == "jl" or op == "jle" or op == "jg" or op == "jge" or
             op == "jb" or op == "jbe" or op == "ja" or op == "jae")
     )
-    return is_final_operand and sview_len(operand) > 0 and sview_at(operand, 0) != ASCII_PERCENT and sview_at(operand, 0) != ASCII_DOLLAR and sview_at(operand, 0) != ASCII_STAR and sview_at(operand, 0) != ASCII_LEFT_PAREN and sview_at(operand, 0) != ASCII_LEFT_BRACKET and EasmTextScan::find(operand, ":") == sview_len(operand) and (op == "call" or op == "callq" or op == "jmp" or op == "jmpq" or op == "je" or op == "jz" or op == "jne" or op == "jnz" or op == "jl" or op == "jle" or op == "jg" or op == "jge" or op == "jb" or op == "jbe" or op == "ja" or op == "jae")
+    return is_final_operand and operand.len > 0 and operand[0] != ASCII_PERCENT and operand[0] != ASCII_DOLLAR and operand[0] != ASCII_STAR and operand[0] != ASCII_LEFT_PAREN and operand[0] != ASCII_LEFT_BRACKET and EasmTextScan::find(operand, ":") == operand.len and (op == "call" or op == "callq" or op == "jmp" or op == "jmpq" or op == "je" or op == "jz" or op == "jne" or op == "jnz" or op == "jl" or op == "jle" or op == "jg" or op == "jge" or op == "jb" or op == "jbe" or op == "ja" or op == "jae")
 """
 if compact(function_section(policy, "is_direct_control_target")) != compact(expected_direct_target):
     raise SystemExit("direct control-target classifier no longer matches its exact target syntax and opcode set")
@@ -250,21 +250,21 @@ for required in (
     'open_relative: usize = EasmTextScan::find(operands, "(")',
     'close_relative: usize = EasmTextScan::find(operands, ")")',
     'close_after_open: usize = EasmTextScan::find(after_open, ")")',
-    'EasmTextScan::find(address_contents, "(") < sview_len(address_contents)',
-    'EasmTextScan::find(trailing, "(") < sview_len(trailing)',
-    'EasmTextScan::find(trailing, ")") < sview_len(trailing)',
+    'EasmTextScan::find(address_contents, "(") < address_contents.len',
+    'EasmTextScan::find(trailing, "(") < trailing.len',
+    'EasmTextScan::find(trailing, ")") < trailing.len',
     "first_separator: usize = next_top_level_separator(text, start, has_address, open, close)",
     "second_separator: usize = next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
     "return (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
-    "ensure result.valid or ( result.count == 0 and result.first_separator == sview_len(text) and result.last_separator == sview_len(text) and not result.has_address_group and result.address_open == sview_len(text) and result.address_close == sview_len(text) )",
-    "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<sview_len(text): sview_at(text, candidate) != ASCII_LEFT_PAREN and sview_at(text, candidate) != ASCII_RIGHT_PAREN )",
-    "ensure result.valid and result.has_address_group implies ( forall candidate in result.start..<result.address_open: sview_at(text, candidate) != ASCII_LEFT_PAREN and sview_at(text, candidate) != ASCII_RIGHT_PAREN )",
-    "ensure result.valid and result.has_address_group implies ( forall candidate in result.address_open + SCAN_STEP..<result.address_close: sview_at(text, candidate) != ASCII_LEFT_PAREN and sview_at(text, candidate) != ASCII_RIGHT_PAREN )",
-    "ensure result.valid and result.has_address_group implies ( forall candidate in result.address_close + SCAN_STEP..<sview_len(text): sview_at(text, candidate) != ASCII_LEFT_PAREN and sview_at(text, candidate) != ASCII_RIGHT_PAREN )",
-    "ensure result.valid and result.count == 0 implies ( result.start == sview_len(text) and result.first_separator == sview_len(text) and result.last_separator == sview_len(text) and not result.has_address_group and result.address_open == sview_len(text) and result.address_close == sview_len(text) )",
-    "ensure result.valid and result.count == 1 implies ( result.first_separator == sview_len(text) and result.last_separator == sview_len(text) and result.start < sview_len(text) and first_operand_byte(text[result.start:sview_len(text)], 0.usize()) < sview_len(text[result.start:sview_len(text)]) and next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) == sview_len(text) )",
-    "ensure result.valid and result.count == 2 implies ( result.first_separator < sview_len(text) and result.first_separator == result.last_separator and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close) == sview_len(text)",
-    "ensure result.valid and result.count == TOO_MANY_OPERANDS_SENTINEL implies ( result.first_separator < result.last_separator and result.last_separator < sview_len(text) and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and result.last_separator == next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close)",
+    "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
+    "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
+    "ensure result.valid and result.has_address_group implies ( forall candidate in result.start..<result.address_open: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
+    "ensure result.valid and result.has_address_group implies ( forall candidate in result.address_open + SCAN_STEP..<result.address_close: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
+    "ensure result.valid and result.has_address_group implies ( forall candidate in result.address_close + SCAN_STEP..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
+    "ensure result.valid and result.count == 0 implies ( result.start == text.len and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
+    "ensure result.valid and result.count == 1 implies ( result.first_separator == text.len and result.last_separator == text.len and result.start < text.len and first_operand_byte(text[result.start:text.len], 0.usize()) < (text[result.start:text.len]).len and next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) == text.len )",
+    "ensure result.valid and result.count == 2 implies ( result.first_separator < text.len and result.first_separator == result.last_separator and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close) == text.len",
+    "ensure result.valid and result.count == TOO_MANY_OPERANDS_SENTINEL implies ( result.first_separator < result.last_separator and result.last_separator < text.len and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and result.last_separator == next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close)",
 ):
     if required not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
@@ -273,7 +273,7 @@ if "decreases text_length - index" not in first_operand_scan or "invariant from 
     raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
 next_separator = compact(function_section(policy, "next_top_level_separator"))
 for required in (
-    "result >= from and sview_at(text, result) == ASCII_COMMA",
+    "result >= from and text[result] == ASCII_COMMA",
     "forall candidate in from..<result",
     'prefix_comma: usize = EasmTextScan::find(prefix, ",")',
     'suffix_comma: usize = EasmTextScan::find(suffix, ",")',
@@ -291,18 +291,18 @@ def easm_first_operand(text: sview) -> sview:
     scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text)
     if not scan.valid or scan.count == 0:
         return ""
-    if scan.first_separator < sview_len(text):
+    if scan.first_separator < text.len:
         return easm_trim(text[scan.start:scan.first_separator])
-    return easm_trim(text[scan.start:sview_len(text)])
+    return easm_trim(text[scan.start:text.len])
 """
 expected_last = """
 def easm_last_operand(text: sview) -> sview:
     scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text)
     if not scan.valid or scan.count == 0:
         return ""
-    if scan.last_separator < sview_len(text):
-        return easm_trim(text[scan.last_separator + 1.usize():sview_len(text)])
-    return easm_trim(text[scan.start:sview_len(text)])
+    if scan.last_separator < text.len:
+        return easm_trim(text[scan.last_separator + 1.usize():text.len])
+    return easm_trim(text[scan.start:text.len])
 """
 if compact(function_section(PROVENANCE.read_text(), "easm_first_operand")) != compact(expected_first):
     raise SystemExit("first-operand parsing no longer uses the proved top-level separator scan")
@@ -324,10 +324,10 @@ if arity_role_check not in instruction_code:
 if instruction_code.index("needs_arity_rejection(operand_scan.count)") > instruction_code.index("capability: sview = easm_required_capability(inst.op)"):
     raise SystemExit("operand arity rejection must precede all per-instruction effect analysis")
 for required in (
-    "if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT: source_end: usize = operand_scan.first_separator if operand_scan.first_separator < sview_len(inst.text) else sview_len(inst.text)",
+    "if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT: source_end: usize = operand_scan.first_separator if operand_scan.first_separator < inst.text.len else inst.text.len",
     "source_operand <- easm_substitute_operand(easm_trim(inst.text[operand_scan.start:source_end]), inst)",
-    "destination_start: usize = operand_scan.last_separator + 1.usize() if operand_scan.last_separator < sview_len(inst.text) else operand_scan.start",
-    "destination_operand <- easm_substitute_operand(easm_trim(inst.text[destination_start:sview_len(inst.text)]), inst)",
+    "destination_start: usize = operand_scan.last_separator + 1.usize() if operand_scan.last_separator < inst.text.len else operand_scan.start",
+    "destination_operand <- easm_substitute_operand(easm_trim(inst.text[destination_start:inst.text.len]), inst)",
     "unmodeled_operand <- true if operand_scan.count == 2 and source_memory_operand and destination_memory_operand",
     "unmodeled_operand <- true if is_lea and (operand_scan.count != 2 or not source_memory_operand or not lea_destination_is_direct_register)",
     "not EasmOperandScan::operand_arity_supported(inst.op, operand_scan.count)",
@@ -335,7 +335,7 @@ for required in (
     "operand: sview = source_operand if operand_index == 0 else destination_operand",
     "is_final_operand: bool = operand_index == 1 or operand_scan.count == 1",
     "register_operand: bool = EasmOperandScan::exact_register_form(operand, parsed_register)",
-    "immediate_operand: bool = sview_at(operand, 0) == EasmOperandScan::ASCII_DOLLAR",
+    "immediate_operand: bool = operand[0] == EasmOperandScan::ASCII_DOLLAR",
     "direct_target: bool = EasmOperandScan::is_direct_control_target(inst.op, operand, is_final_operand)",
     "EasmOperandScan::rejects_unmodeled_operand_form(",
     "EasmOperandScan::rejects_return_immediate(inst.op, immediate_operand)",
@@ -347,13 +347,13 @@ if instruction_code.index("unsupported-operand-form") > instruction_code.index("
     raise SystemExit("operand-form rejection must precede all per-instruction effect analysis")
 role_source = FUNCTION.read_text()
 role_expectations = {
-    "easm_operand_is_direct_register": "return sview_len(operand) > 0 and sview_at(operand, 0) == EasmOperandScan::ASCII_PERCENT and EasmOperandScan::exact_register_form(operand, register) and easm_register_bit(register) != 0",
+    "easm_operand_is_direct_register": "return operand.len > 0 and operand[0] == EasmOperandScan::ASCII_PERCENT and EasmOperandScan::exact_register_form(operand, register) and easm_register_bit(register) != 0",
     "easm_operand_is_segment_register": 'return operand == "%fs" or operand == "%gs"',
     "easm_operand_is_supported_memory": 'base_supported: bool = base == "" or base == "rip" or easm_register_bit(base) != 0 index_supported: bool = index == "" or (easm_register_bit(index) != 0 and easm_register_bit(index) != EasmRegisterMasks::RSP) return base_supported and index_supported',
     "easm_operand_is_data_source": "return easm_operand_is_direct_register(operand) or easm_operand_is_supported_memory(operand) or easm_operand_is_immediate(operand)",
     "easm_operand_is_writable": "return easm_operand_is_direct_register(operand) or easm_operand_is_supported_memory(operand)",
     "easm_move_operand_roles_supported": "false return if source_segment and destination_segment if source_segment: return easm_operand_is_writable(destination) if destination_segment: return (easm_operand_is_direct_register(source) or easm_operand_is_supported_memory(source)) and not easm_operand_is_immediate(source) return easm_operand_is_data_source(source) and easm_operand_is_writable(destination)",
-    "easm_operand_is_control_target": "true return if EasmOperandScan::is_direct_control_target(op, operand, true) and not easm_memory_operand(operand) false return if not easm_is_call_or_unconditional_jump(op) false return if sview_len(operand) < EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH or sview_at(operand, 0) != EasmOperandScan::ASCII_STAR indirect_operand: sview = easm_trim(operand[1:sview_len(operand)]) return easm_operand_is_direct_register(indirect_operand) or easm_operand_is_supported_memory(indirect_operand)",
+    "easm_operand_is_control_target": "true return if EasmOperandScan::is_direct_control_target(op, operand, true) and not easm_memory_operand(operand) false return if not easm_is_call_or_unconditional_jump(op) false return if operand.len < EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH or operand[0] != EasmOperandScan::ASCII_STAR indirect_operand: sview = easm_trim(operand[1:operand.len]) return easm_operand_is_direct_register(indirect_operand) or easm_operand_is_supported_memory(indirect_operand)",
     "easm_instruction_operand_roles_supported": "if op == \"push\" or op == \"pushq\": return easm_operand_is_data_source(source) or easm_operand_is_segment_register(source) if op == \"pop\" or op == \"popq\": return easm_operand_is_writable(destination) or easm_operand_is_segment_register(destination)",
 }
 for helper, expected_fragment in role_expectations.items():
@@ -382,7 +382,7 @@ def easm_register_bit(register: sview) -> i64:
 """):
     raise SystemExit("register lookup no longer delegates exactly to the canonical EASM register map")
 register_bit_source = compact(MASKS.read_text())
-if "_ -> 0" not in register_bit_source or "_: 0" not in register_bit_source:
+if compact("_ -> result == 0") not in register_bit_source or compact("_: 0") not in register_bit_source:
     raise SystemExit("unknown register names must map to no modeled register bit")
 if "EasmOperandScan::is_aarch64_mrs_form" in role_body:
     raise SystemExit("executable MRS must fail closed until its AArch64 register effects are modeled")
@@ -511,7 +511,7 @@ expected_positive = {
     "indexed_address_commas_stay_inside_one_operand": (
         'ensure result == true text: sview = "movq (%rax,%rcx,8), %rbx" ' + scan_decl + ' return ( scan.valid and scan.count == 2 and '
         'text[scan.start:scan.first_separator] == "(%rax,%rcx,8)" and '
-        'text[scan.last_separator + 1.usize():sview_len(text)] == "%rbx" )'
+        'text[scan.last_separator + 1.usize():text.len] == "%rbx" )'
     ),
     "three_top_level_operands_exceed_the_modeled_limit": (
         'ensure result == true text: sview = "shld %cl, %rbx, (%rax)" ' + scan_decl + ' return scan.valid and scan.count == 3 and '
@@ -536,34 +536,34 @@ expected_positive = {
     ),
     "scan_records_exact_top_level_separator_prefix": (
         "ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text) "
-        "if not scan.valid: return scan.count == 0 and scan.first_separator == sview_len(text) and scan.last_separator == sview_len(text) and not scan.has_address_group "
-        "if scan.count == 0: return (scan.start == sview_len(text) and scan.first_separator == sview_len(text) and scan.last_separator == sview_len(text) and not scan.has_address_group and scan.address_open == sview_len(text) and scan.address_close == sview_len(text) ) "
-        "if scan.count == 1: return (scan.first_separator == sview_len(text) and scan.last_separator == sview_len(text) and scan.start < sview_len(text) and EasmOperandScan::first_operand_byte(text[scan.start:sview_len(text)], 0.usize()) < sview_len(text[scan.start:sview_len(text)]) and EasmOperandScan::next_top_level_separator(text, scan.start, scan.has_address_group, scan.address_open, scan.address_close) == sview_len(text) ) "
+        "if not scan.valid: return scan.count == 0 and scan.first_separator == text.len and scan.last_separator == text.len and not scan.has_address_group "
+        "if scan.count == 0: return (scan.start == text.len and scan.first_separator == text.len and scan.last_separator == text.len and not scan.has_address_group and scan.address_open == text.len and scan.address_close == text.len ) "
+        "if scan.count == 1: return (scan.first_separator == text.len and scan.last_separator == text.len and scan.start < text.len and EasmOperandScan::first_operand_byte(text[scan.start:text.len], 0.usize()) < (text[scan.start:text.len]).len and EasmOperandScan::next_top_level_separator(text, scan.start, scan.has_address_group, scan.address_open, scan.address_close) == text.len ) "
         "first: usize = EasmOperandScan::next_top_level_separator(text, scan.start, scan.has_address_group, scan.address_open, scan.address_close) "
-        "if scan.count == 2: return (scan.first_separator == first and scan.last_separator == first and EasmOperandScan::next_top_level_separator(text, first + 1.usize(), scan.has_address_group, scan.address_open, scan.address_close) == sview_len(text) ) "
+        "if scan.count == 2: return (scan.first_separator == first and scan.last_separator == first and EasmOperandScan::next_top_level_separator(text, first + 1.usize(), scan.has_address_group, scan.address_open, scan.address_close) == text.len ) "
         "second: usize = EasmOperandScan::next_top_level_separator(text, first + 1.usize(), scan.has_address_group, scan.address_open, scan.address_close) "
         "return scan.count == EasmOperandScan::TOO_MANY_OPERANDS_SENTINEL and scan.first_separator == first and scan.last_separator == second"
     ),
     "valid_scan_exposes_only_its_delimited_address_pair": (
         "ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text) "
         "if not scan.valid: return true "
-        "if scan.has_address_group: return (scan.start <= scan.address_open and scan.address_open < scan.address_close and scan.address_close < sview_len(text) and sview_at(text, scan.address_open) == EasmOperandScan::ASCII_LEFT_PAREN and sview_at(text, scan.address_close) == EasmOperandScan::ASCII_RIGHT_PAREN and "
-        "(forall candidate in scan.start..<scan.address_open: sview_at(text, candidate) != EasmOperandScan::ASCII_LEFT_PAREN and sview_at(text, candidate) != EasmOperandScan::ASCII_RIGHT_PAREN) and "
-        "(forall candidate in scan.address_open + 1.usize()..<scan.address_close: sview_at(text, candidate) != EasmOperandScan::ASCII_LEFT_PAREN and sview_at(text, candidate) != EasmOperandScan::ASCII_RIGHT_PAREN) and "
-        "(forall candidate in scan.address_close + 1.usize()..<sview_len(text): sview_at(text, candidate) != EasmOperandScan::ASCII_LEFT_PAREN and sview_at(text, candidate) != EasmOperandScan::ASCII_RIGHT_PAREN) ) "
-        "return (scan.address_open == sview_len(text) and scan.address_close == sview_len(text) and "
-        "(forall candidate in scan.start..<sview_len(text): sview_at(text, candidate) != EasmOperandScan::ASCII_LEFT_PAREN and sview_at(text, candidate) != EasmOperandScan::ASCII_RIGHT_PAREN) )"
+        "if scan.has_address_group: return (scan.start <= scan.address_open and scan.address_open < scan.address_close and scan.address_close < text.len and text[scan.address_open] == EasmOperandScan::ASCII_LEFT_PAREN and text[scan.address_close] == EasmOperandScan::ASCII_RIGHT_PAREN and "
+        "(forall candidate in scan.start..<scan.address_open: text[candidate] != EasmOperandScan::ASCII_LEFT_PAREN and text[candidate] != EasmOperandScan::ASCII_RIGHT_PAREN) and "
+        "(forall candidate in scan.address_open + 1.usize()..<scan.address_close: text[candidate] != EasmOperandScan::ASCII_LEFT_PAREN and text[candidate] != EasmOperandScan::ASCII_RIGHT_PAREN) and "
+        "(forall candidate in scan.address_close + 1.usize()..<text.len: text[candidate] != EasmOperandScan::ASCII_LEFT_PAREN and text[candidate] != EasmOperandScan::ASCII_RIGHT_PAREN) ) "
+        "return (scan.address_open == text.len and scan.address_close == text.len and "
+        "(forall candidate in scan.start..<text.len: text[candidate] != EasmOperandScan::ASCII_LEFT_PAREN and text[candidate] != EasmOperandScan::ASCII_RIGHT_PAREN) )"
     ),
     "first_operand_byte_is_the_least_non_whitespace": (
-        "requires from <= sview_len(text) ensure result == true index: usize = EasmOperandScan::first_operand_byte(text, from) return ((index == sview_len(text) and "
-        "(forall candidate in from..<sview_len(text): sview_at(text, candidate) == EasmOperandScan::ASCII_SPACE or sview_at(text, candidate) == EasmOperandScan::ASCII_TAB)) or "
-        "(index < sview_len(text) and sview_at(text, index) != EasmOperandScan::ASCII_SPACE and sview_at(text, index) != EasmOperandScan::ASCII_TAB and "
-        "(forall candidate in from..<index: sview_at(text, candidate) == EasmOperandScan::ASCII_SPACE or sview_at(text, candidate) == EasmOperandScan::ASCII_TAB)))"
+        "requires from <= text.len ensure result == true index: usize = EasmOperandScan::first_operand_byte(text, from) return ((index == text.len and "
+        "(forall candidate in from..<text.len: text[candidate] == EasmOperandScan::ASCII_SPACE or text[candidate] == EasmOperandScan::ASCII_TAB)) or "
+        "(index < text.len and text[index] != EasmOperandScan::ASCII_SPACE and text[index] != EasmOperandScan::ASCII_TAB and "
+        "(forall candidate in from..<index: text[candidate] == EasmOperandScan::ASCII_SPACE or text[candidate] == EasmOperandScan::ASCII_TAB)))"
     ),
     "next_separator_is_the_first_comma_outside_address": (
-        "requires from <= sview_len(text) and open <= sview_len(text) and close <= sview_len(text) ensure result == true separator: usize = EasmOperandScan::next_top_level_separator(text, from, has_address, open, close) "
-        "return ((separator == sview_len(text) or (separator >= from and sview_at(text, separator) == EasmOperandScan::ASCII_COMMA and (not has_address or separator < open or separator > close))) and "
-        "(forall candidate in from..<separator: sview_at(text, candidate) != EasmOperandScan::ASCII_COMMA or (has_address and candidate >= open and candidate <= close)))"
+        "requires from <= text.len and open <= text.len and close <= text.len ensure result == true separator: usize = EasmOperandScan::next_top_level_separator(text, from, has_address, open, close) "
+        "return ((separator == text.len or (separator >= from and text[separator] == EasmOperandScan::ASCII_COMMA and (not has_address or separator < open or separator > close))) and "
+        "(forall candidate in from..<separator: text[candidate] != EasmOperandScan::ASCII_COMMA or (has_address and candidate >= open and candidate <= close)))"
     ),
     "zero_operand_opcode_classifier_matches_its_exact_set": (
         'ensure result == true return EasmOperandScan::is_zero_operand_instruction(op) == ( op == "ret" or op == "retq" or op == "cpuid" or op == "cld" or op == "std" or '
@@ -602,13 +602,13 @@ expected_positive = {
     ),
     "exact_register_form_matches_its_complete_token_equation": (
         "ensure result == true return EasmOperandScan::exact_register_form(operand, register_name) == ( "
-        "(sview_len(operand) == sview_len(register_name) + EasmOperandScan::SCAN_STEP and sview_len(operand) > 0 and sview_at(operand, 0) == EasmOperandScan::ASCII_PERCENT and operand[EasmOperandScan::SCAN_STEP:sview_len(operand)] == register_name) or "
-        "(sview_len(operand) == sview_len(register_name) + EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and sview_len(operand) >= EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and sview_at(operand, 0) == EasmOperandScan::ASCII_STAR and sview_at(operand, 1) == EasmOperandScan::ASCII_PERCENT and operand[EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH:sview_len(operand)] == register_name) )"
+        "(operand.len == register_name.len + EasmOperandScan::SCAN_STEP and operand.len > 0 and operand[0] == EasmOperandScan::ASCII_PERCENT and operand[EasmOperandScan::SCAN_STEP:operand.len] == register_name) or "
+        "(operand.len == register_name.len + EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and operand.len >= EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and operand[0] == EasmOperandScan::ASCII_STAR and operand[1] == EasmOperandScan::ASCII_PERCENT and operand[EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH:operand.len] == register_name) )"
     ),
     "direct_control_target_classifier_matches_its_exact_set": (
-        "ensure result == true return EasmOperandScan::is_direct_control_target(op, operand, is_final_operand) == ( is_final_operand and sview_len(operand) > 0 and "
-        "sview_at(operand, 0) != EasmOperandScan::ASCII_PERCENT and sview_at(operand, 0) != EasmOperandScan::ASCII_DOLLAR and sview_at(operand, 0) != EasmOperandScan::ASCII_STAR and "
-        "sview_at(operand, 0) != EasmOperandScan::ASCII_LEFT_PAREN and sview_at(operand, 0) != EasmOperandScan::ASCII_LEFT_BRACKET and EasmTextScan::find(operand, \":\") == sview_len(operand) and "
+        "ensure result == true return EasmOperandScan::is_direct_control_target(op, operand, is_final_operand) == ( is_final_operand and operand.len > 0 and "
+        "operand[0] != EasmOperandScan::ASCII_PERCENT and operand[0] != EasmOperandScan::ASCII_DOLLAR and operand[0] != EasmOperandScan::ASCII_STAR and "
+        "operand[0] != EasmOperandScan::ASCII_LEFT_PAREN and operand[0] != EasmOperandScan::ASCII_LEFT_BRACKET and EasmTextScan::find(operand, \":\") == operand.len and "
         '(op == "call" or op == "callq" or op == "jmp" or op == "jmpq" or op == "je" or op == "jz" or op == "jne" or op == "jnz" or op == "jl" or op == "jle" or op == "jg" or op == "jge" or op == "jb" or op == "jbe" or op == "ja" or op == "jae") )'
     ),
     "direct_call_symbol_target_is_classified_as_control": (
@@ -619,8 +619,8 @@ expected_positive = {
     ),
     "aarch64_mrs_form_classifier_matches_x0_through_x30_and_xzr": (
         "ensure result == true return EasmOperandScan::is_aarch64_mrs_form(result_register, system_register) == ( system_register == \"cntvct_el0\" and "
-        "(result_register == \"xzr\" or (sview_len(result_register) == 2 and sview_at(result_register, 0) == EasmOperandScan::ASCII_X and sview_at(result_register, 1) >= EasmOperandScan::ASCII_ZERO and sview_at(result_register, 1) <= EasmOperandScan::ASCII_NINE) or "
-        "(sview_len(result_register) == 3 and sview_at(result_register, 0) == EasmOperandScan::ASCII_X and (((sview_at(result_register, 1) == EasmOperandScan::ASCII_ONE or sview_at(result_register, 1) == EasmOperandScan::ASCII_TWO) and sview_at(result_register, 2) >= EasmOperandScan::ASCII_ZERO and sview_at(result_register, 2) <= EasmOperandScan::ASCII_NINE) or (sview_at(result_register, 1) == EasmOperandScan::ASCII_THREE and sview_at(result_register, 2) == EasmOperandScan::ASCII_ZERO))) ) )"
+        "(result_register == \"xzr\" or (result_register.len == 2 and result_register[0] == EasmOperandScan::ASCII_X and result_register[1] >= EasmOperandScan::ASCII_ZERO and result_register[1] <= EasmOperandScan::ASCII_NINE) or "
+        "(result_register.len == 3 and result_register[0] == EasmOperandScan::ASCII_X and (((result_register[1] == EasmOperandScan::ASCII_ONE or result_register[1] == EasmOperandScan::ASCII_TWO) and result_register[2] >= EasmOperandScan::ASCII_ZERO and result_register[2] <= EasmOperandScan::ASCII_NINE) or (result_register[1] == EasmOperandScan::ASCII_THREE and result_register[2] == EasmOperandScan::ASCII_ZERO))) ) )"
     ),
     "mrs_accepts_low_x_register": (
         'ensure result == true return EasmOperandScan::is_aarch64_mrs_form("x0", "cntvct_el0")'
@@ -652,12 +652,12 @@ expected_positive = {
     ),
     "segment_address_is_not_an_exact_register_operand": (
         'ensure result == true operand: sview = "%fs:0x28" register_name: sview = "fs" return not ( '
-        '(sview_len(operand) == sview_len(register_name) + EasmOperandScan::SCAN_STEP and sview_len(operand) > 0 and '
-        'sview_at(operand, 0) == EasmOperandScan::ASCII_PERCENT and operand[EasmOperandScan::SCAN_STEP:sview_len(operand)] == register_name) or '
-        '(sview_len(operand) == sview_len(register_name) + EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and '
-        'sview_len(operand) >= EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and '
-        'sview_at(operand, 0) == EasmOperandScan::ASCII_STAR and sview_at(operand, 1) == EasmOperandScan::ASCII_PERCENT and '
-        'operand[EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH:sview_len(operand)] == register_name) )'
+        '(operand.len == register_name.len + EasmOperandScan::SCAN_STEP and operand.len > 0 and '
+        'operand[0] == EasmOperandScan::ASCII_PERCENT and operand[EasmOperandScan::SCAN_STEP:operand.len] == register_name) or '
+        '(operand.len == register_name.len + EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and '
+        'operand.len >= EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH and '
+        'operand[0] == EasmOperandScan::ASCII_STAR and operand[1] == EasmOperandScan::ASCII_PERCENT and '
+        'operand[EasmOperandScan::INDIRECT_REGISTER_PREFIX_LENGTH:operand.len] == register_name) )'
     ),
 }
 for name, expected in expected_positive.items():
@@ -684,15 +684,15 @@ expected_negative = {
     ),
     "zero_operand_scan_has_non_sentinel_separator": (
         'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("ret") '
-        'return scan.valid and scan.count == 0 and scan.first_separator < sview_len("ret")'
+        'return scan.valid and scan.count == 0 and scan.first_separator < ("ret").len'
     ),
     "single_operand_scan_has_an_empty_operand": (
         'ensure result == true text: sview = "callq *(%rax)" scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text) '
-        "operand: sview = text[scan.start:sview_len(text)] return scan.valid and scan.count == 1 and EasmOperandScan::first_operand_byte(operand, 0.usize()) == sview_len(operand)"
+        "operand: sview = text[scan.start:text.len] return scan.valid and scan.count == 1 and EasmOperandScan::first_operand_byte(operand, 0.usize()) == operand.len"
     ),
     "next_separator_selects_a_comma_inside_address": (
         'ensure result == true text: sview = "(%rax,%rcx),%rbx" separator: usize = EasmOperandScan::next_top_level_separator(text, 0.usize(), true, 0.usize(), 10.usize()) '
-        "return separator < sview_len(text) and separator <= 10.usize()"
+        "return separator < text.len and separator <= 10.usize()"
     ),
     "cpuid_is_not_a_zero_operand_instruction": (
         'ensure result == true return not EasmOperandScan::is_zero_operand_instruction("cpuid")'

@@ -22,7 +22,7 @@ LAWS = ROOT / "src/parser/parser_machine_laws.elisa"
 PARSER = ROOT / "src/parser/parser.elisa"
 POSITIVE = HERE / "parser_machine_marker_prefix.elisa"
 NEGATIVE = HERE / "parser_machine_marker_prefix_rejected.elisa"
-PREFIX = "sview_len(marker) >= 3 and sview_at(marker, 0) == 35 and sview_at(marker, 1) == 45 and sview_at(marker, 2) == 62"
+PREFIX = "marker.len >= 3 and marker[0] == 35 and marker[1] == 45 and marker[2] == 62"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -57,9 +57,9 @@ if compact(f"return {PREFIX}") not in helper:
 matcher = compact(function_section(marker_text, "matches"))
 match_steps = (
     "false return if not has_prefix(marker)",
-    "false return if sview_len(marker) != sview_len(target) + 3",
-    "for index in 0..<sview_len(target):",
-    "return false if sview_at(marker, index + 3) != sview_at(target, index)",
+    "false return if marker.len != target.len + 3",
+    "for index in 0..<target.len:",
+    "return false if marker[index + 3] != target[index]",
     "return true",
 )
 match_positions = [matcher.find(compact(step)) for step in match_steps]
@@ -80,8 +80,8 @@ if compact("include \"./parser_stmt_machine.elisa\"") not in compact(PARSER.read
 generator = compact(function_section(parser_machine_text, "machine_transition_marker"))
 generator_steps = (
     "bytes: mutable darray[u8] = [35, 45, 62]",
-    "for index in 0..<sview_len(target) |bytes|:",
-    "bytes.push(sview_at(target, index))",
+    "for index in 0..<target.len |bytes|:",
+    "bytes.push(target[index])",
     "return NameStore::append(&parser.machine_name_store, bytes, parser.name_store_chunk())",
 )
 generator_positions = [generator.find(compact(step)) for step in generator_steps]

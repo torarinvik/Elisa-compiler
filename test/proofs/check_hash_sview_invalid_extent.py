@@ -99,7 +99,7 @@ required_steps = (
     "decreases view_len - i",
     "invariant i <= view_len",
     "invariant i.i64().usize() == i",
-    "invariant view_len == sview_len(value)",
+    "invariant view_len == value.len",
     f"invariant sview_fnv1a_fold_from(value, i, h) == sview_fnv1a_fold_from(value, 0.usize(), {INITIAL_STATE_NAME})",
     "ch: u8 = value[i].u8()",
     "h <- h ^ ch.u64()",

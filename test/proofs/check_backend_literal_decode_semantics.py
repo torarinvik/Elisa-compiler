@@ -119,7 +119,7 @@ decoder_steps = (
     "hex_available: usize = length - hex_start",
     "hex_ok: mutable bool = hex_digits <= hex_available",
     "while hex_index < hex_digits and hex_ok |hex_index, hex_value, hex_ok, text, hex_start, hex_digits|:",
-    "hex_at: i64 = hex_digit_value(sview_at(text, hex_start + hex_index))",
+    "hex_at: i64 = hex_digit_value(text[hex_start + hex_index])",
     "hex_ok <- false if hex_at < 0",
     "hex_value <- hex_value * 16 + hex_at if hex_at >= 0",
     "hex_index <- hex_index + 1.usize()",

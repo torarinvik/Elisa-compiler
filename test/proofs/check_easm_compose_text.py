@@ -90,11 +90,11 @@ required_span_fragments = (
     "ensure result.end == easm_compose_span_reference(text, wanted).end",
     "ensure not result.valid implies result.start == 0 and result.end == 0",
     "ensure result.valid implies result.start <= result.end",
-    "ensure result.valid implies result.end <= sview_len(text)",
+    "ensure result.valid implies result.end <= text.len",
     'open: usize = EasmTextScan::find(text, "(")',
-    'close: usize = EasmTextScan::find(text[open:sview_len(text)], ")") + open',
-    "assert close <= sview_len(text)",
-    "value_length: usize = sview_len(values)",
+    'close: usize = EasmTextScan::find(text[open:text.len], ")") + open',
+    "assert close <= text.len",
+    "value_length: usize = values.len",
     "assert value_length == close - base",
     "while cursor <= value_length",
     "decreases value_length - cursor",
@@ -118,17 +118,17 @@ if any(compact(fragment) not in span_body for fragment in required_span_fragment
 
 count_body = compact(function_section(text_source, "easm_compose_argument_count"))
 required_count_fragments = (
-    "ensure sview_len(EasmTextScan::trim(text)) == 0 implies result == 0",
-    "ensure sview_len(EasmTextScan::trim(text)) > 0 implies result == easm_compose_comma_count_from(EasmTextScan::trim(text), 0.usize()) + 1",
+    "ensure (EasmTextScan::trim(text)).len == 0 implies result == 0",
+    "ensure (EasmTextScan::trim(text)).len > 0 implies result == easm_compose_comma_count_from(EasmTextScan::trim(text), 0.usize()) + 1",
     "invariant count + easm_compose_comma_count_from(trimmed, index) == easm_compose_comma_count_from(trimmed, 0.usize())",
-    "count <- count + 1 if sview_at(trimmed, index) == 44",
+    "count <- count + 1 if trimmed[index] == 44",
     "return count + 1",
 )
 if any(compact(fragment) not in count_body for fragment in required_count_fragments):
     raise SystemExit("comma-count implementation lost its recursive specification or loop invariant")
 comma_model_body = compact(function_section(text_source, "easm_compose_comma_count_from"))
-if compact("requires cursor <= sview_len(text)") not in comma_model_body \
-        or compact("decreases sview_len(text) - cursor") not in comma_model_body \
+if compact("requires cursor <= text.len") not in comma_model_body \
+        or compact("decreases text.len - cursor") not in comma_model_body \
         or compact("ensure result >= 0") not in comma_model_body \
         or compact("return 1 + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body:
     raise SystemExit("recursive comma-count model lost its range, termination, or delimiter step")
@@ -136,14 +136,14 @@ if compact("requires cursor <= sview_len(text)") not in comma_model_body \
 reference_body = compact(function_section(text_source, "easm_compose_span_reference_from"))
 required_reference_fragments = (
     "ghost def easm_compose_span_reference_from(",
-    "requires cursor <= sview_len(values) and segment_start <= cursor and current >= 0",
-    "decreases sview_len(values) - cursor",
+    "requires cursor <= values.len and segment_start <= cursor and current >= 0",
+    "decreases values.len - cursor",
     "ensure (wanted >= current and wanted - current <= easm_compose_comma_count_from(values, cursor)) implies result.valid",
-    "if cursor < sview_len(values) and sview_at(values, cursor) != 44",
+    "if cursor < values.len and values[cursor] != 44",
     "return easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted)",
     "EasmTextScan::trim_bounds(values[segment_start:cursor])",
     "assert span_end <= source_end",
-    "if cursor == sview_len(values): return ComposeSpan{start: 0, end: 0, valid: false}",
+    "if cursor == values.len: return ComposeSpan{start: 0, end: 0, valid: false}",
     "return easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1, wanted)",
 )
 if any(compact(fragment) not in reference_body for fragment in required_reference_fragments):

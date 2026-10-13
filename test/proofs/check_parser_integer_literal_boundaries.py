@@ -35,8 +35,8 @@ reference_from = source.split("ghost def parse_int_literal_reference_from(", 1)[
 reference = source.split("ghost def parse_int_literal_reference(", 1)[1].split("def parse_int_literal_value(", 1)[0]
 decoder = source.split("def parse_int_literal_value(", 1)[1]
 for fragment in (
-        "requires index <= sview_len(text)",
-        "decreases sview_len(text) - index",
+        "requires index <= text.len",
+        "decreases text.len - index",
         "return 0 if not ((byte >= 48 and byte <= 57) or (is_hex and byte >= 97 and byte <= 102) or (is_hex and byte >= 65 and byte <= 70))",
         "next_value: u64 = maximum if value > (maximum - digit.u64()) / base else value * base + digit.u64()",
 ):
@@ -97,9 +97,9 @@ for name in theorems:
         raise AssertionError(f"positive boundary proof missing: {name}")
 saturation_lemma = positive_text.split("ghost def proof_saturated_suffix_from(", 1)[1].split("\n\n", 1)[0]
 for fragment in (
-    "requires index <= sview_len(text)",
-    "requires (forall suffix_index in index..<sview_len(text):",
-    "decreases sview_len(text) - index",
+    "requires index <= text.len",
+    "requires (forall suffix_index in index..<text.len:",
+    "decreases text.len - index",
     "ensure parse_int_literal_reference_from(text, index, is_hex, 18446744073709551615u64) == 18446744073709551615u64",
     "return proof_saturated_suffix_from(text, index + 1, is_hex) if byte == 95",
     "assert maximum > (maximum - digit.u64()) / base",
@@ -116,26 +116,26 @@ for fragment in ("byte - 48", "byte - 87", "byte - 55"):
 if "ensure result == ((byte - 48).i64() if byte >= 48 and byte <= 57 else (byte - 87).i64() if byte >= 97 and byte <= 102 else (byte - 55).i64())" not in hex_digit_spec:
     raise AssertionError("independent hexadecimal digit mapping no longer has its exact contract")
 hex_pair = positive_text.split("def every_two_ascii_hex_digits_decode_exactly(", 1)[1].split("\ndef ", 1)[0]
-for fragment in ("sview_at(text, 2)", "sview_at(text, 3)", "* 16", "proof_hex_digit_value"):
+for fragment in ("text[2]", "text[3]", "* 16", "proof_hex_digit_value"):
     if fragment not in hex_pair:
         raise AssertionError(f"universal two-digit hex proof lost a byte or radix case: {fragment}")
 hex_pair_requires = hex_pair.split("requires ", 1)[1].split("\n", 1)[0]
 for fragment in (
-    "sview_len(text) == 4",
-    "sview_at(text, 0) == 48",
-    "sview_at(text, 1) == 120 or sview_at(text, 1) == 88",
+    "text.len == 4",
+    "text[0] == 48",
+    "text[1] == 120 or text[1] == 88",
 ):
     if fragment not in hex_pair_requires:
         raise AssertionError(f"universal two-digit hex precondition omits its literal prefix: {fragment}")
 for index in (2, 3):
     for fragment in (
-        f"sview_at(text, {index}) >= 48 and sview_at(text, {index}) <= 57",
-        f"sview_at(text, {index}) >= 97 and sview_at(text, {index}) <= 102",
-        f"sview_at(text, {index}) >= 65 and sview_at(text, {index}) <= 70",
+        f"text[{index}] >= 48 and text[{index}] <= 57",
+        f"text[{index}] >= 97 and text[{index}] <= 102",
+        f"text[{index}] >= 65 and text[{index}] <= 70",
     ):
         if fragment not in hex_pair_requires:
             raise AssertionError(f"universal two-digit hex precondition omits a digit class: {fragment}")
-if "ensure Parser::proof_decode_integer_literal_boundary(text) == (proof_hex_digit_value(sview_at(text, 2)) * 16 + proof_hex_digit_value(sview_at(text, 3)))" not in hex_pair:
+if "ensure Parser::proof_decode_integer_literal_boundary(text) == (proof_hex_digit_value(text[2]) * 16 + proof_hex_digit_value(text[3]))" not in hex_pair:
     raise AssertionError("universal two-digit hex theorem no longer states the exact radix-16 result")
 
 try:

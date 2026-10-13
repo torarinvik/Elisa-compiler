@@ -79,17 +79,17 @@ negative_text = NEGATIVE.read_text()
 
 expected_owner_spec = """
 ghost def annotation_pair_owner_hash_suffix(owner: sview, index: usize, hash: u64) -> u64:
-    requires index <= sview_len(owner)
-    decreases sview_len(owner) - index
-    return hash if index == sview_len(owner)
-    return annotation_pair_owner_hash_suffix(owner, index + 1.usize(), (hash ^ sview_at(owner, index).u64()) * ANNOTATION_PAIR_HASH_PRIME)
+    requires index <= owner.len
+    decreases owner.len - index
+    return hash if index == owner.len
+    return annotation_pair_owner_hash_suffix(owner, index + 1.usize(), (hash ^ owner[index].u64()) * ANNOTATION_PAIR_HASH_PRIME)
 """
 expected_name_spec = """
 ghost def annotation_pair_name_hash_suffix(name: sview, index: usize, hash: u64) -> u64:
-    requires index <= sview_len(name)
-    decreases sview_len(name) - index
-    return hash if index == sview_len(name)
-    return annotation_pair_name_hash_suffix(name, index + 1.usize(), (hash ^ sview_at(name, index).u64()) * ANNOTATION_PAIR_HASH_PRIME)
+    requires index <= name.len
+    decreases name.len - index
+    return hash if index == name.len
+    return annotation_pair_name_hash_suffix(name, index + 1.usize(), (hash ^ name[index].u64()) * ANNOTATION_PAIR_HASH_PRIME)
 """
 expected_pair_spec = """
 ghost def annotation_pair_hash_spec(owner: sview, name: sview) -> u64:
@@ -102,16 +102,16 @@ def annotation_pair_bucket(owner: sview, name: sview) -> usize can[Abort.Panic]:
     ensure result == (annotation_pair_hash_spec(owner, name) % ANNOTATION_PAIR_BUCKETS.u64()).usize()
     ensure result < ANNOTATION_PAIR_BUCKETS
     hash: mutable u64 = ANNOTATION_PAIR_HASH_OFFSET
-    for offset in 0..<sview_len(owner) |hash, owner|:
-        invariant offset <= sview_len(owner)
+    for offset in 0..<owner.len |hash, owner|:
+        invariant offset <= owner.len
         invariant annotation_pair_owner_hash_suffix(owner, offset, hash) == annotation_pair_owner_hash_suffix(owner, 0.usize(), ANNOTATION_PAIR_HASH_OFFSET)
-        hash <- (hash ^ sview_at(owner, offset).u64()) * ANNOTATION_PAIR_HASH_PRIME
+        hash <- (hash ^ owner[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME
     owner_hash: u64 = hash
     hash <- (hash ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME
-    for offset in 0..<sview_len(name) |hash, name|:
-        invariant offset <= sview_len(name)
+    for offset in 0..<name.len |hash, name|:
+        invariant offset <= name.len
         invariant annotation_pair_name_hash_suffix(name, offset, hash) == annotation_pair_name_hash_suffix(name, 0.usize(), (owner_hash ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME)
-        hash <- (hash ^ sview_at(name, offset).u64()) * ANNOTATION_PAIR_HASH_PRIME
+        hash <- (hash ^ name[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME
     return (hash % ANNOTATION_PAIR_BUCKETS.u64()).usize()
 """
 for name, expected in (

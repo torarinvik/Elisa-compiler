@@ -84,15 +84,15 @@ if 'include "./codegen_const_capacity_digits.elisa"' not in capacity:
     raise SystemExit("production capacity parser no longer imports the proved digit policy")
 primary = compact(function_section(capacity, "capacity_span_parse_primary"))
 for required in (
-    "if BackendCapacityDigits::is_ascii_digit(sview_at(text, cursor)):",
+    "if BackendCapacityDigits::is_ascii_digit(text[cursor]):",
     "if BackendCapacityDigits::is_ascii_digit(byte):",
-    "elif byte == 95 and cursor > start and sview_len(text) - cursor > 1:",
+    "elif byte == 95 and cursor > start and text.len - cursor > 1:",
     "break if not BackendCapacityDigits::is_valid_digit_separator(previous, following)",
 ):
     if compact(required) not in primary:
         raise SystemExit(f"capacity literal parser lost digit-policy wiring: {required}")
 fold = compact(function_section(capacity, "fold_const_capacity_text"))
-if compact("false return if cursor != sview_len(text)") not in fold:
+if compact("false return if cursor != text.len") not in fold:
     raise SystemExit("capacity parser no longer rejects a trailing malformed separator or suffix")
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:

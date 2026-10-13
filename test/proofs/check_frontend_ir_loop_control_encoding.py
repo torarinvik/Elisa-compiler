@@ -133,7 +133,7 @@ if position_proof is None or int(position_proof.group(1)) != 1:
 mapping = compact(function_chunk(encoding_text, "node_type_id"))
 position_mapping = compact(function_chunk(encoding_text, "position_field_id"))
 label_mapping = compact(function_chunk(encoding_text, "label_is_unlabeled"))
-if "ensureresult==(sview_len(label)==0)" not in label_mapping or "returnsview_len(label)==0" not in label_mapping:
+if "ensureresult==(label.len==0)" not in label_mapping or "returnlabel.len==0" not in label_mapping:
     raise SystemExit("label encodability predicate no longer exactly tests an empty label")
 for variant, spec in expected.items():
     if compact(f"LoopControlKind.{variant}:{spec['node_name']}") not in mapping:

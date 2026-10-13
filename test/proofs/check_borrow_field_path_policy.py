@@ -50,30 +50,30 @@ def proof_body(source: str, name: str) -> str:
 expected_policy = """
 def wildcard_matches(candidate: sview, field: sview, prefix_end: usize) -> bool:
     ensure result == (
-        sview_len(candidate) > prefix_end and
-        sview_len(candidate) - prefix_end == WILDCARD_SUFFIX_LENGTH and
-        prefix_end < sview_len(field) and
-        sview_at(field, prefix_end) == ASCII_FIELD_SEPARATOR and
-        sview_at(candidate, prefix_end) == ASCII_FIELD_SEPARATOR and
-        sview_at(candidate, sview_len(candidate) - INDEX_STEP) == ASCII_WILDCARD and
+        candidate.len > prefix_end and
+        candidate.len - prefix_end == WILDCARD_SUFFIX_LENGTH and
+        prefix_end < field.len and
+        field[prefix_end] == ASCII_FIELD_SEPARATOR and
+        candidate[prefix_end] == ASCII_FIELD_SEPARATOR and
+        candidate[candidate.len - INDEX_STEP] == ASCII_WILDCARD and
         (forall prefix_index in 0..<prefix_end:
-            sview_at(candidate, prefix_index) == sview_at(field, prefix_index))
+            candidate[prefix_index] == field[prefix_index])
     )
     can Abort.Panic:
-        candidate_length: usize = sview_len(candidate)
-        false return if prefix_end >= sview_len(field)
+        candidate_length: usize = candidate.len
+        false return if prefix_end >= field.len
         false return if prefix_end >= candidate_length
         false return if candidate_length - prefix_end != WILDCARD_SUFFIX_LENGTH
-        false return if sview_at(field, prefix_end) != ASCII_FIELD_SEPARATOR
-        false return if sview_at(candidate, prefix_end) != ASCII_FIELD_SEPARATOR
-        false return if sview_at(candidate, candidate_length - INDEX_STEP) != ASCII_WILDCARD
+        false return if field[prefix_end] != ASCII_FIELD_SEPARATOR
+        false return if candidate[prefix_end] != ASCII_FIELD_SEPARATOR
+        false return if candidate[candidate_length - INDEX_STEP] != ASCII_WILDCARD
         index: mutable usize = 0
         while index < prefix_end |index, candidate, field, prefix_end|:
             decreases prefix_end - index
             invariant index <= prefix_end
             invariant (forall prior in 0..<index:
-                sview_at(candidate, prior) == sview_at(field, prior))
-            false return if sview_at(candidate, index) != sview_at(field, index)
+                candidate[prior] == field[prior])
+            false return if candidate[index] != field[index]
             index <- index + INDEX_STEP
         return true
 """
@@ -150,14 +150,14 @@ for path, source, expected, label in (
             raise SystemExit(f"{label} proof must handle the production matcher effect: {name}")
 
 formula = """(
-    sview_len(candidate) > prefix_end and
-    sview_len(candidate) - prefix_end == SemanticBorrowFieldPath::WILDCARD_SUFFIX_LENGTH and
-    prefix_end < sview_len(field) and
-    sview_at(field, prefix_end) == SemanticBorrowFieldPath::ASCII_FIELD_SEPARATOR and
-    sview_at(candidate, prefix_end) == SemanticBorrowFieldPath::ASCII_FIELD_SEPARATOR and
-    sview_at(candidate, sview_len(candidate) - SemanticBorrowFieldPath::INDEX_STEP) == SemanticBorrowFieldPath::ASCII_WILDCARD and
+    candidate.len > prefix_end and
+    candidate.len - prefix_end == SemanticBorrowFieldPath::WILDCARD_SUFFIX_LENGTH and
+    prefix_end < field.len and
+    field[prefix_end] == SemanticBorrowFieldPath::ASCII_FIELD_SEPARATOR and
+    candidate[prefix_end] == SemanticBorrowFieldPath::ASCII_FIELD_SEPARATOR and
+    candidate[candidate.len - SemanticBorrowFieldPath::INDEX_STEP] == SemanticBorrowFieldPath::ASCII_WILDCARD and
     (forall prefix_index in 0..<prefix_end:
-        sview_at(candidate, prefix_index) == sview_at(field, prefix_index))
+        candidate[prefix_index] == field[prefix_index])
 )"""
 expected_positive = {
     "wildcard_matches_its_exact_byte_path_spec": (

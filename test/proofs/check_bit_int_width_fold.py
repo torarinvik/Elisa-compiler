@@ -47,7 +47,7 @@ def require_parser_fold(source: str) -> list[str]:
         errors.append("production bit-int parser no longer imports the checked width helper")
     parser = function_source(source, "bit_int_window")
     required_steps = (
-        "length: usize = sview_len(type_name)",
+        "length: usize = type_name.len",
         "(false, 0, 0) return if length < 2",
         "lead: u8 = type_name[0]",
         "is_unsigned: bool = lead == 117",

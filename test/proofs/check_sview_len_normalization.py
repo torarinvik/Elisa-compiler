@@ -1,4 +1,4 @@
-"""Bind StringView length normalization claims to the runtime helper."""
+"""Bind direct signed StringView length claims to the runtime field."""
 from __future__ import annotations
 
 import argparse
@@ -52,73 +52,27 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-runtime_text = RUNTIME.read_text()
-sview_len = compact(function_section(runtime_text, "sview_len"))
-normalization_contract = (
-    "ensure ((view.len <= 0 or view.len.usize().i64() != view.len) implies result == 0.usize()) "
-    "and ((view.len > 0 and view.len.usize().i64() == view.len) implies result.i64() == view.len)"
-)
-if compact(normalization_contract) not in sview_len:
-    raise SystemExit("sview_len lost its zero-normalization or representable-length contract")
+prelude_text = (ROOT / "elisacore_std/elisacore_runtime_prelude.elisa").read_text()
+if "data:u8&len:i64" not in compact(prelude_text):
+    raise SystemExit("StringView lost its signed len field")
 
-required_steps = (
-    "0.usize() return if view.len <= 0",
-    "view_len: usize = view.len.usize()",
-    "return 0.usize() if view_len.i64() != view.len",
-    "return view_len",
-)
-step_positions = [sview_len.find(compact(step)) for step in required_steps]
-if any(position < 0 for position in step_positions) or step_positions != sorted(step_positions):
-    raise SystemExit("sview_len no longer normalizes nonpositive and nonroundtripping lengths before return")
-
-positive_names = {
-    "sview_len_obeys_its_piecewise_normalization_contract",
-    "a_positive_representable_length_is_preserved",
-    "a_nonpositive_length_is_normalized_to_zero",
-    "a_nonroundtripping_length_is_normalized_to_zero",
-}
-negative_names = {
-    "a_positive_representable_length_can_become_zero",
-    "a_nonpositive_length_can_produce_a_nonzero_result",
-}
-claims = {
-    "sview_len_obeys_its_piecewise_normalization_contract":
-        "((view.len <= 0 or view.len.usize().i64() != view.len) implies normalized == 0.usize()) and ((view.len > 0 and view.len.usize().i64() == view.len) implies normalized.i64() == view.len)",
-    "a_positive_representable_length_is_preserved":
-        "sview_len(view).i64() == view.len",
-    "a_nonpositive_length_is_normalized_to_zero":
-        "sview_len(view) == 0.usize()",
-    "a_nonroundtripping_length_is_normalized_to_zero":
-        "sview_len(view) == 0.usize()",
-    "a_positive_representable_length_can_become_zero":
-        "sview_len(view) == 0.usize()",
-    "a_nonpositive_length_can_produce_a_nonzero_result":
-        "sview_len(view) != 0.usize()",
-}
-preconditions = {
-    "a_positive_representable_length_is_preserved":
-        "requires view.len > 0 and view.len.usize().i64() == view.len",
-    "a_nonpositive_length_is_normalized_to_zero": "requires view.len <= 0",
-    "a_nonroundtripping_length_is_normalized_to_zero":
-        "requires view.len.usize().i64() != view.len",
-    "a_positive_representable_length_can_become_zero":
-        "requires view.len > 0 and view.len.usize().i64() == view.len",
-    "a_nonpositive_length_can_produce_a_nonzero_result": "requires view.len <= 0",
-}
+positive_names = {'a_positive_length_remains_positive', 'a_nonpositive_length_remains_nonpositive', 'a_representable_length_survives_unsigned_conversion'}
+negative_names = {'a_positive_length_cannot_become_zero', 'a_negative_length_cannot_become_zero'}
+claims = {'a_positive_length_remains_positive': 'return length > 0', 'a_nonpositive_length_remains_nonpositive': 'return length <= 0', 'a_representable_length_survives_unsigned_conversion': 'return length.i64() == view.len', 'a_positive_length_cannot_become_zero': 'return view.len == 0', 'a_negative_length_cannot_become_zero': 'return view.len == 0'}
+preconditions = {'a_positive_length_remains_positive': 'requires view.len > 0', 'a_nonpositive_length_remains_nonpositive': 'requires view.len <= 0', 'a_representable_length_survives_unsigned_conversion': 'requires view.len >= 0 and view.len.usize().i64() == view.len', 'a_positive_length_cannot_become_zero': 'requires view.len > 0', 'a_negative_length_cannot_become_zero': 'requires view.len < 0'}
 for source_text, names, label in (
     (POSITIVE.read_text(), positive_names, "positive"),
     (NEGATIVE.read_text(), negative_names, "negative"),
 ):
     if declarations(source_text) != names:
         raise SystemExit(f"{label} sview_len theorem inventory changed")
-    if 'include "../../elisacore_std/elisacore_runtime_prelude.elisa"' not in source_text \
-            or 'include "../../elisacore_std/elisacore_runtime_strings.elisa"' not in source_text:
+    if 'include "../../elisacore_std/elisacore_runtime_prelude.elisa"' not in source_text:
         raise SystemExit(f"{label} sview_len theorem no longer includes the production runtime")
     for name in names:
         section = compact(function_section(source_text, name))
         if compact("ensure result == true") not in section \
                 or compact(claims[name]) not in section \
-                or compact("sview_len(view)") not in section:
+                or compact("view.len") not in section:
             raise SystemExit(f"{label} sview_len theorem {name} lost its claim")
         if name in preconditions and compact(preconditions[name]) not in section:
             raise SystemExit(f"{label} sview_len theorem {name} lost its precondition")
@@ -175,7 +129,7 @@ assert require_current_product(BIN, PROVER) == product
 
 print(json.dumps({
     "admitted": True,
-    "scope": "sview_len preserves valid positive lengths and maps nonpositive or nonroundtripping lengths to zero",
+    "scope": "direct len preserves signed extent; unsigned conversion requires representability",
     "positive_claims_proved": sorted(positive_names),
     "false_claims_refused": sorted(negative_names),
     "proof_revision": product["proof"].get("head"),

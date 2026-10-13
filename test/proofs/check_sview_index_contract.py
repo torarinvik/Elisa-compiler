@@ -185,22 +185,22 @@ negative_names = {
     "an_out_of_range_index_can_disagree_with_the_safe_helper",
 }
 positive_claims = {
-    "an_in_range_view_index_reads_its_backing_byte": "sview_at(view, index) == view.data[index]",
-    "every_rejected_view_index_reads_zero": "sview_at(view, index) == 0",
+    "an_in_range_view_index_reads_its_backing_byte": "view[index] == view.data[index]",
+    "every_rejected_view_index_reads_zero": "view[index] == 0",
     "a_found_byte_is_the_first_matching_offset": "found < view.len and string_view_index(view, found) == byte.i64() and (forall prior in 0..<found: string_view_index(view, prior) != byte.i64())",
     "an_absent_byte_returns_the_missing_sentinel": "sview_find_byte(view, byte) == -1",
     "an_unrepresentable_view_length_returns_the_missing_sentinel": "sview_find_byte(view, byte) == -1",
-    "length_property_matches_the_normalized_helper_on_valid_views": "view.length == sview_len(view).i64()",
+    "length_property_matches_the_normalized_helper_on_valid_views": "view.length == view.len.i64()",
     "positive_length_guard_makes_the_first_index_valid": "string_view_index_request_valid(view, 0)",
-    "guarded_first_byte_syntax_matches_the_safe_helper": "view[0] == sview_at(view, 0.usize()).i64()",
+    "guarded_first_byte_syntax_matches_the_safe_helper": "view[0] == view[0.usize()].i64()",
 }
 negative_claims = {
-    "invalid_view_index_can_read_a_nonzero_byte": "sview_at(view, index) != 0",
-    "valid_view_index_can_read_a_different_byte": "sview_at(view, index) != view.data[index]",
+    "invalid_view_index_can_read_a_nonzero_byte": "view[index] != 0",
+    "valid_view_index_can_read_a_different_byte": "view[index] != view.data[index]",
     "search_can_skip_an_earlier_matching_byte": "sview_find_byte(view, byte) == later",
     "invalid_view_length_can_return_a_found_offset": "sview_find_byte(view, byte) >= 0",
-    "a_negative_length_property_can_equal_the_normalized_helper": "view.length == sview_len(view).i64()",
-    "an_out_of_range_index_can_disagree_with_the_safe_helper": "view[index] != sview_at(view, index).i64()",
+    "a_negative_length_property_can_equal_the_normalized_helper": "view.length == view.len.i64()",
+    "an_out_of_range_index_can_disagree_with_the_safe_helper": "view[index] != view[index].i64()",
 }
 preconditions = {
     "an_in_range_view_index_reads_its_backing_byte":

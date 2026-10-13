@@ -56,8 +56,8 @@ lookup = compact(function_section(model_text, "easm_label_index"))
 label_name = compact(function_section(model_text, "easm_label_name"))
 required_label_name_contracts = (
     'ensure instruction.op != "label" implies result.len == 0',
-    'ensure (instruction.op == "label" and (sview_len(easm_trim(instruction.text)) == 0 or sview_at(easm_trim(instruction.text), sview_len(easm_trim(instruction.text)) - 1.usize()) != 58)) implies result == easm_trim(instruction.text)',
-    'ensure (instruction.op == "label" and sview_len(easm_trim(instruction.text)) > 0 and sview_at(easm_trim(instruction.text), sview_len(easm_trim(instruction.text)) - 1.usize()) == 58) implies result == easm_trim(easm_trim(instruction.text)[0:sview_len(easm_trim(instruction.text)) - 1.usize()])',
+    'ensure (instruction.op == "label" and ((easm_trim(instruction.text)).len == 0 or (easm_trim(instruction.text))[(easm_trim(instruction.text)).len - 1.usize()] != 58)) implies result == easm_trim(instruction.text)',
+    'ensure (instruction.op == "label" and (easm_trim(instruction.text)).len > 0 and (easm_trim(instruction.text))[(easm_trim(instruction.text)).len - 1.usize()] == 58) implies result == easm_trim(easm_trim(instruction.text)[0:(easm_trim(instruction.text)).len - 1.usize()])',
 )
 if any(compact(contract) not in label_name for contract in required_label_name_contracts):
     raise SystemExit("EASM label-name normalization lost its non-label, trim, or terminal-colon contract")

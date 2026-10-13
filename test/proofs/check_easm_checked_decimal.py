@@ -98,7 +98,7 @@ required_parse_contracts = (
     "text[digit_index]<=ASCII_DIGIT_NINE",
 )
 required_parse_steps = (
-    "return(false,0)iftext.length<0",
+    "return(false,0)iftext.length<=0ortext.length.usize().i64()!=text.length",
     "iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
     "return(false,0)ifposition==text.length",
     "whileposition<text.length|position,text,value|",
@@ -128,6 +128,8 @@ required_reference_fragments = (
     "decreasestext.length-position",
     "ensureresult.validimplies(negativeimpliesresult.value<=0)",
     "ensureresult.validimplies(notnegativeimpliesresult.value>=0)",
+    "return(true,value)ifposition==text.lengthandconsumed_digit",
+    "return(false,0)ifposition==text.length",
     "byte:u8=text[position]",
     "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE",
     "value*DECIMAL_RADIX-digit",
@@ -139,6 +141,7 @@ if not all(fragment in reference_from for fragment in required_reference_fragmen
     raise SystemExit("recursive decimal reference no longer defines an independent checked digit fold")
 if "ghostdefdecimal_parse_reference(text:sview)" not in reference_wrapper or \
         "returndecimal_parse_reference_from(text,position,negative,0,false)" not in reference_wrapper or \
+        "return(false,0)iftext.length<=0ortext.length.usize().i64()!=text.length" not in reference_wrapper or \
         "ensure(result.validandtext.length>0andtext[0]==ASCII_MINUS)impliesresult.value<=0" not in reference_wrapper or \
         "ensure(result.validandtext.length>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0" not in reference_wrapper:
     raise SystemExit("decimal reference wrapper no longer specifies the optional sign and digit fold")
@@ -233,7 +236,7 @@ if not all(fragment in parser_body for fragment in required_parser_fragments):
     raise SystemExit("EASM parser no longer delegates to the source-verified signed-decimal parser")
 if "break if byte <" in parser_body or "value <- value *" in parser_body:
     raise SystemExit("EASM parser bypasses strict digit validation or checked accumulation")
-if "value: i64 = easm_parse_i64(easm_trim(fact[marker + 7.usize():sview_len(fact)]))" not in memory_text:
+if "value: i64 = easm_parse_i64(easm_trim(fact[marker + 7.usize():fact.len]))" not in memory_text:
     raise SystemExit("size-guard facts no longer use the hardened signed-decimal parser")
 size_bound_source = compact(function_section(memory_text, "easm_size_guard_lower_bound"))
 if "greatest<-EasmMemStateDomain::greatest_bound(greatest,value)" not in size_bound_source:
@@ -248,13 +251,13 @@ layout_parse_body = layout_parser_text.split(
     "def parse_layout_module(source: darray[u8]&", 1
 )[1].split("def parse_module(", 1)[0]
 required_layout_fragments = (
-    "easm_parse_i64_checked(easm_trim(attributes[5:sview_len(attributes)]))",
+    "easm_parse_i64_checked(easm_trim(attributes[5:attributes.len]))",
     '"invalid-layout-size"',
     "if not parsed_size.valid",
-    "easm_parse_i64_checked(easm_trim(attributes[7:sview_len(attributes)]))",
+    "easm_parse_i64_checked(easm_trim(attributes[7:attributes.len]))",
     '"invalid-layout-stride"',
     "if not parsed_stride.valid",
-    "easm_parse_i64_checked(easm_trim(rest[guard_start:sview_len(rest)]))",
+    "easm_parse_i64_checked(easm_trim(rest[guard_start:rest.len]))",
     '"invalid-layout-required-size"',
     "if not parsed_requirement.valid",
     "easm_parse_i64_checked(offset_text)",
@@ -272,7 +275,7 @@ required_memory_fragments = (
     "easm_memory_displacement_checked(operand)",
     "def easm_immediate_operand_after_dollar_checked(operand: sview)",
     'dollar: usize = easm_find(operand, "$")',
-    "parsed: (valid: bool, value: i64) = easm_parse_i64_checked(easm_trim(operand[dollar + 1.usize():sview_len(operand)]))",
+    "parsed: (valid: bool, value: i64) = easm_parse_i64_checked(easm_trim(operand[dollar + 1.usize():operand.len]))",
     "parsed.value < -2147483648 or parsed.value > 2147483647",
     "def easm_immediate_after_dollar_checked(text: sview)",
     "return easm_immediate_operand_after_dollar_checked(easm_first_operand(text))",

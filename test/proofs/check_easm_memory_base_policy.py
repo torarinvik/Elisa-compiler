@@ -200,13 +200,13 @@ if roles_compact.count('code: "raw-memory-base"') != 3:
 
 base_parser = compact(function_section(memory, "easm_memory_base_register"))
 if 'open: usize = easm_find(operand, "(")' not in base_parser or \
-        'if open >= sview_len(operand):return ""' not in base_parser or \
-        'close_relative: usize = easm_find(operand[open:sview_len(operand)], ")")' not in base_parser or \
-        'if close_relative >= sview_len(operand[open:sview_len(operand)]):return ""' not in base_parser:
+        'if open >= operand.len:return ""' not in base_parser or \
+        'close_relative: usize = easm_find(operand[open:operand.len], ")")' not in base_parser or \
+        'if close_relative >= (operand[open:operand.len]).len:return ""' not in base_parser:
     raise SystemExit("EASM base parser must fail closed when either address delimiter is missing")
 memory_operand = compact(function_section(PROVENANCE.read_text(), "easm_memory_operand"))
 if "EasmTextScan::contains_memory_address_delimiter" not in memory_operand or \
-        'easm_find(operand, "[") < sview_len(operand)' not in memory_operand:
+        'easm_find(operand, "[") < operand.len' not in memory_operand:
     raise SystemExit("bracketed operands are no longer source-classified as memory by the verifier")
 
 bracket_gate = re.search(

@@ -178,7 +178,7 @@ if self_zeroing != expected_self_zeroing:
     raise SystemExit("production self-zeroing verifier no longer delegates to the proved operand policy")
 
 verify = function_body(FUNCTION.read_text(), "verify_function_instructions")
-source_read = "if sview_len(read_register) > 0 and not easm_self_zeroing(inst) and not easm_live_has(live_registers, read_register)"
+source_read = "if read_register.len > 0 and not easm_self_zeroing(inst) and not easm_live_has(live_registers, read_register)"
 destination_read = "if easm_reads_destination(inst) and destination_read_register != read_register and not easm_live_has(live_registers, destination_read_register)"
 if source_read not in verify or destination_read not in verify or verify.index(source_read) > verify.index(destination_read):
     raise SystemExit("function liveness must apply self-zeroing and destination-read policy before admitting the instruction")

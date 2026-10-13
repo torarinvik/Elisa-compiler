@@ -55,13 +55,14 @@ def declarations(source: str) -> set[str]:
 runtime_text = RUNTIME.read_text()
 trim = compact(function_section(runtime_text, "sview_trim_trailing"))
 required_trim_contracts = (
-    "ensure result.len >= 0 and result.len <= sview_len(view).i64()",
+    "ensure result.len >= 0 and result.len <= (view.len if view.len > 0 and view.len.usize().i64() == view.len else 0)",
     "ensure result.len > 0 implies (string_view_index(view, result.len - 1) != byte.i64() and result.data == view.data)",
-    "ensure forall suffix_index in result.len..<sview_len(view).i64(): string_view_index(view, suffix_index) == byte.i64()",
+    "ensure forall suffix_index in result.len..<(view.len if view.len > 0 and view.len.usize().i64() == view.len else 0): string_view_index(view, suffix_index) == byte.i64()",
 )
 if any(compact(contract) not in trim for contract in required_trim_contracts):
     raise SystemExit("trailing trim lost its bounded maximal-prefix postcondition")
 required_loop_steps = (
+    "return string_view_slice(view, 0, 0) if view.len < 0 or view.len.usize().i64() != view.len",
     "hi: mutable i64 = view.len",
     "while hi > 0 and string_view_index(view, hi - 1) == byte.i64():",
     "decreases hi",
@@ -77,7 +78,7 @@ if any(position < 0 for position in loop_positions) or loop_positions != sorted(
 slice_body = compact(function_section(runtime_text, "string_view_slice"))
 prefix_body = compact(function_section(runtime_text, "string_view_prefix"))
 required_slice_contracts = (
-    "ensure result.len >= 0 and result.len <= sview_len(view).i64() and ((view.len < 0 or view.len.usize().i64() != view.len or start < 0 or start > view.len or end < start or end > view.len) or result.len == end - start)",
+    "ensure result.len >= 0 and result.len <= (view.len if view.len > 0 and view.len.usize().i64() == view.len else 0) and ((view.len < 0 or view.len.usize().i64() != view.len or start < 0 or start > view.len or end < start or end > view.len) or result.len == end - start)",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
 )
 required_prefix_contracts = (

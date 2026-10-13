@@ -87,16 +87,23 @@ if compact(required_parent_contract) not in parent \
     raise SystemExit("Fs.parent lost its pre-separator prefix or no-separator empty-view contract")
 
 required_loop_steps = (
-    "i: mutable i64 = sview_len(view).i64()",
+    "return -1 if view.len < 0 or view.len.usize().i64() != view.len",
+    "i: mutable i64 = view.len",
     "while i > 0:",
     "decreases i",
-    "invariant 0 <= i and i <= sview_len(view).i64()",
-    "invariant forall later in i..<sview_len(view).i64(): string_view_index(view, later) != byte.i64()",
+    "invariant 0 <= i and i <= view.len",
+    "invariant forall later in i..<view.len: string_view_index(view, later) != byte.i64()",
     "i <- i - 1",
-    "i return if sview_at(view, i.usize()) == byte",
+    "i return if view[i.usize()] == byte",
     "return -1",
 )
-loop_positions = [reverse_search.find(compact(step)) for step in required_loop_steps]
+loop_positions = []
+search_offset = 0
+for step in required_loop_steps:
+    position = reverse_search.find(compact(step), search_offset)
+    loop_positions.append(position)
+    if position >= 0:
+        search_offset = position + len(compact(step))
 if any(position < 0 for position in loop_positions) or loop_positions != sorted(loop_positions):
     raise SystemExit("reverse search loop lost its decreasing bound, searched-suffix invariant, or result step")
 

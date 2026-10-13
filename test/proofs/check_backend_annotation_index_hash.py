@@ -82,9 +82,9 @@ negative_text = NEGATIVE.read_text()
 
 if compact_code(function_section(hash_text, "annotation_index_hash_suffix")) != compact_code('''
 ghost def annotation_index_hash_suffix(text: sview, index: usize, hash: u64) -> u64:
-    requires index <= sview_len(text)
-    decreases sview_len(text) - index
-    return hash if index == sview_len(text)
+    requires index <= text.len
+    decreases text.len - index
+    return hash if index == text.len
     return annotation_index_hash_suffix(text, index + 1, (hash ^ text[index].u64()) * ANNOTATION_INDEX_HASH_PRIME)
 '''):
     raise SystemExit("hash suffix reference no longer defines the recursive FNV-1a byte fold")
@@ -93,8 +93,8 @@ if compact_code(function_section(hash_text, "annotation_index_hash")) != compact
 def annotation_index_hash(text: sview) -> u64:
     ensure result == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
     hash: mutable u64 = ANNOTATION_INDEX_HASH_OFFSET
-    for offset in 0..<sview_len(text) |hash, text|:
-        invariant offset <= sview_len(text)
+    for offset in 0..<text.len |hash, text|:
+        invariant offset <= text.len
         invariant annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
         hash <- (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME
     return hash

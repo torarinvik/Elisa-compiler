@@ -78,14 +78,14 @@ if compact(f"return {lower_spec}") not in compact(lower_body):
     raise SystemExit("ABI case-fold implementation differs from its ASCII contract")
 require_in_order(abi_text, "abi_span_is", "def abi_span_is(text: darray[u8]&, start: usize, needle: sview) -> bool:", (
     "false return if start > text.count",
-    "false return if sview_len(needle) > text.count - start",
-    "for index in 0..<sview_len(needle) |text, needle, start|",
+    "false return if needle.len > text.count - start",
+    "for index in 0..<needle.len |text, needle, start|",
     "text[start + index]",
 ))
 require_in_order(abi_text, "abi_span_is_ci", "def abi_span_is_ci(text: darray[u8]&, start: usize, needle: sview) -> bool:", (
     "false return if start > text.count",
-    "false return if sview_len(needle) > text.count - start",
-    "for index in 0..<sview_len(needle) |text, needle, start|",
+    "false return if needle.len > text.count - start",
+    "for index in 0..<needle.len |text, needle, start|",
     "text[start + index]",
 ))
 require_in_order(abi_text, "abi_word_in_span", "def abi_word_in_span(text: darray[u8]&, span_start: usize, span_stop: usize, needle: sview) -> bool:", (

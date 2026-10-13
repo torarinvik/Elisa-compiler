@@ -67,7 +67,7 @@ if compact("return " + lowering) not in compact(helper_ascii_lower):
 
 equals_spec = (
     "value.len == expected.len and (forall index in 0..<expected.len: "
-    "index >= value.len or ascii_lower(sview_at(value, index)) == sview_at(expected, index))"
+    "index >= value.len or ascii_lower(value[index]) == expected[index])"
 )
 for source, label in (
     (function_section(helper_text, "equals_ascii_case_insensitive"), "production string comparison"),

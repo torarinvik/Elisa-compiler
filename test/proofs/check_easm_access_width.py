@@ -105,7 +105,7 @@ require_return(MEMORY.read_text(), "def easm_access_width(op: sview) -> i64:",
                "EasmAccessWidth::access_width(op)")
 if "width: i64 = easm_access_width(instruction.op)" not in MEMORY.read_text():
     raise SystemExit("memory verification no longer uses the proved access-width classifier")
-if compact("sview_len(inst.op) == 0 or not easm_known_op(inst.op)") not in compact(FUNCTIONS.read_text()):
+if compact("inst.op.len == 0 or not easm_known_op(inst.op)") not in compact(FUNCTIONS.read_text()):
     raise SystemExit("EASM function verification no longer rejects opcodes outside its exact operation set")
 
 try:

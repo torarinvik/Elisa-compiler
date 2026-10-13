@@ -151,15 +151,15 @@ def operational_shape(function: str) -> tuple[str, ...]:
 source_text = PREFIX_SOURCE.read_text()
 expected_prefix = """
 def sview_matches_prefix(path: sview, candidate: sview, start: i64, end: i64) -> bool can[Abort.Panic]:
-    path_length: usize = sview_len(path)
-    candidate_length: usize = sview_len(candidate)
+    path_length: usize = path.len
+    candidate_length: usize = candidate.len
     false return if path.len < 0 or candidate.len < 0
     false return if path_length.i64() != path.len or candidate_length.i64() != candidate.len
     false return if start < 0 or end < start or end > path.len
     false return if end - start != candidate.len
     matched: mutable bool = true
     for index in 0..<candidate_length |matched, path, candidate, start|:
-        matched <- false if sview_at(path, (start + index.i64()).usize()) != sview_at(candidate, index)
+        matched <- false if path[(start + index.i64()).usize()] != candidate[index]
     return matched
 """
 if compact_code(function_section(source_text, "sview_matches_prefix")) != compact_code(expected_prefix):
@@ -220,7 +220,7 @@ if compact_code(function_section(spec_text, "prefix_range_is_valid")) != compact
     raise SystemExit("proof-only prefix range model changed without updating its proof gate")
 expected_bytewise_spec = """
 def every_candidate_byte_matches(path: sview, candidate: sview, start: i64, candidate_length: usize) -> bool:
-    return forall index in 0..<candidate_length: sview_at(path, (start + index.i64()).usize()) == sview_at(candidate, index)
+    return forall index in 0..<candidate_length: path[(start + index.i64()).usize()] == candidate[index]
 """
 if compact_code(function_section(spec_text, "every_candidate_byte_matches")) != compact_code(expected_bytewise_spec):
     raise SystemExit("proof-only bytewise prefix specification changed without updating its proof gate")
@@ -230,8 +230,8 @@ def section_without_contracts(source: str, name: str) -> tuple[str, ...]:
 
 guard_prefix = """
 def sview_matches_prefix(path: sview, candidate: sview, start: i64, end: i64) -> bool can[Abort.Panic]:
-    path_length: usize = sview_len(path)
-    candidate_length: usize = sview_len(candidate)
+    path_length: usize = path.len
+    candidate_length: usize = candidate.len
     false return if path.len < 0 or candidate.len < 0
     false return if path_length.i64() != path.len or candidate_length.i64() != candidate.len
     false return if start < 0 or end < start or end > path.len
@@ -273,7 +273,7 @@ model_length = re.search(
 )
 if production_length is None or model_length is None or \
         production_length.group(1) != model_length.group(1) or \
-        production_length.group(1) != "sview_len(candidate)":
+        production_length.group(1) != "candidate.len":
     raise SystemExit("bytewise proof loop bound is not derived from the production StringView length helper")
 
 def accumulator_update(function: str) -> tuple[str, ...]:
@@ -298,16 +298,16 @@ def a_valid_prefix_range_is_admitted(path_length: i64, candidate_length: i64, st
 """,
     "production_loop_accumulator_matches_the_bytewise_prefix_spec": """
 def production_loop_accumulator_matches_the_bytewise_prefix_spec(path: sview, candidate: sview, start: i64, end: i64) -> bool:
-    requires BackendSviewPrefixBoundsSpec::prefix_range_is_valid(path.len, candidate.len, start, end, sview_len(path), sview_len(candidate))
-    ensure result == BackendSviewPrefixBoundsSpec::every_candidate_byte_matches(path, candidate, start, sview_len(candidate))
-    candidate_length_usize: usize = sview_len(candidate)
+    requires BackendSviewPrefixBoundsSpec::prefix_range_is_valid(path.len, candidate.len, start, end, path.len, candidate.len)
+    ensure result == BackendSviewPrefixBoundsSpec::every_candidate_byte_matches(path, candidate, start, candidate.len)
+    candidate_length_usize: usize = candidate.len
     index: mutable usize = 0
     matched: mutable bool = true
     while index < candidate_length_usize |index, matched, path, candidate, start|:
         decreases candidate_length_usize - index
         invariant index <= candidate_length_usize
-        invariant matched == (forall prior in 0..<index: sview_at(path, (start + prior.i64()).usize()) == sview_at(candidate, prior))
-        matched <- false if sview_at(path, (start + index.i64()).usize()) != sview_at(candidate, index)
+        invariant matched == (forall prior in 0..<index: path[(start + prior.i64()).usize()] == candidate[prior])
+        matched <- false if path[(start + index.i64()).usize()] != candidate[index]
         index <- index + 1
     return matched
 """,
@@ -338,7 +338,7 @@ negative_shapes = {
 def false_claim_accepts_a_differing_candidate_byte(path: sview, candidate: sview, start: i64, end: i64, path_length_usize: usize, candidate_length_usize: usize, mismatch_index: usize) -> bool:
     requires BackendSviewPrefixBoundsSpec::prefix_range_is_valid(path.len, candidate.len, start, end, path_length_usize, candidate_length_usize)
     requires mismatch_index < candidate_length_usize
-    requires sview_at(path, (start + mismatch_index.i64()).usize()) != sview_at(candidate, mismatch_index)
+    requires path[(start + mismatch_index.i64()).usize()] != candidate[mismatch_index]
     ensure result == true
     return BackendSviewPrefixBoundsSpec::every_candidate_byte_matches(path, candidate, start, candidate_length_usize)
 """,

@@ -1263,7 +1263,7 @@ for round_index in 0..<(count + 1) |round_index, entries, meets, incoming_counts
         state: FlowState = easm_flow_transfer(instruction, entries[index])
         if easm_starts(instruction.op, "j"):
             target: sview = easm_substitute_operand(easm_last_operand(instruction.text), instruction)
-            if sview_len(target) > 0 and sview_at(target, 0) != 37:
+            if target.len > 0 and target[0] != 37:
                 changed <- easm_propagate_flow(easm_label_index(fn.instructions, target), state, entries, meets, incoming_counts) or changed
             if easm_is_terminator(instruction.op):
                 continue

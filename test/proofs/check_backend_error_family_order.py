@@ -72,11 +72,11 @@ def ghost_declarations(path: Path) -> set[str]:
 production_text = ERROR_UNIONS.read_text()
 expected_production = """
 def error_family_precedes(left: sview, right: sview) -> bool:
-    left_length: usize = sview_len(left)
-    right_length: usize = sview_len(right)
+    left_length: usize = left.len
+    right_length: usize = right.len
     shared_length: usize = left_length if left_length < right_length else right_length
     for index in 0..<shared_length |left, right|:
-        return sview_at(left, index) < sview_at(right, index) if sview_at(left, index) != sview_at(right, index)
+        return left[index] < right[index] if left[index] != right[index]
     return left_length < right_length
 """
 if compact(function_section(production_text, "error_family_precedes")) != compact(expected_production):
@@ -85,13 +85,13 @@ if compact(function_section(production_text, "error_family_precedes")) != compac
 proof_text = POSITIVE.read_text()
 expected_reference = """
 ghost def error_family_precedes_from(left: sview, right: sview, index: usize) -> bool:
-    requires index <= sview_len(left) and index <= sview_len(right)
-    decreases (sview_len(left) if sview_len(left) < sview_len(right) else sview_len(right)) - index
-    left_length: usize = sview_len(left)
-    right_length: usize = sview_len(right)
+    requires index <= left.len and index <= right.len
+    decreases (left.len if left.len < right.len else right.len) - index
+    left_length: usize = left.len
+    right_length: usize = right.len
     shared_length: usize = left_length if left_length < right_length else right_length
     return left_length < right_length if index == shared_length
-    return sview_at(left, index) < sview_at(right, index) if sview_at(left, index) != sview_at(right, index)
+    return left[index] < right[index] if left[index] != right[index]
     return error_family_precedes_from(left, right, index + 1)
 """
 if compact(function_section(proof_text, "error_family_precedes_from")) != compact(expected_reference):
@@ -99,17 +99,17 @@ if compact(function_section(proof_text, "error_family_precedes_from")) != compac
 
 expected_asymmetry_lemma = """
 ghost def error_family_order_pair_not_both_from(left: sview, right: sview, index: usize) -> bool:
-    requires index <= sview_len(left) and index <= sview_len(right)
-    decreases (sview_len(left) if sview_len(left) < sview_len(right) else sview_len(right)) - index
+    requires index <= left.len and index <= right.len
+    decreases (left.len if left.len < right.len else right.len) - index
     ensures result == not (
         error_family_precedes_at(left, right, index)
         and error_family_precedes_at(right, left, index)
     )
     ensures result == true
-    left_length: usize = sview_len(left)
-    right_length: usize = sview_len(right)
+    left_length: usize = left.len
+    right_length: usize = right.len
     if index < left_length and index < right_length:
-        return byte_less_is_asymmetric(sview_at(left, index), sview_at(right, index)) if sview_at(left, index) != sview_at(right, index)
+        return byte_less_is_asymmetric(left[index], right[index]) if left[index] != right[index]
         return error_family_order_pair_not_both_from(left, right, index + 1)
     return not (left_length < right_length and right_length < left_length)
 """
@@ -130,8 +130,8 @@ for name, shape in expected_byte_order_laws.items():
 if 'include "./backend_error_family_byte_order.elisa"' not in proof_text:
     raise SystemExit("the error-family comparator proof no longer imports its byte-order laws")
 expected_total_wrappers = {
-    "error_family_precedes_at": "ghost def error_family_precedes_at(left: sview, right: sview, index: usize) -> bool: left_length: usize = sview_len(left) right_length: usize = sview_len(right) if index <= sview_len(left) and index <= sview_len(right): return error_family_precedes_from(left, right, index) return left_length < right_length",
-    "error_family_equal_at": "ghost def error_family_equal_at(left: sview, right: sview, index: usize) -> bool: left_length: usize = sview_len(left) right_length: usize = sview_len(right) if index <= sview_len(left) and index <= sview_len(right): return error_family_equal_from(left, right, index) return left_length == right_length",
+    "error_family_precedes_at": "ghost def error_family_precedes_at(left: sview, right: sview, index: usize) -> bool: left_length: usize = left.len right_length: usize = right.len if index <= left.len and index <= right.len: return error_family_precedes_from(left, right, index) return left_length < right_length",
+    "error_family_equal_at": "ghost def error_family_equal_at(left: sview, right: sview, index: usize) -> bool: left_length: usize = left.len right_length: usize = right.len if index <= left.len and index <= right.len: return error_family_equal_from(left, right, index) return left_length == right_length",
 }
 for wrapper_name, wrapper_shape in expected_total_wrappers.items():
     if compact(function_section(proof_text, wrapper_name)) != compact(wrapper_shape):
@@ -140,8 +140,8 @@ for wrapper_name, wrapper_shape in expected_total_wrappers.items():
 expected_model = """
 def error_family_precedes(left: sview, right: sview) -> bool:
     ensure result == error_family_precedes_at(left, right, 0)
-    left_length: usize = sview_len(left)
-    right_length: usize = sview_len(right)
+    left_length: usize = left.len
+    right_length: usize = right.len
     shared_length: usize = left_length if left_length < right_length else right_length
     index: mutable usize = 0
     while index < shared_length |index, left, right|:
@@ -149,7 +149,7 @@ def error_family_precedes(left: sview, right: sview) -> bool:
         invariant index <= shared_length
         invariant error_family_precedes_at(left, right, index) == error_family_precedes_at(left, right, 0)
         if index < left_length and index < right_length:
-            return sview_at(left, index) < sview_at(right, index) if sview_at(left, index) != sview_at(right, index)
+            return left[index] < right[index] if left[index] != right[index]
             index <- index + 1
         else:
             return left_length < right_length

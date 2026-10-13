@@ -146,18 +146,18 @@ for name, expected in FUNCTION_SHA256.items():
     if function_fingerprint(source_text, name) != expected:
         raise SystemExit(f"{name} changed since semantic proofs were source-bound; re-review the whole function")
 exact_steps(source_text, "submit_group_ascii_identifier_char", (
-    (4, "return false if offset >= sview_len(text)"),
-    (4, "character: u8 = sview_at(text, offset)"),
+    (4, "return false if offset >= text.len"),
+    (4, "character: u8 = text[offset]"),
     (4, "return character == 95 or character == 36 or character in 48..57 or character in 65..90 or character in 97..122"),
 ), "ASCII identifier classifier")
 exact_steps(source_text, "submit_group_raw_text_mentions_name", (
     (4, 'return false if name == ""'),
-    (4, "text_length: usize = sview_len(text)"),
-    (4, "name_length: usize = sview_len(name)"),
+    (4, "text_length: usize = text.len"),
+    (4, "name_length: usize = name.len"),
     (4, "for offset in 0..<text_length:"),
-    (8, "return true if sview_at(text, offset) >= 128"),
+    (8, "return true if text[offset] >= 128"),
     (4, "for offset in 0..<name_length:"),
-    (8, "return true if sview_at(name, offset) >= 128"),
+    (8, "return true if name[offset] >= 128"),
     (4, "for offset in 0..<text_length:"),
     (8, "if name_length <= text_length - offset:"),
     (12, "if sview_matches_prefix(text, name, offset.i64(), end.i64()):"),

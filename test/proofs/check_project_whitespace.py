@@ -187,16 +187,16 @@ for fragment in (
     if compact(fragment) not in compact(default_body):
         raise SystemExit(f"production project default no longer selects the blank fallback: {fragment}")
 for fragment in (
-    "length: i64 = sview_len(text).i64()",
+    "length: i64 = text.len.i64()",
     "for index in 0..<length |target, text|",
-    "target.push(sview_at(text, index))",
+    "target.push(text[index])",
 ):
     if compact(fragment) not in compact(extend_view_body):
         raise SystemExit(f"production view copy no longer preserves fallback bytes: {fragment}")
 for fragment in (
-    "false return if value.count.i64() != sview_len(text).i64()",
+    "false return if value.count.i64() != text.len.i64()",
     "for index in 0..<value.count |value, text|",
-    "false return if value[index] != sview_at(text, index.i64())",
+    "false return if value[index] != text[index.i64()]",
     "return true",
 ):
     if compact(fragment) not in compact(equal_view_body):

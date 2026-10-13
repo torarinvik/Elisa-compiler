@@ -82,19 +82,19 @@ component = function_section(lexer_text, "source_line_map_path_has_runtime_std_c
 require_ordered(component, (
     "false return if path_stop <= path_start",
     'marker: sview = "elisacore_std/"',
-    "marker_length: usize = sview_len(marker)",
+    "marker_length: usize = marker.len",
     "marker_start: mutable usize = path_start",
     "while marker_start <= path_stop and path_stop - marker_start >= marker_length",
     "matched: mutable bool = true",
     "for marker_offset in 0..<marker_length",
-    "matched <- false if map_storage[marker_start + marker_offset] != sview_at(marker, marker_offset)",
+    "matched <- false if map_storage[marker_start + marker_offset] != marker[marker_offset]",
     "true return if matched and marker_start > path_start and map_storage[marker_start - 1.usize()] == SOURCE_LINE_MAP_PATH_SEPARATOR",
     "marker_start <- marker_start + 1.usize()",
     "return false",
 ), "stdlib component prefilter")
 component_compact = compact(component)
 if (component_compact.count("matched:mutablebool=true") != 1 or
-        component_compact.count("matched<-falseifmap_storage[marker_start+marker_offset]!=sview_at(marker,marker_offset)") != 1 or
+        component_compact.count("matched<-falseifmap_storage[marker_start+marker_offset]!=marker[marker_offset]") != 1 or
         component_compact.count("marker_start<-marker_start+1.usize()") != 1 or
         component_compact.count("truereturnifmatchedandmarker_start>path_startandmap_storage[marker_start-1.usize()]==SOURCE_LINE_MAP_PATH_SEPARATOR") != 1 or
         component_compact.count("truereturn") != 1 or
