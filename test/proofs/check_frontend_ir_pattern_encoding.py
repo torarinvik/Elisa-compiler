@@ -221,9 +221,8 @@ for function in (pattern_function, literal_function, argument_function, arm_func
             re.search(r"ir_put_[A-Za-z_]+\(&fields,\s*&live,\s*[0-9]+", function) or \
             re.search(r"ir_uvarint_out\(payload,\s*[0-9]+", function):
         raise SystemExit("pattern wire tags or field IDs reverted to numeric literals")
-for byte in byte_values.values():
-    if re.search(rf"sview_at\([^\n]*\)\s*(?:==|!=|<=|>=|<|>)\s*{byte}(?:\D|$)", code_only(patterns_source)):
-        raise SystemExit("pattern source-byte classification reverted to numeric literals")
+if re.search(r"(?m)^\s*def sview_(?:len|at)\(", code_only(patterns_source)):
+    raise SystemExit("pattern source uses a removed sview length/index helper")
 
 positive_names = {
     "pattern_node_type_ids_match_schema",
