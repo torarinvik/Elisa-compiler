@@ -138,23 +138,37 @@ any timed compiler sample, set `ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT` to the
 fingerprint file. The candidate run aborts before timing if the reference is incomplete or a
 workload, profile, scope, comparator toolchain, checksum, output stream, or status differs.
 
-`compile_samples.csv` stores each rotated object-only compile wall time, waited-child CPU time
-(user plus system), and host load averages before and after the sample; `compile_results.csv`
-records best and median wall and CPU time. `build_samples.csv` and `build_results.csv` contain
-the same measures for complete executable builds. Runtime `samples.csv` records load1 before
-and after each runtime sample. Waited-child CPU includes compiler/linker subprocesses that are
-reaped by their parent. Each compiler process group has a timeout so a stuck frontend, linker,
-or child worker is killed with its parent.
+`compile_samples.csv` and `build_samples.csv` retain wall time, waited-child CPU time, retired
+instructions, elapsed cycles, counter status, and host load before and after each sample.
+`compile_results.csv` and `build_results.csv` report best and median wall/CPU time plus median
+instructions and cycles. `samples.csv` records the same measurements for runtime samples.
+`counter_samples.csv` records counters for each direct compiler, linker, or runtime child, with
+the metric, workload, sample, launch order, variant, and child role. Elisa executable-build
+counts aggregate its separate object-compilation and link child counts; the per-child rows remain
+available in `counter_samples.csv`.
+
+On macOS, `/usr/bin/time -l -o <report>` captures each child's retired instructions and elapsed
+cycles in a separate report file, leaving benchmark stdout and stderr untouched. Other hosts, or
+hosts where the counters cannot be parsed, record blank counter values with
+`counter_status=unavailable`; existing wall and CPU measurements remain available. The paired
+reporter computes instruction and cycle ratios only when every matched sample has both counters,
+and marks unsupported or incomplete counter sets unavailable.
+
+Waited-child CPU includes compiler/linker subprocesses that are reaped by their parent. Each
+compiler process group has a timeout so a stuck frontend, linker, or child worker is killed with
+its parent.
 
 Completed timing runs write `timing_samples.sha256` and bind its hash into the run fingerprint.
-The manifest covers the raw sample CSVs consumed by the paired reporter, which verifies their
-hashes before reading timing values. Preflight-only runs have no timing manifest.
+The manifest covers the raw sample CSVs consumed by the paired reporter, including
+`counter_samples.csv`; the reporter verifies their hashes before reading timing values.
+Preflight-only runs have no timing manifest.
 
-`compile_ratios.csv`, `build_ratios.csv`, and `runtime_ratios.csv` report Elisa's median time
-divided by Rust's and Zig's median time for each comparison workload, with wall time and child CPU
-kept separate. A ratio below `1.0` means Elisa is faster. Each file ends with an unweighted
-geometric mean across the listed comparison workloads; the per-workload raw measurements remain
-the source of truth. Compile-only runs produce the compile and build ratio files but no runtime ratio file.
+`compile_ratios.csv`, `build_ratios.csv`, and `runtime_ratios.csv` report Elisa's median values
+divided by Rust's and Zig's median values for each comparison workload. Wall time, child CPU,
+retired instructions, and cycles are kept separate. A ratio below `1.0` means Elisa is faster;
+unsupported counter ratios are blank and have `counter_status=unavailable`. Each file ends with
+an unweighted geometric mean across the listed comparison workloads. Compile-only runs produce
+the compile and build ratio files but no runtime ratio file.
 
 The ordinary Elisa semantic path is measured: incremental fact shadow/cache settings and
 forced contracts are cleared, the opt-in Stage1 object cache is disabled, and Stage1 uses one

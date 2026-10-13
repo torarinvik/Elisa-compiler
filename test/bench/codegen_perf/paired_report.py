@@ -67,12 +67,15 @@ def check_complete(directory: Path, scope: str) -> dict[str, object]:
     return fingerprint
 
 
-def read_elisa_samples(path: Path) -> dict[str, dict[int, tuple[float, float]]]:
+SampleMetrics = tuple[float, float, int | None, int | None, str]
+
+
+def read_elisa_samples(path: Path) -> dict[str, dict[int, SampleMetrics]]:
     try:
         sample_bytes = verified_timing_sample_bytes(path)
     except (OSError, ValueError) as error:
         fail(str(error))
-    result: dict[str, dict[int, tuple[float, float]]] = defaultdict(dict)
+    result: dict[str, dict[int, SampleMetrics]] = defaultdict(dict)
     try:
         sample_text = sample_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -82,6 +85,10 @@ def read_elisa_samples(path: Path) -> dict[str, dict[int, tuple[float, float]]]:
         required = {"benchmark", "sample", "variant", "wall_seconds", "child_cpu_seconds"}
         if not required.issubset(reader.fieldnames or ()):
             fail(f"{path} is missing required columns: {sorted(required - set(reader.fieldnames or ())) }")
+        counter_fields = {"instructions_retired", "cycles_elapsed", "counter_status"}
+        present_counter_fields = counter_fields.intersection(reader.fieldnames or ())
+        if present_counter_fields and present_counter_fields != counter_fields:
+            fail(f"{path} has incomplete counter columns")
         for row in reader:
             if row["variant"] != "elisa":
                 continue
@@ -91,16 +98,35 @@ def read_elisa_samples(path: Path) -> dict[str, dict[int, tuple[float, float]]]:
             cpu = float(row["child_cpu_seconds"])
             if not math.isfinite(wall) or wall <= 0 or not math.isfinite(cpu) or cpu <= 0:
                 fail(f"{path} has a non-positive or non-finite timing for {bench}/sample {sample}")
+            if present_counter_fields:
+                counter_status = row["counter_status"]
+                if counter_status not in ("available", "unavailable"):
+                    fail(f"{path} has an invalid counter status for {bench}/sample {sample}")
+                if counter_status == "available":
+                    try:
+                        instructions = int(row["instructions_retired"])
+                        cycles = int(row["cycles_elapsed"])
+                    except (TypeError, ValueError):
+                        fail(f"{path} has missing counters marked available for {bench}/sample {sample}")
+                    if instructions <= 0 or cycles <= 0:
+                        fail(f"{path} has non-positive counters for {bench}/sample {sample}")
+                else:
+                    if row["instructions_retired"] or row["cycles_elapsed"]:
+                        fail(f"{path} has counter values marked unavailable for {bench}/sample {sample}")
+                    instructions = cycles = None
+            else:
+                instructions = cycles = None
+                counter_status = "unavailable"
             if sample in result[bench]:
                 fail(f"{path} has duplicate Elisa sample {bench}/{sample}")
-            result[bench][sample] = (wall, cpu)
+            result[bench][sample] = (wall, cpu, instructions, cycles, counter_status)
     if not result:
         fail(f"{path} contains no Elisa samples")
     return dict(result)
 
 
 def validate_elisa_sample_coverage(
-    samples: dict[str, dict[int, tuple[float, float]]],
+    samples: dict[str, dict[int, SampleMetrics]],
     metric: str,
     payload: dict[str, object],
     path: Path,
@@ -156,11 +182,14 @@ def main(arguments: list[str]) -> int:
     if pair_metadata.get("benchmark_root") != str(BENCHMARK_ROOT.resolve()):
         fail("paired report is running from a different benchmark checkout")
 
-    for path_key, hash_key in (
+    driver_artifacts = [
         ("paired_wrapper", "paired_wrapper_sha256"),
         ("paired_runner", "paired_runner_sha256"),
         ("paired_reporter", "paired_reporter_sha256"),
-    ):
+    ]
+    if pair_metadata.get("process_counter") is not None:
+        driver_artifacts.append(("process_counter", "process_counter_sha256"))
+    for path_key, hash_key in driver_artifacts:
         driver_path = Path(str(pair_metadata.get(path_key, ""))).resolve()
         if not driver_path.is_file() or hashlib.sha256(driver_path.read_bytes()).hexdigest() != pair_metadata.get(hash_key):
             fail(f"paired benchmark driver changed: {driver_path}")
@@ -254,8 +283,10 @@ def main(arguments: list[str]) -> int:
     if scope == "full_runtime":
         metric_files["runtime"] = "samples.csv"
 
-    ratio_values: dict[str, dict[str, dict[str, list[float]]]] = {
-        metric: defaultdict(lambda: {"wall": [], "cpu": []}) for metric in metric_files
+    ratio_values: dict[str, dict[str, dict[str, list[float] | list[bool]]]] = {
+        metric: defaultdict(lambda: {
+            "wall": [], "cpu": [], "instructions": [], "cycles": [], "counter_complete": [],
+        }) for metric in metric_files
     }
     pair_summaries: list[dict[str, object]] = []
     paired_runs: list[dict[str, str]] = []
@@ -309,13 +340,31 @@ def main(arguments: list[str]) -> int:
                     bench_values = ratio_values[metric][bench]
                     pair_wall: list[float] = []
                     pair_cpu: list[float] = []
+                    pair_instructions: list[float] = []
+                    pair_cycles: list[float] = []
                     for sample in sorted(reference_rows):
-                        ref_wall, ref_cpu = reference_rows[sample]
-                        cand_wall, cand_cpu = candidate_rows[sample]
+                        ref_wall, ref_cpu, ref_instructions, ref_cycles, ref_counter_status = reference_rows[sample]
+                        cand_wall, cand_cpu, cand_instructions, cand_cycles, cand_counter_status = candidate_rows[sample]
                         pair_wall.append(cand_wall / ref_wall)
                         pair_cpu.append(cand_cpu / ref_cpu)
+                        if (
+                            ref_counter_status == "available"
+                            and cand_counter_status == "available"
+                            and ref_instructions is not None and cand_instructions is not None
+                            and ref_cycles is not None and cand_cycles is not None
+                        ):
+                            pair_instructions.append(cand_instructions / ref_instructions)
+                            pair_cycles.append(cand_cycles / ref_cycles)
                     bench_values["wall"].extend(pair_wall)
                     bench_values["cpu"].extend(pair_cpu)
+                    pair_counters_available = (
+                        len(pair_instructions) == len(pair_wall)
+                        and len(pair_cycles) == len(pair_wall)
+                    )
+                    bench_values["counter_complete"].append(pair_counters_available)
+                    if pair_counters_available:
+                        bench_values["instructions"].extend(pair_instructions)
+                        bench_values["cycles"].extend(pair_cycles)
                     pair_summaries.append({
                         "metric": metric,
                         "block": block_number,
@@ -324,6 +373,13 @@ def main(arguments: list[str]) -> int:
                         "matched_samples": len(pair_wall),
                         "median_candidate_over_reference_wall": statistics.median(pair_wall),
                         "median_candidate_over_reference_cpu": statistics.median(pair_cpu),
+                        "median_candidate_over_reference_instructions_retired": (
+                            statistics.median(pair_instructions) if pair_counters_available else ""
+                        ),
+                        "median_candidate_over_reference_cycles_elapsed": (
+                            statistics.median(pair_cycles) if pair_counters_available else ""
+                        ),
+                        "counter_status": "available" if pair_counters_available else "unavailable",
                     })
 
     summary_rows: list[dict[str, object]] = []
@@ -332,6 +388,10 @@ def main(arguments: list[str]) -> int:
         for bench in sorted(workload_values):
             wall = workload_values[bench]["wall"]
             cpu = workload_values[bench]["cpu"]
+            instructions = workload_values[bench]["instructions"]
+            cycles = workload_values[bench]["cycles"]
+            counter_complete = workload_values[bench]["counter_complete"]
+            counter_available = bool(counter_complete) and all(counter_complete)
             row = {
                 "metric": metric,
                 "benchmark": bench,
@@ -340,10 +400,24 @@ def main(arguments: list[str]) -> int:
                 "geometric_mean_candidate_over_reference_wall": geometric_mean(wall),
                 "median_candidate_over_reference_cpu": statistics.median(cpu),
                 "geometric_mean_candidate_over_reference_cpu": geometric_mean(cpu),
+                "median_candidate_over_reference_instructions_retired": (
+                    statistics.median(instructions) if counter_available else ""
+                ),
+                "geometric_mean_candidate_over_reference_instructions_retired": (
+                    geometric_mean(instructions) if counter_available else ""
+                ),
+                "median_candidate_over_reference_cycles_elapsed": (
+                    statistics.median(cycles) if counter_available else ""
+                ),
+                "geometric_mean_candidate_over_reference_cycles_elapsed": (
+                    geometric_mean(cycles) if counter_available else ""
+                ),
+                "counter_status": "available" if counter_available else "unavailable",
             }
             summary_rows.append(row)
             metric_rows.append(row)
         if metric_rows:
+            all_metric_counters_available = all(row["counter_status"] == "available" for row in metric_rows)
             summary_rows.append({
                 "metric": metric,
                 "benchmark": "geometric_mean",
@@ -356,6 +430,21 @@ def main(arguments: list[str]) -> int:
                 "geometric_mean_candidate_over_reference_cpu": geometric_mean([
                     float(row["geometric_mean_candidate_over_reference_cpu"]) for row in metric_rows
                 ]),
+                "median_candidate_over_reference_instructions_retired": "",
+                "geometric_mean_candidate_over_reference_instructions_retired": (
+                    geometric_mean([
+                        float(row["geometric_mean_candidate_over_reference_instructions_retired"])
+                        for row in metric_rows
+                    ]) if all_metric_counters_available else ""
+                ),
+                "median_candidate_over_reference_cycles_elapsed": "",
+                "geometric_mean_candidate_over_reference_cycles_elapsed": (
+                    geometric_mean([
+                        float(row["geometric_mean_candidate_over_reference_cycles_elapsed"])
+                        for row in metric_rows
+                    ]) if all_metric_counters_available else ""
+                ),
+                "counter_status": "available" if all_metric_counters_available else "unavailable",
             })
 
     summary_path = out / "paired_ab_summary.csv"
@@ -367,6 +456,11 @@ def main(arguments: list[str]) -> int:
         "geometric_mean_candidate_over_reference_wall",
         "median_candidate_over_reference_cpu",
         "geometric_mean_candidate_over_reference_cpu",
+        "median_candidate_over_reference_instructions_retired",
+        "geometric_mean_candidate_over_reference_instructions_retired",
+        "median_candidate_over_reference_cycles_elapsed",
+        "geometric_mean_candidate_over_reference_cycles_elapsed",
+        "counter_status",
     )
     with summary_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -382,6 +476,9 @@ def main(arguments: list[str]) -> int:
         "matched_samples",
         "median_candidate_over_reference_wall",
         "median_candidate_over_reference_cpu",
+        "median_candidate_over_reference_instructions_retired",
+        "median_candidate_over_reference_cycles_elapsed",
+        "counter_status",
     )
     with pair_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=pair_fields)
@@ -408,6 +505,11 @@ def main(arguments: list[str]) -> int:
                 f"{row['metric']}: candidate/reference geometric mean wall="
                 f"{float(row['geometric_mean_candidate_over_reference_wall']):.4f}, child CPU="
                 f"{float(row['geometric_mean_candidate_over_reference_cpu']):.4f}"
+                + (
+                    f", instructions={float(row['geometric_mean_candidate_over_reference_instructions_retired']):.4f}, "
+                    f"cycles={float(row['geometric_mean_candidate_over_reference_cycles_elapsed']):.4f}"
+                    if row["counter_status"] == "available" else ", counters=unavailable"
+                )
             )
     print(f"Paired compiler A/B report: {summary_path}")
     return 0

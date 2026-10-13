@@ -243,6 +243,8 @@ def verify_run_artifacts(
             expected_timing_names.add("samples.csv")
         elif provenance.get("scope") != "compile_only":
             raise ValueError(f"{directory.name} has an invalid timing sample scope")
+        if "retired_instruction_counter" in provenance:
+            expected_timing_names.add("counter_samples.csv")
         timing_rows: dict[str, str] = {}
         try:
             timing_manifest_text = timing_manifest_bytes.decode("utf-8")
@@ -338,6 +340,9 @@ def paired_input_identity(
         "stable_toolchain_manifest": stable_toolchain_identity(fingerprint, pair_metadata, run_metadata),
         "comparator_toolchain": comparator,
         "shared_runtime_source_manifest": shared_runtime,
+        "retired_instruction_counter": provenance.get(
+            "retired_instruction_counter", run_metadata.get("retired_instruction_counter")
+        ),
     }
 
 
@@ -387,6 +392,7 @@ def main(arguments: list[str]) -> int:
             "paired_wrapper": SCRIPT_DIR / "paired_cross_language.sh",
             "paired_runner": Path(__file__).resolve(),
             "paired_reporter": REPORTER,
+            "process_counter": SCRIPT_DIR / "process_counter.py",
         }
         driver_hashes = {name: digest(path) for name, path in driver_sources.items()}
         arm_source_manifests = {
@@ -469,6 +475,8 @@ def main(arguments: list[str]) -> int:
             "paired_runner_sha256": driver_hashes["paired_runner"],
             "paired_reporter": str(driver_sources["paired_reporter"]),
             "paired_reporter_sha256": driver_hashes["paired_reporter"],
+            "process_counter": str(driver_sources["process_counter"]),
+            "process_counter_sha256": driver_hashes["process_counter"],
             "canonical_workload_fingerprint_sha256": reference_fingerprint["fingerprint_sha256"],
             "canonical_workload_payload": reference_fingerprint["payload"],
             "paired_order": "A-B-B-A",
