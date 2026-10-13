@@ -48,12 +48,12 @@ def compact(text: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\]\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -107,16 +107,37 @@ positive_names = {
     "modeled_index_keeps_source_signedness",
     "soa_row_membership_guard",
     "negative_signed_row_id_is_not_valid",
+    "out_of_bounds_unsigned_index_is_rejected",
+    "either_failed_guard_component_is_rejected",
+    "negative_untyped_literal_never_passes_index_guard",
 }
 if declarations(POSITIVE) != positive_names:
     raise SystemExit("index-guard proof inventory changed")
 negative_names = {
     "false_claim_negative_signed_index_can_pass",
     "false_claim_negative_untyped_literal_is_unsigned",
+    "false_claim_out_of_bounds_unsigned_index_is_accepted",
+    "false_claim_negative_untyped_literal_can_pass_index_guard",
 }
 if declarations(NEGATIVE) != negative_names or \
         'include "./backend_index_guard.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("index-guard rejection control changed")
+if compact(function_section(POSITIVE.read_text(), "out_of_bounds_unsigned_index_is_rejected")) != compact("""
+def out_of_bounds_unsigned_index_is_rejected(index_nonnegative: bool) -> bool:
+    ensure result == true
+    return not signed_index_guard(index_nonnegative, false)
+""") or compact(function_section(POSITIVE.read_text(), "either_failed_guard_component_is_rejected")) != compact("""
+def either_failed_guard_component_is_rejected(index_nonnegative: bool, unsigned_in_bounds: bool) -> bool:
+    ensure result == (not index_nonnegative or not unsigned_in_bounds)
+    return not signed_index_guard(index_nonnegative, unsigned_in_bounds)
+""") or compact(function_section(POSITIVE.read_text(), "negative_untyped_literal_never_passes_index_guard")) != compact("""
+def negative_untyped_literal_never_passes_index_guard(untyped_integer_literal: bool, expected_is_signed: bool, unsigned_in_bounds: bool) -> bool:
+    requires untyped_integer_literal
+    ensure result == true
+    source_is_signed: bool = untyped_integer_literal or expected_is_signed
+    return not signed_index_guard(not source_is_signed, unsigned_in_bounds)
+"""):
+    raise SystemExit("index guard proofs no longer reject either an unsigned bounds failure or a signedness failure")
 if declarations(CHUNKS_POSITIVE) != {
     "chunks_exact_guard",
     "chunks_exact_size_is_valid",
@@ -475,13 +496,15 @@ expected_positive = {
     "modeled_index_keeps_source_signedness": "def modeled_index_keeps_source_signedness(actual_is_signed:bool,expected_is_signed:bool,untyped_integer_literal:bool)->bool:\nensure result==true\nreturn index_source_is_signed(true,actual_is_signed,expected_is_signed,untyped_integer_literal)==actual_is_signed",
     "soa_row_membership_guard": "def soa_row_membership_guard(index_nonnegative:bool,unsigned_in_bounds:bool)->bool:\nensure result==(index_nonnegative and unsigned_in_bounds)\nreturn index_nonnegative and unsigned_in_bounds",
     "negative_signed_row_id_is_not_valid": "def negative_signed_row_id_is_not_valid(unsigned_in_bounds:bool)->bool:\nensure result==true\nreturn not soa_row_membership_guard(false,unsigned_in_bounds)",
+    "negative_untyped_literal_never_passes_index_guard": "def negative_untyped_literal_never_passes_index_guard(untyped_integer_literal:bool,expected_is_signed:bool,unsigned_in_bounds:bool)->bool:\nrequires untyped_integer_literal\nensure result==true\nsource_is_signed:bool=untyped_integer_literal or expected_is_signed\nreturn not signed_index_guard(not source_is_signed,unsigned_in_bounds)",
 }
 for name, expected in expected_positive.items():
     if compact(function_section(positive_text, name)) != compact(expected):
         raise SystemExit(f"index-guard theorem {name} changed")
 negative_text = compact(NEGATIVE.read_text())
 if "requiresunsigned_in_boundsensureresult==truereturnsigned_index_guard(false,unsigned_in_bounds)" not in negative_text or \
-        "requiresnotexpected_is_signedensureresult==truereturnnotindex_source_is_signed(false,false,expected_is_signed,true)" not in negative_text:
+        "requiresnotexpected_is_signedensureresult==truereturnnotindex_source_is_signed(false,false,expected_is_signed,true)" not in negative_text or \
+        "requiresuntyped_integer_literalensureresult==truesource_is_signed:bool=untyped_integer_literalorexpected_is_signedreturnsigned_index_guard(notsource_is_signed,unsigned_in_bounds)" not in negative_text:
     raise SystemExit("false negative-index acceptance control changed")
 
 chunks_positive_text = CHUNKS_POSITIVE.read_text()
@@ -552,14 +575,14 @@ def run(path: Path) -> tuple[int, dict]:
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
 assert positive["summary"]["declarations"] == len(positive_names)
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 20
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 26
 assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "backend index-guard proof report changed across identical runs"
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
 assert negative["summary"]["declarations"] == len(positive_names) + len(negative_names)
-assert negative["summary"]["obligations"] == 24 and negative["summary"]["proven"] == 22
+assert negative["summary"]["obligations"] == 34 and negative["summary"]["proven"] == 26
 assert {row["name"] for row in negative["findings"]} == negative_names
 assert all(row["kind"] == "ensure-unproven" and row["status"] == "unknown"
            for row in negative["findings"])

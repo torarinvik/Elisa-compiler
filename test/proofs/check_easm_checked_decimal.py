@@ -58,6 +58,27 @@ def declaration_names(path: Path) -> set[str]:
 
 helper_text = HELPER.read_text()
 arithmetic_text = ARITH_POSITIVE.read_text()
+boundary_constants = {
+    "I64_DECIMAL_BOUNDARY_PREFIX": "922337203685477580",
+    "I64_MAX_VALUE": "9223372036854775807",
+    "DECIMAL_RADIX": "10",
+    "MAX_POSITIVE_FINAL_DIGIT": "7",
+    "MAX_NEGATIVE_FINAL_DIGIT": "8",
+    "FIRST_POSITIVE_OVERFLOW_DIGIT": "8",
+    "FIRST_NEGATIVE_UNDERFLOW_DIGIT": "9",
+}
+declared_boundary_constants = dict(re.findall(
+    r"(?m)^const ([A-Z0-9_]+): i64 = ([0-9]+)$", arithmetic_text
+))
+if declared_boundary_constants != boundary_constants:
+    raise SystemExit("decimal boundary proof constants changed")
+arithmetic_header, arithmetic_functions = arithmetic_text.split("def positive_digit_guard(", 1)
+arithmetic_functions = re.sub(
+    r"\b(?:" + "|".join(boundary_constants) + r")\b",
+    lambda match: boundary_constants[match.group()],
+    arithmetic_functions,
+)
+arithmetic_text = arithmetic_header + "def positive_digit_guard(" + arithmetic_functions
 arithmetic_compact = compact(arithmetic_text)
 env_text = ENV.read_text()
 parser_text = PARSER.read_text()
@@ -205,6 +226,24 @@ if "requiresdigit>=0anddigit<=9" not in positive_first_digit or \
         "requiresdigit>=0anddigit<=9" not in negative_first_digit or \
         "return0>-922337203685477580or(0==-922337203685477580anddigit<=8)" not in negative_first_digit:
     raise SystemExit("first-digit proofs no longer establish acceptance from the zero accumulator")
+positive_boundary = compact(function_section(arithmetic_text, "positive_boundary_digit_seven_is_safe"))
+positive_overflow = compact(function_section(arithmetic_text, "positive_boundary_digit_eight_is_rejected"))
+negative_boundary = compact(function_section(arithmetic_text, "negative_boundary_digit_eight_is_safe"))
+negative_underflow = compact(function_section(arithmetic_text, "negative_boundary_digit_nine_is_rejected"))
+positive_classification = compact(function_section(arithmetic_text, "positive_final_digit_classification_is_exact"))
+positive_range = compact(function_section(arithmetic_text, "positive_boundary_accumulation_stays_representable"))
+negative_range = compact(function_section(arithmetic_text, "negative_boundary_accumulation_stays_representable"))
+if "return(922337203685477580<922337203685477580or(922337203685477580==922337203685477580and7<=7))and922337203685477580*10+7==9223372036854775807" not in positive_boundary or \
+        "returnnot(922337203685477580<922337203685477580or(922337203685477580==922337203685477580and8<=7))" not in positive_overflow or \
+        "return(0-922337203685477580>0-922337203685477580or(0-922337203685477580==0-922337203685477580and8<=8))and(0-922337203685477580)*10-8==0-9223372036854775807-1" not in negative_boundary or \
+        "returnnot(0-922337203685477580>0-922337203685477580or(0-922337203685477580==0-922337203685477580and9<=8))" not in negative_underflow or \
+        "requiresdigit>=0anddigit<=9" not in positive_classification or \
+        "return(922337203685477580<922337203685477580or(922337203685477580==922337203685477580anddigit<=7))==(digit<=7)" not in positive_classification or \
+        "requiresdigit>=0anddigit<=7" not in positive_range or \
+        "return922337203685477580*10+digit>=0and922337203685477580*10+digit<=9223372036854775807" not in positive_range or \
+        "requiresdigit>=0anddigit<=8" not in negative_range or \
+        "return(0-922337203685477580)*10-digit>=0-9223372036854775807-1and(0-922337203685477580)*10-digit<=0" not in negative_range:
+    raise SystemExit("boundary proofs no longer pin the final accepted and first rejected digit for each sign")
 arithmetic_names = {
     "positive_digit_guard",
     "positive_digit_accumulation_stays_below_max",
@@ -215,10 +254,19 @@ arithmetic_names = {
     "ascii_digit_byte_offset_is_in_range",
     "positive_accumulator_accepts_first_digit",
     "negative_accumulator_accepts_first_digit",
+    "positive_boundary_digit_seven_is_safe",
+    "positive_boundary_digit_eight_is_rejected",
+    "negative_boundary_digit_eight_is_safe",
+    "negative_boundary_digit_nine_is_rejected",
+    "positive_final_digit_classification_is_exact",
+    "positive_boundary_accumulation_stays_representable",
+    "negative_boundary_accumulation_stays_representable",
 }
 arithmetic_false_names = {
     "false_claim_positive_overflow_digit_is_guarded",
     "false_claim_negative_underflow_digit_is_guarded",
+    "false_claim_positive_boundary_digit_eight_is_safe",
+    "false_claim_negative_boundary_digit_nine_is_safe",
 }
 if declaration_names(ARITH_POSITIVE) != arithmetic_names or \
         declaration_names(ARITH_NEGATIVE) != arithmetic_false_names:
