@@ -1,4 +1,5 @@
 """Admit EASM operand parsing, operand-form checks, and conditional-target validation."""
+import argparse
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ from proof_product_gate import require_current_product, source_include_closure
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = ROOT.parent / "elisa-proof"
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "easm_operand_scan.elisa"
 NEGATIVE = HERE / "easm_operand_scan_rejected.elisa"
@@ -22,6 +23,12 @@ PROVENANCE = ROOT / "src/backend/easm_verify_provenance.elisa"
 FUNCTION = ROOT / "src/backend/easm_verify_function.elisa"
 MEMORY = ROOT / "src/backend/easm_verify_memory.elisa"
 MODEL = ROOT / "src/backend/easm_model.elisa"
+MASKS = ROOT / "src/backend/easm_register_masks.elisa"
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true",
+                    help="check source and fixture bindings without invoking Elisa-Proof")
+ARGS = parser.parse_args()
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -368,7 +375,14 @@ for expected_fragment in (
     if compact(expected_fragment) not in role_body:
         raise SystemExit("instruction role validation lost a push/unary/FPU/shift/control/move/binary operand rule")
 register_bit_body = compact(function_section(MODEL.read_text(), "easm_register_bit"))
-if "return 0" not in register_bit_body:
+if register_bit_body != compact("""
+def easm_register_bit(register: sview) -> i64:
+    ensure result == EasmRegisterMasks::register_bit(register)
+    return EasmRegisterMasks::register_bit(register)
+"""):
+    raise SystemExit("register lookup no longer delegates exactly to the canonical EASM register map")
+register_bit_source = compact(MASKS.read_text())
+if "_ -> 0" not in register_bit_source or "_: 0" not in register_bit_source:
     raise SystemExit("unknown register names must map to no modeled register bit")
 if "EasmOperandScan::is_aarch64_mrs_form" in role_body:
     raise SystemExit("executable MRS must fail closed until its AArch64 register effects are modeled")
@@ -378,11 +392,19 @@ if conditional_target_check not in instruction_code:
 if instruction_code.index("target_is_local: bool = easm_label_index(fn.instructions, control_target) >= 0") > instruction_code.index(conditional_target_check):
     raise SystemExit("conditional target validation must derive local-target status from the function's labels")
 label_index = compact(function_section(MODEL.read_text(), "easm_label_index"))
-if "if easm_equal(easm_label_name(instructions[index]), target): return index.i64()" not in label_index or "return -1" not in label_index:
-    raise SystemExit("conditional target resolution must treat a missing local label as unresolved")
+required_label_lookup = (
+    "return -1 if count_signed < 0 or count_signed.usize() != count",
+    "for index in 0..<count |instructions, target|:",
+    "invariant index <= count",
+    "invariant forall prior in 0..<index: not easm_equal(easm_label_name(instructions[prior]), target)",
+    "if easm_equal(easm_label_name(instructions[index]), target): return index.i64()",
+)
+if any(fragment not in label_index for fragment in required_label_lookup) or not label_index.endswith("return -1"):
+    raise SystemExit("conditional target lookup lost its bounded first-match or unresolved-label behavior")
 conditional_classifier = compact(function_section(MODEL.read_text(), "easm_is_conditional_jump"))
 if conditional_classifier != compact("""
 def easm_is_conditional_jump(op: sview) -> bool:
+    ensure result == (easm_starts(op, "j") and not easm_equal(op, "jmp") and not easm_equal(op, "jmpq"))
     return easm_starts(op, "j") and not easm_equal(op, "jmp") and not easm_equal(op, "jmpq")
 """):
     raise SystemExit("conditional branch target guard must cover the production conditional-jump classifier")
@@ -734,6 +756,13 @@ for name, expected in expected_negative.items():
     if proof_body(negative_text, name) != compact(expected):
         raise SystemExit(f"negative scanner false-claim control changed: {name}")
 
+source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "positive": len(positive_names),
+                      "false_claim_controls": len(negative_names),
+                      "source_closure_files": len(source_closure)}, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     manifest = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
@@ -751,9 +780,9 @@ inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE,
-    POLICY, ENV, PROVENANCE, FUNCTION, MEMORY, MODEL,
+    POLICY, ENV, PROVENANCE, FUNCTION, MEMORY, MODEL, MASKS,
 ]
-inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
+inputs.extend(source_closure)
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 
