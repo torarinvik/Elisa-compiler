@@ -87,9 +87,9 @@ def is_positive_power_of_two(value: u64) -> bool:
 '''
 expected_model = '''
 ghost def accepts_from(text: sview, position: usize, value: u64) -> bool:
-    requires position <= text.length
-    decreases text.length - position
-    return is_positive_power_of_two_spec(value) if position == text.length
+    requires position <= text.len
+    decreases text.len - position
+    return is_positive_power_of_two_spec(value) if position == text.len
     byte: u8 = text[position]
     return false if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE
     digit: u64 = (byte - ASCII_DIGIT_ZERO).u64()
@@ -103,9 +103,9 @@ def accepts(text: sview) -> bool can[Abort.Panic]:
     can Abort.Panic:
         value: mutable u64 = 0.u64()
         position: mutable usize = 0
-        while position < text.length |position, value|:
-            decreases text.length - position
-            invariant position <= text.length
+        while position < text.len |position, value|:
+            decreases text.len - position
+            invariant position <= text.len
             invariant accepts_from(text, position, value) == accepts_from(text, 0, 0.u64())
             byte: u8 = text[position]
             return false if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE
