@@ -19,6 +19,10 @@ MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 POSITIVE = HERE / "lexer_utf8_codepoint.elisa"
 TWO_BYTE_RANGES = HERE / "lexer_utf8_two_byte_ranges.elisa"
 WIDE_POSITIVE = HERE / "lexer_utf8_codepoint_wide.elisa"
+THREE_BYTE_SCALAR_BOUNDS = HERE / "lexer_utf8_three_byte_scalar_bounds.elisa"
+THREE_BYTE_SURROGATE_REJECTED = HERE / "lexer_utf8_three_byte_surrogate_rejected.elisa"
+FOUR_BYTE_SCALAR_BOUNDS = HERE / "lexer_utf8_four_byte_scalar_bounds.elisa"
+FOUR_BYTE_SCALAR_REJECTED = HERE / "lexer_utf8_four_byte_scalar_bounds_rejected.elisa"
 PAYLOAD_BOUNDS = HERE / "lexer_utf8_payload_bounds.elisa"
 GUARDS_POSITIVE = HERE / "lexer_utf8_codepoint_guards.elisa"
 SEQUENCE_GUARDS_POSITIVE = HERE / "lexer_utf8_sequence_guards.elisa"
@@ -53,6 +57,10 @@ positive_text = POSITIVE.read_text()
 two_byte_ranges_text = TWO_BYTE_RANGES.read_text()
 negative_text = NEGATIVE.read_text()
 payload_bounds_text = PAYLOAD_BOUNDS.read_text()
+four_byte_scalar_bounds_text = FOUR_BYTE_SCALAR_BOUNDS.read_text()
+four_byte_scalar_rejected_text = FOUR_BYTE_SCALAR_REJECTED.read_text()
+three_byte_scalar_bounds_text = THREE_BYTE_SCALAR_BOUNDS.read_text()
+three_byte_surrogate_rejected_text = THREE_BYTE_SURROGATE_REJECTED.read_text()
 
 helper_constants = {
     "UTF8_CONTINUATION_MIN": "0x80",
@@ -676,6 +684,118 @@ if f"ensure result == ({four_guard_return.removeprefix('return ')})" not in four
 
 if 'include "../../src/lexer/lexer_utf8_codepoint_constants.elisa"' not in negative_text or 'include "../../src/lexer/lexer_utf8_codepoint_wide.elisa"' not in negative_text:
     raise SystemExit("negative control no longer imports the production decoder contracts")
+
+if 'include "../../src/lexer/lexer_utf8_codepoint_constants.elisa"' not in four_byte_scalar_bounds_text or \
+        'include "../../src/lexer/lexer_utf8_codepoint_wide.elisa"' not in four_byte_scalar_bounds_text:
+    raise SystemExit("four-byte scalar proof no longer imports the production decoder contracts")
+if 'include "../../src/lexer/lexer_utf8_codepoint_constants.elisa"' not in four_byte_scalar_rejected_text or \
+        'include "../../src/lexer/lexer_utf8_codepoint_wide.elisa"' not in four_byte_scalar_rejected_text:
+    raise SystemExit("four-byte scalar rejection control no longer imports the production decoder contracts")
+if 'include "../../src/lexer/lexer_utf8_codepoint_constants.elisa"' not in three_byte_scalar_bounds_text or \
+        'include "../../src/lexer/lexer_utf8_codepoint_wide.elisa"' not in three_byte_scalar_bounds_text:
+    raise SystemExit("three-byte scalar proof no longer imports the production decoder contracts")
+if 'include "../../src/lexer/lexer_utf8_codepoint_constants.elisa"' not in three_byte_surrogate_rejected_text or \
+        'include "../../src/lexer/lexer_utf8_codepoint_wide.elisa"' not in three_byte_surrogate_rejected_text:
+    raise SystemExit("three-byte surrogate control no longer imports the production decoder contracts")
+
+three_byte_scalar_theorem = proof_function_section(
+    three_byte_scalar_bounds_text, "valid_three_byte_sequence_decodes_to_non_surrogate_scalar")
+if "def valid_three_byte_sequence_decodes_to_non_surrogate_scalar(first: i64, second: i64, third: i64) -> bool:" not in three_byte_scalar_bounds_text:
+    raise SystemExit("three-byte scalar theorem no longer quantifies over the three raw UTF-8 bytes")
+three_byte_scalar_guard_premises = (
+    "requires first >= UTF8_THREE_BYTE_LEAD_MIN and first <= UTF8_THREE_BYTE_LEAD_MAX",
+    "requires second >= UTF8_CONTINUATION_MIN and second <= UTF8_CONTINUATION_MAX",
+    "requires third >= UTF8_CONTINUATION_MIN and third <= UTF8_CONTINUATION_MAX",
+    "requires first > UTF8_THREE_BYTE_LEAD_MIN or second >= UTF8_E0_SECOND_MIN",
+    "requires first != UTF8_SURROGATE_LEAD or second <= UTF8_ED_SECOND_MAX",
+)
+three_byte_scalar_decode = (
+    "decoded: i64 = lexer_decode_utf8_three(first - UTF8_THREE_BYTE_LEAD_MIN, "
+    "second - UTF8_CONTINUATION_MIN, third - UTF8_CONTINUATION_MIN)"
+)
+three_byte_scalar_predicate = (
+    "decoded >= UTF8_THREE_BYTE_SCALAR_MIN and decoded <= UTF8_THREE_BYTE_SCALAR_MAX and "
+    "(decoded < UNICODE_SURROGATE_MIN or decoded > UNICODE_SURROGATE_MAX)"
+)
+if any(fragment not in three_byte_scalar_theorem for fragment in three_byte_scalar_guard_premises) or \
+        three_byte_scalar_theorem.count(three_byte_scalar_decode) != 1 or \
+        f"ensure result == ({three_byte_scalar_predicate})" not in three_byte_scalar_theorem or \
+        "ensure result implies decoded >= UTF8_THREE_BYTE_SCALAR_MIN" not in three_byte_scalar_theorem or \
+        "ensure result implies decoded <= UTF8_THREE_BYTE_SCALAR_MAX" not in three_byte_scalar_theorem or \
+        "ensure result implies (decoded < UNICODE_SURROGATE_MIN or decoded > UNICODE_SURROGATE_MAX)" not in three_byte_scalar_theorem:
+    raise SystemExit("three-byte scalar theorem no longer proves bounds and surrogate exclusion for the exact decode")
+if [line.strip() for line in three_byte_scalar_theorem.splitlines() if line.strip().startswith("requires ")] != list(three_byte_scalar_guard_premises) or \
+        [line.strip() for line in three_byte_scalar_theorem.splitlines() if line.strip().startswith("return ")] != [f"return {three_byte_scalar_predicate}"]:
+    raise SystemExit("three-byte scalar theorem must use exactly the production byte guards and return the claimed predicate")
+
+three_byte_surrogate_rejected = proof_function_section(
+    three_byte_surrogate_rejected_text, "an_unchecked_ed_a0_sequence_decodes_to_a_surrogate")
+if "def an_unchecked_ed_a0_sequence_decodes_to_a_surrogate() -> bool:" not in three_byte_surrogate_rejected_text or \
+        "lexer_decode_utf8_three(UTF8_SURROGATE_LEAD - UTF8_THREE_BYTE_LEAD_MIN, 32, 0)" not in three_byte_surrogate_rejected or \
+        "ensure result == true" not in three_byte_surrogate_rejected or \
+        "return decoded >= UNICODE_SURROGATE_MIN and decoded <= UNICODE_SURROGATE_MAX" not in three_byte_surrogate_rejected or \
+        any(line.strip().startswith("requires ") for line in three_byte_surrogate_rejected.splitlines()):
+    raise SystemExit("ED A0 surrogate control no longer demonstrates the excluded decode boundary")
+
+four_byte_source = function_body(core_text, "four_byte_codepoint_at_cursor", "is_utf8_continuation")
+four_byte_source_guards = (
+    "-1 return if first.i64() < UTF8_FOUR_BYTE_LEAD_MIN or first.i64() > UTF8_FOUR_BYTE_LEAD_MAX",
+    "-1 return if second.i64() < UTF8_CONTINUATION_MIN or second.i64() > UTF8_CONTINUATION_MAX or third.i64() < UTF8_CONTINUATION_MIN or third.i64() > UTF8_CONTINUATION_MAX or fourth.i64() < UTF8_CONTINUATION_MIN or fourth.i64() > UTF8_CONTINUATION_MAX",
+    "-1 return if first.i64() == UTF8_FOUR_BYTE_LEAD_MIN and second.i64() < UTF8_F0_SECOND_MIN",
+    "-1 return if first.i64() == UTF8_FOUR_BYTE_LEAD_MAX and second.i64() > UTF8_F4_SECOND_MAX",
+)
+if any(four_byte_source.count(fragment) != 1 for fragment in four_byte_source_guards):
+    raise SystemExit("four-byte scalar proof's byte ranges or F0/F4 boundaries no longer match the production decoder")
+four_byte_source_decode = (
+    "return lexer_decode_utf8_four(first.i64() - UTF8_FOUR_BYTE_LEAD_MIN, "
+    "second.i64() - UTF8_CONTINUATION_MIN, third.i64() - UTF8_CONTINUATION_MIN, "
+    "fourth.i64() - UTF8_CONTINUATION_MIN).int()"
+)
+if four_byte_source.count(four_byte_source_decode) != 1 or any(
+        four_byte_source.index(left) >= four_byte_source.index(right)
+        for left, right in zip(four_byte_source_guards, (*four_byte_source_guards[1:], four_byte_source_decode))):
+    raise SystemExit("four-byte scalar proof no longer follows the production byte guards into its single decode call")
+
+four_byte_scalar_theorem = proof_function_section(
+    four_byte_scalar_bounds_text, "valid_four_byte_sequence_decodes_to_unicode_scalar")
+if "def valid_four_byte_sequence_decodes_to_unicode_scalar(first: i64, second: i64, third: i64, fourth: i64) -> bool:" not in four_byte_scalar_bounds_text:
+    raise SystemExit("four-byte scalar theorem no longer quantifies over the four raw UTF-8 bytes")
+four_byte_scalar_guard_premises = (
+    "requires first >= UTF8_FOUR_BYTE_LEAD_MIN and first <= UTF8_FOUR_BYTE_LEAD_MAX",
+    "requires second >= UTF8_CONTINUATION_MIN and second <= UTF8_CONTINUATION_MAX",
+    "requires third >= UTF8_CONTINUATION_MIN and third <= UTF8_CONTINUATION_MAX",
+    "requires fourth >= UTF8_CONTINUATION_MIN and fourth <= UTF8_CONTINUATION_MAX",
+    "requires first > UTF8_FOUR_BYTE_LEAD_MIN or second >= UTF8_F0_SECOND_MIN",
+    "requires first < UTF8_FOUR_BYTE_LEAD_MAX or second <= UTF8_F4_SECOND_MAX",
+)
+four_byte_scalar_decode = (
+    "decoded: i64 = lexer_decode_utf8_four(first - UTF8_FOUR_BYTE_LEAD_MIN, "
+    "second - UTF8_CONTINUATION_MIN, third - UTF8_CONTINUATION_MIN, "
+    "fourth - UTF8_CONTINUATION_MIN)"
+)
+if any(fragment not in four_byte_scalar_theorem for fragment in four_byte_scalar_guard_premises) or \
+        four_byte_scalar_theorem.count(four_byte_scalar_decode) != 1 or \
+        "ensure result == (decoded >= UTF8_FOUR_BYTE_SCALAR_MIN and decoded <= UNICODE_SCALAR_MAX)" not in four_byte_scalar_theorem or \
+        "ensure result implies decoded >= UTF8_FOUR_BYTE_SCALAR_MIN" not in four_byte_scalar_theorem or \
+        "ensure result implies decoded <= UNICODE_SCALAR_MAX" not in four_byte_scalar_theorem:
+    raise SystemExit("four-byte scalar theorem no longer proves the exact production decode's Unicode bounds")
+if [line.strip() for line in four_byte_scalar_theorem.splitlines() if line.strip().startswith("requires ")] != list(four_byte_scalar_guard_premises):
+    raise SystemExit("four-byte scalar theorem must use exactly the production decoder's byte guards as premises")
+if [line.strip() for line in four_byte_scalar_theorem.splitlines() if line.strip().startswith("return ")] != [
+        "return decoded >= UTF8_FOUR_BYTE_SCALAR_MIN and decoded <= UNICODE_SCALAR_MAX"]:
+    raise SystemExit("four-byte scalar theorem body no longer returns the claimed range predicate")
+
+four_byte_scalar_rejected = proof_function_section(
+    four_byte_scalar_rejected_text, "an_out_of_range_f4_sequence_is_not_a_unicode_scalar")
+if "def an_out_of_range_f4_sequence_is_not_a_unicode_scalar() -> bool:" not in four_byte_scalar_rejected_text or \
+        "lexer_decode_utf8_four(UTF8_FOUR_BYTE_LEAD_MAX - UTF8_FOUR_BYTE_LEAD_MIN, 16, 63, 63)" not in four_byte_scalar_rejected or \
+        "ensure result == false" not in four_byte_scalar_rejected or \
+        "return decoded <= UNICODE_SCALAR_MAX" not in four_byte_scalar_rejected or \
+        any(line.strip().startswith("requires ") for line in four_byte_scalar_rejected.splitlines()) or \
+        [line.strip() for line in four_byte_scalar_rejected.splitlines() if line.strip().startswith("return ")] != [
+            "return decoded <= UNICODE_SCALAR_MAX"]:
+    raise SystemExit("F4 90 rejection control no longer exhibits the excluded above-maximum payload")
+
 negative_scalar_claims = {
     "a_valid_three_byte_sequence_cannot_decode_below_minimum": (
         "ensure result == false",
@@ -718,6 +838,10 @@ inputs = list(dict.fromkeys([
     POSITIVE,
     TWO_BYTE_RANGES,
     WIDE_POSITIVE,
+    THREE_BYTE_SCALAR_BOUNDS,
+    THREE_BYTE_SURROGATE_REJECTED,
+    FOUR_BYTE_SCALAR_BOUNDS,
+    FOUR_BYTE_SCALAR_REJECTED,
     PAYLOAD_BOUNDS,
     GUARDS_POSITIVE,
     SEQUENCE_GUARDS_POSITIVE,
@@ -731,7 +855,7 @@ inputs = list(dict.fromkeys([
     WIDE_HELPER,
     FACADE,
     CORE,
-    *source_include_closure([POSITIVE, TWO_BYTE_RANGES, WIDE_POSITIVE, GUARDS_POSITIVE, SEQUENCE_GUARDS_POSITIVE, SEQUENCE_F4_GUARD_POSITIVE, SEQUENCE_REJECTED, SEQUENCE_TRUNCATED, NEGATIVE, FACADE, PAYLOAD_BOUNDS]),
+    *source_include_closure([POSITIVE, TWO_BYTE_RANGES, WIDE_POSITIVE, THREE_BYTE_SCALAR_BOUNDS, THREE_BYTE_SURROGATE_REJECTED, FOUR_BYTE_SCALAR_BOUNDS, FOUR_BYTE_SCALAR_REJECTED, GUARDS_POSITIVE, SEQUENCE_GUARDS_POSITIVE, SEQUENCE_F4_GUARD_POSITIVE, SEQUENCE_REJECTED, SEQUENCE_TRUNCATED, NEGATIVE, FACADE, PAYLOAD_BOUNDS]),
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
@@ -855,6 +979,46 @@ assert wide_positive == run(WIDE_POSITIVE)[1], "wide UTF-8 proof report changed 
 wide_verified = {row["name"] for row in wide_positive["declaration_details"] if row.get("verified")}
 assert wide_verified == {"lexer_decode_utf8_three", "lexer_decode_utf8_four"}
 
+code, three_byte_scalar_bounds = run(THREE_BYTE_SCALAR_BOUNDS)
+assert code == 0 and three_byte_scalar_bounds["status"] == three_byte_scalar_bounds["verification_state"] == "proved"
+assert three_byte_scalar_bounds["summary"]["declarations"] == len(helper_constants) + 3
+assert three_byte_scalar_bounds["summary"]["obligations"] == three_byte_scalar_bounds["summary"]["proven"] == 10
+assert three_byte_scalar_bounds["replay"] == {"certificates": 10, "replayed": 10, "gaps": 0}
+assert not three_byte_scalar_bounds["findings"]
+assert three_byte_scalar_bounds == run(THREE_BYTE_SCALAR_BOUNDS)[1], "three-byte scalar-bound report changed across identical runs"
+three_byte_scalar_verified = {row["name"] for row in three_byte_scalar_bounds["declaration_details"] if row.get("verified")}
+assert three_byte_scalar_verified == {"lexer_decode_utf8_three", "lexer_decode_utf8_four", "valid_three_byte_sequence_decodes_to_non_surrogate_scalar"}
+
+code, three_byte_surrogate_rejected = run(THREE_BYTE_SURROGATE_REJECTED)
+assert code == 0 and three_byte_surrogate_rejected["status"] == three_byte_surrogate_rejected["verification_state"] == "proved"
+assert three_byte_surrogate_rejected["summary"]["declarations"] == len(helper_constants) + 3
+assert three_byte_surrogate_rejected["summary"]["obligations"] == three_byte_surrogate_rejected["summary"]["proven"] == 7
+assert three_byte_surrogate_rejected["replay"] == {"certificates": 7, "replayed": 7, "gaps": 0}
+assert not three_byte_surrogate_rejected["findings"]
+assert three_byte_surrogate_rejected == run(THREE_BYTE_SURROGATE_REJECTED)[1], "surrogate boundary report changed across identical runs"
+three_byte_surrogate_verified = {row["name"] for row in three_byte_surrogate_rejected["declaration_details"] if row.get("verified")}
+assert three_byte_surrogate_verified == {"lexer_decode_utf8_three", "lexer_decode_utf8_four", "an_unchecked_ed_a0_sequence_decodes_to_a_surrogate"}
+
+code, four_byte_scalar_bounds = run(FOUR_BYTE_SCALAR_BOUNDS)
+assert code == 0 and four_byte_scalar_bounds["status"] == four_byte_scalar_bounds["verification_state"] == "proved"
+assert four_byte_scalar_bounds["summary"]["declarations"] == len(helper_constants) + 3
+assert four_byte_scalar_bounds["summary"]["obligations"] == four_byte_scalar_bounds["summary"]["proven"] == 9
+assert four_byte_scalar_bounds["replay"] == {"certificates": 9, "replayed": 9, "gaps": 0}
+assert not four_byte_scalar_bounds["findings"]
+assert four_byte_scalar_bounds == run(FOUR_BYTE_SCALAR_BOUNDS)[1], "four-byte scalar-bound report changed across identical runs"
+four_byte_scalar_verified = {row["name"] for row in four_byte_scalar_bounds["declaration_details"] if row.get("verified")}
+assert four_byte_scalar_verified == {"lexer_decode_utf8_three", "lexer_decode_utf8_four", "valid_four_byte_sequence_decodes_to_unicode_scalar"}
+
+code, four_byte_scalar_rejected = run(FOUR_BYTE_SCALAR_REJECTED)
+assert code == 0 and four_byte_scalar_rejected["status"] == four_byte_scalar_rejected["verification_state"] == "proved"
+assert four_byte_scalar_rejected["summary"]["declarations"] == len(helper_constants) + 3
+assert four_byte_scalar_rejected["summary"]["obligations"] == four_byte_scalar_rejected["summary"]["proven"] == 7
+assert four_byte_scalar_rejected["replay"] == {"certificates": 7, "replayed": 7, "gaps": 0}
+assert not four_byte_scalar_rejected["findings"]
+assert four_byte_scalar_rejected == run(FOUR_BYTE_SCALAR_REJECTED)[1], "F4 rejection report changed across identical runs"
+four_byte_scalar_rejected_verified = {row["name"] for row in four_byte_scalar_rejected["declaration_details"] if row.get("verified")}
+assert four_byte_scalar_rejected_verified == {"lexer_decode_utf8_three", "lexer_decode_utf8_four", "an_out_of_range_f4_sequence_is_not_a_unicode_scalar"}
+
 code, payload_bounds = run(PAYLOAD_BOUNDS)
 assert code == 0 and payload_bounds["status"] == payload_bounds["verification_state"] == "proved"
 assert payload_bounds["summary"]["declarations"] == len(payload_bound_models)
@@ -885,4 +1049,4 @@ assert negative == run(NEGATIVE)[1], "negative UTF-8 proof report changed across
 
 hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 assert hashes_before == hashes_after, "a proof input changed while proof reports were being replayed"
-print("lexer UTF-8 proofs replayed: 6/6 two-byte decoder, 10/10 two-byte scalar ranges, 8/8 wide-helper, 32/32 payload-range, 22/22 decoder-guard, 43/43 sequence-guard, 8/8 F4-guard, 16/16 malformed-input controls, and 12/12 boundary-claim certificates")
+print("lexer UTF-8 proofs replayed: 6/6 two-byte decoder, 10/10 two-byte scalar ranges, 8/8 wide-helper, 10/10 three-byte scalar and surrogate bounds, 7/7 ED surrogate boundary, 9/9 four-byte Unicode bounds, 7/7 F4 rejection boundary, 32/32 payload-range, 22/22 decoder-guard, 43/43 sequence-guard, 8/8 F4-guard, 16/16 malformed-input controls, and 12/12 boundary-claim certificates")
