@@ -354,6 +354,8 @@ run_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n   
 run_case dict_empty_declaration 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 42\n' 42
 run_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0] + xs[1] + 39\n' 42
 run_case for_over_darray 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 36\n' 42
+run_case for_over_empty_darray 'def main() -> i64:\n    xs: darray[i64] = []\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 42\n' 42
+run_case for_over_fixed_array 'def main() -> i64:\n    xs: i64[3] = [1, 2, 3]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 36\n' 42
 run_case comprehension_const_filter 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if false]\n    return xs.count + 42\n' 42
 run_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [40, 0]\n    return xs[0] + xs[1] + xs[2] + 2\n' 42
 run_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40}\n    return p.x + p.y + 2\n' 42

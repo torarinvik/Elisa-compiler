@@ -43,6 +43,7 @@ POSITIVE_NAMES = {
     "zero_width_non_boolean_scalar_uses_layout_size_path",
     "scalar_byte_size_matches_boolean_or_u32_width_formula",
     "scalar_byte_size_is_the_least_byte_count_covering_width",
+    "scalar_byte_size_stays_below_the_u32_width_ceiling",
     "boolean_stride_is_one_byte_for_every_recorded_width",
     "one_bit_enum_backing_stride_is_one_byte",
     "four_bit_enum_backing_stride_is_one_byte",
@@ -59,6 +60,7 @@ NEGATIVE_NAMES = {
     "a_four_bit_enum_backing_has_zero_bytes",
     "a_zero_width_integer_uses_the_scalar_fast_path",
     "scalar_stride_can_truncate_a_requested_bit_width",
+    "maximum_width_byte_count_can_exceed_the_u32_ceiling",
 }
 
 if not __debug__:
@@ -300,6 +302,11 @@ def scalar_byte_size_is_the_least_byte_count_covering_width(bit_width: u32) -> b
         and (byte_count - 1) * BackendElementStridePolicy::BITS_PER_BYTE.u64() < bit_width.u64()
     )
 """,
+    "scalar_byte_size_stays_below_the_u32_width_ceiling": """
+def scalar_byte_size_stays_below_the_u32_width_ceiling(bit_width: u32) -> bool:
+    ensure result == true
+    return BackendElementStridePolicy::scalar_byte_size(false, bit_width) <= 536870912
+""",
     "boolean_stride_is_one_byte_for_every_recorded_width": """
 def boolean_stride_is_one_byte_for_every_recorded_width(bit_width: u32) -> bool:
     ensure result == true
@@ -374,6 +381,11 @@ def scalar_stride_can_truncate_a_requested_bit_width() -> bool:
     ensure result == true
     byte_count: u64 = BackendElementStridePolicy::scalar_byte_size(false, 9).u64()
     return byte_count * BackendElementStridePolicy::BITS_PER_BYTE.u64() < 9.u64()
+""",
+    "maximum_width_byte_count_can_exceed_the_u32_ceiling": """
+def maximum_width_byte_count_can_exceed_the_u32_ceiling() -> bool:
+    ensure result == true
+    return BackendElementStridePolicy::scalar_byte_size(false, 4294967295) > 536870912
 """,
 }
 
