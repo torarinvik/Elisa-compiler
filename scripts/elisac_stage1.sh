@@ -357,8 +357,9 @@ stage1_cache_prepare() {
     dependency_graph="${BASH_REMATCH[1]}"
     dependency_identity="${BASH_REMATCH[2]}"
   else
-    local deps_file emit_seen=0
+    local deps_file snapshot_file verify_file emit_seen=0 deps_output_index=-1 dependency_arg_index
     deps_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps.XXXXXX")" || return 1
+    snapshot_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-dependency-snapshot.XXXXXX")" || { rm -f "$deps_file"; return 1; }
     index=0
     while (( index < count )); do
       arg="${driver_args[index]}"
@@ -379,12 +380,33 @@ stage1_cache_prepare() {
       index=$((index + 1))
     done
     (( emit_seen )) || dependency_args+=("-emit" "deps")
-    if ! "$BIN" "${dependency_args[@]}" </dev/null >/dev/null 2>&1; then
-      rm -f "$deps_file"
+    for ((dependency_arg_index = 0; dependency_arg_index + 1 < ${#dependency_args[@]}; dependency_arg_index++)); do
+      if [[ "${dependency_args[dependency_arg_index]}" == "-o" ]]; then
+        deps_output_index=$((dependency_arg_index + 1))
+        break
+      fi
+    done
+    if (( deps_output_index < 0 )); then
+      rm -f "$deps_file" "$snapshot_file"
       return 1
     fi
-    dependency_state="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-store "$dependency_index" "$stage1_cache_base_key" "$deps_file" "$source" 2>/dev/null)" || dependency_state=""
-    rm -f "$deps_file"
+    if ! "$BIN" "${dependency_args[@]}" </dev/null >/dev/null 2>&1; then
+      rm -f "$deps_file" "$snapshot_file"
+      return 1
+    fi
+    dependency_state="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-store "$snapshot_file" "$stage1_cache_base_key" "$deps_file" "$source" 2>/dev/null)" || dependency_state=""
+    if [[ ! "$dependency_state" =~ ^([0-9a-f]{64})[[:space:]]([0-9a-f]{64})$ || ! -s "$snapshot_file" ]]; then
+      rm -f "$deps_file" "$snapshot_file"
+      return 1
+    fi
+    verify_file="$(mktemp "${TMPDIR:-/tmp}/elisac-stage1-deps-verify.XXXXXX")" || { rm -f "$deps_file" "$snapshot_file"; return 1; }
+    dependency_args[deps_output_index]="$verify_file"
+    if ! "$BIN" "${dependency_args[@]}" </dev/null >/dev/null 2>&1; then
+      rm -f "$deps_file" "$snapshot_file" "$verify_file"
+      return 1
+    fi
+    dependency_state="$(python3 "$ROOT/scripts/stage1_object_cache.py" dependency-confirm "$snapshot_file" "$dependency_index" "$stage1_cache_base_key" "$verify_file" "$source" 2>/dev/null)" || dependency_state=""
+    rm -f "$deps_file" "$snapshot_file" "$verify_file"
     if [[ "$dependency_state" =~ ^([0-9a-f]{64})[[:space:]]([0-9a-f]{64})$ ]]; then
       dependency_graph="${BASH_REMATCH[1]}"
       dependency_identity="${BASH_REMATCH[2]}"

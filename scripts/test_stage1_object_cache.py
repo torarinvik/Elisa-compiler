@@ -70,6 +70,7 @@ class CacheIntegrityTest(unittest.TestCase):
     def fake_dependency_compiler(self, compiler, source):
         compiler.write_text(
             "#!/bin/bash\n"
+            'call_index=0; [[ ! -f "${COMPILER_CALL_LOG:-/dev/null}" ]] || call_index="$(wc -c < "${COMPILER_CALL_LOG:-/dev/null}")"\n'
             'printf x >> "${COMPILER_CALL_LOG:-/dev/null}"\n'
             'out=""; emit="obj"\n'
             'while (($#)); do\n'
@@ -81,7 +82,9 @@ class CacheIntegrityTest(unittest.TestCase):
             'done\n'
             'if [[ "$emit" == deps ]]; then\n'
             '  if [[ -n "${INCLUDED_DEPENDENCY:-}" ]]; then\n'
-            '    printf "%s\\n%s\\n" "$SOURCE_INPUT" "$INCLUDED_DEPENDENCY" > "$out"\n'
+            '    dependency="${INCLUDED_DEPENDENCY}"\n'
+            '    if [[ "${SWITCH_DEPENDENCY_AFTER_FIRST:-0}" == 1 && "$call_index" -ge 1 ]]; then dependency="${SECOND_DEPENDENCY}"; fi\n'
+            '    printf "%s\\n%s\\n" "$SOURCE_INPUT" "$dependency" > "$out"\n'
             '  else\n'
             '    printf "%s\\n" "$SOURCE_INPUT" > "$out"\n'
             '  fi\n'
@@ -198,6 +201,32 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertFalse(list((self.source.parent / "object-cache").rglob("*.json")))
 
+    def test_wrapper_rejects_dependency_graph_changes_between_discovery_passes(self):
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        first = root / "first.elisa"
+        second = root / "second.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        first.write_text("const FIRST: i64 = 1\n")
+        second.write_text("const SECOND: i64 = 2\n")
+        log = self.source.parent / "dependency-compiler-calls"
+
+        result = self.run_cache_key(
+            compiler,
+            source,
+            root=root,
+            extra_env={
+                "INCLUDED_DEPENDENCY": str(first),
+                "SECOND_DEPENDENCY": str(second),
+                "SWITCH_DEPENDENCY_AFTER_FIRST": "1",
+            },
+        )
+
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(log.read_text(), "xx")
+        self.assertFalse(list((self.source.parent / "object-cache").rglob("*.json")))
+
     def test_dependency_index_reuses_graph_and_invalidates_changed_files(self):
         root = self.cache_project()
         compiler = root / "bin" / "fake-compiler"
@@ -209,22 +238,22 @@ class CacheIntegrityTest(unittest.TestCase):
         environment = {"INCLUDED_DEPENDENCY": str(dependency)}
 
         first = self.cache_key(compiler, source, root=root, extra_env=environment)
-        self.assertEqual(log.read_text(), "x")
+        self.assertEqual(log.read_text(), "xx")
         second = self.cache_key(compiler, source, root=root, extra_env=environment)
         self.assertEqual(second, first)
-        self.assertEqual(log.read_text(), "x")
+        self.assertEqual(log.read_text(), "xx")
 
         replacement = root / "replacement.elisa"
         replacement.write_bytes(dependency.read_bytes())
         os.replace(replacement, dependency)
         same_content = self.cache_key(compiler, source, root=root, extra_env=environment)
         self.assertEqual(same_content, first)
-        self.assertEqual(log.read_text(), "xx")
+        self.assertEqual(log.read_text(), "xxxx")
 
         dependency.write_text("const VALUE: i64 = 2\n")
         third = self.cache_key(compiler, source, root=root, extra_env=environment)
         self.assertNotEqual(third, first)
-        self.assertEqual(log.read_text(), "xxx")
+        self.assertEqual(log.read_text(), "xxxxxx")
 
     def test_dependency_index_tracks_symlink_retargeting(self):
         root = self.source.parent
@@ -264,6 +293,51 @@ class CacheIntegrityTest(unittest.TestCase):
         replacement.write_bytes(dependency.read_bytes())
         os.replace(replacement, dependency)
         self.assertIsNone(cache.read_dependencies(index, "base", source))
+
+    def test_dependency_confirmation_publishes_only_a_stable_two_pass_snapshot(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        dependency = root / "included.elisa"
+        first_report = root / "deps-first.txt"
+        second_report = root / "deps-second.txt"
+        snapshot = root / "deps-snapshot.json"
+        index = root / "deps-index.json"
+        source.write_text("source\n")
+        dependency.write_text("const VALUE: i64 = 1\n")
+        first_report.write_text(f"{source}\n{dependency}\n")
+        second_report.write_text(first_report.read_text())
+
+        admitted = cache.store_dependencies(snapshot, "base", first_report, source)
+        confirmed = cache.confirm_dependencies(snapshot, index, "base", second_report, source)
+        self.assertEqual(confirmed, admitted)
+        self.assertEqual(cache.read_dependencies(index, "base", source), admitted)
+
+    def test_dependency_confirmation_rejects_changed_inputs_and_include_sets(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        first = root / "first.elisa"
+        second = root / "second.elisa"
+        replacement = root / "replacement.elisa"
+        first_report = root / "deps-first.txt"
+        second_report = root / "deps-second.txt"
+        snapshot = root / "deps-snapshot.json"
+        index = root / "deps-index.json"
+        source.write_text("source\n")
+        first.write_text("const VALUE: i64 = 1\n")
+        second.write_text("const VALUE: i64 = 1\n")
+        first_report.write_text(f"{source}\n{first}\n")
+        second_report.write_text(first_report.read_text())
+        cache.store_dependencies(snapshot, "base", first_report, source)
+
+        replacement.write_bytes(first.read_bytes())
+        os.replace(replacement, first)
+        self.assertIsNone(cache.confirm_dependencies(snapshot, index, "base", second_report, source))
+        self.assertFalse(index.exists())
+
+        cache.store_dependencies(snapshot, "base", first_report, source)
+        second_report.write_text(f"{source}\n{second}\n")
+        self.assertIsNone(cache.confirm_dependencies(snapshot, index, "base", second_report, source))
+        self.assertFalse(index.exists())
 
     def test_oversized_dependency_index_still_returns_current_digests(self):
         root = self.source.parent

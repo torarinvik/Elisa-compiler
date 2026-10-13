@@ -12,7 +12,7 @@ import tempfile
 SCHEMA = "elisac-stage1-object-integrity-v3"
 MAX_OBJECT_BYTES = 2 * 1024**3
 MAX_DIAGNOSTIC_BYTES = 64 * 1024**2
-DEPENDENCY_INDEX_SCHEMA = "elisac-stage1-dependency-index-v2"
+DEPENDENCY_INDEX_SCHEMA = "elisac-stage1-dependency-index-v3"
 MAX_DEPENDENCY_INDEX_BYTES = 16 * 1024**2
 MAX_DEPENDENCIES = 100_000
 
@@ -91,6 +91,24 @@ def dependency_identity_digest(root, records):
     return hashlib.sha256(canonical_json({"root": root, "dependencies": dependencies})).hexdigest()
 
 
+def write_dependency_manifest(index, manifest):
+    index = Path(index)
+    payload = canonical_json(manifest)
+    if len(payload) > MAX_DEPENDENCY_INDEX_BYTES:
+        return False
+    index.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=index.name + ".incoming.", dir=index.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, index)
+    finally:
+        Path(temporary_path).unlink(missing_ok=True)
+    return True
+
+
 def dependencies_from_output(path, root):
     raw = Path(path).read_bytes()
     if len(raw) > MAX_DEPENDENCY_INDEX_BYTES:
@@ -157,24 +175,28 @@ def store_dependencies(index, base_key, report, root):
         "graph_sha256": dependency_graph_digest(root_value, records),
         "identity_sha256": dependency_identity_digest(root_value, records),
     }
-    index = Path(index)
-    payload = canonical_json(manifest)
-    if len(payload) > MAX_DEPENDENCY_INDEX_BYTES:
-        # The current invocation can still use the dependency digests it just
-        # computed. Skipping the persisted index only costs another `-emit deps`
-        # pass next time; it must not silently disable object caching now.
-        return manifest["graph_sha256"], manifest["identity_sha256"]
-    index.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_path = tempfile.mkstemp(prefix=index.name + ".incoming.", dir=index.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, index)
-    finally:
-        Path(temporary_path).unlink(missing_ok=True)
+    write_dependency_manifest(index, manifest)
     return manifest["graph_sha256"], manifest["identity_sha256"]
+
+
+def confirm_dependencies(snapshot, index, base_key, report, root):
+    # The snapshot is recorded after one compiler dependency pass. Confirm it
+    # against a second pass so an edit between discovery and hashing cannot pair
+    # new root bytes with an old include set.
+    state = read_dependencies(snapshot, base_key, root)
+    if state is None:
+        return None
+    manifest = json.loads(Path(snapshot).read_bytes())
+    root_value, records = dependencies_from_output(report, root)
+    if root_value != manifest["root"] or records != manifest["dependencies"]:
+        return None
+    graph = dependency_graph_digest(root_value, records)
+    identity = dependency_identity_digest(root_value, records)
+    if state != (graph, identity):
+        return None
+    if not write_dependency_manifest(index, manifest):
+        return None
+    return graph, identity
 
 
 def copy_digest(source, target, *, allow_empty=False, limit=None):
@@ -299,6 +321,13 @@ if __name__ == "__main__":
         elif operation == "dependency-store":
             index, base_key, report, root = arguments
             print(*store_dependencies(index, base_key, report, root), sep="\t")
+            sys.exit(0)
+        elif operation == "dependency-confirm":
+            snapshot, index, base_key, report, root = arguments
+            state = confirm_dependencies(snapshot, index, base_key, report, root)
+            if state is None:
+                sys.exit(1)
+            print(*state, sep="\t")
             sys.exit(0)
         elif operation == "restore":
             entry, output, key, *streams = arguments
