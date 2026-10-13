@@ -10,6 +10,7 @@ import subprocess
 from proof_product_gate import require_current_product
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
@@ -41,7 +42,7 @@ if not __debug__:
 
 
 def compact(text: str) -> str:
-    return "".join(text.split())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(text).splitlines())
 
 
 def function_body(source: str, name: str) -> str:
@@ -150,7 +151,7 @@ if 'sview_fields:mutabledarray[LLVMTypeRef]=[pointer_type,int64_type]' not in ru
         'sview_index_type:LLVMTypeRef=LLVMFunctionType(int64_type,sview_index_pointer,2,0)' not in runtime_decl:
     raise SystemExit("StringView runtime layout/index ABI no longer uses pointer-plus-i64 and an i64 index")
 
-# The compiler's checked-decimal parser exercises the exact `.len` and `[0]`
+# The compiler's checked-decimal parser exercises the exact `.length` and `[0]`
 # syntax whose bounds are proved here. The fallback wrapper must preserve the
 # production runtime index helper's semantics.
 if 'iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \

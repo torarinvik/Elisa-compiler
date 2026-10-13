@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
@@ -34,7 +35,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -98,9 +99,9 @@ if semantic_text.count('include "./check_type_path_separator.elisa"') != 1:
 semantic_classifier = compact(function_section(resolver_text, "index_receiver_is_semantic_type_application"))
 scope_arm = semantic_classifier[semantic_classifier.find("Expr.Scope("):]
 qualified_fragments = (
-    "return false if not type_path_collect(object, names, dotted) or names.count == 0",
-    "return false if any was_dotted in dotted where was_dotted",
-    "return false if any bound_name in bound where bound_name == names[0]",
+    "false return if not type_path_collect(object, names, dotted) or names.count == 0",
+    "false return if any was_dotted in dotted where was_dotted",
+    "false return if any bound_name in bound where bound_name == names[0]",
     "row: u32 = binding_nominal_declaration(object, table.current_module, table)",
     "return row != SYMBOL_INDEX_ROW_NONE",
 )

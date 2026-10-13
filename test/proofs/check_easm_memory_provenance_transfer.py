@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
@@ -73,7 +74,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join(source.split())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def code_only(source: str) -> str:
@@ -251,7 +252,7 @@ for helper, expected in (
         raise SystemExit(f"memory provenance alias-aware helper changed: {helper}")
 layout_role = compact(code_only(function_section(MEMORY.read_text(), "easm_verify_memory_roles")))
 signature_fallback = "ifnoteasm_provenance_has_register(states,base):type_name<-easm_input_type_for_register(fn,base)"
-tracked_lookup = "type_name<-easm_provenance_type(states,base)"
+tracked_lookup = "type_name:mutablesview=easm_provenance_type(states,base)"
 if signature_fallback not in layout_role:
     raise SystemExit("layout checking must only fall back to signature provenance for an untracked register")
 if tracked_lookup not in layout_role:

@@ -16,6 +16,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--source-only", action="store_true",
                     help="check production and proof bindings without Elisa-Proof replay")
 ARGS = parser.parse_args()
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
@@ -33,7 +34,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -277,8 +278,8 @@ for fragment in (
     "return 0 if end == 0",
     "prior_end: usize = end - 1",
     "matches_name: bool = table.symbols[prior_end].kind == Semantic::SymbolKind::Struct and table.symbols[prior_end].name == name",
-    "return 2 if prior_count == 2",
-    "return 2 if prior_count == 1 and matches_name",
+    "2 return if prior_count == 2",
+    "2 return if prior_count == 1 and matches_name",
     "return 1 if matches_name",
     "return prior_count",
 ):
@@ -316,7 +317,7 @@ policy_text = POLICY.read_text()
 policy_compact = compact(policy_text)
 if compact("ghost def typestate_widening_spec(expected_is_named: bool, actual_is_container: bool, same_nominal_name: bool, unique_typestate: bool) -> bool: return expected_is_named and actual_is_container and same_nominal_name and unique_typestate") not in policy_compact:
     raise SystemExit("typestate widening specification lost a required compatibility premise")
-if compact("def typestate_widening_allowed(expected_is_named: bool, actual_is_container: bool, same_nominal_name: bool, unique_typestate: bool) -> bool: ensure result == typestate_widening_spec(expected_is_named, actual_is_container, same_nominal_name, unique_typestate) return false if not expected_is_named return false if not actual_is_container return false if not same_nominal_name return unique_typestate") not in policy_compact:
+if compact("def typestate_widening_allowed(expected_is_named: bool, actual_is_container: bool, same_nominal_name: bool, unique_typestate: bool) -> bool: ensure result == typestate_widening_spec(expected_is_named, actual_is_container, same_nominal_name, unique_typestate) false return if not expected_is_named false return if not actual_is_container false return if not same_nominal_name return unique_typestate") not in policy_compact:
     raise SystemExit("production typestate-widening classifier no longer refines its specification")
 
 initializer_text = INITIALIZERS.read_text()
@@ -329,8 +330,8 @@ match_source = compact(function_section(initializer_text, "reference_initializer
 required_match_fragments = (
     "expected_target:u32=interned_elem(declared_id,0,table)",
     "actual_target:u32=reference_initializer_target_id(value,names,types,table)",
-    "returntrueifexpected_target==0oractual_target==0",
-    "returntrueifexpected_target==actual_target",
+    "truereturnifexpected_target==0oractual_target==0",
+    "truereturnifexpected_target==actual_target",
     "SemanticReferenceInitializerCompatibility::typestate_widening_allowed(",
     "interned_kind(expected_target,table)==SemTypeKind.Named",
     "interned_kind(actual_target,table)==SemTypeKind.Container",
@@ -340,8 +341,8 @@ required_match_fragments = (
 if any(fragment not in match_source for fragment in required_match_fragments):
     raise SystemExit("reference initializer no longer uses exact identity plus the proved typestate widening")
 match_order = (
-    match_source.find("returntrueifexpected_target==0oractual_target==0"),
-    match_source.find("returntrueifexpected_target==actual_target"),
+    match_source.find("truereturnifexpected_target==0oractual_target==0"),
+    match_source.find("truereturnifexpected_target==actual_target"),
     match_source.find("SemanticReferenceInitializerCompatibility::typestate_widening_allowed("),
 )
 if any(position < 0 for position in match_order) or match_order != tuple(sorted(match_order)):

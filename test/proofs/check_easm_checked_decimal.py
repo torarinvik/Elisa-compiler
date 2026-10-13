@@ -8,6 +8,7 @@ import re
 import subprocess
 
 from proof_product_gate import require_current_product
+from source_guard_compat import expand_return_if_blocks
 
 
 argument_parser = argparse.ArgumentParser()
@@ -38,7 +39,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -172,13 +173,15 @@ if "constDECIMAL_RADIX:i64=10" not in compact(helper_text) or \
 if "ensureresult.valid==(value<I64_MAX/DECIMAL_RADIXor(value==I64_MAX/DECIMAL_RADIXanddigit<=I64_MAX%DECIMAL_RADIX))" not in positive_source or \
         "limit:i64=I64_MAX/DECIMAL_RADIX" not in positive_source or \
         "final_digit_limit:i64=I64_MAX%DECIMAL_RADIX" not in positive_source or \
-        "return(false,0)if:value>limitvalue==limitanddigit>final_digit_limit" not in positive_source or \
+        "return(false,0)ifvalue>limit" not in positive_source or \
+        "return(false,0)ifvalue==limitanddigit>final_digit_limit" not in positive_source or \
         "return(true,value*DECIMAL_RADIX+digit)" not in positive_source:
     raise SystemExit("positive digit guard or checked accumulation no longer matches its scalar proof")
 if "ensureresult.valid==(value>I64_MIN/DECIMAL_RADIXor(value==I64_MIN/DECIMAL_RADIXanddigit<=0-(I64_MIN%DECIMAL_RADIX)))" not in negative_source or \
         "limit:i64=I64_MIN/DECIMAL_RADIX" not in negative_source or \
         "final_digit_limit:i64=0-(I64_MIN%DECIMAL_RADIX)" not in negative_source or \
-        "return(false,0)if:value<limitvalue==limitanddigit>final_digit_limit" not in negative_source or \
+        "return(false,0)ifvalue<limit" not in negative_source or \
+        "return(false,0)ifvalue==limitanddigit>final_digit_limit" not in negative_source or \
         "return(true,value*DECIMAL_RADIX-digit)" not in negative_source:
     raise SystemExit("negative digit guard or checked accumulation no longer matches its scalar proof")
 if f"ensureresult==({positive_guard})" not in arithmetic_compact or \

@@ -16,6 +16,7 @@ argument_parser = argparse.ArgumentParser()
 argument_parser.add_argument("--source-only", action="store_true",
                              help="check production and proof bindings without running Elisa-Proof")
 ARGS = argument_parser.parse_args()
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
@@ -128,7 +129,7 @@ NEGATIVE_SHAPES = {
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -246,7 +247,7 @@ if declarations(POSITIVE) != set(POSITIVE_SHAPES):
     raise SystemExit("iterator mutation theorem inventory changed")
 if declarations(NEGATIVE) != set(NEGATIVE_SHAPES):
     raise SystemExit("iterator mutation false-control inventory changed")
-mutation = compact(function_section(checker_text, "iter_mutation_method"))
+mutation = compact(function_section(checker_text, "iter_direct_mutation_method"))
 for fragment in (
     "alias_names:darray[sview]&",
     "alias_targets:darray[sview]&",
@@ -275,9 +276,14 @@ if "SemanticIteratorAliasResolution::resolve(alias_names,alias_targets,raw)" not
 unknown_alias = compact(function_section(checker_text, "iter_arg_has_unresolved_alias"))
 if "resolved==\"\"andSemanticIteratorAliasResolution::direct_target(alias_names,alias_targets,raw).found" not in unknown_alias:
     raise SystemExit("mutable-reference call detection no longer treats alias cycles as unknown")
-call_check = compact(function_section(checker_text, "iter_call_passes_container_by_ref"))
-if "argument_root==containeroriter_arg_has_unresolved_alias(argument,alias_names,alias_targets)" not in call_check:
+call_check = compact(function_section(checker_text, "iter_call_argument_hits_place"))
+if "argument_root==containeroriter_arg_has_unresolved_alias(normalized,alias_names,alias_targets)" not in call_check:
     raise SystemExit("mutable-reference calls no longer fail closed for cyclic aliases")
+direct_call_check = compact(function_section(checker_text, "iter_direct_call_passes_container_by_ref"))
+recursive_call_check = compact(function_section(checker_text, "iter_call_passes_container_by_ref"))
+if "iter_call_argument_hits_place(argument,place,container,alias_names,alias_targets)" not in direct_call_check or \
+        "iter_direct_call_passes_container_by_ref(expression,place,container,alias_names,alias_targets,table)" not in recursive_call_check:
+    raise SystemExit("mutable-reference alias checks no longer flow through the recursive expression walker")
 alias_collection = compact(function_section(checker_text, "iter_collect_aliases"))
 if "Stmt.Match(scrutinee,arms,match_line):forarminarms|names,targets|:iter_collect_aliases(arm.body,names,targets)" not in alias_collection:
     raise SystemExit("aliases inside match arms are no longer collected for invalidation checks")

@@ -10,6 +10,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = ROOT.parent / "elisa-proof"
 HERE = Path(__file__).resolve().parent
@@ -35,7 +36,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return " ".join(" ".join(line.split("#", 1)[0].split()) for line in source.splitlines()).strip()
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -143,7 +144,7 @@ if compact(function_section(policy, "operand_arity_supported")) != compact(expec
     raise SystemExit("instruction operand arity no longer matches the closed operation inventory")
 zero_operand_mnemonics = tuple(mnemonic for group in classifier_groups["is_zero_operand_instruction"] for mnemonic in group)
 known_op = compact(function_section(PROVENANCE.read_text(), "easm_known_op"))
-if any(f'easm_equal(op, "{mnemonic}")' not in known_op for mnemonic in zero_operand_mnemonics):
+if any(f'easm_equal(op,"{mnemonic}")' not in known_op for mnemonic in zero_operand_mnemonics):
     raise SystemExit("zero-operand classifier includes an opcode outside the production known-op set")
 
 expected_mrs_form = """
@@ -266,10 +267,10 @@ for required in (
     "ensure result.valid and result.count == 2 implies ( result.first_separator < text.len and result.first_separator == result.last_separator and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close) == text.len",
     "ensure result.valid and result.count == TOO_MANY_OPERANDS_SENTINEL implies ( result.first_separator < result.last_separator and result.last_separator < text.len and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and result.last_separator == next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close)",
 ):
-    if required not in scanner:
+    if compact(required) not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
 first_operand_scan = compact(function_section(policy, "first_operand_byte"))
-if "decreases text_length - index" not in first_operand_scan or "invariant from <= index and index <= text_length" not in first_operand_scan:
+if compact("decreases text_length - index") not in first_operand_scan or compact("invariant from <= index and index <= text_length") not in first_operand_scan:
     raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
 next_separator = compact(function_section(policy, "next_top_level_separator"))
 for required in (
@@ -278,7 +279,7 @@ for required in (
     'prefix_comma: usize = EasmTextScan::find(prefix, ",")',
     'suffix_comma: usize = EasmTextScan::find(suffix, ",")',
 ):
-    if required not in next_separator:
+    if compact(required) not in next_separator:
         raise SystemExit(f"top-level separator search lost its first-match contract: {required}")
 
 environment = ENV.read_text()
@@ -311,17 +312,17 @@ if compact(function_section(PROVENANCE.read_text(), "easm_last_operand")) != com
 
 instruction_check = function_section(FUNCTION.read_text(), "verify_function_instructions")
 instruction_code = compact(instruction_check)
-arity_check = "if unsupported_operands: issues.push(Issue{severity: Severity.Error, code: \"unsupported-operands\", line: inst.line, message: \"instruction operand shape is outside the verified EASM model\"}) continue"
+arity_check = compact("if unsupported_operands: issues.push(Issue{severity: Severity.Error, code: \"unsupported-operands\", line: inst.line, message: \"instruction operand shape is outside the verified EASM model\"}) continue")
 if arity_check not in instruction_code:
     raise SystemExit("instruction verification must reject unsupported operand counts and roles on executable instructions")
-if instruction_code.index("if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT") > instruction_code.index(arity_check):
+if instruction_code.index(compact("if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT")) > instruction_code.index(arity_check):
     raise SystemExit("operand roles must be checked only after their source and destination slices have been extracted")
-if "unsupported_operands: mutable bool = not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)" not in instruction_code:
+if compact("unsupported_operands: mutable bool = not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)") not in instruction_code:
     raise SystemExit("invalid scans and excessive operand counts must fail before opcode-specific role checks")
 arity_role_check = "unsupported_operands <- not EasmOperandScan::operand_arity_supported(inst.op, operand_scan.count) unsupported_operands <- not easm_instruction_operand_roles_supported(inst.op, operand_scan.count, source_operand, destination_operand) if not unsupported_operands"
-if arity_role_check not in instruction_code:
+if compact(arity_role_check) not in instruction_code:
     raise SystemExit("opcode role checks must short-circuit after an unsupported arity")
-if instruction_code.index("needs_arity_rejection(operand_scan.count)") > instruction_code.index("capability: sview = easm_required_capability(inst.op)"):
+if instruction_code.index("needs_arity_rejection(operand_scan.count)") > instruction_code.index(compact("capability: sview = easm_required_capability(inst.op)")):
     raise SystemExit("operand arity rejection must precede all per-instruction effect analysis")
 for required in (
     "if operand_scan.valid and operand_scan.count > 0 and operand_scan.count <= EasmOperandScan::MAX_MODELED_OPERAND_COUNT: source_end: usize = operand_scan.first_separator if operand_scan.first_separator < inst.text.len else inst.text.len",
@@ -341,9 +342,9 @@ for required in (
     "EasmOperandScan::rejects_return_immediate(inst.op, immediate_operand)",
     'code: "unsupported-operand-form"',
 ):
-    if required not in instruction_code:
+    if compact(required) not in instruction_code:
         raise SystemExit(f"instruction validation lost an operand-form guard: {required}")
-if instruction_code.index("unsupported-operand-form") > instruction_code.index("capability: sview = easm_required_capability(inst.op)"):
+if instruction_code.index("unsupported-operand-form") > instruction_code.index(compact("capability: sview = easm_required_capability(inst.op)")):
     raise SystemExit("operand-form rejection must precede all per-instruction effect analysis")
 role_source = FUNCTION.read_text()
 role_expectations = {
@@ -387,9 +388,9 @@ if compact("_ -> result == 0") not in register_bit_source or compact("_: 0") not
 if "EasmOperandScan::is_aarch64_mrs_form" in role_body:
     raise SystemExit("executable MRS must fail closed until its AArch64 register effects are modeled")
 conditional_target_check = "if EasmOperandScan::rejects_unresolved_conditional_target( easm_is_conditional_jump(inst.op), target_is_local, easm_contract_has_word(fn.requires, \"control.direct\"), easm_contract_has_word(fn.requires, \"relocation.symbol\") ): issues.push(Issue{severity: Severity.Error, code: \"unknown-label\", line: inst.line, message: \"conditional jump target is not a declared local label\"})"
-if conditional_target_check not in instruction_code:
+if compact(conditional_target_check) not in instruction_code:
     raise SystemExit("conditional branches must reject unmodeled targets before CFG propagation")
-if instruction_code.index("target_is_local: bool = easm_label_index(fn.instructions, control_target) >= 0") > instruction_code.index(conditional_target_check):
+if instruction_code.index(compact("target_is_local: bool = easm_label_index(fn.instructions, control_target) >= 0")) > instruction_code.index(compact(conditional_target_check)):
     raise SystemExit("conditional target validation must derive local-target status from the function's labels")
 label_index = compact(function_section(MODEL.read_text(), "easm_label_index"))
 required_label_lookup = (
@@ -399,7 +400,7 @@ required_label_lookup = (
     "invariant forall prior in 0..<index: not easm_equal(easm_label_name(instructions[prior]), target)",
     "if easm_equal(easm_label_name(instructions[index]), target): return index.i64()",
 )
-if any(fragment not in label_index for fragment in required_label_lookup) or not label_index.endswith("return -1"):
+if any(compact(fragment) not in label_index for fragment in required_label_lookup) or not label_index.endswith("return-1"):
     raise SystemExit("conditional target lookup lost its bounded first-match or unresolved-label behavior")
 conditional_classifier = compact(function_section(MODEL.read_text(), "easm_is_conditional_jump"))
 if conditional_classifier != compact("""
@@ -412,24 +413,24 @@ one_function = compact(function_section(FUNCTION.read_text(), "verify_one_functi
 function_compositions = compact(function_section(FUNCTION.read_text(), "verify_function_compositions"))
 module_compositions = compact(function_section(FUNCTION.read_text(), "verify_module_compositions"))
 module_verifier = compact(function_section(FUNCTION.read_text(), "verify_module"))
-if "verify_function_instructions(fn, issues, stack_delta, stack_touched, stack_known, uses_call, writes_segment_any)" not in one_function:
+if compact("verify_function_instructions(fn, issues, stack_delta, stack_touched, stack_known, uses_call, writes_segment_any)") not in one_function:
     raise SystemExit("conditional-target diagnostics are not connected to function verification")
-if "verify_control_flow_merges(fn, issues)" not in function_compositions or \
-        "verify_function_compositions(fn, module.fragments, issues)" not in module_compositions:
+if compact("verify_control_flow_merges(fn, issues)") not in function_compositions or \
+        compact("verify_function_compositions(fn, module.fragments, issues)") not in module_compositions:
     raise SystemExit("local target validation no longer precedes control-flow merge analysis")
-if module_verifier.index("verify_module_functions(module, issues)") > module_verifier.index("verify_module_compositions(module, issues)"):
+if module_verifier.index(compact("verify_module_functions(module, issues)")) > module_verifier.index(compact("verify_module_compositions(module, issues)")):
     raise SystemExit("function target diagnostics must run before CFG propagation consumes labels")
 
 memory_roles = function_section(MEMORY.read_text(), "easm_verify_memory_roles")
 memory_code = compact(memory_roles)
-memory_arity = "operand_scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(instruction.text) continue if not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)"
+memory_arity = compact("operand_scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(instruction.text) continue if not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)")
 if memory_arity not in memory_code:
     raise SystemExit("memory provenance scan must skip unsupported operand shapes before checking first/last operands")
-if memory_code.index("needs_arity_rejection(operand_scan.count)") > memory_code.index("for operand_index in 0..<operand_scan.count"):
+if memory_code.index("needs_arity_rejection(operand_scan.count)") > memory_code.index(compact("for operand_index in 0..<operand_scan.count")):
     raise SystemExit("memory-address validation must fail closed before using first/last operand projections")
-if "operand: sview = easm_substitute_operand(raw_operand, instruction)" not in memory_code:
+if compact("operand: sview = easm_substitute_operand(raw_operand, instruction)") not in memory_code:
     raise SystemExit("memory-base and layout checks must inspect fragment-substituted operands")
-if "easm_memory_base_register(operand)" not in memory_code or "continue if not easm_memory_operand(operand)" not in memory_code:
+if "easm_memory_base_register(operand)" not in memory_code or compact("continue if not easm_memory_operand(operand)") not in memory_code:
     raise SystemExit("the raw-carrier pass must visit every substituted memory operand")
 
 positive_names = {

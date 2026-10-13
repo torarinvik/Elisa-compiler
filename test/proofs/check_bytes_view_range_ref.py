@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
@@ -32,7 +33,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -59,7 +60,7 @@ base_view_helper = compact(function_section(runtime_text, "bytes_view"))
 required_base_view_steps = (
     "n: usize = buf.count",
     'sview("", 0, 0) return if n == 0',
-    'return sview("", 0, 0) if buf.items == null or n > buf.capacity',
+    'sview("", 0, 0) return if buf.items == null or n > buf.capacity',
     "signed_len: i64 = n.i64()",
     'if signed_len < 0 or signed_len.usize() != n: return sview("", 0, 0)',
     "trusted Unsafe.UncheckedIndex: trusted Unsafe.PointerCast: return StringView{data: &buf[0], len: signed_len}",
@@ -105,10 +106,10 @@ if any(compact(contract) not in helper for contract in required_contracts):
 required_guards = (
     "n:usize=buf.count",
     "returnemptyifn==0orbuf.items==nullorn>buf.capacity",
-    "returnemptyifsigned_n<0orsigned_n.usize()!=n",
-    "returnemptyifstart>norcount>n-start",
-    "returnemptyifstart_signed<0orstart_signed.usize()!=startorcount_signed<0orcount_signed.usize()!=count",
-    "returnemptyifcount==0",
+    "emptyreturnifsigned_n<0orsigned_n.usize()!=n",
+    "emptyreturnifstart>norcount>n-start",
+    "emptyreturnifstart_signed<0orstart_signed.usize()!=startorcount_signed<0orcount_signed.usize()!=count",
+    "emptyreturnifcount==0",
     "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
 )
 if any(guard not in helper for guard in required_guards):
@@ -119,7 +120,7 @@ if helper.find("returnemptyifstart>norcount>n-start") > helper.find("trustedUnsa
 if {"sview_len", "sview_at"} & declarations(runtime_text):
     raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 checked_index = compact(function_section(runtime_text, "string_view_index"))
-if "return view.data[index_usize].i64()" not in checked_index:
+if "returnview.data[index_usize].i64()" not in checked_index:
     raise SystemExit("bounded-view composition no longer reaches the guarded production byte reader")
 
 positive_names = {

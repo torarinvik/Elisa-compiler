@@ -13,6 +13,7 @@ argument_parser = argparse.ArgumentParser()
 argument_parser.add_argument("--source-only", action="store_true",
                              help="check production and proof bindings without running Elisa-Proof")
 ARGS = argument_parser.parse_args()
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
@@ -35,7 +36,7 @@ if not __debug__:
 
 
 def compact(text: str) -> str:
-    return "".join(text.split())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(text).splitlines())
 
 
 def function_section(source: str, name: str) -> str:

@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
@@ -33,7 +34,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -59,14 +60,13 @@ negative_text = NEGATIVE.read_text()
 
 expected_classifier = '''
 def is_invalid_payload(payload: Ast::Expr, declared_struct_payload: bool) -> bool can[Abort.Panic]:
-    ensure result == (match payload:
-        Ast::Expr.Ident(_, _): declared_struct_payload
-        Ast::Expr.Index(_, _, _): true
-        Ast::Expr.IndexN(_, _, _): true
-        Ast::Expr.Tuple(_, _): true
-        Ast::Expr.Unary(operator, _, _): operator == TokenKind.Question
-        _: false
-    )
+    ensure match payload:
+        Ast::Expr.Ident(_, _): result == declared_struct_payload
+        Ast::Expr.Index(_, _, _): result == true
+        Ast::Expr.IndexN(_, _, _): result == true
+        Ast::Expr.Tuple(_, _): result == true
+        Ast::Expr.Unary(operator, _, _): result == (operator == TokenKind.Question)
+        _: result == false
     can Abort.Panic:
         return match payload:
             Ast::Expr.Ident(_, _): declared_struct_payload
@@ -117,15 +117,13 @@ positive_cases = {
 def classifier_matches_the_closed_ast_shape_spec(payload: Expr, declared_struct_payload: bool) -> bool can[Abort.Panic]:
     ensure result == true
     can Abort.Panic:
-        return SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload) == (
-            match payload:
-                Expr.Ident(_, _): declared_struct_payload
-                Expr.Index(_, _, _): true
-                Expr.IndexN(_, _, _): true
-                Expr.Tuple(_, _): true
-                Expr.Unary(operator, _, _): operator == TokenKind.Question
-                _: false
-        )
+        return match payload:
+            Expr.Ident(_, _): (SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload)) == (declared_struct_payload)
+            Expr.Index(_, _, _): (SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload)) == (true)
+            Expr.IndexN(_, _, _): (SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload)) == (true)
+            Expr.Tuple(_, _): (SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload)) == (true)
+            Expr.Unary(operator, _, _): (SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload)) == (operator == TokenKind.Question)
+            _: (SemanticAtomicPayloadPolicy::is_invalid_payload(payload, declared_struct_payload)) == (false)
 ''',
     "declared_struct_identifiers_are_invalid_payloads": '''
 def declared_struct_identifiers_are_invalid_payloads() -> bool can[Abort.Panic]:

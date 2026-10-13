@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
@@ -35,7 +36,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -79,11 +80,12 @@ required_policy_fragments = (
     "ensure (kind == EasmDeclarationKind.Fragment) implies result == (index >= 0 and index < fragment_count)",
     "ensure (kind == EasmDeclarationKind.Protocol) implies result == (index >= 0 and index < protocol_count)",
     "ensure (kind == EasmDeclarationKind.Template) implies result == (index >= 0 and index < template_count)",
-    "EasmDeclarationKind.Function -> index >= 0 and index < function_count",
-    "EasmDeclarationKind.Fragment -> index >= 0 and index < fragment_count",
-    "EasmDeclarationKind.Protocol -> index >= 0 and index < protocol_count",
-    "EasmDeclarationKind.Template -> index >= 0 and index < template_count",
-    "_ -> true",
+    "ensure (kind == EasmDeclarationKind.None or kind == EasmDeclarationKind.Layout) implies result",
+    "EasmDeclarationKind.Function: index >= 0 and index < function_count",
+    "EasmDeclarationKind.Fragment: index >= 0 and index < fragment_count",
+    "EasmDeclarationKind.Protocol: index >= 0 and index < protocol_count",
+    "EasmDeclarationKind.Template: index >= 0 and index < template_count",
+    "_: true",
 )
 if any(compact(fragment) not in policy_body for fragment in required_policy_fragments):
     raise SystemExit("declaration-index policy lost a collection-bound contract or matching implementation")
@@ -122,8 +124,8 @@ if any(compact(contract) not in range_view_body for contract in range_view_contr
 range_view_guards = (
     "n:usize=buf.count",
     "returnemptyifn==0orbuf.items==nullorn>buf.capacity",
-    "returnemptyifstart>norcount>n-start",
-    "returnemptyifstart_signed<0orstart_signed.usize()!=startorcount_signed<0orcount_signed.usize()!=count",
+    "emptyreturnifstart>norcount>n-start",
+    "emptyreturnifstart_signed<0orstart_signed.usize()!=startorcount_signed<0orcount_signed.usize()!=count",
     "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
 )
 if any(guard not in range_view_body for guard in range_view_guards):

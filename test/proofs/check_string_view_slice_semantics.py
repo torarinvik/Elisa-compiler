@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
@@ -31,7 +32,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -58,8 +59,8 @@ negative_text = NEGATIVE.read_text()
 slice_body = compact(function_section(runtime_text, "string_view_slice"))
 required_slice_steps = (
     'empty:sview=sview("",0,0)',
-    "returnemptyifview.len<0",
-    "returnemptyifview.len==0",
+    "emptyreturnifview.len<0",
+    "emptyreturnifview.len==0",
     "view_len:usize=view.len.usize()",
     "returnemptyifview_len.i64()!=view.len",
     "lo:mutablei64=startifstart>0else0",

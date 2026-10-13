@@ -9,6 +9,7 @@ import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
+from source_guard_compat import expand_return_if_blocks
 
 
 argument_parser = argparse.ArgumentParser()
@@ -60,7 +61,7 @@ if pairwise_start < 0:
     raise SystemExit("proof no longer states low-register pairwise disjointness")
 pairwise_end = positive_text.find("\ndef ", pairwise_start + 1)
 pairwise_body = positive_text[pairwise_start:pairwise_end if pairwise_end >= 0 else len(positive_text)]
-pairwise_compact = "".join(pairwise_body.split())
+pairwise_compact = "".join(expand_return_if_blocks(pairwise_body).split())
 low_registers = ("RAX", "RCX", "RDX", "RBX", "RSI", "RDI", "RBP")
 expected_disjoint_pairs = {
     f"(EasmRegisterMasks::{left}&EasmRegisterMasks::{right})==0"
@@ -80,7 +81,7 @@ if full_start < 0:
     raise SystemExit("proof no longer states full register-mask pairwise disjointness")
 full_end = positive_text.find("\ndef ", full_start + 1)
 full_body = positive_text[full_start:full_end if full_end >= 0 else len(positive_text)]
-full_compact = "".join(full_body.split())
+full_compact = "".join(expand_return_if_blocks(full_body).split())
 expected_full_pairs = {
     f"(EasmRegisterMasks::{left}&EasmRegisterMasks::{right})==0i64"
     for left, right in combinations(all_registers, 2)
@@ -157,8 +158,8 @@ register_bit_source = MASKS.read_text().split(
     "def register_bit(register: sview) -> i64:", 1
 )[1].split("def call_clobber_mask()", 1)[0]
 register_bit_compact = "".join(register_bit_source.split())
-contract_marker = "ensureresult==(whenregister:"
-match_marker = ")returnmatchregister:"
+contract_marker = "ensurewhenregister:"
+match_marker = "returnmatchregister:"
 if contract_marker not in register_bit_compact or match_marker not in register_bit_compact:
     raise SystemExit("canonical EASM register-bit helper lost its exact contract or match implementation")
 contract_spec, match_implementation = register_bit_compact.split(contract_marker, 1)[1].split(
@@ -166,7 +167,7 @@ contract_spec, match_implementation = register_bit_compact.split(contract_marker
 )
 for register, aliases in register_aliases.items():
     alias_pattern = "|".join(f'"{alias}"' for alias in aliases)
-    if f"{alias_pattern}->{register}" not in contract_spec:
+    if f"{alias_pattern}->result=={register}" not in contract_spec:
         raise SystemExit(f"register-bit contract no longer maps {register} aliases to its canonical bit")
     if f"{alias_pattern}:{register}" not in match_implementation:
         raise SystemExit(f"register-bit implementation no longer maps {register} aliases to its canonical bit")
@@ -174,7 +175,7 @@ if re.findall(r'"([a-z0-9]+)"', contract_spec) != register_names:
     raise SystemExit("register-bit contract has a missing, duplicate, or untracked alias")
 if re.findall(r'"([a-z0-9]+)"', match_implementation) != register_names:
     raise SystemExit("register-bit match has a missing, duplicate, or untracked alias")
-if "_->0" not in contract_spec or "_:0" not in match_implementation:
+if "_->result==0" not in contract_spec or "_:0" not in match_implementation:
     raise SystemExit("unknown register names must map to zero in both the contract and implementation")
 
 register_wrapper = model.split("def easm_register_bit(register: sview) -> i64:", 1)[1].split(
@@ -286,8 +287,7 @@ implicit_writes = memory.split("def easm_implicit_write_mask(op: sview)", 1)[1].
 for fragment in (
     "implicit_writes <- EasmRegisterMasks::call_clobber_mask()",
     "return EasmRegisterMasks::cpuid_read_mask()",
-    "return EasmRegisterMasks::cpuid_write_mask()",
-    "return EasmRegisterMasks::rdtsc_write_mask()",
+    "return EasmRegisterMasks::implicit_result_write_mask(op)",
 ):
     if fragment not in operation_effect + implicit_reads + implicit_writes:
         raise SystemExit(f"EASM implicit effects no longer use their proved mask: {fragment}")

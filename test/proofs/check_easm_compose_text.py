@@ -12,6 +12,7 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+from source_guard_compat import expand_return_if_blocks, logical_source_line_count
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
@@ -35,7 +36,7 @@ if not __debug__:
 
 
 def compact(source: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in expand_return_if_blocks(source).splitlines())
 
 
 def function_section(source: str, name: str) -> str:
@@ -67,7 +68,7 @@ if env_text.count(include_line) != 1:
 if not (env_text.index('include "easm_text_scan.elisa"') < env_text.index(include_line)
         < env_text.index('include "easm_verify_function.elisa"')):
     raise SystemExit("compose-text helpers must load after their scanner and before EASM verification")
-if len(TEXT.read_text().splitlines()) > 600 or len(VERIFY.read_text().splitlines()) > 600:
+if logical_source_line_count(TEXT.read_text()) > 600 or logical_source_line_count(VERIFY.read_text()) > 600:
     raise SystemExit("EASM text parsing extraction must keep both implementation modules within 600 lines")
 
 helper_names = {
