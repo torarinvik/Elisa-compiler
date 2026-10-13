@@ -219,7 +219,7 @@ negative_names = {
 negative_claims = {
     "comma_separated_arguments_can_be_counted_as_empty": 'Easm::easm_compose_argument_count("dst, src") == 0',
     "in_range_argument_index_can_have_an_invalid_span": "not span.valid",
-    "valid_span_can_end_past_its_source": "span.valid implies span.end > text.length",
+    "valid_span_can_end_past_its_source": "span.valid implies span.end > text.len",
     "valid_span_can_reverse_its_bounds": "span.valid implies span.start > span.end",
     "invalid_span_can_return_nonzero_bounds": "not span.valid and (span.start != 0 or span.end != 0)",
 }
