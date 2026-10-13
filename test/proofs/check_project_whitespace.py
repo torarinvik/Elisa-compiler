@@ -40,6 +40,7 @@ def compact(text: str) -> str:
 
 project_text = PROJECT.read_text()
 positive_text = POSITIVE.read_text()
+negative_text = NEGATIVE.read_text()
 function_marker = "def bytes_is_space(byte: u8) -> bool:"
 if function_marker not in project_text:
     raise SystemExit("production project whitespace predicate is missing")
@@ -89,7 +90,13 @@ default_body = function_body(
     "def bytes_or_default(value: darray[u8]&, fallback: sview) -> darray[u8]:",
 )
 for fragment in (
+    "ensure result <= value.count",
+    "ensure forall prefix in 0..<result: bytes_is_space(value[prefix])",
+    "ensure result < value.count implies not bytes_is_space(value[result])",
     "while first < value.count",
+    "decreases value.count - first",
+    "invariant first <= value.count",
+    "invariant forall prefix in 0..<first: bytes_is_space(value[prefix])",
     "break if not bytes_is_space(value[first])",
     "first <- first + 1.usize()",
     "return first",
@@ -97,8 +104,16 @@ for fragment in (
     if compact(fragment) not in compact(trim_start_body):
         raise SystemExit(f"production leading trim no longer has its bounded first-nonspace scan: {fragment}")
 for fragment in (
+    "ensure result >= bytes_trim_start(value)",
+    "ensure result <= value.count",
+    "ensure forall suffix in result..<value.count: bytes_is_space(value[suffix])",
+    "ensure result > bytes_trim_start(value) implies not bytes_is_space(value[result - 1.usize()])",
     "first: usize = bytes_trim_start(value)",
     "while last > first",
+    "decreases last - first",
+    "invariant first <= last",
+    "invariant last <= value.count",
+    "invariant forall suffix in last..<value.count: bytes_is_space(value[suffix])",
     "break if not bytes_is_space(value[last - 1.usize()])",
     "last <- last - 1.usize()",
     "return last",
@@ -115,6 +130,48 @@ for fragment in (
 ):
     if compact(fragment) not in compact(trimmed_body):
         raise SystemExit(f"production byte trimming no longer copies its computed interval: {fragment}")
+if "def production_trim_interval_is_bounded(value: darray[u8]&) -> bool:" not in positive_text:
+    raise SystemExit("positive proof no longer checks bounds of the production trim interval")
+if "start <= end and end <= value.count" not in compact(positive_text.split("def production_trim_interval_is_bounded", 1)[1]):
+    raise SystemExit("trim interval proof no longer requires ordered in-bounds endpoints")
+for name, required in (
+    ("production_trim_interval_is_bounded", (
+        "ensure result == true", "start <= end and end <= value.count",
+    )),
+    ("production_trim_boundaries_match_the_whitespace_spec", (
+        "ensure result == true",
+        "ProjectSystem::bytes_trim_start(value)",
+        "ProjectSystem::bytes_trim_end(value)",
+        "forall prefix in 0..<start", "start < value.count implies",
+        "forall suffix in end..<value.count", "end > start implies",
+    )),
+    ("production_trimmed_value_is_exactly_its_source_span", (
+        "ensure result == true",
+        "return false if start > end or end > value.count",
+        "ProjectSystem::bytes_trimmed(value)",
+        "trimmed.count == end - start",
+        "trimmed[index] == value[start + index]",
+    )),
+):
+    if f"def {name}(" not in positive_text:
+        raise SystemExit(f"production trim proof is missing: {name}")
+    body = positive_text.split(f"def {name}(", 1)[1].split("\ndef ", 1)[0]
+    if any(fragment not in body for fragment in required):
+        raise SystemExit(f"production trim proof contract changed: {name}")
+for name, claim in (
+    ("trim_start_can_exceed_the_source_length", "ProjectSystem::bytes_trim_start(value) > value.count"),
+    ("trim_end_can_exceed_the_source_length", "ProjectSystem::bytes_trim_end(value) > value.count"),
+    ("trim_end_can_precede_trim_start", "ProjectSystem::bytes_trim_end(value) < ProjectSystem::bytes_trim_start(value)"),
+    ("trim_start_can_skip_a_non_whitespace_first_byte", "ProjectSystem::bytes_trim_start(value) > 0.usize()"),
+    ("trim_end_can_leave_a_non_whitespace_last_byte", "ProjectSystem::bytes_trim_end(value) < value.count"),
+    ("a_nonblank_trimmed_value_can_lose_all_bytes", "trimmed.count == 0.usize()"),
+):
+    marker = f"def {name}("
+    if marker not in negative_text:
+        raise SystemExit(f"trim interval false-claim control is missing: {name}")
+    body = negative_text.split(marker, 1)[1].split("\ndef ", 1)[0]
+    if "ensure result == true" not in body or claim not in body:
+        raise SystemExit(f"trim interval false-claim control changed: {name}")
 for fragment in (
     "for index in 0..<length |target, source, start|",
     "target.push(source[start + index])",
@@ -230,6 +287,11 @@ assert {
     "surrounding_project_whitespace_preserves_the_middle_byte",
     "blank_project_value_uses_the_fallback",
     "nonblank_project_value_is_preserved",
+    "bytes_trim_start",
+    "bytes_trim_end",
+    "production_trim_interval_is_bounded",
+    "production_trim_boundaries_match_the_whitespace_spec",
+    "production_trimmed_value_is_exactly_its_source_span",
 } <= verified
 
 code, negative = run(NEGATIVE)
@@ -240,6 +302,12 @@ assert [(row["kind"], row["name"]) for row in negative["findings"]] == [
     ("ensure-unproven", "exclamation_mark_is_project_whitespace"),
     ("ensure-unproven", "a_non_space_singleton_can_be_blank"),
     ("ensure-unproven", "blank_project_value_can_ignore_fallback"),
+    ("ensure-unproven", "trim_start_can_exceed_the_source_length"),
+    ("ensure-unproven", "trim_end_can_exceed_the_source_length"),
+    ("ensure-unproven", "trim_end_can_precede_trim_start"),
+    ("ensure-unproven", "trim_start_can_skip_a_non_whitespace_first_byte"),
+    ("ensure-unproven", "trim_end_can_leave_a_non_whitespace_last_byte"),
+    ("ensure-unproven", "a_nonblank_trimmed_value_can_lose_all_bytes"),
 ]
 assert require_current_product(BIN, PROVER) == manifest, "proof product changed during replay"
 assert subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
