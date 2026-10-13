@@ -138,10 +138,13 @@ class CacheIntegrityTest(unittest.TestCase):
         for index, (next_key, next_identity, prepare_rc, admitted) in enumerate(cases):
             with self.subTest(next_key=next_key, next_identity=next_identity, prepare_rc=prepare_rc):
                 entry = self.entry.with_name(f"publication-{index}.o")
-                env = dict(os.environ, ROOT=str(root), stage1_cache_key="key", stage1_cache_dependency_identity="identity", stage1_cache_entry=str(entry), stage1_cache_out=str(self.source), stage1_cache_logs=str(logs), TEST_NEXT_KEY=next_key, TEST_NEXT_IDENTITY=next_identity, TEST_PREPARE_RC=str(prepare_rc))
+                cache_dir = entry.parent / f"publication-cache-{index}"
+                env = dict(os.environ, ROOT=str(root), stage1_cache_key="key", stage1_cache_dependency_identity="identity", stage1_cache_entry=str(entry), stage1_cache_dir=str(cache_dir), stage1_cache_out=str(self.source), stage1_cache_logs=str(logs), TEST_NEXT_KEY=next_key, TEST_NEXT_IDENTITY=next_identity, TEST_PREPARE_RC=str(prepare_rc))
                 subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
-                self.assertEqual(entry.exists(), admitted)
-                self.assertEqual(Path(str(entry) + ".json").exists(), admitted)
+                published_entry = cache_dir / f"{next_key}.o"
+                self.assertEqual(published_entry.exists(), admitted)
+                self.assertEqual(Path(str(published_entry) + ".json").exists(), admitted)
+                self.assertFalse(entry.exists())
                 self.assertEqual(self.source.read_bytes(), b"object payload" * 100)
 
     def test_wrapper_hit_rechecks_inputs_before_publishing_object_or_diagnostics(self):
@@ -270,7 +273,7 @@ class CacheIntegrityTest(unittest.TestCase):
         source.write_text("source\n")
         report.write_text(f"{source}\n")
 
-        with patch.object(cache, "MAX_DEPENDENCY_INDEX_BYTES", 1):
+        with patch.object(cache, "MAX_DEPENDENCY_INDEX_BYTES", report.stat().st_size + 1):
             graph, identity = cache.store_dependencies(index, "base", report, source)
 
         self.assertRegex(graph, r"^[0-9a-f]{64}$")

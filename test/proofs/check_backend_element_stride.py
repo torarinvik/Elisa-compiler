@@ -1,6 +1,7 @@
 """Bind replayed proofs to the backend element-stride sizing policy."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,10 +12,14 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check production and proof bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 SIZES = ROOT / "src/backend/codegen_type_sizes.elisa"
 VALUE_TYPE = ROOT / "src/backend/codegen_value_type.elisa"
 POLICY = ROOT / "src/backend/codegen_element_stride_policy.elisa"
@@ -37,6 +42,7 @@ POSITIVE_NAMES = {
     "every_non_scalar_kind_uses_llvm_layout_sizing",
     "zero_width_non_boolean_scalar_uses_layout_size_path",
     "scalar_byte_size_matches_boolean_or_u32_width_formula",
+    "scalar_byte_size_is_the_least_byte_count_covering_width",
     "boolean_stride_is_one_byte_for_every_recorded_width",
     "one_bit_enum_backing_stride_is_one_byte",
     "four_bit_enum_backing_stride_is_one_byte",
@@ -52,6 +58,7 @@ NEGATIVE_NAMES = {
     "a_32_bit_scalar_has_one_byte",
     "a_four_bit_enum_backing_has_zero_bytes",
     "a_zero_width_integer_uses_the_scalar_fast_path",
+    "scalar_stride_can_truncate_a_requested_bit_width",
 }
 
 if not __debug__:
@@ -104,7 +111,7 @@ if "constBITS_PER_BYTE:u32=8" not in compact(policy_text):
 policy_shapes = {
     "uses_scalar_byte_size": """
 def uses_scalar_byte_size(is_signed: bool, is_unsigned: bool, is_float: bool, is_bool: bool, bit_width: u32) -> bool:
-    ensure result == (is_signed or is_unsigned or is_float or is_bool) and (is_bool or bit_width > 0)
+    ensure result == ((is_signed or is_unsigned or is_float or is_bool) and (is_bool or bit_width > 0))
     return (is_signed or is_unsigned or is_float or is_bool) and (is_bool or bit_width > 0)
 """,
     "scalar_byte_size": """
@@ -282,6 +289,17 @@ def scalar_byte_size_matches_boolean_or_u32_width_formula(is_bool: bool, bit_wid
     ensure result == true
     return BackendElementStridePolicy::scalar_byte_size(is_bool, bit_width) == (1 if is_bool else bit_width / BackendElementStridePolicy::BITS_PER_BYTE + (1 if bit_width % BackendElementStridePolicy::BITS_PER_BYTE > 0 else 0))
 """,
+    "scalar_byte_size_is_the_least_byte_count_covering_width": """
+def scalar_byte_size_is_the_least_byte_count_covering_width(bit_width: u32) -> bool:
+    ensure result == true
+    byte_count: u64 = BackendElementStridePolicy::scalar_byte_size(false, bit_width).u64()
+    if bit_width == 0:
+        return byte_count == 0
+    return (
+        byte_count * BackendElementStridePolicy::BITS_PER_BYTE.u64() >= bit_width.u64()
+        and (byte_count - 1) * BackendElementStridePolicy::BITS_PER_BYTE.u64() < bit_width.u64()
+    )
+""",
     "boolean_stride_is_one_byte_for_every_recorded_width": """
 def boolean_stride_is_one_byte_for_every_recorded_width(bit_width: u32) -> bool:
     ensure result == true
@@ -351,6 +369,12 @@ def a_zero_width_integer_uses_the_scalar_fast_path(is_signed: bool, is_unsigned:
     ensure result == true
     return BackendElementStridePolicy::uses_scalar_byte_size(is_signed, is_unsigned, is_float, false, 0)
 """,
+    "scalar_stride_can_truncate_a_requested_bit_width": """
+def scalar_stride_can_truncate_a_requested_bit_width() -> bool:
+    ensure result == true
+    byte_count: u64 = BackendElementStridePolicy::scalar_byte_size(false, 9).u64()
+    return byte_count * BackendElementStridePolicy::BITS_PER_BYTE.u64() < 9.u64()
+""",
 }
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:
@@ -364,6 +388,16 @@ if 'include "./backend_element_stride.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the positive element-stride proofs")
 if 'include "../../src/backend/codegen_element_stride_policy.elisa"' not in POSITIVE.read_text():
     raise SystemExit("proofs no longer include the production element-stride policy directly")
+
+source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_declarations": len(POSITIVE_NAMES),
+        "false_control_declarations": len(NEGATIVE_NAMES),
+        "source_closure_files": len(source_closure),
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)
@@ -381,7 +415,7 @@ inputs = list(dict.fromkeys([
     Path(__file__), HERE / "proof_product_gate.py", SIZES, VALUE_TYPE, POLICY, CODEGEN,
     CODEGEN_ENV, BITFIELDS, PACKED_REG, PAYLOAD_ENUM_REG, ANNOTATION_SCOPE,
     CONTAINER_OPS, COMPREHENSION, CLONE, EXPR_LITERALS, POSITIVE, NEGATIVE,
-    *source_include_closure([POSITIVE, NEGATIVE]),
+    *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

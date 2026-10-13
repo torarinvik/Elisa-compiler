@@ -130,6 +130,14 @@ def unknown_alias_permission(write: bool) -> sview:
 ''')
 if permission_body != expected_permission:
     raise SystemExit("production unknown-alias permission mapping changed from its exact read/write rule")
+conservative_origin_body = compact(function_section(policy_text, "requires_unknown_alias_permission"))
+expected_conservative_origin = compact('''
+def requires_unknown_alias_permission(origin: usize) -> bool:
+    ensure result == (origin == NO_ORIGIN or origin == UNKNOWN_ALIAS or origin == LOCAL_ALIAS)
+    return origin == NO_ORIGIN or origin == UNKNOWN_ALIAS or origin == LOCAL_ALIAS
+''')
+if conservative_origin_body != expected_conservative_origin:
+    raise SystemExit("reserved and unknown origins must use the exact fail-closed access classification")
 
 policy_include = 'include "./global_authority_origin_policy.elisa"'
 authority_include = 'include "./check_global_authority.elisa"'
@@ -169,10 +177,13 @@ if "state.local_global_origins.push(metadata.global_origin)" not in arms_body:
     raise SystemExit("match-arm binders no longer retain the proved origin metadata")
 
 access_body = compact(function_section(authority_text, "ga_access"))
-if "elifalias_origin==GLOBAL_AUTHORITY_UNKNOWN_ALIAS:table<-ga_access_unknown_alias(Ast::expr_pos(expression),write,state,table)canGlobal{Read,Write}" not in access_body:
+if "elifSemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(alias_origin):table<-ga_access_unknown_alias(Ast::expr_pos(expression),write,state,table)canGlobal{Read,Write}" not in access_body:
     raise SystemExit("unknown binder origins no longer route accesses through conservative authority requirements")
 if "ifga_expression_is_reference(expression,state,0):ifalias_origin<state.globals.count:" not in access_body:
     raise SystemExit("aggregate origin summaries must not be mistaken for direct global accesses")
+rebind_body = compact(function_section(authority_text, "ga_statements_inner"))
+if "elifSemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin):table<-ga_access_unknown_alias(Ast::expr_pos(value),true,state,table)canGlobal{Read,Write}" not in rebind_body:
+    raise SystemExit("unknown reference rebinds no longer route writes through conservative authority requirements")
 write_place_body = compact(function_section(authority_text, "ga_write_place_inner"))
 if "ifga_expression_is_reference(expression,state,0):table<-ga_access(expression,true,state,table)canGlobal{Read,Write}" not in write_place_body:
     raise SystemExit("writes through typed aggregate reference fields must consult their preserved origin")
@@ -185,9 +196,26 @@ for fragment in (
 ):
     if compact(fragment) not in origin_walk:
         raise SystemExit("aggregate reference-origin summaries no longer join all contained value origins")
-local_origin = compact(function_section(authority_text, "ga_direct_local_value_origin"))
-if "returnGLOBAL_AUTHORITY_LOCAL_ALIASiflocal_index<state.locals.countandnotga_expression_is_reference(expression,state,0)" not in local_origin:
-    raise SystemExit("direct borrows of known local nonreference storage must retain local provenance")
+local_address = compact(function_section(authority_text, "ga_local_address_origin"))
+for fragment in (
+    "returnga_local_origin(local_index,state)ifnotprojected",
+    "returnga_local_origin(local_index,state)ifnotga_reference_type(root_type,state,0)",
+):
+    if fragment not in local_address:
+        raise SystemExit("direct borrows of local storage must preserve the encoded local-root identity")
+local_origin = compact(function_section(authority_text, "ga_local_origin"))
+for fragment in (
+    "identity:usize=state.local_origin_ids[local_index]",
+    "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifidentity>=GLOBAL_AUTHORITY_LOCAL_ALIAS",
+    "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifidentity>=GLOBAL_AUTHORITY_LOCAL_ALIAS-state.globals.count",
+    "returnstate.globals.count+identity",
+):
+    if fragment not in local_origin:
+        raise SystemExit("encoded local roots must stay below the reserved alias ceiling and fail closed on overflow")
+push_local_origin = compact(function_section(authority_text, "ga_push_local_origin_id"))
+if "state.local_origin_ids.push(GLOBAL_AUTHORITY_LOCAL_ALIAS)" not in push_local_origin or \
+        "state.next_local_origin_id<GLOBAL_AUTHORITY_LOCAL_ALIAS-state.globals.count" not in push_local_origin:
+    raise SystemExit("local-origin allocation must reserve its ceiling for fail-closed overflow")
 opaque_origin = compact(function_section(authority_text, "ga_expression_reference_origin"))
 if "SemanticGlobalAuthorityOrigin::opaque_expression_origin(true,ga_type_expression_contains_reference(annotation,state,depth+1))" not in opaque_origin or \
         "SemanticGlobalAuthorityOrigin::opaque_expression_origin(false,false)" not in opaque_origin:
@@ -323,6 +351,11 @@ positive_names = {
     "unknown_alias_permission_matches_its_exact_spec",
     "writing_through_an_unknown_alias_requires_global_write",
     "reading_through_an_unknown_alias_requires_global_read",
+    "conservative_alias_policy_matches_its_exact_spec",
+    "missing_origin_requires_conservative_access",
+    "unknown_origin_requires_conservative_access",
+    "reserved_local_alias_requires_conservative_access",
+    "encoded_local_origins_bypass_unknown_alias_policy",
 }
 negative_names = {
     "value_without_references_can_be_an_unknown_alias",
@@ -339,6 +372,10 @@ negative_names = {
     "complete_constructor_must_be_unknown",
     "unknown_alias_write_can_require_only_global_read",
     "unknown_alias_read_can_require_global_write",
+    "unknown_alias_can_skip_conservative_access",
+    "missing_origin_can_skip_conservative_access",
+    "reserved_local_alias_can_skip_conservative_access",
+    "encoded_local_origin_can_require_unknown_alias_access",
 }
 if declarations(positive_text) != positive_names or declarations(negative_text) != negative_names:
     raise SystemExit("global-authority origin proof declaration inventory changed")
@@ -372,6 +409,11 @@ positive_claims = {
     "unknown_alias_permission_matches_its_exact_spec": "SemanticGlobalAuthorityOrigin::unknown_alias_permission(write) == (\"Global.Write\" if write else \"Global.Read\")",
     "writing_through_an_unknown_alias_requires_global_write": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(true) == "Global.Write"',
     "reading_through_an_unknown_alias_requires_global_read": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(false) == "Global.Read"',
+    "conservative_alias_policy_matches_its_exact_spec": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin) == (origin == SemanticGlobalAuthorityOrigin::NO_ORIGIN or origin == SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS or origin == SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
+    "missing_origin_requires_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::NO_ORIGIN)",
+    "unknown_origin_requires_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS)",
+    "reserved_local_alias_requires_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
+    "encoded_local_origins_bypass_unknown_alias_policy": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(global_count + identity)",
 }
 negative_claims = {
     "value_without_references_can_be_an_unknown_alias": "SemanticGlobalAuthorityOrigin::pattern_binding_origin(false, 17.usize()) == SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS",
@@ -388,6 +430,10 @@ negative_claims = {
     "complete_constructor_must_be_unknown": "SemanticGlobalAuthorityOrigin::constructor_origin(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS, true) == SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS",
     "unknown_alias_write_can_require_only_global_read": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(true) == "Global.Read"',
     "unknown_alias_read_can_require_global_write": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(false) == "Global.Write"',
+    "unknown_alias_can_skip_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS)",
+    "missing_origin_can_skip_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::NO_ORIGIN)",
+    "reserved_local_alias_can_skip_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
+    "encoded_local_origin_can_require_unknown_alias_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(global_count + identity)",
 }
 for source_text, claims, label in (
     (positive_text, positive_claims, "positive"),

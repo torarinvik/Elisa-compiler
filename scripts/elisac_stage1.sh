@@ -401,6 +401,9 @@ stage1_cache_publish_if_unchanged() {
   # Keep its output, but publish only under the exact inputs observed at admission.
   stage1_cache_prepare || return 0
   [[ "$stage1_cache_key" == "$compiled_key" && "$stage1_cache_dependency_identity" == "$compiled_identity" ]] || return 0
+  # A cache-hit recheck may discover changed inputs and send the wrapper through
+  # compilation under a new key. Publish to that key's path, not the earlier hit.
+  stage1_cache_entry="$stage1_cache_dir/$stage1_cache_key.o"
   python3 "$ROOT/scripts/stage1_object_cache.py" publish "$stage1_cache_entry" "$stage1_cache_out" "$stage1_cache_key" "$stage1_cache_logs/stdout" "$stage1_cache_logs/stderr" || true
 }
 stage1_cache_restore_if_unchanged() {

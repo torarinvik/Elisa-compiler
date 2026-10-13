@@ -32,6 +32,8 @@ POSITIVE_NAMES = {
     "an_implicit_result_write_drops_old_provenance",
     "a_partial_register_move_drops_the_destination_fact",
     "a_partial_register_exchange_drops_both_operand_facts",
+    "a_tracked_empty_fact_does_not_recover_input_type",
+    "an_untracked_input_register_uses_signature_provenance",
     "pseudo_instruction_preserves_destination_provenance",
     "pseudo_instruction_preserves_source_provenance",
     "non_exchange_without_a_destination_is_a_state_noop",
@@ -49,6 +51,7 @@ POSITIVE_NAMES = {
 }
 MODEL_NAMES = {
     "provenance_after_implicit_clobber",
+    "provenance_type_after_signature_fallback",
     "provenance_destination_after",
     "provenance_source_after",
 }
@@ -62,6 +65,7 @@ NEGATIVE_NAMES = {
     "false_claim_partial_move_copies_pointer_provenance",
     "false_claim_partial_exchange_preserves_source",
     "false_claim_partial_exchange_preserves_destination",
+    "false_claim_cleared_provenance_recovers_from_signature_input",
 }
 
 if not __debug__:
@@ -246,8 +250,14 @@ for helper, expected in (
     if compact(code_only(function_section(MEMORY.read_text(), helper))) != compact(expected):
         raise SystemExit(f"memory provenance alias-aware helper changed: {helper}")
 layout_role = compact(code_only(function_section(MEMORY.read_text(), "easm_verify_memory_roles")))
-if "ifnoteasm_provenance_has_register(states,base):type_name<-easm_input_type_for_register(fn,base)" not in layout_role:
+signature_fallback = "ifnoteasm_provenance_has_register(states,base):type_name<-easm_input_type_for_register(fn,base)"
+tracked_lookup = "type_name<-easm_provenance_type(states,base)"
+if signature_fallback not in layout_role:
     raise SystemExit("layout checking must only fall back to signature provenance for an untracked register")
+if tracked_lookup not in layout_role:
+    raise SystemExit("layout checking must read tracked provenance before applying signature fallback")
+if layout_role.find(tracked_lookup) > layout_role.find(signature_fallback):
+    raise SystemExit("layout checking must read the tracked fact before deciding whether signature fallback is allowed")
 if "ifEasmMemoryBasePolicy::rejects_untraced_raw_base(type_name!=\"\",easm_contract_has_word(fn.requires,\"memory.base.untyped\"))" not in layout_role:
     raise SystemExit("empty or untraced provenance must remain a rejected memory base")
 
@@ -298,6 +308,18 @@ if compact(proof_body(proof_text, "provenance_after_implicit_clobber")) != compa
     "ensure result == (old_provenance and not is_written)\n    return old_provenance and not is_written"
 ):
     raise SystemExit("implicit clobber model must erase exactly written-register facts")
+if compact(proof_body(proof_text, "provenance_type_after_signature_fallback")) != compact(
+    "ensure is_tracked implies result == tracked_type\n    ensure not is_tracked implies result == input_type\n    return tracked_type if is_tracked else input_type"
+):
+    raise SystemExit("signature fallback model must preserve present empty facts and consult inputs only when untracked")
+if compact(proof_body(proof_text, "a_tracked_empty_fact_does_not_recover_input_type")) != compact(
+    'requires input_type != ""\n    ensure result == true\n    return provenance_type_after_signature_fallback(true, "", input_type) == ""'
+):
+    raise SystemExit("tracked-empty theorem must establish that a prior clobber cannot recover signature provenance")
+if compact(proof_body(proof_text, "an_untracked_input_register_uses_signature_provenance")) != compact(
+    'requires input_type != ""\n    ensure result == true\n    return provenance_type_after_signature_fallback(false, "", input_type) == input_type'
+):
+    raise SystemExit("fallback theorem must retain legitimate signature provenance for unseen inputs")
 if compact(proof_body(proof_text, "a_call_drops_existing_caller_saved_provenance")) != compact(
     "requires old_provenance\n    ensure result == false\n    return provenance_after_implicit_clobber(true, old_provenance)"
 ):
@@ -334,6 +356,10 @@ for name, body in {
 }.items():
     if compact(proof_body(negative_text, name)) != compact(body):
         raise SystemExit(f"partial-register false control changed: {name}")
+if compact(proof_body(negative_text, "false_claim_cleared_provenance_recovers_from_signature_input")) != compact(
+    'requires input_type != ""\n    ensure result == true\n    return provenance_type_after_signature_fallback(true, "", input_type) == input_type'
+):
+    raise SystemExit("signature-fallback false control must challenge recovery of a clobbered carrier")
 
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
 if ARGS.source_only:
