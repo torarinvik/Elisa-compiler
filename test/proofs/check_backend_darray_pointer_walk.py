@@ -21,46 +21,51 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 LOWERING = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+BENCHMARK = ROOT / "test/bench/codegen_perf/darray_sum.elisa"
 POSITIVE = HERE / "backend_darray_pointer_walk.elisa"
 NEGATIVE = HERE / "backend_darray_pointer_walk_rejected.elisa"
 
 POSITIVE_SHAPES = {
-    "pointer_walk_eligible": """def pointer_walk_eligible(in_darray_branch: bool, named_darray_source: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
-    ensure result == (in_darray_branch and named_darray_source and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
-    return in_darray_branch and named_darray_source and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element
+    "pointer_walk_eligible": """def pointer_walk_eligible(in_darray_branch: bool, named_local_darray_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
+    ensure result == (in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+    return in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element
 """,
-    "dispatch_policy_matches_exact_pointer_walk_condition": """def dispatch_policy_matches_exact_pointer_walk_condition(in_darray_branch: bool, named_darray_source: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
+    "dispatch_policy_matches_exact_pointer_walk_condition": """def dispatch_policy_matches_exact_pointer_walk_condition(in_darray_branch: bool, named_local_darray_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
     ensure result == true
-    return pointer_walk_eligible(in_darray_branch, named_darray_source, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element) == (in_darray_branch and named_darray_source and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+    return pointer_walk_eligible(in_darray_branch, named_local_darray_source, safe_scalar_fold_body, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element) == (in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
 """,
-    "pointer_walk_requires_a_named_forward_read_only_scalar_darray": """def pointer_walk_requires_a_named_forward_read_only_scalar_darray(in_darray_branch: bool, named_darray_source: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
+    "pointer_walk_requires_a_named_forward_read_only_scalar_darray": """def pointer_walk_requires_a_named_forward_read_only_scalar_darray(in_darray_branch: bool, named_local_darray_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
     ensure result == true
-    selected: bool = pointer_walk_eligible(in_darray_branch, named_darray_source, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element)
-    return not selected or (in_darray_branch and named_darray_source and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+    selected: bool = pointer_walk_eligible(in_darray_branch, named_local_darray_source, safe_scalar_fold_body, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element)
+    return not selected or (in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
 """,
     "fixed_array_sources_stay_on_indexed_path": """def fixed_array_sources_stay_on_indexed_path() -> bool:
     ensure result == true
-    return not pointer_walk_eligible(true, true, false, false, false, true, true)
+    return not pointer_walk_eligible(true, true, true, false, false, false, true, true)
 """,
     "mutable_bindings_stay_on_indexed_path": """def mutable_bindings_stay_on_indexed_path() -> bool:
     ensure result == true
-    return not pointer_walk_eligible(true, true, true, false, false, false, true)
+    return not pointer_walk_eligible(true, true, true, true, false, false, false, true)
 """,
     "reversed_sources_stay_on_indexed_path": """def reversed_sources_stay_on_indexed_path() -> bool:
     ensure result == true
-    return not pointer_walk_eligible(true, true, false, true, false, false, true)
+    return not pointer_walk_eligible(true, true, true, false, true, false, false, true)
 """,
     "draining_sources_stay_on_indexed_path": """def draining_sources_stay_on_indexed_path() -> bool:
     ensure result == true
-    return not pointer_walk_eligible(true, true, false, false, true, false, true)
+    return not pointer_walk_eligible(true, true, true, false, false, true, false, true)
 """,
     "aggregate_elements_stay_on_indexed_path": """def aggregate_elements_stay_on_indexed_path() -> bool:
     ensure result == true
-    return not pointer_walk_eligible(true, true, false, false, false, false, false)
+    return not pointer_walk_eligible(true, true, true, false, false, false, false, false)
 """,
     "temporary_darray_sources_stay_on_indexed_path": """def temporary_darray_sources_stay_on_indexed_path() -> bool:
     ensure result == true
-    return not pointer_walk_eligible(true, false, false, false, false, false, true)
+    return not pointer_walk_eligible(true, false, true, false, false, false, false, true)
+""",
+    "darray_sum_scalar_fold_is_admitted": """def darray_sum_scalar_fold_is_admitted() -> bool:
+    ensure result == true
+    return pointer_walk_eligible(true, true, true, false, false, false, false, true)
 """,
     "empty_snapshot_skips_the_pointer_walk_body": """def empty_snapshot_skips_the_pointer_walk_body() -> bool:
     ensure result == true
@@ -95,27 +100,39 @@ POSITIVE_SHAPES = {
 NEGATIVE_SHAPES = {
     "fixed_array_source_can_use_pointer_walk": """def fixed_array_source_can_use_pointer_walk() -> bool:
     ensure result == true
-    return pointer_walk_eligible(true, true, false, false, false, true, true)
+    return pointer_walk_eligible(true, true, true, false, false, false, true, true)
 """,
     "mutable_binding_can_use_pointer_walk": """def mutable_binding_can_use_pointer_walk() -> bool:
     ensure result == true
-    return pointer_walk_eligible(true, true, true, false, false, false, true)
+    return pointer_walk_eligible(true, true, true, true, false, false, false, true)
 """,
     "reversed_iteration_can_use_pointer_walk": """def reversed_iteration_can_use_pointer_walk() -> bool:
     ensure result == true
-    return pointer_walk_eligible(true, true, false, true, false, false, true)
+    return pointer_walk_eligible(true, true, true, false, true, false, false, true)
 """,
     "draining_source_can_use_pointer_walk": """def draining_source_can_use_pointer_walk() -> bool:
     ensure result == true
-    return pointer_walk_eligible(true, true, false, false, true, false, true)
+    return pointer_walk_eligible(true, true, true, false, false, true, false, true)
 """,
     "aggregate_element_can_use_pointer_walk": """def aggregate_element_can_use_pointer_walk() -> bool:
     ensure result == true
-    return pointer_walk_eligible(true, true, false, false, false, false, false)
+    return pointer_walk_eligible(true, true, true, false, false, false, false, false)
 """,
     "temporary_source_can_use_pointer_walk": """def temporary_source_can_use_pointer_walk() -> bool:
     ensure result == true
-    return pointer_walk_eligible(true, false, false, false, false, false, true)
+    return pointer_walk_eligible(true, false, true, false, false, false, false, true)
+""",
+    "helper_call_body_can_use_pointer_walk": """def helper_call_body_can_use_pointer_walk() -> bool:
+    ensure result == true
+    return pointer_walk_eligible(true, true, false, false, false, false, false, true)
+""",
+    "direct_source_write_body_can_use_pointer_walk": """def direct_source_write_body_can_use_pointer_walk() -> bool:
+    ensure result == true
+    return pointer_walk_eligible(true, true, false, false, false, false, false, true)
+""",
+    "multi_statement_body_can_use_pointer_walk": """def multi_statement_body_can_use_pointer_walk() -> bool:
+    ensure result == true
+    return pointer_walk_eligible(true, true, false, false, false, false, false, true)
 """,
 }
 
@@ -159,7 +176,24 @@ outer_guard = "ifcontainer_type.kind==TypeKind.DArray:"
 if outer_guard not in lowering_body or lowering_body.find(outer_guard) > lowering_body.find(guard):
     raise SystemExit("pointer-walk selection must remain inside the DArray lowering branch")
 for fragment in (
-    "matchfor_source:Expr.Ident(_, _):named_darray_source<-true",
+    "matchfor_source:Expr.Ident(source_name,_):iffor_variables.count==1.usize()andlookup_slot(local_scope,source_name)islocal_source_slot:named_darray_source<-lookup_type(local_scope,source_name).kind==TypeKind.DArrayanddarray_pointer_walk_body_safe(for_body,source_name,for_variable,element_type,local_scope)",
+    "defdarray_pointer_walk_scalar_expr(",
+    "defdarray_pointer_walk_body_safe(",
+    "returnfalseifbody.count!=1",
+    "Expr.IntLit(_,_)|Expr.FloatLit(_,_)|Expr.BoolLit(_,_):returntrue",
+    "Expr.Ident(name,_):returnfalseifname==source_nameifname==element_name:returnloop_scratch_scalar_type(element_type)returnloop_scratch_scalar_type(lookup_type(local_scope,name))",
+    "Expr.Paren(inner,_):returndarray_pointer_walk_scalar_expr(inner,source_name,element_name,element_type,local_scope)",
+    "Expr.Unary(operator,operand,_):returnfalseifoperator!=TokenKind.Minusandoperator!=TokenKind.Plusandoperator!=TokenKind.Notandoperator!=TokenKind.Tildereturndarray_pointer_walk_scalar_expr(operand,source_name,element_name,element_type,local_scope)",
+    "returnfalseifname==source_name",
+    "returnloop_scratch_scalar_type(element_type)",
+    "loop_scratch_scalar_type(lookup_type(local_scope,name))",
+    "returnfalseifoperator!=TokenKind.Minusandoperator!=TokenKind.Plusandoperator!=TokenKind.Notandoperator!=TokenKind.Tilde",
+    "returndarray_pointer_walk_scalar_expr(left,source_name,element_name,element_type,local_scope)anddarray_pointer_walk_scalar_expr(right,source_name,element_name,element_type,local_scope)",
+    "_:returnfalse",
+    "ifbody[0]isStmt.Assign(target,operator,value,_):returnfalseifoperator!=TokenKind.Assignandoperator!=TokenKind.LArrow",
+    "iftargetisExpr.Ident(target_name,_):",
+    "returnfalseif:target_name==source_nameortarget_name==element_namenot(lookup_slot(local_scope,target_name)istarget_slot)",
+    "returnloop_scratch_scalar_type(lookup_type(local_scope,target_name))anddarray_pointer_walk_scalar_expr(value,source_name,element_name,element_type,local_scope)",
     "mutable_source_array.kind!=TypeKind.Array",
     "loop_scratch_scalar_type(element_type)",
     "cursor_slot<-build_entry_alloca(builder,pointer_type,\"for.darray.cursor\")",
@@ -208,6 +242,10 @@ else:
 if any(compact(block) not in lowering_compact for block in pointer_blocks):
     raise SystemExit("pointer-walk initialization, branch, element access, or step moved outside its guarded arm")
 
+benchmark = compact(BENCHMARK.read_text())
+if "total<-forxinxs|total|->total:" not in benchmark or "total<-total-(x>>3)" not in benchmark:
+    raise SystemExit("the admitted DArray scalar-fold theorem is no longer represented by darray_sum")
+
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
 if ARGS.source_only:
     print(json.dumps({
@@ -228,7 +266,7 @@ inputs = list(dict.fromkeys([
     BIN, manifest, manifest.with_name(manifest.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", LOWERING, POSITIVE, NEGATIVE,
-    *source_closure,
+    *source_closure, BENCHMARK,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
