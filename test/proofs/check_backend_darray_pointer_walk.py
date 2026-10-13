@@ -175,8 +175,11 @@ if guard not in lowering_body:
 outer_guard = "ifcontainer_type.kind==TypeKind.DArray:"
 if outer_guard not in lowering_body or lowering_body.find(outer_guard) > lowering_body.find(guard):
     raise SystemExit("pointer-walk selection must remain inside the DArray lowering branch")
+container_type_binding = "container_type: mutable ValueType = iterable_darray_type(for_source, local_scope, fns, structs, generics)"
+if compact(container_type_binding) not in lowering_body or lowering_body.find(compact(container_type_binding)) > lowering_body.find(guard):
+    raise SystemExit("pointer-walk dispatch must use the iterable type resolved from the unwrapped source")
 for fragment in (
-    "matchfor_source:Expr.Ident(source_name,_):iffor_variables.count==1.usize()andlookup_slot(local_scope,source_name)islocal_source_slot:named_darray_source<-lookup_type(local_scope,source_name).kind==TypeKind.DArrayanddarray_pointer_walk_body_safe(for_body,source_name,for_variable,element_type,local_scope)",
+    "matchfor_source:Expr.Ident(source_name,_):iffor_variables.count==1.usize()andlookup_slot(local_scope,source_name)islocal_source_slot:named_darray_source<-container_type.kind==TypeKind.DArrayanddarray_pointer_walk_body_safe(for_body,source_name,for_variable,element_type,local_scope)",
     "defdarray_pointer_walk_scalar_expr(",
     "defdarray_pointer_walk_body_safe(",
     "returnfalseifbody.count!=1",

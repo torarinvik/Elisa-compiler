@@ -1,6 +1,7 @@
 """Source-bind exact BMP UTF-8 boundary proofs to the backend encoder."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -10,11 +11,15 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source and proof bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not ARGS.source_only)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 SOURCE = ROOT / "src/backend/codegen_literals_decode.elisa"
 POSITIVE = HERE / "backend_literal_utf8_boundaries.elisa"
 NEGATIVE = HERE / "backend_literal_utf8_boundaries_rejected.elisa"
@@ -54,6 +59,56 @@ POSITIVE_SHAPES = {
         def literal_utf8_bmp_max_boundary() -> i64:
             ensure result == 15712191
             return 239 * 65536 + 191 * 256 + 191
+    """,
+    "literal_utf8_ascii_branch_stays_in_ascii": """
+        def literal_utf8_ascii_branch_stays_in_ascii(codepoint: i64) -> bool:
+            requires codepoint >= 0 and codepoint < 128
+            ensure result == true
+            return codepoint >= 0 and codepoint <= 127
+    """,
+    "literal_utf8_ascii_branch_emits_the_codepoint": """
+        def literal_utf8_ascii_branch_emits_the_codepoint(codepoint: i64) -> i64:
+            requires codepoint >= 0 and codepoint < 128
+            ensure result == codepoint
+            return codepoint
+    """,
+    "literal_utf8_two_byte_lead_is_valid": """
+        def literal_utf8_two_byte_lead_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 128 and codepoint < 2048
+            ensure result == true
+            lead: i64 = 192 + codepoint / 64
+            return lead >= 194 and lead <= 223
+    """,
+    "literal_utf8_two_byte_continuation_is_valid": """
+        def literal_utf8_two_byte_continuation_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 128 and codepoint < 2048
+            ensure result == true
+            continuation: i64 = 128 + codepoint % 64
+            return continuation >= 128 and continuation <= 191
+    """,
+    "literal_utf8_three_byte_lead_is_valid": """
+        def literal_utf8_three_byte_lead_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 2048 and codepoint <= 65535
+            requires codepoint < 55296 or codepoint > 57343
+            ensure result == true
+            lead: i64 = 224 + codepoint / 4096
+            return lead >= 224 and lead <= 239
+    """,
+    "literal_utf8_three_byte_second_continuation_is_valid": """
+        def literal_utf8_three_byte_second_continuation_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 2048 and codepoint <= 65535
+            requires codepoint < 55296 or codepoint > 57343
+            ensure result == true
+            continuation: i64 = 128 + (codepoint / 64) % 64
+            return continuation >= 128 and continuation <= 191
+    """,
+    "literal_utf8_three_byte_last_continuation_is_valid": """
+        def literal_utf8_three_byte_last_continuation_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 2048 and codepoint <= 65535
+            requires codepoint < 55296 or codepoint > 57343
+            ensure result == true
+            continuation: i64 = 128 + codepoint % 64
+            return continuation >= 128 and continuation <= 191
     """,
 }
 NEGATIVE_SHAPES = {
@@ -162,6 +217,15 @@ for name, (codepoint, expected_packed) in BOUNDARY_CASES.items():
     if actual_packed != expected_packed:
         raise SystemExit(f"{name}: pinned push_utf8 formulas produce {octets}, packed as {actual_packed}, not {expected_packed}")
 
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_declarations": len(POSITIVE_SHAPES),
+        "negative_controls": len(NEGATIVE_SHAPES),
+        "boundary_cases": len(BOUNDARY_CASES),
+    }, sort_keys=True))
+    raise SystemExit(0)
+
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":
     raise SystemExit("UTF-8 boundary theorems require a strict proof build")
@@ -200,14 +264,14 @@ def run(path: Path) -> tuple[int, dict]:
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
 assert positive["summary"]["declarations"] == len(POSITIVE_SHAPES)
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 14
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 28
 assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "boundary proof report changed across identical runs"
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
 assert negative["summary"]["declarations"] == len(POSITIVE_SHAPES) + len(NEGATIVE_SHAPES)
-assert negative["summary"]["obligations"] == 20 and negative["summary"]["proven"] == 17
+assert negative["summary"]["obligations"] == 34 and negative["summary"]["proven"] == 31
 assert len([goal for goal in negative["goals"] if not goal["proven"]]) == len(NEGATIVE_SHAPES)
 assert negative == run(NEGATIVE)[1], "false boundary claims were not rejected deterministically"
 
@@ -215,4 +279,4 @@ for path, expected in hashes_before.items():
     if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
         raise SystemExit(f"proof input changed while it was being checked: {path}")
 
-print("UTF-8 boundary semantics: 14 obligations replay; three incorrect boundary encodings are refused")
+print("UTF-8 boundary semantics: 28 obligations replay; three incorrect boundary encodings are refused")
