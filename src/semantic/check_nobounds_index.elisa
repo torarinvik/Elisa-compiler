@@ -5,10 +5,8 @@
 # established by iteration is not statically proven — stage0 rejects it ("index access that
 # is not statically proven in-bounds, so a runtime bounds check would be emitted").
 #
-# SOUND decidable subset: fire only on `recv[CONST]` where recv is a darray PARAMETER and
-# the access sits OUTSIDE every loop (a `for i in …` iteration is the proven case, left
-# alone). Constant index on a runtime-length darray at loop depth 0 is never provable, so
-# this cannot overfire on the iteration idiom.
+# Discharge only the simple counted-loop proof `for i in 0..<xs.count: ... xs[i]`. Merely
+# being inside a loop is not bounds evidence; unsupported loops and ranges fail closed.
 extend Semantic:
     private:
         # Names of functions that fulfill NoBoundsChecks (directly or transitively via a
@@ -24,62 +22,211 @@ extend Semantic:
                         transitive: bool = law_reaches(annotation.name, "NoBoundsChecks", includes_owner, includes_law, reach_visited)
                         out.push(annotation.owner) if direct or transitive
 
-        # darray-typed parameter names of a function (a runtime-length container — the case
-        # where a constant index is never statically proven).
-        def nb_darray_params(parameters: darray[Ast::ParamDecl], out: mutable darray[sview]&) -> void:
+        # Only a bare immutable `darray[T]` parameter may carry the counted-range evidence.
+        # Mutable/ref-wrapped inputs are not accepted by this local induction proof.
+        def nb_plain_darray_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, _, _) | Expr.IndexN(head, _, _):
+                        return ident_name_of(head) == "darray"
+                    _:
+                        return false
+
+        def nb_darray_params(parameters: darray[Ast::ParamDecl], out: mutable darray[sview]&, immutable_params: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                out.extend([parameter.name for parameter in parameters if is_darray_type(parameter.type_expression)])
-        # Walk statements at loop depth `in_loop`; a constant index into a darray param at
-        # depth 0 is an unproven access.
-        def nb_walk(statements: darray[Ast::Stmt], darray_params: darray[sview]&, in_loop: bool, fn_name: sview, table: lmut SymbolTable) -> void:
+                for parameter in parameters |out, immutable_params|:
+                    if is_darray_type(parameter.type_expression):
+                        out.push(parameter.name)
+                        immutable_params.push(parameter.name) if not parameter.is_mutable and nb_plain_darray_type(parameter.type_expression)
+
+        def nb_index_name(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _): return name
+                    Expr.Paren(inner, _): return nb_index_name(inner)
+                    _: return ""
+
+        # Recognize exactly `for i in 0..<xs.count`, and only when xs is a plain immutable
+        # darray parameter. This does not treat arbitrary while/for nesting as bound evidence.
+        def nb_loop_range_evidence(iterable: Ast::Expr, variables: darray[sview], darray_params: darray[sview]&, immutable_params: darray[sview]&) -> (index_name: sview, receiver: sview):
+            can Abort.Panic:
+                return ("", "") if variables.count != 1
+                match iterable:
+                    Expr.Binary(lower, operator, upper, _):
+                        return ("", "") if operator != TokenKind.RangeLt
+                        zero: (found: bool, value: i64) = signed_int_literal(lower)
+                        return ("", "") if not zero.found or zero.value != 0
+                        match upper:
+                            Expr.Field(object, field, _) if field == "count":
+                                receiver: sview = ident_name_of(object)
+                                valid_source: bool = receiver != "" and (any name in darray_params where name == receiver) and (any name in immutable_params where name == receiver)
+                                return (variables[0], receiver) if valid_source
+                            _:
+                                pass
+                    _:
+                        pass
+                return ("", "")
+
+        def nb_statements_shadow_index(statements: darray[Ast::Stmt], index_name: sview) -> bool:
             can Memory.Allocate, Abort.Panic:
+                return false if index_name == ""
+                for statement in statements:
+                    match statement:
+                        Stmt.VarDecl(name, _, _, _):
+                            return true if name == index_name
+                        Stmt.Assign(target, _, _, _):
+                            return true if ident_name_of(target) == index_name
+                        Stmt.If(_, then_body, else_body, _):
+                            return true if nb_statements_shadow_index(then_body, index_name) or nb_statements_shadow_index(else_body, index_name)
+                        Stmt.While(_, body, _) | Stmt.Block(_, _, _, body, _):
+                            return true if nb_statements_shadow_index(body, index_name)
+                        Stmt.For(_, variables, _, body, _):
+                            return true if (any variable in variables where variable == index_name) or nb_statements_shadow_index(body, index_name)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms:
+                                return true if nb_statements_shadow_index(arm.body, index_name)
+                        _:
+                            pass
+                return false
+
+        def nb_walk(statements: darray[Ast::Stmt], darray_params: darray[sview]&, immutable_params: darray[sview]&, evidence_index: sview, evidence_receiver: sview, fn_name: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                scan_index: mutable sview = evidence_index
+                scan_receiver: mutable sview = evidence_receiver
+                if nb_statements_shadow_index(statements, evidence_index):
+                    scan_index <- ""
+                    scan_receiver <- ""
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- nb_expr(expression, darray_params, in_loop, fn_name, line.line, table)
+                            table <- nb_expr(expression, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- nb_expr(value, darray_params, in_loop, fn_name, line.line, table)
+                            table <- nb_expr(value, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- nb_expr(target, darray_params, in_loop, fn_name, line.line, table)
-                            table <- nb_expr(value, darray_params, in_loop, fn_name, line.line, table)
+                            table <- nb_expr(target, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
+                            table <- nb_expr(value, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- nb_expr(returned, darray_params, in_loop, fn_name, line.line, table)
+                                table <- nb_expr(returned, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- nb_walk(then_body, darray_params, in_loop, fn_name, table)
-                            table <- nb_walk(else_body, darray_params, in_loop, fn_name, table)
+                            table <- nb_expr(condition, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
+                            table <- nb_walk(then_body, darray_params, immutable_params, scan_index, scan_receiver, fn_name, table)
+                            table <- nb_walk(else_body, darray_params, immutable_params, scan_index, scan_receiver, fn_name, table)
                         Stmt.While(condition, while_body, line):
-                            table <- nb_walk(while_body, darray_params, true, fn_name, table)
+                            table <- nb_expr(condition, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
+                            table <- nb_walk(while_body, darray_params, immutable_params, scan_index, scan_receiver, fn_name, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- nb_walk(for_body, darray_params, true, fn_name, table)
+                            table <- nb_expr(iterable, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
+                            evidence: (index_name: sview, receiver: sview) = nb_loop_range_evidence(iterable, variables, darray_params, immutable_params)
+                            shadows_outer: bool = (any variable in variables where variable == scan_index)
+                            next_index: sview = evidence.index_name if evidence.index_name != "" else ("" if shadows_outer else scan_index)
+                            next_receiver: sview = evidence.receiver if evidence.receiver != "" else ("" if shadows_outer else scan_receiver)
+                            table <- nb_walk(for_body, darray_params, immutable_params, next_index, next_receiver, fn_name, table)
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            table <- nb_walk(block_body, darray_params, in_loop, fn_name, table)
+                            block_index: sview = "" if binding == scan_index else scan_index
+                            block_receiver: sview = "" if binding == scan_index else scan_receiver
+                            table <- nb_walk(block_body, darray_params, immutable_params, block_index, block_receiver, fn_name, table)
                         Stmt.Match(scrutinee, arms, line):
+                            table <- nb_expr(scrutinee, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
                             for arm in arms |table| -> table:
-                                table <- nb_walk(arm.body, darray_params, in_loop, fn_name, table)
+                                # Arm patterns bind names, so range evidence does not cross
+                                # into an arm where the source spelling could be shadowed.
+                                table <- nb_expr(arm.guard, darray_params, immutable_params, "", "", fn_name, line.line, table)
+                                table <- nb_walk(arm.body, darray_params, immutable_params, "", "", fn_name, table)
+                        Stmt.Contract(kind, expression, line):
+                            table <- nb_expr(expression, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table)
                         _:
                             pass
 
-        def nb_expr(expression: Ast::Expr, darray_params: darray[sview]&, in_loop: bool, fn_name: sview, line: u32, table: lmut SymbolTable) -> void:
+        def nb_expr(expression: Ast::Expr, darray_params: darray[sview]&, immutable_params: darray[sview]&, evidence_index: sview, evidence_receiver: sview, fn_name: sview, line: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Index(object, index_argument, index_line):
                         object_name: sview = ident_name_of(object)
                         is_darray_param: bool = object_name != "" and (any p in darray_params where p == object_name)
-                        index_literal: (found: bool, value: i64) = signed_int_literal(index_argument)
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NoBoundsCheckUnproven, name: fn_name, line: line, expected: "", actual: ""}) if is_darray_param and index_literal.found and not in_loop
-                        table <- nb_expr(object, darray_params, in_loop, fn_name, line, table)
-                        table <- nb_expr(index_argument, darray_params, in_loop, fn_name, line, table)
-                    Expr.Binary(left, operator, right, binary_line):
-                        table <- nb_expr(left, darray_params, in_loop, fn_name, line, table)
-                        table <- nb_expr(right, darray_params, in_loop, fn_name, line, table)
-                    Expr.Unary(operator, operand, unary_line):
-                        table <- nb_expr(operand, darray_params, in_loop, fn_name, line, table)
-                    Expr.Paren(inner, paren_line):
-                        table <- nb_expr(inner, darray_params, in_loop, fn_name, line, table)
-                    Expr.Call(callee, arguments, argument_names, call_line):
+                        index_name: sview = nb_index_name(index_argument)
+                        has_evidence: bool = SemanticNoBoundsIndexPolicy::matching_range_evidence(is_darray_param, object_name, index_name, evidence_receiver, evidence_index)
+                        report: bool = SemanticNoBoundsIndexPolicy::should_report_unproven(is_darray_param, has_evidence)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NoBoundsCheckUnproven, name: fn_name, line: line, expected: "", actual: ""}) if report
+                        table <- nb_expr(object, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(index_argument, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.IndexN(object, arguments, index_line):
+                        object_name: sview = ident_name_of(object)
+                        is_darray_param: bool = object_name != "" and (any p in darray_params where p == object_name)
+                        index_name: sview = nb_index_name(arguments[0]) if arguments.count == 1 else ""
+                        has_evidence: bool = SemanticNoBoundsIndexPolicy::matching_range_evidence(is_darray_param, object_name, index_name, evidence_receiver, evidence_index)
+                        report: bool = SemanticNoBoundsIndexPolicy::should_report_unproven(is_darray_param, has_evidence)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NoBoundsCheckUnproven, name: fn_name, line: line, expected: "", actual: ""}) if report
+                        table <- nb_expr(object, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
                         for argument in arguments |table| -> table:
-                            table <- nb_expr(argument, darray_params, in_loop, fn_name, line, table)
+                            table <- nb_expr(argument, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- nb_expr(left, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(right, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- nb_expr(operand, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- nb_expr(inner, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Field(object, field, field_line) | Expr.Scope(object, field, field_line):
+                        table <- nb_expr(object, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        table <- nb_expr(callee, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        for argument in arguments |table| -> table:
+                            table <- nb_expr(argument, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_line):
+                        table <- nb_expr(effect_type, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        for argument in arguments |table| -> table:
+                            table <- nb_expr(argument, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Slice(object, low, high, slice_line):
+                        table <- nb_expr(object, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(low, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(high, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Move(operand, move_line) | Expr.RegionNew(operand, _, move_line):
+                        table <- nb_expr(operand, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Array(elements, array_line) | Expr.Tuple(elements, array_line) | Expr.SetLit(elements, array_line):
+                        for element in elements |table| -> table:
+                            table <- nb_expr(element, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.DictLit(entries, dict_line):
+                        for entry in entries |table| -> table:
+                            table <- nb_expr(entry.key, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                            table <- nb_expr(entry.value, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Construct(type_expression, fields, construct_line) | Expr.RecordUpdate(type_expression, fields, construct_line):
+                        table <- nb_expr(type_expression, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        for field in fields |table| -> table:
+                            table <- nb_expr(field.value, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.If(condition, then_value, else_value, if_line):
+                        table <- nb_expr(condition, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(then_value, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(else_value, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Refinement(base, condition, refinement_line) | Expr.GetElse(base, condition, refinement_line):
+                        table <- nb_expr(base, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_expr(condition, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Comprehension(loop_variable, iterable, condition, body, comprehension_line):
+                        table <- nb_expr(iterable, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        loop_evidence: (index_name: sview, receiver: sview) = nb_loop_range_evidence(iterable, [loop_variable], darray_params, immutable_params)
+                        shadows_outer: bool = loop_variable == evidence_index
+                        next_index: sview = loop_evidence.index_name if loop_evidence.index_name != "" else ("" if shadows_outer else evidence_index)
+                        next_receiver: sview = loop_evidence.receiver if loop_evidence.receiver != "" else ("" if shadows_outer else evidence_receiver)
+                        table <- nb_expr(condition, darray_params, immutable_params, next_index, next_receiver, fn_name, line, table)
+                        table <- nb_expr(body, darray_params, immutable_params, next_index, next_receiver, fn_name, line, table)
+                    Expr.Block(statements, value, captures, block_line):
+                        table <- nb_walk(statements, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, table)
+                        table <- nb_expr(value, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                    Expr.Match(scrutinee, arms, match_line):
+                        table <- nb_expr(scrutinee, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        for arm in arms |table| -> table:
+                            table <- nb_expr(arm.guard, darray_params, immutable_params, "", "", fn_name, line, table)
+                            table <- nb_walk(arm.body, darray_params, immutable_params, "", "", fn_name, table)
+                    Expr.Catch(guarded, arms, catch_line):
+                        table <- nb_expr(guarded, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        for arm in arms |table| -> table:
+                            table <- nb_expr(arm.guard, darray_params, immutable_params, "", "", fn_name, line, table)
+                            table <- nb_walk(arm.body, darray_params, immutable_params, "", "", fn_name, table)
+                    Expr.GetElse(guarded, recovery, get_else_line):
+                        table <- nb_expr(guarded, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, line, table)
+                        table <- nb_walk(recovery, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name, table)
+                    Expr.Lambda(lambda_params, lambda_body, lambda_line):
+                        table <- nb_walk(lambda_body, darray_params, immutable_params, "", "", fn_name, table)
                     _:
                         pass
 
@@ -90,8 +237,9 @@ extend Semantic:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             if any f in fulfilling where f == function_name:
                                 darray_params: mutable darray[sview] = []
-                                nb_darray_params(parameters, darray_params)
-                                table <- nb_walk(body, darray_params, false, function_name, table)
+                                immutable_params: mutable darray[sview] = []
+                                nb_darray_params(parameters, darray_params, immutable_params)
+                                table <- nb_walk(body, darray_params, immutable_params, "", "", function_name, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- nb_check_walk(module_body, fulfilling, table)
                         Decl.Scoped(scoped_body, scoped_line):
