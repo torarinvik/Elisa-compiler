@@ -60,17 +60,17 @@ negative_text = NEGATIVE.read_text()
 expected_prefix = '''
 def prefix_matches(text: sview, prefix: sview) -> bool can[Abort.Panic]:
     ensure result == (
-        text.length >= prefix.length and
-        (forall index in 0..<text.length:
-            index >= prefix.length or text[index] == prefix[index]
+        text.len >= prefix.len and
+        (forall index in 0..<text.len:
+            index >= prefix.len or text[index] == prefix[index]
         )
     )
     can Abort.Panic:
-        prefix_length: usize = prefix.length
-        false return if text.length < prefix_length
+        prefix_length: usize = prefix.len
+        false return if text.len < prefix_length
         while index < prefix_length |index: usize = 0, text, prefix, prefix_length|:
             decreases prefix_length - index
-            invariant index <= prefix_length and prefix_length <= text.length
+            invariant index <= prefix_length and prefix_length <= text.len
             invariant forall checked in 0..<index: text[checked] == prefix[checked]
             false return if text[index] != prefix[index]
             index <- index + 1.usize()
@@ -80,21 +80,21 @@ expected_within = '''
 def within_module(current_module: sview, owner: sview) -> bool can[Abort.Panic]:
     ensure result == (
         current_module == owner or (
-            owner.length > 0 and
-            current_module.length > owner.length and
-            current_module.length - owner.length > MODULE_SEPARATOR_LENGTH and
+            owner.len > 0 and
+            current_module.len > owner.len and
+            current_module.len - owner.len > MODULE_SEPARATOR_LENGTH and
             prefix_matches(current_module, owner) and
-            current_module[owner.length] == ASCII_COLON and
-            current_module[owner.length + 1.usize()] == ASCII_COLON
+            current_module[owner.len] == ASCII_COLON and
+            current_module[owner.len + 1.usize()] == ASCII_COLON
         )
     )
     can Abort.Panic:
         true return if current_module == owner
-        false return if owner.length == 0 or current_module.length <= owner.length
-        false return if current_module.length - owner.length <= MODULE_SEPARATOR_LENGTH
+        false return if owner.len == 0 or current_module.len <= owner.len
+        false return if current_module.len - owner.len <= MODULE_SEPARATOR_LENGTH
         false return if not prefix_matches(current_module, owner)
-        return current_module[owner.length] == ASCII_COLON and
-            current_module[owner.length + 1.usize()] == ASCII_COLON
+        return current_module[owner.len] == ASCII_COLON and
+            current_module[owner.len + 1.usize()] == ASCII_COLON
 '''
 if "moduleSemanticPrivateModuleBoundary:" not in compact(source_text) or \
         "constASCII_COLON:u8=58" not in compact(source_text) or \
@@ -140,8 +140,8 @@ if declarations(positive_text) != positive_names or declarations(negative_text) 
     raise SystemExit("private-module boundary proof inventory changed")
 
 expected_positive_claims = {
-    "prefix_classifier_matches_its_bytewise_spec": "SemanticPrivateModuleBoundary::prefix_matches(text,prefix)==(text.length>=prefix.lengthand(forallindexin0..<text.length:index>=prefix.lengthortext[index]==prefix[index]))",
-    "module_containment_classifier_matches_exact_separator_spec": "SemanticPrivateModuleBoundary::within_module(current_module,owner)==(current_module==owneror(owner.length>0andcurrent_module.length>owner.lengthandcurrent_module.length-owner.length>SemanticPrivateModuleBoundary::MODULE_SEPARATOR_LENGTHandSemanticPrivateModuleBoundary::prefix_matches(current_module,owner)andcurrent_module[owner.length]==SemanticPrivateModuleBoundary::ASCII_COLONandcurrent_module[owner.length+1.usize()]==SemanticPrivateModuleBoundary::ASCII_COLON))",
+    "prefix_classifier_matches_its_bytewise_spec": "SemanticPrivateModuleBoundary::prefix_matches(text,prefix)==(text.len>=prefix.lenand(forallindexin0..<text.len:index>=prefix.lenortext[index]==prefix[index]))",
+    "module_containment_classifier_matches_exact_separator_spec": "SemanticPrivateModuleBoundary::within_module(current_module,owner)==(current_module==owneror(owner.len>0andcurrent_module.len>owner.lenandcurrent_module.len-owner.len>SemanticPrivateModuleBoundary::MODULE_SEPARATOR_LENGTHandSemanticPrivateModuleBoundary::prefix_matches(current_module,owner)andcurrent_module[owner.len]==SemanticPrivateModuleBoundary::ASCII_COLONandcurrent_module[owner.len+1.usize()]==SemanticPrivateModuleBoundary::ASCII_COLON))",
     "owner_and_descendant_are_inside_private_boundary": 'SemanticPrivateModuleBoundary::within_module("A::Paint","A::Paint")andSemanticPrivateModuleBoundary::within_module("A::Paint::Brush","A::Paint")andSemanticPrivateModuleBoundary::within_module("A::Paint::Brush::Wet","A::Paint")',
     "similar_prefix_and_parent_are_outside_private_boundary": 'notSemanticPrivateModuleBoundary::within_module("A::Painter::Brush","A::Paint")andnotSemanticPrivateModuleBoundary::within_module("A","A::Paint")andnotSemanticPrivateModuleBoundary::within_module("A::Paint::","A::Paint")',
     "empty_owner_only_contains_the_identical_empty_path": 'SemanticPrivateModuleBoundary::within_module("","")andnotSemanticPrivateModuleBoundary::within_module("A","")',
