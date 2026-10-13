@@ -21,23 +21,29 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 LOWERING = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+TYPE_SIZES = ROOT / "src/backend/codegen_type_sizes.elisa"
+ABI_FACTS = ROOT / "src/backend/codegen_abi_facts.elisa"
 BENCHMARK = ROOT / "test/bench/codegen_perf/darray_sum.elisa"
 POSITIVE = HERE / "backend_darray_pointer_walk.elisa"
 NEGATIVE = HERE / "backend_darray_pointer_walk_rejected.elisa"
 
 POSITIVE_SHAPES = {
-    "pointer_walk_eligible": """def pointer_walk_eligible(in_darray_branch: bool, named_local_darray_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
-    ensure result == (in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
-    return in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element
+    "named_darray_binding_source_accepts_local_or_borrowed_darray": """def named_darray_binding_source_accepts_local_or_borrowed_darray(is_named_ident: bool, is_local_darray: bool, is_borrowed_ref_formal: bool, borrowed_target_is_darray: bool) -> bool:
+    ensure result == (is_named_ident and (is_local_darray or (is_borrowed_ref_formal and borrowed_target_is_darray)))
+    return is_named_ident and (is_local_darray or (is_borrowed_ref_formal and borrowed_target_is_darray))
 """,
-    "dispatch_policy_matches_exact_pointer_walk_condition": """def dispatch_policy_matches_exact_pointer_walk_condition(in_darray_branch: bool, named_local_darray_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
-    ensure result == true
-    return pointer_walk_eligible(in_darray_branch, named_local_darray_source, safe_scalar_fold_body, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element) == (in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+    "pointer_walk_eligible": """def pointer_walk_eligible(in_darray_branch: bool, named_darray_binding_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
+    ensure result == (in_darray_branch and named_darray_binding_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+    return in_darray_branch and named_darray_binding_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element
 """,
-    "pointer_walk_requires_a_named_forward_read_only_scalar_darray": """def pointer_walk_requires_a_named_forward_read_only_scalar_darray(in_darray_branch: bool, named_local_darray_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
+    "dispatch_policy_matches_exact_pointer_walk_condition": """def dispatch_policy_matches_exact_pointer_walk_condition(in_darray_branch: bool, named_darray_binding_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
     ensure result == true
-    selected: bool = pointer_walk_eligible(in_darray_branch, named_local_darray_source, safe_scalar_fold_body, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element)
-    return not selected or (in_darray_branch and named_local_darray_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+    return pointer_walk_eligible(in_darray_branch, named_darray_binding_source, safe_scalar_fold_body, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element) == (in_darray_branch and named_darray_binding_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
+""",
+    "pointer_walk_requires_a_named_forward_read_only_scalar_darray": """def pointer_walk_requires_a_named_forward_read_only_scalar_darray(in_darray_branch: bool, named_darray_binding_source: bool, safe_scalar_fold_body: bool, mutable_binding: bool, reversed_iteration: bool, drains_source: bool, fixed_array_source: bool, scalar_element: bool) -> bool:
+    ensure result == true
+    selected: bool = pointer_walk_eligible(in_darray_branch, named_darray_binding_source, safe_scalar_fold_body, mutable_binding, reversed_iteration, drains_source, fixed_array_source, scalar_element)
+    return not selected or (in_darray_branch and named_darray_binding_source and safe_scalar_fold_body and not mutable_binding and not reversed_iteration and not drains_source and not fixed_array_source and scalar_element)
 """,
     "fixed_array_sources_stay_on_indexed_path": """def fixed_array_sources_stay_on_indexed_path() -> bool:
     ensure result == true
@@ -66,6 +72,11 @@ POSITIVE_SHAPES = {
     "darray_sum_scalar_fold_is_admitted": """def darray_sum_scalar_fold_is_admitted() -> bool:
     ensure result == true
     return pointer_walk_eligible(true, true, true, false, false, false, false, true)
+""",
+    "borrowed_darray_ref_formal_is_a_named_binding_source": """def borrowed_darray_ref_formal_is_a_named_binding_source() -> bool:
+    ensure result == true
+    named_source: bool = named_darray_binding_source_accepts_local_or_borrowed_darray(true, false, true, true)
+    return pointer_walk_eligible(true, named_source, true, false, false, false, false, true)
 """,
     "empty_snapshot_skips_the_pointer_walk_body": """def empty_snapshot_skips_the_pointer_walk_body() -> bool:
     ensure result == true
@@ -98,6 +109,14 @@ POSITIVE_SHAPES = {
 """,
 }
 NEGATIVE_SHAPES = {
+    "borrowed_ref_to_non_darray_is_eligible": """def borrowed_ref_to_non_darray_is_eligible() -> bool:
+    ensure result == true
+    return named_darray_binding_source_accepts_local_or_borrowed_darray(true, false, true, false)
+""",
+    "temporary_ref_source_is_eligible": """def temporary_ref_source_is_eligible() -> bool:
+    ensure result == true
+    return named_darray_binding_source_accepts_local_or_borrowed_darray(false, false, true, true)
+""",
     "fixed_array_source_can_use_pointer_walk": """def fixed_array_source_can_use_pointer_walk() -> bool:
     ensure result == true
     return pointer_walk_eligible(true, true, true, false, false, false, true, true)
@@ -178,6 +197,26 @@ if outer_guard not in lowering_body or lowering_body.find(outer_guard) > lowerin
 container_type_binding = "container_type: mutable ValueType = iterable_darray_type(for_source, local_scope, fns, structs, generics)"
 if compact(container_type_binding) not in lowering_body or lowering_body.find(compact(container_type_binding)) > lowering_body.find(guard):
     raise SystemExit("pointer-walk dispatch must use the iterable type resolved from the unwrapped source")
+type_sizes = compact(TYPE_SIZES.read_text())
+if "defdarray_type_behind(local_scope:mutableScope&,name:sview,structs:mutableStructTable&)" not in type_sizes:
+    raise SystemExit("named DArray source typing no longer resolves through darray_type_behind")
+for fragment in (
+    "unmodeled_type()returnifbound.kind!=TypeKind.Ref",
+    "target:ValueType=ref_target_of(bound,structs)",
+    "targetreturniftarget.kind==TypeKind.DArray",
+):
+    if fragment not in type_sizes:
+        raise SystemExit("borrowed DArray reference no longer resolves to its DArray target")
+abi_facts = compact(ABI_FACTS.read_text())
+if "defdarray_address_of(local_scope:mutableScope&,name:sview,structs:mutableStructTable&,ctx:LLVMContextRef,builder:LLVMBuilderRef)->LLVMValueRef?" not in abi_facts:
+    raise SystemExit("named DArray source address no longer uses darray_address_of")
+for fragment in (
+    "bound.kind!=TypeKind.Ref",
+    "ref_target_of(bound,structs).kind!=TypeKind.DArray",
+    'LLVMBuildLoad2(builder,LLVMPointerTypeInContext(ctx,0),bound_slot,"darray.ref")',
+):
+    if fragment not in abi_facts:
+        raise SystemExit("borrowed DArray formal no longer resolves its header pointer")
 for fragment in (
     "matchfor_source:Expr.Ident(source_name,_):iffor_variables.count==1.usize()andlookup_slot(local_scope,source_name)islocal_source_slot:named_darray_source<-container_type.kind==TypeKind.DArrayanddarray_pointer_walk_body_safe(for_body,source_name,for_variable,element_type,local_scope)",
     "defdarray_pointer_walk_scalar_expr(",
@@ -268,7 +307,7 @@ manifest = BIN.with_name(BIN.name + ".manifest.json")
 inputs = list(dict.fromkeys([
     BIN, manifest, manifest.with_name(manifest.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", LOWERING, POSITIVE, NEGATIVE,
+    Path(__file__), HERE / "proof_product_gate.py", LOWERING, TYPE_SIZES, ABI_FACTS, POSITIVE, NEGATIVE,
     *source_closure, BENCHMARK,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

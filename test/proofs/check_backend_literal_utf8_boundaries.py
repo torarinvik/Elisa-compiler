@@ -110,6 +110,44 @@ POSITIVE_SHAPES = {
             continuation: i64 = 128 + codepoint % 64
             return continuation >= 128 and continuation <= 191
     """,
+    "literal_utf8_four_byte_lead_is_valid": """
+        def literal_utf8_four_byte_lead_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 65536 and codepoint <= 1114111
+            ensure result == true
+            lead: i64 = 240 + codepoint / 262144
+            return lead >= 240 and lead <= 244
+    """,
+    "literal_utf8_four_byte_second_continuation_is_valid": """
+        def literal_utf8_four_byte_second_continuation_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 65536 and codepoint <= 1114111
+            ensure result == true
+            continuation: i64 = 128 + (codepoint / 4096) % 64
+            return continuation >= 128 and continuation <= 191
+    """,
+    "literal_utf8_four_byte_third_continuation_is_valid": """
+        def literal_utf8_four_byte_third_continuation_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 65536 and codepoint <= 1114111
+            ensure result == true
+            continuation: i64 = 128 + (codepoint / 64) % 64
+            return continuation >= 128 and continuation <= 191
+    """,
+    "literal_utf8_four_byte_last_continuation_is_valid": """
+        def literal_utf8_four_byte_last_continuation_is_valid(codepoint: i64) -> bool:
+            requires codepoint >= 65536 and codepoint <= 1114111
+            ensure result == true
+            continuation: i64 = 128 + codepoint % 64
+            return continuation >= 128 and continuation <= 191
+    """,
+    "literal_utf8_minimum_supplementary_scalar_boundary": """
+        def literal_utf8_minimum_supplementary_scalar_boundary() -> i64:
+            ensure result == 4036001920
+            return 240 * 16777216 + 144 * 65536 + 128 * 256 + 128
+    """,
+    "literal_utf8_maximum_unicode_scalar_boundary": """
+        def literal_utf8_maximum_unicode_scalar_boundary() -> i64:
+            ensure result == 4103061439
+            return 244 * 16777216 + 143 * 65536 + 191 * 256 + 191
+    """,
 }
 NEGATIVE_SHAPES = {
     "false_utf8_two_byte_min_is_c180": """
@@ -127,6 +165,16 @@ NEGATIVE_SHAPES = {
             ensure result == true
             return 238 * 65536 + 128 * 256 + 128 == 15564928
     """,
+    "false_utf8_minimum_supplementary_scalar_has_f1_lead": """
+        def false_utf8_minimum_supplementary_scalar_has_f1_lead() -> bool:
+            ensure result == true
+            return 241 * 16777216 + 144 * 65536 + 128 * 256 + 128 == 4036001920
+    """,
+    "false_utf8_maximum_scalar_has_f5_lead": """
+        def false_utf8_maximum_scalar_has_f5_lead() -> bool:
+            ensure result == true
+            return 245 * 16777216 + 143 * 65536 + 191 * 256 + 191 == 4103061439
+    """,
 }
 BOUNDARY_CASES = {
     "literal_utf8_ascii_max_boundary": (127, 127),
@@ -136,6 +184,8 @@ BOUNDARY_CASES = {
     "literal_utf8_last_scalar_before_surrogates": (55295, 15572927),
     "literal_utf8_first_scalar_after_surrogates": (57344, 15630464),
     "literal_utf8_bmp_max_boundary": (65535, 15712191),
+    "literal_utf8_minimum_supplementary_scalar_boundary": (65536, 4036001920),
+    "literal_utf8_maximum_unicode_scalar_boundary": (1114111, 4103061439),
 }
 
 
@@ -169,8 +219,13 @@ def production_encoding(codepoint: int) -> tuple[list[int], int]:
         octets = [codepoint]
     elif codepoint < 2048:
         octets = [192 + codepoint // 64, 128 + codepoint % 64]
-    else:
+    elif codepoint < 65536:
         octets = [224 + codepoint // 4096,
+                  128 + (codepoint // 64) % 64,
+                  128 + codepoint % 64]
+    else:
+        octets = [240 + codepoint // 262144,
+                  128 + (codepoint // 4096) % 64,
                   128 + (codepoint // 64) % 64,
                   128 + codepoint % 64]
     packed = 0
@@ -194,12 +249,18 @@ expected_encoder = compact("""
                 storage.push((192 + (codepoint / 64)).u8())
                 storage.push((128 + (codepoint % 64)).u8())
                 return
-            storage.push((224 + (codepoint / 4096)).u8())
+            if codepoint < 65536:
+                storage.push((224 + (codepoint / 4096)).u8())
+                storage.push((128 + ((codepoint / 64) % 64)).u8())
+                storage.push((128 + (codepoint % 64)).u8())
+                return
+            storage.push((240 + (codepoint / 262144)).u8())
+            storage.push((128 + ((codepoint / 4096) % 64)).u8())
             storage.push((128 + ((codepoint / 64) % 64)).u8())
-            storage.push((128 + (codepoint % 64)).u8()
-""") + ")"
+            storage.push((128 + (codepoint % 64)).u8())
+""")
 if hashlib.sha256(encoder.encode()).hexdigest() != \
-        "0d65674e8c777d16c3ecfd93772eb65be20873f22a71bd98070eb25968a7df59":
+        "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806":
     raise SystemExit("push_utf8 changed since the exact-boundary formulas were reviewed")
 if encoder != expected_encoder:
     raise SystemExit("push_utf8 no longer has the byte formulas modeled by this boundary proof")
@@ -264,14 +325,14 @@ def run(path: Path) -> tuple[int, dict]:
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
 assert positive["summary"]["declarations"] == len(POSITIVE_SHAPES)
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 28
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 40
 assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "boundary proof report changed across identical runs"
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
 assert negative["summary"]["declarations"] == len(POSITIVE_SHAPES) + len(NEGATIVE_SHAPES)
-assert negative["summary"]["obligations"] == 34 and negative["summary"]["proven"] == 31
+assert negative["summary"]["obligations"] == 50 and negative["summary"]["proven"] == 45
 assert len([goal for goal in negative["goals"] if not goal["proven"]]) == len(NEGATIVE_SHAPES)
 assert negative == run(NEGATIVE)[1], "false boundary claims were not rejected deterministically"
 
@@ -279,4 +340,4 @@ for path, expected in hashes_before.items():
     if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
         raise SystemExit(f"proof input changed while it was being checked: {path}")
 
-print("UTF-8 boundary semantics: 28 obligations replay; three incorrect boundary encodings are refused")
+print("UTF-8 boundary semantics: 40 obligations replay; five incorrect boundary encodings are refused")

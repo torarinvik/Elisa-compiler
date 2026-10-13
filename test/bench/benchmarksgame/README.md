@@ -8,6 +8,8 @@ For each task, implement the specified algorithm in ordinary Elisa, with the spe
 
 Keep the correctness preflight and inspect generated code instead. Elisa's `-emit ir -O3` writes optimized LLVM IR; use `-emit obj -O3` followed by `llvm-objdump -d` for assembly. For C/C++, compile the exact comparator source with its published flags plus `-S -emit-llvm` for IR, or `-S` for assembly. For Rust, use `--emit=llvm-ir,asm` with the comparator's release flags. For Zig, use `-femit-llvm-ir` and `-femit-asm` with its release mode. Pin toolchain versions and target CPU flags; where possible, compile both sides through the same LLVM release. Inspect the hot loop for bounds checks, heap allocations, calls, integer division, vectorization, alias metadata, and loop structure. Preserve the emitted files and command lines beside each case. IR/assembly differences are diagnostic evidence, not a substitute for measured speed.
 
+For the current user-directed run, do not collect elapsed or CPU timings, run timing A/Bs, use `time -l`, capture profiles, or count retired instructions. Complete correctness checks first, then use static IR and assembly inspection only.
+
 ## Completion criteria per task
 
 1. Elisa output matches the task's reference output at a small and official performance input.

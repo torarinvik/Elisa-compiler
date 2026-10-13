@@ -1,6 +1,7 @@
 """Prove the lexer surrogate-pair specification and report its backend implementation gap."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -10,11 +11,15 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source and proof bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not ARGS.source_only)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 BACKEND = ROOT / "src/backend/codegen_literals_decode.elisa"
 FIXTURE = ROOT / "test/fixtures/lexer/token_model_escapes.elisa"
 POSITIVE = HERE / "backend_literal_surrogate_semantics.elisa"
@@ -34,9 +39,9 @@ NEGATIVE_NAMES = {
 }
 
 FUNCTION_SHA256 = {
-    ("backend", "push_utf8"): "0d65674e8c777d16c3ecfd93772eb65be20873f22a71bd98070eb25968a7df59",
-    ("backend", "decode_string_escapes"): "e9b9c0245ce4e05f35e8164f88ff55bf6c5ac5f1eed4f4720d21aeb4c33a0472",
-    ("backend", "decoded_literal_byte_count"): "b32ced1d78575400d92951822a8ead8e73a5b7ba3e9022be544ca6971a8341ef",
+    ("backend", "push_utf8"): "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806",
+    ("backend", "decode_string_escapes"): "25d3ba65bcd5872c09495f474c07b54be07459bc54854a184a6d0dcc353e8dbc",
+    ("backend", "decoded_literal_byte_count"): "b79d24da40424aaaf00ed9f1fa2320667921ab589b1cc6d2eaf0520cb31ce2ad",
     ("fixture", "frontend_surrogate_pair_codepoint"): "419f247a1fe86e5c01984fb2f6dbcf7ddd9f9de061ad3f37914dc082726ebbf6",
     ("fixture", "frontend_is_high_surrogate"): "f3769c64344527b1990890508777da5abae3973695a38c0e95ed80675e60e339",
     ("fixture", "frontend_is_low_surrogate"): "bc6916ae72b6ae0662c23989e17e34db7b132be3b44ab11315d031e537d4b3a9",
@@ -113,11 +118,12 @@ if len(surrogate_fixture_lines) != 1 or surrogate_fixture_lines[0].count("D83D")
 if "17793447398112395163" not in compact(fixture_text):
     raise SystemExit("surrogate escape checksum control disappeared from the lexer fixture")
 
-# The backend decodes each four-digit escape and immediately calls push_utf8 on
-# that one value. It neither consumes the following low-surrogate escape nor has
-# a four-byte push branch; the allocation-free counter likewise counts each BMP
-# escape independently. Keep this as a reported gap, not as a claim of production
-# compatibility.
+# The backend encoder now supports four-byte Unicode scalars, but the decoder
+# still sends each four-digit escape independently to push_utf8. A valid
+# high/low pair is therefore emitted as two invalid surrogate encodings, and
+# the allocation-free counter still counts each BMP escape independently.
+# Keep this as a reported pairing gap until the decoder and counter consume a
+# valid pair as one scalar.
 require_ordered(backend_text, "decode_string_escapes", (
     "if next_byte == 120 or next_byte == 117:",
     "hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()",
@@ -130,8 +136,9 @@ if "surrogate" in compact(function_section(backend_text, "decode_string_escapes"
     raise SystemExit("backend escape decoder gained a surrogate transition; revise this audit after proving it")
 utf8_backend = compact(function_section(backend_text, "push_utf8"))
 if "ifcodepoint<128:" not in utf8_backend or "ifcodepoint<2048:" not in utf8_backend or \
-        "storage.push((224+(codepoint/4096)).u8())" not in utf8_backend or "240+" in utf8_backend:
-    raise SystemExit("backend UTF-8 encoder changed; re-evaluate the supplementary-scalar proof gap")
+        "storage.push((224+(codepoint/4096)).u8())" not in utf8_backend or \
+        "storage.push((240+(codepoint/262144)).u8())" not in utf8_backend:
+    raise SystemExit("backend UTF-8 encoder must retain its 1/2/3/4-byte scalar branches")
 count_backend = compact(function_section(backend_text, "decoded_literal_byte_count"))
 if "count<-count+(1ifnext_byte==120orhex_value<128else(2ifhex_value<2048else3))" not in count_backend:
     raise SystemExit("backend byte counter changed its independently decoded 1/2/3-byte formula")
@@ -209,6 +216,15 @@ if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIV
     raise SystemExit("surrogate proof declaration inventory changed")
 if not NEGATIVE.read_text().startswith('include "./backend_literal_surrogate_semantics.elisa"'):
     raise SystemExit("surrogate false claims must include the positive scalar theorems")
+
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_declarations": len(POSITIVE_NAMES),
+        "negative_controls": len(NEGATIVE_NAMES),
+        "production_compatibility": "known-gap",
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":
