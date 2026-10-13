@@ -166,22 +166,8 @@ if compact_code(function_section(source_text, "sview_matches_prefix")) != compac
     raise SystemExit("production prefix comparator lost its view-length, slice, or per-byte bounds guards")
 
 runtime_text = RUNTIME_STRINGS.read_text()
-expected_sview_len = """
-def sview_len(view: sview) -> usize:
-    0.usize() return if view.len <= 0
-    view_len: usize = view.len.usize()
-    return 0.usize() if view_len.i64() != view.len
-    return view_len
-"""
-if compact_code(function_section(runtime_text, "sview_len")) != compact_code(expected_sview_len):
-    raise SystemExit("prefix view-fit guard no longer matches the source StringView length conversion")
-expected_sview_at = """
-def sview_at(view: sview, index: usize) -> u8:
-    can Unsafe.UncheckedIndex:
-        return string_view_index(view, index.i64()).u8()
-"""
-if compact_code(function_section(runtime_text, "sview_at")) != compact_code(expected_sview_at):
-    raise SystemExit("prefix comparator no longer uses the source-bound checked byte reader")
+if {"sview_len", "sview_at"} & declarations(RUNTIME_STRINGS):
+    raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 expected_string_view_index = """
 def string_view_index(view: sview, index: i64) -> i64:
     can Unsafe.UncheckedIndex:
