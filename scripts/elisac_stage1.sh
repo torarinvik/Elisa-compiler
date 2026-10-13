@@ -175,7 +175,13 @@ source "$ROOT/scripts/elisac_stage1_seed.sh"
 
 if [[ "${1:-}" == "--seed" ]]; then
   export ELISA_STAGE1_SEED_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
-  ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+  if [[ -z "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" ]]; then
+    ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+  fi
+  case "$ELISA_STAGE1_SEED_BOOTSTRAP_KIND" in
+    stage0|stage1) ;;
+    *) echo "seed: ELISA_STAGE1_SEED_BOOTSTRAP_KIND must be stage0 or stage1" >&2; exit 2 ;;
+  esac
   export ELISA_STAGE1_SEED_BOOTSTRAP_KIND
   export ELISA_STAGE1_SEED_CLANG="$ELISA_CLANG_TOOL"
   bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN"

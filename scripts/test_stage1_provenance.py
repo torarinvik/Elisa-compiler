@@ -20,6 +20,37 @@ stage1_provenance.source_revision = lambda _root: "test-revision"
 # Stage1 provenance requires LLVM_CONFIG and records its selected backend separately.
 stage1_provenance.llvm_toolchain_fingerprint = lambda _previous=None, exact=False: None
 
+# Compiler filenames are not stage provenance. Recognize the Go Stage0 build identity,
+# accept a hash-matched Stage1 manifest, and reject ambiguous binaries instead of guessing.
+with tempfile.TemporaryDirectory() as directory:
+    compiler = Path(directory) / "elisac-stage1"
+    compiler.write_bytes(b"compiler executable")
+    with patch.dict(os.environ, {"ELISA_STAGE1_SEED_BOOTSTRAP_KIND": ""}):
+        with patch.object(
+            stage1_provenance.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["go", "version", "-m", str(compiler)],
+                0,
+                "path\telisacore/src\nmod\telisacore\t(devel)\n",
+                "",
+            ),
+        ):
+            assert stage1_provenance.bootstrap_compiler_kind(compiler) == "stage0"
+        with patch.object(
+            stage1_provenance.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["go", "version", "-m", str(compiler)], 1, "", "not a Go executable"
+            ),
+        ):
+            try:
+                stage1_provenance.bootstrap_compiler_kind(compiler)
+            except RuntimeError as error:
+                assert "cannot determine bootstrap compiler stage" in str(error)
+            else:
+                raise AssertionError("an unproven compiler filename must not be labeled Stage1")
+
 
 def place_product_after_sources(root, product):
     newest_source_mtime_ns = max(
@@ -159,6 +190,7 @@ with tempfile.TemporaryDirectory() as directory:
         "ELISA_CLANG": str(clang),
         "ELISA_LLVM_LIBS": f"-L{custom_libdir} -lLLVM",
         "ELISA_STAGE1_SEED_STAGE0_BIN": str(clang),
+        "ELISA_STAGE1_SEED_BOOTSTRAP_KIND": "stage0",
         "ELISA_STAGE1_SEED_CLANG": str(clang),
         "ELISA_STAGE1_SEED_OPT_LEVEL": "-O2",
         "ELISA_STAGE1_SEED_RUNTIME_OBJ": str(bootstrap_runtime),

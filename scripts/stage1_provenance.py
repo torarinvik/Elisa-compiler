@@ -92,7 +92,7 @@ def valid_sha256(value):
 
 
 def bootstrap_compiler_kind(path):
-    """Identify Stage1 products by their recorded product hash, not only their filename."""
+    """Identify the bootstrap implementation from artifact provenance, not its filename."""
     path = Path(path).expanduser().resolve()
     explicit = os.environ.get("ELISA_STAGE1_SEED_BOOTSTRAP_KIND")
     if explicit:
@@ -102,8 +102,6 @@ def bootstrap_compiler_kind(path):
                 f"(got {explicit!r})"
             )
         return explicit
-    if path.name == "elisac-stage1":
-        return "stage1"
     try:
         recorded = json.loads(manifest_path(path).read_text())
         if (
@@ -115,9 +113,27 @@ def bootstrap_compiler_kind(path):
             return "stage1"
     except (OSError, json.JSONDecodeError):
         pass
-    # The normal Stage0 product is named `elisac`. Keep legacy custom Stage0 paths working;
-    # callers with a renamed compiler of ambiguous origin can set the explicit kind above.
-    return "stage0"
+    # Stage0 is the Go compiler. Go build metadata identifies it even after a copy or rename,
+    # while a filename alone cannot distinguish a renamed Stage1 from an arbitrary executable.
+    try:
+        go_build = subprocess.run(
+            ["go", "version", "-m", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        go_build = None
+    if go_build is not None and go_build.returncode == 0:
+        for line in go_build.stdout.splitlines():
+            fields = line.split()
+            if fields[:2] == ["path", "elisacore/src"] or fields[:2] == ["mod", "elisacore"]:
+                return "stage0"
+    raise RuntimeError(
+        f"cannot determine bootstrap compiler stage for {path}; use a Stage1 provenance "
+        "manifest or set ELISA_STAGE1_SEED_BOOTSTRAP_KIND explicitly"
+    )
 
 
 def toolchain_content_view(value):
