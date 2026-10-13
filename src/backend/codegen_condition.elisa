@@ -612,6 +612,52 @@ extend Backend:
                 source_length: mutable usize = 0
                 source_path: cstr = LLVMGetSourceFileName(m, &source_length)
                 return if source_length == 0
+                i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                file_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, source_path, "panic.file")
+                message_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, message, message_symbol)
+                report_fn: LLVMValueRef = ensure_panic_report_function(m, ctx)
+                report_args: mutable darray[LLVMValueRef] = [file_global, LLVMConstInt(i64_type, report_line, 0), LLVMConstInt(i64_type, report_column, 0), message_global]
+                report_args_pointer: void& = (&report_args[0]).cast[void&] can Unsafe.PointerCast
+                _ = LLVMBuildCall2(builder, panic_report_function_type(ctx), report_fn, report_args_pointer, 4, "")
+
+
+
+
+        def panic_report_function_type(ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            ptr_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            report_params: mutable darray[LLVMTypeRef] = [ptr_type, i64_type, i64_type, ptr_type]
+            report_params_pointer: void& = (&report_params[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMFunctionType(LLVMVoidTypeInContext(ctx), report_params_pointer, 4, 0)
+
+
+
+
+        # stage0 ensurePanicReportFunction (llvm_panic_report.go): ONE outlined reporter per
+        # module, `void elisa.panic.report(ptr file, i64 line, i64 col, ptr message)`, which
+        # prints the report, the backtrace, and aborts. It is noreturn cold noinline nounwind
+        # and memory(argmem: read, inaccessiblemem: readwrite) -- it reads only the strings it
+        # is given and never returns -- so a lookup whose only write is its panic arm is
+        # inferred read-only and callers keep loaded darray headers across the call.
+        def ensure_panic_report_function(m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if LLVMGetNamedFunction(m, "elisa.panic.report") is existing_report:
+                    return existing_report
+                report_type: LLVMTypeRef = panic_report_function_type(ctx)
+                report_fn: LLVMValueRef = LLVMAddFunction(m, "elisa.panic.report", report_type)
+                # LLVMPrivateLinkage.
+                LLVMSetLinkage(report_fn, 9)
+                add_function_attribute(report_fn, "noreturn", ctx)
+                add_function_attribute(report_fn, "cold", ctx)
+                add_function_attribute(report_fn, "noinline", ctx)
+                add_function_attribute(report_fn, "nounwind", ctx)
+                # MemoryEffects encoding: 2 bits per location (ArgMem=0, InaccessibleMem=1);
+                # argmem Ref (1) | inaccessiblemem ModRef (3 << 2) = 13. Same value as stage0.
+                memory_kind: u32 = LLVMGetEnumAttributeKindForName("memory", 6)
+                if memory_kind != 0:
+                    LLVMAddAttributeAtIndex(report_fn, 4294967295, LLVMCreateEnumAttribute(ctx, memory_kind, 13))
+                body: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+                LLVMPositionBuilderAtEnd(body, LLVMAppendBasicBlockInContext(ctx, report_fn, "entry"))
 
                 i64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
                 ptr_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
@@ -619,46 +665,46 @@ extend Backend:
                 printf_params_pointer: void& = (&printf_params[0]).cast[void&] can Unsafe.PointerCast
                 printf_type: LLVMTypeRef = LLVMFunctionType(i64_type, printf_params_pointer, 1, 1)
                 printf_fn: LLVMValueRef = declare_or_get_named(m, "printf", printf_type)
-
-                format_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, "panic at %s:%d:%d: %s\n", "panic.format")
-                file_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, source_path, "panic.file")
-                message_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, message, message_symbol)
-
-                report_args: mutable darray[LLVMValueRef] = [format_global, file_global, LLVMConstInt(i64_type, report_line, 0), LLVMConstInt(i64_type, report_column, 0), message_global]
+                format_global: LLVMValueRef = LLVMBuildGlobalStringPtr(body, "panic at %s:%d:%d: %s\n", "panic.format")
+                report_args: mutable darray[LLVMValueRef] = [format_global, LLVMGetParam(report_fn, 0), LLVMGetParam(report_fn, 1), LLVMGetParam(report_fn, 2), LLVMGetParam(report_fn, 3)]
                 report_args_pointer: void& = (&report_args[0]).cast[void&] can Unsafe.PointerCast
-                _ = LLVMBuildCall2(builder, printf_type, printf_fn, report_args_pointer, 5, "")
+                _ = LLVMBuildCall2(body, printf_type, printf_fn, report_args_pointer, 5, "")
 
                 # backtrace(3) IS POSIX. Windows has no backtrace/backtrace_symbols_fd,
                 # so emitting these calls left every Windows object referencing two
-                # symbols mingw cannot resolve -- for a panic path that on that
-                # platform would simply print its message and stop. The message still
-                # prints; the frame list is what a Windows build gives up until this
-                # learns CaptureStackBackTrace.
-                return if getenv("ELISA_HOST_WINDOWS") is windows_target
-
-                # backtrace(3): 64 frames is stage0's depth.
-                frame_array: LLVMTypeRef = LLVMArrayType(ptr_type, 64)
-                frame_buffer: LLVMValueRef = build_entry_alloca(builder, frame_array, "panic.backtrace.buffer")
-                backtrace_params: mutable darray[LLVMTypeRef] = [ptr_type, i64_type]
-                backtrace_params_pointer: void& = (&backtrace_params[0]).cast[void&] can Unsafe.PointerCast
-                backtrace_type: LLVMTypeRef = LLVMFunctionType(i64_type, backtrace_params_pointer, 2, 0)
-                backtrace_fn: LLVMValueRef = declare_or_get_named(m, "backtrace", backtrace_type)
-                backtrace_args: mutable darray[LLVMValueRef] = [frame_buffer, LLVMConstInt(i64_type, 64, 0)]
-                backtrace_args_pointer: void& = (&backtrace_args[0]).cast[void&] can Unsafe.PointerCast
-                frame_count: LLVMValueRef = LLVMBuildCall2(builder, backtrace_type, backtrace_fn, backtrace_args_pointer, 2, "panic.backtrace.count")
-
-                header_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, "backtrace:\n", "panic.backtrace.header")
-                header_args: mutable darray[LLVMValueRef] = [header_global]
-                header_args_pointer: void& = (&header_args[0]).cast[void&] can Unsafe.PointerCast
-                _ = LLVMBuildCall2(builder, printf_type, printf_fn, header_args_pointer, 1, "")
-
-                symbols_params: mutable darray[LLVMTypeRef] = [ptr_type, i64_type, i64_type]
-                symbols_params_pointer: void& = (&symbols_params[0]).cast[void&] can Unsafe.PointerCast
-                symbols_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), symbols_params_pointer, 3, 0)
-                symbols_fn: LLVMValueRef = declare_or_get_named(m, "backtrace_symbols_fd", symbols_type)
-                symbols_args: mutable darray[LLVMValueRef] = [frame_buffer, frame_count, LLVMConstInt(i64_type, 2, 0)]
-                symbols_args_pointer: void& = (&symbols_args[0]).cast[void&] can Unsafe.PointerCast
-                _ = LLVMBuildCall2(builder, symbols_type, symbols_fn, symbols_args_pointer, 3, "")
+                # symbols mingw cannot resolve. The message still prints; the frame list
+                # is what a Windows build gives up until this learns CaptureStackBackTrace.
+                windows_host: mutable bool = false
+                if getenv("ELISA_HOST_WINDOWS") is windows_target:
+                    windows_host <- true
+                if not windows_host:
+                    # backtrace(3): 64 frames is stage0's depth.
+                    frame_array: LLVMTypeRef = LLVMArrayType(ptr_type, 64)
+                    frame_buffer: LLVMValueRef = build_entry_alloca(body, frame_array, "panic.backtrace.buffer")
+                    backtrace_params: mutable darray[LLVMTypeRef] = [ptr_type, i64_type]
+                    backtrace_params_pointer: void& = (&backtrace_params[0]).cast[void&] can Unsafe.PointerCast
+                    backtrace_type: LLVMTypeRef = LLVMFunctionType(i64_type, backtrace_params_pointer, 2, 0)
+                    backtrace_fn: LLVMValueRef = declare_or_get_named(m, "backtrace", backtrace_type)
+                    backtrace_args: mutable darray[LLVMValueRef] = [frame_buffer, LLVMConstInt(i64_type, 64, 0)]
+                    backtrace_args_pointer: void& = (&backtrace_args[0]).cast[void&] can Unsafe.PointerCast
+                    frame_count: LLVMValueRef = LLVMBuildCall2(body, backtrace_type, backtrace_fn, backtrace_args_pointer, 2, "panic.backtrace.count")
+                    header_global: LLVMValueRef = LLVMBuildGlobalStringPtr(body, "backtrace:\n", "panic.backtrace.header")
+                    header_args: mutable darray[LLVMValueRef] = [header_global]
+                    header_args_pointer: void& = (&header_args[0]).cast[void&] can Unsafe.PointerCast
+                    _ = LLVMBuildCall2(body, printf_type, printf_fn, header_args_pointer, 1, "")
+                    symbols_params: mutable darray[LLVMTypeRef] = [ptr_type, i64_type, i64_type]
+                    symbols_params_pointer: void& = (&symbols_params[0]).cast[void&] can Unsafe.PointerCast
+                    symbols_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), symbols_params_pointer, 3, 0)
+                    symbols_fn: LLVMValueRef = declare_or_get_named(m, "backtrace_symbols_fd", symbols_type)
+                    symbols_args: mutable darray[LLVMValueRef] = [frame_buffer, frame_count, LLVMConstInt(i64_type, 2, 0)]
+                    symbols_args_pointer: void& = (&symbols_args[0]).cast[void&] can Unsafe.PointerCast
+                    _ = LLVMBuildCall2(body, symbols_type, symbols_fn, symbols_args_pointer, 3, "")
+                abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+                abort_fn: LLVMValueRef = declare_or_get_abort(m, abort_type, false)
+                _ = LLVMBuildCall2(body, abort_type, abort_fn, null, 0, "")
+                _ = LLVMBuildUnreachable(body)
+                LLVMDisposeBuilder(body)
+                return report_fn
 
 
 
