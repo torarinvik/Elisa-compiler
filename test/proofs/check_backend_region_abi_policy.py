@@ -99,9 +99,8 @@ if any(position < 0 for position in prefix_positions) or prefix_positions != sor
     raise SystemExit("explicit-allocator prefix comparison no longer checks each byte in order")
 
 runtime_text = RUNTIME_STRINGS.read_text()
-at_body = compact(function_section(runtime_text, "sview_at"))
-if 'returnstring_view_index(view,index.i64()).u8()' not in at_body:
-    raise SystemExit("prefix classifier no longer uses the checked StringView byte reader")
+if {"sview_len", "sview_at"} & set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", runtime_text)):
+    raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 index_body = compact(function_section(runtime_text, "string_view_index"))
 index_steps = (
     '0returnifview.len<0',
