@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -10,11 +11,15 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source/proof bounds bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not ARGS.source_only)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 SOURCE = ROOT / "src/backend/codegen_literals_decode.elisa"
 POSITIVE = HERE / "backend_literal_decode_bounds.elisa"
 NEGATIVE = HERE / "backend_literal_decode_bounds_rejected.elisa"
@@ -25,6 +30,7 @@ POSITIVE_NAMES = {
     "literal_decode_hex_start_is_bounded",
     "literal_decode_single_byte_advance_is_bounded",
     "literal_decode_hex_digit_is_bounded",
+    "literal_surrogate_pair_marker_second_byte_is_bounded",
     "literal_decode_hex_advance_is_bounded",
     "literal_pattern_quoted_last_byte_is_bounded",
     "literal_pattern_empty_unquoted_span_is_bounded",
@@ -38,9 +44,11 @@ NEGATIVE_NAMES = {
     "false_claim_quoted_inner_span_exceeds_the_text",
 }
 FUNCTION_SHA256 = {
-    "decode_string_escapes": "012467b5183155592d084b82c3f522922bef20e158b1cfcc8166921b47c56c97",
-    "decoded_literal_byte_count": "0ad48dd49ce5b6f5db156c7a0e748dc2e009ec1a2ab56a11e2f4895cb70bb642",
-    "string_pattern_content_cstr": "ba495665e59f59f8f59e613adeb4c0e804a86ff19a6b10d2dd0e050f3a7ea0f5",
+    "hex_escape_value": "02657188556db09219fdf99c77c9d8c91e54383fedd21ec4f2c2be0fe3d6bf19",
+    "utf16_surrogate_pair_codepoint": "efd83178d036eac52fcac8943a452d570f2d5cb32113db59ce0bbf944ceb079c",
+    "decode_string_escapes": "e4dd1e99810e574d447f0fe9fb00d41af2c9846a90789c513de16491ee9fe49a",
+    "decoded_literal_byte_count": "87bb5014f767f76c4f29333d19356897e91e31705875189b8b72aa37fd78ec41",
+    "string_pattern_content_cstr": "e478082e1381286ea6a815ab6b94021ad55e9390800c2190e04b833b5bf78d7a",
 }
 
 
@@ -181,12 +189,39 @@ ordered_steps(source_text, "decode_string_escapes", (
     "hex_start: usize = next_index + 1.usize()",
     "hex_available: usize = length - hex_start",
     "hex_ok: mutable bool = hex_digits <= hex_available",
-    "while hex_index < hex_digits and hex_ok |hex_index, hex_value, hex_ok, text, hex_start, hex_digits|:",
-    "hex_at: i64 = hex_digit_value(text[hex_start + hex_index])",
+    "hex_value <- hex_escape_value(text, hex_start, hex_digits)",
+    "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "low_escape_start: usize = hex_start + hex_digits",
+    "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
+    "if pair_codepoint >= 0:",
+    "push_utf8(storage, pair_codepoint)",
+    "index <- low_escape_start + 6.usize()",
+    "all_known <- false",
+    "for raw_index in index..<low_escape_start |storage, text|:",
+    "if next_byte == 117 and hex_value >= 56320 and hex_value <= 57343:",
+    "all_known <- false",
     "index <- hex_start + hex_digits",
     "storage.push(decoded)",
     "index <- next_index + 1.usize()",
 ), "escape decoder")
+ordered_steps(source_text, "hex_escape_value", (
+    "requires start <= text.len and digits <= text.len - start",
+    "while index < digits |value, index, text, start, digits|:",
+    "invariant index <= digits",
+    "digit: i64 = hex_digit_value(text[start + index])",
+    "return -1 if digit < 0",
+    "value <- value * 16 + digit",
+    "index <- index + 1.usize()",
+), "bounded hexadecimal parser")
+ordered_steps(source_text, "utf16_surrogate_pair_codepoint", (
+    "requires low_escape_start <= text.len",
+    "remaining: usize = text.len - low_escape_start",
+    "return -1 if remaining < 6",
+    "return -1 if text[low_escape_start] != 92 or text[low_escape_start + 1.usize()] != 117",
+    "low: i64 = hex_escape_value(text, low_escape_start + 2.usize(), 4.usize())",
+    "return -1 if low < 56320 or low > 57343",
+    "return 65536 + (high - 55296) * 1024 + (low - 56320)",
+), "surrogate pair bounds")
 ordered_steps(source_text, "decoded_literal_byte_count", (
     "while index < length |index, count, text, length|:",
     "byte: u8 = text[index]",
@@ -202,8 +237,15 @@ ordered_steps(source_text, "decoded_literal_byte_count", (
     "hex_start: usize = next_index + 1.usize()",
     "hex_available: usize = length - hex_start",
     "-1 return if hex_digits > hex_available",
-    "while hex_index < hex_digits |hex_index, hex_value, text, hex_start|:",
-    "hex_at: i64 = hex_digit_value(text[hex_start + hex_index])",
+    "hex_value: i64 = hex_escape_value(text, hex_start, hex_digits)",
+    "-1 return if hex_value < 0",
+    "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "low_escape_start: usize = hex_start + hex_digits",
+    "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
+    "-1 return if pair_codepoint < 0",
+    "count <- count + 4",
+    "index <- low_escape_start + 6.usize()",
+    "-1 return if next_byte == 117 and hex_value >= 56320 and hex_value <= 57343",
     "index <- hex_start + hex_digits",
     "index <- next_index + 1.usize()",
 ), "decoded literal byte counter")
@@ -248,6 +290,10 @@ require_model("literal_decode_hex_digit_is_bounded",
     "def literal_decode_hex_digit_is_bounded(length: usize, start: usize, digits: usize, offset: usize) -> bool:",
     ("requires start <= length", "requires digits <= length - start", "requires offset < digits",
      "ensure result == true", "return start + offset < length"))
+require_model("literal_surrogate_pair_marker_second_byte_is_bounded",
+    "def literal_surrogate_pair_marker_second_byte_is_bounded(length: usize, start: usize) -> bool:",
+    ("requires start <= length", "requires length - start >= 6", "ensure result == true",
+     "return start + 1 < length"))
 require_model("literal_decode_hex_advance_is_bounded",
     "def literal_decode_hex_advance_is_bounded(length: usize, start: usize, digits: usize) -> bool:",
     ("requires start <= length", "requires digits <= length - start", "ensure result == true",
@@ -286,6 +332,14 @@ if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIV
     raise SystemExit("literal decoder proof declaration inventory changed")
 if not NEGATIVE.read_text().startswith('include "./backend_literal_decode_bounds.elisa"'):
     raise SystemExit("literal decoder false-claim controls must include the positive proofs")
+
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_theorems": len(POSITIVE_NAMES),
+        "false_controls": len(NEGATIVE_NAMES),
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":

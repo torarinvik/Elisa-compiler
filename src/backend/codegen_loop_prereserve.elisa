@@ -175,6 +175,53 @@ extend Backend:
                         return false
             return true
 
+        # A cursor defers writes to the public DArray count until the range exits. Any
+        # count-field read in the body, including through a local reference alias, must
+        # keep the ordinary per-push count stores. Unknown forms fail closed; the body
+        # proof above normally rejects them already.
+        def prereserve_expr_reads_darray_count(expression: Expr, budget: mutable usize&, depth: usize = 0) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if depth > PRERESERVE_MAX_ANALYSIS_DEPTH or budget == 0.usize()
+            budget <- budget - 1.usize()
+            match expression:
+                Expr.Field(object, field, _):
+                    return true if field == "count"
+                    return prereserve_expr_reads_darray_count(object, budget, depth + 1.usize())
+                Expr.Call(callee, arguments, _, _):
+                    return true if prereserve_expr_reads_darray_count(callee, budget, depth + 1.usize())
+                    for argument in arguments |budget, depth|:
+                        true return if prereserve_expr_reads_darray_count(argument, budget, depth + 1.usize())
+                    return false
+                Expr.Binary(left, _, right, _):
+                    return prereserve_expr_reads_darray_count(left, budget, depth + 1.usize()) or prereserve_expr_reads_darray_count(right, budget, depth + 1.usize())
+                Expr.Unary(_, operand, _) | Expr.Paren(operand, _):
+                    return prereserve_expr_reads_darray_count(operand, budget, depth + 1.usize())
+                Expr.If(condition, yes, no, _):
+                    return prereserve_expr_reads_darray_count(condition, budget, depth + 1.usize()) or prereserve_expr_reads_darray_count(yes, budget, depth + 1.usize()) or prereserve_expr_reads_darray_count(no, budget, depth + 1.usize())
+                Expr.Block(nested, value, _, _):
+                    return true if prereserve_body_reads_darray_count(nested, budget, depth + 1.usize())
+                    return prereserve_expr_reads_darray_count(value, budget, depth + 1.usize())
+                Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.Invalid | Expr.Absent:
+                    return false
+                _:
+                    return true
+
+        def prereserve_body_reads_darray_count(body: darray[Stmt]&, budget: mutable usize&, depth: usize = 0) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if depth > PRERESERVE_MAX_ANALYSIS_DEPTH
+            for statement in body |budget, depth|:
+                return true if budget == 0.usize()
+                budget <- budget - 1.usize()
+                match statement:
+                    Stmt.VarDecl(_, _, value, _):
+                        return true if prereserve_expr_reads_darray_count(value, budget, depth + 1.usize())
+                    Stmt.Assign(target, _, value, _):
+                        return true if prereserve_expr_reads_darray_count(target, budget, depth + 1.usize())
+                        return true if prereserve_expr_reads_darray_count(value, budget, depth + 1.usize())
+                    Stmt.Expr(expression, _):
+                        return true if prereserve_expr_reads_darray_count(expression, budget, depth + 1.usize())
+                    _:
+                        return true
+            return false
+
         # Unconditional top-level `name.push(x)` statements (looking through capture headers).
         def prereserve_push_count(body: darray[Stmt]&, name: sview, budget: mutable usize&, depth: usize = 0) -> i64 can[Abort.Panic]:
             return -1 if depth > PRERESERVE_MAX_ANALYSIS_DEPTH
@@ -297,7 +344,8 @@ extend Backend:
                                 trips: LLVMValueRef = LLVMBuildSelect(builder, positive, capped, zero, "prereserve.trips")
                                 if emit_checked_reserve_binary(trips, LLVMConstInt(i64_type, pushes.u64(), 0), true, m, ctx, builder, structs.target.target_pointer_bits) is extra:
                                     header: LLVMTypeRef = darray_llvm_type(structs, ctx)
-                                    current: LLVMValueRef = darray_load_size_i64(LLVMBuildStructGEP2(builder, header, slot, 1, "prereserve.count.ptr"), ctx, builder, "prereserve.count", structs.target.target_pointer_bits)
+                                    count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, slot, 1, "prereserve.count.ptr")
+                                    current: LLVMValueRef = darray_load_size_i64(count_pointer, ctx, builder, "prereserve.count", structs.target.target_pointer_bits)
                                     if emit_checked_reserve_binary(current, extra, false, m, ctx, builder, structs.target.target_pointer_bits) is needed:
                                         growth_runtime: Runtime = growth_runtime_for(receiver_expression, local_scope, runtime)
                                         if (emit_darray_reserve(slot, receiver_type, needed, structs, growth_runtime, m, ctx, builder, true) can Global{Read,Write}):
@@ -307,3 +355,11 @@ extend Backend:
                                             # retain the checked push path because reserve caps them.
                                             if bound is Expr.IntLit(limit, _) and limit > 0 and limit.u64() <= PRERESERVE_CAP:
                                                 fast_push_slots.push(slot)
+                                                cursor_budget: mutable usize = PRERESERVE_MAX_ANALYSIS_NODES
+                                                if not prereserve_body_reads_darray_count(body, cursor_budget):
+                                                    items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, slot, 0, "fill.items.ptr")
+                                                    items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "fill.items")
+                                                    cursor_initial: LLVMValueRef = darray_load_size_i64(count_pointer, ctx, builder, "fill.count.initial", structs.target.target_pointer_bits)
+                                                    cursor_slot: LLVMValueRef = build_entry_alloca(builder, LLVMInt64TypeInContext(ctx), "darray.fill.cursor")
+                                                    _ = LLVMBuildStore(builder, cursor_initial, cursor_slot)
+                                                    structs.memory.memory_fast_push_cursors.push(FastPushCursor{array_slot: slot, items: items, count_pointer: count_pointer, cursor_slot: cursor_slot})

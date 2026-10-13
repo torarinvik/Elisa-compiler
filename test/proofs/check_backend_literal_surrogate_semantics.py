@@ -1,4 +1,4 @@
-"""Prove the lexer surrogate-pair specification and report its backend implementation gap."""
+"""Prove surrogate-pair semantics and bind pair emission/counting to the backend."""
 from __future__ import annotations
 
 import argparse
@@ -31,6 +31,7 @@ POSITIVE_NAMES = {
     "literal_low_surrogate_is_not_a_unicode_scalar",
     "literal_unpaired_surrogate_contributes_no_decoded_bytes",
     "literal_two_surrogate_code_units_are_not_the_pair_encoding_width",
+    "literal_surrogate_pair_contributes_four_decoded_bytes",
 }
 NEGATIVE_NAMES = {
     "false_isolated_high_surrogate_is_scalar",
@@ -40,8 +41,10 @@ NEGATIVE_NAMES = {
 
 FUNCTION_SHA256 = {
     ("backend", "push_utf8"): "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806",
-    ("backend", "decode_string_escapes"): "25d3ba65bcd5872c09495f474c07b54be07459bc54854a184a6d0dcc353e8dbc",
-    ("backend", "decoded_literal_byte_count"): "b79d24da40424aaaf00ed9f1fa2320667921ab589b1cc6d2eaf0520cb31ce2ad",
+    ("backend", "hex_escape_value"): "aa2be944112d40839abbbca286c05f48870c8cfe91fed249f582dbc636fbeff5",
+    ("backend", "utf16_surrogate_pair_codepoint"): "ef4056ce3278b3b28a3185c77c23a6ff4546acc98c15486db8da7b7f278610b3",
+    ("backend", "decode_string_escapes"): "2598bda667a69096077a3919f9f51ef91fcf918e41020496207d468febf13440",
+    ("backend", "decoded_literal_byte_count"): "422fd89b0ed7ffd5f98d90318d9869ecafe508e35266bec5e658e6abaa45b756",
     ("fixture", "frontend_surrogate_pair_codepoint"): "419f247a1fe86e5c01984fb2f6dbcf7ddd9f9de061ad3f37914dc082726ebbf6",
     ("fixture", "frontend_is_high_surrogate"): "f3769c64344527b1990890508777da5abae3973695a38c0e95ed80675e60e339",
     ("fixture", "frontend_is_low_surrogate"): "bc6916ae72b6ae0662c23989e17e34db7b132be3b44ab11315d031e537d4b3a9",
@@ -118,30 +121,44 @@ if len(surrogate_fixture_lines) != 1 or surrogate_fixture_lines[0].count("D83D")
 if "17793447398112395163" not in compact(fixture_text):
     raise SystemExit("surrogate escape checksum control disappeared from the lexer fixture")
 
-# The backend encoder now supports four-byte Unicode scalars, but the decoder
-# still sends each four-digit escape independently to push_utf8. A valid
-# high/low pair is therefore emitted as two invalid surrogate encodings, and
-# the allocation-free counter still counts each BMP escape independently.
-# Keep this as a reported pairing gap until the decoder and counter consume a
-# valid pair as one scalar.
+# The backend consumes an adjacent valid high/low escape pair as one Unicode
+# scalar. Both emission and the allocation-free counter call the same pair
+# decoder; isolated surrogate units remain unknown rather than being encoded
+# as invalid UTF-8 scalar values.
+require_ordered(backend_text, "utf16_surrogate_pair_codepoint", (
+    "remaining: usize = text.len - low_escape_start",
+    "return -1 if remaining < 6",
+    "return -1 if text[low_escape_start] != 92 or text[low_escape_start + 1.usize()] != 117",
+    "low: i64 = hex_escape_value(text, low_escape_start + 2.usize(), 4.usize())",
+    "return -1 if low < 56320 or low > 57343",
+    "return 65536 + (high - 55296) * 1024 + (low - 56320)",
+), "backend surrogate-pair scalar conversion")
 require_ordered(backend_text, "decode_string_escapes", (
     "if next_byte == 120 or next_byte == 117:",
     "hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()",
-    "if hex_ok:",
-    "push_utf8(storage, hex_value) if next_byte == 117",
+    "hex_value <- hex_escape_value(text, hex_start, hex_digits)",
+    "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "low_escape_start: usize = hex_start + hex_digits",
+    "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
+    "if pair_codepoint >= 0:",
+    "push_utf8(storage, pair_codepoint)",
+    "index <- low_escape_start + 6.usize()",
+    "continue",
+    "all_known <- false",
+    "if next_byte == 117 and hex_value >= 56320 and hex_value <= 57343:",
+    "all_known <- false",
     "index <- hex_start + hex_digits",
 ), "backend BMP escape path")
-if "surrogate" in compact(function_section(backend_text, "decode_string_escapes")) or \
-        "low_value" in compact(function_section(backend_text, "decode_string_escapes")):
-    raise SystemExit("backend escape decoder gained a surrogate transition; revise this audit after proving it")
+if "pair_codepoint" not in compact(function_section(backend_text, "decode_string_escapes")):
+    raise SystemExit("backend escape decoder no longer combines valid surrogate pairs")
 utf8_backend = compact(function_section(backend_text, "push_utf8"))
 if "ifcodepoint<128:" not in utf8_backend or "ifcodepoint<2048:" not in utf8_backend or \
         "storage.push((224+(codepoint/4096)).u8())" not in utf8_backend or \
         "storage.push((240+(codepoint/262144)).u8())" not in utf8_backend:
     raise SystemExit("backend UTF-8 encoder must retain its 1/2/3/4-byte scalar branches")
 count_backend = compact(function_section(backend_text, "decoded_literal_byte_count"))
-if "count<-count+(1ifnext_byte==120orhex_value<128else(2ifhex_value<2048else3))" not in count_backend:
-    raise SystemExit("backend byte counter changed its independently decoded 1/2/3-byte formula")
+if "count<-count+4" not in count_backend or "-1returnifnext_byte==117andhex_value>=56320andhex_value<=57343" not in count_backend:
+    raise SystemExit("backend byte counter must count pairs once and refuse isolated surrogate units")
 
 positive_shapes = {
     "literal_surrogate_pair_codepoint_is_unicode_scalar": """
@@ -186,6 +203,13 @@ positive_shapes = {
             ensure result == true
             return 3 + 3 != 4
     """,
+    "literal_surrogate_pair_contributes_four_decoded_bytes": """
+        def literal_surrogate_pair_contributes_four_decoded_bytes(high: i64, low: i64) -> i64:
+            requires high >= 55296 and high <= 56319
+            requires low >= 56320 and low <= 57343
+            ensure result == 4
+            return 4
+    """,
 }
 for name, shape in positive_shapes.items():
     require_shape(POSITIVE, name, shape)
@@ -222,7 +246,7 @@ if ARGS.source_only:
         "source_bound": True,
         "positive_declarations": len(POSITIVE_NAMES),
         "negative_controls": len(NEGATIVE_NAMES),
-        "production_compatibility": "known-gap",
+        "production_compatibility": "valid-surrogate-pairs-combined",
     }, sort_keys=True))
     raise SystemExit(0)
 
@@ -264,16 +288,16 @@ def run(path: Path) -> tuple[int, dict]:
 
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
-assert positive["summary"]["declarations"] == 6
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 15
+assert positive["summary"]["declarations"] == 7
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 18
 assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "surrogate specification report changed across identical runs"
 assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == POSITIVE_NAMES
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
-assert negative["summary"]["declarations"] == 9
-assert negative["summary"]["obligations"] == 21 and negative["summary"]["proven"] == 18
+assert negative["summary"]["declarations"] == 10
+assert negative["summary"]["obligations"] == 24 and negative["summary"]["proven"] == 21
 assert {row["name"] for row in negative["findings"]} == NEGATIVE_NAMES
 assert all(row["kind"] == "ensure-unproven" and row["status"] in ("unknown", "disproved")
            for row in negative["findings"])
@@ -285,8 +309,8 @@ print(json.dumps({
     "audit_complete": True,
     "specification_obligations": positive["summary"]["proven"],
     "false_claims_refused": sorted(NEGATIVE_NAMES),
-    "production_compatibility": "known-gap",
-    "gap": "stage1 decodes each u\\uXXXX code unit independently; stage0's source-linked lexer model combines valid pairs and rejects isolated surrogates",
+    "production_compatibility": "valid-surrogate-pairs-combined",
+    "pair_width_counted_once": True,
     "proof_revision": product["proof"].get("head"),
     "compiler_revision": product["compiler"].get("source_revision"),
     "source_sha256": hashes_before,

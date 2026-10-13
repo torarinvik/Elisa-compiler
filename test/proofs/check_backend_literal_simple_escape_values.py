@@ -115,7 +115,7 @@ if not __debug__:
 source_text = SOURCE.read_text()
 decoder = compact(function_section(source_text, "decode_string_escapes"))
 if hashlib.sha256(decoder.encode()).hexdigest() != \
-        "e9b9c0245ce4e05f35e8164f88ff55bf6c5ac5f1eed4f4720d21aeb4c33a0472":
+        "2598bda667a69096077a3919f9f51ef91fcf918e41020496207d468febf13440":
     raise SystemExit("decode_string_escapes changed since its simple-escape byte mapping was reviewed")
 expected_mapping = compact("""
     decoded: u8 = when next_byte:

@@ -42,8 +42,8 @@ NEGATIVE_NAMES = {
 # algorithm change requires a fresh review of the source-to-model correspondence.
 FUNCTION_SHA256 = {
     "hex_digit_value": "b6397a60d08f4dc97b2078a5671333a782af29f7c2deb33dfddf65675c7cd71e",
-    "push_utf8": "0d65674e8c777d16c3ecfd93772eb65be20873f22a71bd98070eb25968a7df59",
-    "decode_string_escapes": "e9b9c0245ce4e05f35e8164f88ff55bf6c5ac5f1eed4f4720d21aeb4c33a0472",
+    "push_utf8": "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806",
+    "decode_string_escapes": "2598bda667a69096077a3919f9f51ef91fcf918e41020496207d468febf13440",
 }
 
 
@@ -100,7 +100,13 @@ utf8_steps = (
     "storage.push((192 + (codepoint / 64)).u8())",
     "storage.push((128 + (codepoint % 64)).u8())",
     "return",
+    "if codepoint < 65536:",
     "storage.push((224 + (codepoint / 4096)).u8())",
+    "storage.push((128 + ((codepoint / 64) % 64)).u8())",
+    "storage.push((128 + (codepoint % 64)).u8())",
+    "return",
+    "storage.push((240 + (codepoint / 262144)).u8())",
+    "storage.push((128 + ((codepoint / 4096) % 64)).u8())",
     "storage.push((128 + ((codepoint / 64) % 64)).u8())",
     "storage.push((128 + (codepoint % 64)).u8())",
 )
@@ -118,12 +124,14 @@ decoder_steps = (
     "hex_start: usize = next_index + 1.usize()",
     "hex_available: usize = length - hex_start",
     "hex_ok: mutable bool = hex_digits <= hex_available",
-    "while hex_index < hex_digits and hex_ok |hex_index, hex_value, hex_ok, text, hex_start, hex_digits|:",
-    "hex_at: i64 = hex_digit_value(text[hex_start + hex_index])",
-    "hex_ok <- false if hex_at < 0",
-    "hex_value <- hex_value * 16 + hex_at if hex_at >= 0",
-    "hex_index <- hex_index + 1.usize()",
+    "hex_value <- hex_escape_value(text, hex_start, hex_digits)",
     "if hex_ok:",
+    "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
+    "push_utf8(storage, pair_codepoint)",
+    "index <- low_escape_start + 6.usize()",
+    "if next_byte == 117 and hex_value >= 56320 and hex_value <= 57343:",
+    "all_known <- false",
     "push_utf8(storage, hex_value) if next_byte == 117",
 )
 cursor = 0
