@@ -89,7 +89,7 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
 
 for name, first_name, output in (
     ("json_parse_string", "first", "json_push_utf8(&out, code.u32())"),
-    ("json_push_string_entry", "first_unit", "scalar: u32 = code.u32()"),
+    ("json_push_string_entry", "first_unit", "json_push_utf8(&list.data, code.u32())"),
 ):
     decoder = compact(function_section(source, name))
     call_sequence = (
@@ -106,9 +106,9 @@ for name, first_name, output in (
     if any(position < 0 for position in positions) or positions != sorted(positions):
         raise SystemExit(f"{name} no longer consumes one code unit before using the shared scalar transition")
 
-# The scalar proof's four width ranges are bound to both production encoding
-# paths, including the else branch's Unicode maximum established above.
-for name, value in (("json_push_utf8", "code"), ("json_push_string_entry", "scalar")):
+# The scalar proof's four width ranges are bound to the single production
+# encoder. The string-list path must call it instead of keeping a duplicate.
+for name, value in (("json_push_utf8", "code"),):
     encoder = compact(function_section(source, name))
     branch_steps = (
         f"if{value}<128:",
@@ -119,6 +119,9 @@ for name, value in (("json_push_utf8", "code"), ("json_push_string_entry", "scal
     positions = [encoder.find(step) for step in branch_steps]
     if any(position < 0 for position in positions) or positions != sorted(positions):
         raise SystemExit(f"{name} no longer follows the proved ordered UTF-8 scalar width branches")
+list_encoder = compact(function_section(source, "json_push_string_entry"))
+if "list.data<-list.data.push((192+" in list_encoder or "list.data<-list.data.push((240+" in list_encoder:
+    raise SystemExit("JSON string-list decoding reintroduced a duplicate UTF-8 encoder")
 
 project_source = PROJECT.read_text()
 if 'include "./project_json_parse.elisa"' not in project_source or \
