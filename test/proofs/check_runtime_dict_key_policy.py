@@ -73,8 +73,8 @@ negative_text = NEGATIVE.read_text()
 expected_resolved_classifier = '''
 def is_unhashable_resolved_key_spelling(key_spelling: sview) -> bool:
     ensure when key_spelling:
-        "sview" | "dstr" | "f32" | "f64" -> result
-        _ -> not result
+        "sview" | "dstr" | "f32" | "f64" -> result == true
+        _ -> result == false
     return match key_spelling:
         "sview" | "dstr" | "f32" | "f64": true
         _: false
@@ -82,8 +82,8 @@ def is_unhashable_resolved_key_spelling(key_spelling: sview) -> bool:
 expected_declared_classifier = '''
 def requires_declared_key_spelling_check(key_spelling: sview) -> bool:
     ensure when key_spelling:
-        "sview" | "dstr" -> result
-        _ -> not result
+        "sview" | "dstr" -> result == true
+        _ -> result == false
     return match key_spelling:
         "sview" | "dstr": true
         _: false
@@ -233,9 +233,9 @@ if declarations(positive_text) != positive_names or declarations(negative_text) 
     raise SystemExit("dictionary-key proof inventory changed")
 
 positive_claims = {
-    "resolved_key_classifier_is_exact": 'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling(spelling)==(spelling=="sview"orspelling=="dstr"orspelling=="f32"orspelling=="f64")',
-    "declared_spelling_check_is_exact": 'SemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check(spelling)==(spelling=="sview"orspelling=="dstr")',
-    "diagnostic_spelling_is_exact_for_every_input": 'SemanticRuntimeDictKeyPolicy::diagnostic_spelling(spelling)==("darray[u8]"ifspelling=="dstr"elsespelling)',
+    "resolved_key_classifier_is_exact": 'SemanticRuntimeDictKeyPolicy::is_unhashable_resolved_key_spelling(spelling)==(whenspelling:"sview"|"dstr"|"f32"|"f64"->true_->false)',
+    "declared_spelling_check_is_exact": 'SemanticRuntimeDictKeyPolicy::requires_declared_key_spelling_check(spelling)==(whenspelling:"sview"|"dstr"->true_->false)',
+    "diagnostic_spelling_is_exact_for_every_input": 'SemanticRuntimeDictKeyPolicy::diagnostic_spelling(spelling)==(whenspelling:"dstr"->"darray[u8]"_->spelling)',
 }
 for name, claim in positive_claims.items():
     section = compact(function_section(positive_text, name))
