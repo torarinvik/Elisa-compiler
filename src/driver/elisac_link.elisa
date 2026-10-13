@@ -85,6 +85,111 @@ def append_native_link_driver(command: mutable darray[u8]&) -> void can[Abort.Pa
         emit_tokens_push_sview(command, " -fno-builtin -Wl,-dead_strip -o ")
 
 
+# ---- Link-time optimization (`-flto`, `-flto=thin`; stage0 native_lto.go) ----------------
+#
+# Under LTO the program module is written as LLVM bitcode and the link runs the linker's LLVM
+# LTO plugin (ld64 + the LLVM-matched clang's libLTO on macOS, lld elsewhere), so the program,
+# the callback/profiler fallback C (compiled by the same clang invocation) and any foreign C
+# are optimized and code-generated as ONE unit. The prebuilt runtime object stays a native
+# object here (stage0 rebuilds its runtime as bitcode; stage1 links ELISA_RUNTIME_OBJ as is).
+
+# ELISA_STAGE1_LTO: "full" | "thin"; empty/unset is off.
+def lto_mode_requested(mode: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    return env_value("ELISA_STAGE1_LTO", mode)
+
+
+def lto_requested() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    mode: mutable darray[u8] = []
+    return lto_mode_requested(&mode)
+
+
+# The CPU code generation targets (stage0 resolvedNativeTargetCPU): an explicit `-mcpu`,
+# else `native` for a host build, else nothing (generic, for an explicit triple).
+def append_lto_cpu_flag(command: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    cpu: mutable darray[u8] = []
+    if env_value("ELISACORE_TARGET_CPU", &cpu):
+        emit_tokens_push_sview(command, " -mcpu=")
+        if Backend::target_cpu_request_is_native(cpu):
+            emit_tokens_push_sview(command, "native")
+        else:
+            carchive_push_quoted(command, cpu)
+        return
+    triple: mutable darray[u8] = []
+    if not env_value("ELISA_STAGE1_TRIPLE", &triple):
+        emit_tokens_push_sview(command, " -mcpu=native")
+
+
+def append_lto_target_flag(command: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    triple: mutable darray[u8] = []
+    if env_value("ELISA_STAGE1_TRIPLE", &triple):
+        emit_tokens_push_sview(command, " -target ")
+        carchive_push_quoted(command, triple)
+
+
+# ` -flto=<mode> -O<n>` plus the platform's LTO linker plumbing (stage0 ltoLinkArgs).
+def append_lto_link_flags(command: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    mode: mutable darray[u8] = []
+    return if not lto_mode_requested(&mode)
+    level: mutable darray[u8] = []
+    if not env_value("ELISA_STAGE1_OPT", &level):
+        level.push(48)
+    emit_tokens_push_sview(command, " -flto=")
+    for mode_index in 0..<mode.count |command, mode|:
+        command.push(mode[mode_index])
+    emit_tokens_push_sview(command, " -O")
+    for level_index in 0..<level.count |command, level|:
+        command.push(level[level_index])
+    append_lto_cpu_flag(command)
+    static if ELISA_TARGET_OS_LINUX:
+        # GNU ld needs the LLVMgold plugin; use lld when it is installed.
+        if (system_hiding_line_map("command -v ld.lld >/dev/null 2>&1") can Global.Write) == 0:
+            emit_tokens_push_sview(command, " -fuse-ld=lld")
+    static else:
+        # libLTO defaults to O2; ld64 forwards -mllvm options to it.
+        emit_tokens_push_sview(command, " -Wl,-mllvm,-O")
+        for level_index in 0..<level.count |command, level|:
+            command.push(level[level_index])
+
+
+# Write `m` (already optimized by the per-module pipeline, exactly like an object) as an LTO
+# object at `path` (NUL-free bytes): bitcode, then `clang -c -O0 -flto=<mode> -x ir`. The
+# clang step adds the ThinLTO summary, and on macOS rewrites LLVM's default
+# `arm64-apple-darwinN` module triple into the `-apple-macosxN` form ld64 accepts for bitcode.
+def write_lto_object(machine: void&, m: LLVMModuleRef, path: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    mode: mutable darray[u8] = []
+    false return if not lto_mode_requested(&mode)
+    Backend::stamp_lto_target_attributes(machine, m)
+    bitcode_path: mutable darray[u8] = []
+    for path_index in 0..<path.count |bitcode_path, path|:
+        bitcode_path.push(path[path_index])
+    emit_tokens_push_sview(&bitcode_path, ".module.bc")
+    bitcode_c: mutable darray[u8] = []
+    for path_index in 0..<bitcode_path.count |bitcode_c, bitcode_path|:
+        bitcode_c.push(bitcode_path[path_index])
+    bitcode_c.push(0)
+    bitcode_cstr: cstr = (&bitcode_c[0]).cast[cstr] can Unsafe.PointerCast
+    false return if LLVMWriteBitcodeToFile(m, bitcode_cstr) != 0
+    command: mutable darray[u8] = []
+    clang_storage: mutable darray[u8] = []
+    if env_value("ELISA_CLANG", &clang_storage):
+        carchive_push_quoted(&command, clang_storage)
+    else:
+        emit_tokens_push_sview(&command, "clang")
+    append_lto_target_flag(&command)
+    emit_tokens_push_sview(&command, " -c -O0 -Wno-override-module -flto=")
+    for mode_index in 0..<mode.count |command, mode|:
+        command.push(mode[mode_index])
+    emit_tokens_push_sview(&command, " -x ir ")
+    carchive_push_quoted(&command, bitcode_path)
+    emit_tokens_push_sview(&command, " -o ")
+    carchive_push_quoted(&command, path)
+    command.push(0)
+    command_c: cstr = (&command[0]).cast[cstr] can Unsafe.PointerCast
+    status: i64 = system_hiding_line_map(command_c) can Global.Write
+    _ = unlink(bitcode_cstr)
+    return status == 0
+
+
 def append_native_link_libraries(command: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
     # Keep libraries after the input objects for linkers with left-to-right
     # resolution. Darwin provides these math symbols through libSystem.
@@ -96,6 +201,7 @@ def link_executable(object_path: darray[u8]&, exe_path: darray[u8]&) -> i64 can[
     command: mutable darray[u8] = []
     append_native_link_driver(&command)
     carchive_push_quoted(&command, exe_path)
+    append_lto_link_flags(&command) can Global.Write
     command.push(32)
     carchive_push_quoted(&command, object_path)
     command.push(32)
