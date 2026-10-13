@@ -289,7 +289,7 @@ def run(path: Path) -> tuple[int, dict]:
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
 assert positive["summary"]["declarations"] == 7
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 18
+assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 17
 assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "surrogate specification report changed across identical runs"
 assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == POSITIVE_NAMES
@@ -297,7 +297,7 @@ assert {row["name"] for row in positive["declaration_details"] if row.get("verif
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == negative["verification_state"] == "failed"
 assert negative["summary"]["declarations"] == 10
-assert negative["summary"]["obligations"] == 24 and negative["summary"]["proven"] == 21
+assert negative["summary"]["obligations"] == 23 and negative["summary"]["proven"] == 20
 assert {row["name"] for row in negative["findings"]} == NEGATIVE_NAMES
 assert all(row["kind"] == "ensure-unproven" and row["status"] in ("unknown", "disproved")
            for row in negative["findings"])

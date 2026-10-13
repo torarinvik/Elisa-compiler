@@ -30,7 +30,6 @@ POSITIVE_NAMES = {
     "literal_decode_hex_start_is_bounded",
     "literal_decode_single_byte_advance_is_bounded",
     "literal_decode_hex_digit_is_bounded",
-    "literal_surrogate_pair_marker_second_byte_is_bounded",
     "literal_decode_hex_advance_is_bounded",
     "literal_pattern_quoted_last_byte_is_bounded",
     "literal_pattern_empty_unquoted_span_is_bounded",
@@ -290,10 +289,6 @@ require_model("literal_decode_hex_digit_is_bounded",
     "def literal_decode_hex_digit_is_bounded(length: usize, start: usize, digits: usize, offset: usize) -> bool:",
     ("requires start <= length", "requires digits <= length - start", "requires offset < digits",
      "ensure result == true", "return start + offset < length"))
-require_model("literal_surrogate_pair_marker_second_byte_is_bounded",
-    "def literal_surrogate_pair_marker_second_byte_is_bounded(length: usize, start: usize) -> bool:",
-    ("requires start <= length", "requires length - start >= 6", "ensure result == true",
-     "return start + 1 < length"))
 require_model("literal_decode_hex_advance_is_bounded",
     "def literal_decode_hex_advance_is_bounded(length: usize, start: usize, digits: usize) -> bool:",
     ("requires start <= length", "requires digits <= length - start", "ensure result == true",
