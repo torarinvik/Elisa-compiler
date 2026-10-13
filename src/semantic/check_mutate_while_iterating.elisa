@@ -1,9 +1,12 @@
 # Iterator invalidation: a `for v in xs:` loop that grows `xs` inside the body (`xs.push(...)`,
 # `xs.extend(...)`, `xs.insert(...)`) can reallocate the darray's buffer out from under the live
 # iterator. stage0 rejects it. SOUND, structural: the iterable is a bare Ident or an
-# Ident-rooted field chain (`s.items`, `o.s.items`) and the body calls a growing method on,
-# replaces, or passes by `mutable&` that same place (a reallocating mutation). Reads and mutations of a
-# DIFFERENT container are fine; `for v in move xs:` (a drain) is a separate consuming construct.
+# Ident-rooted field chain (`s.items`, `o.s.items`) and the body calls a relocating method on
+# that place (including through a local reference alias), replaces it, or passes it by `mutable&`.
+# Reads and mutations of a DIFFERENT container are fine; `for v in move xs:` (a drain) is a
+# separate consuming construct.
+include "./iterator_alias_resolution.elisa"
+
 extend Semantic:
     private:
         # Whether EXPRESSION names the iterated PLACE. A bare-Ident place compares by name
@@ -37,8 +40,9 @@ extend Semantic:
                         return sview("", 0, 0)
 
         # The growing-mutation method name a statement expression calls on the iterated place
-        # (`container.push(..)` -> "push"), else "". Reallocating mutators only.
-        def iter_mutation_method(expression: Ast::Expr, place: Ast::Expr, container: sview) -> sview:
+        # (`container.push(..)` -> "push"), else "". Reallocating mutators only. Resolve a bare
+        # receiver through local reference aliases too (`alias = &container; alias.push(..)`).
+        def iter_mutation_method(expression: Ast::Expr, place: Ast::Expr, container: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&) -> sview:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
@@ -49,7 +53,11 @@ extend Semantic:
                                 # or shrink the buffer the loop walks just as surely as growth
                                 # moves it (fuzz F13: `xs.clear()` in `for x in move xs`).
                                 grows: bool = method_name in {"push", "extend", "insert", "append", "reserve", "clear", "truncate"}
-                                method_name return if grows and iter_place_hit(receiver, place, container)
+                                receiver_is_place: mutable bool = iter_place_hit(receiver, place, container)
+                                receiver_name: sview = ident_name_of(receiver)
+                                resolved_receiver: sview = SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, receiver_name) if receiver_name != ""
+                                receiver_is_place <- SemanticIteratorAliasResolution::may_name(resolved_receiver, container) if receiver_name != ""
+                                method_name return if grows and receiver_is_place
                             _:
                                 pass
                         return sview("", 0, 0)
@@ -57,21 +65,36 @@ extend Semantic:
                         return sview("", 0, 0)
 
         # Collect reference-alias locals: `ys: T& = &xs` binds `ys` to container `xs`, so passing
-        # `ys` by mutable ref is passing `xs`. Parallel (names, targets); over-collection is safe.
+        # `ys` by mutable ref is passing `xs`. Bare identifier copies and rebinding assignments are
+        # included as possible aliases too. Duplicate names become unknown in the resolver, which
+        # is conservative across branches and shadowed scopes. Parallel (names, targets).
+        def iter_alias_value_target(value: Ast::Expr) -> sview:
+            can Abort.Panic:
+                stripped: Ast::Expr = storage_view_strip_paren_move(value)
+                return match stripped:
+                    Expr.Unary(operator, operand, unary_line):
+                        ident_name_of(operand) if operator == TokenKind.Ampersand else sview("", 0, 0)
+                    Expr.Ident(_, _):
+                        ident_name_of(stripped)
+                    _:
+                        sview("", 0, 0)
+
+        def iter_collect_alias_binding(name: sview, value: Ast::Expr, names: mutable darray[sview]&, targets: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                target: sview = iter_alias_value_target(value)
+                if target != "" and name != "":
+                    names.push(name)
+                    targets.push(target)
+
         def iter_collect_aliases(statements: darray[Ast::Stmt], names: mutable darray[sview]&, targets: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |names, targets|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            match value:
-                                Expr.Unary(operator, operand, unary_line):
-                                    if operator == TokenKind.Ampersand:
-                                        target: sview = ident_name_of(operand)
-                                        if target != "" and name != "":
-                                            names.push(name)
-                                            targets.push(target)
-                                _:
-                                    pass
+                            iter_collect_alias_binding(name, value, names, targets)
+                        Stmt.Assign(target, operator, value, line):
+                            alias_name: sview = ident_name_of(storage_view_strip_paren_move(target))
+                            iter_collect_alias_binding(alias_name, value, names, targets) if operator == TokenKind.Assign or operator == TokenKind.LArrow
                         Stmt.If(condition, then_body, else_body, if_line):
                             iter_collect_aliases(then_body, names, targets)
                             iter_collect_aliases(else_body, names, targets)
@@ -81,28 +104,35 @@ extend Semantic:
                             iter_collect_aliases(for_body, names, targets)
                         Stmt.Block(block_kind, clause, binding, block_body, block_line):
                             iter_collect_aliases(block_body, names, targets)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |names, targets|:
+                                iter_collect_aliases(arm.body, names, targets)
                         _:
                             pass
 
-        # Resolve a name through the alias map to the container it references, or itself.
-        def iter_resolve_alias(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> sview:
-            can Abort.Panic:
-                while index < alias_names.count |index: usize = 0|:
-                    alias_targets[index] return if alias_names[index] == name and name != ""
-                    index <- index + 1
-                return name
-
         # The container ident an argument names, seeing through a leading `&` (`&xs` -> "xs") and a
         # reference-alias local (`ys` where `ys = &xs` -> "xs").
+        def iter_arg_reference_name(argument: Ast::Expr) -> sview:
+            can Abort.Panic:
+                return match argument:
+                    Expr.Unary(operator, operand, unary_line):
+                        ident_name_of(operand) if operator == TokenKind.Ampersand else ident_name_of(argument)
+                    _:
+                        ident_name_of(argument)
+
         def iter_arg_container_name(argument: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[sview]&) -> sview:
             can Memory.Allocate, Abort.Panic:
-                raw: sview =
-                    match argument:
-                        Expr.Unary(operator, operand, unary_line):
-                            ident_name_of(operand) if operator == TokenKind.Ampersand else ident_name_of(argument)
-                        _:
-                            ident_name_of(argument)
-                return iter_resolve_alias(alias_names, alias_targets, raw)
+                raw: sview = iter_arg_reference_name(argument)
+                return SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, raw)
+
+        # A cycle resolves to the empty sentinel. A mutable-reference call through that alias is
+        # conservatively treated as potentially reaching the active iterator source.
+        def iter_arg_has_unresolved_alias(argument: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[sview]&) -> bool:
+            can Abort.Panic:
+                raw: sview = iter_arg_reference_name(argument)
+                return false if raw == ""
+                resolved: sview = SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, raw)
+                return resolved == "" and SemanticIteratorAliasResolution::direct_target(alias_names, alias_targets, raw).found
 
         # Whether EXPRESSION is a call that passes `container` (as `container` or `&container`) into
         # a `mutable T&` parameter — the callee can then relocate the iterated buffer. A field-chain
@@ -125,7 +155,8 @@ extend Semantic:
                                         argument_operand if argument_operator == TokenKind.Ampersand else argument
                                     _:
                                         argument
-                            hit: bool = argument_root == container if place_is_ident else iter_place_hit(argument_place, place, container)
+                            alias_may_be_place: bool = argument_root == container or iter_arg_has_unresolved_alias(argument, alias_names, alias_targets)
+                            hit: bool = alias_may_be_place if place_is_ident else iter_place_hit(argument_place, place, container)
                             found <- true if hit and container != "" and frame_interproc_param_mutable_ref(table, callee_name, position)
                             position <- position + 1
                         return found
@@ -257,7 +288,7 @@ extend Semantic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            method: sview = iter_mutation_method(expression, place, container)
+                            method: sview = iter_mutation_method(expression, place, container, alias_names, alias_targets)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutateWhileIterating, name: container, line: line.line, expected: "", actual: method}) if method != ""
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.IterCalleeMutableRef, name: container, line: line.line, expected: "", actual: ""}) if method == "" and iter_call_passes_container_by_ref(expression, place, container, alias_names, alias_targets, table)
                             table <- iter_owner_call_walk(expression, place, container, line.line, table)
