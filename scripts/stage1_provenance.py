@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 SCHEMA = "elisa-stage1-provenance-v5"
@@ -293,6 +295,24 @@ def stage1_seed_link_recipe():
     raise RuntimeError(f"unsupported Stage1 seed host OS: {host_os}")
 
 
+def normalize_linker_probe_argv(argv):
+    # Clang's `-###` prints a randomized temporary object name for the `/dev/null`
+    # translation unit. That path is not part of the selected linker or its recipe,
+    # and would make exact Stage1 input fingerprints differ on every invocation.
+    temporary_directory = Path(tempfile.gettempdir()).resolve()
+    normalized = []
+    for argument in argv:
+        path = Path(argument)
+        if (
+            re.fullmatch(r"null-[A-Za-z0-9]+\.o", path.name)
+            and path.parent.resolve() == temporary_directory
+        ):
+            normalized.append("<clang-stage1-probe-object>")
+        else:
+            normalized.append(argument)
+    return normalized
+
+
 def effective_developer_dir(host_os):
     raw = os.environ.get("DEVELOPER_DIR", "")
     if not raw and host_os == "Darwin" and Path("/Library/Developer/CommandLineTools").is_dir():
@@ -373,6 +393,7 @@ def selected_external_linker(clang, clang_artifact, config_libdir, link_flags, p
             raise RuntimeError(f"could not identify the Stage1 external linker: {excerpt}")
         resolved_command = shutil.which(linker_command, path=path_env) or linker_command
         linker_path = Path(resolved_command).expanduser().resolve()
+    linker_argv = normalize_linker_probe_argv(linker_argv) if linker_argv else None
     if not linker_path.is_file() or not os.access(linker_path, os.X_OK):
         raise RuntimeError(f"selected Stage1 external linker is not executable: {linker_path}")
     linker_artifact = fingerprint_artifact(

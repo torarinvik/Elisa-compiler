@@ -121,12 +121,13 @@ with tempfile.TemporaryDirectory() as directory:
     clang = bindir / "clang"
     clang.write_text(
         f"#!{sys.executable}\n"
+        "import os, secrets, tempfile\n"
         "import sys\n"
         "args = sys.argv[1:]\n"
         "if '--version' in args:\n"
         "    print('clang version test')\n"
         "elif '-###' in args:\n"
-        f"    print({str(linker)!r} + ' -o /dev/null', file=sys.stderr)\n"
+        f"    print({str(linker)!r} + ' -o /dev/null ' + os.path.join(tempfile.gettempdir(), 'null-' + secrets.token_hex(4) + '.o'), file=sys.stderr)\n"
         "else:\n"
         "    raise SystemExit(2)\n"
     )
@@ -166,7 +167,12 @@ with tempfile.TemporaryDirectory() as directory:
         "ELISA_LD_STACK_512M": "-Wl,test-stack",
     }
     with patch.dict(os.environ, toolchain_env):
-        original = stage1_provenance.llvm_toolchain_fingerprint()
+        original = stage1_provenance.llvm_toolchain_fingerprint(exact=True)
+        repeated = stage1_provenance.llvm_toolchain_fingerprint(exact=True)
+        assert repeated == original
+        assert "<clang-stage1-probe-object>" in original["external_linker"]["link_command"]
+        assert str(Path(original["external_linker"]["link_command"][0]).resolve()) == str(linker.resolve())
+        assert "-o" in original["external_linker"]["link_command"]
         assert [item["path"] for item in original["link_libraries"]] == [str(custom_library.resolve())]
         with patch.object(stage1_provenance, "sha256_file", side_effect=AssertionError("unchanged artifact was rehashed")):
             unchanged = stage1_provenance.llvm_toolchain_fingerprint(original)
