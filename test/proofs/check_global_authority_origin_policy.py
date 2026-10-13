@@ -149,18 +149,16 @@ if policy_include not in semantic_text or authority_include not in semantic_text
 
 pattern_metadata = compact(function_section(authority_text, "ga_pattern_binding_metadata"))
 metadata_steps = (
-    "is_reference: bool = ga_type_id_is_reference(binding_type_id, table)",
-    "is_reference <- ga_expression_is_reference(subject, state, 0) if binding_type_id == 0 and whole_value",
-    "contains_reference: bool = ga_type_id_contains_reference(binding_type_id, table) or is_reference",
-    "source_origin: mutable usize = GLOBAL_AUTHORITY_NONE",
-    "source_origin <- ga_reference_origin(subject, state, 0) if contains_reference",
+    "is_reference: bool = ga_type_id_is_reference(binding_type_id, table) or (binding_type_id == 0 and whole_value and ga_expression_is_reference(subject, state, 0))",
+    "contains_reference: bool = ga_type_id_contains_reference(binding_type_id, table) or is_reference or (type_expression is binding_type_expression and ga_type_expression_contains_reference(binding_type_expression, state, 0))",
+    "source_origin: usize = ga_reference_origin(subject, state, 0) if contains_reference else GLOBAL_AUTHORITY_NONE",
     "global_origin: usize = SemanticGlobalAuthorityOrigin::pattern_binding_origin(contains_reference, source_origin)",
     "return (type_expression, global_origin)",
 )
 metadata_positions = [pattern_metadata.find(compact(fragment)) for fragment in metadata_steps]
 if any(position < 0 for position in metadata_positions) or metadata_positions != sorted(metadata_positions):
     raise SystemExit("match-pattern binding no longer forwards its type and source origin through the proved policy")
-if "contains_reference<-trueifga_type_expression_contains_reference(binding_type_expression,state,0)" not in pattern_metadata:
+if "type_expressionisbinding_type_expressionandga_type_expression_contains_reference(binding_type_expression,state,0)" not in pattern_metadata:
     raise SystemExit("match binders must classify nested references in named aggregate types")
 if "return(type_expression,GLOBAL_AUTHORITY_NONE)" in pattern_metadata or \
         "return(type_expression,GLOBAL_AUTHORITY_UNKNOWN_ALIAS)" in pattern_metadata:
