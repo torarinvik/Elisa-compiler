@@ -161,6 +161,7 @@ ownership policy of a target's WIT records and lists.
 
 A source-defined `arena_alloc` replaces the bundled implementation for that unit. It must obey
 the same allocator law: simultaneously live returned extents do not overlap, and storage is
-reused only after the old allocation lifetime has ended. The LLVM backend relies on this contract
-when it marks `arena_alloc`'s return `noalias`; an implementation that returns the same storage
-for two live allocations is not a valid replacement.
+reused only after the old allocation lifetime has ended. An implementation that returns the same
+storage for two live allocations is not a valid replacement. The LLVM backend currently does not
+mark `arena_alloc`'s return `noalias`: the allocator law alone does not establish the stronger
+malloc-like guarantee that the result is disjoint from every other object accessible to the caller.
