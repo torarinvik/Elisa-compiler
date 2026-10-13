@@ -75,7 +75,7 @@ survives = compact(function(prereserve_source, "prereserve_unaliased_fact_surviv
 for required in (
     "argument_names.count!=1",
     "argument_names[0]!=\"\"",
-    "not(arguments[0]isExpr.IntLit(_, _))",
+    "not(arguments[0]isExpr.IntLit(_,_))",
     "lookup_type(local_scope,receiver).kind==TypeKind.DArray",
     "receiver==nameandmethod==\"reserve\"",
 ):
@@ -96,6 +96,8 @@ if "notprereserve_unaliased_fact_survives(statement,local_name,local_scope)" not
     raise SystemExit("other statements must clear provenance before nested lowering")
 
 emit_statements = compact(function(statements, "emit_statements_value"))
+if "prepare_prereserve_unaliased_facts(statement,local_scope)" not in emit_statements:
+    raise SystemExit("statement lowering must prepare the direct-loop fact before emitting nested control flow")
 if "update_prereserve_unaliased_facts(statement,EmitStatus.Declined,local_scope.names.count,local_scope)" not in emit_statements:
     raise SystemExit("skipped statements must invalidate backing provenance")
 if "update_prereserve_unaliased_facts(statement,status,statement_local_count,local_scope)" not in emit_statements:
@@ -107,7 +109,7 @@ if min(prepare_position, helper_position) < 0 or prepare_position > helper_posit
 statement_count_capture = emit_statements.find("statement_local_count:usize=local_scope.names.count")
 statement_emission = emit_statements.find("status<-emit_statement(statement", statement_count_capture)
 fact_update = emit_statements.find("update_prereserve_unaliased_facts(statement,status,statement_local_count,local_scope)", statement_emission)
-if min(statement_count_capture, statement_emission, fact_update) < 0 or not (statement_count_capture < statement_emission < fact_update):
+if min(statement_count_capture, prepare_position, statement_emission, fact_update) < 0 or not (statement_count_capture < prepare_position < statement_emission < fact_update):
     raise SystemExit("backing facts must update after each emitted statement using its pre-emission local count")
 
 calls_source = (BACKEND / "codegen_stmt_expr_calls.elisa").read_text()
@@ -139,16 +141,11 @@ if min(loop_reserve, loop_clear, loop_body) < 0 or not (loop_reserve < loop_clea
     raise SystemExit("nested loop lowering must not inherit the outer loop's pre-reserve proof")
 
 fixture_steps = (
-    "xs: mutable darray[i64] = []",
-    "xs.reserve(8)",
-    "xs.push(10)",
-    "xs.push(11)",
-    "xs.push(12)",
-    "xs.push(13)",
+    "xs: mutable darray[i64] = [10, 11, 12, 13]",
     "alias: mutable darray[i64] = xs",
     "alias.push(99)",
     "alias.count <- 4",
-    "xs <- for i in 0..<8 |xs| -> xs:",
+    "xs <- for i in 0..<300 |xs| -> xs:",
     "xs.push(100 + i)",
     "return 1 if alias[4] != 100",
 )
@@ -159,9 +156,16 @@ for expected in fixture_steps:
         raise SystemExit(f"copied-header regression witness lost or reordered step: {expected}")
     fixture_cursor = fixture_position + len(expected)
 
-for expected in ("push(10)", "push(11)", "push(12)", "push(13)"):
-    if expected not in fixture:
-        raise SystemExit(f"the alias witness must fill the reserved buffer before copying: {expected}")
+# Bind the fixture's capacity assumption to the literal emitter. Empty literals
+# are null headers; every non-empty literal reserves the fixed 256-element seed.
+aggregates = (BACKEND / "codegen_expr_aggregates.elisa").read_text()
+array_literal = compact(function(aggregates, "emit_expression_aggregate_literals"))
+if "ifarray_elements.count==0:returnLLVMConstNull(darray_llvm_type(structs,ctx))" not in array_literal:
+    raise SystemExit("empty DArray literals must remain zero-capacity in the alias witness model")
+if "literal_initial_capacity:LLVMValueRef=LLVMConstInt(LLVMInt64TypeInContext(ctx),256,0)" not in array_literal:
+    raise SystemExit("non-empty DArray literals must retain their observable initial capacity of 256")
+if "emit_darray_reserve(temporary,expected,literal_initial_capacity" not in array_literal:
+    raise SystemExit("non-empty DArray literals must reserve their 256-element initial capacity")
 
 benchmark = (ROOT / "test/bench/codegen_perf/darray_count_sum.elisa").read_text()
 benchmark_tokens = (
@@ -177,17 +181,21 @@ for token in benchmark_tokens:
         raise SystemExit(f"runtime fill benchmark no longer keeps the unique-header setup sequence: {token}")
     benchmark_cursor = benchmark_position + len(token)
 
-# Concrete shallow-copy control: with N=4, C=8, and K=12, ordinary pushes first
-# write into shared spare slots, while eager reserve detaches before the first write.
-n, capacity, required = 4, 8, 12
+# Abstract shallow-copy control: with N=4, C=256, and K=304, ordinary pushes
+# first write into shared spare slots, while eager reserve detaches before the
+# first write. The source checks bind C to the literal emitter; this model does
+# not execute Elisa or prove arena allocation behavior.
+n, capacity, required = 4, 256, 304
 assert n < capacity < required
-ordinary_alias = [10, 11, 12, 13, 99, 0, 0, 0, 0, 0, 0, 0]
+ordinary_alias = [10, 11, 12, 13, 99] + [0] * (capacity - 5)
 ordinary_receiver = ordinary_alias
-eager_alias = [10, 11, 12, 13, 99, 0, 0, 0, 0, 0, 0, 0]
-eager_receiver = eager_alias.copy()  # eager reserve detaches before the first push
+eager_alias = [10, 11, 12, 13, 99] + [0] * (capacity - 5)
+eager_receiver = eager_alias.copy() + [0] * (required - capacity)  # eager reserve detaches before the first push
 for index in range(n, required):
+    if index >= len(ordinary_receiver):
+        ordinary_receiver = ordinary_receiver.copy() + [0] * len(ordinary_receiver)
     ordinary_receiver[index] = 100 + index - n
     eager_receiver[index] = 100 + index - n
 assert ordinary_alias[4] == 100 and eager_alias[4] == 99
 
-print("counted-fill alias gate: source-bound provenance, invalidation, and reserve guard verified")
+print("counted-fill alias checker: provenance source shape and abstract shallow-copy control verified")
