@@ -93,6 +93,10 @@ extend Semantic:
             heads: mutable dict[u64, u32] = {}
             tails: mutable dict[u64, u32] = {}
             next: mutable darray[u32] = []
+            # Exact triple membership lets convergence checks avoid rescanning every
+            # field in a (function, position) chain for each candidate field.
+            triple_heads: mutable dict[u64, u32] = {}
+            triple_next: mutable darray[u32] = []
             # Exact (callee, position-tag) lookup results are immutable for this round.
             lookup_heads: mutable dict[u64, u32] = {}
             lookup_next: mutable darray[u32] = []
@@ -111,6 +115,11 @@ extend Semantic:
             can Abort.Panic:
                 return (name_hash(function) * SEMANTIC_HASH_PRIME) ^ name_hash(tag)
 
+        def pgs_triple_key(function: sview, tag: sview, field: sview) -> u64:
+            can Abort.Panic:
+                pair_hash: u64 = pgs_key(function, tag)
+                return (pair_hash * SEMANTIC_HASH_PRIME) ^ name_hash(field)
+
         def pgs_head(prior: PgsPrior&, key: u64) -> u32:
             can Abort.Panic:
                 return head if prior.heads.get(key) is head else SYMBOL_INDEX_ROW_NONE
@@ -118,6 +127,10 @@ extend Semantic:
         def pgs_tail(prior: PgsPrior&, key: u64) -> u32:
             can Abort.Panic:
                 return tail_row if prior.tails.get(key) is tail_row else SYMBOL_INDEX_ROW_NONE
+
+        def pgs_triple_head(prior: PgsPrior&, key: u64) -> u32:
+            can Abort.Panic:
+                return triple if prior.triple_heads.get(key) is triple else SYMBOL_INDEX_ROW_NONE
 
         def pgs_lookup_head(prior: PgsPrior&, key: u64) -> u32:
             can Abort.Panic:
@@ -139,15 +152,19 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 # Both row-copy sizes are known before filling; avoid repeated geometric
                 # growth while rebuilding the index on each fixpoint round.
-                prior.rows.reserve(rows.count)
+                # `sview` is a byte-copyable descriptor, so use the bulk append path
+                # instead of one generated push per summary cell.
+                prior.rows <- prior.rows.extend(rows)
                 prior.next.reserve(rows.count / pgs_row())
-                for row_text in rows |prior|:
-                    prior.rows <- prior.rows.push(row_text)
+                prior.triple_next.reserve(rows.count / pgs_row())
                 row: mutable usize = 0
                 while row + 2 < rows.count |row, prior, rows|:
                     key: u64 = pgs_key(rows[row], rows[row + 1])
                     triple: u32 = (row / pgs_row()).u32()
                     prior.next <- prior.next.push(SYMBOL_INDEX_ROW_NONE)
+                    triple_key: u64 = pgs_triple_key(rows[row], rows[row + 1], rows[row + 2])
+                    prior.triple_next <- prior.triple_next.push(pgs_triple_head(prior, triple_key))
+                    prior.triple_heads <- prior.triple_heads.put(triple_key, triple) can Global{Read,Write}
                     tail_row: u32 = pgs_tail(prior, key)
                     if tail_row != SYMBOL_INDEX_ROW_NONE:
                         prior.next[tail_row.usize()] <- triple
@@ -517,32 +534,34 @@ extend Semantic:
                         _:
                             pass
 
-        # Whether every triple in A[FIRST..<STOP] is in B (rows only grow between rounds).
+        # Whether every triple in A[FIRST..<STOP] is in B. Summary rows only grow
+        # semantically; their flat traversal order is an encoding detail.
         def pgs_segment_rows_covered(a: darray[sview]&, first: usize, stop: usize, b: PgsPrior&) -> bool:
             can Abort.Panic:
                 false return if first > stop or stop > a.count or first % pgs_row() != 0 or stop % pgs_row() != 0
                 row: mutable usize = first
                 while row + 2 < stop |row, stop, a, b|:
                     found: mutable bool = false
-                    triple: mutable u32 = pgs_head(b, pgs_key(a[row], a[row + 1]))
+                    key: u64 = pgs_triple_key(a[row], a[row + 1], a[row + 2])
+                    triple: mutable u32 = pgs_triple_head(b, key)
                     while triple != SYMBOL_INDEX_ROW_NONE and not found:
                         other: usize = triple.usize() * pgs_row()
                         found <- true if a[row] == b.rows[other] and a[row + 1] == b.rows[other + 1] and a[row + 2] == b.rows[other + 2]
-                        triple <- b.next[triple.usize()]
+                        triple <- b.triple_next[triple.usize()]
                     false return if not found
                     row <- row + pgs_row()
                 return true
 
     public:
-        # The least fixpoint, computed incrementally. A function's rows depend only on its
+        # The least set fixpoint, computed incrementally. A function's rows depend only on its
         # own body, the table, and the PRIOR rows of the callees it looks up (recorded in
         # `looked_up`; the same names every round, since which calls consult the summary is
         # fixed by the AST and the table). So a round re-summarises only the functions that
         # looked up a name whose rows changed in the round before, and reuses the others'
-        # rows. Rows are still assembled in declaration order, so every round's row list --
-        # and the published result -- is exactly what re-summarising everything gave; the
-        # full re-walk per round made this the costliest part of
-        # check_region_storage_stability.
+        # rows. Rows are assembled in declaration order and field rows are consumed as sets; a
+        # full re-walk per round gives the same summary relation, though flat order is not
+        # semantically significant. Rewalking every function each round was the costliest part
+        # of check_region_storage_stability.
         def param_growth_rows(file: Ast::File&, table: SymbolTable&) -> darray[sview]:
             can Memory.Allocate, Abort.Panic:
                 rows: mutable darray[sview] = []
@@ -622,32 +641,36 @@ extend Semantic:
                                 for compare_index in 0..<cached_count |same_rows, next, rows, start, cached_start|:
                                     same_rows <- false if same_rows and next[start + compare_index] != rows[cached_start + compare_index]
                                 if not same_rows:
-                                    # Reused segments are copied from ROWS and are therefore
-                                    # already covered by PRIOR. Only changed segments can add
-                                    # summary triples; check those before building another index.
-                                    has_new_rows <- true if not pgs_segment_rows_covered(next, start, next.count, prior)
-                                    function_hash: u64 = name_hash(function_name)
-                                    if next_changed.get(function_hash) is already_changed:
-                                        pass
+                                    # Reused segments are copied from ROWS and are already
+                                    # covered by PRIOR. Only changed segments can add triples.
+                                    if not pgs_segment_rows_covered(next, start, next.count, prior):
+                                        has_new_rows <- true
+                                        function_hash: u64 = name_hash(function_name)
+                                        if next_changed.get(function_hash) is already_changed:
+                                            pass
+                                        else:
+                                            next_changed <- next_changed.put(function_hash, true) can Global{Read,Write}
+                                            next_changed_hashes.push(function_hash)
                                     else:
-                                        next_changed <- next_changed.put(function_hash, true) can Global{Read,Write}
-                                        next_changed_hashes.push(function_hash)
+                                        # The relation did not grow, even if this walk
+                                        # produced a different ordering. Reuse the cached
+                                        # encoding so another function's growth in this wave
+                                        # cannot publish a permutation of this segment.
+                                        next <- next.truncate(start)
+                                        for cached_index in 0..<cached_count |next, rows, cached_start|:
+                                            next.push(rows[cached_start + cached_index])
                         else:
                             for reuse_index in cached_start..<(cached_start + cached_count) |next, rows|:
                                 next.push(rows[reuse_index])
                         cache_starts[function_index] <- start
                         cache_counts[function_index] <- next.count - start
-                    # If no function's exact cached segment changed, every segment in
-                    # `next` is either copied from the prior `rows` or was just compared
-                    # equal to that segment. The complete row sequence is unchanged; avoid
-                    # rebuilding its index and checking only the recomputed segments for rows
-                    # that were absent from PRIOR.
-                    same: mutable bool = not has_new_rows
+                    # A round with no new triples reached the same monotone summary set.
+                    # Keep `rows` to preserve its stable declaration and traversal order.
+                    return rows if not has_new_rows
                     rows <- next
                     changed_hashes <- next_changed_hashes
-                    return rows if same
-                    # Another wave is needed only when new rows were found. Build this index
-                    # once for those rows and carry it into the next round.
+                    # Rebuild once for newly discovered triples and carry the index into the
+                    # next dependency wave.
                     next_prior <- pgs_index(rows, next_prior) can Global{Read,Write}
                     prior <- next_prior
                 empty: darray[sview] = []
