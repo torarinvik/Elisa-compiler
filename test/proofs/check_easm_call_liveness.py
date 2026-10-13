@@ -1,4 +1,5 @@
 """Admit the finite EASM call-liveness proof against a strict Elisa-proof product."""
+import argparse
 import hashlib
 import json
 import os
@@ -20,6 +21,11 @@ MASKS = ROOT / "src/backend/easm_register_masks.elisa"
 MODEL = ROOT / "src/backend/easm_model.elisa"
 PROVENANCE = ROOT / "src/backend/easm_verify_provenance.elisa"
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true",
+                    help="check production and proof-fixture bindings without running Elisa-Proof")
+ARGS = parser.parse_args()
+
 REGISTER_NAMES = (
     "RAX", "RCX", "RDX", "RBX", "RSI", "RDI", "RBP", "RSP",
     "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15",
@@ -30,6 +36,7 @@ EXPECTED_DECLARATIONS = {
     "model_call_invalidates_register_index",
     "call_transfer_clears_live_flags",
     "every_register_slot_has_its_exact_call_effect_class",
+    "out_of_range_register_indices_have_no_call_effect",
     "rax_is_disjoint_from_the_invalidated_class",
     "rsp_is_disjoint_from_the_invalidated_class",
     "rbx_is_disjoint_from_the_invalidated_class",
@@ -38,12 +45,25 @@ EXPECTED_DECLARATIONS = {
     "r13_is_disjoint_from_the_invalidated_class",
     "r14_is_disjoint_from_the_invalidated_class",
     "r15_is_disjoint_from_the_invalidated_class",
+    "xchg_writes_both_register_operands",
+    "xchg_flow_transfer_adds_both_operands_to_live_set",
+    "xchg_rsp_invalidates_stack_alignment",
+    "xchg_rsp_destination_invalidates_stack_alignment",
+    "pushq_updates_known_stack_state",
+    "popq_register_destination_updates_known_stack_state",
 }
 FALSE_CLAIMS = {
     "call_invalidates_rax_slot",
     "call_preserves_rcx_slot",
     "call_invalidates_callee_saved_slot",
+    "out_of_range_register_index_is_invalidated",
     "call_preserves_live_flags",
+    "xchg_can_omit_its_source_register_write",
+    "xchg_flow_transfer_can_drop_both_new_live_registers",
+    "xchg_rsp_can_preserve_stack_knownness",
+    "xchg_rsp_destination_can_preserve_stack_knownness",
+    "pushq_can_leave_stack_delta_unchanged",
+    "popq_register_destination_can_invalidate_stack_alignment",
 }
 
 if not __debug__:
@@ -157,37 +177,38 @@ for theorem, expression in (
     ("call_invalidates_rax_slot", "REG_RAX == 1 or REG_RAX == 2 or REG_RAX == 4 or REG_RAX == 5 or REG_RAX == 8 or REG_RAX == 9 or REG_RAX == 10 or REG_RAX == 11"),
     ("call_preserves_rcx_slot", "REG_RCX == 0 or REG_RCX == 3 or REG_RCX == 6 or REG_RCX == 7 or REG_RCX == 12 or REG_RCX == 13 or REG_RCX == 14 or REG_RCX == 15"),
     ("call_invalidates_callee_saved_slot", "REG_RBX == 1 or REG_RBX == 2 or REG_RBX == 4 or REG_RBX == 5 or REG_RBX == 8 or REG_RBX == 9 or REG_RBX == 10 or REG_RBX == 11"),
+    ("out_of_range_register_index_is_invalidated", "model_call_invalidates_register_index(REG_R15 + 1)"),
 ):
     if return_expression(negative_text, theorem) != compact(expression):
         raise SystemExit(f"false-claim control changed: {theorem}")
 
+out_of_range_negative = proof_body(negative_text, "out_of_range_register_index_is_invalidated")
+expected_out_of_range_negative = """
+requires REG_R15 + 1 == 16
+ensure result == true
+return model_call_invalidates_register_index(REG_R15 + 1)
+"""
+if compact(out_of_range_negative) != compact(expected_out_of_range_negative):
+    raise SystemExit("out-of-range false control no longer targets the first index beyond R15")
+
+out_of_range_positive = proof_body(positive_text, "out_of_range_register_indices_have_no_call_effect")
+expected_out_of_range_positive = """
+requires register_index < 0 or register_index >= 16
+ensure result == true
+return not model_call_preserves_register_index(register_index) and
+    not model_call_invalidates_register_index(register_index)
+"""
+if compact(out_of_range_positive) != compact(expected_out_of_range_positive):
+    raise SystemExit("out-of-range call-liveness theorem no longer proves both classifications are false")
+
 model_source = MODEL.read_text()
 register_bit = source_body(model_source, "def easm_register_bit(register: sview) -> i64:")
-register_aliases = {
-    "RAX": ("rax", "eax", "ax", "al"),
-    "RCX": ("rcx", "ecx", "cx", "cl"),
-    "RDX": ("rdx", "edx", "dx", "dl"),
-    "RBX": ("rbx", "ebx", "bx", "bl"),
-    "RSI": ("rsi", "esi", "si", "sil"),
-    "RDI": ("rdi", "edi", "di", "dil"),
-    "RBP": ("rbp", "ebp", "bp", "bpl"),
-    "RSP": ("rsp", "esp", "sp", "spl"),
-    "R8": ("r8", "r8d", "r8w", "r8b"),
-    "R9": ("r9", "r9d", "r9w", "r9b"),
-    "R10": ("r10", "r10d", "r10w", "r10b"),
-    "R11": ("r11", "r11d", "r11w", "r11b"),
-    "R12": ("r12", "r12d", "r12w", "r12b"),
-    "R13": ("r13", "r13d", "r13w", "r13b"),
-    "R14": ("r14", "r14d", "r14w", "r14b"),
-    "R15": ("r15", "r15d", "r15w", "r15b"),
-}
-expected_register_bit = "\n".join(
-    "if " + " or ".join(f'easm_equal(register, "{alias}")' for alias in aliases) +
-    f":\n                return EasmRegisterMasks::{register}"
-    for register, aliases in register_aliases.items()
-) + "\nreturn 0"
+expected_register_bit = """
+ensure result == EasmRegisterMasks::register_bit(register)
+return EasmRegisterMasks::register_bit(register)
+"""
 if compact(register_bit) != compact(expected_register_bit):
-    raise SystemExit("register names no longer map exactly to the canonical mask bits")
+    raise SystemExit("EASM register-bit lookup no longer delegates exactly to the canonical alias map")
 
 written_mask = source_body(model_source, "def easm_written_mask(instruction: Instruction) -> i64:")
 expected_written_mask = (
@@ -196,10 +217,246 @@ expected_written_mask = (
     'easm_starts(instruction.op, "call") or easm_starts(instruction.op, "jmp") or '
     'easm_starts(instruction.op, "ret"):\n'
     '                return 0\n'
-    '            return easm_register_bit(easm_register_operand(easm_substitute_operand(easm_last_operand(instruction.text), instruction)))\n'
+    '            destination: sview = easm_substitute_operand(easm_last_operand(instruction.text), instruction)\n'
+    '            destination_mask: i64 = easm_register_bit(easm_register_operand(destination))\n'
+    '            if easm_starts(instruction.op, "xchg"):\n'
+    '                source: sview = easm_substitute_operand(easm_first_operand(instruction.text), instruction)\n'
+    '                return destination_mask | easm_register_bit(easm_register_operand(source))\n'
+    '            return destination_mask\n'
 )
 if compact(written_mask) != compact(expected_written_mask):
     raise SystemExit("call instructions no longer bypass the ordinary written-register transfer")
+
+xchg_instruction = """
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "xchgq",
+    text: "%rax, %rcx",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+written: i64 = Easm::easm_written_mask(instruction)
+"""
+expected_xchg_positive = """
+ensure result == true
+""" + xchg_instruction + """
+return (
+    written == (EasmRegisterMasks::RAX | EasmRegisterMasks::RCX) and
+    (written & EasmRegisterMasks::RAX) == EasmRegisterMasks::RAX and
+    (written & EasmRegisterMasks::RCX) == EasmRegisterMasks::RCX
+)
+"""
+if compact(proof_body(positive_text, "xchg_writes_both_register_operands")) != compact(expected_xchg_positive):
+    raise SystemExit("xchg proof must check the production write mask against both concrete operands")
+expected_xchg_negative = """
+ensure result == true
+""" + xchg_instruction + """
+return (written & EasmRegisterMasks::RAX) == 0
+"""
+if compact(proof_body(negative_text, "xchg_can_omit_its_source_register_write")) != compact(expected_xchg_negative):
+    raise SystemExit("xchg false control must challenge omission of the source operand write")
+expected_xchg_flow_positive = """
+ensure result == true
+""" + xchg_instruction.split("written: i64 =", 1)[0] + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return (
+    out.live == (incoming.live | (EasmRegisterMasks::RAX | EasmRegisterMasks::RCX)) and
+    out.flags_live == incoming.flags_live and
+    out.stack_delta == incoming.stack_delta and
+    out.stack_mod16 == incoming.stack_mod16 and
+    out.stack_known == incoming.stack_known and
+    out.valid == incoming.valid
+)
+"""
+if compact(proof_body(positive_text, "xchg_flow_transfer_adds_both_operands_to_live_set")) != compact(expected_xchg_flow_positive):
+    raise SystemExit("xchg flow theorem must preserve the complete state while adding both writes")
+expected_xchg_flow_negative = """
+ensure result == true
+""" + xchg_instruction.split("written: i64 =", 1)[0] + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return out.live == incoming.live
+"""
+if compact(proof_body(negative_text, "xchg_flow_transfer_can_drop_both_new_live_registers")) != compact(expected_xchg_flow_negative):
+    raise SystemExit("xchg flow false control must reject dropping the written registers")
+
+xchg_rsp_instruction = """
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "xchgq",
+    text: "%rsp, %rax",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+"""
+expected_xchg_rsp_positive = """
+ensure result == true
+""" + xchg_rsp_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return (
+    out.live == (incoming.live | (EasmRegisterMasks::RSP | EasmRegisterMasks::RAX)) and
+    out.stack_known == false and
+    out.stack_mod16 == 0 and
+    out.stack_delta == incoming.stack_delta and
+    out.flags_live == incoming.flags_live and
+    out.valid == incoming.valid
+)
+"""
+if compact(proof_body(positive_text, "xchg_rsp_invalidates_stack_alignment")) != compact(expected_xchg_rsp_positive):
+    raise SystemExit("xchg-rsp theorem must prove both writes and fail-closed stack-state invalidation")
+expected_xchg_rsp_negative = """
+requires incoming.stack_known == true
+ensure result == true
+""" + xchg_rsp_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return out.stack_known
+"""
+if compact(proof_body(negative_text, "xchg_rsp_can_preserve_stack_knownness")) != compact(expected_xchg_rsp_negative):
+    raise SystemExit("xchg-rsp false control must challenge preservation of known stack state")
+
+xchg_rsp_destination_instruction = xchg_rsp_instruction.replace(
+    'text: "%rsp, %rax"', 'text: "%rax, %rsp"'
+)
+expected_xchg_rsp_destination_positive = """
+ensure result == true
+""" + xchg_rsp_destination_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return (
+    out.live == (incoming.live | (EasmRegisterMasks::RSP | EasmRegisterMasks::RAX)) and
+    out.stack_known == false and
+    out.stack_mod16 == 0 and
+    out.stack_delta == incoming.stack_delta and
+    out.flags_live == incoming.flags_live and
+    out.valid == incoming.valid
+)
+"""
+if compact(proof_body(positive_text, "xchg_rsp_destination_invalidates_stack_alignment")) != compact(expected_xchg_rsp_destination_positive):
+    raise SystemExit("destination-RSP xchg theorem must prove both writes and stack-state invalidation")
+expected_xchg_rsp_destination_negative = """
+requires incoming.stack_known == true
+ensure result == true
+""" + xchg_rsp_destination_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return out.stack_known
+"""
+if compact(proof_body(negative_text, "xchg_rsp_destination_can_preserve_stack_knownness")) != compact(expected_xchg_rsp_destination_negative):
+    raise SystemExit("destination-RSP xchg false control must challenge preservation of known stack state")
+
+push_instruction = """
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "pushq",
+    text: "$0",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+"""
+expected_push_positive = """
+requires incoming.stack_known == true
+requires incoming.stack_delta >= -9223372036854775800
+requires incoming.stack_mod16 >= 0 and incoming.stack_mod16 < 16
+ensure result == true
+""" + push_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return (
+    out.live == incoming.live and
+    out.stack_delta == incoming.stack_delta - 8 and
+    out.stack_mod16 == (incoming.stack_mod16 - 8) % 16 and
+    out.stack_known == true and
+    out.flags_live == incoming.flags_live and
+    out.valid == incoming.valid
+)
+"""
+if compact(proof_body(positive_text, "pushq_updates_known_stack_state")) != compact(expected_push_positive):
+    raise SystemExit("push theorem must bind exact depth, alignment, and preserved-flow effects")
+expected_push_negative = """
+requires incoming.stack_known == true
+requires incoming.stack_delta >= -9223372036854775800
+requires incoming.stack_mod16 >= 0 and incoming.stack_mod16 < 16
+ensure result == true
+""" + push_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return out.stack_delta == incoming.stack_delta
+"""
+if compact(proof_body(negative_text, "pushq_can_leave_stack_delta_unchanged")) != compact(expected_push_negative):
+    raise SystemExit("push false control must challenge its word-sized stack-depth decrement")
+
+pop_instruction = """
+instruction: Easm::Instruction = Easm::Instruction{
+    op: "popq",
+    text: "%rax",
+    line: 1,
+    pseudo: false,
+    substitution_count: 0,
+    substitution0: Easm::Substitution{from: "", replacement: ""},
+    substitution1: Easm::Substitution{from: "", replacement: ""},
+    substitution2: Easm::Substitution{from: "", replacement: ""},
+    substitution3: Easm::Substitution{from: "", replacement: ""}
+}
+"""
+expected_pop_positive = """
+requires incoming.stack_known == true
+requires incoming.stack_delta <= 9223372036854775799
+requires incoming.stack_mod16 >= 0 and incoming.stack_mod16 < 16
+ensure result == true
+""" + pop_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return (
+    out.live == (incoming.live | EasmRegisterMasks::RAX) and
+    out.stack_delta == incoming.stack_delta + 8 and
+    out.stack_mod16 == (incoming.stack_mod16 + 8) % 16 and
+    out.stack_known == true and
+    out.flags_live == incoming.flags_live and
+    out.valid == incoming.valid
+)
+"""
+if compact(proof_body(positive_text, "popq_register_destination_updates_known_stack_state")) != compact(expected_pop_positive):
+    raise SystemExit("register-pop theorem must prove destination liveness and preserved stack alignment")
+expected_pop_negative = """
+requires incoming.stack_known == true
+requires incoming.stack_delta <= 9223372036854775799
+requires incoming.stack_mod16 >= 0 and incoming.stack_mod16 < 16
+ensure result == true
+""" + pop_instruction + """
+out: Easm::FlowState = Easm::easm_flow_transfer(instruction, incoming)
+return not out.stack_known
+"""
+if compact(proof_body(negative_text, "popq_register_destination_can_invalidate_stack_alignment")) != compact(expected_pop_negative):
+    raise SystemExit("register-pop false control must challenge preservation of known stack alignment")
+
+stack_pointer_write = source_body(
+    model_source,
+    "def easm_stack_pointer_write_register(instruction: Instruction) -> sview:",
+)
+expected_stack_pointer_write = """
+destination: sview = easm_substitute_operand(easm_last_operand(instruction.text), instruction)
+destination_register: sview = easm_register_operand(destination)
+if easm_register_bit(destination_register) == EasmRegisterMasks::RSP:
+    return destination_register
+if easm_starts(instruction.op, "xchg"):
+    source: sview = easm_substitute_operand(easm_first_operand(instruction.text), instruction)
+    source_register: sview = easm_register_operand(source)
+    return source_register if easm_register_bit(source_register) == EasmRegisterMasks::RSP
+return ""
+"""
+if compact(stack_pointer_write) != compact(expected_stack_pointer_write):
+    raise SystemExit("stack-pointer write resolver must detect RSP in either xchg operand")
+if compact(source_body(model_source, "def easm_writes_stack_pointer(instruction: Instruction) -> bool:")) != compact(
+    "return easm_stack_pointer_write_register(instruction) != \"\""
+):
+    raise SystemExit("stack-pointer write predicate must delegate to its operand resolver")
+
 flow_transfer = source_body(model_source, "def easm_flow_transfer(instruction: Instruction, incoming: FlowState) -> FlowState:")
 ordinary_write = "if written != 0:\n                out.live <- out.live | written"
 call_branch = (
@@ -209,6 +466,33 @@ call_branch = (
 )
 if "out: mutable FlowState = incoming" not in flow_transfer or "written: i64 = easm_written_mask(instruction)" not in flow_transfer:
     raise SystemExit("flow transfer no longer begins from incoming state and its written-register mask")
+stack_invalidation = """
+if easm_writes_stack_pointer(instruction) and not stack_write_handled:
+    out.stack_known <- false
+    out.stack_mod16 <- 0
+"""
+push_stack_update = """
+if easm_starts(instruction.op, "push"):
+    out.stack_delta <- out.stack_delta - 8
+    out.stack_mod16 <- (out.stack_mod16 - 8) % 16 if out.stack_known
+"""
+pop_register_update = """
+if easm_starts(instruction.op, "pop"):
+    pop_destination: sview = easm_register_operand(easm_substitute_operand(easm_last_operand(instruction.text), instruction))
+    stack_write_handled <- true
+    if easm_register_bit(pop_destination) == EasmRegisterMasks::RSP:
+        out.stack_known <- false
+        out.stack_mod16 <- 0
+    else:
+        out.stack_delta <- out.stack_delta + 8
+        out.stack_mod16 <- (out.stack_mod16 + 8) % 16 if out.stack_known
+"""
+if compact(stack_invalidation) not in compact(flow_transfer) or flow_transfer.count("stack_write_handled <- true") != 2:
+    raise SystemExit("unhandled stack-pointer writes must invalidate alignment without xchg exceptions")
+if compact(push_stack_update) not in compact(flow_transfer):
+    raise SystemExit("push transfer must decrement stack depth and rotate known alignment by one word")
+if compact(pop_register_update) not in compact(flow_transfer):
+    raise SystemExit("pop transfer must distinguish RSP from ordinary register destinations")
 if compact(ordinary_write) not in compact(flow_transfer) or compact(call_branch) not in compact(flow_transfer):
     raise SystemExit("call liveness kill moved outside its source-guarded call branch")
 if flow_transfer.count("out.live <-") != 2:
@@ -236,6 +520,16 @@ if compact("def call_transfer_clears_live_flags(was_live: bool) -> bool: ensure 
     raise SystemExit("call-flags proof no longer models the transfer's unconditional flag clear")
 if compact("def call_preserves_live_flags(was_live: bool) -> bool: requires was_live == true ensure result == was_live return false") not in compact(negative_text):
     raise SystemExit("call-flags false claim no longer challenges the unconditional flag clear")
+
+source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_theorems": len(EXPECTED_DECLARATIONS),
+        "false_claim_controls": len(FALSE_CLAIMS),
+        "source_closure_files": len(source_closure),
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)
@@ -306,7 +600,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "finite call liveness partition for return, stack, callee-saved, and caller-clobbered registers, plus unconditional live-flag reset",
+    "scope": "finite call liveness partition for return, stack, callee-saved, and caller-clobbered registers, out-of-range rejection, and unconditional live-flag reset",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(FALSE_CLAIMS),
     "proof_binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(),
