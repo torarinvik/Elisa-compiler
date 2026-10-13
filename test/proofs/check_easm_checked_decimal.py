@@ -1,4 +1,5 @@
 """Admit overflow-safe EASM decimal parsing against a strict proof product."""
+import argparse
 import hashlib
 import json
 import os
@@ -9,10 +10,14 @@ import subprocess
 from proof_product_gate import require_current_product
 
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check production and proof bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = ROOT.parent / "elisa-proof"
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "easm_checked_decimal.elisa"
 NEGATIVE = HERE / "easm_checked_decimal_rejected.elisa"
@@ -94,7 +99,7 @@ required_parse_contracts = (
 )
 required_parse_steps = (
     "return(false,0)iftext.length<0",
-    "iftext.length>0andtext[0]==ASCII_MINUS:",
+    "iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
     "return(false,0)ifposition==text.length",
     "whileposition<text.length|position,text,value|",
     "decreasestext.length-position",
@@ -240,7 +245,7 @@ if "parsed:(valid:bool,value:i64)=easm_parse_i64_checked(text)" not in unchecked
 
 layout_parser_text = LAYOUT_PARSER.read_text()
 layout_parse_body = layout_parser_text.split(
-    "def parse_layout_module(source: u8&", 1
+    "def parse_layout_module(source: darray[u8]&", 1
 )[1].split("def parse_module(", 1)[0]
 required_layout_fragments = (
     "easm_parse_i64_checked(easm_trim(attributes[5:sview_len(attributes)]))",
@@ -265,13 +270,16 @@ required_memory_fragments = (
     "return easm_parse_i64_checked(prefix)",
     '"invalid-memory-displacement"',
     "easm_memory_displacement_checked(operand)",
-    "def easm_immediate_after_dollar_checked(text: sview)",
-    "operand: sview = easm_first_operand(text)",
+    "def easm_immediate_operand_after_dollar_checked(operand: sview)",
+    'dollar: usize = easm_find(operand, "$")',
+    "parsed: (valid: bool, value: i64) = easm_parse_i64_checked(easm_trim(operand[dollar + 1.usize():sview_len(operand)]))",
     "parsed.value < -2147483648 or parsed.value > 2147483647",
+    "def easm_immediate_after_dollar_checked(text: sview)",
+    "return easm_immediate_operand_after_dollar_checked(easm_first_operand(text))",
 )
 if not all(fragment in memory_text for fragment in required_memory_fragments):
     raise SystemExit("EASM memory and immediate decimal consumers no longer fail closed")
-if '"invalid-stack-adjustment"' not in parser_text or "easm_immediate_after_dollar_checked(inst.text)" not in parser_text:
+if '"invalid-stack-adjustment"' not in parser_text or "easm_immediate_operand_after_dollar_checked(source_operand)" not in parser_text:
     raise SystemExit("stack adjustment verification no longer reports malformed immediates")
 
 required_integration_fragments = (
@@ -316,7 +324,9 @@ positive_names = {
     "negative_i64_min_is_reached_without_overflow",
     "signed_parser_accepts_only_well_formed_decimal_bytes",
     "signed_parser_returns_zero_on_every_rejection",
+    "signed_parser_matches_independent_recursive_reference",
     "nonpositive_decimal_size_fact_does_not_strengthen_an_existing_bound",
+    "rejected_decimal_does_not_strengthen_an_existing_bound",
     "signed_parser_preserves_the_sign_of_every_valid_result",
     "signed_parser_rejects_empty_or_incomplete_signs",
     "signed_parser_computes_both_i64_extremes",
@@ -326,11 +336,15 @@ parser_false_names = (
     "positive_i64_overflow_is_accepted",
     "negative_i64_underflow_is_accepted",
     "signed_parser_accepts_a_nondigit",
+    "signed_parser_always_disagrees_with_independent_recursive_reference",
     "signed_parser_accepts_positive_overflow",
     "signed_parser_accepts_negative_underflow",
     "signed_parser_returns_positive_for_negative_input",
     "signed_parser_returns_negative_for_positive_input",
+    "rejected_decimal_can_strengthen_a_nonnegative_size_bound",
 )
+if declaration_names(POSITIVE) != positive_names or declaration_names(NEGATIVE) != set(parser_false_names):
+    raise SystemExit("checked-decimal parser proof declaration inventory changed")
 negative_text = NEGATIVE.read_text()
 negative_proof_shapes = {
     "positive_i64_overflow_is_accepted": (
@@ -344,6 +358,11 @@ negative_proof_shapes = {
     "signed_parser_accepts_a_nondigit": (
         'EasmCheckedDecimal::parse_signed("7x")',
         "returnparsed.valid",
+    ),
+    "signed_parser_always_disagrees_with_independent_recursive_reference": (
+        "EasmCheckedDecimal::parse_signed(text)",
+        "EasmCheckedDecimal::decimal_parse_reference(text)",
+        "returnparsed.valid!=reference.validorparsed.value!=reference.value",
     ),
     "signed_parser_accepts_positive_overflow": (
         'EasmCheckedDecimal::parse_signed("9223372036854775808")',
@@ -361,6 +380,10 @@ negative_proof_shapes = {
         'EasmCheckedDecimal::parse_signed("1")',
         "returnparsed.validandparsed.value<0",
     ),
+    "rejected_decimal_can_strengthen_a_nonnegative_size_bound": (
+        "EasmCheckedDecimal::parse_signed(text)",
+        "returnnotparsed.validandEasmMemStateDomain::greatest_bound(current,parsed.value)>current",
+    ),
 }
 for name, fragments in negative_proof_shapes.items():
     body = compact(function_section(negative_text, name))
@@ -370,6 +393,15 @@ for name in positive_names:
     if f"def {name}(" not in POSITIVE.read_text():
         raise SystemExit(f"positive theorem missing: {name}")
 positive_text = POSITIVE.read_text()
+parse_equivalence_shape = (
+    "ensure result == true "
+    "parsed: (valid: bool, value: i64) = EasmCheckedDecimal::parse_signed(text) "
+    "reference: (valid: bool, value: i64) = EasmCheckedDecimal::decimal_parse_reference(text) "
+    "return parsed.valid == reference.valid and parsed.value == reference.value"
+)
+if compact(parse_equivalence_shape) not in compact(function_section(
+        positive_text, "signed_parser_matches_independent_recursive_reference")):
+    raise SystemExit("decimal refinement theorem no longer compares parser and independent reference results")
 sign_proof = compact(function_section(
     positive_text, "signed_parser_preserves_the_sign_of_every_valid_result"
 ))
@@ -396,6 +428,13 @@ if "requirescurrent>=0" not in invalid_bound_proof or \
         "EasmCheckedDecimal::parse_signed(text)" not in invalid_bound_proof or \
         "parsed.value>0orEasmMemStateDomain::greatest_bound(current,parsed.value)==current" not in invalid_bound_proof:
     raise SystemExit("nonpositive decimal size-fact theorem no longer connects parser output to the production bound join")
+rejected_bound_proof = compact(function_section(
+    positive_text, "rejected_decimal_does_not_strengthen_an_existing_bound"
+))
+if "requirescurrent>=0" not in rejected_bound_proof or \
+        "parsed:(valid:bool,value:i64)=EasmCheckedDecimal::parse_signed(text)" not in rejected_bound_proof or \
+        "ifnotparsed.valid:returnEasmMemStateDomain::greatest_bound(current,parsed.value)==current" not in rejected_bound_proof:
+    raise SystemExit("rejected-decimal theorem no longer proves that the zero sentinel leaves a nonnegative bound unchanged")
 for sign in ("positive", "negative"):
     name = f"{sign}_ascii_digit_byte_step_preserves_the_i64_range"
     body = positive_text.split(f"def {name}(", 1)[1].split("\ndef ", 1)[0]
@@ -403,6 +442,16 @@ for sign in ("positive", "negative"):
         raise SystemExit(f"{name} no longer proves the production ASCII-byte-to-digit mapping")
     if f"EasmCheckedDecimal::append_{sign}_digit(value, digit)" not in body:
         raise SystemExit(f"{name} no longer applies the production checked-digit helper")
+
+if ARGS.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "parser_positive_declarations": len(positive_names),
+        "parser_false_controls": len(parser_false_names),
+        "arithmetic_positive_declarations": len(arithmetic_names),
+        "arithmetic_false_controls": len(arithmetic_false_names),
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     product_manifest = require_current_product(BIN, PROVER)
@@ -487,7 +536,7 @@ assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest(
 assert require_current_product(BIN, PROVER) == product_manifest, "proof-product provenance changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "signed decimal parser refines an independent recursive byte-fold specification, preserves input sign, rejects empty/sign-only/plus-prefixed inputs, accepts only signed ASCII decimal input, zeroes rejection, preserves memory-size bounds for nonpositive facts, and covers both i64 boundaries",
+    "scope": "signed decimal parser refines an independent recursive byte-fold specification, preserves input sign, rejects empty/sign-only/plus-prefixed inputs, accepts only signed ASCII decimal input, zeroes rejection without strengthening nonnegative memory-size bounds, and covers both i64 boundaries",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": [finding["name"] for finding in negative["findings"]],
     "arithmetic_obligations": arithmetic_positive["summary"]["proven"],
