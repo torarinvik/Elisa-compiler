@@ -110,14 +110,14 @@ def require_branch_kind_contract() -> None:
 def require_parser_emission() -> None:
     declaration = compact(function_section(PARSER_DECL.read_text(), "capture_static_if_condition"))
     expected = (
-        "branch_kind:StaticIfBranch::Kind=matchis_chain_head:true:StaticIfBranch::Kind::ChainHead"
-        "false:StaticIfBranch::Kind::ChainContinuation"
+        "branch_kind:StaticIfBranch::Kind=matchis_chain_head:true:StaticIfBranch::Kind.ChainHead"
+        "false:StaticIfBranch::Kind.ChainContinuation"
         "parser.static_if_kinds<-parser.static_if_kinds.push(branch_kind)"
     )
     if expected not in declaration:
         raise SystemExit("parser must pattern-match static-if and static-elif row tags")
     fallback = compact(function_section(PARSER_DECL.read_text(), "record_static_else"))
-    if "StaticIfBranch::Kind::Fallback" not in fallback or "push(2)" in fallback:
+    if "StaticIfBranch::Kind.Fallback" not in fallback or "push(2)" in fallback:
         raise SystemExit("parser fallback rows must use the shared named branch kind")
     if "StaticIfBranch::TOP_LEVEL_DEPTH" not in compact(PARSER_CORE.read_text()):
         raise SystemExit("parser static-if nesting must start at the named top-level depth")
@@ -133,7 +133,7 @@ def require_static_if_row_alignment() -> None:
     columns = ("static_if_conds", "static_if_lines", "static_if_kinds", "static_if_depths")
     append_values = {
         "capture_static_if_condition": ("condition_expr", "branch_line", "branch_kind", "parser.static_if_depth"),
-        "record_static_else": ("(Ast::Expr.Absent)", "branch_line", "StaticIfBranch::Kind::Fallback", "parser.static_if_depth"),
+        "record_static_else": ("(Ast::Expr.Absent)", "branch_line", "StaticIfBranch::Kind.Fallback", "parser.static_if_depth"),
     }
     for function_name, values in append_values.items():
         section = compact(function_section(PARSER_DECL.read_text(), function_name))
@@ -165,17 +165,17 @@ def require_policy_source() -> None:
     declarations = (
         "constenumActionofu8:SkipSelectFallbackEvaluateCondition",
         "defrow_action(kind:StaticIfBranch::Kind,previously_satisfied:bool)->Action:",
-        "ensurekind==StaticIfBranch::Kind::ChainHeadimpliesresult==Action.EvaluateCondition",
-        "ensurekind==StaticIfBranch::Kind::ChainContinuationandnotpreviously_satisfiedimpliesresult==Action.EvaluateCondition",
-        "ensurekind==StaticIfBranch::Kind::Fallbackandnotpreviously_satisfiedimpliesresult==Action.SelectFallback",
-        "ensurepreviously_satisfiedandkind!=StaticIfBranch::Kind::ChainHeadimpliesresult==Action.Skip",
-        "starts_new_chain:bool=matchkind:StaticIfBranch::Kind::ChainHead:true_:false",
+        "ensurekind==StaticIfBranch::Kind.ChainHeadimpliesresult==Action.EvaluateCondition",
+        "ensurekind==StaticIfBranch::Kind.ChainContinuationandnotpreviously_satisfiedimpliesresult==Action.EvaluateCondition",
+        "ensurekind==StaticIfBranch::Kind.Fallbackandnotpreviously_satisfiedimpliesresult==Action.SelectFallback",
+        "ensurepreviously_satisfiedandkind!=StaticIfBranch::Kind.ChainHeadimpliesresult==Action.Skip",
+        "starts_new_chain:bool=matchkind:StaticIfBranch::Kind.ChainHead:true_:false",
         "chain_satisfied:bool=falseifstarts_new_chainelsepreviously_satisfied",
         "returnAction.Skipifchain_satisfied",
         "returnmatchkind:",
-        "StaticIfBranch::Kind::ChainHead:Action.EvaluateCondition",
-        "StaticIfBranch::Kind::ChainContinuation:Action.EvaluateCondition",
-        "StaticIfBranch::Kind::Fallback:Action.SelectFallback",
+        "StaticIfBranch::Kind.ChainHead:Action.EvaluateCondition",
+        "StaticIfBranch::Kind.ChainContinuation:Action.EvaluateCondition",
+        "StaticIfBranch::Kind.Fallback:Action.SelectFallback",
         "_:Action.Skip",
         "defcondition_selects_branch(condition_ok:bool,condition_value:i64)->bool:",
         "returncondition_okandcondition_value!=StaticIfBranch::CONDITION_FALSE_VALUE",
@@ -196,7 +196,7 @@ def require_selector_layout() -> None:
         "row_depth:usize=file.static_if_depths[row].usize()ifrow<file.static_if_depths.countelseStaticIfBranch::TOP_LEVEL_DEPTH.usize()",
         "whilesatisfied_by_depth.count<=row_depth|satisfied_by_depth|:",
         "satisfied_by_depth.push(false)",
-        "starts_new_chain:bool=matchbranch_kind:StaticIfBranch::Kind::ChainHead:true_:false",
+        "starts_new_chain:bool=matchbranch_kind:StaticIfBranch::Kind.ChainHead:true_:false",
         "satisfied_by_depth[row_depth]<-falseifstarts_new_chain",
         "action:StaticIfPolicy::Action=StaticIfPolicy::row_action(branch_kind,satisfied_by_depth[row_depth])",
         "matchaction:",
