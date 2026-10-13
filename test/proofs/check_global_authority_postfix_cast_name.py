@@ -1,4 +1,5 @@
 """Admit proofs for the source-linked global-authority postfix cast-name classifier."""
+import argparse
 import hashlib
 import json
 import os
@@ -9,10 +10,18 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--source-only",
+    action="store_true",
+    help="validate source and proof-shape invariants without requiring a current proof product",
+)
+ARGS = parser.parse_args()
+
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 POSITIVE = HERE / "global_authority_postfix_cast_name.elisa"
 NEGATIVE = HERE / "global_authority_postfix_cast_name_rejected.elisa"
 HELPER = ROOT / "src/semantic/global_authority_postfix_cast_name.elisa"
@@ -76,13 +85,43 @@ def match_arms(block: str, fallback: str, description: str) -> None:
 
 def contract_match(text: str, description: str) -> str:
     match = re.search(
-        r"ensure\s+result\s*==\s*\(\s*when\s+name:\s*\n(.*?)^\s*\)",
+        r"ensure[ \t]+(?:result[ \t]*==[ \t]*\([ \t\r\n]*)?when[ \t]+name:[ \t]*\n"
+        r"(.*?)(?=^[ \t]*(?:can\b|\)[ \t]*$))",
         text,
         re.DOTALL | re.MULTILINE,
     )
     if not match:
         raise SystemExit(f"{description} must state the closed set with pattern matching")
-    return match.group(1)
+    arms = [line.strip() for line in match.group(1).splitlines() if line.strip()]
+    if len(arms) != 2 or "->" not in arms[0] or "->" not in arms[1]:
+        raise SystemExit(f"{description} must have exactly two pattern-match arms")
+    literal_pattern, literal_result = (part.strip() for part in arms[0].split("->", 1))
+    fallback_pattern, fallback_result = (part.strip() for part in arms[1].split("->", 1))
+    if fallback_pattern != "_" or literal_result not in ("result == true", "result == (true)"):
+        raise SystemExit(f"{description} must return true for the builtin cast-name arm")
+    fallback = re.fullmatch(r"result\s*==\s*\((.*)\)", fallback_result)
+    if fallback is None:
+        raise SystemExit(f"{description} must express its fallback as a result equality")
+    return f"{literal_pattern} -> true\n_ -> {fallback.group(1)}"
+
+
+_fixture_arms = '"void" -> true\n_ -> false\n'
+for _label, _fixture in (
+    (
+        "expression contract",
+        'ensure when name:\n    "void" -> result == (true)\n    _ -> result == (false)\n'
+        "can Abort.Panic:\n    return false\n",
+    ),
+    (
+        "parenthesized contract",
+        'ensure result == (\n    when name:\n        "void" -> result == (true)\n'
+        "        _ -> result == (false)\n    )\ncan Abort.Panic:\n    return false\n",
+    ),
+):
+    _fixture_match = contract_match(_fixture, _label)
+    _fixture_lines = [line.strip() for line in _fixture_match.splitlines() if line.strip()]
+    if _fixture_lines != [line.strip() for line in _fixture_arms.splitlines() if line.strip()]:
+        raise SystemExit(f"contract parser did not preserve {_label} arms")
 
 
 source_contract = contract_match(function_body(source, "is_postfix_cast_name"), "production cast-name contract")
@@ -112,6 +151,26 @@ for path, expected in ((POSITIVE, EXPECTED_POSITIVE), (NEGATIVE, EXPECTED_NEGATI
     declarations = set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", path.read_text()))
     if declarations != expected:
         raise SystemExit(f"{path.name} proof declaration inventory changed")
+
+if ARGS.source_only:
+    source_inputs = {
+        Path(__file__).resolve(),
+        *source_include_closure([POSITIVE, NEGATIVE]),
+        HELPER.resolve(),
+        CONSUMER.resolve(),
+    }
+    print(json.dumps({
+        "admitted": True,
+        "mode": "source-only",
+        "scope": "closed builtin postfix cast names plus the ASCII-uppercase type-name rule",
+        "positive_declarations": sorted(EXPECTED_POSITIVE),
+        "false_claims_rejected": sorted(EXPECTED_NEGATIVE),
+        "source_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(source_inputs)
+        },
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)
