@@ -78,6 +78,41 @@ class SemanticParallelAuditTest(unittest.TestCase):
             "can Global{Read,Write}",
         )
 
+    def test_dispatcher_accepts_single_update_inside_effect_scope(self):
+        source = (
+            "def par_pass_call(pass_id: u32):\n"
+            "    if pass_id == 0:\n"
+            "        table <- check_plain(file, table)\n"
+            "    elif pass_id == 1:\n"
+            "        can Global{Read,Write}:\n"
+            "            table <- check_global(file, table)\n"
+        )
+
+        records, errors = audit.parse_parallel_dispatch(source)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            records,
+            [
+                {"id": 0, "name": "check_plain", "args": "file, table", "condition": None},
+                {"id": 1, "name": "check_global", "args": "file, table", "condition": None},
+            ],
+        )
+
+    def test_dispatcher_rejects_multiple_effect_scope_statements(self):
+        source = (
+            "def par_pass_call(pass_id: u32):\n"
+            "    if pass_id == 0:\n"
+            "        can Global{Read,Write}:\n"
+            "            before()\n"
+            "            table <- check_global(file, table)\n"
+        )
+
+        records, errors = audit.parse_parallel_dispatch(source)
+
+        self.assertEqual(records, [])
+        self.assertTrue(any("exactly one body statement" in error for error in errors))
+
     def test_method_receiver_stops_at_nested_index_boundary(self):
         self.assertEqual(
             list(audit.call_sites("table.symbols[cur.usize()]")),

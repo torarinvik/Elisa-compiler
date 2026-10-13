@@ -414,11 +414,24 @@ def parse_parallel_dispatch(source):
             code = strip_comments(lines[index]).strip()
             if code:
                 body.append((index, len(lines[index]) - len(lines[index].lstrip()), code))
-        if len(body) != 1 or body[0][1] <= arm_indent:
+        statement = None
+        body_index = line_index
+        if len(body) == 1 and body[0][1] > arm_indent:
+            body_index, _indent, statement = body[0]
+        elif (
+            len(body) == 2
+            and body[0][1] > arm_indent
+            and re.fullmatch(r"can\b.*:", body[0][2])
+            and body[1][1] > body[0][1]
+        ):
+            # Some dispatcher calls need an explicit local effect scope. Treat its
+            # single nested table update as the arm's statement, while rejecting
+            # scopes that contain multiple operations.
+            body_index, _indent, statement = body[1]
+        else:
             errors.append("semantic_parallel_passes.elisa:%d: pass_id %d must have exactly one body statement" %
                           (line_index + 1, pass_id))
             continue
-        body_index, _indent, statement = body[0]
         parsed = parse_table_call_statement(statement)
         if parsed is None:
             errors.append("semantic_parallel_passes.elisa:%d: unrecognized dispatcher call for pass_id %d" %
