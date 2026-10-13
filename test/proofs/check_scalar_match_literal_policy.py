@@ -61,12 +61,12 @@ negative_text = NEGATIVE.read_text()
 
 expected_classifier = '''
 def starts_like_numeric_literal(text: sview) -> bool can[Abort.Panic]:
-    ensure result == (text.length > 0 and (
+    ensure result == (text.len > 0 and (
         (text[0] >= ASCII_DIGIT_ZERO and text[0] <= ASCII_DIGIT_NINE)
         or text[0] == ASCII_MINUS
     ))
     can Abort.Panic:
-        return false if text.length == 0
+        return false if text.len == 0
         first: u8 = text[0]
         return (first >= ASCII_DIGIT_ZERO and first <= ASCII_DIGIT_NINE) or first == ASCII_MINUS
 '''
@@ -165,7 +165,7 @@ def first_byte_classifier_matches_its_exact_specification(text: sview) -> bool c
     ensure result == true
     can Abort.Panic:
         return SemanticScalarMatchLiteralPolicy::starts_like_numeric_literal(text) == (
-            text.length > 0 and (
+            text.len > 0 and (
                 (text[0] >= SemanticScalarMatchLiteralPolicy::ASCII_DIGIT_ZERO
                     and text[0] <= SemanticScalarMatchLiteralPolicy::ASCII_DIGIT_NINE)
                 or text[0] == SemanticScalarMatchLiteralPolicy::ASCII_MINUS
@@ -178,7 +178,7 @@ def family_classifier_matches_its_exact_specification(text: sview, scalar_family
     can Abort.Panic:
         return SemanticScalarMatchLiteralPolicy::valid_for_family(text, scalar_family) == (
             scalar_family == "string" or (
-                text.length > 0 and (
+                text.len > 0 and (
                     (text[0] >= SemanticScalarMatchLiteralPolicy::ASCII_DIGIT_ZERO
                         and text[0] <= SemanticScalarMatchLiteralPolicy::ASCII_DIGIT_NINE)
                     or text[0] == SemanticScalarMatchLiteralPolicy::ASCII_MINUS
