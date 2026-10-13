@@ -66,7 +66,8 @@ struct ConcurrencyWorkStart1:
 @intrusive
 struct ConcurrencyTaskGroupNode:
 	next: mutable heap ConcurrencyTaskGroupNode&?
-	state_bits: mutable void&
+	handle: mutable uintptr
+	state_bits: mutable void&?
 
 @intrusive
 struct ConcurrencyRawTaskNode:
@@ -869,28 +870,41 @@ def task_group_new_raw() -> TaskGroup:
 	return move out
 
 @internal
-def task_group_add_raw(group: mutable TaskGroup&, task: Task[void&?, Pending]):
+def task_group_add_raw(group: mutable TaskGroup&, task: Task[void&?, Pending], state_bits: void&?):
 	can Memory.Allocate, Abort.Panic:
 		handle: uintptr = task.handle
 		_ = move task
-		raw: heap void& = ctx_concurrency_alloc(size_of(ConcurrencyRawTaskNode))
-		node: mutable heap ConcurrencyRawTaskNode& = raw.cast[heap ConcurrencyRawTaskNode&]
+		raw: heap void& = ctx_concurrency_alloc(size_of(ConcurrencyTaskGroupNode))
+		node: mutable heap ConcurrencyTaskGroupNode& = raw.cast[heap ConcurrencyTaskGroupNode&]
 		node.handle <- handle
-		node.next <- null if group.handle == null else group.handle.cast[heap ConcurrencyRawTaskNode&]
+		node.next <- null if group.handle == null else group.handle.cast[heap ConcurrencyTaskGroupNode&]
+		# Keep task result state in the same intrusive record as its wait handle. The group
+		# owns it until every task has joined; its lifetime remains the caller's contract.
+		trusted Unsafe.StaleRef:
+			node.state_bits <- state_bits
 		group.handle <- node.cast[void&]
 
 @internal
 def task_group_wait_all_raw(group: mutable TaskGroup&):
 	can Pool.WaitAll, Memory.Release, Abort.Panic:
-		current: mutable heap ConcurrencyRawTaskNode&? = group.handle.cast[heap ConcurrencyRawTaskNode&?]
-		group.handle <- null
+		current: mutable heap ConcurrencyTaskGroupNode&? = group.handle.cast[heap ConcurrencyTaskGroupNode&?]
+		tail: mutable heap ConcurrencyTaskGroupNode&? = null
 		trusted Unsafe.AssumeProgress:
 			while current != null:
-				next: mutable heap ConcurrencyRawTaskNode&? = current.next
-				can Sync{Lock,Wait,Unlock}:
-					ctx_pool_wait_record(current.handle)
-				free(current.cast[heap void&])
+				next: mutable heap ConcurrencyTaskGroupNode&? = current.next
+				if current.handle != 0:
+					can Sync{Lock,Wait,Unlock}:
+						ctx_pool_wait_record(current.handle)
+					current.handle <- 0
+				tail <- current
 				current <- next
+		# Release result states only after every wait has completed. Chaining prior batches here
+		# preserves the two-phase lifetime when a caller waits, adds more work, then waits again.
+		if group.handle != null:
+			if tail is last:
+				last.next <- group.cleanup.cast[heap ConcurrencyTaskGroupNode&] if group.cleanup != null
+			group.cleanup <- group.handle
+		group.handle <- null
 
 def ctx_concurrency_ref_release(slot: mutable AtomicSlot[i64]&) -> i64:
 	trusted Unsafe.AssumeProgress:
@@ -963,19 +977,6 @@ def task_group_new() -> TaskGroup:
 	group: TaskGroup = task_group_new_raw()
 	group.cleanup <- null
 	return move group
-
-@internal
-def ctx_task_group_push_state(group: mutable TaskGroup&, state_bits: void&?):
-	can Memory.Allocate, Abort.Panic:
-		return if state_bits == null
-		raw: heap void& = ctx_concurrency_alloc(size_of(ConcurrencyTaskGroupNode))
-		node: mutable heap ConcurrencyTaskGroupNode& = raw.cast[heap ConcurrencyTaskGroupNode&]
-		node.next <- null if group.cleanup == null else group.cleanup.cast[heap ConcurrencyTaskGroupNode&]
-		# state_bits is a caller-provided pointer recorded in a heap cleanup node;
-		# its lifetime is the caller's contract, unverifiable by the type system.
-		trusted Unsafe.StaleRef:
-			node.state_bits <- state_bits
-		group.cleanup <- node.cast[void&]
 
 @internal
 def ctx_task_group_release_all(group: mutable TaskGroup&):
@@ -1095,8 +1096,7 @@ def task_group_add[R](group: mutable TaskGroup&, task: Task[R, Pending]):
 	can Memory.Allocate, Abort.Panic:
 		state_bits: void&? = task.state
 		raw: Task[void&?, Pending] = ctx_task_to_raw(move task)
-		task_group_add_raw(group, move raw)
-		ctx_task_group_push_state(group, state_bits)
+		task_group_add_raw(group, move raw, state_bits)
 
 @internal
 def task_group_wait_all(group: mutable TaskGroup&):
