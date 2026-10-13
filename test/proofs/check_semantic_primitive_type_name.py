@@ -96,10 +96,16 @@ if compact("ensure result == (byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_N
         compact("return byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_NINE") not in digit:
     raise SystemExit("ASCII digit helper no longer matches its closed byte interval")
 
+shape = compact(function_section(policy_text, "is_bit_width_int_shape"))
+shape_spec = "sview_len(name) >= MIN_INT_NAME_LENGTH and (sview_at(name, INT_LEAD_INDEX) == ASCII_LOWER_I or sview_at(name, INT_LEAD_INDEX) == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<sview_len(name): is_ascii_digit(sview_at(name, digit_index)))"
+if compact("ensure result == (" + shape_spec + ")") not in shape or \
+        compact("return (" + shape_spec + ")") not in shape:
+    raise SystemExit("total width-name shape no longer provides a contract-safe lexical specification")
+
 bit_width = compact(function_section(policy_text, "is_bit_width_int"))
 for required in (
-    "ensure result == (sview_len(name) >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<sview_len(name): is_ascii_digit(name[digit_index])))",
-    "prefix_is_integer: bool = match lead: ASCII_LOWER_I | ASCII_LOWER_U: true _: false",
+    "ensure result == is_bit_width_int_shape(name)",
+    "prefix_is_integer: bool = lead == ASCII_LOWER_I or lead == ASCII_LOWER_U",
     "while index < length |all_digits, index, length, name|:",
     "decreases length - index",
     "invariant index >= INT_PREFIX_LENGTH",
@@ -115,14 +121,14 @@ primitive = function_section(policy_text, "is_primitive_type")
 if match_literals(primitive, "primitive type policy", "is_bit_width_int(name)") != list(fixed_names):
     raise SystemExit("primitive type match differs from the ordered closed source-level set")
 if compact("ensure result == (when name: " + " | ".join(f'"{name}"' for name in fixed_names) +
-            " -> true _ -> is_bit_width_int(name))") not in compact(primitive):
+            " -> true _ -> is_bit_width_int_shape(name))") not in compact(primitive):
     raise SystemExit("primitive type contract differs from the production fixed-name match")
 
 builtin_scalar = function_section(policy_text, "is_builtin_scalar_type_name")
 if match_literals(builtin_scalar, "builtin scalar type policy", "is_bit_width_int(name)") != list(builtin_scalar_names):
     raise SystemExit("builtin scalar match differs from the exact Stage0 shadow-warning name set")
 if compact("ensure result == (when name: " + " | ".join(f'"{name}"' for name in builtin_scalar_names) +
-            " -> true _ -> is_bit_width_int(name))") not in compact(builtin_scalar):
+            " -> true _ -> is_bit_width_int_shape(name))") not in compact(builtin_scalar):
     raise SystemExit("builtin scalar postcondition differs from its closed match policy")
 
 semantic = SEMANTIC.read_text()
