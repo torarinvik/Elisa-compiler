@@ -89,21 +89,21 @@ required_parse_contracts = (
     "ensureresult.valid==decimal_parse_reference(text).valid",
     "ensureresult.value==decimal_parse_reference(text).value",
     "ensurenotresult.validimpliesresult.value==0",
-    "ensure(result.validandtext.len>0andtext[0]==ASCII_MINUS)impliesresult.value<=0",
-    "ensure(result.validandtext.len>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0",
-    "text.len>0",
-    "text[0]!=ASCII_MINUSortext.len>1",
-    "foralldigit_indexin0..<text.len",
+    "ensure(result.validandtext.length>0andtext[0]==ASCII_MINUS)impliesresult.value<=0",
+    "ensure(result.validandtext.length>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0",
+    "text.length>0",
+    "text[0]!=ASCII_MINUSortext.length>1",
+    "foralldigit_indexin0..<text.length",
     "text[digit_index]>=ASCII_DIGIT_ZERO",
     "text[digit_index]<=ASCII_DIGIT_NINE",
 )
 required_parse_steps = (
-    "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len",
-    "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
-    "return(false,0)ifposition==text.len",
-    "whileposition<text.len|position,text,value|",
-    "decreasestext.len-position",
-    "invariantposition<=text.len",
+    "return(false,0)iftext.length<=0ortext.length.usize().i64()!=text.length",
+    "iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
+    "return(false,0)ifposition==text.length",
+    "whileposition<text.length|position,text,value|",
+    "decreasestext.length-position",
+    "invariantposition<=text.length",
     "invariantnegativeimpliesposition>=1",
     "invariantnegativeimpliesvalue<=0",
     "invariantnotnegativeimpliesvalue>=0",
@@ -124,12 +124,12 @@ reference_from = compact(function_section(helper_text, "decimal_parse_reference_
 reference_wrapper = compact(function_section(helper_text, "decimal_parse_reference"))
 required_reference_fragments = (
     "ghostdefdecimal_parse_reference_from(",
-    "requiresposition<=text.lenand(negativeimpliesvalue<=0)and(notnegativeimpliesvalue>=0)",
-    "decreasestext.len-position",
+    "requiresposition<=text.lengthand(negativeimpliesvalue<=0)and(notnegativeimpliesvalue>=0)",
+    "decreasestext.length-position",
     "ensureresult.validimplies(negativeimpliesresult.value<=0)",
     "ensureresult.validimplies(notnegativeimpliesresult.value>=0)",
-    "return(true,value)ifposition==text.lenandconsumed_digit",
-    "return(false,0)ifposition==text.len",
+    "return(true,value)ifposition==text.lengthandconsumed_digit",
+    "return(false,0)ifposition==text.length",
     "byte:u8=text[position]",
     "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE",
     "value*DECIMAL_RADIX-digit",
@@ -141,9 +141,9 @@ if not all(fragment in reference_from for fragment in required_reference_fragmen
     raise SystemExit("recursive decimal reference no longer defines an independent checked digit fold")
 if "ghostdefdecimal_parse_reference(text:sview)" not in reference_wrapper or \
         "returndecimal_parse_reference_from(text,position,negative,0,false)" not in reference_wrapper or \
-        "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len" not in reference_wrapper or \
-        "ensure(result.validandtext.len>0andtext[0]==ASCII_MINUS)impliesresult.value<=0" not in reference_wrapper or \
-        "ensure(result.validandtext.len>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0" not in reference_wrapper:
+        "return(false,0)iftext.length<=0ortext.length.usize().i64()!=text.length" not in reference_wrapper or \
+        "ensure(result.validandtext.length>0andtext[0]==ASCII_MINUS)impliesresult.value<=0" not in reference_wrapper or \
+        "ensure(result.validandtext.length>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0" not in reference_wrapper:
     raise SystemExit("decimal reference wrapper no longer specifies the optional sign and digit fold")
 
 # Reduce the production i64 constants to the exact thresholds used by the
