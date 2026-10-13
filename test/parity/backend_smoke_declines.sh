@@ -212,8 +212,8 @@ run_case list_comp_darray_filter 'def main() -> i64:\n    xs: darray[i64] = [1, 
 # `xs.extend(ys)` — numeric and sview elements use one bulk append; other elements use push.
 run_case darray_extend_count 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    ys: darray[i64] = [10, 20]\n    xs.extend(ys)\n    return xs.count.i64() * 8 + 2\n' 42
 run_case darray_extend_values 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    ys: darray[i64] = [40, 8]\n    xs.extend(ys)\n    return xs[2] + xs[3] - 6\n' 42
-run_case darray_extend_sview_values 'def main() -> i64:\n    xs: mutable darray[sview] = ["a", "b"]\n    ys: darray[sview] = ["c", "d"]\n    xs.extend(ys)\n    return sview_at(xs[2], 0.usize()).i64() + sview_at(xs[3], 0.usize()).i64() - 157\n' 42
-run_case darray_extend_sview_self 'def main() -> i64:\n    xs: mutable darray[sview] = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]\n    xs.extend(xs)\n    return xs.count.i64() + sview_at(xs[9], 0.usize()).i64() + sview_at(xs[17], 0.usize()).i64() - 178\n' 42
+run_case darray_extend_sview_values 'def main() -> i64:\n    xs: mutable darray[sview] = ["a", "b"]\n    ys: darray[sview] = ["c", "d"]\n    xs.extend(ys)\n    return xs[2][0] + xs[3][0] - 157\n' 42
+run_case darray_extend_sview_self 'def main() -> i64:\n    xs: mutable darray[sview] = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]\n    xs.extend(xs)\n    return xs.count.i64() + xs[9][0] + xs[17][0] - 178\n' 42
 run_case darray_extend_empty 'def main() -> i64:\n    xs: mutable darray[i64] = [42]\n    ys: darray[i64] = []\n    xs.extend(ys)\n    return xs[0]\n' 42
 # `for i, x in xs.enumerate()` — index+value iteration over a darray (two binders: the
 # running index i64 and the element).
