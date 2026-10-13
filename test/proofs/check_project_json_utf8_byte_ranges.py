@@ -70,31 +70,17 @@ expected_occurrences = {
 if any(encoder.count(fragment) != count for fragment, count in expected_occurrences.items()):
     raise SystemExit("each UTF-8 output-byte formula must occur once in json_push_utf8")
 
-# The list decoder has an allocation-free copy of the same encoder. Keep both code paths
-# tied to the same byte-range contracts.
+# The list decoder must share the encoder whose branch formulas are tied to these byte-range
+# contracts, rather than maintaining a second copy of the arithmetic.
 list_decoder = compact(function_section(source_text, "json_push_string_entry"))
-list_encoder_order = (
-    "ifscalar<128:",
-    "list.data<-list.data.push(scalar.u8())",
-    "elifscalar<2048:",
-    "list.data<-list.data.push((192+(scalar/64)).u8())",
-    "list.data<-list.data.push((128+(scalar%64)).u8())",
-    "elifscalar<65536:",
-    "list.data<-list.data.push((224+(scalar/4096)).u8())",
-    "list.data<-list.data.push((128+((scalar/64)%64)).u8())",
-    "list.data<-list.data.push((128+(scalar%64)).u8())",
-    "else:",
-    "list.data<-list.data.push((240+(scalar/262144)).u8())",
-    "list.data<-list.data.push((128+((scalar/4096)%64)).u8())",
-    "list.data<-list.data.push((128+((scalar/64)%64)).u8())",
-    "list.data<-list.data.push((128+(scalar%64)).u8())",
-)
-cursor = 0
-for fragment in list_encoder_order:
-    position = list_decoder.find(fragment, cursor)
-    if position < 0:
-        raise SystemExit("allocation-free JSON string decoding diverged from the proved UTF-8 byte formulas")
-    cursor = position + len(fragment)
+for fragment in (
+    "code:i64=json_unicode_escape_scalar(data,cursor,first_unit)",
+    "json_push_utf8(&list.data,code.u32())",
+):
+    if fragment not in list_decoder:
+        raise SystemExit("JSON string-list decoding no longer shares the Unicode-scalar UTF-8 encoder")
+if "list.data<-list.data.push((192+" in list_decoder or "list.data<-list.data.push((240+" in list_decoder:
+    raise SystemExit("JSON string-list decoding reintroduced duplicate UTF-8 byte formulas")
 
 scalar_decoder = compact(function_section(source_text, "json_unicode_escape_scalar"))
 for fragment in (
