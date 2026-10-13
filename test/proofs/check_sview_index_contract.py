@@ -90,34 +90,19 @@ guard_positions = [index_helper.find(compact(guard)) for guard in index_guards]
 if any(position < 0 for position in guard_positions) or guard_positions != sorted(guard_positions):
     raise SystemExit("StringView index no longer validates its domain before loading a byte")
 
-sview_at = compact(function_section(runtime_text, "sview_at"))
-required_sview_contracts = (
-    "ensure not string_view_index_request_valid(view, index.i64()) implies result == 0",
-    "ensure string_view_index_request_valid(view, index.i64()) implies result == view.data[index]",
-    "return string_view_index(view, index.i64()).u8()",
-)
-if any(compact(clause) not in sview_at for clause in required_sview_contracts):
-    raise SystemExit("sview_at no longer preserves the guarded runtime byte-read contract")
+if {"sview_len", "sview_at"} & declarations(runtime_text):
+    raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 
 # The ergonomic source syntax used by the checked-decimal parser is an alias
 # for the same StringView extent and bounded byte read specified above.
 inference_text = compact(TYPE_INFERENCE.read_text())
-if compact('"len" | "length" -> true') not in inference_text or \
+if compact('"len" -> true') not in inference_text or \
         compact('InferType{kind: SemTypeKind.Int, name: "i64"} return if object_type.kind == SemTypeKind.String and object_type.name == "sview" and is_sview_size_field') not in inference_text:
-    raise SystemExit("sview .length no longer resolves to the signed StringView extent")
-sview_len = compact(function_section(runtime_text, "sview_len"))
-required_length_contract = (
-    "ensure ((view.len <= 0 or view.len.usize().i64() != view.len) implies result == 0.usize()) "
-    "and ((view.len > 0 and view.len.usize().i64() == view.len) implies result.i64() == view.len)"
-)
-if compact(required_length_contract) not in sview_len or \
-        compact("0.usize() return if view.len <= 0") not in sview_len or \
-        compact("return 0.usize() if view_len.i64() != view.len") not in sview_len:
-    raise SystemExit("sview_len no longer normalizes invalid extents before its valid-length result")
+    raise SystemExit("sview .len no longer resolves to the signed StringView extent")
 field_lowering = compact(function_section(FIELD_LOWERING.read_text(), "emit_expression_field_read"))
-if compact('"data" | "len" | "length" -> true') not in field_lowering or \
+if compact('"data" | "len" -> true') not in field_lowering or \
         compact('return LLVMBuildExtractValue(builder, sview_value, 1, "sview.len")') not in field_lowering:
-    raise SystemExit("sview .length no longer reads the same aggregate field as .len")
+    raise SystemExit("sview .len no longer reads the signed extent from its runtime pair")
 index_lowering = compact(function_section(INDEX_LOWERING.read_text(), "emit_inline_sview_index"))
 required_inline_guards = (
     'LLVMBuildICmp(builder, LLVMIntPredicate::SGE, length, zero, "sview.idx.len.ok")',
@@ -142,9 +127,9 @@ if any(compact(fragment) not in index_dispatch for fragment in required_index_di
 decimal_source = DECIMAL_PARSER.read_text()
 decimal_parser = compact(function_section(decimal_source, "parse_signed"))
 decimal_reference = compact(function_section(decimal_source, "decimal_parse_reference"))
-decimal_minus_guard = "iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:"
+decimal_minus_guard = "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:"
 if decimal_minus_guard not in decimal_parser or decimal_minus_guard not in decimal_reference:
-    raise SystemExit("checked-decimal implementation and reference no longer use the guarded .length and [0] syntax")
+    raise SystemExit("checked-decimal implementation and reference no longer use the guarded .len and [0] syntax")
 
 find_byte = compact(function_section(runtime_text, "sview_find_byte"))
 required_find_contracts = (
@@ -172,7 +157,7 @@ positive_names = {
     "a_found_byte_is_the_first_matching_offset",
     "an_absent_byte_returns_the_missing_sentinel",
     "an_unrepresentable_view_length_returns_the_missing_sentinel",
-    "length_property_matches_the_normalized_helper_on_valid_views",
+    "len_field_matches_its_signed_value_on_valid_views",
     "positive_length_guard_makes_the_first_index_valid",
     "guarded_first_byte_syntax_matches_the_safe_helper",
 }
@@ -181,7 +166,7 @@ negative_names = {
     "valid_view_index_can_read_a_different_byte",
     "search_can_skip_an_earlier_matching_byte",
     "invalid_view_length_can_return_a_found_offset",
-    "a_negative_length_property_can_equal_the_normalized_helper",
+    "a_negative_len_field_matches_its_signed_value",
     "an_out_of_range_index_can_disagree_with_the_safe_helper",
 }
 positive_claims = {
@@ -190,7 +175,7 @@ positive_claims = {
     "a_found_byte_is_the_first_matching_offset": "found < view.len and string_view_index(view, found) == byte.i64() and (forall prior in 0..<found: string_view_index(view, prior) != byte.i64())",
     "an_absent_byte_returns_the_missing_sentinel": "sview_find_byte(view, byte) == -1",
     "an_unrepresentable_view_length_returns_the_missing_sentinel": "sview_find_byte(view, byte) == -1",
-    "length_property_matches_the_normalized_helper_on_valid_views": "view.length == view.len.i64()",
+    "len_field_matches_its_signed_value_on_valid_views": "view.len == view.len.i64()",
     "positive_length_guard_makes_the_first_index_valid": "string_view_index_request_valid(view, 0)",
     "guarded_first_byte_syntax_matches_the_safe_helper": "view[0] == view[0.usize()].i64()",
 }
@@ -199,7 +184,7 @@ negative_claims = {
     "valid_view_index_can_read_a_different_byte": "view[index] != view.data[index]",
     "search_can_skip_an_earlier_matching_byte": "sview_find_byte(view, byte) == later",
     "invalid_view_length_can_return_a_found_offset": "sview_find_byte(view, byte) >= 0",
-    "a_negative_length_property_can_equal_the_normalized_helper": "view.length == view.len.i64()",
+    "a_negative_len_field_matches_its_signed_value": "view.len == view.len.i64()",
     "an_out_of_range_index_can_disagree_with_the_safe_helper": "view[index] != view[index].i64()",
 }
 preconditions = {
@@ -213,12 +198,12 @@ preconditions = {
         "requires view.len >= 0 and view.len.usize().i64() == view.len requires forall candidate in 0..<view.len: string_view_index(view, candidate) != byte.i64()",
     "an_unrepresentable_view_length_returns_the_missing_sentinel":
         "requires view.len < 0 or view.len.usize().i64() != view.len",
-    "length_property_matches_the_normalized_helper_on_valid_views":
-        "requires view.length >= 0 and view.length.usize().i64() == view.length",
+    "len_field_matches_its_signed_value_on_valid_views":
+        "requires view.len >= 0 and view.len.usize().i64() == view.len",
     "positive_length_guard_makes_the_first_index_valid":
-        "requires view.length > 0 and view.length.usize().i64() == view.length",
+        "requires view.len > 0 and view.len.usize().i64() == view.len",
     "guarded_first_byte_syntax_matches_the_safe_helper":
-        "requires view.length > 0 and view.length.usize().i64() == view.length",
+        "requires view.len > 0 and view.len.usize().i64() == view.len",
 }
 negative_preconditions = {
     "invalid_view_index_can_read_a_nonzero_byte":
@@ -229,8 +214,8 @@ negative_preconditions = {
         "requires view.len >= 0 and view.len.usize().i64() == view.len requires earlier >= 0 and earlier < later and later < view.len requires string_view_index(view, earlier) == byte.i64() requires string_view_index(view, later) == byte.i64()",
     "invalid_view_length_can_return_a_found_offset":
         "requires view.len < 0 or view.len.usize().i64() != view.len",
-    "a_negative_length_property_can_equal_the_normalized_helper":
-        "requires view.length < 0",
+    "a_negative_len_field_matches_its_signed_value":
+        "requires view.len < 0",
     "an_out_of_range_index_can_disagree_with_the_safe_helper":
         "requires not string_view_index_request_valid(view, index.i64())",
 }
