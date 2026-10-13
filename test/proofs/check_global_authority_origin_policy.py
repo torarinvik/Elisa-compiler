@@ -96,8 +96,9 @@ def join_reference_origins(left: usize, right: usize) -> usize:
             (left if left == right else UNKNOWN_ALIAS))
     )
     return right if left == NO_ORIGIN
-    return left if right == NO_ORIGIN
-    return left if left == right
+    return left if:
+        right == NO_ORIGIN
+        left == right
     return UNKNOWN_ALIAS
 """)
 if join_body != expected_join:
@@ -106,8 +107,9 @@ opaque_body = compact(function_section(policy_text, "opaque_expression_origin"))
 expected_opaque = compact("""
 def opaque_expression_origin(type_known: bool, contains_reference: bool) -> usize:
     ensure result == (UNKNOWN_ALIAS if not type_known or contains_reference else NO_ORIGIN)
-    return UNKNOWN_ALIAS if not type_known
-    return UNKNOWN_ALIAS if contains_reference
+    return UNKNOWN_ALIAS if:
+        not type_known
+        contains_reference
     return NO_ORIGIN
 """)
 if opaque_body != expected_opaque:
@@ -204,14 +206,15 @@ for fragment in (
     if fragment not in local_address:
         raise SystemExit("direct borrows of local storage must preserve the encoded local-root identity")
 local_origin = compact(function_section(authority_text, "ga_local_origin"))
-for fragment in (
-    "identity:usize=state.local_origin_ids[local_index]",
-    "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifidentity>=GLOBAL_AUTHORITY_LOCAL_ALIAS",
-    "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifidentity>=GLOBAL_AUTHORITY_LOCAL_ALIAS-state.globals.count",
-    "returnstate.globals.count+identity",
-):
-    if fragment not in local_origin:
-        raise SystemExit("encoded local roots must stay below the reserved alias ceiling and fail closed on overflow")
+local_origin_guard = compact("""
+return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if:
+    identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS or state.globals.count >= GLOBAL_AUTHORITY_LOCAL_ALIAS
+    identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS - state.globals.count
+""")
+if "identity:usize=state.local_origin_ids[local_index]" not in local_origin or \
+        local_origin_guard not in local_origin or \
+        "returnstate.globals.count+identity" not in local_origin:
+    raise SystemExit("encoded local roots must stay below the reserved alias ceiling and fail closed on overflow")
 push_local_origin = compact(function_section(authority_text, "ga_push_local_origin_id"))
 if "state.local_origin_ids.push(GLOBAL_AUTHORITY_LOCAL_ALIAS)" not in push_local_origin or \
         "state.next_local_origin_id<GLOBAL_AUTHORITY_LOCAL_ALIAS-state.globals.count" not in push_local_origin:
@@ -268,7 +271,7 @@ if "Expr.Call(callee,arguments,labels,_):variant_slot:usize=ga_enum_variant_slot
 type_expression_classifier = compact(function_section(AUTHORITY_TYPES.read_text(), "ga_type_expression_contains_reference"))
 if "returntrueifga_reference_type(resolved,state,depth+1)" not in type_expression_classifier or \
         "owner:usize=ga_known_struct(resolved,state.module_scope,state,depth+1)" not in type_expression_classifier or \
-        "returntrueifstate.field_scopes[index]!=state.module_scope" not in type_expression_classifier or \
+        "returntrueif:state.field_scopes[index]!=state.module_scopega_type_expression_contains_reference(state.field_types[index],state,depth+1)" not in type_expression_classifier or \
         "ga_type_expression_contains_reference(state.enum_variant_payload_types[payload_index],state,depth+1)" not in type_expression_classifier:
     raise SystemExit("reference classification must recurse through named aggregate and enum payload fields")
 contains_refs = compact(function_section(authority_text, "ga_type_id_contains_reference"))
