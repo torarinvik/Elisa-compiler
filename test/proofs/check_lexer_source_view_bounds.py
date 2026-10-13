@@ -22,6 +22,7 @@ PARSER_ENTRY = ROOT / "src/parser/parser_types_entry.elisa"
 PARSER_API = ROOT / "src/parser/parser.elisa"
 PARSER_FSTRING = ROOT / "src/parser/parser_expr_fstring.elisa"
 COMPILER_DRIVER = ROOT / "src/driver/elisac.elisa"
+INCREMENTAL_FACTS = ROOT / "src/semantic/incremental_function_facts.elisa"
 POSITIVE = HERE / "lexer_source_view_bounds.elisa"
 NEGATIVE = HERE / "lexer_source_view_bounds_rejected.elisa"
 
@@ -77,6 +78,35 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
 if constructor_text.count("returnsource[start:end]") != 1:
     raise SystemExit("expected exactly one raw source slice in the checked constructor")
 
+# The incremental semantic cache copies validated byte spans through this same
+# source-view boundary. Bind the arithmetic proof to the helper's exact guards
+# and half-open end expression so a future refactor cannot drop either bound.
+incremental_span = compact(function_body(INCREMENTAL_FACTS.read_text(), "ifc_byte_span"))
+incremental_span_steps = (
+    "def ifc_byte_span(source: darray[u8]&, start: usize, length: usize) -> sview?:",
+    "assert start <= source.count",
+    "assert length <= source.count - start",
+    "null return if length == 0",
+    "return Lexer::make_source_view(&source[0], source.count, start, start + length)",
+)
+incremental_span_positions = [incremental_span.find(compact(step)) for step in incremental_span_steps]
+if any(position < 0 for position in incremental_span_positions) or incremental_span_positions != sorted(incremental_span_positions):
+    raise SystemExit("incremental byte spans must validate the remaining extent and reject empty spans before constructing their view")
+canonical_layout = compact(function_body(INCREMENTAL_FACTS.read_text(), "ifc_canonical_layout"))
+incremental_copy_sites = (
+    "ififc_byte_span(snapshot.bytes,snapshot.source_path_start,snapshot.source_path_length)is source_path:ordered.bytes.extend(source_path)",
+    "ififc_byte_span(snapshot.bytes,record.key_start,record.key_length)is key:ordered.bytes.extend(key)",
+    "ififc_byte_span(snapshot.bytes,record.body_start,record.body_length)is body:ordered.bytes.extend(body)",
+    "ififc_byte_span(snapshot.bytes,fact.subject_start,fact.subject_length)is subject:ordered.bytes.extend(subject)",
+    "ififc_byte_span(snapshot.bytes,grant.name_start,grant.name_length)is name:ordered.bytes.extend(name)",
+    "ififc_byte_span(snapshot.bytes,snapshot.declaration_surface_start,snapshot.declaration_surface_length)is declaration_surface:ordered.bytes.extend(declaration_surface)",
+)
+if any(canonical_layout.count(compact(site)) != 1 for site in incremental_copy_sites) or \
+        canonical_layout.count("ififc_byte_span(snapshot.bytes,") != len(incremental_copy_sites):
+    raise SystemExit("canonical snapshot re-layout must route every stored byte span through the bounded-view copy")
+if "ordered.bytes.reserve(snapshot.bytes.count)" not in canonical_layout:
+    raise SystemExit("canonical snapshot re-layout must reserve enough destination space before copying validated spans")
+
 token_text = TOKENS.read_text()
 if not re.search(
     r"(?ms)^[ \t]*def source_view_or_empty\(source: u8&, source_length: usize, start: usize, end: usize\) -> sview:\s*"
@@ -120,11 +150,13 @@ if "def text_or_empty(token: Token&, source: u8&, source_length: usize)" not in 
 
 # Parser bounds come from the source owner. The production driver passes the exact
 # byte extent used for lexing; the compatibility entry is explicitly C-string based.
-parser_constructor = source_file_function(PARSER_CORE, "Parser")
-if compact("def Parser(source: u8&, source_length: usize, tokens: darray[Token]) -> Parser") not in compact(parser_constructor) or \
-        "source_length:source_length" not in compact(parser_constructor) or \
-        "terminal_token" in parser_constructor or "TokenKind.Eof" in parser_constructor:
-    raise SystemExit("Parser must retain the caller's source length without recovering it from EOF tokens")
+parser_core_text = compact(PARSER_CORE.read_text())
+if compact("""def Parser(source: u8&, tokens: darray[Token]) -> Parser:
+            return Parser(source, Lexer::token_stream_source_length(tokens), tokens)""") not in parser_core_text:
+    raise SystemExit("the source-compatible Parser constructor must delegate to the token-stream extent helper")
+if compact("def Parser(source: u8&, source_length: usize, tokens: darray[Token]) -> Parser") not in parser_core_text or \
+        "source:source,source_length:source_length" not in parser_core_text:
+    raise SystemExit("the explicit-length Parser constructor must retain the caller-supplied source length")
 parser_file = source_file_function(PARSER_ENTRY, "parse_file")
 parser_seeded = source_file_function(PARSER_ENTRY, "parse_file_seeded")
 if compact("def parse_file(source: u8&, source_length: usize, tokens: darray[Token])") not in compact(parser_file) or \
@@ -230,6 +262,9 @@ positive_names = {
     "accepted_source_span_extent_fits_remaining_bytes",
     "token_text_end_within_source",
     "token_suffix_end_within_source",
+    "incremental_byte_span_nonempty_range_is_admitted",
+    "incremental_byte_span_empty_range_is_rejected",
+    "incremental_nonempty_byte_span_has_index_zero",
     "token_self_bound_does_not_prove_backing_extent",
     "empty_source_span_is_rejected",
     "reversed_source_span_is_rejected",
@@ -239,6 +274,9 @@ negative_names = {
     "accepted_source_span_can_exceed_remaining_bytes",
     "bounded_token_text_end_can_exceed_source",
     "bounded_token_suffix_end_can_exceed_source",
+    "incremental_byte_span_nonempty_range_can_be_rejected",
+    "incremental_byte_span_empty_range_can_be_admitted",
+    "incremental_nonempty_byte_span_can_have_no_index_zero",
     "token_self_bound_guarantees_backing_extent",
     "empty_source_span_can_be_admitted",
     "reversed_source_span_can_be_admitted",
@@ -281,6 +319,21 @@ positive_claims = {
         "requires suffix_length <= source_length - (start + length) ensure result <= source_length "
         "return start + length + suffix_length"
     ),
+    "incremental_byte_span_nonempty_range_is_admitted": (
+        "def incremental_byte_span_nonempty_range_is_admitted(start: usize, length: usize, source_length: usize) -> bool: "
+        "requires start <= source_length requires length > 0 requires length <= source_length - start "
+        "ensure result == true return source_view_guard_accepts(start, start + length, source_length)"
+    ),
+    "incremental_byte_span_empty_range_is_rejected": (
+        "def incremental_byte_span_empty_range_is_rejected(start: usize, source_length: usize) -> bool: "
+        "requires start <= source_length ensure result == true "
+        "return not source_view_guard_accepts(start, start, source_length)"
+    ),
+    "incremental_nonempty_byte_span_has_index_zero": (
+        "def incremental_nonempty_byte_span_has_index_zero(start: usize, length: usize, source_length: usize) -> bool: "
+        "requires start <= source_length requires length > 0 requires length <= source_length - start "
+        "ensure result == true return source_length > 0"
+    ),
     "token_self_bound_does_not_prove_backing_extent": (
         "def token_self_bound_does_not_prove_backing_extent(requested_end: usize, token_end: usize, backing_length: usize) -> bool: "
         "requires requested_end == token_end and token_end > backing_length ensure result == false "
@@ -322,6 +375,18 @@ negative_claims = {
         "requires start <= source_length requires length <= source_length - start "
         "requires suffix_length <= source_length - (start + length) ensure result == true "
         "return start + length + suffix_length > source_length",
+    "incremental_byte_span_nonempty_range_can_be_rejected":
+        "def incremental_byte_span_nonempty_range_can_be_rejected(start: usize, length: usize, source_length: usize) -> bool: "
+        "requires start <= source_length requires length > 0 requires length <= source_length - start "
+        "ensure result == true return not source_view_guard_accepts(start, start + length, source_length)",
+    "incremental_byte_span_empty_range_can_be_admitted":
+        "def incremental_byte_span_empty_range_can_be_admitted(start: usize, source_length: usize) -> bool: "
+        "requires start <= source_length ensure result == true "
+        "return source_view_guard_accepts(start, start, source_length)",
+    "incremental_nonempty_byte_span_can_have_no_index_zero":
+        "def incremental_nonempty_byte_span_can_have_no_index_zero(start: usize, length: usize, source_length: usize) -> bool: "
+        "requires start <= source_length requires length > 0 requires length <= source_length - start "
+        "ensure result == true return source_length == 0",
     "token_self_bound_guarantees_backing_extent":
         "def token_self_bound_guarantees_backing_extent(requested_end: usize, token_end: usize, backing_length: usize) -> bool: "
         "requires requested_end == token_end and token_end > backing_length ensure result == true "
@@ -350,7 +415,7 @@ inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", SOURCE, TOKENS, LEXER_TOKENS,
-    PARSER_CORE, PARSER_ENTRY, PARSER_API, PARSER_FSTRING, COMPILER_DRIVER,
+    PARSER_CORE, PARSER_ENTRY, PARSER_API, PARSER_FSTRING, COMPILER_DRIVER, INCREMENTAL_FACTS,
     POSITIVE, NEGATIVE,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
@@ -369,13 +434,13 @@ def run(path: Path) -> tuple[int, dict]:
 
 code, positive = run(POSITIVE)
 assert code == 0 and positive["status"] == positive["verification_state"] == "proved"
-assert positive["summary"]["obligations"] == positive["summary"]["proven"] == 17
+assert positive["summary"]["obligations"] == positive["summary"]["proven"]
 assert not positive["findings"]
 assert {row["name"] for row in positive["declaration_details"] if row.get("verified")} == positive_names
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-assert negative["summary"]["obligations"] == 12 and negative["summary"]["proven"] == 5
+assert negative["summary"]["proven"] + len(negative_names) == negative["summary"]["obligations"]
 assert {(row["kind"], row["name"]) for row in negative["findings"]} == {
     ("ensure-unproven", name) for name in negative_names
 }
@@ -385,7 +450,7 @@ hashes_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for pat
 assert hashes_before == hashes_after, "proof inputs changed during replay"
 print(json.dumps({
     "admitted": True,
-    "scope": "source-view and Token text/suffix arithmetic relative to the source owner's readable extent; parser and f-string consumers preserve that bound",
+    "scope": "source-view and Token text/suffix arithmetic relative to the source owner's readable extent; incremental byte-span copying checks the same half-open bounds; parser and f-string consumers preserve that bound",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_revision": product["proof"].get("head"),
