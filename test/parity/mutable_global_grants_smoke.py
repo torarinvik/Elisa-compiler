@@ -27,6 +27,8 @@ cases = [
     ("read", "global mutable count: i64 = 0\ndef read_count() -> i64:\n    return count\n", {"Global.Read"}),
     ("write", "global mutable count: i64 = 0\ndef write_count() -> void:\n    count <- 1\n", {"Global.Write"}),
     ("read-modify-write", "global mutable count: i64 = 0\ndef bump() -> void:\n    count <- count + 1\n", {"Global.Read", "Global.Write"}),
+    ("scalar self-update with only Global.Write", "global mutable count: i64 = 0\ndef bump() -> void:\n    can Global.Write:\n        count <- count + 1\n", {"Global.Read"}),
+    ("indexed self-update with only Global.Write", "global mutable cursor: usize = 0\nglobal mutable slots: i64[4] = zeroed\ndef bump() -> void:\n    can Global.Write:\n        slots[cursor] <- slots[cursor] + 1\n", {"Global.Read"}),
     ("alias read-modify-write missing read", "global mutable count: i64 = 0\ndef bump() -> void:\n    can Global.Write:\n        reference: mutable i64& = &count\n        reference <- reference + 1\n", {"Global.Read"}),
     ("alias read-modify-write missing write", "global mutable count: i64 = 0\ndef bump() -> void:\n    can Global.Read:\n        reference: mutable i64& = &count\n        reference <- reference + 1\n", {"Global.Write"}),
     ("alias read-modify-write granted", "global mutable count: i64 = 0\ndef bump() -> void:\n    can Global{Read, Write}:\n        reference: mutable i64& = &count\n        reference <- reference + 1\n", set()),

@@ -286,6 +286,7 @@ NAMES=(
     mutate_while_iterating_enclosing_owner
     auto_region_store_escape_nested
     iter_owner_callee
+    iter_mutref_expression_contexts
     storage_dependency_field_replacement
     fn_value_effect_row
     fn_value_effect_row_arg
@@ -545,6 +546,7 @@ EXPECTS=(
     "items\" while it is being iterated: reassignment of"
     'value backed by a short-lived region escapes via store into longer-lived storage'
     'by mutable reference while "p.items" is being iterated: the callee may push/clear/replace it through "p"'
+    'cannot pass "xs" by mutable reference while it is being iterated: the callee may push/clear/relocate its buffer'
     "storage dependency facts were invalidated for interior reference \"r\""
     "variable \"g\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Global]"
     "argument 1 to \"apply\" expects fn(i64) -> i64, got fn(i64) -> i64 can[Memory]"
@@ -603,6 +605,25 @@ run_case() {
     fi
 }
 
+require_diagnostic_count() {
+    local name="$1" file="$2" expect="$3" expected_count="$4"
+    total=$((total + 1))
+    local out actual
+    out="$("$RPT" < "$file" 2>&1)"
+    if ! check_parses "$file" "$out"; then
+        failed=$((failed + 1))
+        return
+    fi
+    actual="$(grep -Fc "$expect" <<< "$out" || true)"
+    if [[ "$actual" -eq "$expected_count" ]]; then
+        echo "  PASS $name (saw $actual expected invalidation diagnostics)"
+    else
+        echo "  FAIL $name: expected $expected_count invalidation diagnostics, saw $actual" >&2
+        echo "$out" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+    fi
+}
+
 num_diagnostics=${#NAMES[@]}
 echo "diagnostics smoke: $num_diagnostics diagnostics, $((num_diagnostics * 2)) fixtures"
 echo
@@ -616,6 +637,10 @@ while [[ "$index" -lt "$num_diagnostics" ]]; do
     run_case "$name" neg "$FIXTURES/$name.neg.elisa" "$expect"
     index=$((index + 1))
 done
+
+require_diagnostic_count iter_mutref_expression_contexts \
+    "$FIXTURES/iter_mutref_expression_contexts.pos.elisa" \
+    'cannot pass "xs" by mutable reference while it is being iterated: the callee may push/clear/relocate its buffer' 8
 
 echo "-- region_returned_stored_borrow --"
 run_case region_returned_stored_borrow pos "$REPO_ROOT/test/repro/region_returned_stored_borrow.pos.elisa" "cannot be returned with a region-less type"

@@ -158,3 +158,9 @@ their chunks return to a component-local free list on every generated return/err
 the independent CABI allocator remains protected from reuse. A target SDK must still bound and
 validate host-returned pointer/count pairs; the compiler does not know the element type or
 ownership policy of a target's WIT records and lists.
+
+A source-defined `arena_alloc` replaces the bundled implementation for that unit. It must obey
+the same allocator law: simultaneously live returned extents do not overlap, and storage is
+reused only after the old allocation lifetime has ended. The LLVM backend relies on this contract
+when it marks `arena_alloc`'s return `noalias`; an implementation that returns the same storage
+for two live allocations is not a valid replacement.

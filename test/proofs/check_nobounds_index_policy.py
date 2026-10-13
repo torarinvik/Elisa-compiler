@@ -101,40 +101,55 @@ for required in (
     "zero:(found:bool,value:i64)=signed_int_literal(lower)",
     "zero.value!=0",
     "Expr.Field(object,field,_)iffield==\"count\"",
-    "receiver!=\"\"andreceiver!=variables[0]and(anynameindarray_paramswherename==receiver)and(anynameinimmutable_paramswherename==receiver)",
+    "receiver!=\"\"andreceiver!=variables[0]andnotnb_name_shadowed(receiver,shadowed_names)and(anynameindarray_paramswherename==receiver)and(anynameinimmutable_paramswherename==receiver)",
 ):
     if compact(required) not in range_section:
         raise SystemExit(f"counted-range recognizer lost required guard: {required}")
 
 walk_section = compact(function_section(checker_text, "nb_walk"))
 expr_section = compact(function_section(checker_text, "nb_expr"))
-shadow_section = compact(function_section(checker_text, "nb_statements_shadow_evidence"))
+shadow_section = compact(function_section(checker_text, "nb_statements_write_evidence"))
 for required in (
-    "if nb_statements_shadow_evidence(statements, evidence_index, evidence_receiver)",
+    "if nb_statements_write_evidence(statements, evidence_index, evidence_receiver, shadowed_names)",
     "SemanticNoBoundsIndexPolicy::matching_range_evidence(is_darray_param, object_name, index_name, evidence_receiver, evidence_index)",
     "SemanticNoBoundsIndexPolicy::should_report_unproven(is_darray_param, has_evidence)",
+    "is_darray_param: bool = object_name != \"\" and (any p in darray_params where p == object_name)",
+    "has_evidence: bool = not nb_name_shadowed(object_name, shadowed_names) and SemanticNoBoundsIndexPolicy::matching_range_evidence(is_darray_param, object_name, index_name, evidence_receiver, evidence_index)",
     "evidence.index_name if evidence.index_name != \"\" else (\"\" if shadows_outer else scan_index)",
     "block_shadows: bool = binding == scan_index or binding == scan_receiver",
     "nb_expr(arm.guard, darray_params, immutable_params, \"\", \"\", fn_name",
     "nb_walk(arm.body, darray_params, immutable_params, \"\", \"\", fn_name",
     "shadows_outer: bool = loop_variable == evidence_index or loop_variable == evidence_receiver",
-    "nb_loop_range_evidence(iterable, variables, bind, darray_params, immutable_params)",
+    "nb_loop_range_evidence(iterable, variables, bind, darray_params, immutable_params, shadowed_names)",
     "Expr.Catch(guarded, arms, catch_line)",
+    "nb_loop_range_evidence(iterable, [loop_variable], \"\", darray_params, immutable_params, shadowed_names)",
     "nb_walk(recovery, darray_params, immutable_params, evidence_index, evidence_receiver, fn_name",
-    "block_index: sview = \"\" if nb_statements_shadow_evidence(statements, evidence_index, evidence_receiver) else evidence_index",
-    "return true if name == index_name or name == receiver_name",
-    "return true if target_name == index_name or target_name == receiver_name",
-    "variable == index_name or variable == receiver_name",
+    "block_index: sview = \"\" if nb_statements_write_evidence(statements, evidence_index, evidence_receiver, shadowed_names) else evidence_index",
+    "return true if (target_name == index_name or target_name == receiver_name) and not nb_name_shadowed(target_name, scoped_shadowed)",
+    "shadowed_names.push(name)",
+    "if name == scan_index or name == scan_receiver",
+    "then_shadowed: mutable darray[sview] = [name for name in shadowed_names]",
+    "for_shadowed.push(variable)",
+    "block_shadowed.push(binding) if binding != \"\"",
+    "collect_pattern_binding_names(arm.pattern, arm_bindings)",
+    "for binder in arm_bindings: arm_shadowed.push(binder)",
 ):
     if compact(required) not in walk_section + expr_section + shadow_section:
         raise SystemExit(f"NoBoundsChecks evidence flow lost a fail-closed guard: {required}")
 
+var_decl_value = walk_section.find(compact("table <- nb_expr(value, darray_params, immutable_params, scan_index, scan_receiver, fn_name, line.line, table, shadowed_names)"))
+var_decl_shadow = walk_section.find(compact("shadowed_names.push(name)"))
+if var_decl_value < 0 or var_decl_shadow < var_decl_value:
+    raise SystemExit("a local name must shadow a parameter only after its initializer is checked")
+
 for variant in (
     "Expr.StaticEffectCall(", "Expr.Slice(", "Expr.Move(", "Expr.RegionNew(",
-    "Expr.Catch(", "Expr.GetElse(", "Expr.Lambda(", "Expr.Block(",
+    "Expr.Catch(", "Expr.GetElse(", "Expr.Refinement(", "Expr.Lambda(", "Expr.Block(",
 ):
     if variant not in expr_section:
         raise SystemExit(f"NoBoundsChecks expression traversal omits {variant}")
+if expr_section.count("Expr.GetElse(") != 1 or "Expr.Refinement(base,condition,refinement_line)|Expr.GetElse(" in expr_section:
+    raise SystemExit("NoBoundsChecks must traverse GetElse recovery statements with their AST statement type")
 
 if 'include "../../src/semantic/nobounds_index_policy.elisa"' not in positive_text or \
         'include "../../src/semantic/nobounds_index_policy.elisa"' not in negative_text:
