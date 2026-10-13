@@ -60,23 +60,27 @@ positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
 expected_model = '''
-ghost def method_unproven_from(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview, index: usize) -> bool:
-    requires index <= method_names.count
-    decreases method_names.count - index
-    return false if index == method_names.count
-    refined: bool = index < method_refined.count and method_refined[index]
-    return true if method_names[index] == method and not refined
-    return method_unproven_from(method_names, method_refined, method, index + 1)
+ghost def method_unproven_from(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview, remaining: usize) -> bool:
+    decreases remaining
+    return false if remaining == 0 or remaining > method_names.count
+    return (
+        method_names[method_names.count - remaining] == method
+        and not (method_names.count - remaining < method_refined.count and method_refined[method_names.count - remaining])
+    ) or method_unproven_from(method_names, method_refined, method, remaining - 1)
 '''
 expected_scan = '''
 def method_unproven(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview) -> bool:
-    ensure result == method_unproven_from(method_names, method_refined, method, 0)
-    for index in 0..<method_names.count |index|:
-        invariant index <= method_names.count
-        invariant method_unproven_from(method_names, method_refined, method, index) == method_unproven_from(method_names, method_refined, method, 0)
+    ensure result == method_unproven_from(method_names, method_refined, method, method_names.count)
+    found: mutable bool = false
+    remaining: mutable usize = method_names.count
+    while remaining > 0 |found, remaining, method_names, method_refined, method|:
+        invariant remaining <= method_names.count
+        invariant method_unproven_from(method_names, method_refined, method, method_names.count) == (found or method_unproven_from(method_names, method_refined, method, remaining))
+        index: usize = method_names.count - remaining
         refined: bool = index < method_refined.count and method_refined[index]
-        return true if method_names[index] == method and not refined
-    return false
+        found <- found or (method_names[index] == method and not refined)
+        remaining <- remaining - 1
+    return found
 '''
 if compact(function_section(source_text, "method_unproven_from")) != compact(expected_model):
     raise SystemExit("recursive membership model changed without updating its proof")
@@ -121,7 +125,7 @@ expected_positive = {
     "production_scan_matches_the_recursive_specification": '''
 def production_scan_matches_the_recursive_specification(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview) -> bool:
     ensure result == true
-    return SemanticAssocIndex::method_unproven(method_names, method_refined, method) == SemanticAssocIndex::method_unproven_from(method_names, method_refined, method, 0)
+    return SemanticAssocIndex::method_unproven(method_names, method_refined, method) == SemanticAssocIndex::method_unproven_from(method_names, method_refined, method, method_names.count)
 ''',
     "later_unrefined_duplicate_makes_method_unproven": '''
 def later_unrefined_duplicate_makes_method_unproven() -> bool:
