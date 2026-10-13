@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
@@ -21,6 +22,22 @@ ABI_SCAN = ROOT / "src/driver/abi_lint_scan.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 POSITIVE = HERE / "project_byte_order.elisa"
 NEGATIVE = HERE / "project_byte_order_rejected.elisa"
+BYTE_ORDER_PROOF = HERE / "backend_error_family_byte_order.elisa"
+
+
+def compact(text: str) -> str:
+    return "".join("".join(line.split("#", 1)[0].split()) for line in text.splitlines())
+
+
+def function_section(source: str, name: str) -> str:
+    matches = list(re.finditer(rf"(?m)^([ \t]*)(?:ghost )?def {re.escape(name)}\(", source))
+    if len(matches) != 1:
+        raise SystemExit(f"expected exactly one function named {name}")
+    match = matches[0]
+    indent = match.group(1)
+    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    end = match.end() + following.start() if following else len(source)
+    return source[match.start():end]
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -32,17 +49,58 @@ order_signature = "def bytes_less(left: darray[u8]&, right: darray[u8]&) -> bool
 if order_signature not in project_text:
     raise SystemExit("production project byte comparator is missing")
 order_body = project_text.split(order_signature, 1)[1].split("\n    def ", 1)[0]
-for fragment in (
-    "limit: usize = left.count if left.count < right.count else right.count",
-    "for index in 0..<limit |left, right|",
-    "true return if left[index] < right[index]",
-    "false return if left[index] > right[index]",
-    "return left.count < right.count",
-):
-    if fragment not in order_body:
-        raise SystemExit(f"production byte comparator lost lexicographic step: {fragment}")
-if 'include "../../src/driver/project.elisa"' not in positive_text or 'include "../../src/driver/project.elisa"' not in negative_text:
-    raise SystemExit("byte-order proofs no longer include the production project system")
+expected_comparator = """
+limit: usize = left.count if left.count < right.count else right.count
+for index in 0..<limit |left, right|:
+    true return if left[index] < right[index]
+    false return if left[index] > right[index]
+return left.count < right.count
+"""
+if compact(order_body) != compact(expected_comparator):
+    raise SystemExit("production project comparator changed without updating its source-linked model")
+if 'include "../../src/driver/project.elisa"' in positive_text or 'include "../../src/driver/project.elisa"' in negative_text:
+    raise SystemExit("proofs must isolate the comparator model from unrelated project-system effects")
+if 'include "./backend_error_family_byte_order.elisa"' not in positive_text:
+    raise SystemExit("universal project byte-order proofs lost their primitive byte-order laws")
+if 'include "./project_byte_order.elisa"' not in negative_text:
+    raise SystemExit("negative controls no longer exercise the proved byte-order model")
+
+expected_model = """
+def project_bytes_less_model(left: darray[u8]&, right: darray[u8]&) -> bool:
+    ensure result == project_bytes_less_at(left, right, 0)
+    limit: usize = left.count if left.count < right.count else right.count
+    index: mutable usize = 0
+    while index < limit |index, left, right|:
+        decreases limit - index
+        invariant index <= limit
+        invariant project_bytes_less_at(left, right, index) == project_bytes_less_at(left, right, 0)
+        if index < left.count and index < right.count:
+            true return if left[index] < right[index]
+            false return if left[index] > right[index]
+            index <- index + 1
+        else:
+            return left.count < right.count
+    return left.count < right.count
+"""
+if compact(function_section(positive_text, "project_bytes_less_model")) != compact(expected_model):
+    raise SystemExit("verified byte-order model changed without reviewing its comparator correspondence")
+for spec_name, expected_spec in {
+    "project_bytes_less_from": "ghost def project_bytes_less_from(left: darray[u8]&, right: darray[u8]&, index: usize) -> bool: requires index <= left.count and index <= right.count decreases (left.count if left.count < right.count else right.count) - index if index < left.count and index < right.count: return left[index] < right[index] if left[index] != right[index] return project_bytes_less_from(left, right, index + 1) return left.count < right.count",
+    "project_bytes_equal_from": "ghost def project_bytes_equal_from(left: darray[u8]&, right: darray[u8]&, index: usize) -> bool: requires index <= left.count and index <= right.count decreases (left.count if left.count < right.count else right.count) - index if index < left.count and index < right.count: return false if left[index] != right[index] return project_bytes_equal_from(left, right, index + 1) return left.count == right.count",
+    "project_bytes_less_at": "ghost def project_bytes_less_at(left: darray[u8]&, right: darray[u8]&, index: usize) -> bool: return left.count < right.count if index > left.count or index > right.count return project_bytes_less_from(left, right, index)",
+    "project_bytes_equal_at": "ghost def project_bytes_equal_at(left: darray[u8]&, right: darray[u8]&, index: usize) -> bool: return left.count == right.count if index > left.count or index > right.count return project_bytes_equal_from(left, right, index)",
+}.items():
+    if compact(function_section(positive_text, spec_name)) != compact(expected_spec):
+        raise SystemExit(f"{spec_name} changed without rechecking its recursive bounds and lexicographic meaning")
+byte_order_text = BYTE_ORDER_PROOF.read_text()
+byte_order_shapes = {
+    "byte_less_is_asymmetric": "ghost def byte_less_is_asymmetric(left: u8, right: u8) -> bool: ensure result == true return not (left < right and right < left)",
+    "byte_less_is_transitive": "ghost def byte_less_is_transitive(left: u8, middle: u8, right: u8) -> bool: ensure result == true return not (left < middle and middle < right) or left < right",
+    "byte_order_is_total": "ghost def byte_order_is_total(left: u8, right: u8) -> bool: ensure result == true return left < right or right < left or left == right",
+}
+for byte_law, expected_law in byte_order_shapes.items():
+    if compact(function_section(byte_order_text, byte_law)) != compact(expected_law):
+        raise SystemExit(f"the imported primitive byte-order proof changed: {byte_law}")
 if 'include "./project.elisa"' not in DRIVER.read_text():
     raise SystemExit("compiler driver no longer imports the production project system")
 if 'break if not bytes_less(right, left)' not in ABI_SCAN.read_text():
@@ -53,6 +111,20 @@ if 'bytes_less(project.targets[order[inner + 1.usize()]].name, project.targets[o
     raise SystemExit("project report sorting no longer uses the proved byte comparator")
 
 positive_names = {
+    "byte_less_is_asymmetric",
+    "byte_less_is_transitive",
+    "byte_order_is_total",
+    "project_bytes_less_from",
+    "project_bytes_equal_from",
+    "project_bytes_less_at",
+    "project_bytes_equal_at",
+    "project_bytes_less_model",
+    "project_bytes_not_both_from",
+    "project_bytes_total_from",
+    "project_bytes_transitive_from",
+    "project_bytes_order_is_asymmetric",
+    "project_bytes_order_is_total",
+    "project_bytes_order_is_transitive",
     "singleton_bytes_use_unsigned_order",
     "first_differing_byte_decides_before_the_suffix",
     "equal_prefixes_compare_the_next_byte",
@@ -60,7 +132,8 @@ positive_names = {
     "equal_two_byte_strings_are_not_less",
 }
 for name in positive_names:
-    if f"def {name}(" not in positive_text:
+    declaration_text = byte_order_text if name in byte_order_shapes else positive_text
+    if f"def {name}(" not in declaration_text:
         raise SystemExit(f"positive byte-order theorem is missing: {name}")
 negative_names = {
     "a_greater_single_byte_sorts_before_a_smaller_byte",
@@ -121,7 +194,7 @@ assert hashes_before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest(
 assert require_current_product(BIN, PROVER) == product_manifest
 print(json.dumps({
     "admitted": True,
-    "scope": "unsigned byte order, first-difference precedence, and proper-prefix ordering",
+    "scope": "source-bound unsigned lexicographic order with recursive asymmetry, totality, transitivity, first-difference, and prefix laws",
     "positive_obligations": positive["summary"]["proven"],
     "false_claims_rejected": sorted(negative_names),
     "proof_revision": product_manifest["proof"].get("head"),
