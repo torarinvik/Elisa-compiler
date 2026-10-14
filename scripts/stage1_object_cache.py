@@ -49,7 +49,33 @@ def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def dependency_records(paths, root):
+def unchanged_fingerprint(path, previous):
+    """Reuse a cached digest when the filesystem identity proves the file unchanged."""
+    if not isinstance(previous, dict):
+        return None
+    digest = previous.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return None
+    info = Path(path).stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("dependency is not a regular file")
+    identity = {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+        "size": info.st_size,
+    }
+    if any(previous.get(name) != value for name, value in identity.items()):
+        return None
+    return {**identity, "sha256": digest}
+
+
+def dependency_records(paths, root, previous_records=None):
     root_path = Path(root).resolve(strict=True)
     records = []
     seen = set()
@@ -60,7 +86,10 @@ def dependency_records(paths, root):
             raise ValueError("invalid dependency path")
         path = Path(spelling)
         resolved = path.resolve(strict=True)
-        identity = fingerprint(resolved)
+        previous = (previous_records or {}).get(spelling)
+        identity = unchanged_fingerprint(resolved, previous)
+        if identity is None:
+            identity = fingerprint(resolved)
         record = {"path": spelling, "resolved_path": str(resolved), **identity}
         if spelling in seen:
             raise ValueError("dependency report repeats a path")
@@ -143,6 +172,7 @@ def read_dependencies(index, base_key, root):
         if manifest["root"] != expected_root or not isinstance(manifest["dependencies"], list):
             return None
         paths = []
+        previous_records = {}
         for record in manifest["dependencies"]:
             if not isinstance(record, dict) or set(record) != {
                 "path", "resolved_path", "device", "inode", "mtime_ns", "ctime_ns", "size", "sha256"
@@ -151,7 +181,8 @@ def read_dependencies(index, base_key, root):
             if not isinstance(record["path"], str):
                 return None
             paths.append(record["path"])
-        root_value, records = dependency_records(paths, root)
+            previous_records[record["path"]] = record
+        root_value, records = dependency_records(paths, root, previous_records)
         graph_sha256 = dependency_graph_digest(root_value, records)
         identity_sha256 = dependency_identity_digest(root_value, records)
         if (
