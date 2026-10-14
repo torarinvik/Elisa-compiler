@@ -16,10 +16,12 @@ POSITIVE = HERE / 'backend_reserve_u32_add.elisa'
 NEGATIVE = HERE / 'backend_reserve_u32_add_rejected.elisa'
 POSITIVE_HASHES = {
     'reserve_u32_add_operands_bound_the_wide_sum': 'b7f02ef8241bfcafce833fbe523a6b86118bfca9606c2268dc135e659fa7eb91',
+    'reserve_u32_add_sum_fits_signed_i64': 'caa03985a17f4882d2706517045c9eb7330018fd44d1c48d41b226bf42dddce5',
     'reserve_u32_add_accepted_result_fits_target': 'a182c8c2c79e0486c56914d865435b3914109458af0ea0317a73a0ec840d7c18',
 }
 NEGATIVE_HASHES = {
     'false_maximum_u32_operands_sum_fits_target': '7d0e0d09e4935cbad41a45c21b99df77dbbc5416e52a063e0058bdeabe5b241c',
+    'false_maximum_u32_operands_overflow_signed_i64': '3928fb0da85515da5ce89f6981dedac6aa32a1546c7fc7930eb1a87dcd62bbdc',
 }
 def compact(text: str) -> str:
     return ''.join(''.join(line.split('#', 1)[0].split()) for line in text.splitlines())
@@ -47,6 +49,7 @@ source = compact(source_text[match.start():match.end() + next_function.start() i
 for fragment in (
     'ifmultiplyandtarget_bits==32:',
     'intrinsic_name:sview="llvm.umul.with.overflow"ifmultiplyelse"llvm.uadd.with.overflow"',
+    'int_type:LLVMTypeRef=LLVMInt64TypeInContext(ctx)',
     'iftarget_bits==32:',
     'left_exceeds:LLVMValueRef=LLVMBuildICmp(builder,34,left,LLVMConstInt(int_type,DARRAY_U32_MAX,0)',
     'right_exceeds:LLVMValueRef=LLVMBuildICmp(builder,34,right,LLVMConstInt(int_type,DARRAY_U32_MAX,0)',

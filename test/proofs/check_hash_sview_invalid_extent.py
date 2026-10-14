@@ -80,13 +80,15 @@ if compact('include "./elisacore_fnv1a_spec.elisa"') not in compact(hash_text):
 fold_spec = compact(function_section(spec_text, "sview_fnv1a_fold_from"))
 if "requiresvalue.len>0andvalue.len.usize().i64()==value.len" not in fold_spec or \
         "requiresindex<=value.len.usize()" not in fold_spec or \
-        "decreasesvalue.len.usize()-index" not in fold_spec or \
+        "requiresremaining==value.len.usize()-index" not in fold_spec or \
+        "decreasesremaining" not in fold_spec or \
+        "remaining-1.usize()" not in fold_spec or \
         f"(state^value[index].u8().u64())*{PRIME_NAME}" not in fold_spec:
     raise SystemExit("recursive FNV specification lost its bounded index, termination measure, or update step")
 model_spec = compact(function_section(spec_text, "sview_fnv1a_model"))
 if compact("ensure result == sview_fnv1a_model(value)") not in hash_body or \
         "returnSVIEW_FNV1A_OFFSET_BASISifvalue.len<=0orvalue.len.usize().i64()!=value.len" not in model_spec or \
-        f"return sview_fnv1a_fold_from(value, 0.usize(), {INITIAL_STATE_NAME})".replace(" ", "") not in model_spec:
+        f"return sview_fnv1a_fold_from(value, 0.usize(), value.len.usize(), {INITIAL_STATE_NAME})".replace(" ", "") not in model_spec:
     raise SystemExit("hash_sview or the shared all-extents FNV model lost its valid/invalid result contract")
 
 required_steps = (
@@ -100,7 +102,7 @@ required_steps = (
     "invariant i <= view_len",
     "invariant i.i64().usize() == i",
     "invariant view_len == value.len",
-    f"invariant sview_fnv1a_fold_from(value, i, h) == sview_fnv1a_fold_from(value, 0.usize(), {INITIAL_STATE_NAME})",
+    f"invariant sview_fnv1a_fold_from(value, i, view_len - i, h) == sview_fnv1a_fold_from(value, 0.usize(), view_len, {INITIAL_STATE_NAME})",
     "ch: u8 = value[i].u8()",
     "h <- h ^ ch.u64()",
     f"h <- h * {PRIME_NAME}",
@@ -130,7 +132,7 @@ collection_required_steps = (
     "invariant i <= view_len",
     "invariant i.i64().usize() == i",
     "invariant view_len.i64() == view.len",
-    f"invariant sview_fnv1a_fold_from(view, i, h) == sview_fnv1a_fold_from(view, 0.usize(), {INITIAL_STATE_NAME})",
+    f"invariant sview_fnv1a_fold_from(view, i, view_len - i, h) == sview_fnv1a_fold_from(view, 0.usize(), view_len, {INITIAL_STATE_NAME})",
     f"h <- (h ^ view[i].u8().u64()) * {PRIME_NAME}",
     "i <- i + 1.usize()",
     "return h",
