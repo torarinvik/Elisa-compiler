@@ -96,6 +96,8 @@ run_case static_if_untaken_fn_dropped 'static if ELISA_TARGET_OS_WINDOWS:\n    d
 # cstr byte indexing preserves ctx_string_index(s, i) -> i64 semantics; Stage1 may inline it.
 run_case cstr_index_const 'def main() -> i64:\n    s: cstr = "ABC"\n    return s[0].i64() + s[2].i64()\n'   132
 run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 1)\n'   89
+run_case cstr_index_negative 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", -1)\n'   0
+run_case cstr_index_out_of_bounds 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 3)\n'   0
 # Low-level runtime string helpers return borrowed byte pointers (`u8&`), not only cstr.
 # A literal in that context must still lower to the same LLVM global pointer.
 run_case byte_ref_literal 'def choose(flag: bool) -> u8&:\n    return "True" if flag else "False"\n\ndef main() -> i64:\n    _ = choose(true)\n    return 42\n' 42
