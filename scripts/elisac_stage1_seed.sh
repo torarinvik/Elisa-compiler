@@ -268,6 +268,13 @@ seed_build() {
       echo "seed: unsupported host for native product linking: $(uname -s) (supported: Linux, Darwin)" >&2
       exit 2
   esac
+  if [[ -n "${ELISA_STAGE1_SEED_LINKER:-}" ]]; then
+    [[ -x "$ELISA_STAGE1_SEED_LINKER" ]] || {
+      echo "seed: selected linker is not executable: $ELISA_STAGE1_SEED_LINKER" >&2
+      exit 2
+    }
+    seed_link_flags+=("--ld-path=$ELISA_STAGE1_SEED_LINKER")
+  fi
   # Use the shared weak fallback source so seed, runtime, and test products keep
   # one definition of the optional profiler/native callback ABI.
   if [[ -n "$seed_hook_mode" ]]; then

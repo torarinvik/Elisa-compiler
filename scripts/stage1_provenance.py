@@ -734,7 +734,7 @@ def snapshot(
         product_digest = sha256_file(binary)
         if file_stat_identity(binary) != product_identity:
             raise RuntimeError(f"Stage1 product changed while fingerprinting: {binary}")
-    return {
+    data = {
         "schema": SCHEMA,
         "source_revision": source_revision(root),
         **input_fingerprint(
@@ -747,6 +747,36 @@ def snapshot(
         "product_stat_identity": product_identity,
         "product_sha256": product_digest,
     }
+    linker = os.environ.get("ELISA_STAGE1_SEED_LINKER")
+    if linker:
+        # LLD selects its driver from argv[0]; resolving ld64.lld to lld before
+        # invoking it loses the Darwin driver selection.
+        executable = Path(linker).absolute()
+        resolved = executable.resolve(strict=True)
+        version = subprocess.run([str(executable), "--version"], check=True,
+                                 capture_output=True, text=True)
+        data["seed_linker"] = {
+            "path": str(executable),
+            "resolved_path": str(resolved),
+            "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+            "version": version.stdout.strip(),
+        }
+    return data
+    linker = os.environ.get("ELISA_STAGE1_SEED_LINKER")
+    if linker:
+        # LLD selects its driver from argv[0]; resolving ld64.lld to lld before
+        # invoking it loses the Darwin driver selection.
+        executable = Path(linker).absolute()
+        resolved = executable.resolve(strict=True)
+        version = subprocess.run([str(executable), "--version"], check=True,
+                                 capture_output=True, text=True)
+        data["seed_linker"] = {
+            "path": str(executable),
+            "resolved_path": str(resolved),
+            "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+            "version": version.stdout.strip(),
+        }
+    return data
 
 
 def manifest_path(binary):
