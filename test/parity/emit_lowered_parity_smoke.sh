@@ -28,6 +28,28 @@ baseline="$(tr -d '[:space:]' < "$BASELINE_FILE")"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
+# `lowered` also uses the formatting-only parser option and must retain the exact grouping node.
+cat > "$WORK/parenthesized.elisa" <<'CASE'
+def f() -> i32:
+    return (1)
+CASE
+s0 -emit lowered "$WORK/parenthesized.elisa" </dev/null > "$WORK/parenthesized.s0" 2>/dev/null || {
+    echo "emit_lowered parity FAILED: stage0 parenthesis fixture"
+    exit 1
+}
+s1 -emit lowered -o "$WORK/parenthesized.s1" "$WORK/parenthesized.elisa" >/dev/null 2>&1 || {
+    echo "emit_lowered parity FAILED: stage1 parenthesis fixture"
+    exit 1
+}
+cmp -s "$WORK/parenthesized.s0" "$WORK/parenthesized.s1" || {
+    echo "emit_lowered parity FAILED: parenthesized output differs"
+    exit 1
+}
+rg -Fq 'return (1)' "$WORK/parenthesized.s1" || {
+    echo "emit_lowered parity FAILED: grouping node was not preserved"
+    exit 1
+}
+
 same=0
 total=0
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
