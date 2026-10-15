@@ -165,6 +165,26 @@ extend Backend:
                 # every function uniformly.
                 needs_auto_region: mutable bool = auto_region_statements_need_arena(body, fns, structs, generics)
                 local_packed_store_root: i64 = auto_region_statements_packed_store_root(body, fns, structs)
+                # A by-value owning argument can carry caller-region storage into a
+                # mutable global even when this body allocates nothing. The store needs
+                # a scratch carrier so the global can be re-homed before the caller's
+                # region ends (for example, publishing a `Clip?` built by a caller).
+                structs.bindings.global_store_shadows <- []
+                stores_global: mutable bool = false
+                global_store_scan_needed: mutable bool = needs_auto_region
+                # A body that needs no carrier can still forward a caller-owned aggregate
+                # into a global. Scan those bodies only when a by-value parameter can carry
+                # region storage; scalar-only functions keep the existing cheap path.
+                if not global_store_scan_needed:
+                    for region_parameter in params |global_store_scan_needed, structs|:
+                        region_parameter_type: ValueType = parameter_value_type(region_parameter.type_expression, structs)
+                        global_store_scan_needed <- true if value_type_owns_region_storage(region_parameter_type, structs, 0)
+                if global_store_scan_needed:
+                    for shadow_parameter in params |structs|:
+                        structs.bindings.global_store_shadows.push(shadow_parameter.name)
+                    stores_global <- function_name != "arena_free" and auto_region_statements_store_global(body, structs)
+                    structs.bindings.global_store_shadows <- []
+                needs_auto_region <- true if stores_global
                 # Creating an implicit packed store allocates its state even when
                 # the ordinary body scan finds no direct allocation. A received
                 # hidden store already owns its arena and needs no new carrier.
@@ -206,7 +226,7 @@ extend Backend:
                 # (&out[0]).cast[static u8&]`) allocates them in the permanent arena, never in a
                 # per-call region freed at return (stage0 analyzer_region_polymorphism: bind the
                 # ambient region to perm when not region-polymorphic and no Arena parameter).
-                perm_global_index: i64 = mutable_global_index_of(structs, "perm_arena") if needs_auto_region and not threads_arena and return_value_type.kind == TypeKind.Ref and return_type_opt is static_return and annotation_is_static_qualified(static_return) else -1
+                perm_global_index: i64 = mutable_global_index_of(structs, "perm_arena") if needs_auto_region and not stores_global and not threads_arena and return_value_type.kind == TypeKind.Ref and return_type_opt is static_return and annotation_is_static_qualified(static_return) else -1
                 if perm_global_index >= 0:
                     local_runtime.arena <- structs.globals.mutable_global_handles[perm_global_index.usize()]
                     local_runtime.owns_arena <- false
@@ -214,10 +234,6 @@ extend Backend:
                     arena_type: LLVMTypeRef = arena_llvm_type(ctx, structs.target.target_pointer_bits)
                     local_runtime.rehome_fns <- []
                     global_rehome_set_scratch(local_runtime, null)
-                    structs.bindings.global_store_shadows <- []
-                    for shadow_parameter in params |structs|:
-                        structs.bindings.global_store_shadows.push(shadow_parameter.name)
-                    stores_global: bool = function_name != "arena_free" and auto_region_statements_store_global(body, structs)
                     # The body may leave module globals pointing at what it allocates. Keep
                     # the ordinary scratch region and re-home each touched global into its
                     # own generational region before the scratch is freed
@@ -227,6 +243,9 @@ extend Backend:
                     rehome_helpers: mutable darray[LLVMValueRef] = []
                     rehome_supported: mutable bool = stores_global
                     if stores_global:
+                        structs.bindings.global_store_shadows <- []
+                        for shadow_parameter in params |structs|:
+                            structs.bindings.global_store_shadows.push(shadow_parameter.name)
                         rehome_indices: mutable darray[i64] = []
                         global_rehome_collect_statements(body, structs, rehome_indices)
                         for rehome_index in rehome_indices |rehome_helpers, rehome_supported, structs, local_runtime, m, ctx|:
@@ -234,7 +253,7 @@ extend Backend:
                                 rehome_helpers.push(rehome_helper)
                             else:
                                 rehome_supported <- false
-                    structs.bindings.global_store_shadows <- []
+                        structs.bindings.global_store_shadows <- []
                     if stores_global and not rehome_supported:
                         local_runtime.arena <- auto_region_static_region(arena_type, m)
                         local_runtime.owns_arena <- false
@@ -256,6 +275,35 @@ extend Backend:
                     # by-reference parameter still uses the caller-owned region.
                     local_runtime.arena <- local_runtime.caller_arena
                     local_runtime.owns_arena <- false
+                    if stores_global:
+                        # The body's ordinary allocations remain in its caller-owned
+                        # carriers, but a value copied into a global still needs an
+                        # independently owned scratch region for generational re-homing.
+                        # Reusing the caller's arena here would retain old generations
+                        # until the caller ends, so keep this scratch in the function's
+                        # own cleanup stack.
+                        arena_type: LLVMTypeRef = arena_llvm_type(ctx, structs.target.target_pointer_bits)
+                        rehome_slot: LLVMValueRef = build_entry_alloca(builder, arena_type, "global.rehome.region")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), rehome_slot)
+                        strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, rehome_slot, 3, "global.rehome.strategy")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(runtime_size_llvm_type(ctx, structs.target.target_pointer_bits), 0, 0), strategy_pointer)
+                        rehome_helpers: mutable darray[LLVMValueRef] = []
+                        rehome_supported: mutable bool = stores_global
+                        structs.bindings.global_store_shadows <- []
+                        for shadow_parameter in params |structs|:
+                            structs.bindings.global_store_shadows.push(shadow_parameter.name)
+                        rehome_indices: mutable darray[i64] = []
+                        global_rehome_collect_statements(body, structs, rehome_indices)
+                        for rehome_index in rehome_indices |rehome_helpers, rehome_supported, structs, local_runtime, m, ctx|:
+                            if (global_rehome_helper(rehome_index, structs, local_runtime, m, ctx) can Global{Read,Write}) is rehome_helper:
+                                rehome_helpers.push(rehome_helper)
+                            else:
+                                rehome_supported <- false
+                        structs.bindings.global_store_shadows <- []
+                        false return if not rehome_supported
+                        local_runtime.rehome_fns <- rehome_helpers
+                        global_rehome_set_scratch(local_runtime, rehome_slot)
+                        local_runtime.rehome_fn_type <- global_rehome_fn_type(ctx)
                 else:
                     # No body operation should consume this placeholder. It is a correctly
                     # typed null pointer so a declined/unmodeled path cannot accidentally
@@ -352,6 +400,8 @@ extend Backend:
                 # so the stack stays empty.
                 regions: mutable RegionStack = RegionStack{arenas: []}
                 regions.arenas.push(local_runtime.arena) if local_runtime.owns_arena
+                if local_runtime.rehome_scratch is function_rehome_scratch:
+                    regions.arenas.push(function_rehome_scratch) if function_rehome_scratch != local_runtime.arena
                 parameter_index: mutable u32 = leading_param_offset
                 parameter_arena_index: mutable i64 = 0
                 # An Arena-taking function has no hidden caller slots (params_manage_arena), so a
@@ -446,6 +496,11 @@ extend Backend:
                     # answers 31. Found by adversarial differential testing; nothing in the
                     # compiler's own sources hits it, because they all return explicitly.
                     false return if not (emit_deferred_actions(local_scope, false, fns, structs, generics, local_runtime, m, ctx, builder) can Global{Read,Write})
+                    if local_runtime.rehome_scratch is fallthrough_rehome_scratch and fallthrough_rehome_scratch != local_runtime.arena:
+                        emit_global_rehomes(fallthrough_rehome_scratch, local_runtime, builder)
+                        rehome_free_arguments: mutable darray[LLVMValueRef] = [fallthrough_rehome_scratch]
+                        rehome_free_pointer: void& = (&rehome_free_arguments[0]).cast[void&] can Unsafe.PointerCast
+                        _ = LLVMBuildCall2(builder, local_runtime.arena_free_type, (local_runtime.arena_free can Global{Read,Write}), rehome_free_pointer, 1, "")
                     (emit_region_free(local_runtime, builder) can Global{Read,Write})
                     # A `void error[E]` fn that runs off the end succeeds — return the 0 code.
                     if fn_is_error:
