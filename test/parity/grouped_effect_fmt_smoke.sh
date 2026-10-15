@@ -34,6 +34,10 @@ check() {
     s1 -emit fmt -o "$WORK/$name.again" "$WORK/$name.s1" > /dev/null 2>&1 || fail "$name roundtrip"
     cmp -s "$WORK/$name.s1" "$WORK/$name.again" || fail "$name formatter stability"
 }
+check parenthesized_expression 'return (1)' <<'CASE'
+def f() -> i32:
+    return (1)
+CASE
 check adjacent 'def f() -> i32 can[Global{Read,Write}]:' <<'CASE'
 def f() -> i32 can[Global.Read, Global.Write]:
     can Global.Read, Global.Write:
