@@ -90,6 +90,10 @@ check_case provable_rec   $'def rec(n: i64) -> i64:\n    requires n >= 0\n    en
 # Ordinary top-level functions must stay in the prover's declaration walk when a guarded
 # return occurs inside a captured-loop body.
 check_case top_level_captured_loop $'def choose(n: i64) -> i64:\n    ensure result == 3\n    while n > 0 |n|:\n        return 2\n    return 3\n'
+# Protocol defaults are checked by the same ensure pass. The captured loop's parameter
+# return must be visible to its nested statement walkers, even though the other return is
+# a different parameter and is directly present in the function body.
+check_case protocol_default_captured_loop $'protocol Eq:\n    def eq(self: Self, other: Self) -> bool\n    def choose(a: Self, b: Self, n: i64) -> Self:\n        ensure result.eq(a)\n        while n > 0 |n|:\n            return a\n        return b\n'
 
 if [ "$failed" -ne 0 ]; then
     echo "ensure guarded-return smoke FAILED: $failed/$checked cases disagree" >&2
