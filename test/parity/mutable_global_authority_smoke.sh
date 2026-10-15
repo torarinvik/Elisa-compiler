@@ -330,6 +330,44 @@ def main() -> i64:
         state.value <- 2
     return 0
 CASE
+run_case immutable_global_mutable_field_compound_write_only 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Write:
+        state.value += 2
+    return 0
+CASE
+run_case immutable_global_mutable_field_compound_read_only 'accesses a global mutable binding without Global.Write' <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Read:
+        state.value += 2
+    return 0
+CASE
+run_case immutable_global_mutable_field_compound_both_grants clean <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global{Read,Write}:
+        state.value += 2
+    return 0
+CASE
+run_case immutable_global_nested_mutable_field_compound_write_only 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct Inner:
+    value: mutable i64
+struct State:
+    inner: Inner
+global state: State = State{inner: Inner{value: 1}}
+def main() -> i64:
+    can Global.Write:
+        state.inner.value += 2
+    return 0
+CASE
 run_case immutable_global_parenthesized_mutable_field_read_missing 'accesses a global mutable binding without Global.Read' <<'CASE'
 struct State:
     value: (mutable i64)
