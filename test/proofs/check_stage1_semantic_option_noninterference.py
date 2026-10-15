@@ -78,7 +78,7 @@ if not all(
     if field != "enforce_mutable_global_grants"
 ):
     raise SystemExit("production projection no longer specifies every option output")
-if "ensure result.enforce_mutable_global_grants != permissive_environment_enabled" not in projection_text:
+if "ensure result.enforce_mutable_global_grants == (not permissive_environment_enabled)" not in projection_text:
     raise SystemExit("production projection no longer specifies every option output")
 if "def same_non_smt_options(" not in positive_text or "def smt_sources_change_only_the_smt_option(" not in positive_text:
     raise SystemExit("positive noninterference theorem is missing")

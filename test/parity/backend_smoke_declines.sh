@@ -93,9 +93,11 @@ run_case static_if_selects_branch 'static if ELISA_TARGET_OS_WINDOWS:\n    const
 run_case static_if_nested_const_chain 'const B_MMAP: int = 1\nconst B_MALLOC: int = 2\n\nstatic if ELISA_TARGET_OS_POSIX:\n    const BACKEND: int = B_MMAP\nstatic else:\n    const BACKEND: int = B_MALLOC\n\nstatic if BACKEND == B_MMAP:\n    def pick() -> i64:\n        return 40\nstatic else:\n    def pick() -> i64:\n        return 7\n\ndef main() -> i64:\n    return pick() + 2\n' 42
 # A FUNCTION declared in the untaken branch must not shadow or duplicate the taken one.
 run_case static_if_untaken_fn_dropped 'static if ELISA_TARGET_OS_WINDOWS:\n    def who() -> i64:\n        return 1\nstatic else:\n    def who() -> i64:\n        return 42\n\ndef main() -> i64:\n    return who()\n' 42
-# cstr byte indexing lowers to ctx_string_index(s, i) -> i64 (stage0's shape).
+# cstr byte indexing preserves ctx_string_index(s, i) -> i64 semantics; Stage1 may inline it.
 run_case cstr_index_const 'def main() -> i64:\n    s: cstr = "ABC"\n    return s[0].i64() + s[2].i64()\n'   132
 run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 1)\n'   89
+run_case cstr_index_negative 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", -1)\n'   0
+run_case cstr_index_out_of_bounds 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 3)\n'   0
 # Low-level runtime string helpers return borrowed byte pointers (`u8&`), not only cstr.
 # A literal in that context must still lower to the same LLVM global pointer.
 run_case byte_ref_literal 'def choose(flag: bool) -> u8&:\n    return "True" if flag else "False"\n\ndef main() -> i64:\n    _ = choose(true)\n    return 42\n' 42

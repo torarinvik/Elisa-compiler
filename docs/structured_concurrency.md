@@ -36,7 +36,9 @@ def total(values: Slice[usize]) -> usize:
 ```
 
 Use `nursery on(pool):` when a caller-owned pool should serve multiple batches.
-Each block joins its own submissions while leaving the pool alive for the caller:
+Each block joins its unqualified `submit` calls while leaving the pool alive for the
+caller. An explicit `submit[pool] work(arg)` still returns a task handle that must
+be awaited or added to a `TaskGroup`:
 
 ```elisa
 def submit_batch(pool: mutable ThreadPool&, count: usize) -> void:
@@ -47,10 +49,25 @@ def submit_batch(pool: mutable ThreadPool&, count: usize) -> void:
 ```
 
 Use `TaskGroup` directly when you need to choose the group creation or wait point
-yourself. Adding a task consumes its handle, and `wait all` discards its result. Keep
-individual handles and await them after the batch when their results are needed; use
-`par_map` or `reduce` for common bulk-result patterns. The pool's owner remains
-responsible for shutting it down after all borrowed-pool nurseries have finished.
+yourself. Add only the submissions that should be joined at that point:
+
+```elisa
+def run_group() -> void:
+    can Parallel:
+        pool: mutable ThreadPool = pool_new(4)
+        group: mutable TaskGroup = task_group_new()
+        first: Task[usize, Pending] = submit[pool] visit(1.usize())
+        second: Task[usize, Pending] = submit[pool] visit(2.usize())
+        task_group_add(group, move first)
+        task_group_add(group, move second)
+        wait all group
+        pool_shutdown(&pool)
+```
+
+Adding a task consumes its handle, and `wait all` discards its result. Keep
+individual handles and await them when their results are needed; use `par_map` or
+`reduce` for common bulk-result patterns. The pool's owner remains responsible for
+shutting it down after all work has joined.
 
 Pass values that are safe to transfer to a worker. The compiler checks thread
 shareability and whether borrowed storage stays valid until the nursery or task

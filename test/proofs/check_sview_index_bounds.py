@@ -151,12 +151,12 @@ if 'sview_fields:mutabledarray[LLVMTypeRef]=[pointer_type,int64_type]' not in ru
         'sview_index_type:LLVMTypeRef=LLVMFunctionType(int64_type,sview_index_pointer,2,0)' not in runtime_decl:
     raise SystemExit("StringView runtime layout/index ABI no longer uses pointer-plus-i64 and an i64 index")
 
-# The compiler's checked-decimal parser exercises the exact `.length` and `[0]`
+# The compiler's checked-decimal parser exercises the exact `.len` and `[0]`
 # syntax whose bounds are proved here. The fallback wrapper must preserve the
 # production runtime index helper's semantics.
-if 'iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
+if 'iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_parser or \
         'returnEasmCheckedDecimal::parse_signed(text)' not in parser:
-    raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.length")
+    raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.len")
 runtime_steps = (
     '0returnifview.len<0',
     'view_len:usize=view.len.usize()',

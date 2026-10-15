@@ -93,6 +93,10 @@ struct ConcurrencyPoolState:
 	qhead: mutable heap PoolTaskRecord&?
 	qtail: mutable heap PoolTaskRecord&?
 	shutdown: mutable i64
+	# Number of task records whose completion wait has not finished. Records keep
+	# the pool synchronization state alive even after the owner requests shutdown.
+	outstanding_records: mutable usize
+	owner_closed: mutable i64
 	workers: mutable void&?
 
 # ------------------------------------------------------------
@@ -704,6 +708,8 @@ def ctx_pool_state_new(threads: usize) -> mutable heap ConcurrencyPoolState&:
 		state.qhead <- null
 		state.qtail <- null
 		state.shutdown <- 0
+		state.outstanding_records <- 0.usize()
+		state.owner_closed <- 0
 		state.workers <- null
 		# The mutex/condvar handles are heap-allocated (malloc'd in *_init) and live
 		# for the pool's lifetime, but they flow through nullable `void&?` fields
@@ -762,16 +768,14 @@ def pool_shutdown(pool: mutable ThreadPool&):
 				ctx_concurrency_join_handle(current.handle)
 				free(current.cast[heap void&])
 				current <- next
-		mutex_handle: mutable Mutex = zeroed
-		mutex_handle.handle <- state.mutex
-		mutex_destroy(&mutex_handle)
-		wc_handle: mutable CondVar = zeroed
-		wc_handle.handle <- state.work_cond
-		condvar_destroy(&wc_handle)
-		dc_handle: mutable CondVar = zeroed
-		dc_handle.handle <- state.done_cond
-		condvar_destroy(&dc_handle)
-		free(state.cast[heap void&])
+		dispose_state: mutable bool = false
+		can Sync.Lock:
+			ctx_pool_lock(mu)
+		state.owner_closed <- 1
+		dispose_state <- state.outstanding_records == 0.usize()
+		can Sync.Unlock:
+			ctx_pool_unlock(mu)
+		ctx_pool_state_destroy(state) if dispose_state
 		pool.handle <- null
 
 # The implicit pool for `parallel for` / each / reduce when there is no explicit
@@ -817,6 +821,11 @@ def pool_submit_raw(pool: mutable ThreadPool&, entry: void&, arg: void&?) -> Tas
 		wc: void& = ctx_sync_handle(state.work_cond)
 		can Sync.Lock:
 			ctx_pool_lock(mu)
+		if state.shutdown != 0:
+			can Sync.Unlock:
+				ctx_pool_unlock(mu)
+			panic("pool_submit on shut down pool")
+		state.outstanding_records <- state.outstanding_records + 1.usize()
 		tail_node: mutable heap PoolTaskRecord&? = state.qtail
 		if tail_node != null:
 			tail_node.next <- rec
@@ -836,7 +845,7 @@ def pool_submit_raw(pool: mutable ThreadPool&, entry: void&, arg: void&?) -> Tas
 # its separate group link after the wait.
 @internal
 def ctx_pool_wait_record_done(handle: uintptr):
-	can Abort.Panic:
+	can Memory.Release, Abort.Panic:
 		return if handle == 0
 		rec: mutable heap PoolTaskRecord& = handle.cast[mutable heap PoolTaskRecord&] can Unsafe.PointerCast
 		state: mutable heap ConcurrencyPoolState& = rec.pool.cast[mutable heap ConcurrencyPoolState&]
@@ -844,12 +853,16 @@ def ctx_pool_wait_record_done(handle: uintptr):
 		dc: void& = ctx_sync_handle(state.done_cond)
 		can Sync.Lock:
 			ctx_pool_lock(mu)
+		dispose_state: mutable bool = false
 		trusted Unsafe.AssumeProgress:
 			while rec.done == 0:
 				can Sync.Wait:
 					ctx_pool_wait(dc, mu)
+		state.outstanding_records <- state.outstanding_records - 1.usize()
+		dispose_state <- state.owner_closed != 0 and state.outstanding_records == 0.usize()
 		can Sync.Unlock:
 			ctx_pool_unlock(mu)
+		ctx_pool_state_destroy(state) if dispose_state
 
 # Standalone awaits consume their record immediately. TaskGroups use the retaining
 # helper above and free records only after every task in the batch has joined.
@@ -860,6 +873,23 @@ def ctx_pool_wait_record(handle: uintptr):
 		ctx_pool_wait_record_done(handle)
 		rec: mutable heap PoolTaskRecord& = handle.cast[mutable heap PoolTaskRecord&] can Unsafe.PointerCast
 		free(rec.cast[heap void&])
+
+# The pool owner and every outstanding completion record share this state. Workers
+# are joined by pool_shutdown before owner_closed is set; the final record waiter
+# may then destroy the synchronization objects after releasing the pool lock.
+@internal
+def ctx_pool_state_destroy(state: mutable heap ConcurrencyPoolState&):
+	can Memory.Release:
+		mutex_handle: mutable Mutex = zeroed
+		mutex_handle.handle <- state.mutex
+		mutex_destroy(&mutex_handle)
+		wc_handle: mutable CondVar = zeroed
+		wc_handle.handle <- state.work_cond
+		condvar_destroy(&wc_handle)
+		dc_handle: mutable CondVar = zeroed
+		dc_handle.handle <- state.done_cond
+		condvar_destroy(&dc_handle)
+		free(state.cast[heap void&])
 
 def pool_await_raw(task: Task[void&?, Pending]) -> void&?:
 	can Pool.Await, Memory.Release, Abort.Panic:
@@ -891,7 +921,7 @@ def task_group_add_raw(group: mutable TaskGroup&, task: Task[void&?, Pending], s
 
 @internal
 def task_group_wait_all_raw(group: mutable TaskGroup&):
-	can Pool.WaitAll, Abort.Panic:
+	can Pool.WaitAll, Memory.Release, Abort.Panic:
 		current: mutable heap PoolTaskRecord&? = group.handle.cast[heap PoolTaskRecord&?]
 		last_waited: mutable heap PoolTaskRecord&? = null
 		trusted Unsafe.AssumeProgress:
@@ -977,7 +1007,6 @@ def ctx_task_from_raw[R, S](raw: Task[void&?, S]) -> Task[R, S]:
 def ctx_task_to_raw[R, S](task: Task[R, S]) -> Task[void&?, S]:
 	return Task[void&?, S]{handle: task.handle, state: task.state}
 
-@internal
 def task_group_new() -> TaskGroup:
 	group: TaskGroup = task_group_new_raw()
 	group.cleanup <- null
@@ -1096,14 +1125,12 @@ def pool_await[R](task: Task[R, Pending]) -> R:
 		result: R = take_result(state_bits) can Unsafe.PointerCast
 		return result
 
-@internal
 def task_group_add[R](group: mutable TaskGroup&, task: Task[R, Pending]):
 	can Abort.Panic:
 		state_bits: void&? = task.state
 		raw: Task[void&?, Pending] = ctx_task_to_raw(move task)
 		task_group_add_raw(group, move raw, state_bits)
 
-@internal
 def task_group_wait_all(group: mutable TaskGroup&):
 	can Pool.WaitAll, Thread.Join, Memory.Release, Abort.Panic, Atomics.Load, Atomics.CompareExchange:
 		can Sync{Lock,Wait,Unlock}:

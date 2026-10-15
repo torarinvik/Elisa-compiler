@@ -1,0 +1,17 @@
+# mandelbrot — Zig (1.zig)
+
+The Computer Language Benchmarks Game has never published Zig programs (no zig
+entries in its source zip or its git history at
+https://salsa.debian.org/benchmarksgame-team/benchmarksgame). The Zig comparator is
+taken from the closest maintained collection, hanabi1224's Programming Language
+Benchmarks, which reuses the Benchmarks Game task definitions.
+
+- Source: https://github.com/hanabi1224/Programming-Language-Benchmarks/blob/ad18b203dd1769724f4eea94fc3ac1e99f6593e0/bench/algorithm/mandelbrot/1.zig
+- Original file kept as `mandelbrot.orig.zig`; ported file is `mandelbrot.zig` (diff them for the exact changes).
+- Ranking page: https://programming-language-benchmarks.vercel.app/zig
+- Retrieved: 2026-10-13
+- PLB measurement (zig 0.14.1, their host): 248 ms @ 5000; fastest published Zig variant for this task.
+- Threads: single-thread
+- Port to Zig 0.17: `main` takes std.process.Init and calls compat.setup (../compat.zig) for args/stdout/stdin. ArrayList unmanaged API; runtime vector indexing `absz[i]` -> `inline for` (0.17 requires comptime vector indices). Semantic change: PLB prints an md5 of the bitmap; this port writes the raw P4 bitmap as the Benchmarks Game requires. Like the original it rounds the width up to a multiple of 8, so it is only correct for N divisible by 8 (200 and 16000 are).
+- Build: `zig build-exe -O ReleaseFast -mcpu=native -lc` (PLB: ReleaseFast + libc). See ../../build_refs.sh.
+- Output verified against the Benchmarks Game mandelbrot-output.txt at the small size: yes.

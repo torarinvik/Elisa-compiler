@@ -121,7 +121,7 @@ required_parse_contracts = (
 )
 required_parse_steps = (
     "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len",
-    "iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
+    "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
     "return(false,0)ifposition==text.len",
     "whileposition<text.len|position,text,value|",
     "decreasestext.len-position",

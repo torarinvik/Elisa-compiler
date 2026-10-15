@@ -15,6 +15,7 @@ ulimit -c 0 || true
 BAD="$ROOT/test/repro/sview_region_use_after_destroy.elisa"
 GENERIC_BAD="$ROOT/test/repro/region_generic_struct_signature.elisa"
 MULTI_GENERIC_BAD="$ROOT/test/repro/region_multiple_generic_dependencies.elisa"
+GENERIC_ALIAS_RESET_BAD="$ROOT/test/repro/arena_generic_region_alias_reset_leak.elisa"
 POOL_PROJECTION_BAD="$ROOT/test/repro/region_pool_projection_after_destroy.elisa"
 POOL_PRIMITIVE_BAD="$ROOT/test/repro/region_pool_primitive_after_destroy.elisa"
 JSON_HANDLE_BAD="$ROOT/test/repro/json_handle_after_arena_free.elisa"
@@ -139,6 +140,19 @@ for optimization in 0 2; do
         exit 1
     }
     [[ ! -e "$multi_generic_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a rejected multi-region wrapper at O$optimization" >&2; exit 1; }
+
+    generic_alias_reset_output="$WORK/generic-alias-reset-O$optimization"
+    generic_alias_reset_log="$generic_alias_reset_output.log"
+    if "$STAGE1" -emit llvm "-O$optimization" -o "$generic_alias_reset_output.ll" "$GENERIC_ALIAS_RESET_BAD" >"$generic_alias_reset_log" 2>&1; then
+        echo "destroyed view lifetime smoke: accepted a generic view after resetting an arena whose region may alias the view region at O$optimization" >&2
+        exit 1
+    fi
+    rg -Fq 'region dependency facts were invalidated by destroy of region' "$generic_alias_reset_log" || {
+        echo "destroyed view lifetime smoke: generic arena reset lost the possibly aliased view region at O$optimization" >&2
+        cat "$generic_alias_reset_log" >&2
+        exit 1
+    }
+    [[ ! -e "$generic_alias_reset_output.ll" ]] || { echo "destroyed view lifetime smoke: wrote LLVM for a generic view after possibly-aliasing arena reset at O$optimization" >&2; exit 1; }
 
     json_output="$WORK/json-handle-O$optimization"
     json_log="$json_output.log"

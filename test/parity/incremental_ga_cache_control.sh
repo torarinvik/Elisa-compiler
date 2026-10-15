@@ -211,6 +211,36 @@ run_check enabled "$WORK/check.elisa" corrupt-warm permissive
 compare_without_cache_report corrupt-cold corrupt-warm
 grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/corrupt-warm.err"
 
+# Changing strictness must invalidate the cached semantic snapshot and change the
+# actual grant result for the same source, in both directions.
+cat >"$WORK/grant-mode.elisa" <<'ELISA'
+global mutable counter: i64 = 0
+
+def read_counter() -> i64:
+    return counter
+ELISA
+CACHE="$WORK/grant-mode-cache"
+mkdir -p "$CACHE"
+run_check cold "$WORK/grant-mode.elisa" grant-strict-cold
+if [[ "$(<"$WORK/grant-strict-cold.status")" == 0 ]]; then
+    echo "strict mutable-global mode accepted an ungranted read" >&2
+    exit 1
+fi
+run_check cold "$WORK/grant-mode.elisa" grant-permissive-cold permissive
+if [[ "$(<"$WORK/grant-permissive-cold.status")" != 0 ]]; then
+    echo "permissive mode rejected the mutable-global control" >&2
+    exit 1
+fi
+run_check enabled "$WORK/grant-mode.elisa" grant-strict-warm
+compare_without_cache_report grant-strict-cold grant-strict-warm
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=1 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/grant-strict-warm.err"
+run_check enabled "$WORK/grant-mode.elisa" grant-permissive-warm permissive
+compare_without_cache_report grant-permissive-cold grant-permissive-warm
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=1 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/grant-permissive-warm.err"
+run_check enabled "$WORK/grant-mode.elisa" grant-strict-return
+compare_without_cache_report grant-strict-cold grant-strict-return
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=1 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/grant-strict-return.err"
+
 CACHE="$WORK/generated-cache"
 mkdir -p "$CACHE"
 cat >"$WORK/generated.elisa" <<'ELISA'
@@ -233,4 +263,4 @@ run_check enabled "$WORK/generated.elisa" generated-warm
 compare_without_cache_report generated-cold generated-warm
 grep -Eq 'incremental-ga-cache: input=generated prior=valid matched=2 visited=2 rejected=0 ga_walks_skipped=2 published=yes' "$WORK/generated-warm.err"
 
-echo "incremental GA cache control OK: cold/warm parity, grant-only skip boundaries, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"
+echo "incremental GA cache control OK: cold/warm parity, grant-only skip boundaries, strict/permissive grant invalidation, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"

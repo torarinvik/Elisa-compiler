@@ -269,6 +269,42 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertNotEqual(third, first)
         self.assertEqual(log.read_text(), "xxxxxx")
 
+    def test_dependency_index_reuses_hashes_when_filesystem_identity_is_unchanged(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        dependency = root / "included.elisa"
+        report = root / "deps.txt"
+        index = root / "deps.json"
+        source.write_text("source\n")
+        dependency.write_text("dependency\n")
+        report.write_text(f"{source}\n{dependency}\n")
+        graph = cache.store_dependencies(index, "base", report, source)
+
+        # A cache hit only needs stat identity checks; unchanged files should not
+        # be streamed through SHA-256 again.
+        with patch("stage1_object_cache.fingerprint", side_effect=AssertionError("unexpected rehash")):
+            self.assertEqual(cache.read_dependencies(index, "base", source), graph)
+
+    def test_dependency_index_rehashes_when_filesystem_identity_changes(self):
+        root = self.source.parent
+        source = root / "root.elisa"
+        dependency = root / "included.elisa"
+        report = root / "deps.txt"
+        index = root / "deps.json"
+        source.write_text("source\n")
+        dependency.write_text("dependency\n")
+        report.write_text(f"{source}\n{dependency}\n")
+        cache.store_dependencies(index, "base", report, source)
+        previous = dependency.stat()
+        dependency.write_text("1234567890\n")
+        os.utime(dependency, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        self.assertEqual(dependency.stat().st_mtime_ns, previous.st_mtime_ns)
+        self.assertNotEqual(dependency.stat().st_ctime_ns, previous.st_ctime_ns)
+
+        with patch("stage1_object_cache.fingerprint", wraps=cache.fingerprint) as fingerprint:
+            self.assertIsNone(cache.read_dependencies(index, "base", source))
+        fingerprint.assert_called_once()
+
     def test_relative_dependency_paths_reuse_index_and_invalidate_changes(self):
         root = self.cache_project()
         compiler = root / "bin" / "fake-compiler"

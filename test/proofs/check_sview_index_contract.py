@@ -128,9 +128,9 @@ if any(compact(fragment) not in index_dispatch for fragment in required_index_di
 decimal_source = DECIMAL_PARSER.read_text()
 decimal_parser = compact(function_section(decimal_source, "parse_signed"))
 decimal_reference = compact(function_section(decimal_source, "decimal_parse_reference"))
-decimal_minus_guard = "iftext.length>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:"
+decimal_minus_guard = "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:"
 if decimal_minus_guard not in decimal_parser or decimal_minus_guard not in decimal_reference:
-    raise SystemExit("checked-decimal implementation and reference no longer use the guarded .length and [0] syntax")
+    raise SystemExit("checked-decimal implementation and reference no longer use the guarded .len and [0] syntax")
 
 find_byte = compact(function_section(runtime_text, "sview_find_byte"))
 required_find_contracts = (
