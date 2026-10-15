@@ -278,6 +278,282 @@ const frozen: i64 = 3
 def main() -> i64:
     return cold + frozen
 CASE
+run_case immutable_global_mutable_field_read 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    return state.value
+CASE
+run_case immutable_global_mutable_field_read_granted clean <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Read:
+        return state.value
+CASE
+run_case immutable_global_field_uses_declaration_scope 'accesses a global mutable binding without Global.Read' <<'CASE'
+module Owner:
+    public:
+        struct State:
+            value: mutable i64
+        global state: State = State{value: 1}
+module Consumer:
+    struct State:
+        value: i64
+    def read() -> i64:
+        return Owner::state.value
+CASE
+run_case immutable_global_readonly_alias_field clean <<'CASE'
+type Scalar = i64
+struct State:
+    value: Scalar
+global state: State = State{value: 1}
+def main() -> i64:
+    return state.value
+CASE
+run_case immutable_global_mutable_field_write 'accesses a global mutable binding without Global.Write' <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    state.value <- 2
+    return 0
+CASE
+run_case immutable_global_mutable_field_write_granted clean <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Write:
+        state.value <- 2
+    return 0
+CASE
+run_case immutable_global_parenthesized_mutable_field_read_missing 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct State:
+    value: (mutable i64)
+global state: State = State{value: 1}
+def main() -> i64:
+    return state.value
+CASE
+run_case immutable_global_parenthesized_mutable_field_read_granted clean <<'CASE'
+struct State:
+    value: (mutable i64)
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Read:
+        return state.value
+CASE
+run_case immutable_global_parenthesized_mutable_field_write_missing 'accesses a global mutable binding without Global.Write' <<'CASE'
+struct State:
+    value: (mutable i64)
+global state: State = State{value: 1}
+def main() -> i64:
+    state.value <- 2
+    return 0
+CASE
+run_case immutable_global_parenthesized_mutable_field_write_granted clean <<'CASE'
+struct State:
+    value: (mutable i64)
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Write:
+        state.value <- 2
+    return 0
+CASE
+run_case immutable_global_refined_mutable_field_read_missing 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct State:
+    value: mutable i64 where value > 0
+global state: State = State{value: 1}
+def main() -> i64:
+    return state.value
+CASE
+run_case immutable_global_refined_mutable_field_read_granted clean <<'CASE'
+struct State:
+    value: mutable i64 where value > 0
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Read:
+        return state.value
+CASE
+run_case immutable_global_refined_mutable_field_write_missing 'accesses a global mutable binding without Global.Write' <<'CASE'
+struct State:
+    value: mutable i64 where value > 0
+global state: State = State{value: 1}
+def main() -> i64:
+    state.value <- 2
+    return 0
+CASE
+run_case immutable_global_refined_mutable_field_write_granted clean <<'CASE'
+struct State:
+    value: mutable i64 where value > 0
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Write:
+        state.value <- 2
+    return 0
+CASE
+run_case immutable_global_reference_field_read_missing 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct Cell:
+    value: mutable i64
+struct Holder:
+    alias: mutable Cell&
+global mutable cell: Cell = Cell{value: 1}
+global holder: Holder = Holder{alias: &cell}
+def main() -> i64:
+    can Global.Write:
+        holder.alias.value <- 2
+    return 0
+CASE
+run_case immutable_global_reference_field_write_missing 'accesses a global mutable binding without Global.Write' <<'CASE'
+struct Cell:
+    value: mutable i64
+struct Holder:
+    alias: mutable Cell&
+global mutable cell: Cell = Cell{value: 1}
+global holder: Holder = Holder{alias: &cell}
+def main() -> i64:
+    can Global.Read:
+        holder.alias.value <- 2
+    return 0
+CASE
+run_case immutable_global_reference_field_granted clean <<'CASE'
+struct Cell:
+    value: mutable i64
+struct Holder:
+    alias: mutable Cell&
+global mutable cell: Cell = Cell{value: 1}
+global holder: Holder = Holder{alias: &cell}
+def main() -> i64:
+    can Global{Read,Write}:
+        holder.alias.value <- 2
+    return 0
+CASE
+run_case cross_module_reference_field_uses_declaration_scope 'accesses a global mutable binding without Global.Write' <<'CASE'
+module Model:
+    public:
+        struct Cell:
+            value: mutable i64
+        struct Holder:
+            alias: mutable Cell&
+        global mutable cell: Cell = Cell{value: 1}
+module Owner:
+    public:
+        struct Cell:
+            value: i64
+        global holder: Model::Holder = Model::Holder{alias: &Model::cell}
+module Consumer:
+    struct Cell:
+        value: i64
+    def write() -> void:
+        can Global.Read:
+            Owner::holder.alias.value <- 2
+CASE
+run_case inferred_cross_module_reference_field_local_missing 'accesses a global mutable binding without Global.Write' <<'CASE'
+module Model:
+    public:
+        struct Cell:
+            value: mutable i64
+        type LocalCell = mutable Cell&
+        struct Holder:
+            alias: LocalCell
+        global mutable cell: Cell = Cell{value: 1}
+module Owner:
+    public:
+        type LocalCell = i64
+        global holder: Model::Holder = Model::Holder{alias: &Model::cell}
+module Consumer:
+    type LocalCell = i64
+    def write() -> void:
+        can Global.Read:
+            alias = Owner::holder.alias
+            alias.value <- 2
+CASE
+run_case inferred_cross_module_reference_field_local_granted clean <<'CASE'
+module Model:
+    public:
+        struct Cell:
+            value: mutable i64
+        type LocalCell = mutable Cell&
+        struct Holder:
+            alias: LocalCell
+        global mutable cell: Cell = Cell{value: 1}
+module Owner:
+    public:
+        type LocalCell = i64
+        global holder: Model::Holder = Model::Holder{alias: &Model::cell}
+module Consumer:
+    type LocalCell = i64
+    def write() -> void:
+        can Global{Read,Write}:
+            alias = Owner::holder.alias
+            alias.value <- 2
+CASE
+run_case inferred_cross_module_call_reference_local_missing 'accesses a global mutable binding without Global.Write' <<'CASE'
+module Model:
+    public:
+        struct Cell:
+            value: mutable i64
+        type CellRef = mutable Cell&
+        global mutable cell: Cell = Cell{value: 1}
+        def get_ref() -> CellRef:
+            can Global{Read,Write}:
+                return &cell
+module Consumer:
+    type CellRef = i64
+    def write() -> void:
+        alias = Model::get_ref() can Global{Read,Write}
+        can Global.Read:
+            alias.value <- 2
+CASE
+run_case inferred_cross_module_call_reference_local_granted clean <<'CASE'
+module Model:
+    public:
+        struct Cell:
+            value: mutable i64
+        type CellRef = mutable Cell&
+        global mutable cell: Cell = Cell{value: 1}
+        def get_ref() -> CellRef:
+            can Global{Read,Write}:
+                return &cell
+module Consumer:
+    type CellRef = i64
+    def write() -> void:
+        alias = Model::get_ref() can Global{Read,Write}
+        can Global{Read,Write}:
+            alias.value <- 2
+CASE
+run_case immutable_global_mutable_field_local_alias_write_missing 'accesses a global mutable binding without Global.Write' <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Read:
+        reference: mutable i64& = &state.value
+        reference <- 2
+    return 0
+CASE
+run_case immutable_global_mutable_field_local_alias_read_missing 'accesses a global mutable binding without Global.Read' <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global.Write:
+        reference: mutable i64& = &state.value
+        reference <- 2
+    return 0
+CASE
+run_case immutable_global_mutable_field_local_alias_granted clean <<'CASE'
+struct State:
+    value: mutable i64
+global state: State = State{value: 1}
+def main() -> i64:
+    can Global{Read,Write}:
+        reference: mutable i64& = &state.value
+        reference <- 2
+    return 0
+CASE
 run_case parameter_shadow clean <<'CASE'
 global mutable hot: i64 = 1
 def identity(hot: i64) -> i64:
