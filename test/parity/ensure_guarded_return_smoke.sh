@@ -87,6 +87,10 @@ check_case dead_refinement $'def f(n: i64 where n > 0) -> i64:\n    ensure resul
 check_case provable_guard $'def f(n: i64) -> i64:\n    ensure result == n + 3\n    if n == 0:\n        return 3\n    return n + 3\n'
 check_case provable_rec   $'def rec(n: i64) -> i64:\n    requires n >= 0\n    ensure result == n + 2\n    decreases n\n    if n == 0:\n        return 2\n    return rec(n - 1) + 1\n'
 
+# Ordinary top-level functions must stay in the prover's declaration walk when a guarded
+# return occurs inside a captured-loop body.
+check_case top_level_captured_loop $'def choose(n: i64) -> i64:\n    ensure result == 3\n    while n > 0 |n|:\n        return 2\n    return 3\n'
+
 if [ "$failed" -ne 0 ]; then
     echo "ensure guarded-return smoke FAILED: $failed/$checked cases disagree" >&2
     exit 1
