@@ -2,6 +2,131 @@
 # Part of `module Backend` (see codegen.elisa); split out to keep each file short.
 
 extend Backend:
+    private:
+        const SCOPED_MARKER_BUCKET_COUNT: usize = 256
+        const SCOPED_MARKER_MAX_ROWS: usize = 1048576
+
+        # The module declaration and body passes both ask whether a Scoped declaration's
+        # source line carries one of these markers. Preserve source order in each bucket so
+        # duplicate (owner, line) rows resolve to the same first annotation as the old scan.
+        # The stream identity fields let a cached lookup decline to the old scan if its
+        # annotation slice changes while this index is in use.
+        struct ScopedMarkerLineIndex:
+            available: mutable bool = false
+            annotation_base: mutable uintptr = 0
+            annotation_count: mutable usize = 0
+            first_owner: mutable sview = ""
+            first_name: mutable sview = ""
+            first_line: mutable u32 = 0
+            last_owner: mutable sview = ""
+            last_name: mutable sview = ""
+            last_line: mutable u32 = 0
+            marker_rows: mutable darray[usize] = []
+            marker_lines: mutable darray[u32] = []
+            marker_kinds: mutable darray[u8] = []
+            marker_next: mutable darray[i64] = []
+            bucket_heads: mutable darray[i64] = []
+            bucket_tails: mutable darray[i64] = []
+
+        def scoped_marker_kind(owner: sview) -> u8:
+            return 1 if owner == "__impl_scope"
+            return 2 if owner == "__handler_scope"
+            return 0
+
+        def scoped_marker_bucket(kind: u8, source_line: u32) -> usize:
+            hash: mutable u64 = 14695981039346656037
+            hash <- (hash ^ kind.u64()) * 1099511628211
+            line: mutable u32 = source_line
+            for _ in 0..<4 |hash, line|:
+                hash <- (hash ^ (line % 256).u64()) * 1099511628211
+                line <- line / 256
+            return (hash % SCOPED_MARKER_BUCKET_COUNT.u64()).usize()
+
+        def build_scoped_marker_line_index(annotations: darray[Ast::EnumAnnotation]&, index: mutable ScopedMarkerLineIndex&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            index.available <- false
+            index.annotation_base <- 0
+            index.annotation_count <- annotations.count
+            index.first_owner <- ""
+            index.first_name <- ""
+            index.first_line <- 0
+            index.last_owner <- ""
+            index.last_name <- ""
+            index.last_line <- 0
+            index.marker_rows <- []
+            index.marker_lines <- []
+            index.marker_kinds <- []
+            index.marker_next <- []
+            index.bucket_heads <- []
+            index.bucket_tails <- []
+            # Keep the exact linear lookup as the overflow/unavailable path.
+            return if annotations.count > SCOPED_MARKER_MAX_ROWS
+            if annotations.count > 0:
+                can Unsafe.PointerCast:
+                    index.annotation_base <- (&annotations[0]).cast[uintptr]
+                index.first_owner <- annotations[0].owner
+                index.first_name <- annotations[0].name
+                index.first_line <- annotations[0].line
+                last: usize = annotations.count - 1
+                index.last_owner <- annotations[last].owner
+                index.last_name <- annotations[last].name
+                index.last_line <- annotations[last].line
+            for annotation_index in 0..<annotations.count |annotations, index|:
+                kind: u8 = scoped_marker_kind(annotations[annotation_index].owner)
+                continue if kind == 0
+                if index.bucket_heads.count == 0:
+                    for _ in 0..<SCOPED_MARKER_BUCKET_COUNT |index|:
+                        index.bucket_heads.push(-1)
+                        index.bucket_tails.push(-1)
+                bucket: usize = scoped_marker_bucket(kind, annotations[annotation_index].line)
+                marker_index: usize = index.marker_rows.count
+                index.marker_rows.push(annotation_index)
+                index.marker_lines.push(annotations[annotation_index].line)
+                index.marker_kinds.push(kind)
+                index.marker_next.push(-1)
+                prior: i64 = index.bucket_tails[bucket]
+                if prior >= 0:
+                    index.marker_next[prior.usize()] <- marker_index.i64()
+                else:
+                    index.bucket_heads[bucket] <- marker_index.i64()
+                index.bucket_tails[bucket] <- marker_index.i64()
+            index.available <- true
+
+        def scoped_marker_index_is_current(annotations: darray[Ast::EnumAnnotation]&, index: ScopedMarkerLineIndex&) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            false return if not index.available
+            false return if annotations.count != index.annotation_count
+            false return if index.marker_rows.count != index.marker_lines.count or index.marker_rows.count != index.marker_kinds.count or index.marker_rows.count != index.marker_next.count
+            if index.marker_rows.count > 0:
+                false return if index.bucket_heads.count != SCOPED_MARKER_BUCKET_COUNT or index.bucket_tails.count != SCOPED_MARKER_BUCKET_COUNT
+            else:
+                false return if index.bucket_heads.count != 0 or index.bucket_tails.count != 0
+            if annotations.count == 0:
+                return index.annotation_base == 0
+            base: mutable uintptr = 0
+            can Unsafe.PointerCast:
+                base <- (&annotations[0]).cast[uintptr]
+            false return if base != index.annotation_base
+            false return if annotations[0].owner != index.first_owner or annotations[0].name != index.first_name or annotations[0].line != index.first_line
+            last: usize = annotations.count - 1
+            false return if annotations[last].owner != index.last_owner or annotations[last].name != index.last_name or annotations[last].line != index.last_line
+            return true
+
+        # Return the first source annotation for (owner, line), matching the former scan.
+        # If the index is absent or its stream fingerprint changed, use that scan directly.
+        def scoped_marker_first(annotations: darray[Ast::EnumAnnotation]&, index: ScopedMarkerLineIndex&, owner: sview, source_line: u32) -> i64 can[Abort.Panic, Unsafe.PointerCast]:
+            if not scoped_marker_index_is_current(annotations, index):
+                for annotation_index in 0..<annotations.count |annotations, owner, source_line|:
+                    annotation_index.i64() return if annotations[annotation_index].owner == owner and annotations[annotation_index].line == source_line
+                return -1
+            kind: u8 = scoped_marker_kind(owner)
+            return -1 if kind == 0 or index.marker_rows.count == 0
+            bucket: usize = scoped_marker_bucket(kind, source_line)
+            marker_index: mutable i64 = index.bucket_heads[bucket]
+            while marker_index >= 0 |marker_index, index, kind, source_line|:
+                marker: usize = marker_index.usize()
+                return index.marker_rows[marker].i64() if index.marker_kinds[marker] == kind and index.marker_lines[marker] == source_line
+                marker_index <- index.marker_next[marker]
+            return -1
+
     public:
 
 
@@ -13,13 +138,15 @@ extend Backend:
                 variadic_annotations: mutable darray[Ast::EnumAnnotation] = []
                 template_lines: GenericDeclarationLines = generic_declaration_lines(file)
                 lemma_names: darray[sview] = lemma_function_names(file.enum_annotations)
+                scoped_marker_index: mutable ScopedMarkerLineIndex = ScopedMarkerLineIndex{}
+                scoped_marker_index_ready: mutable bool = false
                 for annotation in file.enum_annotations |variadic_annotations|:
                     variadic_annotations.push(annotation) if annotation.owner == "__variadic"
-                for declaration_index in 0..<top.count |fns, structs, generics, m, ctx, file, variadic_annotations, template_lines, lemma_names|:
+                for declaration_index in 0..<top.count |fns, structs, generics, m, ctx, file, variadic_annotations, template_lines, lemma_names, scoped_marker_index, scoped_marker_index_ready|:
                     declaration: Decl = top[declaration_index]
                     if declaration_is_module(declaration):
                         module_name: sview = module_name_of(declaration)
-                        for nested_index in 0..<declaration_module_count(declaration) |fns, structs, generics, m, ctx, module_name, file, declaration, variadic_annotations, template_lines|:
+                        for nested_index in 0..<declaration_module_count(declaration) |fns, structs, generics, m, ctx, module_name, file, declaration, variadic_annotations, template_lines, scoped_marker_index, scoped_marker_index_ready|:
                             nested: Decl = declaration_module_at(declaration, nested_index)
                             # Module-scoped externs must be registered before call bodies.
                             # Keep the source owner distinct from the libc linker spelling.
@@ -44,13 +171,11 @@ extend Backend:
                             # functions of an untaken branch is exactly what flattening exists
                             # to prevent.
                             if nested is Decl.Scoped(impl_body, impl_line):
-                                impl_is_conformance: mutable bool = false
-                                handler_is_scoped: mutable bool = false
-                                # Collect both scope tags while traversing the annotation table once.
-                                for scope_annotation in file.enum_annotations |impl_is_conformance, handler_is_scoped, impl_line|:
-                                    impl_is_conformance <- true if scope_annotation.owner == "__impl_scope" and scope_annotation.line == impl_line.line
-                                    handler_is_scoped <- true if scope_annotation.owner == "__handler_scope" and scope_annotation.line == impl_line.line
-                                if impl_is_conformance:
+                                if not scoped_marker_index_ready:
+                                    build_scoped_marker_line_index(file.enum_annotations, scoped_marker_index)
+                                    scoped_marker_index_ready <- true
+                                impl_marker: i64 = scoped_marker_first(file.enum_annotations, scoped_marker_index, "__impl_scope", impl_line.line)
+                                if impl_marker >= 0:
                                     for impl_member_index in 0..<impl_body.count |fns, structs, generics, m, ctx, module_name, file, impl_body, variadic_annotations, template_lines|:
                                         impl_member: Decl = impl_body[impl_member_index]
                                         continue if function_name_of(impl_member) == ""
@@ -60,7 +185,8 @@ extend Backend:
                                             _ = impl_member_ok
                                         else:
                                             record_declined_function(function_name_of(impl_member), m, ctx)
-                                if handler_is_scoped:
+                                handler_marker: i64 = scoped_marker_first(file.enum_annotations, scoped_marker_index, "__handler_scope", impl_line.line)
+                                if handler_marker >= 0:
                                     for handler_member in impl_body |fns, structs, generics, m, ctx, module_name, file, variadic_annotations, template_lines|:
                                         continue if function_name_of(handler_member) == ""
                                         continue if generic_declaration_line_present(template_lines, function_line_of(handler_member)) and not (declaration_is_generated_typestate(file, function_name_of(handler_member), function_line_of(handler_member)) can Global{Read,Write})
@@ -98,6 +224,8 @@ extend Backend:
                 emitted_count: mutable i64 = 0
                 template_lines: GenericDeclarationLines = generic_declaration_lines(file)
                 lemma_names: darray[sview] = lemma_function_names(file.enum_annotations)
+                scoped_marker_index: mutable ScopedMarkerLineIndex = ScopedMarkerLineIndex{}
+                scoped_marker_index_ready: mutable bool = false
                 # Whether this module is a PROGRAM. Read from the declare pass's FnTable rather than
                 # threaded through a parameter, so no signature changes and no region reparameterizing.
                 module_has_main: bool = force_program or function_index_of(fns, "", "main") >= 0
@@ -107,11 +235,11 @@ extend Backend:
                 # Normal program emission still gives its private functions internal linkage.
                 linkage_as_program: bool = module_has_main and not force_program
                 source_defines_default_runtime: bool = declarations_define_default_runtime(top)
-                for declaration_index in 0..<top.count |emitted_count, main_ok, module_has_main, dangling, source_defines_default_runtime, fns, structs, m, ctx, builder, file, generics, runtime, template_lines, lemma_names|:
+                for declaration_index in 0..<top.count |emitted_count, main_ok, module_has_main, dangling, source_defines_default_runtime, fns, structs, m, ctx, builder, file, generics, runtime, template_lines, lemma_names, scoped_marker_index, scoped_marker_index_ready|:
                     declaration: Decl = top[declaration_index]
                     if declaration_is_module(declaration):
                         module_name: sview = module_name_of(declaration)
-                        for nested_decl_index in 0..<declaration_module_count(declaration) |emitted_count, dangling, module_has_main, source_defines_default_runtime, fns, structs, m, ctx, builder, module_name, file, generics, runtime, declaration, template_lines|:
+                        for nested_decl_index in 0..<declaration_module_count(declaration) |emitted_count, dangling, module_has_main, source_defines_default_runtime, fns, structs, m, ctx, builder, module_name, file, generics, runtime, declaration, template_lines, scoped_marker_index, scoped_marker_index_ready|:
                             nested: Decl = declaration_module_at(declaration, nested_decl_index)
                             # The DEFINITION half of the impl-in-module fix. This walk skips a
                             # nameless declaration exactly as declare_module_functions did, so
@@ -125,14 +253,11 @@ extend Backend:
                             # emits its body. Any one alone changes nothing observable, which
                             # is what made the first attempt look like a dead end.
                             if nested is Decl.Scoped(impl_body, impl_line):
-                                impl_is_conformance: mutable bool = false
-                                handler_is_scoped: mutable bool = false
-                                # These tags share the same scope line and annotation table.
-                                # Collect both in one pass; emission order below stays unchanged.
-                                for scope_annotation in file.enum_annotations |impl_is_conformance, handler_is_scoped, impl_line|:
-                                    impl_is_conformance <- true if scope_annotation.owner == "__impl_scope" and scope_annotation.line == impl_line.line
-                                    handler_is_scoped <- true if scope_annotation.owner == "__handler_scope" and scope_annotation.line == impl_line.line
-                                if impl_is_conformance:
+                                if not scoped_marker_index_ready:
+                                    build_scoped_marker_line_index(file.enum_annotations, scoped_marker_index)
+                                    scoped_marker_index_ready <- true
+                                impl_marker: i64 = scoped_marker_first(file.enum_annotations, scoped_marker_index, "__impl_scope", impl_line.line)
+                                if impl_marker >= 0:
                                     for impl_body_index in 0..<impl_body.count |emitted_count, dangling, module_has_main, fns, structs, m, ctx, builder, module_name, file, generics, runtime, impl_body|:
                                         impl_member: Decl = impl_body[impl_body_index]
                                         impl_member_name: sview = function_name_of(impl_member)
@@ -146,7 +271,8 @@ extend Backend:
                                         strip_function_body(fns.handles[impl_member_slot.usize()]) if not impl_member_emitted
                                         record_declined_body(impl_member_name, structs, m, ctx) can Global{Read,Write} if not impl_member_emitted
                                         note_dangling_decline(impl_member_name, fns.handles[impl_member_slot.usize()], module_has_main, dangling) if not impl_member_emitted
-                                if handler_is_scoped:
+                                handler_marker: i64 = scoped_marker_first(file.enum_annotations, scoped_marker_index, "__handler_scope", impl_line.line)
+                                if handler_marker >= 0:
                                     for handler_member in impl_body |emitted_count, dangling, module_has_main, fns, structs, m, ctx, builder, module_name, file, generics, runtime, template_lines|:
                                         handler_member_name: sview = function_name_of(handler_member)
                                         continue if handler_member_name == ""
