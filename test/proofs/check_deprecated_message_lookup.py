@@ -61,7 +61,7 @@ ghost def message_of_from(names: darray[sview]&, messages: darray[sview]&, calle
     return message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far)
 '''
 expected_scan = '''
-def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: sview) -> (found: bool, message: sview) can[Abort.Panic]:
+def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: sview) -> (found: bool, message: sview):
     requires names.count == messages.count
     ensure result.found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
     ensure result.message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
@@ -71,11 +71,18 @@ def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: svi
     while probe < names.count |probe, found, message|:
         decreases names.count - probe
         invariant probe <= names.count
-        invariant message_of_from(names, messages, callee_name, probe, found, message) == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0))
-        if names[probe] == callee_name:
+        invariant message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found and message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
+        current_probe: usize = probe
+        current_found: bool = found
+        current_message: sview = message
+        if names[current_probe] == callee_name:
             found <- true
-            message <- messages[probe]
-        probe <- probe + 1
+            message <- messages[current_probe]
+        assert message_of_from(names, messages, callee_name, current_probe, current_found, current_message).found == message_of_from(names, messages, callee_name, current_probe + 1, found, message).found
+        assert message_of_from(names, messages, callee_name, current_probe, current_found, current_message).message == message_of_from(names, messages, callee_name, current_probe + 1, found, message).message
+        probe <- current_probe + 1
+        assert message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
+        assert message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
     return (found, message)
 '''
 if compact(function_section(source_text, "message_of_from")) != compact(expected_model):
