@@ -53,30 +53,15 @@ negative_text = NEGATIVE.read_text()
 
 expected_spec = '''
 ghost def first_argument_spec(arguments: darray[sview]&, arg_start: u32, arg_count: u32) -> sview:
-    ensure (arg_count == 0 or arg_start.usize() >= arguments.count) implies result == ""
-    ensure (arg_count > 0 and arg_start.usize() < arguments.count) implies result == arguments[arg_start.usize()]
-    if arg_count == 0:
-        return ""
-    if arg_start.usize() >= arguments.count:
-        return ""
+    return "" if arg_count == 0 or arg_start.usize() >= arguments.count
     return arguments[arg_start.usize()]
 '''
 expected_accessor = '''
-def first_argument(arguments: darray[sview]&, arg_start: u32, arg_count: u32) -> sview can[Abort.Panic]:
-    ensure result == first_argument_spec(arguments, arg_start, arg_count)
-    ensure (arg_count == 0 or arg_start.usize() >= arguments.count) implies result == ""
-    ensure (arg_count > 0 and arg_start.usize() < arguments.count) implies result == arguments[arg_start.usize()]
+def first_argument(arguments: darray[sview @source]&, arg_start: u32, arg_count: u32) -> sview @source can[Abort.Panic]:
+    ensure (arg_count > 0 and arg_start.usize() < arguments.count) or result == ""
+    ensure (arg_count == 0 or arg_start.usize() >= arguments.count) or result == arguments[arg_start.usize()]
     can Abort.Panic:
-        if arg_count == 0:
-            assert first_argument_spec(arguments, arg_start, arg_count) == ""
-            return ""
-        if arg_start.usize() >= arguments.count:
-            assert first_argument_spec(arguments, arg_start, arg_count) == ""
-            return ""
-        assert arg_count > 0
-        assert arg_start.usize() < arguments.count
-        assert not (arg_count == 0 or arg_start.usize() >= arguments.count)
-        assert first_argument_spec(arguments, arg_start, arg_count) == arguments[arg_start.usize()]
+        return "" if arg_count == 0 or arg_start.usize() >= arguments.count
         return arguments[arg_start.usize()]
 '''
 if "moduleSemanticTypeAnnotationArgument:" not in compact(source_text):
