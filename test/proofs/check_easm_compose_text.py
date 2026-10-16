@@ -142,10 +142,14 @@ required_reference_fragments = (
     "requires cursor <= values.len and segment_start <= cursor and current >= 0",
     "decreases values.len - cursor",
     "ensure (wanted >= current and wanted - current <= easm_compose_comma_count_from(values, cursor)) implies result.valid",
+    "return ComposeSpan{start: 0, end: 0, valid: false} if wanted < current",
     "if cursor < values.len and values[cursor] != 44",
+    "assert easm_compose_comma_count_from(values, cursor) == easm_compose_comma_count_from(values, cursor + 1.usize())",
     "return easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted)",
     "EasmTextScan::trim_bounds_spec(values[segment_start:cursor])",
     "if cursor == values.len: return ComposeSpan{start: 0, end: 0, valid: false}",
+    "assert values[cursor] == 44",
+    "assert easm_compose_comma_count_from(values, cursor) == 1 + easm_compose_comma_count_from(values, cursor + 1.usize())",
     "return easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1, wanted)",
 )
 if any(compact(fragment) not in reference_body for fragment in required_reference_fragments):
