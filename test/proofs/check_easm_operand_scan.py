@@ -253,7 +253,10 @@ for required in (
     'EasmTextScan::find(trailing, ")") < trailing.len',
     "first_separator: usize = next_top_level_separator(text, start, has_address, open, close)",
     "second_separator: usize = next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
-    "return (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
+    "many_result: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
+    "return many_result",
+    "empty_result: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = (text_length, 0, text_length, text_length, false, text_length, text_length, true)",
+    "assert empty_result.start == first_operand_byte(text, EasmTextScan::first_space(text).usize())",
     "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
     "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
     "ensure result.valid and result.has_address_group implies ( forall candidate in result.start..<result.address_open: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
@@ -268,24 +271,26 @@ for required in (
 ):
     if compact(required) not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
-for tuple_value, count_value in (
-    ("start, 1, text_length, text_length, has_address, open, close, true", "1"),
-    ("start, 2, first_separator, first_separator, has_address, open, close, true", "2"),
+for tuple_value, result_name, count_value in (
+    ("start, 1, text_length, text_length, has_address, open, close, true", "single_result", "1"),
+    ("start, 2, first_separator, first_separator, has_address, open, close, true", "double_result", "2"),
     ("start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true",
-     "TOO_MANY_OPERANDS_SENTINEL"),
+     "many_result", "TOO_MANY_OPERANDS_SENTINEL"),
 ):
-    literal = f"({tuple_value})"
+    named_tuple = "(start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool)"
     for required in (
-        f"assert not ({literal}._7 and not {literal}._4) or",
-        f"assert not ({literal}._7 and {literal}._4) or",
-        f"assert not ({literal}._7 and {literal}._1 == {count_value}) or",
-        f"(forall candidate in {literal}._0..<text.len:",
-        f"(forall candidate in {literal}._0..<{literal}._5:",
-        f"(forall candidate in {literal}._5 + SCAN_STEP..<{literal}._6:",
-        f"(forall candidate in {literal}._6 + SCAN_STEP..<text.len:",
+        f"{result_name}: {named_tuple} = ({tuple_value})",
+        f"assert not {result_name}.valid or {result_name}.start == first_operand_byte(text, EasmTextScan::first_space(text).usize())",
+        f"assert not ({result_name}.valid and not {result_name}.has_address_group) or",
+        f"assert not ({result_name}.valid and {result_name}.has_address_group) or",
+        f"assert not ({result_name}.valid and {result_name}.count == {count_value}) or",
+        f"(forall candidate in {result_name}.start..<text.len:",
+        f"(forall candidate in {result_name}.start..<{result_name}.address_open:",
+        f"(forall candidate in {result_name}.address_open + SCAN_STEP..<{result_name}.address_close:",
+        f"(forall candidate in {result_name}.address_close + SCAN_STEP..<text.len:",
     ):
         if compact(required) not in scanner:
-            raise SystemExit(f"operand scan return lost its literal projection assertion: {required}")
+            raise SystemExit(f"operand scan return lost its typed-field assertion: {required}")
 first_operand_scan = compact(function_section(policy, "first_operand_byte"))
 if compact("decreases text_length - index") not in first_operand_scan or compact("invariant from <= index and index <= text_length") not in first_operand_scan:
     raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
