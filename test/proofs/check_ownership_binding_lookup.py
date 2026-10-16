@@ -144,7 +144,9 @@ required_contracts = (
     "table.ref_owner_observed_counts[owner.value.usize()] == 1.usize()",
     "if table.ref_owner_index_valid:",
     "if table.ref_binding_ids.count == 1 and table.ref_pos.count == 1",
-    "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
+    "bucket_count: u32 = table.ref_owner_counts[owner.value.usize()]",
+    "if bucket_count == 1.u32()",
+    "expected_count: usize = bucket_count.usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
     "return (false, missing) if expected_count > table.ref_pos.count",
     "return (false, missing) if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
@@ -163,6 +165,10 @@ normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
+singleton_count = normalized_lookup.index("if bucket_count == 1.u32()")
+cast_count = normalized_lookup.index("expected_count: usize = bucket_count.usize()")
+if singleton_count >= cast_count:
+    raise AssertionError("singleton lookup must branch on the raw u32 count before casting")
 if not re.search(
     r"if found:\s+assert owner\.value != INVALID_DECL_ID_VALUE\s+"
     r"assert owner\.value\.usize\(\) < table\.symbols\.count\s+"
