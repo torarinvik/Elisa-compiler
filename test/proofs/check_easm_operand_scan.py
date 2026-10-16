@@ -273,8 +273,10 @@ next_separator = compact(function_section(policy, "next_top_level_separator"))
 for required in (
     "result >= from and text[result] == ASCII_COMMA",
     "forall candidate in from..<result",
-    'prefix_comma: usize = EasmTextScan::find(prefix, ",")',
-    'suffix_comma: usize = EasmTextScan::find(suffix, ",")',
+    "while index < text_length",
+    "invariant from <= index and index <= text_length",
+    "invariant forall candidate in from..<index",
+    "return index if text[index] == ASCII_COMMA and (not has_address or index < open or index > close)",
 ):
     if compact(required) not in next_separator:
         raise SystemExit(f"top-level separator search lost its first-match contract: {required}")
