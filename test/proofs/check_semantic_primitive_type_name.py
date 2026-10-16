@@ -104,7 +104,9 @@ if compact("ensure result == (byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_N
 shape = compact(function_section(policy_text, "is_bit_width_int_shape"))
 shape_spec = "name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index]))"
 if compact("ensure result == (" + shape_spec + ")") not in shape or \
-        compact("return " + shape_spec) not in shape:
+        compact("valid_prefix: bool = name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U)") not in shape or \
+        compact("all_digits: bool = forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index])") not in shape or \
+        compact("return valid_prefix and all_digits") not in shape:
     raise SystemExit("total width-name shape no longer returns its contract-safe lexical specification")
 
 bit_width = compact(function_section(policy_text, "is_bit_width_int"))
