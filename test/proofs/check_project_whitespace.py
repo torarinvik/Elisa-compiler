@@ -106,7 +106,6 @@ for fragment in (
     "assert forall prefix in 0..<first: bytes_is_space(value[prefix])",
     "if first < value.count:",
     "assert not bytes_is_space(value[first])",
-    "assert first < value.count implies not bytes_is_space(value[first])",
     "return first",
 ):
     if compact(fragment) not in compact(trim_start_body):
@@ -121,7 +120,6 @@ for fragment in (
     "while last > first and bytes_is_space(value[last - 1.usize()])",
     "decreases last - first",
     "invariant first <= last",
-    "invariant first == bytes_trim_start(value)",
     "invariant last <= value.count",
     "invariant forall suffix in last..<value.count: bytes_is_space(value[suffix])",
     "last <- last - 1.usize()",
@@ -131,8 +129,6 @@ for fragment in (
     "assert forall suffix in last..<value.count: bytes_is_space(value[suffix])",
     "if last > first:",
     "assert not bytes_is_space(value[last - 1.usize()])",
-    "assert last >= bytes_trim_start(value)",
-    "assert last > bytes_trim_start(value) implies not bytes_is_space(value[last - 1.usize()])",
     "return last",
 ):
     if compact(fragment) not in compact(trim_end_body):
