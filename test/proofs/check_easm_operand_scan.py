@@ -247,6 +247,7 @@ for required in (
     "start: usize = first_operand_byte(text, EasmTextScan::first_space(text).usize())",
     'open_relative: usize = EasmTextScan::find(operands, "(")',
     'close_relative: usize = EasmTextScan::find(operands, ")")',
+    'if close_relative >= operands.len: return (start, 0, text_length, text_length, false, text_length, text_length, false)',
     'close_after_open: usize = EasmTextScan::find(after_open, ")")',
     'EasmTextScan::find(address_contents, "(") < address_contents.len',
     'EasmTextScan::find(trailing, "(") < trailing.len',
