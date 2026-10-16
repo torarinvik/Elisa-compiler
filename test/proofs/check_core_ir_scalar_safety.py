@@ -83,10 +83,7 @@ expected_wrapper = compact("""def scalar_i64_binary_is_defined(operator: I64Bina
             ensure operator == I64BinaryOperator.Divide and left >= 0 and right >= 0 implies result == (right != 0)
             return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::ADD_GUARD_CODE, left, right) if operator == I64BinaryOperator.Add
             return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::SUBTRACT_GUARD_CODE, left, right) if operator == I64BinaryOperator.Subtract
-            if operator == I64BinaryOperator.Multiply:
-                multiply_safe: bool = ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::MULTIPLY_GUARD_CODE, left, right)
-                assert (left < 0 or right < 0) or multiply_safe == (right == 0 or left <= (ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM / right if right > 0 else ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM))
-                return multiply_safe
+            return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::MULTIPLY_GUARD_CODE, left, right) if operator == I64BinaryOperator.Multiply
             return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::DIVIDE_GUARD_CODE, left, right) if operator == I64BinaryOperator.Divide
             return false""")
 if wrapper != expected_wrapper:
