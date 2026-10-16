@@ -44,7 +44,14 @@ negative = NEGATIVE.read_text()
 if "const ASCII_DIGIT_ZERO: u8 = 48" not in source or "const ASCII_DIGIT_NINE: u8 = 57" not in source or "const ASCII_MINUS: u8 = 45" not in source:
     raise SystemExit("production ASCII digit boundaries changed")
 parse_signed = compact(function_section(source, "parse_signed"))
-if "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE" not in parse_signed:
+legacy_digit_rejection = "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE"
+checked_digit_rejection = compact("""
+    if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE:
+        assert not reference.valid
+        assert reference.value == 0
+        return (false, 0)
+""")
+if legacy_digit_rejection not in parse_signed and checked_digit_rejection not in parse_signed:
     raise SystemExit("production parser no longer rejects bytes outside the decimal digit interval")
 if parse_signed.count("digit:i64=(byte-ASCII_DIGIT_ZERO).i64()") != 1:
     raise SystemExit("production parser no longer maps digits by subtracting ASCII_DIGIT_ZERO")
