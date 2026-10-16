@@ -53,12 +53,8 @@ if "vro_sort_rows(origin_rows)" not in consumer:
 
 required_source = (
     "ghost def vro_text_compare_reference_from(",
-    "ghost def vro_text_compare_prefix_preserves(",
     "requires position <= left.len and position <= right.len",
     "decreases (left.len if left.len < right.len else right.len) - position",
-    "ensure vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
-    "assert left[previous] == right[previous]",
-    "assert vro_text_compare_reference_from(left, right, previous) == vro_text_compare_reference_from(left, right, position)",
     "if left[position] < right[position]:",
     "if left[position] > right[position]:",
     "assert vro_text_compare_reference_from(left, right, position) == VRO_COMPARE_LESS",
@@ -69,17 +65,19 @@ required_source = (
     "ensure vro_text_compare_reference_from(left, right, position) == -vro_text_compare_reference_from(right, left, position)",
     "assert vro_text_compare_reference_from(left, right, position) == vro_text_compare_reference_from(left, right, position + VRO_BYTE_STEP)",
     "assert vro_text_compare_reference_from(right, left, position) == vro_text_compare_reference_from(right, left, position + VRO_BYTE_STEP)",
+    "next_result: bool = vro_text_compare_reference_swap(left, right, position + VRO_BYTE_STEP)",
+    "assert vro_text_compare_reference_from(left, right, position) == -vro_text_compare_reference_from(right, left, position)",
     "invariant position <= shared",
-    "invariant forall prefix_index in VRO_FIRST_BYTE_POSITION..<position: left[prefix_index] == right[prefix_index]",
-    "invariant vro_text_compare_prefix_preserves(left, right, position)",
-    "assert forall prefix_index in VRO_FIRST_BYTE_POSITION..<position + VRO_BYTE_STEP: left[prefix_index] == right[prefix_index]",
-    "assert vro_text_compare_prefix_preserves(left, right, shared)",
-    "assert vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, shared)",
+    "while position < shared |position, left, right, shared|:",
+    "invariant vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
+    "assert vro_text_compare_reference_from(left, right, position) == vro_text_compare_reference_from(left, right, position + VRO_BYTE_STEP)",
+    "assert position == shared",
+    "assert vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
     "assert shared == left_length",
-    "assert vro_text_compare_reference_from(left, right, shared) == VRO_COMPARE_LESS",
+    "assert vro_text_compare_reference_from(left, right, position) == VRO_COMPARE_LESS",
     "assert shared == right_length",
-    "assert vro_text_compare_reference_from(left, right, shared) == VRO_COMPARE_GREATER",
-    "assert vro_text_compare_reference_from(left, right, shared) == VRO_COMPARE_EQUAL",
+    "assert vro_text_compare_reference_from(left, right, position) == VRO_COMPARE_GREATER",
+    "assert vro_text_compare_reference_from(left, right, position) == VRO_COMPARE_EQUAL",
     "rows.count / VRO_ROW_WIDTH",
     "middle * VRO_ROW_WIDTH",
     "row + VRO_ROW_FIELD_OFFSET >= rows.count",
@@ -88,7 +86,7 @@ required_source = (
     "sorted: mutable darray[sview @source] = [VRO_SORTED_MARKER, \"\", \"\", \"\", \"\"]",
 )
 if not all(fragment in source for fragment in required_source):
-    raise SystemExit("production text comparator lost its recursive specification or prefix proof invariant")
+    raise SystemExit("production text comparator lost its recursive specification or reference cursor invariant")
 constant_source = CONSTANTS.read_text()
 required_constants = (
     "const VRO_COMPARE_LESS: i32 = -1",
