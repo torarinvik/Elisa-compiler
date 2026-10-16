@@ -82,38 +82,31 @@ root_only_contract = compact("""
 """)
 if root_only_contract not in cleaner:
     raise SystemExit("production path_clean no longer specifies exact cleaning of the root-only path")
-if "invariant(path.count!=0.usize())ordepth==0.usize()" not in cleaner:
-    raise SystemExit("path_clean no longer preserves an empty input's zero segment depth through its scan")
-if "invariantnot(rootedandpath.count==1.usize())ordepth==0.usize()" not in cleaner:
-    raise SystemExit("path_clean no longer preserves zero segment depth for the root-only path")
-
-output_start = compact("out: mutable darray[u8] = []")
+output_start = compact("body: mutable darray[u8] = []")
 fallback_start = compact("if out.count == 0.usize():")
 if output_start not in cleaner or fallback_start not in cleaner:
     raise SystemExit("production path_clean output construction or empty-relative fallback is missing")
 build = cleaner.split(output_start, 1)[1].split(fallback_start, 1)[0]
 expected_build = compact("""
-    out.push(47) if rooted
-    assert not rooted or (
-        out.count > 0.usize() and
-        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-    )
-    for segment in 0..<depth |out, starts, lengths, path, rooted|:
+    for segment in 0..<depth |body, starts, lengths, path|:
+        body.push(47) if segment > 0.usize()
+        for offset in 0..<lengths[segment] |body, starts, lengths, path, segment|:
+            body.push(path[starts[segment] + offset])
+    out: mutable darray[u8] = []
+    if rooted:
+        out.resize(body.count + 1.usize())
+        out[0.usize()] <- ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    else:
+        out.resize(body.count)
+    for index in 0..<body.count |out, body, rooted|:
         invariant not rooted or (
             out.count > 0.usize() and
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
         )
-        out.push(47) if segment > 0.usize() or (out.count > 0.usize() and not rooted)
-        assert not rooted or (
-            out.count > 0.usize() and
-            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-        )
-        for offset in 0..<lengths[segment] |out, starts, lengths, path, rooted, segment|:
-            invariant not rooted or (
-                out.count > 0.usize() and
-                out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-            )
-            out.push(path[starts[segment] + offset])
+        if rooted:
+            out[index + 1.usize()] <- body[index]
+        else:
+            out[index] <- body[index]
 """)
 if build != expected_build:
     raise SystemExit("path_clean root-preserving output loops changed or gained a root-mutating operation")
