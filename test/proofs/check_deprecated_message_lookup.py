@@ -88,8 +88,8 @@ def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: svi
         assert message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
         assert message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
     assert probe == names.count
-    assert (found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-    assert (found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
+    assert found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
+    assert message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
     return (found, message)
 '''
 if compact(function_section(source_text, "message_of_from")) != compact(expected_model):
