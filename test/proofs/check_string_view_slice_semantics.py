@@ -60,15 +60,11 @@ slice_body = compact(function_section(runtime_text, "string_view_slice"))
 required_slice_steps = (
     'empty:sview=sview("",0,0)',
     "emptyreturnifview.len<0",
-    "emptyreturnifview.len==0",
-    "view_len:usize=view.len.usize()",
-    "returnemptyifview_len.i64()!=view.len",
-    "lo:mutablei64=startifstart>0else0",
-    "hi:mutablei64=endifend>=0elseview.len",
-    "lo<-view.leniflo>view.len",
-    "hi<-view.lenifhi>view.len",
-    "hi<-loifhi<lo",
-    "trustedUnsafe.PointerCast:returnStringView{data:view.data+lo.usize(),len:hi-lo}",
+    "emptyreturnifview.len.usize().i64()!=view.len",
+    "low:i64=string_view_clamped_start(view.len,start)",
+    "length:i64=string_view_clamped_length(view.len,low,end)",
+    "returnemptyiflength==0",
+    "trustedUnsafe.PointerCast:returnStringView{data:view.data+low.usize(),len:length}",
 )
 slice_positions = [slice_body.find(step) for step in required_slice_steps]
 if any(position < 0 for position in slice_positions) or slice_positions != sorted(slice_positions):
@@ -99,6 +95,24 @@ required_model_steps = (
 )
 if any(any(step not in model for step in required_model_steps) for model in model_texts):
     raise SystemExit("slice reference model lost a bound, default-end, clamp, or ordering law")
+if "string_view_slice_bounds(view.len, start, end)" not in positive_text \
+        or "string_view_slice_bounds(view.len, start, end)" not in negative_text:
+    raise SystemExit("slice proofs no longer bind to the reference bounds model")
+start_helper = compact(function_section(runtime_text, "string_view_clamped_start"))
+length_helper = compact(function_section(runtime_text, "string_view_clamped_length"))
+required_start_contracts = (
+    "requires length >= 0",
+    "ensure result == (start if start > 0 and start <= length else length if start > length else 0)",
+    "ensure result >= 0 and result <= length",
+)
+required_length_contracts = (
+    "requires length >= 0 and low >= 0 and low <= length",
+    "ensure result == (length if end < 0 else low if end < low else end if end <= length else length) - low",
+    "ensure result >= 0 and result <= length",
+)
+if any(compact(item) not in start_helper for item in required_start_contracts) \
+        or any(compact(item) not in length_helper for item in required_length_contracts):
+    raise SystemExit("runtime slice bound helpers lost their exact clamp and extent contracts")
 
 positive_claims = {
     "a_runtime_slice_has_the_specified_clamped_extent": (

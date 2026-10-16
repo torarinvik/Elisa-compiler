@@ -85,6 +85,8 @@ if any(position < 0 for position in range_wrapper_positions) \
     raise SystemExit("by-value bounded view lost its ordered backing, range, conversion, or slice checks")
 if compact("ensure result == (buf.count > 0 and buf.items != null and buf.count <= buf.capacity and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count and start <= buf.count and count <= buf.count - start and start.i64() >= 0 and start.i64().usize() == start and count.i64() >= 0 and count.i64().usize() == count and count > 0 and start < buf.count)") not in request_predicate:
     raise SystemExit("bounded view request predicate lost a backing, extent, or representation condition")
+if not request_predicate.startswith("defbytes_view_range_ref_request_valid("):
+    raise SystemExit("bounded view request predicate must be executable so construction can branch on its full contract")
 required_contracts = (
     "ensure result.len >= 0",
     "ensure result.len == 0 or result.len == count.i64()",
@@ -104,21 +106,14 @@ if any(compact(contract) not in helper for contract in required_contracts):
     raise SystemExit("bounded view helper lost a length, fail-closed, extent, or alias contract")
 
 required_guards = (
-    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
-    "emptyreturnifbuf.count.i64()<0orbuf.count.i64().usize()!=buf.count",
-    "start>buf.countorcount>buf.count-start",
-    "emptyreturnifstart.i64()<0orstart.i64().usize()!=startorcount.i64()<0orcount.i64().usize()!=count",
-    "count==0",
+    "returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)",
     "count_signed:i64=count.i64()",
     "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
 )
 if any(guard not in helper for guard in required_guards):
     raise SystemExit("bounded view helper lost a backing, range, conversion, or guarded-address check")
-runtime_body = helper.split("canUnsafe{PointerArithmetic,RawExtern}:", 1)[-1]
-if "bytes_view_range_ref_request_valid(" in runtime_body:
-    raise SystemExit("ghost-only request predicate must not be called from executable view construction")
-if helper.find("returnemptyifstart>norcount>n-start") > helper.find("trustedUnsafe.PointerCast"):
-    raise SystemExit("requested byte extent must be checked before the helper constructs its pointer")
+if helper.find("returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)") > helper.find("trustedUnsafe.PointerCast"):
+    raise SystemExit("request predicate must be checked before the helper constructs its pointer")
 
 if {"sview_len", "sview_at"} & declarations(runtime_text):
     raise SystemExit("legacy sview length/index wrappers remain in the runtime")

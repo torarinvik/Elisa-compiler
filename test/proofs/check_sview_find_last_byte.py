@@ -94,7 +94,7 @@ required_loop_steps = (
     "invariant 0 <= i and i <= view.len",
     "invariant forall later in i..<view.len: string_view_index(view, later) != byte.i64()",
     "i <- i - 1",
-    "i return if view[i.usize()] == byte",
+    "i return if string_view_index(view, i) == byte.i64()",
     "return -1",
 )
 loop_positions = []

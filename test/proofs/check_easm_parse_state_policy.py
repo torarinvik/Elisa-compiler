@@ -122,16 +122,15 @@ range_view_contracts = (
 if any(compact(contract) not in range_view_body for contract in range_view_contracts):
     raise SystemExit("bounded view helper lost its output-length, extent, representation, or alias postcondition")
 range_view_guards = (
-    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
-    "emptyreturnifbuf.count.i64()<0orbuf.count.i64().usize()!=buf.count",
-    "emptyreturnifstart>buf.countorcount>buf.count-start",
-    "emptyreturnifstart.i64()<0orstart.i64().usize()!=startorcount.i64()<0orcount.i64().usize()!=count",
-    "emptyreturnifcount==0",
+    "returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)",
+    "count_signed:i64=count.i64()",
     "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
 )
 if any(guard not in range_view_body for guard in range_view_guards):
     raise SystemExit("bounded view helper lost a count, capacity, range, representation, or guarded pointer check")
-if range_view_body.find("emptyreturnifstart>buf.countorcount>buf.count-start") > range_view_body.find("trustedUnsafe.PointerCast"):
+if not range_view_request.startswith("defbytes_view_range_ref_request_valid("):
+    raise SystemExit("bounded view request predicate must be executable before pointer construction")
+if range_view_body.find("returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)") > range_view_body.find("trustedUnsafe.PointerCast"):
     raise SystemExit("bounded view helper must check the requested extent before pointer construction")
 
 parse_body = compact(function_section(parser_text, "parse_layout_module"))
