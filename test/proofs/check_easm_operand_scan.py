@@ -165,14 +165,11 @@ def is_aarch64_mrs_form(result_register: sview, system_register: sview) -> bool:
     if result_register == "xzr":
         return true
     if result_register.len == 2 and result_register[0] == ASCII_X:
-        digit: u8 = result_register[1]
-        return digit >= ASCII_ZERO and digit <= ASCII_NINE
+        return result_register[1] >= ASCII_ZERO and result_register[1] <= ASCII_NINE
     if result_register.len == 3 and result_register[0] == ASCII_X:
-        tens: u8 = result_register[1]
-        ones: u8 = result_register[2]
-        return ((tens == ASCII_ONE and ones >= ASCII_ZERO and ones <= ASCII_NINE) or
-            (tens == ASCII_TWO and ones >= ASCII_ZERO and ones <= ASCII_NINE) or
-            (tens == ASCII_THREE and ones == ASCII_ZERO))
+        return ((result_register[1] == ASCII_ONE and result_register[2] >= ASCII_ZERO and result_register[2] <= ASCII_NINE) or
+            (result_register[1] == ASCII_TWO and result_register[2] >= ASCII_ZERO and result_register[2] <= ASCII_NINE) or
+            (result_register[1] == ASCII_THREE and result_register[2] == ASCII_ZERO))
     return false
 """
 if compact(function_section(policy, "is_aarch64_mrs_form")) != compact(expected_mrs_form):
