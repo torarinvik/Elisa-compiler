@@ -96,22 +96,17 @@ def indexed_enum_tag_count(names: darray[sview]&, counts: darray[i64]&, name: sv
     ensure result == enum_tag_count_from(names, counts, name, 0)
     can Abort.Panic:
         scan_count: usize = names.count if names.count < counts.count else counts.count
-        cursor: mutable usize = 0
-        for index in 0..<scan_count |names, counts, cursor|:
-            invariant cursor == index
-            invariant enum_tag_count_from(names, counts, name, cursor) == enum_tag_count_from(names, counts, name, 0)
+        for index in 0..<scan_count |names, counts|:
+            invariant enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, 0)
             if names[index] == name:
-                assert enum_tag_count_from(names, counts, name, cursor) == counts[index]
+                assert enum_tag_count_from(names, counts, name, index) == counts[index]
                 return counts[index]
             assert names[index] != name
-            next_cursor: usize = cursor + 1
-            assert next_cursor == index + 1
-            assert next_cursor <= names.count and next_cursor <= counts.count
-            assert enum_tag_count_from(names, counts, name, cursor) == enum_tag_count_from(names, counts, name, next_cursor)
-            cursor <- next_cursor
-        assert cursor == scan_count
+            next_index: usize = index + 1
+            assert next_index <= names.count and next_index <= counts.count
+            assert enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, next_index)
         assert scan_count == names.count or scan_count == counts.count
-        assert enum_tag_count_from(names, counts, name, cursor) == 0
+        assert enum_tag_count_from(names, counts, name, scan_count) == 0
         return 0
 '''
 if compact_code(function_section(lookup_text, "indexed_enum_tag_count")) != compact_code(expected_lookup):
