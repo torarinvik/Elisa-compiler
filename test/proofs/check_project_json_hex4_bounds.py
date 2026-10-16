@@ -54,10 +54,13 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
 
 hex4 = compact(function_section(source, "json_hex4"))
 hex4_steps = (
-    "foroffsetin0..<4|value,data,position|:",
+    "offset:mutableusize=0",
+    "whileoffset<4.usize()|offset,value,data,position|:",
+    "decreases4.usize()-offset",
     "digit:i64=json_hex_digit(json_at(data,position+offset.usize()))",
     "-1returnifdigit<0",
     "value<-value*16+digit",
+    "offset<-offset+1.usize()",
     "returnvalue",
 )
 positions = [hex4.find(step) for step in hex4_steps]
