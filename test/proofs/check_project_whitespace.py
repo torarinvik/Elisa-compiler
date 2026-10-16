@@ -106,6 +106,7 @@ for fragment in (
     "assert forall prefix in 0..<first: bytes_is_space(value[prefix])",
     "if first < value.count:",
     "assert not bytes_is_space(value[first])",
+    "assert first < value.count implies not bytes_is_space(value[first])",
     "return first",
 ):
     if compact(fragment) not in compact(trim_start_body):
