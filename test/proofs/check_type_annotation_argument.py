@@ -60,8 +60,7 @@ expected_accessor = '''
 def first_argument(arguments: darray[sview @source]&, arg_start: u32, arg_count: u32) -> sview @source can[Abort.Panic]:
     ensure result == ("" if arg_count == 0 or arg_start.usize() >= arguments.count else arguments[arg_start.usize()])
     can Abort.Panic:
-        return "" if arg_count == 0 or arg_start.usize() >= arguments.count
-        return arguments[arg_start.usize()]
+        return "" if arg_count == 0 or arg_start.usize() >= arguments.count else arguments[arg_start.usize()]
 '''
 if "moduleSemanticTypeAnnotationArgument:" not in compact(source_text):
     raise SystemExit("annotation argument accessor moved outside its source-linked module")
