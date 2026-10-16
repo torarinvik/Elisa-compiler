@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -10,11 +11,15 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true")
+args = argument_parser.parse_args()
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POLICY = ROOT / "src/semantic/primitive_type_name_policy.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
@@ -98,37 +103,35 @@ if compact("ensure result == (byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_N
 
 shape = compact(function_section(policy_text, "is_bit_width_int_shape"))
 shape_spec = "name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index]))"
-if compact("ensure result == (" + shape_spec + ")") not in shape or \
-        compact("return (" + shape_spec + ")") not in shape:
+if compact("ensure result == (" + shape_spec + ")") not in shape or any(
+        compact(step) not in shape for step in (
+            "return false if name.len < MIN_INT_NAME_LENGTH",
+            "lead: u8 = name[INT_LEAD_INDEX]",
+            "return false if lead != ASCII_LOWER_I and lead != ASCII_LOWER_U",
+            "return forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index])",
+        )):
     raise SystemExit("total width-name shape no longer provides a contract-safe lexical specification")
 
 bit_width = compact(function_section(policy_text, "is_bit_width_int"))
 for required in (
     "ensure result == is_bit_width_int_shape(name)",
-    "prefix_is_integer: bool = lead == ASCII_LOWER_I or lead == ASCII_LOWER_U",
-    "while index < length |all_digits, index, length, name|:",
-    "decreases length - index",
-    "invariant index >= INT_PREFIX_LENGTH",
-    "invariant index <= length",
-    "invariant all_digits == (forall checked_index in INT_PREFIX_LENGTH..<index: is_ascii_digit(name[checked_index]))",
-    "all_digits <- false if not is_ascii_digit(name[index])",
-    "index <- index + INDEX_STEP",
+    "return is_bit_width_int_shape(name)",
 ):
     if compact(required) not in bit_width:
-        raise SystemExit(f"bit-width spelling checker lost its proved loop condition: {required}")
+        raise SystemExit(f"bit-width spelling checker lost its contract-bound specification: {required}")
 
 primitive = function_section(policy_text, "is_primitive_type")
 if match_literals(primitive, "primitive type policy", "is_bit_width_int(name)") != list(fixed_names):
     raise SystemExit("primitive type match differs from the ordered closed source-level set")
-if compact("ensure result == (when name: " + " | ".join(f'"{name}"' for name in fixed_names) +
-            " -> true _ -> is_bit_width_int_shape(name))") not in compact(primitive):
+if compact("ensure when name: " + " | ".join(f'"{name}"' for name in fixed_names) +
+            " -> result == true _ -> result == is_bit_width_int_shape(name)") not in compact(primitive):
     raise SystemExit("primitive type contract differs from the production fixed-name match")
 
 builtin_scalar = function_section(policy_text, "is_builtin_scalar_type_name")
 if match_literals(builtin_scalar, "builtin scalar type policy", "is_bit_width_int(name)") != list(builtin_scalar_names):
     raise SystemExit("builtin scalar match differs from the exact Stage0 shadow-warning name set")
-if compact("ensure result == (when name: " + " | ".join(f'"{name}"' for name in builtin_scalar_names) +
-            " -> true _ -> is_bit_width_int_shape(name))") not in compact(builtin_scalar):
+if compact("ensure when name: " + " | ".join(f'"{name}"' for name in builtin_scalar_names) +
+            " -> result == true _ -> result == is_bit_width_int_shape(name)") not in compact(builtin_scalar):
     raise SystemExit("builtin scalar postcondition differs from its closed match policy")
 
 semantic = SEMANTIC.read_text()
@@ -145,7 +148,8 @@ def is_primitive_type(name: sview) -> bool:
         return SemanticPrimitiveTypeName::is_primitive_type(name)
 """):
     raise SystemExit("struct-layout resolution no longer delegates primitive classification to the proved policy")
-if compact("false return if is_primitive_type(name)") not in compact(function_section(RESOLVE.read_text(), "is_unresolved_type")):
+unresolved_type = compact(function_section(RESOLVE.read_text(), "is_unresolved_type"))
+if compact("return false if: name.len == 1 is_primitive_type(name) is_registered_type(name, table)") not in unresolved_type:
     raise SystemExit("unresolved-type classification no longer consumes the proved primitive-name policy")
 shadow_walk = compact(function_section(SHADOW_CHECK.read_text(), "def_shadows_builtin_walk"))
 if compact('if SemanticPrimitiveTypeName::is_builtin_scalar_type_name(function_name)') not in shadow_walk:
@@ -176,6 +180,10 @@ for path, expected, label in ((POSITIVE, positive_names, "positive"), (NEGATIVE,
 if 'include "../../src/semantic/primitive_type_name_policy.elisa"' not in POSITIVE.read_text() or \
         'include "./semantic_primitive_type_name.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("positive and negative proofs must include the production policy and each other")
+
+if args.source_only:
+    print(f"source_bound=True positive={len(positive_names)} false_controls={len(negative_names)}")
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)
