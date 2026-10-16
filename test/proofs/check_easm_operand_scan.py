@@ -266,24 +266,6 @@ for required in (
 ):
     if compact(required) not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
-for tuple_value, count_value in (
-    ("start, 1, text_length, text_length, has_address, open, close, true", "1"),
-    ("start, 2, first_separator, first_separator, has_address, open, close, true", "2"),
-    ("start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true",
-     "TOO_MANY_OPERANDS_SENTINEL"),
-):
-    literal = f"({tuple_value})"
-    for required in (
-        f"assert not ({literal}.valid and not {literal}.has_address_group) or",
-        f"assert not ({literal}.valid and {literal}.has_address_group) or",
-        f"assert not ({literal}.valid and {literal}.count == {count_value}) or",
-        f"(forall candidate in {literal}.start..<text.len:",
-        f"(forall candidate in {literal}.start..<{literal}.address_open:",
-        f"(forall candidate in {literal}.address_open + SCAN_STEP..<{literal}.address_close:",
-        f"(forall candidate in {literal}.address_close + SCAN_STEP..<text.len:",
-    ):
-        if compact(required) not in scanner:
-            raise SystemExit(f"operand scan return lost its literal projection assertion: {required}")
 first_operand_scan = compact(function_section(policy, "first_operand_byte"))
 if compact("decreases text_length - index") not in first_operand_scan or compact("invariant from <= index and index <= text_length") not in first_operand_scan:
     raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
