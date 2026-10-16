@@ -58,7 +58,7 @@ ghost def first_argument_spec(arguments: darray[sview]&, arg_start: u32, arg_cou
 '''
 expected_accessor = '''
 def first_argument(arguments: darray[sview @source]&, arg_start: u32, arg_count: u32) -> sview @source can[Abort.Panic]:
-    ensure (arg_count > 0 and arg_start.usize() < arguments.count) or result == ""
+    ensure not (arg_count == 0 or arg_start.usize() >= arguments.count) or result == ""
     ensure (arg_count == 0 or arg_start.usize() >= arguments.count) or result == arguments[arg_start.usize()]
     can Abort.Panic:
         return "" if arg_count == 0 or arg_start.usize() >= arguments.count
