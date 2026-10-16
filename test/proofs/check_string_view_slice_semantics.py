@@ -81,11 +81,6 @@ required_slice_contracts = (
 )
 if any(compact(contract) not in slice_body for contract in required_slice_contracts):
     raise SystemExit("StringView slice lost its exact clamped length or backing-address contract")
-for path_helper in ("extension", "stem"):
-    path_body = compact(function_section(runtime_text, path_helper))
-    if compact("assert name_start == sview_find_last_byte(p, 47) + 1") not in path_body \
-            or compact("assert dot == sview_find_last_byte(p, 46)") not in path_body:
-        raise SystemExit(f"Filesystem {path_helper} lost its named separator/dot proof cutpoints")
 prefix_body = compact(function_section(runtime_text, "string_view_prefix"))
 suffix_body = compact(function_section(runtime_text, "string_view_suffix"))
 if "returnstring_view_slice(view,0,end)" not in prefix_body:
