@@ -53,7 +53,12 @@ negative_text = NEGATIVE.read_text()
 
 expected_spec = '''
 ghost def first_argument_spec(arguments: darray[sview]&, arg_start: u32, arg_count: u32) -> sview:
-    return "" if arg_count == 0 or arg_start.usize() >= arguments.count
+    ensure (arg_count == 0 or arg_start.usize() >= arguments.count) implies result == ""
+    ensure (arg_count > 0 and arg_start.usize() < arguments.count) implies result == arguments[arg_start.usize()]
+    if arg_count == 0:
+        return ""
+    if arg_start.usize() >= arguments.count:
+        return ""
     return arguments[arg_start.usize()]
 '''
 expected_accessor = '''
