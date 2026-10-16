@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import argparse
 from pathlib import Path
 import re
 import subprocess
@@ -10,7 +11,11 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = ROOT.parent / "elisa-proof"
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true",
+                    help="check source and fixture bindings without proof-product replay")
+ARGS = parser.parse_args()
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 from proof_product_gate import require_current_product, source_include_closure
@@ -25,12 +30,16 @@ SENTINEL_SOURCE = ROOT / "src/semantic/symbols_hash_index.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
-manifest = require_current_product(BIN, PROVER)
-binary_digest = hashlib.sha256(BIN.read_bytes()).hexdigest()
-compiler_head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
-                               check=True, capture_output=True, text=True).stdout.strip()
-if manifest.get("compiler", {}).get("source_revision") != compiler_head:
-    raise SystemExit("proof executable was built against a different compiler revision")
+manifest = {}
+binary_digest = ""
+compiler_head = ""
+if not ARGS.source_only:
+    manifest = require_current_product(BIN, PROVER)
+    binary_digest = hashlib.sha256(BIN.read_bytes()).hexdigest()
+    compiler_head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                   check=True, capture_output=True, text=True).stdout.strip()
+    if manifest.get("compiler", {}).get("source_revision") != compiler_head:
+        raise SystemExit("proof executable was built against a different compiler revision")
 
 
 def struct_fields(path: Path, name: str) -> dict[str, str]:
@@ -67,6 +76,9 @@ projected_fields = {
     "ref_owner_index_valid": "mutablebool",
     "ref_owner_next": "mutabledarray[u32]",
     "ref_owner_heads": "mutabledarray[u32]",
+    "ref_owner_tails": "mutabledarray[u32]",
+    "ref_owner_counts": "mutabledarray[u32]",
+    "ref_owner_observed_counts": "mutabledarray[usize]",
 }
 for field, expected_type in projected_fields.items():
     if production_table.get(field) != expected_type:
@@ -124,6 +136,13 @@ required_contracts = (
     "not result.known implies result.binding_id.owner.value == INVALID_DECL_ID_VALUE",
     "not result.known implies result.binding_id.serial == FIRST_BINDING_SERIAL",
     "table.ref_owner_heads[owner.value.usize()].usize() != SYMBOL_INDEX_ROW_NONE.usize()",
+    "table.ref_owner_heads.count == table.ref_owner_tails.count",
+    "table.ref_owner_heads.count == table.ref_owner_counts.count",
+    "table.ref_owner_heads.count == table.ref_owner_observed_counts.count",
+    "table.ref_owner_tails[owner.value.usize()] == table.ref_owner_heads[owner.value.usize()]",
+    "table.ref_owner_counts[owner.value.usize()] == 1.u32()",
+    "table.ref_owner_observed_counts[owner.value.usize()] == 1.usize()",
+    "return (false, missing) if table.ref_owner_index_valid",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
     "and (table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].offset != position.offset or table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].end_offset != position.end_offset)) implies not result.known",
     "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
@@ -142,6 +161,11 @@ if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 4:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 1:
     raise AssertionError("ownership lookup termination measure changed; review this proof gate")
+
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "contract_count": 15,
+                      "invariant_count": 4, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
+    raise SystemExit(0)
 
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, TABLE_SOURCE, POS_SOURCE,
            LOOKUP_SOURCE, IDENTITY_SOURCE, SENTINEL_SOURCE,
