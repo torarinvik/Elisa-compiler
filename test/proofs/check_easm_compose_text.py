@@ -190,6 +190,7 @@ span_count_from_open_body = compact(function_section(text_source, "easm_compose_
 if any(compact(fragment) not in span_count_from_open_body for fragment in (
     "ensure open >= text.len implies result == 0",
     "ensure (open < text.len and easm_compose_close_offset(text, open) == 0) implies result == 0",
+    "ensure (open < text.len and easm_compose_close_offset(text, open) > 0) implies result == easm_compose_argument_count_spec(text[open + 1.usize():open + easm_compose_close_offset(text, open)])",
     "return 0 if open >= text.len",
     "return 0 if easm_compose_close_offset(text, open) == 0",
     "return easm_compose_argument_count_spec(text[open + 1.usize():open + easm_compose_close_offset(text, open)])",
@@ -197,7 +198,8 @@ if any(compact(fragment) not in span_count_from_open_body for fragment in (
     raise SystemExit("span argument count no longer uses a total open-relative return tree")
 reference_from_open_body = compact(function_section(text_source, "easm_compose_span_reference_from_open"))
 if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_from_open(text, open)) implies result.valid") not in reference_from_open_body \
-        or compact("return easm_compose_span_reference_at_bounds(text, open, close_offset, wanted)") not in reference_from_open_body:
+        or compact("return ComposeSpan{start: 0, end: 0, valid: false} if easm_compose_close_offset(text, open) == 0") not in reference_from_open_body \
+        or compact("return easm_compose_span_reference_at_bounds(text, open, easm_compose_close_offset(text, open), wanted)") not in reference_from_open_body:
     raise SystemExit("recursive span helper lost its open-relative validity contract")
 trimmed_span_body = compact(function_section(text_source, "easm_compose_trimmed_span"))
 if any(compact(fragment) not in trimmed_span_body for fragment in (
