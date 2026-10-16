@@ -157,37 +157,21 @@ def find(text: sview, needle: sview) -> usize:
     needle_length: usize = needle.len
     assert text_length == text.len
     assert needle_length == needle.len
-    if needle.len == 0 or text.len < needle.len:
-        assert (forall candidate in 0..<text.len:
-            needle.len == 0 or needle.len > text.len - candidate
-        )
-        return text.len
-    assert needle.len > 0 and needle.len <= text.len
-    assert needle_length > 0 and needle_length <= text_length
+    if needle_length == 0 or text_length < needle_length:
+        return text_length
     search_limit: usize = text_length - needle_length + BYTE_INDEX_STEP
-    assert search_limit <= text_length
     index: mutable usize = 0
     while index < search_limit |index, search_limit, text, needle, needle_length, text_length|:
         decreases search_limit - index
         invariant index <= search_limit
         invariant (forall candidate in 0..<index:
-            needle.len == 0 or
-            needle.len > text.len - candidate or
-            text[candidate:candidate + needle.len] != needle
+            needle_length <= text_length - candidate and
+            text[candidate:candidate + needle_length] != needle
         )
-        assert index <= text_length - needle_length
         if text[index:index + needle_length] == needle:
-            assert text[index:index + needle.len] == needle
             return index
-        assert text[index:index + needle.len] != needle
         index <- index + BYTE_INDEX_STEP
-    assert index == search_limit
-    assert (forall candidate in 0..<text.len:
-        needle.len == 0 or
-        needle.len > text.len - candidate or
-        text[candidate:candidate + needle.len] != needle
-    )
-    return text.len
+    return text_length
 """
 if compact(function_section(source_text, "find")) != compact(expected_find):
     raise SystemExit("production EASM substring search no longer implements the verified first-match scan")
