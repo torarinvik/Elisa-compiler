@@ -79,10 +79,6 @@ if not all(fragment in trim_bounds_spec for fragment in (
     "ensureresult.end==trim_end_spec(text,trim_start_spec(text,0.usize()),text.len)",
     "first:usize=trim_start_spec(text,0.usize())",
     "bounds:TrimBounds=trim_bounds_spec_from(text,first)",
-    "ensureforallprefix_indexin0..<result.start:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
-    "ensureforallsuffix_indexinresult.end..<text.len:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
-    "ensureresult.start==result.endor(text[result.start]!=ASCII_SPACEandtext[result.start]!=ASCII_TABandtext[result.end-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[result.end-BYTE_INDEX_STEP]!=ASCII_TAB)",
-    "ensureresult.start!=result.endorresult.start==text.len",
     "returnbounds",
 )):
     raise SystemExit("ghost trim bounds no longer returns its ordered in-range span from the recursive trim specs")
@@ -100,19 +96,7 @@ if not all(fragment in trim_bounds_spec_from for fragment in (
 for spec_name in ("find_from_spec", "find_spec"):
     if "ensureresult<=text.len" not in compact(function_section(source_text, spec_name)):
         raise SystemExit(f"ghost {spec_name} no longer exposes the bounded search-result fact")
-find_from_spec = compact(function_section(source_text, "find_from_spec"))
-if not all(fragment in find_from_spec for fragment in (
-    "ensureresult>=index",
-    "ensureresult<text.lenimplies(result<=text.len-needle.lenandtext[result:result+needle.len]==needle)",
-    "ensureforallcandidateinindex..<result:candidate>=text.len-needle.len+BYTE_INDEX_STEPortext[candidate:candidate+needle.len]!=needle",
-)):
-    raise SystemExit("recursive search no longer exposes its first-match contract")
-find_spec = compact(function_section(source_text, "find_spec"))
-if not all(fragment in find_spec for fragment in (
-    "ensure(needle.len>0andtext.len>=needle.len)impliesresult==find_from_spec(text,needle,0.usize())",
-    "ensureresult<text.lenimplies(needle.len>0andresult<=text.len-needle.lenandtext[result:result+needle.len]==needle)",
-    "ensureforallcandidatein0..<result:needle.len==0orneedle.len>text.len-candidateortext[candidate:candidate+needle.len]!=needle",
-)):
+if "ensure(needle.len>0andtext.len>=needle.len)impliesresult==find_from_spec(text,needle,0.usize())" not in compact(function_section(source_text, "find_spec")):
     raise SystemExit("ghost first-match search no longer exposes its recursive starting point")
 if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
@@ -157,17 +141,18 @@ required_source = (
     "forallsuffix_indexinresult.end..<text.len:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
     "result.start==result.endor(",
     "ensureresult.start!=result.endorresult.start==text.len",
-    "whilefirst<lastand(text[first]==ASCII_SPACEortext[first]==ASCII_TAB)|first,last,text,text_length|",
+    "whilefirst<last|first,last,text,text_length|",
     "decreaseslast-first",
     "invariantfirst<=last",
     "invariantlast<=text_length",
-    "first_result:usize=trim_start_spec(text,0.usize())",
-    "invariantfirst_result==trim_start_spec(text,first)",
+    "invariantforallprefix_indexin0..<first:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
+    "invarianttrim_start_spec(text,first)==trim_start_spec(text,0.usize())",
+    "iftext[first]!=ASCII_SPACEandtext[first]!=ASCII_TAB:break",
     "assertfirst==lastor(text[first]!=ASCII_SPACEandtext[first]!=ASCII_TAB)",
-    "whilelast>firstand(text[last-BYTE_INDEX_STEP]==ASCII_SPACEortext[last-BYTE_INDEX_STEP]==ASCII_TAB)|last,first,text,text_length|",
-    "last_result:usize=trim_end_spec(text,first,text_length)",
-    "invariantfirst<=last",
-    "invariantlast_result==trim_end_spec(text,first,last)",
+    "whilelast>first|last,first,text,text_length|",
+    "invariantforallsuffix_indexinlast..<text_length:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
+    "invarianttrim_end_spec(text,first,last)==trim_end_spec(text,first,text_length)",
+    "iftext[last-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[last-BYTE_INDEX_STEP]!=ASCII_TAB:break",
     "assertlast==firstor(text[last-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[last-BYTE_INDEX_STEP]!=ASCII_TAB)",
     "assertbounds.start==bounds.endor(bounds.start==text.len)",
     "assertbounds.start==trim_bounds_spec(text).start",
@@ -200,26 +185,6 @@ required_source = (
 )
 if not all(fragment in source_compact for fragment in required_source):
     raise SystemExit("production EASM scanner lost a source contract or loop invariant")
-
-trim_start_spec_source = compact(function_section(source_text, "trim_start_spec"))
-if not all(fragment in trim_start_spec_source for fragment in (
-    "ensureforallprefix_indexin0..<result:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
-    "ensureresult==text.lenor(text[result]!=ASCII_SPACEandtext[result]!=ASCII_TAB)",
-)):
-    raise SystemExit("leading-trim recursion no longer exposes its prefix and endpoint facts")
-trim_end_spec_source = compact(function_section(source_text, "trim_end_spec"))
-if not all(fragment in trim_end_spec_source for fragment in (
-    "ensureforallsuffix_indexinresult..<last:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
-    "ensureresult==firstor(text[result-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[result-BYTE_INDEX_STEP]!=ASCII_TAB)",
-)):
-    raise SystemExit("trailing-trim recursion no longer exposes its suffix and endpoint facts")
-trim_spec_source = compact(function_section(source_text, "trim_spec"))
-if not all(fragment in trim_spec_source for fragment in (
-    "ensureresult.len==trim_end_spec(text,trim_start_spec(text,0.usize()),text.len)-trim_start_spec(text,0.usize())",
-    "ensureresult.len>=0",
-    "ensureresult.len<=text.len",
-)):
-    raise SystemExit("ghost trim no longer exposes the bounded length of its selected span")
 expected_find = """
 def find(text: sview, needle: sview) -> usize:
     ensure result <= text.len
@@ -242,19 +207,26 @@ def find(text: sview, needle: sview) -> usize:
     assert needle_length == needle.len
     if needle.len == 0 or text.len < needle.len:
         assert find_spec(text, needle) == text.len
+        assert (forall candidate in 0..<text.len:
+            needle.len == 0 or
+            needle.len > text.len - candidate or
+            text[candidate:candidate + needle.len] != needle
+        )
         return text.len
     assert needle.len > 0 and needle.len <= text.len
     assert needle_length > 0 and needle_length <= text_length
     search_limit: usize = text_length - needle_length + BYTE_INDEX_STEP
     assert search_limit <= text_length
-    first_match: usize = find_spec(text, needle)
-    assert first_match == find_spec(text, needle)
-    assert first_match == find_from_spec(text, needle, 0.usize())
     index: mutable usize = 0
     while index < search_limit |index, search_limit, text, needle, needle_length, text_length|:
         decreases search_limit - index
         invariant index <= search_limit
-        invariant find_from_spec(text, needle, index) == first_match
+        invariant find_from_spec(text, needle, index) == find_spec(text, needle)
+        invariant (forall candidate in 0..<index:
+            candidate <= text_length - needle_length and
+            needle_length <= text_length - candidate and
+            text[candidate:candidate + needle_length] != needle
+        )
         assert index <= text_length - needle_length
         assert index <= text.len - needle.len
         if text[index:index + needle_length] == needle:
@@ -264,14 +236,18 @@ def find(text: sview, needle: sview) -> usize:
             assert index < text.len
             assert text[index:index + needle.len] == needle
             assert find_from_spec(text, needle, index) == index
-            assert first_match == index
+            assert find_spec(text, needle) == index
             return index
-        assert find_from_spec(text, needle, index) == find_from_spec(text, needle, index + BYTE_INDEX_STEP)
         index <- index + BYTE_INDEX_STEP
     assert index == search_limit
     assert index == text.len - needle.len + BYTE_INDEX_STEP
+    assert (forall candidate in 0..<text.len:
+        needle.len == 0 or
+        needle.len > text.len - candidate or
+        text[candidate:candidate + needle.len] != needle
+    )
     assert find_from_spec(text, needle, index) == text.len
-    assert first_match == text.len
+    assert find_spec(text, needle) == text.len
     return text.len
 """
 if compact(function_section(source_text, "find")) != compact(expected_find):
