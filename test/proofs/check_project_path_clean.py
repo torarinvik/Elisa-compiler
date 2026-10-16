@@ -93,19 +93,12 @@ expected_build = compact("""
         for offset in 0..<lengths[segment] |body, starts, lengths, path, segment|:
             body.push(path[starts[segment] + offset])
     out: mutable darray[u8] = [ProjectSystemPathByte::ASCII_FORWARD_SLASH] if rooted else []
-    if rooted:
-        out.resize(body.count + 1.usize())
-    else:
-        out.resize(body.count)
     for index in 0..<body.count |out, body, rooted|:
         invariant not rooted or (
             out.count > 0.usize() and
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
         )
-        if rooted:
-            out[index + 1.usize()] <- body[index]
-        else:
-            out[index] <- body[index]
+        out.push(body[index])
 """)
 if build != expected_build:
     raise SystemExit("path_clean root-preserving output loops changed or gained a root-mutating operation")
