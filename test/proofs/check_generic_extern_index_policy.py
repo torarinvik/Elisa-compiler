@@ -69,10 +69,23 @@ expected_scan = '''
 expected_contains = '''
 def contains(names: darray[sview]&, target_name: sview) -> bool:
     ensure result == contains_from(names, target_name, 0)
-    for index in 0..<names.count |index|:
+    index: mutable usize = 0
+    while index < names.count |index, names, target_name|:
+        decreases names.count - index
         invariant index <= names.count
         invariant contains_from(names, target_name, index) == contains_from(names, target_name, 0)
-        return true if names[index] == target_name
+        assert contains_from(names, target_name, index) == (
+            names[index] == target_name or contains_from(names, target_name, index + 1.usize())
+        )
+        if names[index] == target_name:
+            assert contains_from(names, target_name, index)
+            return true
+        assert contains_from(names, target_name, index) == contains_from(names, target_name, index + 1.usize())
+        index <- index + 1.usize()
+        assert contains_from(names, target_name, index) == contains_from(names, target_name, 0)
+    assert index == names.count
+    assert contains_from(names, target_name, index) == false
+    assert contains_from(names, target_name, 0) == false
     return false
 '''
 if "moduleSemanticGenericExternIndexPolicy:" not in compact(policy_text):
