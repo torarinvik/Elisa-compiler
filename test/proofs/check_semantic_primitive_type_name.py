@@ -101,17 +101,12 @@ if compact("ensure result == (byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_N
         compact("return byte >= ASCII_DIGIT_ZERO and byte <= ASCII_DIGIT_NINE") not in digit:
     raise SystemExit("ASCII digit helper no longer matches its closed byte interval")
 
-suffix = compact(function_section(policy_text, "bit_width_suffix_is_ascii_digits"))
-suffix_spec = "forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index])"
-if compact("ensure result == (" + suffix_spec + ")") not in suffix or \
-        compact("return " + suffix_spec) not in suffix:
-    raise SystemExit("width suffix helper no longer exposes its exact total quantified contract")
-
 shape = compact(function_section(policy_text, "is_bit_width_int_shape"))
-shape_spec = "name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U) and bit_width_suffix_is_ascii_digits(name)"
+shape_spec = "name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U) and (forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index]))"
 if compact("ensure result == (" + shape_spec + ")") not in shape or \
         compact("valid_prefix: bool = name.len >= MIN_INT_NAME_LENGTH and (name[INT_LEAD_INDEX] == ASCII_LOWER_I or name[INT_LEAD_INDEX] == ASCII_LOWER_U)") not in shape or \
-        compact("all_digits: bool = bit_width_suffix_is_ascii_digits(name)") not in shape or \
+        compact("all_digits: bool = forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index])") not in shape or \
+        compact("assert all_digits == (forall digit_index in INT_PREFIX_LENGTH..<name.len: is_ascii_digit(name[digit_index]))") not in shape or \
         compact("return valid_prefix and all_digits") not in shape:
     raise SystemExit("total width-name shape no longer returns its contract-safe lexical specification")
 
