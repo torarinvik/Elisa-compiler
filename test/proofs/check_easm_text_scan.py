@@ -75,9 +75,18 @@ if not all(fragment in trim_bounds_spec for fragment in (
     "ghostdeftrim_bounds_spec(text:sview)",
     "ensureresult.start<=result.end",
     "ensureresult.end<=text.len",
-    "return(trim_start_spec(text,0),trim_end_spec(text,trim_start_spec(text,0),text.len))",
+    "returntrim_bounds_spec_from(text,trim_start_spec(text,0))",
 )):
     raise SystemExit("ghost trim bounds no longer returns its ordered in-range span from the recursive trim specs")
+trim_bounds_spec_from = compact(function_section(source_text, "trim_bounds_spec_from"))
+if not all(fragment in trim_bounds_spec_from for fragment in (
+    "ghostdeftrim_bounds_spec_from(text:sview,first:usize)",
+    "requiresfirst<=text.len",
+    "ensureresult.start<=result.end",
+    "ensureresult.end<=text.len",
+    "return(first,trim_end_spec(text,first,text.len))",
+)):
+    raise SystemExit("ghost trim bounds helper no longer shares the leading-trim endpoint")
 if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
 if environment_text.index('include "easm_text_scan.elisa"') > environment_text.index('include "easm_verify_provenance.elisa"'):

@@ -53,14 +53,30 @@ model_text = MODEL.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 lookup = compact(function_section(model_text, "easm_label_index"))
+label_name_helper = compact(function_section(model_text, "easm_label_name_from_trimmed"))
 label_name = compact(function_section(model_text, "easm_label_name"))
+required_label_helper_contracts = (
+    "ensure result == (easm_trim(text[0:text.len - 1.usize()]) if text.len > 0 and text[text.len - 1.usize()] == 58 else text)",
+)
+if any(compact(contract) not in label_name_helper for contract in required_label_helper_contracts):
+    raise SystemExit("EASM label-name helper lost its exact trimmed-name or terminal-colon contract")
 required_label_name_contracts = (
-    'ensure instruction.op != "label" implies result.len == 0',
-    'ensure (instruction.op == "label" and ((easm_trim(instruction.text)).len == 0 or (easm_trim(instruction.text))[(easm_trim(instruction.text)).len - 1.usize()] != 58)) implies result == easm_trim(instruction.text)',
-    'ensure (instruction.op == "label" and (easm_trim(instruction.text)).len > 0 and (easm_trim(instruction.text))[(easm_trim(instruction.text)).len - 1.usize()] == 58) implies result == easm_trim(easm_trim(instruction.text)[0:(easm_trim(instruction.text)).len - 1.usize()])',
+    'ensure result == (easm_label_name_from_trimmed(easm_trim(instruction.text)) if instruction.op == "label" else "")',
 )
 if any(compact(contract) not in label_name for contract in required_label_name_contracts):
     raise SystemExit("EASM label-name normalization lost its non-label, trim, or terminal-colon contract")
+required_label_helper_body = (
+    "return easm_trim(text[0:text.len - 1.usize()]) if text.len > 0 and text[text.len - 1.usize()] == 58 else text",
+)
+helper_positions = [label_name_helper.find(compact(fragment)) for fragment in required_label_helper_body]
+if any(position < 0 for position in helper_positions) or helper_positions != sorted(helper_positions):
+    raise SystemExit("EASM label-name helper lost its exact terminal-colon implementation")
+required_label_name_body = (
+    'return easm_label_name_from_trimmed(easm_trim(instruction.text)) if instruction.op == "label" else ""',
+)
+label_positions = [label_name.find(compact(fragment)) for fragment in required_label_name_body]
+if any(position < 0 for position in label_positions) or label_positions != sorted(label_positions):
+    raise SystemExit("EASM label-name resolver lost its exact label-only normalization")
 required_contracts = (
     "ensure result >= -1",
     "ensure (instructions.count.i64() < 0 or instructions.count.i64().usize() != instructions.count) implies result == -1",
