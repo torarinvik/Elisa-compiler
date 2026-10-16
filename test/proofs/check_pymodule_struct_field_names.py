@@ -134,24 +134,16 @@ expected_function = source_function(source, "c_field_name_expected")
 expected_public = compact_source("""def c_field_name(field_name: sview) -> sview:
     ensure result == c_field_name_expected(field_name)
     can Abort.Panic:
-        return when field_name:
-            EXPECTED_MATCH_ARMS""".replace("EXPECTED_MATCH_ARMS", expected_match_arms()))
+        return c_field_name_expected(field_name)""")
 if compact_source(expected_function) != expected_mapping_function("c_field_name_expected"):
     raise SystemExit("C field expected-name helper changed from the exact closed match body")
 if compact_source(function) != expected_public:
-    raise SystemExit("C field mapper changed from the exact expected-name contract and match body")
-expected_implementation = re.search(
-    r"return\s+when\s+field_name:\s*\n(.*?)(?=^\s*(?:public:|private:|def\s)|\Z)",
-    expected_function,
-    re.DOTALL | re.MULTILINE,
-)
-implementation = re.search(r"return\s+when\s+field_name:\s*\n(.*)", function, re.DOTALL)
-if not expected_implementation or not implementation:
-    raise SystemExit("C field mapper lost a pattern-matching implementation")
-if parse_match(expected_implementation.group(1), "expected-name mapping") != EXPECTED:
+    raise SystemExit("C field mapper changed from the exact expected-name contract and forwarding body")
+implementation = re.search(r"return\s+when\s+field_name:\s*\n(.*)", expected_function, re.DOTALL)
+if not implementation:
+    raise SystemExit("C field expected-name helper lost its pattern-matching implementation")
+if parse_match(implementation.group(1), "expected-name mapping") != EXPECTED:
     raise SystemExit("C field expected-name mapping differs from the closed expected keyword map")
-if parse_match(implementation.group(1), "implementation") != EXPECTED:
-    raise SystemExit("C field implementation differs from the closed expected keyword map")
 
 wrapper_source = WRAPPER.read_text()
 if 'include "./pymodule_struct_field_names.elisa"' not in wrapper_source:

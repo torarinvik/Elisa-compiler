@@ -114,6 +114,9 @@ required_guards = (
 )
 if any(guard not in helper for guard in required_guards):
     raise SystemExit("bounded view helper lost a backing, range, conversion, or guarded-address check")
+runtime_body = helper.split("canUnsafe{PointerArithmetic,RawExtern}:", 1)[-1]
+if "bytes_view_range_ref_request_valid(" in runtime_body:
+    raise SystemExit("ghost-only request predicate must not be called from executable view construction")
 if helper.find("returnemptyifstart>norcount>n-start") > helper.find("trustedUnsafe.PointerCast"):
     raise SystemExit("requested byte extent must be checked before the helper constructs its pointer")
 
