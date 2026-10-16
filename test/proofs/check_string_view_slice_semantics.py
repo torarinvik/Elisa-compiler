@@ -66,8 +66,15 @@ required_slice_steps = (
     "high:i64=view.lenifend<0elselowifend<lowelseendifend<=view.lenelseview.len",
     "assert0<=lowandlow<=view.len",
     "assertlow<=highandhigh<=view.len",
+    "assertlow==(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)",
+    "asserthigh==(view.lenifend<0else(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)ifend<(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)elseendifend<=view.lenelseview.len)",
     "returnemptyifhigh==low",
-    "trustedUnsafe.PointerCast:returnStringView{data:view.data+(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0).usize(),len:high-low}",
+    "trustedUnsafe.PointerCast:out:sview=StringView{data:view.data+low.usize(),len:high-low}",
+    "assertout.len>=0",
+    "assertout.len<=view.len",
+    "assertout.len==((view.lenifend<0else(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)ifend<(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)elseendifend<=view.lenelseview.len)-(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0))",
+    "assertout.data==view.data+(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0).usize()",
+    "returnout",
 )
 slice_positions = [slice_body.find(step) for step in required_slice_steps]
 if any(position < 0 for position in slice_positions) or slice_positions != sorted(slice_positions):
