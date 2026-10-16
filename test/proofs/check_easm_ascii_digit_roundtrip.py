@@ -47,8 +47,8 @@ parse_signed = compact(function_section(source, "parse_signed"))
 legacy_digit_rejection = "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE"
 checked_digit_rejection = compact("""
     if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE:
-        assert not reference.valid
-        assert reference.value == 0
+        assert not decimal_parse_reference(text).valid
+        assert decimal_parse_reference(text).value == 0
         return (false, 0)
 """)
 if legacy_digit_rejection not in parse_signed and checked_digit_rejection not in parse_signed:
