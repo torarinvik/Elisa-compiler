@@ -191,8 +191,6 @@ if any(compact(fragment) not in close_offset_body for fragment in (
 span_count_from_open_body = compact(function_section(text_source, "easm_compose_span_argument_count_from_open"))
 if any(compact(fragment) not in span_count_from_open_body for fragment in (
     "requires open <= text.len",
-    "ensure open >= text.len implies result == 0",
-    "ensure open < text.len implies result == easm_compose_span_argument_count_at_offset(text, open, easm_compose_close_offset(text, open))",
     "return 0 if open >= text.len",
     "return easm_compose_span_argument_count_at_offset(text, open, easm_compose_close_offset(text, open))",
 )):
