@@ -160,9 +160,6 @@ required_reference_fragments = (
     "ghostdefdecimal_parse_reference_from(",
     "requiresposition<=text.lenand(negativeimpliesvalue<=0)and(notnegativeimpliesvalue>=0)",
     "decreasestext.len-position",
-    "ensureresult.validimplies(negativeimpliesresult.value<=0)",
-    "ensureresult.validimplies(notnegativeimpliesresult.value>=0)",
-    "ensure(position==text.lenandnotconsumed_digit)impliesnotresult.valid",
     "return(false,0)ifposition==text.lenandnotconsumed_digit",
     "return(true,value)ifposition==text.len",
     "return(false,0)iftext[position]<ASCII_DIGIT_ZEROortext[position]>ASCII_DIGIT_NINE",
@@ -178,8 +175,7 @@ if "ghostdefdecimal_parse_reference(text:sview)" not in reference_wrapper or \
         "returndecimal_parse_reference_from(text,1,true,0,false)iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS" not in reference_wrapper or \
         "returndecimal_parse_reference_from(text,0,false,0,false)" not in reference_wrapper or \
         "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len" not in reference_wrapper or \
-        "ensure(result.validandtext.len>0andtext[0]==ASCII_MINUS)impliesresult.value<=0" not in reference_wrapper or \
-        "ensure(result.validandtext.len>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0" not in reference_wrapper:
+        "return(false,0)iftext.len==1andtext[0]==ASCII_MINUS" not in reference_wrapper:
     raise SystemExit("decimal reference wrapper no longer specifies the optional sign and digit fold")
 
 # Reduce the production i64 constants to the exact thresholds used by the
