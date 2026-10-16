@@ -101,7 +101,11 @@ def indexed_enum_tag_count(names: darray[sview]&, counts: darray[i64]&, name: sv
             invariant index <= names.count
             invariant index <= counts.count
             invariant enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, 0)
-            index <- index + 1
+            assert names[index] != name
+            next_index: usize = index + 1
+            assert next_index <= names.count and next_index <= counts.count
+            assert enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, next_index)
+            index <- next_index
         return 0 if index >= names.count or index >= counts.count
         assert names[index] == name
         return counts[index]
