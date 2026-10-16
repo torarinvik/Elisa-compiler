@@ -102,15 +102,15 @@ required_span_fragments = (
     "invariant cursor <= value_length",
     "invariant start <= cursor",
     "invariant current >= 0",
-    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).valid == reference_valid",
-    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).start == reference_start",
-    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).end == reference_end",
+    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).valid == easm_compose_span_reference(text, wanted).valid",
+    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).start == easm_compose_span_reference(text, wanted).start",
+    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).end == easm_compose_span_reference(text, wanted).end",
     "if cursor == value_length: break",
     "EasmTextScan::trim_bounds(values[start:cursor])",
     "assert span_end <= close",
-    "assert reference_at_cursor.valid",
-    "assert reference_at_cursor.start == span_start",
-    "assert reference_at_cursor.end == span_end",
+    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).valid",
+    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).start == span_start",
+    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).end == span_end",
     "return ComposeSpan{start: span_start, end: span_end, valid: true}",
     "return ComposeSpan{start: 0, end: 0, valid: false}",
 )
@@ -142,8 +142,7 @@ required_reference_fragments = (
     "ensure (wanted >= current and wanted - current <= easm_compose_comma_count_from(values, cursor)) implies result.valid",
     "if cursor < values.len and values[cursor] != 44",
     "return easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted)",
-    "EasmTextScan::trim_bounds(values[segment_start:cursor])",
-    "assert span_end <= source_end",
+    "EasmTextScan::trim_bounds_spec(values[segment_start:cursor])",
     "if cursor == values.len: return ComposeSpan{start: 0, end: 0, valid: false}",
     "return easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1, wanted)",
 )
@@ -151,8 +150,13 @@ if any(compact(fragment) not in reference_body for fragment in required_referenc
     raise SystemExit("recursive compose-span specification changed without updating its refinement proof")
 
 span_count_body = compact(function_section(text_source, "easm_compose_span_argument_count"))
-if compact("return easm_compose_argument_count(values)") not in span_count_body:
-    raise SystemExit("span-domain count no longer uses the verified comma-count policy")
+span_count_expression = (
+    'return easm_compose_argument_count_spec(text[EasmTextScan::find_spec(text, "(") + 1.usize():'
+    'EasmTextScan::find_spec(text[EasmTextScan::find_spec(text, "("):text.len], ")") '
+    '+ EasmTextScan::find_spec(text, "(")])'
+)
+if compact(span_count_expression) not in span_count_body:
+    raise SystemExit("span-domain count no longer applies the recursive comma-count specification to the bounded argument span")
 reference_wrapper_body = compact(function_section(text_source, "easm_compose_span_reference"))
 if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count(text)) implies result.valid") not in reference_wrapper_body:
     raise SystemExit("recursive span wrapper lost its in-range index validity contract")
