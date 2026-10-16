@@ -158,6 +158,10 @@ required_contracts = (
     "invariant (step == 0 implies row == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()].usize())",
     "invariant not found or result_index < table.ref_pos.count",
     "invariant not found or table.ref_binding_ids[result_index].owner.value == owner.value",
+    "def ownership_binding_singleton_row(",
+    "and result.row == table.ref_owner_heads[owner.value.usize()].usize())",
+    "and result.row == 0)",
+    "singleton_hit, singleton_row = ownership_binding_singleton_row(table, owner, position)",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
@@ -183,7 +187,14 @@ if not re.search(
     lookup_text,
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
-lookup_lines = lookup_text.splitlines()
+helper_start = lookup_text.find("def ownership_binding_singleton_row(")
+lookup_start = lookup_text.find("def ownership_binding_at_position(")
+if helper_start < 0 or lookup_start <= helper_start:
+    raise AssertionError("singleton witness helper must precede the ownership lookup")
+helper_lines = lookup_text[helper_start:lookup_start].splitlines()
+lookup_lines = lookup_text[lookup_start:].splitlines()
+if sum(line.lstrip().startswith("ensure ") for line in helper_lines) != 3:
+    raise AssertionError("singleton witness contract set changed; review this proof gate")
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
 if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 8:
@@ -192,7 +203,8 @@ if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
-    print(json.dumps({"source_bound": True, "contract_count": 15,
+    print(json.dumps({"source_bound": True, "contract_count": 18,
+                      "singleton_witness_contract_count": 3,
                       "invariant_count": 8, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
