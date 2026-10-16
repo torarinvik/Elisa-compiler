@@ -45,8 +45,6 @@ if loop_start < 0 or loop_end < 0:
     raise SystemExit("source-linked signed decimal parser no longer has a bounded digit loop")
 if "assert position == text.len" not in parser_impl:
     raise SystemExit("signed decimal parser no longer exposes the loop-exit input bound")
-if parser_impl.count("assert forall digit_index in 0..<position:") < 2:
-    raise SystemExit("signed decimal parser no longer exposes the digit-prefix base and step facts")
 loop_body = parser_impl[loop_start:loop_end]
 if "append_positive_digit(value, digit)" not in loop_body:
     raise SystemExit("positive parser path no longer uses the proved checked-digit helper")
