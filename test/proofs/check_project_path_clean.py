@@ -92,9 +92,11 @@ expected_build = compact("""
         body.push(47) if segment > 0.usize()
         for offset in 0..<lengths[segment] |body, starts, lengths, path, segment|:
             body.push(path[starts[segment] + offset])
-    out: mutable darray[u8] = [ProjectSystemPathByte::ASCII_FORWARD_SLASH] if rooted else []
-    for index in 0..<body.count |out, body, rooted|:
-        invariant not rooted or (
+    out: mutable darray[u8] = []
+    if path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH:
+        out.push(ProjectSystemPathByte::ASCII_FORWARD_SLASH)
+    for index in 0..<body.count |out, body, path|:
+        invariant not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
             out.count > 0.usize() and
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
         )
