@@ -146,8 +146,15 @@ required_contracts = (
     "if table.ref_binding_ids.count == 1 and table.ref_pos.count == 1",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
-    "return (false, missing) if expected_count > table.ref_pos.count",
-    "return (false, missing) if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "missing_result: (known: bool, binding_id: BindingId) = (false, missing)",
+    "assert not missing_result.known",
+    "assert missing_result.binding_id.owner.value == INVALID_DECL_ID_VALUE",
+    "assert missing_result.binding_id.serial == FIRST_BINDING_SERIAL",
+    "return missing_result if expected_count > table.ref_pos.count",
+    "return missing_result if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "found_result: (known: bool, binding_id: BindingId) = (true, table.ref_binding_ids[result_index])",
+    "assert found_result.known",
+    "assert found_result.binding_id.owner.value == owner.value",
     "for step in 0..<expected_count",
     "row != SYMBOL_INDEX_ROW_NONE.usize() or last_row != expected_tail",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
@@ -165,8 +172,9 @@ for contract in required_contracts:
         raise AssertionError(f"required source contract missing: {contract}")
 if not re.search(
     r"if found:\s+assert result_index < table\.ref_binding_ids\.count\s+"
-    r"return \(true, table\.ref_binding_ids\[result_index\]\)\s+"
-    r"return \(false, missing\)",
+    r"found_result: \(known: bool, binding_id: BindingId\) = "
+    r"\(true, table\.ref_binding_ids\[result_index\]\)\s+"
+    r"return found_result\s+return missing_result",
     lookup_text,
 ):
     raise AssertionError("lookup result must preserve found/payload facts on separate return paths")
