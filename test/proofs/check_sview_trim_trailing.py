@@ -62,15 +62,17 @@ required_trim_contracts = (
 if any(compact(contract) not in trim for contract in required_trim_contracts):
     raise SystemExit("trailing trim lost its bounded maximal-prefix postcondition")
 required_loop_steps = (
-    'return sview("", 0, 0) if view.len < 0 or view.len.usize().i64() != view.len',
+    'return sview("", 0, 0) if view.len < 0',
+    "view_len: usize = view.len.usize()",
+    'return sview("", 0, 0) if view_len.i64() != view.len',
+    "assert view.len >= 0 and view_len.i64() == view.len",
     "hi: mutable i64 = view.len",
-    "while hi > 0:",
+    "while hi > 0 and string_view_index(view, hi - 1) == byte.i64():",
     "decreases hi",
     "invariant 0 <= hi and hi <= view.len and hi.usize().i64() == hi",
     "invariant forall suffix_index in hi..<view.len: string_view_index(view, suffix_index) == byte.i64()",
-    "break if string_view_index(view, hi - 1) != byte.i64()",
     "hi <- hi - 1",
-    "return StringView{data: view.data, len: hi}",
+    "return string_view_prefix(view, hi)",
 )
 loop_positions = [trim.find(compact(step)) for step in required_loop_steps]
 if any(position < 0 for position in loop_positions) or loop_positions != sorted(loop_positions):
@@ -81,11 +83,11 @@ prefix_body = compact(function_section(runtime_text, "string_view_prefix"))
 suffix_body = compact(function_section(runtime_text, "string_view_suffix"))
 required_slice_contracts = (
     "ensure result.len >= 0 and result.len <= (view.len if view.len > 0 and view.len.usize().i64() == view.len else 0)",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == string_view_clamped_length(view.len, string_view_clamped_start(view.len, start), end)",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + string_view_clamped_start(view.len, start).usize()",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == ((view.len if end < 0 else (start if start > 0 and start <= view.len else view.len if start > view.len else 0) if end < (start if start > 0 and start <= view.len else view.len if start > view.len else 0) else end if end <= view.len else view.len) - (start if start > 0 and start <= view.len else view.len if start > view.len else 0))",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
 )
 required_prefix_contracts = (
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == string_view_clamped_length(view.len, 0, end)",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == (view.len if end < 0 else end if end <= view.len else view.len)",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and end >= 0 and end <= view.len) implies result.len == end",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data",
 )
@@ -94,8 +96,8 @@ if any(compact(contract) not in slice_body for contract in required_slice_contra
     raise SystemExit("trim proof dependencies lost their bounded prefix length or backing-address contract")
 suffix_contracts = (
     "ensure result.len >= 0 and result.len <= (view.len if view.len > 0 and view.len.usize().i64() == view.len else 0)",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == string_view_clamped_length(view.len, string_view_clamped_start(view.len, start), view.len)",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + string_view_clamped_start(view.len, start).usize()",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == view.len - (start if start > 0 and start <= view.len else view.len if start > view.len else 0)",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
 )
 if any(compact(contract) not in suffix_body for contract in suffix_contracts):
     raise SystemExit("StringView suffix lost its clamped extent or backing-address contract")

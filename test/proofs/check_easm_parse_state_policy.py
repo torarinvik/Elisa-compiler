@@ -121,17 +121,27 @@ range_view_contracts = (
 )
 if any(compact(contract) not in range_view_body for contract in range_view_contracts):
     raise SystemExit("bounded view helper lost its output-length, extent, representation, or alias postcondition")
+range_view_body_impl = range_view_body.split("canUnsafe{PointerArithmetic,RawExtern}:", 1)[-1]
 range_view_guards = (
-    "returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)",
-    "count_signed:i64=count.i64()",
-    "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
+    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
+    "buf.count.i64()<0",
+    "buf.count.i64().usize()!=buf.count",
+    "start>buf.count",
+    "count>buf.count-start",
+    "start.i64()<0",
+    "start.i64().usize()!=start",
+    "count.i64()<0",
+    "count.i64().usize()!=count",
+    "count==0",
+    "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}",
 )
-if any(guard not in range_view_body for guard in range_view_guards):
+if any(guard not in range_view_body_impl for guard in range_view_guards):
     raise SystemExit("bounded view helper lost a count, capacity, range, representation, or guarded pointer check")
-if not range_view_request.startswith("defbytes_view_range_ref_request_valid("):
-    raise SystemExit("bounded view request predicate must be executable before pointer construction")
-if range_view_body.find("returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)") > range_view_body.find("trustedUnsafe.PointerCast"):
-    raise SystemExit("bounded view helper must check the requested extent before pointer construction")
+range_view_pointer_cast = range_view_body_impl.find("trustedUnsafe.PointerCast")
+if any(range_view_body_impl.find(guard) > range_view_pointer_cast for guard in range_view_guards[:-1]):
+    raise SystemExit("all bounded-view range checks must precede pointer construction")
+if not range_view_request.startswith("ghostdefbytes_view_range_ref_request_valid("):
+    raise SystemExit("bounded view request predicate must remain a proof-only description")
 
 parse_body = compact(function_section(parser_text, "parse_layout_module"))
 if "defparse_layout_module(source:darray[u8]&,length:usize,path:sview)->Module:requireslength<=source.count" not in parse_body:

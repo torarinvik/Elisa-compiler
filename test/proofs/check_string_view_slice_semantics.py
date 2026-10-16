@@ -59,16 +59,25 @@ negative_text = NEGATIVE.read_text()
 slice_body = compact(function_section(runtime_text, "string_view_slice"))
 required_slice_steps = (
     'empty:sview=sview("",0,0)',
-    "emptyreturnifview.len<0",
-    "emptyreturnifview.len.usize().i64()!=view.len",
-    "low:i64=string_view_clamped_start(view.len,start)",
-    "length:i64=string_view_clamped_length(view.len,low,end)",
-    "returnemptyiflength==0",
-    "trustedUnsafe.PointerCast:returnStringView{data:view.data+low.usize(),len:length}",
+    "returnemptyifview.len<0",
+    "view_len:usize=view.len.usize()",
+    "returnemptyifview_len.i64()!=view.len",
+    "low:i64=startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0",
+    "high:i64=view.lenifend<0elselowifend<lowelseendifend<=view.lenelseview.len",
+    "assert0<=lowandlow<=view.len",
+    "assertlow<=highandhigh<=view.len",
+    "returnemptyifhigh==low",
+    "trustedUnsafe.PointerCast:returnStringView{data:view.data+low.usize(),len:high-low}",
 )
 slice_positions = [slice_body.find(step) for step in required_slice_steps]
 if any(position < 0 for position in slice_positions) or slice_positions != sorted(slice_positions):
-    raise SystemExit("StringView slice lost its ordered length validation, clamping, or bounded pointer construction")
+    raise SystemExit("StringView slice lost its ordered length validation, direct bounds, or bounded pointer construction")
+required_slice_contracts = (
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == ((view.len if end < 0 else (start if start > 0 and start <= view.len else view.len if start > view.len else 0) if end < (start if start > 0 and start <= view.len else view.len if start > view.len else 0) else end if end <= view.len else view.len) - (start if start > 0 and start <= view.len else view.len if start > view.len else 0))",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
+)
+if any(compact(contract) not in slice_body for contract in required_slice_contracts):
+    raise SystemExit("StringView slice lost its exact clamped length or backing-address contract")
 prefix_body = compact(function_section(runtime_text, "string_view_prefix"))
 suffix_body = compact(function_section(runtime_text, "string_view_suffix"))
 if "returnstring_view_slice(view,0,end)" not in prefix_body:
@@ -98,22 +107,6 @@ if any(any(step not in model for step in required_model_steps) for model in mode
 if "string_view_slice_bounds(view.len, start, end)" not in positive_text \
         or "string_view_slice_bounds(view.len, start, end)" not in negative_text:
     raise SystemExit("slice proofs no longer bind to the reference bounds model")
-start_helper = compact(function_section(runtime_text, "string_view_clamped_start"))
-length_helper = compact(function_section(runtime_text, "string_view_clamped_length"))
-required_start_contracts = (
-    "requires length >= 0",
-    "ensure result == (start if start > 0 and start <= length else length if start > length else 0)",
-    "ensure result >= 0 and result <= length",
-)
-required_length_contracts = (
-    "requires length >= 0 and low >= 0 and low <= length",
-    "ensure result == (length if end < 0 else low if end < low else end if end <= length else length) - low",
-    "ensure result >= 0 and result <= length",
-)
-if any(compact(item) not in start_helper for item in required_start_contracts) \
-        or any(compact(item) not in length_helper for item in required_length_contracts):
-    raise SystemExit("runtime slice bound helpers lost their exact clamp and extent contracts")
-
 positive_claims = {
     "a_runtime_slice_has_the_specified_clamped_extent": (
         "sliced.len == bounds.high - bounds.low and (sliced.len == 0 or sliced.data == view.data + bounds.low.usize())",

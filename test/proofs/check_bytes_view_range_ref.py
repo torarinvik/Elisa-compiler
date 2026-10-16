@@ -55,6 +55,7 @@ runtime_text = RUNTIME_STRINGS.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 helper = compact(function_section(runtime_text, "bytes_view_range_ref"))
+helper_body = helper.split("canUnsafe{PointerArithmetic,RawExtern}:", 1)[-1]
 request_predicate = compact(function_section(runtime_text, "bytes_view_range_ref_request_valid"))
 base_view_helper = compact(function_section(runtime_text, "bytes_view"))
 required_base_view_steps = (
@@ -85,8 +86,8 @@ if any(position < 0 for position in range_wrapper_positions) \
     raise SystemExit("by-value bounded view lost its ordered backing, range, conversion, or slice checks")
 if compact("ensure result == (buf.count > 0 and buf.items != null and buf.count <= buf.capacity and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count and start <= buf.count and count <= buf.count - start and start.i64() >= 0 and start.i64().usize() == start and count.i64() >= 0 and count.i64().usize() == count and count > 0 and start < buf.count)") not in request_predicate:
     raise SystemExit("bounded view request predicate lost a backing, extent, or representation condition")
-if not request_predicate.startswith("defbytes_view_range_ref_request_valid("):
-    raise SystemExit("bounded view request predicate must be executable so construction can branch on its full contract")
+if not request_predicate.startswith("ghostdefbytes_view_range_ref_request_valid("):
+    raise SystemExit("bounded view request predicate must remain a proof-only description of the checked request")
 required_contracts = (
     "ensure result.len >= 0",
     "ensure result.len == 0 or result.len == count.i64()",
@@ -106,14 +107,23 @@ if any(compact(contract) not in helper for contract in required_contracts):
     raise SystemExit("bounded view helper lost a length, fail-closed, extent, or alias contract")
 
 required_guards = (
-    "returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)",
-    "count_signed:i64=count.i64()",
-    "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
+    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
+    "buf.count.i64()<0",
+    "buf.count.i64().usize()!=buf.count",
+    "start>buf.count",
+    "count>buf.count-start",
+    "start.i64()<0",
+    "start.i64().usize()!=start",
+    "count.i64()<0",
+    "count.i64().usize()!=count",
+    "count==0",
+    "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}",
 )
-if any(guard not in helper for guard in required_guards):
+if any(guard not in helper_body for guard in required_guards):
     raise SystemExit("bounded view helper lost a backing, range, conversion, or guarded-address check")
-if helper.find("returnemptyifnotbytes_view_range_ref_request_valid(buf,start,count)") > helper.find("trustedUnsafe.PointerCast"):
-    raise SystemExit("request predicate must be checked before the helper constructs its pointer")
+pointer_cast = helper_body.find("trustedUnsafe.PointerCast")
+if any(helper_body.find(guard) > pointer_cast for guard in required_guards[:-1]):
+    raise SystemExit("every bounded-view request check must precede its pointer construction")
 
 if {"sview_len", "sview_at"} & declarations(runtime_text):
     raise SystemExit("legacy sview length/index wrappers remain in the runtime")

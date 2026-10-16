@@ -87,14 +87,17 @@ if compact(required_parent_contract) not in parent \
     raise SystemExit("Fs.parent lost its pre-separator prefix or no-separator empty-view contract")
 
 required_loop_steps = (
-    "return -1 if view.len < 0 or view.len.usize().i64() != view.len",
+    "return -1 if view.len < 0",
+    "view_len: usize = view.len.usize()",
+    "return -1 if view_len.i64() != view.len",
+    "assert view.len >= 0 and view_len.i64() == view.len",
     "i: mutable i64 = view.len",
     "while i > 0:",
     "decreases i",
     "invariant 0 <= i and i <= view.len",
     "invariant forall later in i..<view.len: string_view_index(view, later) != byte.i64()",
     "i <- i - 1",
-    "i return if string_view_index(view, i) == byte.i64()",
+    "return i if string_view_index(view, i) == byte.i64()",
     "return -1",
 )
 loop_positions = []
