@@ -63,6 +63,7 @@ expected_binary_safety = compact("""def binary_is_defined(operator: i64, left: i
                 return true
             if operator == ElisaCoreIRArithmetic::MULTIPLY_GUARD_CODE:
                 return true if right == ElisaCoreIRArithmetic::ZERO
+                assert right > 0
                 return left <= ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM / right
             if operator == ElisaCoreIRArithmetic::DIVIDE_GUARD_CODE:
                 return right != ElisaCoreIRArithmetic::ZERO
