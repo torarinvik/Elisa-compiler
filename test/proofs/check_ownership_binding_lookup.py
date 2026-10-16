@@ -146,10 +146,13 @@ required_contracts = (
     "if table.ref_binding_ids.count == 1 and table.ref_pos.count == 1",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
-    "return (false, missing) if expected_count > table.ref_pos.count",
-    "return (false, missing) if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "lookup_valid: mutable bool = true",
+    "if expected_count > table.ref_pos.count or expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "if row == SYMBOL_INDEX_ROW_NONE.usize() or row >= table.ref_pos.count or row >= table.ref_owner_next.count",
+    "if id.owner.value != owner.value",
+    "if row != SYMBOL_INDEX_ROW_NONE.usize() or last_row != expected_tail",
+    "if not lookup_valid:",
     "for step in 0..<expected_count",
-    "row != SYMBOL_INDEX_ROW_NONE.usize() or last_row != expected_tail",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
     "and (table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].offset != position.offset or table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].end_offset != position.end_offset)) implies not result.known",
     "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
@@ -164,6 +167,7 @@ for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
 if not re.search(
+    r"if not lookup_valid:\s+found <- false\s+result_index <- 0\s+"
     r"if found:\s+assert owner\.value != INVALID_DECL_ID_VALUE\s+"
     r"assert owner\.value\.usize\(\) < table\.symbols\.count\s+"
     r"assert position\.end_offset > position\.offset\s+"
