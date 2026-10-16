@@ -142,13 +142,19 @@ required_contracts = (
     "table.ref_owner_tails[owner.value.usize()] == table.ref_owner_heads[owner.value.usize()]",
     "table.ref_owner_counts[owner.value.usize()] == 1.u32()",
     "table.ref_owner_observed_counts[owner.value.usize()] == 1.usize()",
-    "return (false, missing) if table.ref_owner_index_valid",
+    "index_claimed: bool = table.ref_owner_index_valid",
+    "return (false, missing) if index_claimed",
+    "expected_count <= table.ref_pos.count",
+    "expected_count == table.ref_owner_counts[owner.value.usize()].usize()",
+    "expected_tail == table.ref_owner_tails[owner.value.usize()]",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
     "and (table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].offset != position.offset or table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].end_offset != position.end_offset)) implies not result.known",
     "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
     "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
-    "invariant steps <= table.ref_pos.count",
-    "decreases table.ref_pos.count - steps",
+    "invariant steps <= expected_count",
+    "steps != 0 implies last_row.usize() < table.ref_pos.count",
+    "row == table.ref_owner_next[last_row.usize()].usize()",
+    "decreases expected_count - steps",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
