@@ -275,7 +275,7 @@ for required in (
     "forall candidate in from..<result",
     "while index < text_length",
     "invariant from <= index and index <= text_length",
-    "invariant forall candidate in from..<index",
+    "invariant (forall candidate in from..<index",
     "return index if text[index] == ASCII_COMMA and (not has_address or index < open or index > close)",
 ):
     if compact(required) not in next_separator:
