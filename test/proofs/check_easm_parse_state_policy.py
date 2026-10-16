@@ -75,16 +75,15 @@ if "const enum EasmBodyMode" in parser_text or "const enum EasmDeclarationKind" 
 
 policy_body = compact(function_section(policy_text, "easm_declaration_index_valid"))
 required_policy_fragments = (
-    "requires function_count >= 0 and fragment_count >= 0 and protocol_count >= 0 and template_count >= 0",
-    "ensure (kind == EasmDeclarationKind.Function) implies result == (index >= 0 and index < function_count)",
-    "ensure (kind == EasmDeclarationKind.Fragment) implies result == (index >= 0 and index < fragment_count)",
-    "ensure (kind == EasmDeclarationKind.Protocol) implies result == (index >= 0 and index < protocol_count)",
-    "ensure (kind == EasmDeclarationKind.Template) implies result == (index >= 0 and index < template_count)",
+    "ensure (kind == EasmDeclarationKind.Function) implies result == (index >= 0 and index.usize() < function_count)",
+    "ensure (kind == EasmDeclarationKind.Fragment) implies result == (index >= 0 and index.usize() < fragment_count)",
+    "ensure (kind == EasmDeclarationKind.Protocol) implies result == (index >= 0 and index.usize() < protocol_count)",
+    "ensure (kind == EasmDeclarationKind.Template) implies result == (index >= 0 and index.usize() < template_count)",
     "ensure (kind == EasmDeclarationKind.None or kind == EasmDeclarationKind.Layout) implies result",
-    "EasmDeclarationKind.Function: return index >= 0 and index < function_count",
-    "EasmDeclarationKind.Fragment: return index >= 0 and index < fragment_count",
-    "EasmDeclarationKind.Protocol: return index >= 0 and index < protocol_count",
-    "EasmDeclarationKind.Template: return index >= 0 and index < template_count",
+    "EasmDeclarationKind.Function: return index >= 0 and index.usize() < function_count",
+    "EasmDeclarationKind.Fragment: return index >= 0 and index.usize() < fragment_count",
+    "EasmDeclarationKind.Protocol: return index >= 0 and index.usize() < protocol_count",
+    "EasmDeclarationKind.Template: return index >= 0 and index.usize() < template_count",
     "_: return true",
 )
 if any(compact(fragment) not in policy_body for fragment in required_policy_fragments):
@@ -155,11 +154,11 @@ for source_path in [*ROOT.joinpath("src").rglob("*.elisa"), *ROOT.joinpath("test
         raise SystemExit(f"raw pointer passed to the bounded EASM parser at {source_path.relative_to(ROOT)}")
 required_invariants = (
     "invariant cursor <= length",
-    "invariant easm_declaration_index_valid(current_kind, current_index, out.functions.count.i64(), out.fragments.count.i64(), out.protocols.count.i64(), out.templates.count.i64())",
+    "invariant easm_declaration_index_valid(current_kind, current_index, out.functions.count, out.fragments.count, out.protocols.count, out.templates.count)",
     "invariant active_layout >= -1",
     "invariant (current_kind == EasmDeclarationKind.Layout) == (active_layout >= 0)",
-    "invariant active_layout < 0 or active_layout < out.layouts.count.i64()",
-    "invariant active_target == -1 or (active_target >= 0 and current_kind == EasmDeclarationKind.Function and current_index >= 0 and current_index < out.functions.count.i64() and active_target < out.functions[current_index.usize()].targets.count.i64())",
+    "invariant active_layout < 0 or active_layout.usize() < out.layouts.count",
+    "invariant active_target == -1 or (active_target >= 0 and current_kind == EasmDeclarationKind.Function and current_index >= 0 and current_index.usize() < out.functions.count and active_target.usize() < out.functions[current_index.usize()].targets.count)",
     "invariant easm_body_routing_valid(body_mode, current_kind, active_target)",
 )
 if any(compact(fragment) not in parse_body for fragment in required_invariants):
@@ -171,6 +170,9 @@ last_invariant = max(parse_body.find(compact(fragment)) for fragment in required
 if declaration_invariant < 0 or target_invariant < declaration_invariant \
         or line_scan <= last_invariant:
     raise SystemExit("collection-index invariants must dominate target indexing and source-line parsing")
+project_body = compact(function_section(parser_text, "parse_project"))
+if "assertlength<=source.bytes.countparsed:Module=parse_module(source.bytes,length,source.path)" not in project_body:
+    raise SystemExit("project parser must restate the bounded source extent after trimming the logical length")
 scanner = parse_body.find("whilecursor<lengthandsource[cursor]!=10|cursor,length,source|:")
 scanner_increment = parse_body.find("cursor<-cursor+1", scanner)
 scanner_obligations = (
