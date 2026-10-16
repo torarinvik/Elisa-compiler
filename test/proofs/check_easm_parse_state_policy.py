@@ -114,10 +114,10 @@ range_view_contracts = (
     "ensure (buf.count.i64() < 0 or buf.count.i64().usize() != buf.count) implies result.len == 0",
     "ensure (start.i64() < 0 or start.i64().usize() != start) implies result.len == 0",
     "ensure (count.i64() < 0 or count.i64().usize() != count) implies result.len == 0",
-    "ensure bytes_view_range_ref_request_valid(buf, start, count) implies result.len == count.i64()",
-    "ensure bytes_view_range_ref_request_valid(buf, start, count) implies result.data == &buf[start]",
-    "ensure not bytes_view_range_ref_request_valid(buf, start, count) implies result.len == 0",
-    "ensure result.len > 0 implies (bytes_view_range_ref_request_valid(buf, start, count) and result.data == &buf[start])",
+    "ensure (buf.count > 0 and buf.items != null and buf.count <= buf.capacity and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count and start <= buf.count and count <= buf.count - start and start.i64() >= 0 and start.i64().usize() == start and count.i64() >= 0 and count.i64().usize() == count and count > 0 and start < buf.count) implies result.len == count.i64()",
+    "ensure (buf.count > 0 and buf.items != null and buf.count <= buf.capacity and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count and start <= buf.count and count <= buf.count - start and start.i64() >= 0 and start.i64().usize() == start and count.i64() >= 0 and count.i64().usize() == count and count > 0 and start < buf.count) implies result.data == &buf[start]",
+    "ensure not (buf.count > 0 and buf.items != null and buf.count <= buf.capacity and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count and start <= buf.count and count <= buf.count - start and start.i64() >= 0 and start.i64().usize() == start and count.i64() >= 0 and count.i64().usize() == count and count > 0 and start < buf.count) implies result.len == 0",
+    "ensure result.len > 0 implies (buf.count > 0 and buf.items != null and buf.count <= buf.capacity and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count and start <= buf.count and count <= buf.count - start and start.i64() >= 0 and start.i64().usize() == start and count.i64() >= 0 and count.i64().usize() == count and count > 0 and start < buf.count and result.data == &buf[start])",
 )
 if any(compact(contract) not in range_view_body for contract in range_view_contracts):
     raise SystemExit("bounded view helper lost its output-length, extent, representation, or alias postcondition")
