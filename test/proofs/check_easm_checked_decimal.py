@@ -122,7 +122,8 @@ required_parse_contracts = (
 required_parse_steps = (
     "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len",
     "iftext.len==1andtext[0]==ASCII_MINUS:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0return(false,0)",
-    "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
+    "negative:bool=text.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS",
+    "position:mutableusize=1ifnegativeelse0",
     "assertposition<text.len",
     "assertstart<text.len",
     "assertnotnegativeorposition>=1",
@@ -130,7 +131,7 @@ required_parse_steps = (
     "assertnegativeorvalue>=0",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
-    "whileposition<text.len|position,text,value,negative,start|",
+    "whileposition<text.len|position,text,value|",
     "decreasestext.len-position",
     "invariantposition<=text.len",
     "invariantstart<text.len",
