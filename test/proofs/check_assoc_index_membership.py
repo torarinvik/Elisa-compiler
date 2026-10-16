@@ -102,8 +102,8 @@ collector_invariants = "invariantmethod_names.count==method_refined.count"
 if ("requiresmethod_names.count==method_refined.count" not in collector or
         "ensuremethod_names.count==method_refined.count" not in collector or
         collector.count(collector_invariants) != 2 or
-        collector.count("assertmethod_names.count==method_refined.count") < 4):
-    raise SystemExit("impl-method collection must preserve the parallel method/refinement table invariant")
+        collector.count("assertmethod_names.count==method_refined.count") < 7):
+    raise SystemExit("impl-method collection must establish parallel table parity at each loop and recursion boundary")
 name_push = collector.find("method_names.push(name)")
 refinement_push = collector.find("method_refined.push(refined)")
 if name_push < 0 or refinement_push <= name_push:
