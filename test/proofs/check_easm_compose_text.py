@@ -104,16 +104,23 @@ required_span_fragments = (
     "decreases value_length - cursor",
     "invariant cursor <= value_length",
     "invariant start <= cursor",
-    "invariant current >= 0",
-    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).valid == easm_compose_span_reference(text, wanted).valid",
-    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).start == easm_compose_span_reference(text, wanted).start",
-    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).end == easm_compose_span_reference(text, wanted).end",
+    "return ComposeSpan{start: 0, end: 0, valid: false} if wanted < 0",
+    "wanted_index: usize = wanted.usize()",
+    "return ComposeSpan{start: 0, end: 0, valid: false} if wanted_index.i64() != wanted",
+    "return ComposeSpan{start: 0, end: 0, valid: false} if easm_compose_span_argument_count(text) < 0 or wanted >= easm_compose_span_argument_count(text)",
+    "invariant current <= cursor",
+    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted_index).valid == easm_compose_span_reference(text, wanted).valid",
+    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted_index).start == easm_compose_span_reference(text, wanted).start",
+    "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted_index).end == easm_compose_span_reference(text, wanted).end",
     "if cursor == value_length: break",
     "EasmTextScan::trim_bounds(values[start:cursor])",
     "assert span_end <= close",
-    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).valid",
-    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).start == span_start",
-    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).end == span_end",
+    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted_index).valid",
+    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted_index).start == span_start",
+    "assert easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted_index).end == span_end",
+    "current: mutable usize = 0.usize()",
+    "if current == wanted_index:",
+    "current <- current + 1.usize()",
     "return ComposeSpan{start: span_start, end: span_end, valid: true}",
     "return ComposeSpan{start: 0, end: 0, valid: false}",
 )
@@ -123,38 +130,46 @@ if any(compact(fragment) not in span_body for fragment in required_span_fragment
 count_body = compact(function_section(text_source, "easm_compose_argument_count"))
 required_count_fragments = (
     "ensure (EasmTextScan::trim(text)).len == 0 implies result == 0",
-    "ensure (EasmTextScan::trim(text)).len > 0 implies result == easm_compose_comma_count_from(text, 0.usize()) + 1",
+    "ensure (EasmTextScan::trim(text)).len > 0 and easm_compose_comma_count_from(text, 0.usize()).i64() >= 0 and easm_compose_comma_count_from(text, 0.usize()).i64().usize() == easm_compose_comma_count_from(text, 0.usize()) and easm_compose_comma_count_from(text, 0.usize()).i64() < COMPOSE_ARGUMENT_COUNT_MAX implies result == easm_compose_comma_count_from(text, 0.usize()).i64() + 1",
+    "ensure (EasmTextScan::trim(text)).len > 0 and (easm_compose_comma_count_from(text, 0.usize()).i64() < 0 or easm_compose_comma_count_from(text, 0.usize()).i64().usize() != easm_compose_comma_count_from(text, 0.usize()) or easm_compose_comma_count_from(text, 0.usize()).i64() >= COMPOSE_ARGUMENT_COUNT_MAX) implies result == -1",
     "invariant index <= text.len",
+    "invariant count <= index",
     "invariant count + easm_compose_comma_count_from(text, index) == easm_compose_comma_count_from(text, 0.usize())",
     "assert count + easm_compose_comma_count_from(text, 0.usize()) == easm_compose_comma_count_from(text, 0.usize())",
     "if text[index] == 44:",
-    "assert easm_compose_comma_count_from(text, index) == 1 + easm_compose_comma_count_from(text, index + 1.usize())",
-    "count <- count + 1",
+    "assert easm_compose_comma_count_from(text, index) == 1.usize() + easm_compose_comma_count_from(text, index + 1.usize())",
+    "count <- count + 1.usize()",
     "assert count + easm_compose_comma_count_from(text, index + 1.usize()) == easm_compose_comma_count_from(text, 0.usize())",
     "assert easm_compose_comma_count_from(text, index) == easm_compose_comma_count_from(text, index + 1.usize())",
-    "return count + 1",
+    "count_signed: i64 = count.i64()",
+    "return -1 if count_signed < 0 or count_signed.usize() != count or count_signed >= COMPOSE_ARGUMENT_COUNT_MAX",
+    "return count_signed + 1",
 )
 if any(compact(fragment) not in count_body for fragment in required_count_fragments):
     raise SystemExit("comma-count implementation lost its recursive specification or loop invariant")
+if compact("const COMPOSE_ARGUMENT_COUNT_MAX: i64 = 9223372036854775807") not in compact(text_source):
+    raise SystemExit("compose count no longer names the signed conversion boundary")
 comma_model_body = compact(function_section(text_source, "easm_compose_comma_count_from"))
 if compact("requires cursor <= text.len") not in comma_model_body \
         or compact("decreases text.len - cursor") not in comma_model_body \
         or compact("ensure (cursor < text.len and text[cursor] != 44) implies result == easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body \
-        or compact("ensure (cursor < text.len and text[cursor] == 44) implies result == 1 + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body \
-        or compact("ensure result >= 0") not in comma_model_body \
-        or compact("return 1 + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body:
+        or compact("ensure (cursor < text.len and text[cursor] == 44) implies result == 1.usize() + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body \
+        or compact("ensure result <= text.len - cursor") not in comma_model_body \
+        or compact("return 1.usize() + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body:
     raise SystemExit("recursive comma-count model lost its range, termination, or delimiter step")
 count_spec_body = compact(function_section(text_source, "easm_compose_argument_count_spec"))
 if any(compact(fragment) not in count_spec_body for fragment in (
     "ensure (EasmTextScan::trim_spec(text)).len == 0 implies result == 0",
-    "ensure (EasmTextScan::trim_spec(text)).len > 0 implies result == easm_compose_comma_count_from(text, 0.usize()) + 1",
+    "ensure (EasmTextScan::trim_spec(text)).len > 0 and easm_compose_comma_count_from(text, 0.usize()).i64() >= 0 and easm_compose_comma_count_from(text, 0.usize()).i64().usize() == easm_compose_comma_count_from(text, 0.usize()) and easm_compose_comma_count_from(text, 0.usize()).i64() < COMPOSE_ARGUMENT_COUNT_MAX implies result == easm_compose_comma_count_from(text, 0.usize()).i64() + 1",
+    "ensure (EasmTextScan::trim_spec(text)).len > 0 and (easm_compose_comma_count_from(text, 0.usize()).i64() < 0 or easm_compose_comma_count_from(text, 0.usize()).i64().usize() != easm_compose_comma_count_from(text, 0.usize()) or easm_compose_comma_count_from(text, 0.usize()).i64() >= COMPOSE_ARGUMENT_COUNT_MAX) implies result == -1",
 )):
     raise SystemExit("ghost argument-count model lost the empty-input or raw-delimiter contract")
 
 reference_body = compact(function_section(text_source, "easm_compose_span_reference_from"))
 required_reference_fragments = (
     "ghost def easm_compose_span_reference_from(",
-    "requires cursor <= values.len and segment_start <= cursor and current >= 0",
+    "requires cursor <= values.len and segment_start <= cursor and current <= cursor",
+    "requires wanted.i64() >= 0 and wanted.i64().usize() == wanted",
     "requires base <= source_end",
     "requires cursor <= source_end - base",
     "decreases values.len - cursor",
@@ -163,20 +178,21 @@ required_reference_fragments = (
     "return easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted) if cursor < values.len and values[cursor] != 44",
     "return easm_compose_trimmed_span(values, base, source_end, segment_start, cursor) if current == wanted",
     "return ComposeSpan{start: 0, end: 0, valid: false} if cursor == values.len",
-    "return easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1, wanted)",
+    "return easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1.usize(), wanted)",
 )
 if any(compact(fragment) not in reference_body for fragment in required_reference_fragments):
     raise SystemExit("recursive compose-span specification changed without updating its refinement proof")
 reference_at_bounds_body = compact(function_section(text_source, "easm_compose_span_reference_at_bounds"))
 if any(compact(fragment) not in reference_at_bounds_body for fragment in (
-    "ghost def easm_compose_span_reference_at_bounds(text:sview,open:usize,close_offset:usize,wanted:i64)",
+    "ghost def easm_compose_span_reference_at_bounds(text:sview,open:usize,close_offset:usize,wanted:usize)",
     "requires open < text.len",
     "requires close_offset > 0 and close_offset <= text.len - open",
+    "requires wanted.i64() >= 0 and wanted.i64().usize() == wanted",
     "ensure not result.valid implies result.start == 0 and result.end == 0",
     "ensure result.valid implies result.start <= result.end",
     "ensure result.valid implies result.end <= text.len",
-    "ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_at_offset(text, open, close_offset)) implies result.valid",
-    "return easm_compose_span_reference_from(text[open + 1.usize():open + close_offset], open + 1.usize(), open + close_offset, 0, 0, 0, wanted)",
+    "ensure wanted.i64() < easm_compose_span_argument_count_at_offset(text, open, close_offset) implies result.valid",
+    "return easm_compose_span_reference_from(text[open + 1.usize():open + close_offset], open + 1.usize(), open + close_offset, 0.usize(), 0.usize(), 0.usize(), wanted)",
 )):
     raise SystemExit("named compose-span bounds helper lost its source-slice contracts")
 close_offset_body = compact(function_section(text_source, "easm_compose_close_offset"))
@@ -206,8 +222,10 @@ if any(compact(fragment) not in span_count_at_offset_body for fragment in (
 )):
     raise SystemExit("relative compose count no longer consumes one bounded close offset")
 reference_from_open_body = compact(function_section(text_source, "easm_compose_span_reference_from_open"))
-if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_from_open(text, open)) implies result.valid") not in reference_from_open_body \
+if compact("ensure wanted.i64() < easm_compose_span_argument_count_from_open(text, open) implies result.valid") not in reference_from_open_body \
         or compact("requires open <= text.len") not in reference_from_open_body \
+        or compact("requires wanted.i64() >= 0 and wanted.i64().usize() == wanted") not in reference_from_open_body \
+        or compact("ensure wanted.i64() < easm_compose_span_argument_count_from_open(text, open) implies result.valid") not in reference_from_open_body \
         or compact("return ComposeSpan{start: 0, end: 0, valid: false} if open >= text.len") not in reference_from_open_body \
         or compact("return easm_compose_span_reference_at_offset(text, open, easm_compose_close_offset(text, open), wanted)") not in reference_from_open_body:
     raise SystemExit("recursive span helper lost its open-relative validity contract")
@@ -215,7 +233,8 @@ reference_at_offset_body = compact(function_section(text_source, "easm_compose_s
 if any(compact(fragment) not in reference_at_offset_body for fragment in (
     "requires open <= text.len",
     "requires close_offset <= text.len - open",
-    "ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_at_offset(text, open, close_offset)) implies result.valid",
+    "requires wanted.i64() >= 0 and wanted.i64().usize() == wanted",
+    "ensure wanted.i64() < easm_compose_span_argument_count_at_offset(text, open, close_offset) implies result.valid",
     "return ComposeSpan{start: 0, end: 0, valid: false} if open >= text.len",
     "return ComposeSpan{start: 0, end: 0, valid: false} if close_offset == 0",
     "return easm_compose_span_reference_at_bounds(text, open, close_offset, wanted)",
@@ -252,6 +271,10 @@ if compact('return easm_compose_span_argument_count_from_open(text, EasmTextScan
 reference_wrapper_body = compact(function_section(text_source, "easm_compose_span_reference"))
 if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count(text)) implies result.valid") not in reference_wrapper_body:
     raise SystemExit("recursive span wrapper lost its in-range index validity contract")
+if compact("return ComposeSpan{start: 0, end: 0, valid: false} if wanted < 0") not in reference_wrapper_body \
+        or compact("return ComposeSpan{start: 0, end: 0, valid: false} if wanted_index.i64() != wanted") not in reference_wrapper_body \
+        or compact("return ComposeSpan{start: 0, end: 0, valid: false} if easm_compose_span_argument_count(text) < 0 or wanted >= easm_compose_span_argument_count(text)") not in reference_wrapper_body:
+    raise SystemExit("recursive span wrapper no longer rejects negative or unrepresentable indices")
 parse_compose_body = compact(function_section(text_source, "easm_parse_compose"))
 if compact("ensure result.valid implies result.argument_count == easm_compose_span_argument_count(text)") not in parse_compose_body:
     raise SystemExit("compose parser count is not bound to the span-domain argument count")
