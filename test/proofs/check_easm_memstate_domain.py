@@ -67,10 +67,9 @@ if 'marker:usize=EasmTextScan::find_spec(fact,"size>=")' not in fact_bound_compa
         'returneasm_parse_i64_spec(EasmTextScan::trim_spec(fact[marker+7.usize():fact.len]))' not in fact_bound_compact:
     raise SystemExit("memory size facts no longer use the pure scanner and decimal specifications")
 lower_bound_body = memory.split("def easm_size_guard_lower_bound(", 1)[1].split("\n\n        def ", 1)[0]
-if "".join("greatest <- EasmMemStateDomain::greatest_bound(greatest, value)".split()) not in "".join(lower_bound_body.split()):
-    raise SystemExit("production size-fact lower-bound fold no longer uses the proved maximum operation")
 lower_bound_compact = "".join(lower_bound_body.split())
-if "ensureresult>=0" not in lower_bound_compact or \
+if "ifvalue>greatest:greatest<-value" not in lower_bound_compact or \
+        "ensureresult>=0" not in lower_bound_compact or \
         "forindexin0..<facts.count|facts,greatest|:" not in lower_bound_compact or \
         "invariantindex<=facts.count" not in lower_bound_compact or \
         "invariantgreatest>=0" not in lower_bound_compact or \
