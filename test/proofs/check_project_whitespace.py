@@ -82,6 +82,9 @@ extend_span_body = function_body(
 extend_view_body = function_body(
     "bytes_extend_view", "def bytes_extend_view(target: mutable darray[u8]&, text: sview) -> void:"
 )
+strlist_extend_body = function_body(
+    "strlist_extend", "def strlist_extend(target: lmut StrList, source: StrList&) -> void:"
+)
 equal_view_body = function_body(
     "bytes_equal_view", "def bytes_equal_view(value: darray[u8]&, text: sview) -> bool:"
 )
@@ -93,11 +96,10 @@ for fragment in (
     "ensure result <= value.count",
     "ensure forall prefix in 0..<result: bytes_is_space(value[prefix])",
     "ensure result < value.count implies not bytes_is_space(value[result])",
-    "while first < value.count",
+    "while first < value.count and bytes_is_space(value[first])",
     "decreases value.count - first",
     "invariant first <= value.count",
     "invariant forall prefix in 0..<first: bytes_is_space(value[prefix])",
-    "break if not bytes_is_space(value[first])",
     "first <- first + 1.usize()",
     "return first",
 ):
@@ -109,12 +111,12 @@ for fragment in (
     "ensure forall suffix in result..<value.count: bytes_is_space(value[suffix])",
     "ensure result > bytes_trim_start(value) implies not bytes_is_space(value[result - 1.usize()])",
     "first: usize = bytes_trim_start(value)",
-    "while last > first",
+    "while last > first and bytes_is_space(value[last - 1.usize()])",
     "decreases last - first",
     "invariant first <= last",
+    "invariant first == bytes_trim_start(value)",
     "invariant last <= value.count",
     "invariant forall suffix in last..<value.count: bytes_is_space(value[suffix])",
-    "break if not bytes_is_space(value[last - 1.usize()])",
     "last <- last - 1.usize()",
     "return last",
 ):
@@ -122,6 +124,10 @@ for fragment in (
         raise SystemExit(f"production trailing trim no longer preserves the nonspace interval: {fragment}")
 if compact("return bytes_trim_start(value) == value.count") not in compact(blank_body):
     raise SystemExit("production blank predicate no longer uses the leading trim boundary")
+if compact("can Memory.Allocate, Abort.Panic:") not in compact(strlist_extend_body) or \
+        compact("target <- strlist_push_span(target, source.data, source.starts[index], source.lengths[index])") \
+        not in compact(strlist_extend_body):
+    raise SystemExit("production StrList extension no longer grants the span-copy effects explicitly")
 for fragment in (
     "start: usize = bytes_trim_start(value)",
     "end: usize = bytes_trim_end(value)",
