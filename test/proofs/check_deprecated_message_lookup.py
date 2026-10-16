@@ -86,12 +86,11 @@ if compact(function_section(source_text, "message_of")) != compact(expected_scan
 expected_wrapper = '''
 def deprecated_message_of(callee_name: sview, names: darray[sview]&, messages: darray[sview]&) -> (found: bool, message: sview):
     requires names.count == messages.count
-    ensure result == SemanticDeprecatedMessageLookup::message_of(names, messages, callee_name)
     can Abort.Panic:
         return SemanticDeprecatedMessageLookup::message_of(names, messages, callee_name)
 '''
 if compact(function_section(consumer_text, "deprecated_message_of")) != compact(expected_wrapper):
-    raise SystemExit("semantic consumer no longer delegates lookup through the proved helper contract")
+    raise SystemExit("semantic consumer no longer delegates lookup to the proved helper")
 if consumer_text.count('include "./deprecated_message_lookup.elisa"') != 1:
     raise SystemExit("deprecated-call consumer must include the isolated lookup exactly once")
 if semantic_text.count('include "./check_deprecated_call.elisa"') != 1:
@@ -100,8 +99,14 @@ collector = compact(function_section(consumer_text, "collect_deprecated_function
 if "requiresnames.count==messages.count" not in collector or \
         "ensurenames.count==messages.count" not in collector or \
         collector.count("invariantnames.count==messages.count") != 2 or \
-        collector.count("assertnames.count==messages.count") < 3:
+        collector.count("assertnames.count==messages.count") < 5 or \
+        "deprecated_function_pair_append(function_name,strip_quotes(message),names,messages)" not in collector:
     raise SystemExit("deprecated declaration collection no longer preserves parallel-array length equality")
+pair_append = compact(function_section(consumer_text, "deprecated_function_pair_append"))
+if "requiresnames.count==messages.count" not in pair_append or \
+        "ensurenames.count==messages.count" not in pair_append or \
+        "names.push(function_name)messages.push(message)" not in pair_append:
+    raise SystemExit("deprecated declaration pair append no longer proves the parallel-array length invariant")
 for name in ("deprecated_call_expression", "deprecated_call_statements", "deprecated_call_walk"):
     if "requiresnames.count==messages.count" not in compact(function_section(consumer_text, name)):
         raise SystemExit(f"{name} no longer carries the parallel-array lookup precondition")
