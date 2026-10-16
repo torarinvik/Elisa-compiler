@@ -140,7 +140,7 @@ required_parse_steps = (
     "start:usize=position",
     "invariantnotvalidordecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "invariantnotvalidordecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
-    "invariantnotvalidorforalldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE)",
+    "invariantnotvalidor(foralldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE))",
     "ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-falsebreak",
     "append_negative_digit(value,digit)",
     "ifnotstep.valid:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-falsebreak",
