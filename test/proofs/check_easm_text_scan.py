@@ -57,7 +57,7 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)(?:ghost[ \t]+)?def {re.escape(name)}\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
@@ -70,6 +70,14 @@ def function_section(source: str, name: str) -> str:
 source_text = SOURCE.read_text()
 source_compact = compact(source_text)
 environment_text = ENV.read_text()
+trim_bounds_spec = compact(function_section(source_text, "trim_bounds_spec"))
+if not all(fragment in trim_bounds_spec for fragment in (
+    "ghostdeftrim_bounds_spec(text:sview)",
+    "ensureresult.start<=result.end",
+    "ensureresult.end<=text.len",
+    "return(trim_start_spec(text,0),trim_end_spec(text,trim_start_spec(text,0),text.len))",
+)):
+    raise SystemExit("ghost trim bounds no longer proves its ordered in-range output span")
 if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
 if environment_text.index('include "easm_text_scan.elisa"') > environment_text.index('include "easm_verify_provenance.elisa"'):
