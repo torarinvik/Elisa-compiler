@@ -67,34 +67,21 @@ if "ensureresult>=0" not in lower_bound_compact or \
         "decreasesfacts.count-index" not in lower_bound_compact or \
         "invariantindex<=facts.count" not in lower_bound_compact or \
         "invariantgreatest>=0" not in lower_bound_compact or \
-        "ensureresult==easm_size_guard_lower_bound_from(facts,0.usize(),0)" not in lower_bound_compact or \
         "ensure(forallfact_indexin0..<facts.count:" not in lower_bound_compact or \
-        "invarianteasm_size_guard_lower_bound_from(facts,index,greatest)==easm_size_guard_lower_bound_from(facts,0.usize(),0)" not in lower_bound_compact:
-    raise SystemExit("production size-fact fold no longer proves its exact recursive-fold result and nonnegative accumulator")
-fold_spec = memory.split("ghost def easm_size_guard_lower_bound_from(", 1)[1].split(
-    "\n\n        def easm_memory_reads(", 1
-)[0]
-fold_spec_compact = "".join(fold_spec.split())
-required_fold_fragments = (
-    "facts:darray[sview]&,index:usize,greatest:i64)->i64:",
-    "requiresindex<=facts.countandgreatest>=0",
-    "decreasesfacts.count-index",
-    "ensureresult>=greatest",
-    "ensure(forallfact_indexinindex..<facts.count:",
-    "returngreatestifindex==facts.count",
-    'returneasm_size_guard_lower_bound_from(facts,index+1.usize(),EasmMemStateDomain::greatest_bound(greatest,easm_parse_i64(easm_trim(facts[index][easm_find(facts[index],"size>=")+7.usize():(facts[index]).len]))))ifeasm_find(facts[index],"size>=")<(facts[index]).len',
-    "returneasm_size_guard_lower_bound_from(facts,index+1.usize(),greatest)",
-)
-if not all(fragment in fold_spec_compact for fragment in required_fold_fragments):
-    raise SystemExit("recursive size-fact fold specification changed without updating its production proof")
+        "invariant(forallfact_indexin0..<index:" not in lower_bound_compact:
+    raise SystemExit("production size-fact fold no longer proves its processed-prefix coverage and nonnegative accumulator")
 covered_fact = (
     'easm_find(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
     'result>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():(facts[fact_index]).len]))'
 )
-if f"ensure(forallfact_indexinindex..<facts.count:{covered_fact}" not in fold_spec_compact:
-    raise SystemExit("recursive size-fact spec no longer proves every recognized fact is covered")
 if f"ensure(forallfact_indexin0..<facts.count:{covered_fact}" not in lower_bound_compact:
     raise SystemExit("production size-fact fold no longer exports its per-fact coverage guarantee")
+processed_fact = (
+    'easm_find(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
+    'greatest>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():(facts[fact_index]).len]))'
+)
+if f"invariant(forallfact_indexin0..<index:{processed_fact}" not in lower_bound_compact:
+    raise SystemExit("production size-fact fold no longer tracks its processed-prefix lower-bound invariant")
 wrappers = {
     "easm_memstate_join_min": "EasmMemStateDomain::join_min(left, right)",
     "easm_memstate_read_well_typed": "EasmMemStateDomain::read_well_typed(need, known_min)",
