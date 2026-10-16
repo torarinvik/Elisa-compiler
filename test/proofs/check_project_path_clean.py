@@ -100,10 +100,19 @@ expected_build = compact("""
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
         )
         out.push(47) if segment > 0.usize() or (out.count > 0.usize() and not rooted)
-        bytes_extend_span(&out, path, starts[segment], lengths[segment])
+        assert not rooted or (
+            out.count > 0.usize() and
+            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+        )
+        for offset in 0..<lengths[segment] |out, starts, lengths, path, rooted, segment|:
+            invariant not rooted or (
+                out.count > 0.usize() and
+                out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+            )
+            out.push(path[starts[segment] + offset])
 """)
 if build != expected_build:
-    raise SystemExit("path_clean root-preserving output loop changed or gained a root-mutating operation")
+    raise SystemExit("path_clean root-preserving output loops changed or gained a root-mutating operation")
 if compact("if out.count == 0.usize(): out.push(46) return out") not in cleaner:
     raise SystemExit("path_clean no longer uses the relative empty-path fallback")
 for fragment in (
