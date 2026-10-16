@@ -112,12 +112,13 @@ if compact(function_chunk(ENCODING_TEXT, "binding_mode")) != compact('''
         ensure bind != "" or result == ForBindingMode.Value
         ensure bind != "mutable" or result == ForBindingMode.MutableReference
         ensure (bind == "" or bind == "mutable") or result == ForBindingMode.Unsupported
-        return match bind:
-            "": ForBindingMode.Value
-            "mutable": ForBindingMode.MutableReference
-            _: ForBindingMode.Unsupported
+        if bind == "":
+            return ForBindingMode.Value
+        if bind == "mutable":
+            return ForBindingMode.MutableReference
+        return ForBindingMode.Unsupported
 '''):
-    raise SystemExit("binding_mode no longer uses the exact closed pattern match")
+    raise SystemExit("binding_mode no longer implements the exact three-way binding mode map")
 if compact(function_chunk(ENCODING_TEXT, "binding_mode_value")) != compact('''
     def binding_mode_value(mode: ForBindingMode) -> i64:
         ensure mode != ForBindingMode.Value or result == ITER_BIND_VALUE_MODE_VALUE
