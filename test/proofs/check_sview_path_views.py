@@ -100,15 +100,13 @@ for helper, fragments, label in (
     (basename, (
         'return sview("", 0, 0) if view.len < 0 or view.len.usize().i64() != view.len',
         "last: i64 = sview_find_last_byte(view, sep)",
-        "if last >= 0:",
-        "return string_view_slice(view, last + 1, view.len)",
+        "return string_view_slice(view, last + 1, view.len) if last >= 0",
         "return view",
     ), "basename"),
     (dirname, (
         'return sview("", 0, 0) if view.len < 0 or view.len.usize().i64() != view.len',
         "last: i64 = sview_find_last_byte(view, sep)",
-        "if last >= 0:",
-        "return string_view_prefix(view, last)",
+        "return string_view_prefix(view, last) if last >= 0",
         "return string_view_prefix(view, 0)",
     ), "dirname"),
 ):
