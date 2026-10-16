@@ -154,6 +154,7 @@ required_contracts = (
     "invariant steps <= expected_count",
     "steps != 0 implies last_row.usize() < table.ref_pos.count",
     "row == table.ref_owner_next[last_row.usize()].usize()",
+    "invariant not indexed or ((steps == 0 and row == table.ref_owner_heads[owner.value.usize()].usize()) or (steps != 0 and row == table.ref_owner_next[last_row.usize()].usize()))",
     "decreases expected_count - steps",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
@@ -163,14 +164,14 @@ for contract in required_contracts:
 lookup_lines = lookup_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
-if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 4:
+if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 5:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 1:
     raise AssertionError("ownership lookup termination measure changed; review this proof gate")
 
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "contract_count": 15,
-                      "invariant_count": 4, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
+                      "invariant_count": 5, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, TABLE_SOURCE, POS_SOURCE,
