@@ -37,9 +37,15 @@ if 'include "./check_extern_enum.elisa"' not in SEMANTIC.read_text():
 if "ForeignEnumName::is_validator_of(function_name, name)" not in check_text:
     raise SystemExit("foreign-enum check no longer uses the proved validator-name predicate")
 if "ensure result == (" not in helper_text or "forall prefix_index in 0..<enum_name.len:" not in helper_text \
-        or 'function_name.len == enum_name.len + "__from_c".len' not in helper_text \
+        or "function_name.len >= enum_name.len" not in helper_text \
+        or 'function_name.len - enum_name.len == "__from_c".len' not in helper_text \
         or 'function_name[enum_name.len + suffix_index] == "__from_c"[suffix_index]' not in helper_text:
-    raise SystemExit("production predicate no longer contracts exact prefix and suffix identity")
+    raise SystemExit("production predicate no longer contracts overflow-safe prefix and suffix identity")
+if "false return if function_name.len < enum_name.len" not in helper_text or \
+        "assert function_name.len - enum_name.len == \"__from_c\".len" not in helper_text or \
+        'assert enum_name.len + "__from_c".len == function_name.len' not in helper_text or \
+        "assert enum_name.len + suffix_index < function_name.len" not in helper_text:
+    raise SystemExit("production validator-name proof lost its overflow-safe length and suffix bounds")
 if "invariant index <= enum_name.len and enum_name.len <= function_name.len" not in helper_text or \
         "invariant forall prefix_index in 0..<index:" not in helper_text:
     raise SystemExit("production prefix loop is missing its byte-prefix invariant")
