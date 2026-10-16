@@ -158,6 +158,11 @@ required_contracts = (
     "invariant (step == 0 implies row == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()].usize())",
     "invariant not found or result_index < table.ref_pos.count",
     "invariant not found or table.ref_binding_ids[result_index].owner.value == owner.value",
+    "return (false, missing) if row == SYMBOL_INDEX_ROW_NONE.usize() or row >= table.ref_pos.count or row >= table.ref_binding_ids.count or row >= table.ref_owner_next.count",
+    "assert index < table.ref_binding_ids.count",
+    "assert table.ref_binding_ids[index].owner.value == owner.value",
+    "assert table.ref_pos[index].offset == position.offset",
+    "assert table.ref_pos[index].end_offset == position.end_offset",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
