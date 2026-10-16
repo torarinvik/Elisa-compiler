@@ -93,7 +93,7 @@ if f"invariant(forallfact_indexin0..<index:{processed_fact}" not in lower_bound_
 if 'assertmarker==EasmTextScan::find_spec(fact,"size>=")' not in lower_bound_compact or \
         "assertvalue==easm_size_guard_fact_bound_spec(fact)" not in lower_bound_compact or \
         'value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():fact.len]))' not in lower_bound_compact or \
-        "assertforallfact_indexin0..<(index+1.usize()):" not in lower_bound_compact:
+        "assert(forallfact_indexin0..<(index+1.usize()):" not in lower_bound_compact:
     raise SystemExit("runtime size-fact extraction no longer proves each loop step against its pure specification")
 wrappers = {
     "easm_memstate_join_min": "EasmMemStateDomain::join_min(left, right)",
