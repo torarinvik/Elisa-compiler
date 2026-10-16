@@ -83,11 +83,18 @@ def is_lexical(owner: sview, current: sview) -> bool:
         false return if current_length < 2
         false return if owner_length > current_length - 2
         false return if current[owner_length] != 58 or current[owner_length + 1.usize()] != 58
-        for index in 0..<owner_length |owner, current, owner_length, current_length|:
-            invariant index <= owner_length
-            invariant owner_length <= current_length - 2
+        assert current_length >= 2
+        assert owner_length <= current_length - 2
+        assert current[owner_length] == 58 and current[owner_length + 1.usize()] == 58
+        index: mutable usize = 0
+        while index < owner_length |index, owner, current, owner_length, current_length|:
+            decreases owner_length - index
+            invariant index <= owner_length and owner_length <= current_length - 2
             invariant forall prefix_index in 0..<index: owner[prefix_index] == current[prefix_index]
             false return if owner[index] != current[index]
+            assert owner[index] == current[index]
+            index <- index + 1.usize()
+        assert forall prefix_index in 0..<owner_length: owner[prefix_index] == current[prefix_index]
         return true
 '''
 if "moduleSemanticLexicalModuleOwnerPolicy:" not in compact(policy_text):
