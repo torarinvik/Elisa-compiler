@@ -71,13 +71,11 @@ if "".join("greatest <- EasmMemStateDomain::greatest_bound(greatest, value)".spl
     raise SystemExit("production size-fact lower-bound fold no longer uses the proved maximum operation")
 lower_bound_compact = "".join(lower_bound_body.split())
 if "ensureresult>=0" not in lower_bound_compact or \
-        "whileindex<facts.count|index,facts,greatest|:" not in lower_bound_compact or \
-        "decreasesfacts.count-index" not in lower_bound_compact or \
+        "forindexin0..<facts.count|facts,greatest|:" not in lower_bound_compact or \
         "invariantindex<=facts.count" not in lower_bound_compact or \
         "invariantgreatest>=0" not in lower_bound_compact or \
-        "assertindex==0" not in lower_bound_compact or \
         "assertgreatest>=0" not in lower_bound_compact or \
-        "assert(forallfact_indexin0..<index:" not in lower_bound_compact or \
+        "assert(forallfact_indexin0..<facts.count:" not in lower_bound_compact or \
         "ensure(forallfact_indexin0..<facts.count:" not in lower_bound_compact or \
         "invariant(forallfact_indexin0..<index:" not in lower_bound_compact:
     raise SystemExit("production size-fact fold no longer proves its processed-prefix coverage and nonnegative accumulator")
