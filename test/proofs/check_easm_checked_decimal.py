@@ -121,8 +121,8 @@ required_parse_contracts = (
 )
 required_parse_steps = (
     "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len",
+    "return(false,0)iftext.len==1andtext[0]==ASCII_MINUS",
     "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
-    "ifposition==text.len:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0return(false,0)",
     "assertposition<text.len",
     "assertstart<text.len",
     "assertnotnegativeorposition>=1",
