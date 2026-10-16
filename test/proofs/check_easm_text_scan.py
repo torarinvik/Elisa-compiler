@@ -1,4 +1,5 @@
 """Admit the source-linked EASM first-whitespace scan proof."""
+import argparse
 import hashlib
 import json
 import os
@@ -12,7 +13,11 @@ from proof_product_gate import require_current_product
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check production and proof source bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/backend/easm_text_scan.elisa"
 ENV = ROOT / "src/backend/codegen_env.elisa"
@@ -57,7 +62,7 @@ def function_section(source: str, name: str) -> str:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost[ \t]+)?def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -373,6 +378,11 @@ required_negative_claims = (
 )
 if not all(fragment in negative_compact for fragment in required_negative_claims):
     raise SystemExit("negative controls no longer cover scanner prefix, search, or trim boundaries")
+
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "positive_claims": len(positive_names),
+                      "false_claim_controls": len(negative_names)}))
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

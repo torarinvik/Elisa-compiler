@@ -122,9 +122,7 @@ required_parse_contracts = (
 required_parse_steps = (
     "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len",
     "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
-    "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:iftext.len==1:assertnotdecimal_parse_reference(text).valid",
-    "assertdecimal_parse_reference(text).value==0",
-    "return(false,0)",
+    "return(false,0)ifposition==text.len",
     "whileposition<text.len|position,text,value|",
     "decreasestext.len-position",
     "invariantposition<=text.len",
@@ -164,7 +162,8 @@ if not all(fragment in reference_from for fragment in required_reference_fragmen
         "append_positive_digit" in reference_from or "append_negative_digit" in reference_from:
     raise SystemExit("recursive decimal reference no longer defines an independent checked digit fold")
 if "ghostdefdecimal_parse_reference(text:sview)" not in reference_wrapper or \
-        "returndecimal_parse_reference_from(text,position,negative,0,false)" not in reference_wrapper or \
+        "returndecimal_parse_reference_from(text,1,true,0,false)iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS" not in reference_wrapper or \
+        "returndecimal_parse_reference_from(text,0,false,0,false)" not in reference_wrapper or \
         "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len" not in reference_wrapper or \
         "ensure(result.validandtext.len>0andtext[0]==ASCII_MINUS)impliesresult.value<=0" not in reference_wrapper or \
         "ensure(result.validandtext.len>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0" not in reference_wrapper:

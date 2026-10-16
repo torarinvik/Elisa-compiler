@@ -129,7 +129,11 @@ decimal_source = DECIMAL_PARSER.read_text()
 decimal_parser = compact(function_section(decimal_source, "parse_signed"))
 decimal_reference = compact(function_section(decimal_source, "decimal_parse_reference"))
 decimal_minus_guard = "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:"
-if decimal_minus_guard not in decimal_parser or decimal_minus_guard not in decimal_reference:
+decimal_reference_minus_branch = (
+    "returndecimal_parse_reference_from(text,1,true,0,false)if"
+    "text.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS"
+)
+if decimal_minus_guard not in decimal_parser or decimal_reference_minus_branch not in decimal_reference:
     raise SystemExit("checked-decimal implementation and reference no longer use the guarded .len and [0] syntax")
 
 find_byte = compact(function_section(runtime_text, "sview_find_byte"))
