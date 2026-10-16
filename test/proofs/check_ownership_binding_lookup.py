@@ -146,6 +146,8 @@ required_contracts = (
     "if table.ref_binding_ids.count == 1 and table.ref_pos.count == 1",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
+    "assert expected_count == table.ref_owner_counts[owner.value.usize()].usize()",
+    "assert expected_tail == table.ref_owner_tails[owner.value.usize()]",
     "return (false, missing) if expected_count > table.ref_pos.count",
     "return (false, missing) if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
     "for step in 0..<expected_count",
