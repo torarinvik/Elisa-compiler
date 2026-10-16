@@ -313,9 +313,10 @@ size_bound_source = compact(function_section(memory_text, "easm_size_guard_lower
 if "greatest<-EasmMemStateDomain::greatest_bound(greatest,value)" not in size_bound_source:
     raise SystemExit("size-guard facts no longer combine parsed values in the proved lower-bound domain")
 unchecked_parse_source = compact(function_section(parser_text, "easm_parse_i64"))
-if "parsed:(valid:bool,value:i64)=easm_parse_i64_checked(text)" not in unchecked_parse_source or \
+if "ensureresult==easm_parse_i64_spec(text)" not in unchecked_parse_source or \
+        "parsed:(valid:bool,value:i64)=easm_parse_i64_checked(text)" not in unchecked_parse_source or \
         "returnparsed.valueifparsed.validelse0" not in unchecked_parse_source:
-    raise SystemExit("legacy size-fact parser no longer maps rejected decimals to the proved zero sentinel")
+    raise SystemExit("legacy size-fact parser no longer matches the checked-decimal specification")
 
 layout_parser_text = LAYOUT_PARSER.read_text()
 layout_parse_body = layout_parser_text.split(
