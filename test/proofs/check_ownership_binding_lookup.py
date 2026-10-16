@@ -146,8 +146,8 @@ required_contracts = (
     "if table.ref_binding_ids.count == 1 and table.ref_pos.count == 1",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
-    "return (false, missing) if expected_count > table.ref_pos.count",
-    "return (false, missing) if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "return ownership_binding_missing() if expected_count > table.ref_pos.count",
+    "return ownership_binding_missing() if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
     "for step in 0..<expected_count",
     "row != SYMBOL_INDEX_ROW_NONE.usize() or last_row != expected_tail",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
@@ -160,6 +160,14 @@ required_contracts = (
     "invariant not found or table.ref_binding_ids[result_index].owner.value == owner.value",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
+for helper_fragment in (
+    "private:",
+    "def ownership_binding_missing() -> (known: bool, binding_id: BindingId):",
+    "ensure not result.known and result.binding_id.owner.value == INVALID_DECL_ID_VALUE and result.binding_id.serial == FIRST_BINDING_SERIAL",
+    "return (false, BindingId{owner: DeclId{value: INVALID_DECL_ID_VALUE}, serial: FIRST_BINDING_SERIAL})",
+):
+    if helper_fragment not in normalized_lookup:
+        raise AssertionError(f"canonical ownership miss helper lost its contract or literal result: {helper_fragment}")
 for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
@@ -177,22 +185,20 @@ if not re.search(
     r"assert table\.ref_pos\[result_index\]\.offset == position\.offset\s+"
     r"assert table\.ref_pos\[result_index\]\.end_offset == position\.end_offset\s+"
     r"return \(true, binding_id\)\s+"
-    r"assert missing\.owner\.value == INVALID_DECL_ID_VALUE\s+"
-    r"assert missing\.serial == FIRST_BINDING_SERIAL\s+"
-    r"return \(false, missing\)",
+    r"return ownership_binding_missing\(\)",
     lookup_text,
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
 lookup_lines = lookup_text.splitlines()
-if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
-    raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
+if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 16:
+    raise AssertionError("ownership lookup/helper contract set changed; review and update this proof gate")
 if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 8:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
-    print(json.dumps({"source_bound": True, "contract_count": 15,
+    print(json.dumps({"source_bound": True, "contract_count": 16,
                       "invariant_count": 8, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
