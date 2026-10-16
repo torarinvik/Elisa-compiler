@@ -76,7 +76,8 @@ helper_names = {
     "easm_parse_instruction", "easm_issue", "easm_parse_compose",
     "easm_compose_argument_count", "easm_compose_span",
     "easm_compose_comma_count_from", "easm_compose_span_argument_count",
-    "easm_compose_trimmed_span", "easm_compose_span_reference_from",
+    "easm_compose_span_from_trim_bounds", "easm_compose_trimmed_span",
+    "easm_compose_span_reference_from", "easm_compose_span_reference_at_bounds",
     "easm_compose_span_reference",
 }
 if not helper_names <= declarations(text_source):
@@ -152,6 +153,17 @@ required_reference_fragments = (
 )
 if any(compact(fragment) not in reference_body for fragment in required_reference_fragments):
     raise SystemExit("recursive compose-span specification changed without updating its refinement proof")
+reference_at_bounds_body = compact(function_section(text_source, "easm_compose_span_reference_at_bounds"))
+if any(compact(fragment) not in reference_at_bounds_body for fragment in (
+    "ghost def easm_compose_span_reference_at_bounds(text:sview,open:usize,close:usize,wanted:i64)",
+    "requires open < close and close <= text.len",
+    "ensure not result.valid implies result.start == 0 and result.end == 0",
+    "ensure result.valid implies result.start <= result.end",
+    "ensure result.valid implies result.end <= text.len",
+    "ensure (wanted >= 0 and wanted < easm_compose_span_argument_count(text)) implies result.valid",
+    "return easm_compose_span_reference_from(text[open + 1.usize():close], open + 1.usize(), close, 0, 0, 0, wanted)",
+)):
+    raise SystemExit("named compose-span bounds helper lost its source-slice contracts")
 trimmed_span_body = compact(function_section(text_source, "easm_compose_trimmed_span"))
 if any(compact(fragment) not in trimmed_span_body for fragment in (
     "ghost def easm_compose_trimmed_span(",
@@ -159,10 +171,21 @@ if any(compact(fragment) not in trimmed_span_body for fragment in (
     "ensure result.valid",
     "ensure result.start <= result.end",
     "ensure result.end <= source_end",
-    "EasmTextScan::trim_bounds_spec(values[segment_start:cursor]).start",
-    "EasmTextScan::trim_bounds_spec(values[segment_start:cursor]).end",
+    "return easm_compose_span_from_trim_bounds(base, source_end, segment_start, cursor, EasmTextScan::trim_bounds_spec(values[segment_start:cursor]))",
 )):
     raise SystemExit("trimmed compose spans no longer derive their bounds from the proved trim specification")
+trim_bounds_span_body = compact(function_section(text_source, "easm_compose_span_from_trim_bounds"))
+if any(compact(fragment) not in trim_bounds_span_body for fragment in (
+    "ghost def easm_compose_span_from_trim_bounds(",
+    "requires bounds.start <= bounds.end and bounds.end <= cursor - segment_start",
+    "requires base + cursor <= source_end",
+    "ensure result.valid",
+    "ensure result.start <= result.end",
+    "ensure result.end <= source_end",
+    "start: base + segment_start + bounds.start",
+    "end: base + segment_start + bounds.end",
+)):
+    raise SystemExit("compose span constructor no longer binds both endpoints to one proved trim tuple")
 
 span_count_body = compact(function_section(text_source, "easm_compose_span_argument_count"))
 span_count_expression = (

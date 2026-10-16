@@ -87,6 +87,9 @@ if not all(fragment in trim_bounds_spec_from for fragment in (
     "return(first,trim_end_spec(text,first,text.len))",
 )):
     raise SystemExit("ghost trim bounds helper no longer shares the leading-trim endpoint")
+for spec_name in ("find_from_spec", "find_spec"):
+    if "ensureresult<=text.len" not in compact(function_section(source_text, spec_name)):
+        raise SystemExit(f"ghost {spec_name} no longer exposes the bounded search-result fact")
 if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
 if environment_text.index('include "easm_text_scan.elisa"') > environment_text.index('include "easm_verify_provenance.elisa"'):
