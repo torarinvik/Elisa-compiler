@@ -130,7 +130,7 @@ required_parse_steps = (
     "assertnegativeorvalue>=0",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
-    "whileposition<text.len|position,text,value|",
+    "whileposition<text.len|position,text,value,negative,start|",
     "decreasestext.len-position",
     "invariantposition<=text.len",
     "invariantstart<text.len",
@@ -314,8 +314,8 @@ if "break if byte <" in parser_body or "value <- value *" in parser_body:
 if "value: i64 = easm_parse_i64(easm_trim(fact[marker + 7.usize():fact.len]))" not in memory_text:
     raise SystemExit("size-guard facts no longer use the hardened signed-decimal parser")
 size_bound_source = compact(function_section(memory_text, "easm_size_guard_lower_bound"))
-if "greatest<-EasmMemStateDomain::greatest_bound(greatest,value)" not in size_bound_source:
-    raise SystemExit("size-guard facts no longer combine parsed values in the proved lower-bound domain")
+if "ifvalue>greatest:greatest<-value" not in size_bound_source:
+    raise SystemExit("size-guard facts no longer combine parsed values with the lower-bound maximum")
 unchecked_parse_source = compact(function_section(parser_text, "easm_parse_i64"))
 if "ensureresult==easm_parse_i64_spec(text)" not in unchecked_parse_source or \
         "parsed:(valid:bool,value:i64)=easm_parse_i64_checked(text)" not in unchecked_parse_source or \
