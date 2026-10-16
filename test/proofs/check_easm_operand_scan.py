@@ -263,6 +263,8 @@ for required in (
     "ensure result.valid and result.count == 1 implies ( result.first_separator == text.len and result.last_separator == text.len and result.start < text.len and first_operand_byte(text[result.start:text.len], 0.usize()) < (text[result.start:text.len]).len and next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) == text.len )",
     "ensure result.valid and result.count == 2 implies ( result.first_separator < text.len and result.first_separator == result.last_separator and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close) == text.len",
     "ensure result.valid and result.count == TOO_MANY_OPERANDS_SENTINEL implies ( result.first_separator < result.last_separator and result.last_separator < text.len and result.first_separator == next_top_level_separator(text, result.start, result.has_address_group, result.address_open, result.address_close) and result.last_separator == next_top_level_separator(text, result.first_separator + SCAN_STEP, result.has_address_group, result.address_open, result.address_close)",
+    "final_span: sview = text[second_separator + SCAN_STEP:text_length]",
+    "first_operand_byte(final_span, 0.usize()) < final_span.len",
 ):
     if compact(required) not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
