@@ -130,6 +130,8 @@ if any(compact(fragment) not in count_body for fragment in required_count_fragme
 comma_model_body = compact(function_section(text_source, "easm_compose_comma_count_from"))
 if compact("requires cursor <= text.len") not in comma_model_body \
         or compact("decreases text.len - cursor") not in comma_model_body \
+        or compact("ensure (cursor < text.len and text[cursor] != 44) implies result == easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body \
+        or compact("ensure (cursor < text.len and text[cursor] == 44) implies result == 1 + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body \
         or compact("ensure result >= 0") not in comma_model_body \
         or compact("return 1 + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body:
     raise SystemExit("recursive comma-count model lost its range, termination, or delimiter step")
