@@ -253,6 +253,12 @@ for required in (
     'EasmTextScan::find(trailing, ")") < trailing.len',
     "first_separator: usize = next_top_level_separator(text, start, has_address, open, close)",
     "second_separator: usize = next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
+    "assert not has_address or (start <= open and open < close and close < text.len and text[open] == ASCII_LEFT_PAREN and text[close] == ASCII_RIGHT_PAREN)",
+    "assert not has_address or (forall candidate in start..<open: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN)",
+    "assert not has_address or (forall candidate in open + SCAN_STEP..<close: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN)",
+    "assert not has_address or (forall candidate in close + SCAN_STEP..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN)",
+    "assert has_address or (open == text.len and close == text.len)",
+    "assert has_address or (forall candidate in start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN)",
     "return (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
     "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
     "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
@@ -266,6 +272,24 @@ for required in (
 ):
     if compact(required) not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
+for return_fact in (
+    "assert open <= text.len and close <= text.len",
+    "assert not has_address or (start <= open and open < close and close < text.len and text[open] == ASCII_LEFT_PAREN and text[close] == ASCII_RIGHT_PAREN)",
+    "assert not has_address or (forall candidate in start..<open:",
+    "assert not has_address or (forall candidate in open + SCAN_STEP..<close:",
+    "assert not has_address or (forall candidate in close + SCAN_STEP..<text.len:",
+    "assert has_address or (open == text.len and close == text.len)",
+    "assert has_address or (forall candidate in start..<text.len:",
+):
+    if scanner.count(compact(return_fact)) != 3:
+        raise SystemExit(f"valid scan returns must share the same address proof fact: {return_fact}")
+for arity_fact in (
+    "assert first_separator == text.len",
+    "assert next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close) == text.len",
+    "assert second_separator == next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
+):
+    if compact(arity_fact) not in scanner:
+        raise SystemExit(f"valid scan return lost its separator proof fact: {arity_fact}")
 first_operand_scan = compact(function_section(policy, "first_operand_byte"))
 if compact("decreases text_length - index") not in first_operand_scan or compact("invariant from <= index and index <= text_length") not in first_operand_scan:
     raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
