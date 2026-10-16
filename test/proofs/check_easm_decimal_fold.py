@@ -43,6 +43,8 @@ loop_start = parser_impl.find("while position < text.len")
 loop_end = parser_impl.find("return (true, value)", loop_start)
 if loop_start < 0 or loop_end < 0:
     raise SystemExit("source-linked signed decimal parser no longer has a bounded digit loop")
+if "assert position == text.len" not in parser_impl:
+    raise SystemExit("signed decimal parser no longer exposes the loop-exit input bound")
 loop_body = parser_impl[loop_start:loop_end]
 if "append_positive_digit(value, digit)" not in loop_body:
     raise SystemExit("positive parser path no longer uses the proved checked-digit helper")
