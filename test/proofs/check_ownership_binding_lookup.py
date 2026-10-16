@@ -143,19 +143,20 @@ required_contracts = (
     "table.ref_owner_counts[owner.value.usize()] == 1.u32()",
     "table.ref_owner_observed_counts[owner.value.usize()] == 1.usize()",
     "index_claimed: bool = table.ref_owner_index_valid",
-    "return (false, missing) if index_claimed",
-    "expected_count <= table.ref_pos.count",
-    "expected_count == table.ref_owner_counts[owner.value.usize()].usize()",
-    "expected_tail == table.ref_owner_tails[owner.value.usize()]",
+    "if index_claimed:",
+    "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
+    "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
+    "return (false, missing) if expected_count > table.ref_pos.count",
+    "return (false, missing) if expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "for step in 0..<expected_count",
+    "row != SYMBOL_INDEX_ROW_NONE.usize() or last_row != expected_tail",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
     "and (table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].offset != position.offset or table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].end_offset != position.end_offset)) implies not result.known",
     "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
     "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
-    "invariant steps <= expected_count",
-    "steps != 0 implies last_row.usize() < table.ref_pos.count",
-    "row == table.ref_owner_next[last_row.usize()].usize()",
-    "invariant not indexed or ((steps == 0 and row == table.ref_owner_heads[owner.value.usize()].usize()) or (steps != 0 and row == table.ref_owner_next[last_row.usize()].usize()))",
-    "decreases expected_count - steps",
+    "invariant step <= expected_count",
+    "invariant (step == 0 implies row == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()].usize())",
+    "found implies exists candidate in 0..<table.ref_pos.count:",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
@@ -164,14 +165,14 @@ for contract in required_contracts:
 lookup_lines = lookup_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
-if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 5:
+if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 8:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
-if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 1:
-    raise AssertionError("ownership lookup termination measure changed; review this proof gate")
+if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
+    raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "contract_count": 15,
-                      "invariant_count": 5, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
+                      "invariant_count": 8, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, TABLE_SOURCE, POS_SOURCE,
