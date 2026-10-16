@@ -243,18 +243,21 @@ if compact(function_section(policy, "is_direct_control_target")) != compact(expe
     raise SystemExit("direct control-target classifier no longer matches its exact target syntax and opcode set")
 
 scanner = compact(function_section(policy, "scan_instruction"))
+scan_result = "struct InstructionScanResult: start: usize count: usize first_separator: usize last_separator: usize has_address_group: bool address_open: usize address_close: usize valid: bool"
+if compact(scan_result) not in compact(policy):
+    raise SystemExit("operand scanner result lost a required field")
 for required in (
     "start: usize = first_operand_byte(text, EasmTextScan::first_space(text).usize())",
     'open_relative: usize = EasmTextScan::find(operands, "(")',
     'close_relative: usize = EasmTextScan::find(operands, ")")',
-    'if close_relative >= operands.len: return (start, 0, text_length, text_length, false, text_length, text_length, false)',
+    "if close_relative >= operands.len: return InstructionScanResult{start: start, count: 0, first_separator: text_length, last_separator: text_length, has_address_group: false, address_open: text_length, address_close: text_length, valid: false}",
     'close_after_open: usize = EasmTextScan::find(after_open, ")")',
     'EasmTextScan::find(address_contents, "(") < address_contents.len',
     'EasmTextScan::find(trailing, "(") < trailing.len',
     'EasmTextScan::find(trailing, ")") < trailing.len',
     "first_separator: usize = next_top_level_separator(text, start, has_address, open, close)",
     "second_separator: usize = next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
-    "return (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
+    "return InstructionScanResult{start: start, count: TOO_MANY_OPERANDS_SENTINEL, first_separator: first_separator, last_separator: second_separator, has_address_group: has_address, address_open: open, address_close: close, valid: true}",
     "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
     "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
     "ensure result.valid and result.has_address_group implies ( forall candidate in result.start..<result.address_open: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
@@ -289,7 +292,7 @@ if environment.index('include "easm_text_scan.elisa"') > environment.index('incl
 
 expected_first = """
 def easm_first_operand(text: sview) -> sview:
-    scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text)
+    scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(text)
     if not scan.valid or scan.count == 0:
         return ""
     if scan.first_separator < text.len:
@@ -298,7 +301,7 @@ def easm_first_operand(text: sview) -> sview:
 """
 expected_last = """
 def easm_last_operand(text: sview) -> sview:
-    scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text)
+    scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(text)
     if not scan.valid or scan.count == 0:
         return ""
     if scan.last_separator < text.len:
@@ -423,7 +426,7 @@ if module_verifier.index(compact("verify_module_functions(module, issues)")) > m
 
 memory_roles = function_section(MEMORY.read_text(), "easm_verify_memory_roles")
 memory_code = compact(memory_roles)
-memory_arity = compact("operand_scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(instruction.text) continue if not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)")
+memory_arity = compact("operand_scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(instruction.text) continue if not operand_scan.valid or EasmOperandScan::needs_arity_rejection(operand_scan.count)")
 if memory_arity not in memory_code:
     raise SystemExit("memory provenance scan must skip unsupported operand shapes before checking first/last operands")
 if memory_code.index("needs_arity_rejection(operand_scan.count)") > memory_code.index(compact("for operand_index in 0..<operand_scan.count")):
@@ -507,7 +510,7 @@ for path, expected, label in ((POSITIVE, positive_names, "positive"), (NEGATIVE,
         raise SystemExit("positive proof no longer imports the production operand scanner")
 
 positive_text = POSITIVE.read_text()
-scan_decl = "scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text)"
+scan_decl = "scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(text)"
 expected_positive = {
     "indexed_address_commas_stay_inside_one_operand": (
         'ensure result == true text: sview = "movq (%rax,%rcx,8), %rbx" ' + scan_decl + ' return ( scan.valid and scan.count == 2 and '
@@ -532,11 +535,11 @@ expected_positive = {
         'ensure result == true text: sview = "movq ((%rax)), %rbx" ' + scan_decl + ' return not scan.valid'
     ),
     "no_operand_instruction_has_zero_operands": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("ret") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("ret") '
         'return scan.valid and scan.count == 0'
     ),
     "scan_records_exact_top_level_separator_prefix": (
-        "ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text) "
+        "ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(text) "
         "if not scan.valid: return scan.count == 0 and scan.first_separator == text.len and scan.last_separator == text.len and not scan.has_address_group "
         "if scan.count == 0: return (scan.start == text.len and scan.first_separator == text.len and scan.last_separator == text.len and not scan.has_address_group and scan.address_open == text.len and scan.address_close == text.len ) "
         "if scan.count == 1: return (scan.first_separator == text.len and scan.last_separator == text.len and scan.start < text.len and EasmOperandScan::first_operand_byte(text[scan.start:text.len], 0.usize()) < (text[scan.start:text.len]).len and EasmOperandScan::next_top_level_separator(text, scan.start, scan.has_address_group, scan.address_open, scan.address_close) == text.len ) "
@@ -546,7 +549,7 @@ expected_positive = {
         "return scan.count == EasmOperandScan::TOO_MANY_OPERANDS_SENTINEL and scan.first_separator == first and scan.last_separator == second"
     ),
     "valid_scan_exposes_only_its_delimited_address_pair": (
-        "ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text) "
+        "ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(text) "
         "if not scan.valid: return true "
         "if scan.has_address_group: return (scan.start <= scan.address_open and scan.address_open < scan.address_close and scan.address_close < text.len and text[scan.address_open] == EasmOperandScan::ASCII_LEFT_PAREN and text[scan.address_close] == EasmOperandScan::ASCII_RIGHT_PAREN and "
         "(forall candidate in scan.start..<scan.address_open: text[candidate] != EasmOperandScan::ASCII_LEFT_PAREN and text[candidate] != EasmOperandScan::ASCII_RIGHT_PAREN) and "
@@ -668,27 +671,27 @@ for name, expected in expected_positive.items():
 negative_text = NEGATIVE.read_text()
 expected_negative = {
     "indexed_address_has_four_operands": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("movq (%rax,%rcx,8), %rbx") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("movq (%rax,%rcx,8), %rbx") '
         'return scan.count == 4'
     ),
     "three_top_level_operands_are_supported": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("shld %cl, %rbx, (%rax)") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("shld %cl, %rbx, (%rax)") '
         "return scan.valid and not EasmOperandScan::needs_arity_rejection(scan.count)"
     ),
     "unmatched_address_parenthesis_is_valid": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("movq (%rax,%rcx,8, %rbx") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("movq (%rax,%rcx,8, %rbx") '
         "return scan.valid"
     ),
     "invalid_scan_preserves_address_group_metadata": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("movq (%rax") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("movq (%rax") '
         "return not scan.valid and scan.has_address_group"
     ),
     "zero_operand_scan_has_non_sentinel_separator": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("ret") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("ret") '
         'return scan.valid and scan.count == 0 and scan.first_separator < ("ret").len'
     ),
     "single_operand_scan_has_an_empty_operand": (
-        'ensure result == true text: sview = "callq *(%rax)" scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction(text) '
+        'ensure result == true text: sview = "callq *(%rax)" scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction(text) '
         "operand: sview = text[scan.start:text.len] return scan.valid and scan.count == 1 and EasmOperandScan::first_operand_byte(operand, 0.usize()) == operand.len"
     ),
     "next_separator_selects_a_comma_inside_address": (
@@ -738,7 +741,7 @@ expected_negative = {
         'ensure result == true return EasmOperandScan::is_aarch64_mrs_form("x0", "cntfrq_el0")'
     ),
     "nested_address_parentheses_are_valid": (
-        'ensure result == true scan: (start: usize, count: usize, first_separator: usize, last_separator: usize, has_address_group: bool, address_open: usize, address_close: usize, valid: bool) = EasmOperandScan::scan_instruction("movq ((%rax)), %rbx") '
+        'ensure result == true scan: EasmOperandScan::InstructionScanResult = EasmOperandScan::scan_instruction("movq ((%rax)), %rbx") '
         "return scan.valid"
     ),
     "bare_data_symbol_is_accepted": (
