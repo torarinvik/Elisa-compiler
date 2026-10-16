@@ -75,7 +75,9 @@ if not all(fragment in trim_bounds_spec for fragment in (
     "ghostdeftrim_bounds_spec(text:sview)",
     "ensureresult.start<=result.end",
     "ensureresult.end<=text.len",
-    "return(trim_start_spec(text,0),trim_end_spec(text,trim_start_spec(text,0),text.len))",
+    "first:usize=trim_start_spec(text,0)",
+    "last:usize=trim_end_spec(text,first,text.len)",
+    "return(first,last)",
 )):
     raise SystemExit("ghost trim bounds no longer proves its ordered in-range output span")
 if 'include "easm_text_scan.elisa"' not in environment_text:
