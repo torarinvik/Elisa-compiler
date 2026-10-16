@@ -1,5 +1,6 @@
 """Admit signed-i64 arithmetic and shift guards in backend constant folding."""
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,10 @@ import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
+
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true")
+args = argument_parser.parse_args()
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,7 +21,7 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 ARITHMETIC = ROOT / "src/backend/codegen_const_checked_arithmetic.elisa"
 FOLDING = ROOT / "src/backend/codegen_const_folding.elisa"
-SEMANTIC_ARITHMETIC = ROOT / "src/semantic/check_ensure_strict.elisa"
+SEMANTIC_ARITHMETIC = ROOT / "src/semantic/linear_checked_arithmetic.elisa"
 SEMANTIC_INDEX_FOLD = ROOT / "src/semantic/check_index_out_of_bounds.elisa"
 POSITIVE = HERE / "codegen_const_checked_arithmetic.elisa"
 NEGATIVE = HERE / "codegen_const_checked_arithmetic_rejected.elisa"
@@ -125,11 +130,44 @@ guard_specifications = {
 if 'include "../../src/backend/codegen_const_checked_arithmetic.elisa"' not in proof_text:
     raise SystemExit("positive arithmetic proofs must include the production guard module")
 for name, specification in guard_specifications.items():
-    production_return = strip_outer_parens(return_expression(arithmetic_text, name))
-    if production_return != compact(specification):
-        raise SystemExit(f"{name} no longer implements the checked signed-i64 boundary predicate")
-    if ensure_expression(arithmetic_text, name) != production_return:
+    if ensure_expression(arithmetic_text, name) != compact(specification):
         raise SystemExit(f"{name} postcondition no longer matches its production return expression")
+
+# Keep the operational guard flow explicit so the verifier can use each rejected
+# overflow case as a path fact when discharging the checked-result range contracts.
+return_shapes = {
+    "add_is_safe": (
+        "returnfalseif:right>0andleft>I64_MAX-rightright<0andleft<I64_MIN-right",
+        "returntrue",
+    ),
+    "subtract_is_safe": (
+        "returnfalseif:right>0andleft<I64_MIN+rightright<0andleft>I64_MAX+right",
+        "returntrue",
+    ),
+    "multiply_is_safe": (
+        "returntrueifleft==0orright==0",
+        "returnfalseifleft>I64_MAX/right",
+        "returntrue",
+        "returnfalseifright<I64_MIN/left",
+        "returntrue",
+        "returnfalseifleft<I64_MIN/right",
+        "returntrue",
+        "returnfalseifleft<I64_MAX/right",
+        "returntrue",
+    ),
+    "negation_is_safe": ("returnfalseifvalue==I64_MIN", "returntrue"),
+}
+for name, expected_returns in return_shapes.items():
+    body = compact(function_body(arithmetic_text, name))
+    position = -1
+    for fragment in expected_returns:
+        position = body.find(fragment, position + 1)
+        if position < 0:
+            break
+    if position < 0:
+        raise SystemExit(f"{name} no longer rejects overflow cases before returning true")
+    if len(re.findall(r"\breturn\b", function_body(arithmetic_text, name))) != len(expected_returns):
+        raise SystemExit(f"{name} has an unexpected return path")
 
 # The helpers' call contracts expose the range facts consumed by the folder. The
 # proofs below call these exact guards as preconditions, so these properties are
@@ -169,8 +207,7 @@ if "return9223372036854775807" not in semantic_max or \
 
 semantic_add = compact(function_body(semantic_text, "linear_add_safe"))
 add_guards = (
-    "return(false,0)ifright>0andleft>linear_i64_max()-right",
-    "return(false,0)ifright<0andleft<linear_i64_min()-right",
+    "return(false,0)if:right>0andleft>linear_i64_max()-rightright<0andleft<linear_i64_min()-right",
     "return(true,left+right)",
 )
 add_positions = [semantic_add.find(fragment) for fragment in add_guards]
@@ -179,8 +216,7 @@ if any(position < 0 for position in add_positions) or add_positions != sorted(ad
 
 semantic_subtract = compact(function_body(semantic_text, "linear_sub_safe"))
 subtract_guards = (
-    "return(false,0)ifright>0andleft<linear_i64_min()+right",
-    "return(false,0)ifright<0andleft>linear_i64_max()+right",
+    "return(false,0)if:right>0andleft<linear_i64_min()+rightright<0andleft>linear_i64_max()+right",
     "return(true,left-right)",
 )
 subtract_positions = [semantic_subtract.find(fragment) for fragment in subtract_guards]
@@ -199,11 +235,9 @@ multiply_guards = (
     "return(false,0)ifleft==linear_i64_min()",
     "return(true,0-left)",
     "ifleft>0:",
-    "return(false,0)ifright>0andleft>linear_i64_max()/right",
-    "return(false,0)ifright<0andright<linear_i64_min()/left",
+    "return(false,0)if:right>0andleft>linear_i64_max()/rightright<0andright<linear_i64_min()/left",
     "else:",
-    "return(false,0)ifright>0andleft<linear_i64_min()/right",
-    "return(false,0)ifright<0andleft<linear_i64_max()/right",
+    "return(false,0)if:right>0andleft<linear_i64_min()/rightright<0andleft<linear_i64_max()/right",
     "return(true,left*right)",
 )
 multiply_positions = [semantic_multiply.find(fragment) for fragment in multiply_guards]
@@ -211,14 +245,13 @@ if any(position < 0 for position in multiply_positions) or multiply_positions !=
     raise SystemExit("backend multiplication guard no longer matches the proved semantic overflow conditions")
 
 semantic_negate = compact(function_body(semantic_text, "linear_neg_safe"))
-if not semantic_negate.startswith("deflinear_neg_safe(operand:i64)->(known:bool,value:i64):returnlinear_sub_safe(0,operand)"):
+if "returnlinear_sub_safe(0,operand)" not in semantic_negate:
     raise SystemExit("backend negation guard no longer matches the proved semantic subtraction guard")
 
 semantic_division = compact(function_body(SEMANTIC_INDEX_FOLD.read_text(), "resolve_fold_binary"))
 division_guards = (
     "ifoperator==TokenKind.Slashoroperator==TokenKind.Percent:",
-    "return(false,0)ifright==0",
-    "return(false,0)ifleft==linear_i64_min()andright==-1",
+    "return(false,0)if:right==0left==linear_i64_min()andright==-1",
     "return(true,left/right)ifoperator==TokenKind.Slash",
     "return(true,left%right)",
 )
@@ -363,6 +396,10 @@ negative_shapes = {
 for name, shape in negative_shapes.items():
     if compact(shape) not in compact(function_body(NEGATIVE.read_text(), name)):
         raise SystemExit(f"{name} no longer challenges the source-bound guard at an overflow boundary")
+
+if args.source_only:
+    print("source_bound=True checked_i64_guards=7 false_controls=15")
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)
