@@ -73,21 +73,29 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
             for offset in 0..<prefix_length |cursor, candidate, candidate_length, prefix|:
                 invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != prefix[offset]
+                assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
+                assert cursor <= candidate_length
             false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
+            assert cursor <= candidate_length and candidate_length - cursor >= 2
             cursor <- cursor + 2.usize()
+            assert cursor <= candidate_length
         for index in from..<count |cursor, candidate, candidate_length, names, from|:
             invariant from <= index
             invariant index <= count
             invariant cursor <= candidate_length
             if index > from:
                 false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
+                assert cursor <= candidate_length and candidate_length - cursor >= 2
                 cursor <- cursor + 2.usize()
+                assert cursor <= candidate_length
             segment: sview = names[index]
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
                 invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
+                assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
+                assert cursor <= candidate_length
         return cursor == candidate_length
 '''
 expected_relative = '''
@@ -118,17 +126,22 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
             invariant ancestor_length <= enclosing_length
             false return if candidate[offset] != enclosing[offset]
         cursor: mutable usize = ancestor_length + 2.usize()
+                assert cursor <= candidate_length
         for index in 0..<count |cursor, candidate, candidate_length, names|:
             invariant cursor <= candidate_length
             invariant index <= count
             if index > 0:
                 false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
+                        assert cursor <= candidate_length and candidate_length - cursor >= 2
                 cursor <- cursor + 2.usize()
+                        assert cursor <= candidate_length
             segment: sview = names[index]
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
                 invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
+                        assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
+                        assert cursor <= candidate_length
         return cursor == candidate_length
 '''
 if "moduleSemanticModuleSymbolPathMatcher:" not in compact(policy_text):
