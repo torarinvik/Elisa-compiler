@@ -69,7 +69,7 @@ required_slice_steps = (
     "assertlow==(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)",
     "asserthigh==(view.lenifend<0else(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)ifend<(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)elseendifend<=view.lenelseview.len)",
     "returnemptyifhigh==low",
-    "trustedUnsafe.PointerCast:out:sview=StringView{data:view.data+low.usize(),len:high-low}",
+    "trustedUnsafe.PointerCast:out:sview=StringView{data:view.data+(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0).usize(),len:high-low}",
     "assertout.len>=0",
     "assertout.len<=view.len",
     "assertout.len==((view.lenifend<0else(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)ifend<(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)elseendifend<=view.lenelseview.len)-(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0))",
