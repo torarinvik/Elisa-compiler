@@ -104,12 +104,12 @@ if any(compact(contract) not in helper for contract in required_contracts):
     raise SystemExit("bounded view helper lost a length, fail-closed, extent, or alias contract")
 
 required_guards = (
-    "n:usize=buf.count",
-    "returnemptyifn==0orbuf.items==nullorn>buf.capacity",
-    "emptyreturnifsigned_n<0orsigned_n.usize()!=n",
-    "emptyreturnifstart>norcount>n-start",
-    "emptyreturnifstart_signed<0orstart_signed.usize()!=startorcount_signed<0orcount_signed.usize()!=count",
-    "emptyreturnifcount==0",
+    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
+    "emptyreturnifbuf.count.i64()<0orbuf.count.i64().usize()!=buf.count",
+    "start>buf.countorcount>buf.count-start",
+    "emptyreturnifstart.i64()<0orstart.i64().usize()!=startorcount.i64()<0orcount.i64().usize()!=count",
+    "count==0",
+    "count_signed:i64=count.i64()",
     "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
 )
 if any(guard not in helper for guard in required_guards):
