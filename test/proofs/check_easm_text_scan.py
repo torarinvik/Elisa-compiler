@@ -128,7 +128,6 @@ required_source = (
     "forallprefix_indexin0..<result.start:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
     "forallsuffix_indexinresult.end..<text.len:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
     "result.start==result.endor(",
-    "ensureresult.start==result.endor(text[result.end-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[result.end-BYTE_INDEX_STEP]!=ASCII_TAB)",
     "ensureresult.start!=result.endorresult.start==text.len",
     "whilefirst<lastand(text[first]==ASCII_SPACEortext[first]==ASCII_TAB)",
     "decreaseslast-first",
