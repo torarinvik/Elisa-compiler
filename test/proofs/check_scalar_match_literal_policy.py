@@ -60,33 +60,30 @@ positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
 expected_classifier = '''
-def starts_like_numeric_literal(text: sview) -> bool can[Abort.Panic]:
+def starts_like_numeric_literal(text: sview) -> bool:
     ensure result == (text.len > 0 and (
         (text[0] >= ASCII_DIGIT_ZERO and text[0] <= ASCII_DIGIT_NINE)
         or text[0] == ASCII_MINUS
     ))
-    can Abort.Panic:
-        return false if text.len == 0
-        first: u8 = text[0]
-        return (first >= ASCII_DIGIT_ZERO and first <= ASCII_DIGIT_NINE) or first == ASCII_MINUS
+    return false if text.len == 0
+    first: u8 = text[0]
+    return (first >= ASCII_DIGIT_ZERO and first <= ASCII_DIGIT_NINE) or first == ASCII_MINUS
 '''
 expected_family_policy = '''
-def valid_for_family(text: sview, scalar_family: sview) -> bool can[Abort.Panic]:
+def valid_for_family(text: sview, scalar_family: sview) -> bool:
     ensure result == (scalar_family == "string" or starts_like_numeric_literal(text))
-    can Abort.Panic:
-        return true if scalar_family == "string"
-        return starts_like_numeric_literal(text)
+    return true if scalar_family == "string"
+    return starts_like_numeric_literal(text)
 '''
 expected_pattern_policy = '''
-def pattern_valid(pattern: Pattern, scalar_family: sview) -> bool can[Abort.Panic]:
-    can Abort.Panic:
-        return match pattern:
-            Pattern.Wildcard: true
-            Pattern.Literal(text): valid_for_family(text, scalar_family)
-            Pattern.Or(options): all option in options where pattern_valid(option, scalar_family)
-            Pattern.Range(range_lo, range_hi, range_inclusive): scalar_family == "int"
-            Pattern.Pin(binding_name): scalar_family == "int"
-            _: false
+def pattern_valid(pattern: Pattern, scalar_family: sview) -> bool:
+    return match pattern:
+        Pattern.Wildcard: true
+        Pattern.Literal(text): valid_for_family(text, scalar_family)
+        Pattern.Or(options): all option in options where pattern_valid(option, scalar_family)
+        Pattern.Range(range_lo, range_hi, range_inclusive): scalar_family == "int"
+        Pattern.Pin(binding_name): scalar_family == "int"
+        _: false
 '''
 expected_consumer_wrapper = '''
 def scalar_match_pattern_valid(pattern: Ast::Pattern, scalar_family: sview) -> bool:

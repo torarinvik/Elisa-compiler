@@ -243,14 +243,14 @@ if 'include "./reference_initializer_compatibility.elisa"' not in NEGATIVE.read_
 
 proof_projection = POSITIVE.read_text()
 actual_semantic_types = SEMANTIC_TYPES.read_text()
-expected_symbol_fields = {"name": "sview", "kind": "SymbolKind"}
+expected_symbol_fields = {"name": "sview@source", "kind": "SymbolKind"}
 for field, expected in expected_symbol_fields.items():
     if struct_fields(actual_semantic_types, "Symbol").get(field) != expected or \
             struct_fields(proof_projection, "Symbol").get(field) != expected:
         raise SystemExit(f"Symbol.{field} proof projection differs from production")
 expected_table_fields = {
     "symbols": "mutabledarray[Symbol]",
-    "typestate_struct_names": "mutabledarray[sview]",
+    "typestate_struct_names": "mutabledarray[sview@source]",
 }
 for field, expected in expected_table_fields.items():
     if struct_fields(actual_semantic_types, "SymbolTable").get(field) != expected or \
@@ -273,17 +273,17 @@ if unique_declarations != {
     raise SystemExit("reference-initializer uniqueness module gained an unreviewed function")
 count_spec = compact(function_section(unique_text, "matching_struct_count_class_prefix"))
 for fragment in (
-    "requires end <= table.symbols.count",
-    "decreases end",
-    "return 0 if end == 0",
-    "prior_end: usize = end - 1",
-    "matches_name: bool = table.symbols[prior_end].kind == Semantic::SymbolKind::Struct and table.symbols[prior_end].name == name",
-    "2 return if prior_count == 2",
-    "2 return if prior_count == 1 and matches_name",
-    "return 1 if matches_name",
-    "return prior_count",
+    "requiresend<=table.symbols.count",
+    "decreasesend",
+    "return0ifend==0",
+    "prior_end:usize=end-1",
+    "matches_name:bool=table.symbols[prior_end].kind==Semantic::SymbolKind.Structandtable.symbols[prior_end].name==name",
+    "2returnifmatching_struct_count_class_prefix(table,name,prior_end)==2",
+    "2returnifmatching_struct_count_class_prefix(table,name,prior_end)==1andmatches_name",
+    "return1ifmatches_name",
+    "returnmatching_struct_count_class_prefix(table,name,prior_end)",
 ):
-    if compact(fragment) not in count_spec:
+    if fragment not in count_spec:
         raise SystemExit(f"saturating struct-count specification lost a case: {fragment}")
 member_spec = compact(function_section(unique_text, "typestate_name_member_prefix"))
 for fragment in (

@@ -59,23 +59,22 @@ positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
 expected_prefix = '''
-def prefix_matches(text: sview, prefix: sview) -> bool can[Abort.Panic]:
+def prefix_matches(text: sview, prefix: sview) -> bool:
     ensure result == (
         text.len >= prefix.len and
         (forall index in 0..<text.len:
             index >= prefix.len or text[index] == prefix[index]
         )
     )
-    can Abort.Panic:
-        prefix_length: usize = prefix.len
-        false return if text.len < prefix_length
-        while index < prefix_length |index: usize = 0, text, prefix, prefix_length|:
-            decreases prefix_length - index
-            invariant index <= prefix_length and prefix_length <= text.len
-            invariant forall checked in 0..<index: text[checked] == prefix[checked]
-            false return if text[index] != prefix[index]
-            index <- index + 1.usize()
-        return true
+    prefix_length: usize = prefix.len
+    false return if text.len < prefix_length
+    while index < prefix_length |index: usize = 0, text, prefix, prefix_length|:
+        decreases prefix_length - index
+        invariant index <= prefix_length and prefix_length <= text.len
+        invariant forall checked in 0..<index: text[checked] == prefix[checked]
+        false return if text[index] != prefix[index]
+        index <- index + 1.usize()
+    return true
 '''
 expected_within = '''
 def within_module(current_module: sview, owner: sview) -> bool can[Abort.Panic]:

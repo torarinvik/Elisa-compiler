@@ -63,7 +63,7 @@ negative_text = NEGATIVE.read_text()
 
 expected_policy = {
     "matching_range_evidence_spec": """
-        ghost def matching_range_evidence_spec(is_darray_parameter: bool, receiver: sview, index_name: sview, evidence_receiver: sview, evidence_index: sview) -> bool can[Abort.Panic]:
+        ghost def matching_range_evidence_spec(is_darray_parameter: bool, receiver: sview, index_name: sview, evidence_receiver: sview, evidence_index: sview) -> bool:
             return is_darray_parameter and receiver != "" and index_name != "" and receiver == evidence_receiver and index_name == evidence_index
     """,
     "matching_range_evidence": """

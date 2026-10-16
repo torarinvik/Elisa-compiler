@@ -43,7 +43,7 @@ NEGATIVE_NAMES = {
     "false_claim_quoted_inner_span_exceeds_the_text",
 }
 FUNCTION_SHA256 = {
-    "hex_escape_value": "02657188556db09219fdf99c77c9d8c91e54383fedd21ec4f2c2be0fe3d6bf19",
+    "hex_escape_value": "d9b1e1e760583153fd1d95a08394c45db8c6d70466c227db4006d1bfddfd42ac",
     "utf16_surrogate_pair_codepoint": "6fe1cf69636c6389de24bbd7d0c07093d8e0f8f40197c287ca9f6090568e4eef",
     "decode_string_escapes": "e4dd1e99810e574d447f0fe9fb00d41af2c9846a90789c513de16491ee9fe49a",
     "decoded_literal_byte_count": "87bb5014f767f76c4f29333d19356897e91e31705875189b8b72aa37fd78ec41",
@@ -205,7 +205,8 @@ ordered_steps(source_text, "decode_string_escapes", (
 ), "escape decoder")
 ordered_steps(source_text, "hex_escape_value", (
     "requires start <= text.len and digits <= text.len - start",
-    "while index < digits |value, index, text, start, digits|:",
+    "can Abort.Panic:",
+    "while index < digits |value: i64 = 0, index: usize = 0| -> value:",
     "invariant index <= digits",
     "digit: i64 = hex_digit_value(text[start + index])",
     "return -1 if digit < 0",

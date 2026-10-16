@@ -41,8 +41,8 @@ NEGATIVE_NAMES = {
 
 FUNCTION_SHA256 = {
     ("backend", "push_utf8"): "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806",
-    ("backend", "hex_escape_value"): "aa2be944112d40839abbbca286c05f48870c8cfe91fed249f582dbc636fbeff5",
-    ("backend", "utf16_surrogate_pair_codepoint"): "ef4056ce3278b3b28a3185c77c23a6ff4546acc98c15486db8da7b7f278610b3",
+    ("backend", "hex_escape_value"): "5f7db2bb2b8a54e6ea70df157056148316da91cff221efc63cf781159fa3774a",
+    ("backend", "utf16_surrogate_pair_codepoint"): "4dc66116af2c3f7bd69939116e10b83ee5ac5b7a671a959ab7e45201a3e2f04b",
     ("backend", "decode_string_escapes"): "2598bda667a69096077a3919f9f51ef91fcf918e41020496207d468febf13440",
     ("backend", "decoded_literal_byte_count"): "422fd89b0ed7ffd5f98d90318d9869ecafe508e35266bec5e658e6abaa45b756",
     ("fixture", "frontend_surrogate_pair_codepoint"): "419f247a1fe86e5c01984fb2f6dbcf7ddd9f9de061ad3f37914dc082726ebbf6",
@@ -127,8 +127,9 @@ if "17793447398112395163" not in compact(fixture_text):
 # as invalid UTF-8 scalar values.
 require_ordered(backend_text, "utf16_surrogate_pair_codepoint", (
     "remaining: usize = text.len - low_escape_start",
-    "return -1 if remaining < 6",
-    "return -1 if text[low_escape_start] != 92 or text[low_escape_start + 1.usize()] != 117",
+    "return -1 if:",
+    "remaining < 6",
+    "text[low_escape_start] != 92 or text[low_escape_start + 1.usize()] != 117",
     "low: i64 = hex_escape_value(text, low_escape_start + 2.usize(), 4.usize())",
     "return -1 if low < 56320 or low > 57343",
     "return 65536 + (high - 55296) * 1024 + (low - 56320)",

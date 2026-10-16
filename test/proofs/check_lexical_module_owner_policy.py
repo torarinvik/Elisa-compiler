@@ -64,18 +64,18 @@ negative_text = NEGATIVE.read_text()
 
 expected_policy = '''
 def is_lexical(owner: sview, current: sview) -> bool:
-    can Abort.Panic:
-        ensure result == (
-            owner == "" or owner == current or (
-                current.len >= 2 and
-                owner.len <= current.len - 2 and
-                current[owner.len] == 58 and
-                current[owner.len + 1.usize()] == 58 and
-                (forall index in 0..<owner.len:
-                    owner[index] == current[index]
-                )
+    ensure result == (
+        owner == "" or owner == current or (
+            current.len >= 2 and
+            owner.len <= current.len - 2 and
+            current[owner.len] == 58 and
+            current[owner.len + 1.usize()] == 58 and
+            (forall index in 0..<owner.len:
+                owner[index] == current[index]
             )
         )
+    )
+    can Abort.Panic:
         true return if owner == ""
         true return if owner == current
         owner_length: usize = owner.len

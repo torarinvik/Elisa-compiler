@@ -133,12 +133,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)(?:ghost )?def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)(?:ghost )?def {re.escape(name)}(?:\[[^\n]*?\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*?\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -167,15 +167,15 @@ expected_module = {
     "direct_target_from": """ghost def direct_target_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, index: usize) -> (found: bool, target: sview):
     requires index <= alias_names.count
     decreases alias_names.count - index
-    return (false, sview("", 0, 0)) if index == alias_names.count
+    return (false, "") if index == alias_names.count
     return (true, alias_targets[index]) if index < alias_targets.count and alias_names[index] == name
     return direct_target_from(alias_names, alias_targets, name, index + 1)
 """,
     "direct_target": """def direct_target(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> (found: bool, target: sview):
-    ensure result == direct_target_from(alias_names, alias_targets, name, 0)
+    ensure result.found == direct_target_from(alias_names, alias_targets, name, 0).found and result.target == direct_target_from(alias_names, alias_targets, name, 0).target
     for index in 0..<alias_names.count |index|:
         invariant index <= alias_names.count
-        invariant direct_target_from(alias_names, alias_targets, name, index) == direct_target_from(alias_names, alias_targets, name, 0)
+        invariant direct_target_from(alias_names, alias_targets, name, index).found == direct_target_from(alias_names, alias_targets, name, 0).found and direct_target_from(alias_names, alias_targets, name, index).target == direct_target_from(alias_names, alias_targets, name, 0).target
         return (true, alias_targets[index]) if index < alias_targets.count and alias_names[index] == name
     return (false, sview("", 0, 0))
 """,
@@ -200,11 +200,10 @@ expected_module = {
     "resolve_from": """ghost def resolve_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, remaining: usize) -> sview:
     requires remaining <= alias_names.count
     decreases remaining
-    return sview("", 0, 0) if ambiguous_from(alias_names, name, 0, false)
-    target: (found: bool, target: sview) = direct_target_from(alias_names, alias_targets, name, 0)
-    return name if not target.found
-    return sview("", 0, 0) if target.target == name or remaining == 0
-    return resolve_from(alias_names, alias_targets, target.target, remaining - 1)
+    return "" if ambiguous_from(alias_names, name, 0, false)
+    return name if not direct_target_from(alias_names, alias_targets, name, 0).found
+    return "" if direct_target_from(alias_names, alias_targets, name, 0).target == name or remaining == 0
+    return resolve_from(alias_names, alias_targets, direct_target_from(alias_names, alias_targets, name, 0).target, remaining - 1)
 """,
     "resolve": """def resolve(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> sview:
     ensure result == resolve_from(alias_names, alias_targets, name, alias_names.count)

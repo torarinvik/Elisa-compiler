@@ -81,11 +81,11 @@ required_policy_fragments = (
     "ensure (kind == EasmDeclarationKind.Protocol) implies result == (index >= 0 and index < protocol_count)",
     "ensure (kind == EasmDeclarationKind.Template) implies result == (index >= 0 and index < template_count)",
     "ensure (kind == EasmDeclarationKind.None or kind == EasmDeclarationKind.Layout) implies result",
-    "EasmDeclarationKind.Function: index >= 0 and index < function_count",
-    "EasmDeclarationKind.Fragment: index >= 0 and index < fragment_count",
-    "EasmDeclarationKind.Protocol: index >= 0 and index < protocol_count",
-    "EasmDeclarationKind.Template: index >= 0 and index < template_count",
-    "_: true",
+    "EasmDeclarationKind.Function: return index >= 0 and index < function_count",
+    "EasmDeclarationKind.Fragment: return index >= 0 and index < fragment_count",
+    "EasmDeclarationKind.Protocol: return index >= 0 and index < protocol_count",
+    "EasmDeclarationKind.Template: return index >= 0 and index < template_count",
+    "_: return true",
 )
 if any(compact(fragment) not in policy_body for fragment in required_policy_fragments):
     raise SystemExit("declaration-index policy lost a collection-bound contract or matching implementation")
@@ -122,15 +122,16 @@ range_view_contracts = (
 if any(compact(contract) not in range_view_body for contract in range_view_contracts):
     raise SystemExit("bounded view helper lost its output-length, extent, representation, or alias postcondition")
 range_view_guards = (
-    "n:usize=buf.count",
-    "returnemptyifn==0orbuf.items==nullorn>buf.capacity",
-    "emptyreturnifstart>norcount>n-start",
-    "emptyreturnifstart_signed<0orstart_signed.usize()!=startorcount_signed<0orcount_signed.usize()!=count",
+    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
+    "emptyreturnifbuf.count.i64()<0orbuf.count.i64().usize()!=buf.count",
+    "emptyreturnifstart>buf.countorcount>buf.count-start",
+    "emptyreturnifstart.i64()<0orstart.i64().usize()!=startorcount.i64()<0orcount.i64().usize()!=count",
+    "emptyreturnifcount==0",
     "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count_signed}",
 )
 if any(guard not in range_view_body for guard in range_view_guards):
     raise SystemExit("bounded view helper lost a count, capacity, range, representation, or guarded pointer check")
-if range_view_body.find("returnemptyifstart>norcount>n-start") > range_view_body.find("trustedUnsafe.PointerCast"):
+if range_view_body.find("emptyreturnifstart>buf.countorcount>buf.count-start") > range_view_body.find("trustedUnsafe.PointerCast"):
     raise SystemExit("bounded view helper must check the requested extent before pointer construction")
 
 parse_body = compact(function_section(parser_text, "parse_layout_module"))

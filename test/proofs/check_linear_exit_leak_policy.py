@@ -60,14 +60,30 @@ expected_policy = {
             ensure result < count
             return index - 1
     """,
+    "name_present_from": """
+        ghost def name_present_from(names: darray[sview]&, wanted: sview, index: usize) -> bool:
+            requires index <= names.count
+            decreases names.count - index
+            return false if index == names.count
+            return true if names[index] == wanted
+            return name_present_from(names, wanted, index + 1.usize())
+    """,
     "name_present_spec": """
         ghost def name_present_spec(names: darray[sview]&, wanted: sview) -> bool:
-            return any name in names where name == wanted
+            return name_present_from(names, wanted, 0)
     """,
     "name_present": """
         def name_present(names: darray[sview]&, wanted: sview) -> bool:
             ensure result == name_present_spec(names, wanted)
-            return any name in names where name == wanted
+            index: mutable usize = 0
+            while index < names.count |index|:
+                decreases names.count - index
+                invariant index <= names.count
+                invariant name_present_from(names, wanted, index) == name_present_from(names, wanted, 0)
+                if names[index] == wanted:
+                    return true
+                index <- index + 1
+            return false
     """,
     "scan_step_spec": """
         ghost def scan_step_spec(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> (stopped: bool, report: bool):
@@ -81,7 +97,7 @@ expected_policy = {
     """,
     "scan_step": """
         def scan_step(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> (stopped: bool, report: bool) can[Abort.Panic]:
-            ensure result == scan_step_spec(scope_name, stopped, loop_only, consumed, leaked)
+            ensure result.stopped == scan_step_spec(scope_name, stopped, loop_only, consumed, leaked).stopped and result.report == scan_step_spec(scope_name, stopped, loop_only, consumed, leaked).report
             can Abort.Panic:
                 stopped_after: bool = stopped or (loop_only and scope_name == "")
                 report: bool = scope_name != "" and not stopped_after and
