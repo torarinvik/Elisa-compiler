@@ -62,8 +62,8 @@ for fragment in (
     "const MAX_REPORTED_MAGNITUDE:i64=4294967295",
     "requires index<0",
     "ensure result.i64()==(MAX_REPORTED_MAGNITUDE if index<(0-MAX_REPORTED_MAGNITUDE) else (0-index))",
-    "if index<(0-MAX_REPORTED_MAGNITUDE):return MAX_REPORTED_MAGNITUDE.u32()",
-    "return (0-index).u32()",
+    "if index<(0-MAX_REPORTED_MAGNITUDE):assert MAX_REPORTED_MAGNITUDE.u32().i64()==MAX_REPORTED_MAGNITUDE return MAX_REPORTED_MAGNITUDE.u32()",
+    "magnitude:i64=0-index assert magnitude>=0 assert magnitude<=MAX_REPORTED_MAGNITUDE assert magnitude.u32().i64()==(0-index) return magnitude.u32()",
 ):
     if compact(fragment) not in compact(helper_text):
         raise SystemExit("negative-index magnitude helper no longer states or implements the checked saturation law")
