@@ -124,8 +124,14 @@ count_body = compact(function_section(text_source, "easm_compose_argument_count"
 required_count_fragments = (
     "ensure (EasmTextScan::trim(text)).len == 0 implies result == 0",
     "ensure (EasmTextScan::trim(text)).len > 0 implies result == easm_compose_comma_count_from(text, 0.usize()) + 1",
+    "invariant index <= text.len",
+    "invariant count >= 0",
+    "invariant count <= index.i64()",
     "invariant count + easm_compose_comma_count_from(text, index) == easm_compose_comma_count_from(text, 0.usize())",
-    "count <- count + 1 if text[index] == 44",
+    "if text[index] == 44:",
+    "assert easm_compose_comma_count_from(text, index) == 1 + easm_compose_comma_count_from(text, index + 1.usize())",
+    "count <- count + 1",
+    "assert easm_compose_comma_count_from(text, index) == easm_compose_comma_count_from(text, index + 1.usize())",
     "return count + 1",
 )
 if any(compact(fragment) not in count_body for fragment in required_count_fragments):
@@ -138,6 +144,12 @@ if compact("requires cursor <= text.len") not in comma_model_body \
         or compact("ensure result >= 0") not in comma_model_body \
         or compact("return 1 + easm_compose_comma_count_from(text, cursor + 1.usize())") not in comma_model_body:
     raise SystemExit("recursive comma-count model lost its range, termination, or delimiter step")
+count_spec_body = compact(function_section(text_source, "easm_compose_argument_count_spec"))
+if any(compact(fragment) not in count_spec_body for fragment in (
+    "ensure (EasmTextScan::trim(text)).len == 0 implies result == 0",
+    "ensure (EasmTextScan::trim(text)).len > 0 implies result == easm_compose_comma_count_from(text, 0.usize()) + 1",
+)):
+    raise SystemExit("ghost argument-count model lost the empty-input or raw-delimiter contract")
 
 reference_body = compact(function_section(text_source, "easm_compose_span_reference_from"))
 required_reference_fragments = (
@@ -175,8 +187,14 @@ if any(compact(fragment) not in close_offset_body for fragment in (
 )):
     raise SystemExit("relative close search lost its suffix-bound result contract")
 span_count_from_open_body = compact(function_section(text_source, "easm_compose_span_argument_count_from_open"))
-if compact("return easm_compose_argument_count_spec(text[open + 1.usize():open + close_offset])") not in span_count_from_open_body:
-    raise SystemExit("span argument count no longer uses the bounded relative-close slice")
+if any(compact(fragment) not in span_count_from_open_body for fragment in (
+    "ensure open >= text.len implies result == 0",
+    "ensure (open < text.len and easm_compose_close_offset(text, open) == 0) implies result == 0",
+    "return 0 if open >= text.len",
+    "return 0 if easm_compose_close_offset(text, open) == 0",
+    "return easm_compose_argument_count_spec(text[open + 1.usize():open + easm_compose_close_offset(text, open)])",
+)):
+    raise SystemExit("span argument count no longer uses a total open-relative return tree")
 reference_from_open_body = compact(function_section(text_source, "easm_compose_span_reference_from_open"))
 if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_from_open(text, open)) implies result.valid") not in reference_from_open_body \
         or compact("return easm_compose_span_reference_at_bounds(text, open, close_offset, wanted)") not in reference_from_open_body:
@@ -215,6 +233,8 @@ if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count(te
 parse_compose_body = compact(function_section(text_source, "easm_parse_compose"))
 if compact("ensure result.valid implies result.argument_count == easm_compose_span_argument_count(text)") not in parse_compose_body:
     raise SystemExit("compose parser count is not bound to the span-domain argument count")
+if compact("assert argument_count == easm_compose_span_argument_count(text)") not in parse_compose_body:
+    raise SystemExit("compose parser no longer proves its runtime count matches the span-domain specification")
 
 for caller_name in ("easm_parse_compose", "easm_compose_argument_count", "easm_compose_span"):
     if caller_name in declarations(verify_text):
