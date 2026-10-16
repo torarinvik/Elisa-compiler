@@ -72,24 +72,32 @@ source_compact = compact(source_text)
 environment_text = ENV.read_text()
 trim_bounds_spec = compact(function_section(source_text, "trim_bounds_spec"))
 if not all(fragment in trim_bounds_spec for fragment in (
-    "ghostdeftrim_bounds_spec(text:sview)",
+    "ghostdeftrim_bounds_spec(text:sview)->TrimBounds:",
     "ensureresult.start<=result.end",
     "ensureresult.end<=text.len",
-    "returntrim_bounds_spec_from(text,trim_start_spec(text,0))",
+    "ensureresult.start==trim_start_spec(text,0.usize())",
+    "ensureresult.end==trim_end_spec(text,trim_start_spec(text,0.usize()),text.len)",
+    "first:usize=trim_start_spec(text,0.usize())",
+    "bounds:TrimBounds=trim_bounds_spec_from(text,first)",
+    "returnbounds",
 )):
     raise SystemExit("ghost trim bounds no longer returns its ordered in-range span from the recursive trim specs")
 trim_bounds_spec_from = compact(function_section(source_text, "trim_bounds_spec_from"))
 if not all(fragment in trim_bounds_spec_from for fragment in (
-    "ghostdeftrim_bounds_spec_from(text:sview,first:usize)",
+    "ghostdeftrim_bounds_spec_from(text:sview,first:usize)->TrimBounds:",
     "requiresfirst<=text.len",
     "ensureresult.start<=result.end",
     "ensureresult.end<=text.len",
-    "return(first,trim_end_spec(text,first,text.len))",
+    "ensureresult.start==first",
+    "ensureresult.end==trim_end_spec(text,first,text.len)",
+    "returnbounds",
 )):
     raise SystemExit("ghost trim bounds helper no longer shares the leading-trim endpoint")
 for spec_name in ("find_from_spec", "find_spec"):
     if "ensureresult<=text.len" not in compact(function_section(source_text, spec_name)):
         raise SystemExit(f"ghost {spec_name} no longer exposes the bounded search-result fact")
+if "ensure(needle.len>0andtext.len>=needle.len)impliesresult==find_from_spec(text,needle,0.usize())" not in compact(function_section(source_text, "find_spec")):
+    raise SystemExit("ghost first-match search no longer exposes its recursive starting point")
 if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
 if environment_text.index('include "easm_text_scan.elisa"') > environment_text.index('include "easm_verify_provenance.elisa"'):
@@ -109,6 +117,7 @@ required_source = (
     "constASCII_TAB:u8=9",
     "constBYTE_INDEX_STEP:usize=1",
     "constSIGNED_INDEX_STEP:i64=1",
+    "ensureresult==find_spec(text,needle)",
     "ensureresult>=0",
     "ensuretext.len<0impliesresult==0",
     "ensuretext.len>=0impliesresult<=text.len",
@@ -122,23 +131,33 @@ required_source = (
     "invariantforallprefix_indexin0..<index:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=ASCII_SPACEandtext[prefix_index]!=ASCII_TAB)",
     "returnindexiftext[index]==ASCII_SPACEortext[index]==ASCII_TAB",
     "index<-index+SIGNED_INDEX_STEP",
-    "deftrim_bounds(text:sview)->(start:usize,end:usize):",
+    "structTrimBounds:start:usizeend:usize",
+    "deftrim_bounds(text:sview)->TrimBounds:",
     "ensureresult.start<=result.end",
     "ensureresult.end<=text.len",
+    "ensureresult.start==trim_bounds_spec(text).start",
+    "ensureresult.end==trim_bounds_spec(text).end",
     "forallprefix_indexin0..<result.start:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
     "forallsuffix_indexinresult.end..<text.len:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
     "result.start==result.endor(",
     "ensureresult.start!=result.endorresult.start==text.len",
-    "whilefirst<lastand(text[first]==ASCII_SPACEortext[first]==ASCII_TAB)",
+    "whilefirst<last|first,last,text,text_length|",
     "decreaseslast-first",
     "invariantfirst<=last",
     "invariantlast<=text_length",
     "invariantforallprefix_indexin0..<first:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB",
+    "invarianttrim_start_spec(text,first)==trim_start_spec(text,0.usize())",
+    "iftext[first]!=ASCII_SPACEandtext[first]!=ASCII_TAB:break",
     "assertfirst==lastor(text[first]!=ASCII_SPACEandtext[first]!=ASCII_TAB)",
-    "whilelast>firstand(text[last-BYTE_INDEX_STEP]==ASCII_SPACEortext[last-BYTE_INDEX_STEP]==ASCII_TAB)",
+    "whilelast>first|last,first,text,text_length|",
     "invariantforallsuffix_indexinlast..<text_length:text[suffix_index]==ASCII_SPACEortext[suffix_index]==ASCII_TAB",
+    "invarianttrim_end_spec(text,first,last)==trim_end_spec(text,first,text_length)",
+    "iftext[last-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[last-BYTE_INDEX_STEP]!=ASCII_TAB:break",
     "assertlast==firstor(text[last-BYTE_INDEX_STEP]!=ASCII_SPACEandtext[last-BYTE_INDEX_STEP]!=ASCII_TAB)",
-    "return(first,last)",
+    "assertbounds.start==bounds.endor(bounds.start==text.len)",
+    "assertbounds.start==trim_bounds_spec(text).start",
+    "assertbounds.end==trim_bounds_spec(text).end",
+    "returnbounds",
     "defstarts_with(text:sview,prefix:sview)->bool:",
     "ensureresultimpliesprefix.len<=text.len",
     "forallprefix_indexin0..<prefix.len:prefix_index>=text.lenortext[prefix_index]==prefix[prefix_index]",
@@ -158,14 +177,18 @@ required_source = (
     "(a.len==b.lenand(forallindexin0..<a.len:",
     "returna.len==b.lenandstarts_with(a,b)",
     "deftrim(text:sview)->sview:",
-    "bounds:(start:usize,end:usize)=trim_bounds(text)",
-    "returntext[bounds.start:bounds.end]",
+    "ensureresult==trim_spec(text)",
+    "bounds:TrimBounds=trim_bounds(text)",
+    "trimmed:sview=text[bounds.start:bounds.end]",
+    "asserttrimmed==trim_spec(text)",
+    "returntrimmed",
 )
 if not all(fragment in source_compact for fragment in required_source):
     raise SystemExit("production EASM scanner lost a source contract or loop invariant")
 expected_find = """
 def find(text: sview, needle: sview) -> usize:
     ensure result <= text.len
+    ensure result == find_spec(text, needle)
     ensure (needle.len == 0 or text.len < needle.len) implies result == text.len
     ensure result < text.len implies (
         needle.len > 0 and
@@ -183,6 +206,12 @@ def find(text: sview, needle: sview) -> usize:
     assert text_length == text.len
     assert needle_length == needle.len
     if needle.len == 0 or text.len < needle.len:
+        assert find_spec(text, needle) == text.len
+        assert (forall candidate in 0..<text.len:
+            needle.len == 0 or
+            needle.len > text.len - candidate or
+            text[candidate:candidate + needle.len] != needle
+        )
         return text.len
     assert needle.len > 0 and needle.len <= text.len
     assert needle_length > 0 and needle_length <= text_length
@@ -192,6 +221,7 @@ def find(text: sview, needle: sview) -> usize:
     while index < search_limit |index, search_limit, text, needle, needle_length, text_length|:
         decreases search_limit - index
         invariant index <= search_limit
+        invariant find_from_spec(text, needle, index) == find_spec(text, needle)
         invariant (forall candidate in 0..<index:
             candidate <= text_length - needle_length and
             needle_length <= text_length - candidate and
@@ -203,14 +233,21 @@ def find(text: sview, needle: sview) -> usize:
             assert needle.len > 0 and needle.len <= text.len
             assert needle_length > 0 and needle_length <= text_length
             assert index <= text.len - needle.len
+            assert index < text.len
+            assert text[index:index + needle.len] == needle
+            assert find_from_spec(text, needle, index) == index
+            assert find_spec(text, needle) == index
             return index
         index <- index + BYTE_INDEX_STEP
     assert index == search_limit
+    assert index == text.len - needle.len + BYTE_INDEX_STEP
     assert (forall candidate in 0..<text.len:
         needle.len == 0 or
         needle.len > text.len - candidate or
         text[candidate:candidate + needle.len] != needle
     )
+    assert find_from_spec(text, needle, index) == text.len
+    assert find_spec(text, needle) == text.len
     return text.len
 """
 if compact(function_section(source_text, "find")) != compact(expected_find):
@@ -224,8 +261,11 @@ if compact(function_section(source_text, "contains_memory_address_delimiter")) !
     raise SystemExit("production EASM memory-delimiter classifier no longer matches its proved boolean policy")
 expected_trim = """
 def trim(text: sview) -> sview:
-    bounds: (start: usize, end: usize) = trim_bounds(text)
-    return text[bounds.start:bounds.end]
+    ensure result == trim_spec(text)
+    bounds: TrimBounds = trim_bounds(text)
+    trimmed: sview = text[bounds.start:bounds.end]
+    assert trimmed == trim_spec(text)
+    return trimmed
 """
 if compact(function_section(source_text, "trim")) != compact(expected_trim):
     raise SystemExit("production EASM trim no longer returns exactly the verified half-open span")
@@ -355,7 +395,7 @@ required_positive_claims = (
     "text.len<0orposition==text.lenor(",
     "forallprefix_indexin0..<position:text.len<0orprefix_index>=text.lenor(text[prefix_index]!=EasmTextScan::ASCII_SPACEandtext[prefix_index]!=EasmTextScan::ASCII_TAB)",
     "deftrim_bounds_contract_holds(text:sview)->bool:",
-    "bounds:(start:usize,end:usize)=EasmTextScan::trim_bounds(text)",
+    "bounds:EasmTextScan::TrimBounds=EasmTextScan::trim_bounds(text)",
     "bounds.start<=bounds.endandbounds.end<=text_length",
     "forallprefix_indexin0..<bounds.start:",
     "forallsuffix_indexinbounds.end..<text_length:",
@@ -393,7 +433,7 @@ required_negative_claims = (
     'trimmed:sview=EasmTextScan::trim("x\\t")',
     "trimmed[trimmed.len-1.usize()]==EasmTextScan::ASCII_TAB",
     'EasmTextScan::trim("left right")=="leftright"',
-    'bounds:(start:usize,end:usize)=EasmTextScan::trim_bounds(" \\t ")',
+    'bounds:EasmTextScan::TrimBounds=EasmTextScan::trim_bounds(" \\t ")',
     "returnbounds.start==0andbounds.end==0",
 )
 if not all(fragment in negative_compact for fragment in required_negative_claims):
