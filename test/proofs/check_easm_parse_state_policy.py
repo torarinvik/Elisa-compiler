@@ -122,24 +122,24 @@ range_view_contracts = (
 if any(compact(contract) not in range_view_body for contract in range_view_contracts):
     raise SystemExit("bounded view helper lost its output-length, extent, representation, or alias postcondition")
 range_view_body_impl = range_view_body.split("canUnsafe{PointerArithmetic,RawExtern}:", 1)[-1]
-range_view_guards = (
-    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
-    "buf.count.i64()<0",
-    "buf.count.i64().usize()!=buf.count",
-    "start>buf.count",
-    "count>buf.count-start",
-    "start.i64()<0",
-    "start.i64().usize()!=start",
-    "count.i64()<0",
-    "count.i64().usize()!=count",
-    "count==0",
-    "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}",
+range_view_guard = compact(
+    "if (buf.count > 0 and buf.items != null and buf.count <= buf.capacity "
+    "and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count "
+    "and start <= buf.count and count <= buf.count - start "
+    "and start.i64() >= 0 and start.i64().usize() == start "
+    "and count.i64() >= 0 and count.i64().usize() == count "
+    "and count > 0 and start < buf.count):"
 )
-if any(guard not in range_view_body_impl for guard in range_view_guards):
+range_view_return = "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}"
+if range_view_guard not in range_view_body_impl or range_view_return not in range_view_body_impl \
+        or "returnempty" not in range_view_body_impl:
     raise SystemExit("bounded view helper lost a count, capacity, range, representation, or guarded pointer check")
+range_view_guard_position = range_view_body_impl.find(range_view_guard)
 range_view_pointer_cast = range_view_body_impl.find("trustedUnsafe.PointerCast")
-if any(range_view_body_impl.find(guard) > range_view_pointer_cast for guard in range_view_guards[:-1]):
-    raise SystemExit("all bounded-view range checks must precede pointer construction")
+range_view_empty_return = range_view_body_impl.find("returnempty", range_view_pointer_cast)
+if range_view_guard_position < 0 or range_view_pointer_cast < range_view_guard_position \
+        or range_view_empty_return < range_view_pointer_cast:
+    raise SystemExit("the full bounded-view guard must dominate pointer construction and fail closed")
 if not range_view_request.startswith("ghostdefbytes_view_range_ref_request_valid("):
     raise SystemExit("bounded view request predicate must remain a proof-only description")
 

@@ -106,24 +106,22 @@ required_contracts = (
 if any(compact(contract) not in helper for contract in required_contracts):
     raise SystemExit("bounded view helper lost a length, fail-closed, extent, or alias contract")
 
-required_guards = (
-    "returnemptyifbuf.count==0orbuf.items==nullorbuf.count>buf.capacity",
-    "buf.count.i64()<0",
-    "buf.count.i64().usize()!=buf.count",
-    "start>buf.count",
-    "count>buf.count-start",
-    "start.i64()<0",
-    "start.i64().usize()!=start",
-    "count.i64()<0",
-    "count.i64().usize()!=count",
-    "count==0",
-    "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}",
+request_guard = compact(
+    "if (buf.count > 0 and buf.items != null and buf.count <= buf.capacity "
+    "and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count "
+    "and start <= buf.count and count <= buf.count - start "
+    "and start.i64() >= 0 and start.i64().usize() == start "
+    "and count.i64() >= 0 and count.i64().usize() == count "
+    "and count > 0 and start < buf.count):"
 )
-if any(guard not in helper_body for guard in required_guards):
+required_return = "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}"
+if request_guard not in helper_body or required_return not in helper_body or "returnempty" not in helper_body:
     raise SystemExit("bounded view helper lost a backing, range, conversion, or guarded-address check")
+guard_position = helper_body.find(request_guard)
 pointer_cast = helper_body.find("trustedUnsafe.PointerCast")
-if any(helper_body.find(guard) > pointer_cast for guard in required_guards[:-1]):
-    raise SystemExit("every bounded-view request check must precede its pointer construction")
+empty_return = helper_body.find("returnempty", pointer_cast)
+if guard_position < 0 or pointer_cast < guard_position or empty_return < pointer_cast:
+    raise SystemExit("the full bounded-view request guard must dominate pointer construction and fail closed")
 
 if {"sview_len", "sview_at"} & declarations(runtime_text):
     raise SystemExit("legacy sview length/index wrappers remain in the runtime")
