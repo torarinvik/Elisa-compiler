@@ -77,13 +77,25 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
 # its -1 invalid/truncated sentinel and the full four-digit u16 range.
 hex4 = compact(function_section(source, "json_hex4"))
 hex4_steps = (
-    "offset:mutableusize=0",
-    "whileoffset<4.usize()|offset,value,data,position|:",
-    "decreases4.usize()-offset",
-    "digit:i64=json_hex_digit(json_at(data,position+offset.usize()))",
-    "-1returnifdigit<0",
-    "value<-value*16+digit",
-    "offset<-offset+1.usize()",
+    "digit0:i64=json_hex_digit(json_at(data,position))",
+    "-1returnifdigit0<0",
+    "assertdigit0>=0anddigit0<=15",
+    "value:mutablei64=digit0",
+    "digit1:i64=json_hex_digit(json_at(data,position+1.usize()))",
+    "-1returnifdigit1<0",
+    "assertdigit1>=0anddigit1<=15",
+    "value<-value*16+digit1",
+    "assertvalue>=0andvalue<=255",
+    "digit2:i64=json_hex_digit(json_at(data,position+2.usize()))",
+    "-1returnifdigit2<0",
+    "assertdigit2>=0anddigit2<=15",
+    "value<-value*16+digit2",
+    "assertvalue>=0andvalue<=4095",
+    "digit3:i64=json_hex_digit(json_at(data,position+3.usize()))",
+    "-1returnifdigit3<0",
+    "assertdigit3>=0anddigit3<=15",
+    "value<-value*16+digit3",
+    "assertvalue>=0andvalue<=65535",
     "returnvalue",
 )
 positions = [hex4.find(step) for step in hex4_steps]
