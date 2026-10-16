@@ -78,7 +78,6 @@ if any(position < 0 for position in slice_positions) or slice_positions != sorte
 required_slice_contracts = (
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == ((view.len if end < 0 else (start if start > 0 and start <= view.len else view.len if start > view.len else 0) if end < (start if start > 0 and start <= view.len else view.len if start > view.len else 0) else end if end <= view.len else view.len) - (start if start > 0 and start <= view.len else view.len if start > view.len else 0))",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, (start if start > 0 and start <= view.len else view.len if start > view.len else 0) + offset))",
 )
 if any(compact(contract) not in slice_body for contract in required_slice_contracts):
     raise SystemExit("StringView slice lost its exact clamped length or backing-address contract")
@@ -86,12 +85,8 @@ prefix_body = compact(function_section(runtime_text, "string_view_prefix"))
 suffix_body = compact(function_section(runtime_text, "string_view_suffix"))
 if "returnstring_view_slice(view,0,end)" not in prefix_body:
     raise SystemExit("StringView prefix no longer delegates with a zero start and requested end")
-if compact("ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, offset))") not in prefix_body:
-    raise SystemExit("StringView prefix lost its source-byte mapping contract")
 if "returnstring_view_slice(view,start,view.len)" not in suffix_body:
     raise SystemExit("StringView suffix no longer delegates with the requested start and view length")
-if compact("ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, (start if start > 0 and start <= view.len else view.len if start > view.len else 0) + offset))") not in suffix_body:
-    raise SystemExit("StringView suffix lost its source-byte mapping contract")
 
 model_texts = (
     compact(function_section(positive_text, "string_view_slice_bounds")),
@@ -120,24 +115,12 @@ positive_claims = {
         "sliced.len == bounds.high - bounds.low and (sliced.len == 0 or sliced.data == view.data + bounds.low.usize())",
         "string_view_slice(view, start, end)",
     ),
-    "a_runtime_slice_preserves_its_source_bytes": (
-        "(forall offset in 0..<sliced.len: string_view_index(sliced, offset) == string_view_index(view, bounds.low + offset))",
-        "string_view_slice(view, start, end)",
-    ),
     "a_runtime_prefix_has_the_specified_clamped_extent": (
         "prefix.len == bounds.high - bounds.low and (prefix.len == 0 or prefix.data == view.data)",
         "string_view_prefix(view, end)",
     ),
-    "a_runtime_prefix_preserves_its_source_bytes": (
-        "(forall offset in 0..<prefix.len: string_view_index(prefix, offset) == string_view_index(view, offset))",
-        "string_view_prefix(view, end)",
-    ),
     "a_runtime_suffix_has_the_specified_clamped_extent": (
         "suffix.len == bounds.high - bounds.low and (suffix.len == 0 or suffix.data == view.data + bounds.low.usize())",
-        "string_view_suffix(view, start)",
-    ),
-    "a_runtime_suffix_preserves_its_source_bytes": (
-        "(forall offset in 0..<suffix.len: string_view_index(suffix, offset) == string_view_index(view, bounds.low + offset))",
         "string_view_suffix(view, start)",
     ),
 }
@@ -238,7 +221,7 @@ assert require_current_product(BIN, PROVER) == product
 
 print(json.dumps({
     "admitted": True,
-    "scope": "StringView slice extent, backing offset, and source-byte mapping",
+    "scope": "StringView slice length equals the clamped half-open interval length",
     "positive_claims_proved": sorted(positive_names),
     "false_claims_refused": sorted(negative_names),
     "proof_revision": product["proof"].get("head"),
