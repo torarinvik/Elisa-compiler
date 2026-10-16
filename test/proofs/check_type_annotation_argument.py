@@ -63,11 +63,15 @@ def first_argument(arguments: darray[sview]&, arg_start: u32, arg_count: u32) ->
     ensure (arg_count > 0 and arg_start.usize() < arguments.count) implies result == arguments[arg_start.usize()]
     can Abort.Panic:
         if arg_count == 0:
+            assert first_argument_spec(arguments, arg_start, arg_count) == ""
             return ""
         if arg_start.usize() >= arguments.count:
+            assert first_argument_spec(arguments, arg_start, arg_count) == ""
             return ""
         assert arg_count > 0
         assert arg_start.usize() < arguments.count
+        assert not (arg_count == 0 or arg_start.usize() >= arguments.count)
+        assert first_argument_spec(arguments, arg_start, arg_count) == arguments[arg_start.usize()]
         return arguments[arg_start.usize()]
 '''
 if "moduleSemanticTypeAnnotationArgument:" not in compact(source_text):
