@@ -67,6 +67,8 @@ required_loop_steps = (
     'return sview("", 0, 0) if view_len.i64() != view.len',
     "assert view.len >= 0 and view_len.i64() == view.len",
     "hi: mutable i64 = view.len",
+    "assert hi == view.len",
+    "assert forall suffix_index in hi..<view.len: string_view_index(view, suffix_index) == byte.i64()",
     "while hi > 0 and string_view_index(view, hi - 1) == byte.i64():",
     "decreases hi",
     "invariant 0 <= hi and hi <= view.len and hi.usize().i64() == hi",
