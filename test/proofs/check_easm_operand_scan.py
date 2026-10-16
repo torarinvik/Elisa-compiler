@@ -253,6 +253,7 @@ for required in (
     'EasmTextScan::find(trailing, "(") < trailing.len',
     'EasmTextScan::find(trailing, ")") < trailing.len',
     "first_separator: usize = next_top_level_separator(text, start, has_address, open, close)",
+    "if first_separator >= text_length: assert first_separator == text_length",
     "second_separator: usize = next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
     "return (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
     "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
