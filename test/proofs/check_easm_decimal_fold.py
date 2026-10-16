@@ -52,6 +52,7 @@ for fragment in (
     "byte: u8 = text[position]",
     "return (false, 0) if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE",
     "digit: i64 = (byte - ASCII_DIGIT_ZERO).i64()",
+    "position <- position + 1\n                assert position <= text.len",
 ):
     if fragment not in loop_body:
         raise SystemExit(f"parser digit loop no longer matches the checked-fold model: {fragment}")
