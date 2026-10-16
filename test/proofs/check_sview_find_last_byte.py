@@ -97,8 +97,17 @@ required_loop_steps = (
     "invariant 0 <= i and i <= view.len",
     "invariant forall later in i..<view.len: string_view_index(view, later) != byte.i64()",
     "candidate: i64 = i - 1",
-    "return candidate if string_view_index(view, candidate) == byte.i64()",
+    "if string_view_index(view, candidate) == byte.i64():",
+    "assert candidate >= 0",
+    "assert candidate < view.len",
+    "assert string_view_index(view, candidate) == byte.i64()",
+    "assert forall later in candidate + 1..<view.len: string_view_index(view, later) != byte.i64()",
+    "return candidate",
+    "assert string_view_index(view, candidate) != byte.i64()",
     "i <- candidate",
+    "assert forall later in i..<view.len: string_view_index(view, later) != byte.i64()",
+    "assert i == 0",
+    "assert forall candidate in 0..<view.len: string_view_index(view, candidate) != byte.i64()",
     "return -1",
 )
 loop_positions = []
