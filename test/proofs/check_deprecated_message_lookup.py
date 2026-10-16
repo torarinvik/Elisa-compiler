@@ -99,7 +99,8 @@ if semantic_text.count('include "./check_deprecated_call.elisa"') != 1:
 collector = compact(function_section(consumer_text, "collect_deprecated_functions"))
 if "requiresnames.count==messages.count" not in collector or \
         "ensurenames.count==messages.count" not in collector or \
-        collector.count("invariantnames.count==messages.count") != 2:
+        collector.count("invariantnames.count==messages.count") != 2 or \
+        collector.count("assertnames.count==messages.count") < 3:
     raise SystemExit("deprecated declaration collection no longer preserves parallel-array length equality")
 for name in ("deprecated_call_expression", "deprecated_call_statements", "deprecated_call_walk"):
     if "requiresnames.count==messages.count" not in compact(function_section(consumer_text, name)):
@@ -108,7 +109,9 @@ root_check = compact(function_section(consumer_text, "check_deprecated_call"))
 root_order = (
     "names:mutabledarray[sview]=[]",
     "messages:mutabledarray[sview]=[]",
+    "assertnames.count==messages.count",
     "collect_deprecated_functions(file.top_decls,file.annotation_args,names,messages)",
+    "assertnames.count==messages.count",
     "table<-deprecated_call_walk(file.top_decls,names,messages,table)ifnames.count>0",
 )
 root_positions = [root_check.find(fragment) for fragment in root_order]
