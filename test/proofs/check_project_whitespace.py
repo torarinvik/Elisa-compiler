@@ -132,8 +132,7 @@ for fragment in (
     "if last > first:",
     "assert not bytes_is_space(value[last - 1.usize()])",
     "assert last >= bytes_trim_start(value)",
-    "if last > bytes_trim_start(value):",
-    "assert last > 0.usize()",
+    "assert last > bytes_trim_start(value) implies not bytes_is_space(value[last - 1.usize()])",
     "return last",
 ):
     if compact(fragment) not in compact(trim_end_body):
