@@ -71,7 +71,6 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
         prefix_length: usize = prefix.len
         if prefix_length > 0:
             for offset in 0..<prefix_length |cursor, candidate, candidate_length, prefix|:
-                invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != prefix[offset]
                 assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
@@ -83,7 +82,6 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
         for index in from..<count |cursor, candidate, candidate_length, names, from|:
             invariant from <= index
             invariant index <= count
-            invariant cursor <= candidate_length
             if index > from:
                 false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
                 assert cursor <= candidate_length and candidate_length - cursor >= 2
@@ -91,7 +89,6 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
                 assert cursor <= candidate_length
             segment: sview = names[index]
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
-                invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
                 assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
@@ -106,7 +103,6 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
         candidate_length: usize = candidate.len
         false return if candidate_length < 3
         for index in 0..<count |path_length, names, candidate_length|:
-            invariant path_length <= candidate_length
             segment_length: usize = (names[index]).len
             false return if path_length > candidate_length or segment_length > candidate_length - path_length
             path_length <- path_length + segment_length
@@ -128,7 +124,6 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
         cursor: mutable usize = ancestor_length + 2.usize()
                 assert cursor <= candidate_length
         for index in 0..<count |cursor, candidate, candidate_length, names|:
-            invariant cursor <= candidate_length
             invariant index <= count
             if index > 0:
                 false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
@@ -137,7 +132,6 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
                         assert cursor <= candidate_length
             segment: sview = names[index]
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
-                invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
                         assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
