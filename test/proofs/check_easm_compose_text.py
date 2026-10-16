@@ -182,7 +182,8 @@ if any(compact(fragment) not in reference_at_bounds_body for fragment in (
     "argument_count: i64 = easm_compose_span_argument_count_at_offset(text, open, close_offset)",
     "comma_count: i64 = easm_compose_comma_count_from(values, 0.usize())",
     "assert argument_count == easm_compose_argument_count_spec(values)",
-    "assert (wanted >= 0 and wanted < argument_count) implies wanted <= comma_count",
+    "if wanted >= 0 and wanted < argument_count",
+    "assert wanted <= comma_count",
     "return easm_compose_span_reference_from(values, open + 1.usize(), open + close_offset, 0, 0, 0, wanted)",
 )):
     raise SystemExit("named compose-span bounds helper lost its source-slice contracts")
