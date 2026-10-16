@@ -76,7 +76,7 @@ for name, fields_text in variant_rows:
             contract_match,
         )
         implementation_arm = re.search(
-            rf"(?m)^[ \t]*Decl\.{name}\(([^)\n]*)\):[ \t]*\n[ \t]*return[ \t]+([A-Za-z_]\w*)\b",
+            rf"(?m)^[ \t]*Decl\.{name}\(([^)\n]*)\):[ \t]*([A-Za-z_]\w*)\b",
             implementation_match,
         )
         if not contract_arm or not implementation_arm:
@@ -93,13 +93,11 @@ for name, fields_text in variant_rows:
         expected = f"Decl.{name}: sview(\"\", 0, 0)" if name == "Invalid" else f"Decl.{name}(_, _): sview(\"\", 0, 0)"
         if compact(expected) not in compact(contract_match):
             raise SystemExit(f"Ast.decl_name must specify an empty name for Decl.{name}")
-        arm = re.search(rf"(?m)^[ \t]*Decl\.{name}(?:\([^\n)]*\))?:[ \t]*\n[ \t]*pass\b", implementation_match)
-        if not arm:
+        if compact(expected) not in compact(implementation_match):
             raise SystemExit(f"Ast.decl_name must explicitly handle positionless name case Decl.{name}")
 
-if compact('return sview("", 0, 0)') not in compact(implementation_match) or \
-        re.search(r"(?m)^[ \t]*_:", implementation_match):
-    raise SystemExit("Ast.decl_name must retain an explicit empty-name fallback and no wildcard arm")
+if re.search(r"(?m)^[ \t]*_:", implementation_match):
+    raise SystemExit("Ast.decl_name must remain exhaustive without a wildcard arm")
 
 expected_member_name_helper = """def module_member_decl_name(declaration: Ast::Decl) -> sview:
     ensure result == Ast::decl_name(declaration)
