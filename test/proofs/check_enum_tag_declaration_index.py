@@ -96,14 +96,15 @@ def indexed_enum_tag_count(names: darray[sview]&, counts: darray[i64]&, name: sv
     ensure result == enum_tag_count_from(names, counts, name, 0)
     can Abort.Panic:
         index: mutable usize = 0
-        while index < names.count |index|:
+        while index < names.count and index < counts.count and names[index] != name |index|:
             decreases names.count - index
             invariant index <= names.count
+            invariant index <= counts.count
             invariant enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, 0)
-            return 0 if index >= counts.count
-            return counts[index] if names[index] == name
             index <- index + 1
-        return 0
+        return 0 if index >= names.count or index >= counts.count
+        assert names[index] == name
+        return counts[index]
 '''
 if compact_code(function_section(lookup_text, "indexed_enum_tag_count")) != compact_code(expected_lookup):
     raise SystemExit("production enum-tag lookup contract or loop refinement changed without updating its proof")
@@ -112,8 +113,9 @@ expected_reference = '''
 ghost def enum_tag_count_from(names: darray[sview]&, counts: darray[i64]&, name: sview, index: usize) -> i64:
     requires index <= names.count
     decreases names.count - index
-    return 0 if index == names.count
-    return 0 if index >= counts.count
+    return 0 if:
+        index == names.count
+        index >= counts.count
     return counts[index] if names[index] == name
     return enum_tag_count_from(names, counts, name, index + 1)
 '''
