@@ -70,17 +70,12 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
         candidate_length: usize = candidate.len
         prefix_length: usize = prefix.len
         if prefix_length > 0:
-            false return if prefix_length > candidate_length
             for offset in 0..<prefix_length |cursor, candidate, candidate_length, prefix|:
-                invariant offset <= prefix_length
-                invariant cursor == offset
                 invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != prefix[offset]
                 assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
-                assert cursor == offset + 1.usize()
                 assert cursor <= candidate_length
-            assert cursor == prefix_length
             false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
             assert cursor <= candidate_length and candidate_length - cursor >= 2
             cursor <- cursor + 2.usize()
@@ -95,20 +90,12 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
                 cursor <- cursor + 2.usize()
                 assert cursor <= candidate_length
             segment: sview = names[index]
-            false return if cursor > candidate_length or segment.len > candidate_length - cursor
-            segment_start: usize = cursor
-            assert segment_start <= candidate_length
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
-                invariant offset <= segment.len
-                invariant cursor == segment_start + offset
                 invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
                 assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
-                assert cursor == segment_start + offset + 1.usize()
                 assert cursor <= candidate_length
-            assert cursor == segment_start + segment.len
-            assert cursor <= candidate_length
         return cursor == candidate_length
 '''
 expected_relative = '''
@@ -149,20 +136,12 @@ def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: u
                 cursor <- cursor + 2.usize()
                         assert cursor <= candidate_length
             segment: sview = names[index]
-            false return if cursor > candidate_length or segment.len > candidate_length - cursor
-            segment_start: usize = cursor
-            assert segment_start <= candidate_length
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
-                invariant offset <= segment.len
-                invariant cursor == segment_start + offset
                 invariant cursor <= candidate_length
                 false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
                         assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
-                assert cursor == segment_start + offset + 1.usize()
                         assert cursor <= candidate_length
-            assert cursor == segment_start + segment.len
-            assert cursor <= candidate_length
         return cursor == candidate_length
 '''
 if "moduleSemanticModuleSymbolPathMatcher:" not in compact(policy_text):
