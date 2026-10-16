@@ -82,11 +82,8 @@ required_fold_fragments = (
     "ensureresult>=greatest",
     "ensure(forallfact_indexinindex..<facts.count:",
     "returngreatestifindex==facts.count",
-    'fact:sview=facts[index]marker:usize=easm_find(fact,"size>=")',
-    "ifmarker<fact.len:",
-    "value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():fact.len]))",
-    "returneasm_size_guard_lower_bound_from(facts,index+1,EasmMemStateDomain::greatest_bound(greatest,value))",
-    "returneasm_size_guard_lower_bound_from(facts,index+1,greatest)",
+    'returneasm_size_guard_lower_bound_from(facts,index+1.usize(),EasmMemStateDomain::greatest_bound(greatest,easm_parse_i64(easm_trim(facts[index][easm_find(facts[index],"size>=")+7.usize():(facts[index]).len]))))ifeasm_find(facts[index],"size>=")<(facts[index]).len',
+    "returneasm_size_guard_lower_bound_from(facts,index+1.usize(),greatest)",
 )
 if not all(fragment in fold_spec_compact for fragment in required_fold_fragments):
     raise SystemExit("recursive size-fact fold specification changed without updating its production proof")
