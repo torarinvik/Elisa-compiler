@@ -114,13 +114,22 @@ request_guard = compact(
     "and count.i64() >= 0 and count.i64().usize() == count "
     "and count > 0 and start < buf.count):"
 )
+fallback_assert = compact(
+    "assert not (buf.count > 0 and buf.items != null and buf.count <= buf.capacity "
+    "and buf.count.i64() >= 0 and buf.count.i64().usize() == buf.count "
+    "and start <= buf.count and count <= buf.count - start "
+    "and start.i64() >= 0 and start.i64().usize() == start "
+    "and count.i64() >= 0 and count.i64().usize() == count "
+    "and count > 0 and start < buf.count)"
+)
 required_return = "trustedUnsafe.UncheckedIndex:trustedUnsafe.PointerCast:returnStringView{data:&buf[start],len:count.i64()}"
-if request_guard not in helper_body or required_return not in helper_body or "returnempty" not in helper_body:
+if request_guard not in helper_body or required_return not in helper_body or fallback_assert not in helper_body or "returnempty" not in helper_body:
     raise SystemExit("bounded view helper lost a backing, range, conversion, or guarded-address check")
 guard_position = helper_body.find(request_guard)
 pointer_cast = helper_body.find("trustedUnsafe.PointerCast")
+fallback_position = helper_body.find(fallback_assert)
 empty_return = helper_body.find("returnempty", pointer_cast)
-if guard_position < 0 or pointer_cast < guard_position or empty_return < pointer_cast:
+if guard_position < 0 or pointer_cast < guard_position or fallback_position < pointer_cast or empty_return < fallback_position:
     raise SystemExit("the full bounded-view request guard must dominate pointer construction and fail closed")
 
 if {"sview_len", "sview_at"} & declarations(runtime_text):
