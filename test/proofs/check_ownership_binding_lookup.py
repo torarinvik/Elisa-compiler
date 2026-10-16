@@ -164,12 +164,25 @@ for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
 if not re.search(
-    r"if found:\s+assert result_index < table\.ref_binding_ids\.count\s+"
-    r"return \(true, table\.ref_binding_ids\[result_index\]\)\s+"
+    r"if found:\s+assert owner\.value != INVALID_DECL_ID_VALUE\s+"
+    r"assert owner\.value\.usize\(\) < table\.symbols\.count\s+"
+    r"assert position\.end_offset > position\.offset\s+"
+    r"assert table\.ref_pos\.count == table\.ref_binding_ids\.count\s+"
+    r"assert not table\.ref_owner_index_valid or table\.ref_owner_next\.count == table\.ref_pos\.count\s+"
+    r"assert not table\.ref_owner_index_valid or owner\.value\.usize\(\) < table\.ref_owner_heads\.count\s+"
+    r"assert result_index < table\.ref_pos\.count\s+"
+    r"assert result_index < table\.ref_binding_ids\.count\s+"
+    r"binding_id: BindingId = table\.ref_binding_ids\[result_index\]\s+"
+    r"assert binding_id\.owner\.value == owner\.value\s+"
+    r"assert table\.ref_pos\[result_index\]\.offset == position\.offset\s+"
+    r"assert table\.ref_pos\[result_index\]\.end_offset == position\.end_offset\s+"
+    r"return \(true, binding_id\)\s+"
+    r"assert missing\.owner\.value == INVALID_DECL_ID_VALUE\s+"
+    r"assert missing\.serial == FIRST_BINDING_SERIAL\s+"
     r"return \(false, missing\)",
     lookup_text,
 ):
-    raise AssertionError("lookup result must preserve found/payload facts on separate return paths")
+    raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
 lookup_lines = lookup_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
