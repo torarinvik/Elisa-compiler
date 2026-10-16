@@ -71,6 +71,7 @@ required_source = (
     "while position < shared |position, left, right, shared|:",
     "invariant vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
     "assert vro_text_compare_reference_from(left, right, position) == vro_text_compare_reference_from(left, right, position + VRO_BYTE_STEP)",
+    "assert vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, next_position)",
     "assert position == shared",
     "assert vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
     "assert shared == left_length",
