@@ -98,17 +98,13 @@ if any(compact(clause) not in dirname for clause in required_dirname_contracts):
 
 for helper, fragments, label in (
     (basename, (
-        "if view.len < 0 or view.len.usize().i64() != view.len:",
-        "assert not (view.len >= 0 and view.len.usize().i64() == view.len)",
-        'return sview("", 0, 0)',
+        'return sview("", 0, 0) if view.len < 0 or view.len.usize().i64() != view.len',
         "last: i64 = sview_find_last_byte(view, sep)",
         "return string_view_slice(view, last + 1, view.len) if last >= 0",
         "return view",
     ), "basename"),
     (dirname, (
-        "if view.len < 0 or view.len.usize().i64() != view.len:",
-        "assert not (view.len >= 0 and view.len.usize().i64() == view.len)",
-        'return sview("", 0, 0)',
+        'return sview("", 0, 0) if view.len < 0 or view.len.usize().i64() != view.len',
         "last: i64 = sview_find_last_byte(view, sep)",
         "return string_view_prefix(view, last) if last >= 0",
         "return string_view_prefix(view, 0)",
