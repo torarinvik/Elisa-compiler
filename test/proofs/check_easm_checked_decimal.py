@@ -122,8 +122,8 @@ required_parse_contracts = (
 required_parse_steps = (
     "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len",
     "iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:",
-    "assert(position!=text.len)ornotdecimal_parse_reference(text).valid",
-    "assert(position!=text.len)ordecimal_parse_reference(text).value==0",
+    "assertposition!=text.lenornotdecimal_parse_reference(text).valid",
+    "assertposition!=text.lenordecimal_parse_reference(text).value==0",
     "return(false,0)ifposition==text.len",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
