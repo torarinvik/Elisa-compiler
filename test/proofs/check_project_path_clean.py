@@ -94,6 +94,10 @@ if output_start not in cleaner or fallback_start not in cleaner:
 build = cleaner.split(output_start, 1)[1].split(fallback_start, 1)[0]
 expected_build = compact("""
     out.push(47) if rooted
+    assert not rooted or (
+        out.count > 0.usize() and
+        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    )
     for segment in 0..<depth |out, starts, lengths, path, rooted|:
         invariant not rooted or (
             out.count > 0.usize() and
