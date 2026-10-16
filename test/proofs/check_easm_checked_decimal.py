@@ -163,14 +163,13 @@ required_reference_fragments = (
     "ensureresult.validimplies(negativeimpliesresult.value<=0)",
     "ensureresult.validimplies(notnegativeimpliesresult.value>=0)",
     "ensure(position==text.lenandnotconsumed_digit)impliesnotresult.valid",
-    "return(true,value)ifposition==text.lenandconsumed_digit",
-    "return(false,0)ifposition==text.len",
-    "byte:u8=text[position]",
-    "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE",
-    "value*DECIMAL_RADIX-digit",
-    "value*DECIMAL_RADIX+digit",
-    "returndecimal_parse_reference_from(text,position+1,true,next_value,true)",
-    "returndecimal_parse_reference_from(text,position+1,false,next_value,true)",
+    "return(false,0)ifposition==text.lenandnotconsumed_digit",
+    "return(true,value)ifposition==text.len",
+    "return(false,0)iftext[position]<ASCII_DIGIT_ZEROortext[position]>ASCII_DIGIT_NINE",
+    "return(false,0)ifnegativeand(value<I64_MIN/DECIMAL_RADIXor(value==I64_MIN/DECIMAL_RADIXand(text[position]-ASCII_DIGIT_ZERO).i64()>0-(I64_MIN%DECIMAL_RADIX)))",
+    "return(false,0)ifvalue>I64_MAX/DECIMAL_RADIXor(value==I64_MAX/DECIMAL_RADIXand(text[position]-ASCII_DIGIT_ZERO).i64()>I64_MAX%DECIMAL_RADIX)",
+    "returndecimal_parse_reference_from(text,position+1,true,value*DECIMAL_RADIX-(text[position]-ASCII_DIGIT_ZERO).i64(),true)ifnegative",
+    "returndecimal_parse_reference_from(text,position+1,false,value*DECIMAL_RADIX+(text[position]-ASCII_DIGIT_ZERO).i64(),true)",
 )
 if not all(fragment in reference_from for fragment in required_reference_fragments) or \
         "append_positive_digit" in reference_from or "append_negative_digit" in reference_from:
