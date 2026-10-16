@@ -59,7 +59,7 @@ path_text = PATHS.read_text()
 project_text = PROJECT.read_text()
 cleaner = compact(function_section(path_text, "path_clean"))
 root_contract = compact("""
-    ensure path_is_absolute(path) implies (
+    ensure (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) implies (
         result.count > 0.usize() and
         result[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
     )
