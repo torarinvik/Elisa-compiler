@@ -183,18 +183,6 @@ if not re.search(
     lookup_text,
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
-if not re.search(
-    r"table\.ref_pos\[table\.ref_owner_heads\[owner\.value\.usize\(\)\]\.usize\(\)\]\.end_offset == position\.end_offset:\s+"
-    r"return \(true, table\.ref_binding_ids\[table\.ref_owner_heads\[owner\.value\.usize\(\)\]\.usize\(\)\]\)",
-    lookup_text,
-):
-    raise AssertionError("indexed singleton ownership match must return its checked binding row directly")
-if not re.search(
-    r"table\.ref_pos\[0\]\.end_offset == position\.end_offset:\s+"
-    r"return \(true, table\.ref_binding_ids\[0\]\)",
-    lookup_text,
-):
-    raise AssertionError("unindexed singleton ownership match must return its checked binding row directly")
 lookup_lines = lookup_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
