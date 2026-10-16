@@ -47,6 +47,23 @@ unknown_fact_contract = (
 if unknown_fact_contract not in binding_flow_source:
     raise SystemExit("unknown ownership facts no longer have the fail-closed source contract")
 
+join_cutpoints = (
+    "inputs_match:bool=ownership_binding_join_inputs_match(id,left,right)"
+    "ifnotinputs_match:returnOwnershipBindingFact{binding_id:id,reachable:reachable,known:false,may_live:reachable,may_consumed:reachable}"
+    "assertinputs_match"
+    "assertinputs_match==ownership_binding_join_inputs_match(id,left,right)"
+    "joined:OwnershipBindingFact=OwnershipBindingFact{binding_id:id,reachable:reachable"
+    "assertjoined.binding_id.owner.value==id.owner.value"
+    "assertjoined.binding_id.serial==id.serial"
+    "assertjoined.reachable==(left.reachableorright.reachable)"
+    "assertjoined.known==(inputs_matchandOwnershipFlow::join_reachable_known(left.reachable,left.known,right.reachable,right.known))"
+    "assertjoined.may_live==(inputs_matchandOwnershipFlow::join_reachable_possible(left.reachable,left.may_live,right.reachable,right.may_live))"
+    "assertjoined.may_consumed==(inputs_matchandOwnershipFlow::join_reachable_possible(left.reachable,left.may_consumed,right.reachable,right.may_consumed))"
+    "returnjoined"
+)
+if join_cutpoints not in binding_flow_source:
+    raise SystemExit("same-binding ownership joins must assert identity and component facts before return")
+
 unknown_vector_contract = (
     "defownership_bindings_unknown(facts:mutabledarray[OwnershipBindingFact]&,reachable:bool)->voidcan[Abort.Panic]:"
     "ensureforallfact_indexin0..<facts.count:notfacts[fact_index].known"
@@ -62,8 +79,26 @@ unknown_vector_contract = (
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
     "fact:OwnershipBindingFact=facts[index]"
-    "facts[index]<-ownership_binding_unknown(fact.binding_id,reachable)"
+    "unknown:OwnershipBindingFact=ownership_binding_unknown(fact.binding_id,reachable)"
+    "assertnotunknown.known"
+    "assertunknown.reachable==reachable"
+    "assertunknown.may_live==reachable"
+    "assertunknown.may_consumed==reachable"
+    "facts[index]<-unknown"
+    "assertnotfacts[index].known"
+    "assertfacts[index].reachable==reachable"
+    "assertfacts[index].may_live==reachable"
+    "assertfacts[index].may_consumed==reachable"
     "index<-index+1"
+    "assertforallfact_indexin0..<index:notfacts[fact_index].known"
+    "andfacts[fact_index].reachable==reachable"
+    "andfacts[fact_index].may_live==reachable"
+    "andfacts[fact_index].may_consumed==reachable"
+    "assertindex==facts.count"
+    "assertforallfact_indexin0..<facts.count:notfacts[fact_index].known"
+    "andfacts[fact_index].reachable==reachable"
+    "andfacts[fact_index].may_live==reachable"
+    "andfacts[fact_index].may_consumed==reachable"
 )
 if unknown_vector_contract not in binding_flow_source:
     raise SystemExit("the ownership fallback no longer proves its all-rows loop invariant")
