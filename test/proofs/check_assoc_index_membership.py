@@ -101,7 +101,8 @@ collector = compact(function_section(consumer_text, "aib_collect_impl_methods"))
 collector_invariants = "invariantmethod_names.count==method_refined.count"
 if ("requiresmethod_names.count==method_refined.count" not in collector or
         "ensuremethod_names.count==method_refined.count" not in collector or
-        collector.count(collector_invariants) != 2):
+        collector.count(collector_invariants) != 2 or
+        collector.count("assertmethod_names.count==method_refined.count") < 4):
     raise SystemExit("impl-method collection must preserve the parallel method/refinement table invariant")
 name_push = collector.find("method_names.push(name)")
 refinement_push = collector.find("method_refined.push(refined)")
@@ -113,7 +114,9 @@ if (collector.count("aib_collect_impl_methods(body,annotations,method_names,meth
 entry = compact(function_section(consumer_text, "check_assoc_index_bounds"))
 if ("method_names:mutabledarray[sview]=[]" not in entry or
         "method_refined:mutabledarray[bool]=[]" not in entry or
-        "aib_collect_impl_methods(file.top_decls,file.enum_annotations,method_names,method_refined)" not in entry):
+        "assertmethod_names.count==method_refined.count" not in entry or
+        "aib_collect_impl_methods(file.top_decls,file.enum_annotations,method_names,method_refined)" not in entry or
+        entry.count("assertmethod_names.count==method_refined.count") != 2):
     raise SystemExit("top-level impl collection must establish equal empty vectors before recursive scanning")
 if semantic_text.count('include "./check_assoc_index_bounds.elisa"') != 1:
     raise SystemExit("semantic root must include the associated-index checker exactly once")
