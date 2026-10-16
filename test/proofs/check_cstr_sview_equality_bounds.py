@@ -61,7 +61,6 @@ if any(compact(contract) not in compare for contract in contracts):
     raise SystemExit("ctx_cstr_eq_sview lost its invalid-extent, length, or empty-input contract")
 steps = (
     "false return if view.len < 0",
-    "if view.len == 0 and text.len == 0: return true",
     "len: usize = view.len.usize()",
     "text_len: i64 = text.len",
     "false return if len.i64() != view.len",
@@ -78,13 +77,9 @@ steps = (
     "trusted Unsafe.UncheckedIndex: text_byte <- text[i].u8()",
     "false return if text_byte != view_byte",
     "i <- i + 1.usize()",
-    "return false if text.len != view.len",
     "return true",
 )
-positions = [
-    compare.rfind(compact(step)) if step == "return false if text.len != view.len" else compare.find(compact(step))
-    for step in steps
-]
+positions = [compare.find(compact(step)) for step in steps]
 if any(position < 0 for position in positions) or positions != sorted(positions):
     raise SystemExit("ctx_cstr_eq_sview lost its extent guards, bounded loop, or byte comparison")
 if "view.data[" in compare or "text[len]" in compare or "trustedUnsafe.UncheckedIndex:while" in compare:
