@@ -36,7 +36,8 @@ def compact(source):
 binding_flow_source = compact(semantic_sources[2].read_text())
 unknown_fact_contract = (
     "defownership_binding_unknown(id:BindingId,reachable:bool)->OwnershipBindingFact:"
-    "ensureownership_binding_ids_equal(result.binding_id,id)"
+    "ensureresult.binding_id.owner.value==id.owner.value"
+    "ensureresult.binding_id.serial==id.serial"
     "ensureresult.reachable==reachable"
     "ensurenotresult.known"
     "ensureresult.may_live==reachable"
