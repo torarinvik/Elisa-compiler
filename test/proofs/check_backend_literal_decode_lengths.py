@@ -35,8 +35,8 @@ NEGATIVE_NAMES = {
 FUNCTION_SHA256 = {
     "hex_digit_value": "b6397a60d08f4dc97b2078a5671333a782af29f7c2deb33dfddf65675c7cd71e",
     "push_utf8": "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806",
-    "decode_string_escapes": "2598bda667a69096077a3919f9f51ef91fcf918e41020496207d468febf13440",
-    "decoded_literal_byte_count": "422fd89b0ed7ffd5f98d90318d9869ecafe508e35266bec5e658e6abaa45b756",
+    "decode_string_escapes": "45fea57369382104303b0e5bde8812f92ccba34c8d672e3ecea87495e1e687fe",
+    "decoded_literal_byte_count": "43d7e7d396d281b64d685930657722a43c5cedfa56c2d5105280e5aca8c59588",
 }
 
 
@@ -90,9 +90,11 @@ require_ordered(source_text, "decode_string_escapes", (
     "if next_byte == 120 or next_byte == 117:",
     "hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()",
     "hex_ok: mutable bool = hex_digits <= hex_available",
+    "if hex_start <= text.len and hex_digits <= text.len - hex_start:",
     "hex_value <- hex_escape_value(text, hex_start, hex_digits)",
     "if hex_ok:",
     "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "if low_escape_start <= text.len:",
     "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
     "push_utf8(storage, pair_codepoint)",
     "index <- low_escape_start + 6.usize()",
@@ -137,10 +139,13 @@ require_ordered(source_text, "decoded_literal_byte_count", (
     "next_byte: u8 = text[next_index]",
     "if next_byte == 120 or next_byte == 117:",
     "hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()",
+    "-1 return if hex_start > text.len",
     "-1 return if hex_digits > hex_available",
+    "-1 return if hex_digits > text.len - hex_start",
     "hex_value: i64 = hex_escape_value(text, hex_start, hex_digits)",
     "-1 return if hex_value < 0",
     "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "-1 return if low_escape_start > text.len",
     "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
     "-1 return if pair_codepoint < 0",
     "count <- count + 4",

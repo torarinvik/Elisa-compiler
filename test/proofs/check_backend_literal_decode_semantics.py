@@ -43,7 +43,7 @@ NEGATIVE_NAMES = {
 FUNCTION_SHA256 = {
     "hex_digit_value": "b6397a60d08f4dc97b2078a5671333a782af29f7c2deb33dfddf65675c7cd71e",
     "push_utf8": "107894c98de754e4b12241cdb65fa7add39a1c876a3e4b33daae9d9ddef7c806",
-    "decode_string_escapes": "2598bda667a69096077a3919f9f51ef91fcf918e41020496207d468febf13440",
+    "decode_string_escapes": "45fea57369382104303b0e5bde8812f92ccba34c8d672e3ecea87495e1e687fe",
 }
 
 
@@ -124,9 +124,11 @@ decoder_steps = (
     "hex_start: usize = next_index + 1.usize()",
     "hex_available: usize = length - hex_start",
     "hex_ok: mutable bool = hex_digits <= hex_available",
+    "if hex_start <= text.len and hex_digits <= text.len - hex_start:",
     "hex_value <- hex_escape_value(text, hex_start, hex_digits)",
     "if hex_ok:",
     "if next_byte == 117 and hex_value >= 55296 and hex_value <= 56319:",
+    "if low_escape_start <= text.len:",
     "pair_codepoint: i64 = utf16_surrogate_pair_codepoint(text, low_escape_start, hex_value)",
     "push_utf8(storage, pair_codepoint)",
     "index <- low_escape_start + 6.usize()",
