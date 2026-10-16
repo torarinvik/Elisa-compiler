@@ -56,6 +56,7 @@ required_source = (
     "ghost def vro_text_compare_prefix_preserves(",
     "requires position <= left.len and position <= right.len",
     "decreases (left.len if left.len < right.len else right.len) - position",
+    "ensure (position < left.len and position < right.len and left[position] == right[position]) implies result == vro_text_compare_reference_from(left, right, position + VRO_BYTE_STEP)",
     "ensure vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION) == vro_text_compare_reference_from(left, right, position)",
     "VRO_COMPARE_LESS return if left[position] < right[position]",
     "VRO_COMPARE_GREATER return if left[position] > right[position]",
@@ -66,12 +67,14 @@ required_source = (
     "invariant position <= shared",
     "invariant forall prefix_index in VRO_FIRST_BYTE_POSITION..<position: left[prefix_index] == right[prefix_index]",
     "invariant vro_text_compare_prefix_preserves(left, right, position)",
+    "while position < shared |position, left, right, shared|:",
+    "position <- position + VRO_BYTE_STEP",
     "rows.count / VRO_ROW_WIDTH",
     "middle * VRO_ROW_WIDTH",
     "row + VRO_ROW_FIELD_OFFSET >= rows.count",
     "row <- row + VRO_ROW_WIDTH",
     "width <- width * VRO_MERGE_PAIR_COUNT",
-    "sorted: mutable darray[sview] = [VRO_SORTED_MARKER, \"\", \"\", \"\", \"\"]",
+    "sorted: mutable darray[sview @source] = [VRO_SORTED_MARKER, \"\", \"\", \"\", \"\"]",
 )
 if not all(fragment in source for fragment in required_source):
     raise SystemExit("production text comparator lost its recursive specification or prefix proof invariant")
