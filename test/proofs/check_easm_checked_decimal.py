@@ -97,10 +97,10 @@ if env_text.index('include "easm_checked_decimal.elisa"') > env_text.index('incl
     raise SystemExit("checked-digit helpers are imported after the parser that uses them")
 
 for contract in (
-    "ensure result.valid == (value < I64_MAX / DECIMAL_RADIX",
+    "ensure result.valid == (value >= 0 and (value < I64_MAX / DECIMAL_RADIX",
     "ensure result.valid implies result.value == value * DECIMAL_RADIX + digit",
     "ensure not result.valid implies result.value == 0",
-    "ensure result.valid == (value > I64_MIN / DECIMAL_RADIX",
+    "ensure result.valid == (value <= 0 and (value > I64_MIN / DECIMAL_RADIX",
     "ensure result.valid implies result.value == value * DECIMAL_RADIX - digit",
 ):
     if contract not in helper_text:
@@ -165,13 +165,15 @@ reference_from = compact(function_section(helper_text, "decimal_parse_reference_
 reference_wrapper = compact(function_section(helper_text, "decimal_parse_reference"))
 required_reference_fragments = (
     "ghostdefdecimal_parse_reference_from(",
-    "requiresposition<=text.lenand(negativeimpliesvalue<=0)and(notnegativeimpliesvalue>=0)",
+    "requiresposition<=text.len",
     "decreasestext.len-position",
     "ensure(position==text.lenandnotconsumed_digit)implies(notresult.validandresult.value==0)",
     "ensure(position==text.lenandconsumed_digit)implies(result.validandresult.value==value)",
     "return(false,0)ifposition==text.lenandnotconsumed_digit",
     "return(true,value)ifposition==text.len",
     "return(false,0)iftext[position]<ASCII_DIGIT_ZEROortext[position]>ASCII_DIGIT_NINE",
+    "return(false,0)ifnegativeandvalue>0",
+    "return(false,0)ifnotnegativeandvalue<0",
     "return(false,0)ifnegativeand(value<I64_MIN/DECIMAL_RADIXor(value==I64_MIN/DECIMAL_RADIXand(text[position]-ASCII_DIGIT_ZERO).i64()>0-(I64_MIN%DECIMAL_RADIX)))",
     "return(false,0)ifvalue>I64_MAX/DECIMAL_RADIXor(value==I64_MAX/DECIMAL_RADIXand(text[position]-ASCII_DIGIT_ZERO).i64()>I64_MAX%DECIMAL_RADIX)",
     "returndecimal_parse_reference_from(text,position+1,true,value*DECIMAL_RADIX-(text[position]-ASCII_DIGIT_ZERO).i64(),true)ifnegative",
@@ -212,16 +214,18 @@ if "constDECIMAL_RADIX:i64=10" not in compact(helper_text) or \
         f"constI64_MAX:i64={i64_max}" not in compact(helper_text) or \
         "constI64_MIN:i64=0-I64_MAX-1" not in compact(helper_text):
     raise SystemExit("production decimal constants no longer match the i64 proof domain")
-if "ensureresult.valid==(value<I64_MAX/DECIMAL_RADIXor(value==I64_MAX/DECIMAL_RADIXanddigit<=I64_MAX%DECIMAL_RADIX))" not in positive_source or \
+if "ensureresult.valid==(value>=0and(value<I64_MAX/DECIMAL_RADIXor(value==I64_MAX/DECIMAL_RADIXanddigit<=I64_MAX%DECIMAL_RADIX)))" not in positive_source or \
         "limit:i64=I64_MAX/DECIMAL_RADIX" not in positive_source or \
         "final_digit_limit:i64=I64_MAX%DECIMAL_RADIX" not in positive_source or \
+        "return(false,0)ifvalue<0" not in positive_source or \
         "return(false,0)ifvalue>limit" not in positive_source or \
         "return(false,0)ifvalue==limitanddigit>final_digit_limit" not in positive_source or \
         "return(true,value*DECIMAL_RADIX+digit)" not in positive_source:
     raise SystemExit("positive digit guard or checked accumulation no longer matches its scalar proof")
-if "ensureresult.valid==(value>I64_MIN/DECIMAL_RADIXor(value==I64_MIN/DECIMAL_RADIXanddigit<=0-(I64_MIN%DECIMAL_RADIX)))" not in negative_source or \
+if "ensureresult.valid==(value<=0and(value>I64_MIN/DECIMAL_RADIXor(value==I64_MIN/DECIMAL_RADIXanddigit<=0-(I64_MIN%DECIMAL_RADIX))))" not in negative_source or \
         "limit:i64=I64_MIN/DECIMAL_RADIX" not in negative_source or \
         "final_digit_limit:i64=0-(I64_MIN%DECIMAL_RADIX)" not in negative_source or \
+        "return(false,0)ifvalue>0" not in negative_source or \
         "return(false,0)ifvalue<limit" not in negative_source or \
         "return(false,0)ifvalue==limitanddigit>final_digit_limit" not in negative_source or \
         "return(true,value*DECIMAL_RADIX-digit)" not in negative_source:
