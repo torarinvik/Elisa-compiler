@@ -215,10 +215,9 @@ expected_module = {
     decreases remaining
     return "" if ambiguous_from(alias_names, name, 0, false)
     return name if not direct_target_found_from(alias_names, alias_targets, name, 0)
-    target: sview = direct_target_value_from(alias_names, alias_targets, name, 0)
-    return "" if target == name
+    return "" if direct_target_value_from(alias_names, alias_targets, name, 0) == name
     return "" if remaining == 0
-    return resolve_from(alias_names, alias_targets, target, remaining - 1)
+    return resolve_from(alias_names, alias_targets, direct_target_value_from(alias_names, alias_targets, name, 0), remaining - 1)
 """,
     "resolve": """def resolve(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> sview:
     ensure result == resolve_from(alias_names, alias_targets, name, alias_names.count)

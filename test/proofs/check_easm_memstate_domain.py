@@ -62,9 +62,8 @@ fact_bound_body = memory.split("ghost def easm_size_guard_fact_bound_spec(", 1)[
     "\n\n        def ", 1
 )[0]
 fact_bound_compact = "".join(fact_bound_body.split())
-if 'marker:usize=EasmTextScan::find_spec(fact,"size>=")' not in fact_bound_compact or \
-        "return0ifmarker>=fact.len" not in fact_bound_compact or \
-        'returneasm_parse_i64_spec(EasmTextScan::trim_spec(fact[marker+7.usize():fact.len]))' not in fact_bound_compact:
+if 'return0ifEasmTextScan::find_spec(fact,"size>=")>=fact.len' not in fact_bound_compact or \
+        'returneasm_parse_i64_spec(EasmTextScan::trim_spec(fact[EasmTextScan::find_spec(fact,"size>=")+7.usize():fact.len]))' not in fact_bound_compact:
     raise SystemExit("memory size facts no longer use the pure scanner and decimal specifications")
 lower_bound_body = memory.split("def easm_size_guard_lower_bound(", 1)[1].split("\n\n        def ", 1)[0]
 lower_bound_compact = "".join(lower_bound_body.split())
