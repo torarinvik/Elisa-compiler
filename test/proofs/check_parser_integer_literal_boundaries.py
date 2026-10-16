@@ -42,9 +42,9 @@ for fragment in (
 ):
     if fragment not in reference_from:
         raise AssertionError(f"recursive literal reference lost its proof-checked fold step: {fragment}")
-if "assert start_index <= n" not in reference or \
-        "return parse_int_literal_reference_from(text, start_index, is_hex, 0).i64()" not in reference:
-    raise AssertionError("recursive literal reference no longer bounds its production radix prefix")
+if "return parse_int_literal_reference_from(text, 2, true, 0).i64() if n >= 2 and text[0] == 48 and (text[1] == 120 or text[1] == 88)" not in reference or \
+        "return parse_int_literal_reference_from(text, 0, false, 0).i64()" not in reference:
+    raise AssertionError("recursive literal reference no longer proves its radix prefix is within the text span")
 for fragment in (
         "ensure result == parse_int_literal_reference(text)",
         "assert start_index <= n",
