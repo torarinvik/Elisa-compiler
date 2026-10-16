@@ -85,6 +85,7 @@ for name, required in {
         "invariant probed <= m.capacity",
         "invariant slot < m.capacity",
         "invariant insert_slot == m.capacity or insert_slot < m.capacity",
+        "if insert_slot != m.capacity: assert insert_slot < m.capacity",
     ),
     "arena_set_find_index": (
         "while probed < s.capacity:",
@@ -92,6 +93,7 @@ for name, required in {
         "invariant probed <= s.capacity",
         "invariant slot < s.capacity",
         "invariant insert_slot == s.capacity or insert_slot < s.capacity",
+        "if insert_slot != s.capacity: assert insert_slot < s.capacity",
     ),
     "arena_dict_find_cstr_view_index": (
         "while remaining > 0:",
