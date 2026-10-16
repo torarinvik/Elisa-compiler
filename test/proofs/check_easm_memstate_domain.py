@@ -58,6 +58,14 @@ if "requiresleft<=upperandright<=upper" not in lub_theorem_compact or \
     raise SystemExit("the max-domain least-upper-bound theorem is no longer proved and consumed by the source-linked suite")
 
 memory = MEMORY.read_text()
+fact_bound_body = memory.split("ghost def easm_size_guard_fact_bound_spec(", 1)[1].split(
+    "\n\n        def ", 1
+)[0]
+fact_bound_compact = "".join(fact_bound_body.split())
+if 'marker:usize=EasmTextScan::find_spec(fact,"size>=")' not in fact_bound_compact or \
+        "return0ifmarker>=fact.len" not in fact_bound_compact or \
+        'returneasm_parse_i64_spec(EasmTextScan::trim_spec(fact[marker+7.usize():fact.len]))' not in fact_bound_compact:
+    raise SystemExit("memory size facts no longer use the pure scanner and decimal specifications")
 lower_bound_body = memory.split("def easm_size_guard_lower_bound(", 1)[1].split("\n\n        def ", 1)[0]
 if "".join("greatest <- EasmMemStateDomain::greatest_bound(greatest, value)".split()) not in "".join(lower_bound_body.split()):
     raise SystemExit("production size-fact lower-bound fold no longer uses the proved maximum operation")
@@ -71,17 +79,22 @@ if "ensureresult>=0" not in lower_bound_compact or \
         "invariant(forallfact_indexin0..<index:" not in lower_bound_compact:
     raise SystemExit("production size-fact fold no longer proves its processed-prefix coverage and nonnegative accumulator")
 covered_fact = (
-    'easm_find(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
-    'result>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():(facts[fact_index]).len]))'
+    'EasmTextScan::find_spec(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
+    'result>=easm_size_guard_fact_bound_spec(facts[fact_index])'
 )
 if f"ensure(forallfact_indexin0..<facts.count:{covered_fact}" not in lower_bound_compact:
-    raise SystemExit("production size-fact fold no longer exports its per-fact coverage guarantee")
+    raise SystemExit("production size-fact fold no longer exports its pure-spec per-fact coverage guarantee")
 processed_fact = (
-    'easm_find(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
-    'greatest>=easm_parse_i64(easm_trim(facts[fact_index][easm_find(facts[fact_index],"size>=")+7.usize():(facts[fact_index]).len]))'
+    'EasmTextScan::find_spec(facts[fact_index],"size>=")>=(facts[fact_index]).lenor'
+    'greatest>=easm_size_guard_fact_bound_spec(facts[fact_index])'
 )
 if f"invariant(forallfact_indexin0..<index:{processed_fact}" not in lower_bound_compact:
-    raise SystemExit("production size-fact fold no longer tracks its processed-prefix lower-bound invariant")
+    raise SystemExit("production size-fact fold no longer tracks its processed-prefix pure-spec invariant")
+if 'assertmarker==EasmTextScan::find_spec(fact,"size>=")' not in lower_bound_compact or \
+        "assertvalue==easm_size_guard_fact_bound_spec(fact)" not in lower_bound_compact or \
+        'value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():fact.len]))' not in lower_bound_compact or \
+        "assertforallfact_indexin0..<(index+1.usize()):" not in lower_bound_compact:
+    raise SystemExit("runtime size-fact extraction no longer proves each loop step against its pure specification")
 wrappers = {
     "easm_memstate_join_min": "EasmMemStateDomain::join_min(left, right)",
     "easm_memstate_read_well_typed": "EasmMemStateDomain::read_well_typed(need, known_min)",
