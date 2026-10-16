@@ -49,7 +49,8 @@ checked_digit_rejection = compact("""
     if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE:
         assert not decimal_parse_reference(text).valid
         assert decimal_parse_reference(text).value == 0
-        return (false, 0)
+        valid <- false
+        break
 """)
 if legacy_digit_rejection not in parse_signed and checked_digit_rejection not in parse_signed:
     raise SystemExit("production parser no longer rejects bytes outside the decimal digit interval")
