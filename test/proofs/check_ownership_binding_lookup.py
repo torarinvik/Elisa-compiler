@@ -163,6 +163,13 @@ normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
+if not re.search(
+    r"if found:\s+assert result_index < table\.ref_binding_ids\.count\s+"
+    r"return \(true, table\.ref_binding_ids\[result_index\]\)\s+"
+    r"return \(false, missing\)",
+    lookup_text,
+):
+    raise AssertionError("lookup result must preserve found/payload facts on separate return paths")
 lookup_lines = lookup_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
