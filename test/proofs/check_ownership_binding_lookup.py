@@ -156,7 +156,8 @@ required_contracts = (
     "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
     "invariant step <= expected_count",
     "invariant (step == 0 implies row == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()].usize())",
-    "found implies exists candidate in 0..<table.ref_pos.count:",
+    "invariant not found or result_index < table.ref_pos.count",
+    "invariant not found or table.ref_binding_ids[result_index].owner.value == owner.value",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
