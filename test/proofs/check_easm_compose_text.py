@@ -127,14 +127,19 @@ count_body = compact(function_section(text_source, "easm_compose_argument_count"
 required_count_fragments = (
     "ensure (EasmTextScan::trim(text)).len == 0 implies result == 0",
     "ensure (EasmTextScan::trim(text)).len > 0 implies result == easm_compose_comma_count_from(text, 0.usize()) + 1",
-    "invariant index <= text.len",
+    "text_length: usize = text.len.usize()",
+    "index: mutable usize = 0",
+    "while index < text_length",
+    "decreases text_length - index",
+    "invariant index <= text_length",
+    "invariant text_length == text.len",
+    "invariant count >= 0",
+    "invariant count.usize() <= index",
     "invariant count + easm_compose_comma_count_from(text, index) == easm_compose_comma_count_from(text, 0.usize())",
     "assert count + easm_compose_comma_count_from(text, 0.usize()) == easm_compose_comma_count_from(text, 0.usize())",
     "if text[index] == 44:",
-    "assert easm_compose_comma_count_from(text, index) == 1 + easm_compose_comma_count_from(text, index + 1.usize())",
     "count <- count + 1",
-    "assert count + easm_compose_comma_count_from(text, index + 1.usize()) == easm_compose_comma_count_from(text, 0.usize())",
-    "assert easm_compose_comma_count_from(text, index) == easm_compose_comma_count_from(text, index + 1.usize())",
+    "index <- index + 1.usize()",
     "return count + 1",
 )
 if any(compact(fragment) not in count_body for fragment in required_count_fragments):
