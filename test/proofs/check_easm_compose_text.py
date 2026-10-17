@@ -184,7 +184,7 @@ if any(compact(fragment) not in reference_at_bounds_body for fragment in (
     raise SystemExit("named compose-span bounds helper lost its source-slice contracts")
 close_offset_body = compact(function_section(text_source, "easm_compose_close_offset"))
 if any(compact(fragment) not in close_offset_body for fragment in (
-    "requires open < text.len",
+    "requires open <= text.len",
     "ensure result <= text.len - open",
     'return EasmTextScan::find_spec(text[open:text.len], ")")',
 )):
@@ -195,8 +195,7 @@ if any(compact(fragment) not in span_count_from_open_body for fragment in (
     "ensure open >= text.len implies result == 0",
     "ensure open < text.len implies result == easm_compose_span_argument_count_at_offset(text, open, easm_compose_close_offset(text, open))",
     "return 0 if open >= text.len",
-    "close_offset: usize = easm_compose_close_offset(text, open)",
-    "return easm_compose_span_argument_count_at_offset(text, open, close_offset)",
+    "return easm_compose_span_argument_count_at_offset(text, open, easm_compose_close_offset(text, open))",
 )):
     raise SystemExit("span argument count no longer uses a total open-relative return tree")
 span_count_at_offset_body = compact(function_section(text_source, "easm_compose_span_argument_count_at_offset"))
