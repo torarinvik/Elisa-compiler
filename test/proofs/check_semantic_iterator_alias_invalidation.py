@@ -178,17 +178,19 @@ expected_module = {
     return alias_targets[index] if index < alias_targets.count and alias_names[index] == name
     return direct_target_value_from(alias_names, alias_targets, name, index + 1)
 """,
+    "direct_target_from": """def direct_target_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, index: usize) -> (found: bool, target: sview):
+    requires index <= alias_names.count
+    decreases alias_names.count - index
+    ensure result.found == direct_target_found_from(alias_names, alias_targets, name, index)
+    ensure result.found implies result.target == direct_target_value_from(alias_names, alias_targets, name, index)
+    return (false, sview("", 0, 0)) if index == alias_names.count
+    return (true, alias_targets[index]) if index < alias_targets.count and alias_names[index] == name
+    return direct_target_from(alias_names, alias_targets, name, index + 1)
+""",
     "direct_target": """def direct_target(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> (found: bool, target: sview):
     ensure result.found == direct_target_found_from(alias_names, alias_targets, name, 0)
-    ensure result.target == direct_target_value_from(alias_names, alias_targets, name, 0)
-    for index in 0..<alias_names.count |index|:
-        invariant index <= alias_names.count
-        invariant direct_target_found_from(alias_names, alias_targets, name, index) == direct_target_found_from(alias_names, alias_targets, name, 0)
-        invariant direct_target_value_from(alias_names, alias_targets, name, index) == direct_target_value_from(alias_names, alias_targets, name, 0)
-        return (true, alias_targets[index]) if index < alias_targets.count and alias_names[index] == name
-        assert direct_target_found_from(alias_names, alias_targets, name, index) == direct_target_found_from(alias_names, alias_targets, name, index + 1.usize())
-        assert direct_target_value_from(alias_names, alias_targets, name, index) == direct_target_value_from(alias_names, alias_targets, name, index + 1.usize())
-    return (false, sview("", 0, 0))
+    ensure result.found implies result.target == direct_target_value_from(alias_names, alias_targets, name, 0)
+    return direct_target_from(alias_names, alias_targets, name, 0)
 """,
     "ambiguous_from": """ghost def ambiguous_from(alias_names: darray[sview]&, name: sview, index: usize, seen: bool) -> bool:
     requires index <= alias_names.count
@@ -198,17 +200,18 @@ expected_module = {
     next_seen: bool = seen or alias_names[index] == name
     return ambiguous_from(alias_names, name, index + 1, next_seen)
 """,
+    "ambiguous_from_runtime": """def ambiguous_from_runtime(alias_names: darray[sview]&, name: sview, index: usize, seen: bool) -> bool:
+    requires index <= alias_names.count
+    decreases alias_names.count - index
+    ensure result == ambiguous_from(alias_names, name, index, seen)
+    return false if index == alias_names.count
+    return true if alias_names[index] == name and seen
+    next_seen: bool = seen or alias_names[index] == name
+    return ambiguous_from_runtime(alias_names, name, index + 1, next_seen)
+""",
     "ambiguous": """def ambiguous(alias_names: darray[sview]&, name: sview) -> bool:
     ensure result == ambiguous_from(alias_names, name, 0, false)
-    found: mutable bool = false
-    for index in 0..<alias_names.count |index, found|:
-        invariant index <= alias_names.count
-        invariant ambiguous_from(alias_names, name, index, found) == ambiguous_from(alias_names, name, 0, false)
-        return true if alias_names[index] == name and found
-        next_found: bool = found or alias_names[index] == name
-        assert ambiguous_from(alias_names, name, index, found) == ambiguous_from(alias_names, name, index + 1.usize(), next_found)
-        found <- next_found
-    return false
+    return ambiguous_from_runtime(alias_names, name, 0, false)
 """,
     "resolve_from": """ghost def resolve_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, remaining: usize) -> sview:
     requires remaining <= alias_names.count
@@ -219,38 +222,20 @@ expected_module = {
     return "" if remaining == 0
     return resolve_from(alias_names, alias_targets, direct_target_value_from(alias_names, alias_targets, name, 0), remaining - 1)
 """,
+    "resolve_runtime_from": """def resolve_runtime_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, remaining: usize) -> sview:
+    requires remaining <= alias_names.count
+    decreases remaining
+    ensure result == resolve_from(alias_names, alias_targets, name, remaining)
+    return sview("", 0, 0) if ambiguous(alias_names, name)
+    target: (found: bool, target: sview) = direct_target(alias_names, alias_targets, name)
+    return name if not target.found
+    return sview("", 0, 0) if target.target == name
+    return sview("", 0, 0) if remaining == 0
+    return resolve_runtime_from(alias_names, alias_targets, target.target, remaining - 1)
+""",
     "resolve": """def resolve(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> sview:
     ensure result == resolve_from(alias_names, alias_targets, name, alias_names.count)
-    current: mutable sview = name
-    remaining: mutable usize = alias_names.count
-    assert remaining <= alias_names.count
-    while remaining > 0 |current, remaining, alias_names, alias_targets, name|:
-        invariant remaining <= alias_names.count
-        invariant resolve_from(alias_names, alias_targets, current, remaining) == resolve_from(alias_names, alias_targets, name, alias_names.count)
-        if ambiguous(alias_names, current):
-            assert resolve_from(alias_names, alias_targets, current, remaining) == ""
-            return sview("", 0, 0)
-        target: (found: bool, target: sview) = direct_target(alias_names, alias_targets, current)
-        if not target.found:
-            assert resolve_from(alias_names, alias_targets, current, remaining) == current
-            return current
-        if target.target == current:
-            assert resolve_from(alias_names, alias_targets, current, remaining) == ""
-            return sview("", 0, 0)
-        assert remaining > 0
-        assert resolve_from(alias_names, alias_targets, current, remaining) == resolve_from(alias_names, alias_targets, target.target, remaining - 1)
-        current <- target.target
-        remaining <- remaining - 1
-        assert remaining <= alias_names.count
-    if ambiguous(alias_names, current):
-        assert resolve_from(alias_names, alias_targets, current, 0) == ""
-        return sview("", 0, 0)
-    target: (found: bool, target: sview) = direct_target(alias_names, alias_targets, current)
-    if target.found:
-        assert resolve_from(alias_names, alias_targets, current, 0) == ""
-        return sview("", 0, 0)
-    assert resolve_from(alias_names, alias_targets, current, 0) == current
-    return current
+    return resolve_runtime_from(alias_names, alias_targets, name, alias_names.count)
 """,
     "may_name": """def may_name(resolved: sview, source: sview) -> bool:
     ensure result == (resolved == "" or resolved == source)
