@@ -138,7 +138,10 @@ def function_section(source: str, name: str) -> str:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*?\])?\(", source[match.end():])
+    following = re.search(
+        rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*?\])?\(|^[ \t]*(?:public|private):",
+        source[match.end():],
+    )
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
