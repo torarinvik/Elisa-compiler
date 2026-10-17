@@ -69,9 +69,9 @@ find_byte = compact(function_section(text_scan, "find_byte"))
 for required in (
     "ensure result <= text.len",
     "ensure result == text.len or text[result] == needle",
-    "ensure forall candidate in 0..<result: text[candidate] != needle",
+    "ensure (forall candidate in 0..<result: text[candidate] != needle)",
     "while index < text.len",
-    "invariant forall candidate in 0..<index: text[candidate] != needle",
+    "invariant (forall candidate in 0..<index: text[candidate] != needle)",
     "return index if text[index] == needle",
 ):
     if compact(required) not in find_byte:
