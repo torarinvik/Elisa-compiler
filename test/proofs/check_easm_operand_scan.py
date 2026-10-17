@@ -272,6 +272,7 @@ if compact("decreases text_length - index") not in first_operand_scan or compact
     raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
 next_separator = compact(function_section(policy, "next_top_level_separator"))
 for required in (
+    "ensure result >= from",
     "result >= from and text[result] == ASCII_COMMA",
     "forall candidate in from..<result",
     "while index < text_length",
