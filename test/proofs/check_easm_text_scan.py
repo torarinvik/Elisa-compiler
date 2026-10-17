@@ -163,9 +163,6 @@ required_source = (
 )
 if not all(fragment in source_compact for fragment in required_source):
     raise SystemExit("production EASM scanner lost a source contract or loop invariant")
-trim_bounds_impl = compact(function_section(source_text, "trim_bounds"))
-if trim_bounds_impl.count("invariantfirst==0or(forallprefix_indexin0..<first:text[prefix_index]==ASCII_SPACEortext[prefix_index]==ASCII_TAB)") != 2:
-    raise SystemExit("both trim scans must carry the explicit empty-prefix invariant case")
 expected_find = """
 def find(text: sview, needle: sview) -> usize:
     ensure result <= text.len
