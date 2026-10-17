@@ -257,7 +257,7 @@ if checker_text.count('include "./iterator_mutation_policy.elisa"') != 1:
     raise SystemExit("iterator invalidation must include the proof-refined mutation policy exactly once")
 policy_text = POLICY.read_text()
 policy_compact = compact(policy_text)
-if compact('ghost def forbidden_during_iteration_spec(method: sview) -> bool: return method == "push" or method == "extend" or method == "insert" or method == "append" or method == "reserve" or method == "clear" or method == "truncate" or method == "resize"') not in policy_compact:
+if compact('ghost def forbidden_during_iteration_spec(method: sview) -> bool: ensure result == (method == "push" or method == "extend" or method == "insert" or method == "append" or method == "reserve" or method == "clear" or method == "truncate" or method == "resize") return method == "push" or method == "extend" or method == "insert" or method == "append" or method == "reserve" or method == "clear" or method == "truncate" or method == "resize"') not in policy_compact:
     raise SystemExit("iterator mutation specification lost a classified method")
 if compact('def forbidden_during_iteration(method: sview) -> bool: ensure result == forbidden_during_iteration_spec(method) return method == "push" or method == "extend" or method == "insert" or method == "append" or method == "reserve" or method == "clear" or method == "truncate" or method == "resize"') not in policy_compact:
     raise SystemExit("production iterator mutation classifier no longer refines its independent specification")
