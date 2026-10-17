@@ -79,8 +79,8 @@ def declaration_name_position(annotations: darray[Ast::EnumAnnotation]&, name: s
             invariant index <= annotations.count
             invariant Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
             annotation: Ast::EnumAnnotation = annotations[index]
-            continue if annotation.owner != "__lsp_decl_name" or annotation.name != name
-            return annotation.pos if annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0)
+            eligible: bool = annotation.owner == "__lsp_decl_name" and annotation.name == name and annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0)
+            return annotation.pos if eligible
         return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
 '''
 if compact(function_section(lookup_text, "declaration_name_position")) != compact(expected_lookup):
