@@ -197,7 +197,7 @@ if not re.search(
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
 lookup_lines = lookup_text.splitlines()
-if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 14:
+if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
 if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 4:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
@@ -205,7 +205,7 @@ if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
-    print(json.dumps({"source_bound": True, "contract_count": 14,
+    print(json.dumps({"source_bound": True, "contract_count": 15,
                       "invariant_count": 4, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
