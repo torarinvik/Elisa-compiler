@@ -19,6 +19,7 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "easm_operand_scan.elisa"
 NEGATIVE = HERE / "easm_operand_scan_rejected.elisa"
 POLICY = ROOT / "src/backend/easm_operand_scan.elisa"
+TEXT_SCAN = ROOT / "src/backend/easm_text_scan.elisa"
 ENV = ROOT / "src/backend/codegen_env.elisa"
 PROVENANCE = ROOT / "src/backend/easm_verify_provenance.elisa"
 FUNCTION = ROOT / "src/backend/easm_verify_function.elisa"
@@ -63,6 +64,18 @@ def proof_body(source: str, name: str) -> str:
 
 
 policy = POLICY.read_text()
+text_scan = TEXT_SCAN.read_text()
+find_byte = compact(function_section(text_scan, "find_byte"))
+for required in (
+    "ensure result <= text.len",
+    "ensure result == text.len or text[result] == needle",
+    "ensure forall candidate in 0..<result: text[candidate] != needle",
+    "while index < text.len",
+    "invariant forall candidate in 0..<index: text[candidate] != needle",
+    "return index if text[index] == needle",
+):
+    if compact(required) not in find_byte:
+        raise SystemExit(f"single-byte scanner lost its first-match proof: {required}")
 expected_policy_inventory = {
     "needs_arity_rejection", "is_zero_operand_instruction", "is_one_operand_instruction", "is_two_operand_instruction",
     "is_shift_instruction", "operand_arity_supported", "is_aarch64_mrs_form", "exact_register_form", "is_direct_control_target",
@@ -245,13 +258,13 @@ if compact(function_section(policy, "is_direct_control_target")) != compact(expe
 scanner = compact(function_section(policy, "scan_instruction"))
 for required in (
     "start: usize = first_operand_byte(text, EasmTextScan::first_space(text).usize())",
-    'open_relative: usize = EasmTextScan::find(operands, "(")',
-    'close_relative: usize = EasmTextScan::find(operands, ")")',
+    "open_relative: usize = EasmTextScan::find_byte(operands, ASCII_LEFT_PAREN)",
+    "close_relative: usize = EasmTextScan::find_byte(operands, ASCII_RIGHT_PAREN)",
     'if close_relative >= operands.len: return (start, 0, text_length, text_length, false, text_length, text_length, false)',
-    'close_after_open: usize = EasmTextScan::find(after_open, ")")',
-    'EasmTextScan::find(address_contents, "(") < address_contents.len',
-    'EasmTextScan::find(trailing, "(") < trailing.len',
-    'EasmTextScan::find(trailing, ")") < trailing.len',
+    "close_after_open: usize = EasmTextScan::find_byte(after_open, ASCII_RIGHT_PAREN)",
+    "EasmTextScan::find_byte(address_contents, ASCII_LEFT_PAREN) < address_contents.len",
+    "EasmTextScan::find_byte(trailing, ASCII_LEFT_PAREN) < trailing.len",
+    "EasmTextScan::find_byte(trailing, ASCII_RIGHT_PAREN) < trailing.len",
     "first_separator: usize = next_top_level_separator(text, start, has_address, open, close)",
     "second_separator: usize = next_top_level_separator(text, first_separator + SCAN_STEP, has_address, open, close)",
     "return (start, TOO_MANY_OPERANDS_SENTINEL, first_separator, second_separator, has_address, open, close, true)",
