@@ -52,7 +52,7 @@ if "append_negative_digit(value, digit)" not in loop_body:
     raise SystemExit("negative parser path no longer uses the proved checked-digit helper")
 for fragment in (
     "byte: u8 = text[position]",
-    "return (false, 0) if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE",
+    "if byte < ASCII_DIGIT_ZERO or byte > ASCII_DIGIT_NINE:\n                    assert not decimal_parse_reference(text).valid\n                    assert decimal_parse_reference(text).value == 0\n                    return (false, 0)",
     "digit: i64 = (byte - ASCII_DIGIT_ZERO).i64()",
     "position <- position + 1\n                assert position <= text.len",
 ):
@@ -61,7 +61,9 @@ for fragment in (
 for helper in ("append_positive_digit", "append_negative_digit"):
     call = f"{helper}(value, digit)"
     call_at = loop_body.index(call)
-    reject_at = loop_body.index("return (false, 0) if not step.valid", call_at)
+    reject_at = loop_body.index("if not step.valid:", call_at)
+    if "return (false, 0)" not in loop_body[reject_at:reject_at + 400]:
+        raise SystemExit(f"parser does not return immediately after failed {helper} steps")
     update_at = loop_body.index("value <- step.value", reject_at)
     advance_at = loop_body.index("position <- position + 1", update_at)
     if not call_at < reject_at < update_at < advance_at:
