@@ -80,18 +80,11 @@ if any(compact(contract) not in extension for contract in extension_contracts):
 if any(compact(contract) not in stem for contract in stem_contracts):
     raise SystemExit("Fs::stem lost its malformed-input, basename, offset, or byte-preservation contract")
 if compact("dot: i64 = sview_find_last_byte(p, 46)") not in extension \
-        or compact("return empty if p.len < 0") not in extension \
-        or compact("return empty if p.len.usize().i64() != p.len") not in extension \
-        or compact("if dot > name_start") not in extension \
-        or compact("return string_view_suffix(p, dot)") not in extension \
-        or compact("return empty") not in extension:
+        or compact("return string_view_suffix(p, dot) if dot > name_start") not in extension:
     raise SystemExit("Fs::extension no longer returns the final qualifying dot suffix")
 if compact("dot: i64 = sview_find_last_byte(p, 46)") not in stem \
-        or compact("return empty if p.len < 0") not in stem \
-        or compact("return empty if p.len.usize().i64() != p.len") not in stem \
-        or compact("if dot > name_start") not in stem \
-        or compact("return string_view_slice(p, name_start, dot)") not in stem \
-        or compact("return string_view_suffix(p, name_start)") not in stem:
+        or compact("return string_view_slice(p, name_start, dot) if dot > name_start") not in stem \
+        or compact("else string_view_suffix(p, name_start)") not in stem:
     raise SystemExit("Fs::stem no longer cuts before the final qualifying dot")
 
 positive_claims = {
