@@ -171,7 +171,12 @@ if declaration_invariant < 0 or target_invariant < declaration_invariant \
         or line_scan <= last_invariant:
     raise SystemExit("collection-index invariants must dominate target indexing and source-line parsing")
 project_body = compact(function_section(parser_text, "parse_project"))
-if "assertlength<=source.bytes.countparsed:Module=parse_module(source.bytes,length,source.path)" not in project_body:
+required_source_extent_facts = (
+    "source_length:usize=source.bytes.count",
+    "length:mutableusize=source_length",
+    "assertlength<=source_lengthassertsource_length==source.bytes.countparsed:Module=parse_module(source.bytes,length,source.path)",
+)
+if any(fact not in project_body for fact in required_source_extent_facts):
     raise SystemExit("project parser must restate the bounded source extent after trimming the logical length")
 scanner = parse_body.find("whilecursor<lengthandsource[cursor]!=10|cursor,length,source|:")
 scanner_increment = parse_body.find("cursor<-cursor+1", scanner)

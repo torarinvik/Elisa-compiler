@@ -82,9 +82,6 @@ root_only_contract = compact("""
 """)
 if root_only_contract not in cleaner:
     raise SystemExit("production path_clean no longer specifies exact cleaning of the root-only path")
-rooted_fact = compact("rooted: bool = path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH")
-if rooted_fact not in cleaner:
-    raise SystemExit("production path_clean no longer binds its rooted-path fact to the input prefix")
 output_start = compact("body: mutable darray[u8] = []")
 fallback_start = compact("if out.count == 0.usize():")
 if output_start not in cleaner or fallback_start not in cleaner:
@@ -99,7 +96,7 @@ expected_build = compact("""
     if path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH:
         out.push(ProjectSystemPathByte::ASCII_FORWARD_SLASH)
     for index in 0..<body.count |out, body, path|:
-        invariant not rooted or (
+        invariant not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
             out.count > 0.usize() and
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
         )
