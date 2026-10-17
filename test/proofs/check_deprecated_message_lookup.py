@@ -129,7 +129,13 @@ root_order = (
     "assertnames.count==messages.count",
     "table<-deprecated_call_walk(file.top_decls,names,messages,table)ifnames.count>0",
 )
-root_positions = [root_check.find(fragment) for fragment in root_order]
+root_positions = []
+root_cursor = 0
+for fragment in root_order:
+    position = root_check.find(fragment, root_cursor)
+    root_positions.append(position)
+    if position >= 0:
+        root_cursor = position + len(fragment)
 if any(position < 0 for position in root_positions) or root_positions != sorted(root_positions):
     raise SystemExit("top-level deprecated-call pass no longer establishes array parity before lookup traversal")
 
