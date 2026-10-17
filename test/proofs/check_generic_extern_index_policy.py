@@ -69,9 +69,7 @@ expected_scan = '''
 expected_contains = '''
 def contains(names: darray[sview]&, target_name: sview) -> bool:
     ensure result == contains_from(names, target_name, 0)
-    index: mutable usize = 0
-    while index < names.count |index, names, target_name|:
-        decreases names.count - index
+    for index in 0..<names.count |names, target_name|:
         invariant index <= names.count
         invariant contains_from(names, target_name, index) == contains_from(names, target_name, 0)
         assert contains_from(names, target_name, index) == (
@@ -81,10 +79,8 @@ def contains(names: darray[sview]&, target_name: sview) -> bool:
             assert contains_from(names, target_name, index)
             return true
         assert contains_from(names, target_name, index) == contains_from(names, target_name, index + 1.usize())
-        index <- index + 1.usize()
-        assert contains_from(names, target_name, index) == contains_from(names, target_name, 0)
-    assert index == names.count
-    assert contains_from(names, target_name, index) == false
+        assert contains_from(names, target_name, index + 1.usize()) == contains_from(names, target_name, 0)
+    assert contains_from(names, target_name, names.count) == false
     assert contains_from(names, target_name, 0) == false
     return false
 '''
