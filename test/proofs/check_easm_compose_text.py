@@ -105,6 +105,8 @@ required_span_fragments = (
     "while cursor <= value_length",
     "decreases value_length - cursor",
     "invariant cursor <= value_length",
+    "invariant values.len == close - base",
+    "invariant cursor <= close - base",
     "invariant start <= cursor",
     "invariant current >= 0",
     "invariant easm_compose_span_reference_from(values, base, close, start, cursor, current, wanted).valid == easm_compose_span_reference(text, wanted).valid",
