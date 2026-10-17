@@ -55,6 +55,15 @@ expected_model = '''
 ghost def message_of_from(names: darray[sview]&, messages: darray[sview]&, callee_name: sview, probe: usize, found_so_far: bool, message_so_far: sview) -> (found: bool, message: sview):
     requires names.count == messages.count and probe <= names.count
     decreases names.count - probe
+    ensure (probe == names.count) implies (result.found == found_so_far and result.message == message_so_far)
+    ensure (probe < names.count and names[probe] == callee_name) implies (
+        result.found == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).found and
+        result.message == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).message
+    )
+    ensure (probe < names.count and names[probe] != callee_name) implies (
+        result.found == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).found and
+        result.message == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).message
+    )
     return (found_so_far, message_so_far) if probe == names.count
     if names[probe] == callee_name:
         return message_of_from(names, messages, callee_name, probe + 1, true, messages[probe])

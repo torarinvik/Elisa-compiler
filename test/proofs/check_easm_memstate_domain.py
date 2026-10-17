@@ -40,22 +40,20 @@ lower_law = helper.split("ghost def join_min_obeys_greatest_lower_bound_law(", 1
 lower_law_compact = "".join(lower_law.split())
 if "requireslower<=leftandlower<=right" not in lower_law_compact or \
         "ensureresult==true" not in lower_law_compact or \
-        "minimum:i64=join_min(left,right)" not in lower_law_compact or \
-        "ifleft<right:assertminimum==leftreturnlower<=minimum" not in lower_law_compact or \
-        "assertminimum==rightreturnlower<=minimum" not in lower_law_compact or \
+        "returnlower<=(leftifleft<rightelseright)" not in lower_law_compact or \
+        "minimum:i64" in lower_law_compact or "assert" in lower_law_compact or \
         "EasmMemStateDomain::join_min_obeys_greatest_lower_bound_law(left,right,lower)" not in "".join(POSITIVE.read_text().split()):
-    raise SystemExit("the minimum-domain greatest-lower-bound theorem is no longer proved and consumed")
+    raise SystemExit("the minimum-domain greatest-lower-bound theorem is no longer a pure total expression or consumed")
 lub_theorem = helper.split("ghost def greatest_bound_obeys_least_upper_bound_law(", 1)[1].split(
     "\n\n        def read_well_typed(", 1
 )[0]
 lub_theorem_compact = "".join(lub_theorem.split())
 if "requiresleft<=upperandright<=upper" not in lub_theorem_compact or \
         "ensureresult==true" not in lub_theorem_compact or \
-        "maximum:i64=greatest_bound(left,right)" not in lub_theorem_compact or \
-        "ifleft>right:assertmaximum==leftreturnmaximum<=upper" not in lub_theorem_compact or \
-        "assertmaximum==rightreturnmaximum<=upper" not in lub_theorem_compact or \
+        "return(leftifleft>rightelseright)<=upper" not in lub_theorem_compact or \
+        "maximum:i64" in lub_theorem_compact or "assert" in lub_theorem_compact or \
         "EasmMemStateDomain::greatest_bound_obeys_least_upper_bound_law(left,right,upper)" not in "".join(POSITIVE.read_text().split()):
-    raise SystemExit("the max-domain least-upper-bound theorem is no longer proved and consumed by the source-linked suite")
+    raise SystemExit("the max-domain least-upper-bound theorem is no longer a pure total expression or consumed")
 
 memory = MEMORY.read_text()
 fact_bound_body = memory.split("ghost def easm_size_guard_fact_bound_spec(", 1)[1].split(
@@ -67,9 +65,25 @@ if 'return0ifEasmTextScan::find_spec(fact,"size>=")>=fact.len' not in fact_bound
     raise SystemExit("memory size facts no longer use the pure scanner and decimal specifications")
 lower_bound_body = memory.split("def easm_size_guard_lower_bound(", 1)[1].split("\n\n        def ", 1)[0]
 lower_bound_compact = "".join(lower_bound_body.split())
-if "ifvalue>greatest:greatest<-value" not in lower_bound_compact or \
+step_body = memory.split("def easm_size_guard_step(", 1)[1].split("\n\n        def ", 1)[0]
+step_compact = "".join(step_body.split())
+step_max = (
+    "ensureresult==((greatestifgreatest>easm_size_guard_fact_bound_spec(fact)"
+    "elseeasm_size_guard_fact_bound_spec(fact))if(greatestifgreatest>"
+    "easm_size_guard_fact_bound_spec(fact)elseeasm_size_guard_fact_bound_spec(fact))>0else0)"
+)
+if step_max not in step_compact or \
+        "ensureresult>=greatest" not in step_compact or \
+        "ensureresult>=easm_size_guard_fact_bound_spec(fact)" not in step_compact or \
+        'assertmarker==EasmTextScan::find_spec(fact,"size>=")' not in step_compact or \
+        "assertvalue==easm_size_guard_fact_bound_spec(fact)" not in step_compact or \
+        'value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():fact.len]))' not in step_compact or \
+        "candidate:i64=valueifvalue>greatestelsegreatest" not in step_compact or \
+        "returncandidateifcandidate>0else0" not in step_compact:
+    raise SystemExit("per-fact greatest update no longer proves exact max against the decimal specification")
+if "greatest<-easm_size_guard_step(facts[index],greatest)" not in lower_bound_compact or \
         "ensureresult>=0" not in lower_bound_compact or \
-        "forindexin0..<facts.count|facts,greatest|:" not in lower_bound_compact or \
+        "forindexin0..<facts.count|greatest|:" not in lower_bound_compact or \
         "invariantindex<=facts.count" not in lower_bound_compact or \
         "invariantgreatest>=0" not in lower_bound_compact or \
         "assertgreatest>=0" not in lower_bound_compact or \
@@ -89,11 +103,8 @@ processed_fact = (
 )
 if f"invariant(forallfact_indexin0..<index:{processed_fact}" not in lower_bound_compact:
     raise SystemExit("production size-fact fold no longer tracks its processed-prefix pure-spec invariant")
-if 'assertmarker==EasmTextScan::find_spec(fact,"size>=")' not in lower_bound_compact or \
-        "assertvalue==easm_size_guard_fact_bound_spec(fact)" not in lower_bound_compact or \
-        'value:i64=easm_parse_i64(easm_trim(fact[marker+7.usize():fact.len]))' not in lower_bound_compact or \
-        "assert(forallfact_indexin0..<(index+1.usize()):" not in lower_bound_compact:
-    raise SystemExit("runtime size-fact extraction no longer proves each loop step against its pure specification")
+if f"assert(forallfact_indexin0..<(index+1.usize()):{processed_fact}" not in lower_bound_compact:
+    raise SystemExit("production size-fact fold no longer surfaces the updated processed-prefix fact after its step")
 wrappers = {
     "easm_memstate_join_min": "EasmMemStateDomain::join_min(left, right)",
     "easm_memstate_read_well_typed": "EasmMemStateDomain::read_well_typed(need, known_min)",

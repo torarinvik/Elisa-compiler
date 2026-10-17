@@ -129,18 +129,13 @@ required_parse_steps = (
     "assertnotnegativeorposition>=1",
     "assertnotnegativeorvalue<=0",
     "assertnegativeorvalue>=0",
+    "assertnotvalidornegative==(text.len>0andtext[0]==ASCII_MINUS)",
+    "assertnotvalidor(foralldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE))",
     "ifvalid:assertdecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).validassertdecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
     "whilevalidandposition<text.len|position,text,value,valid|",
     "decreasestext.len-position",
-    "invariantnotvalidorposition<=text.len",
-    "invariantnotvalidorstart<text.len",
-    "invariantnegativeimpliesposition>=1",
-    "invariantnegativeimpliesvalue<=0",
-    "invariantnotnegativeimpliesvalue>=0",
     "start:usize=position",
-    "invariantnotvalidordecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
-    "invariantnotvalidordecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
-    "invariantnotvalidor(foralldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE))",
+    "invariant((notvalidorposition<=text.len)and(notvalidorstart<text.len)and(notvalidornegative==(text.len>0andtext[0]==ASCII_MINUS))and(negativeimpliesposition>=1)and(negativeimpliesvalue<=0)and(notnegativeimpliesvalue>=0)and(notvalidordecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid)and(notvalidordecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value)and(notvalidor(foralldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE))))",
     "ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-falsebreak",
     "append_negative_digit(value,digit)",
     "ifnotstep.valid:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-falsebreak",
@@ -148,10 +143,13 @@ required_parse_steps = (
     "assertstep.value<=0",
     "append_positive_digit(value,digit)",
     "assertstep.value>=0",
+    "assertnotnegativeorvalue<=0",
+    "assertnegativeorvalue>=0",
     "position<-position+1",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
-    "ifvalid:assertposition==text.lenassertdecimal_parse_reference_from(text,position,negative,value,position>start).validassertdecimal_parse_reference_from(text,position,negative,value,position>start).value==valueassertdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==value",
+    "assertnotvalidor(foralldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE))",
+    "ifvalid:assertposition==text.lenassertnegative==(text.len>0andtext[0]==ASCII_MINUS)assertnotnegativeorvalue<=0assertnegativeorvalue>=0assertforalldigit_indexin0..<text.len:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE)",
     "return(true,value)",
     "assertnotdecimal_parse_reference(text).valid",
     "assertdecimal_parse_reference(text).value==0",
@@ -317,9 +315,12 @@ if "break if byte <" in parser_body or "value <- value *" in parser_body:
     raise SystemExit("EASM parser bypasses strict digit validation or checked accumulation")
 if "value: i64 = easm_parse_i64(easm_trim(fact[marker + 7.usize():fact.len]))" not in memory_text:
     raise SystemExit("size-guard facts no longer use the hardened signed-decimal parser")
-size_bound_source = compact(function_section(memory_text, "easm_size_guard_lower_bound"))
-if "ifvalue>greatest:greatest<-value" not in size_bound_source:
-    raise SystemExit("size-guard facts no longer combine parsed values with the lower-bound maximum")
+size_bound_step_section = function_section(memory_text, "easm_size_guard_step")
+size_bound_step_source = "".join(size_bound_step_section.split())
+if "candidate:i64=valueifvalue>greatestelsegreatest" not in size_bound_step_source or \
+        "returncandidateifcandidate>0else0" not in size_bound_step_source or \
+        "ensureresult==(" not in size_bound_step_source:
+    raise SystemExit("size-guard facts no longer combine parsed values with the exact lower-bound maximum")
 unchecked_parse_source = compact(function_section(parser_text, "easm_parse_i64"))
 if "ensureresult==easm_parse_i64_spec(text)" not in unchecked_parse_source or \
         "parsed:(valid:bool,value:i64)=easm_parse_i64_checked(text)" not in unchecked_parse_source or \

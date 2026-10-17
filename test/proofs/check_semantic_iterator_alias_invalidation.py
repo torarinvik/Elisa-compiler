@@ -186,8 +186,12 @@ expected_module = {
     decreases alias_names.count - index
     ensure result.found == direct_target_found_from(alias_names, alias_targets, name, index)
     ensure result.found implies result.target == direct_target_value_from(alias_names, alias_targets, name, index)
-    return (false, sview("", 0, 0)) if index == alias_names.count
-    return (true, alias_targets[index]) if index < alias_names.count and index < alias_targets.count and alias_names[index] == name
+    if index == alias_names.count:
+        return (false, sview("", 0, 0))
+    if index < alias_names.count and index < alias_targets.count and alias_names[index] == name:
+        return (true, alias_targets[index])
+    assert direct_target_found_from(alias_names, alias_targets, name, index + 1) == direct_target_found_from(alias_names, alias_targets, name, index)
+    assert direct_target_value_from(alias_names, alias_targets, name, index + 1) == direct_target_value_from(alias_names, alias_targets, name, index)
     return direct_target_from(alias_names, alias_targets, name, index + 1)
 """,
     "direct_target": """def direct_target(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> (found: bool, target: sview):

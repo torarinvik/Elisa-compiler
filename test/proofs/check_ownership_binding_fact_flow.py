@@ -53,17 +53,34 @@ unknown_vector_contract = (
     "andfacts[fact_index].reachable==reachable"
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
+    "fact_count:usize=facts.count"
     "index:mutableusize=0"
-    "whileindex<facts.count|index,facts|:"
-    "decreasesfacts.count-index"
-    "invariantindex<=facts.count"
+    "whileindex<fact_count|index,facts|:"
+    "decreasesfact_count-index"
+    "invariantindex<=fact_count"
+    "invariantfacts.count==fact_count"
     "invariantforallfact_indexin0..<index:notfacts[fact_index].known"
     "andfacts[fact_index].reachable==reachable"
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
     "fact:OwnershipBindingFact=facts[index]"
     "facts[index]<-ownership_binding_unknown(fact.binding_id,reachable)"
+    "assertnotfacts[index].known"
+    "assertfacts[index].reachable==reachable"
+    "assertfacts[index].may_live==reachable"
+    "assertfacts[index].may_consumed==reachable"
     "index<-index+1"
+    "assertindex<=fact_count"
+    "assertforallfact_indexin0..<index:notfacts[fact_index].known"
+    "andfacts[fact_index].reachable==reachable"
+    "andfacts[fact_index].may_live==reachable"
+    "andfacts[fact_index].may_consumed==reachable"
+    "assertindex==fact_count"
+    "assertfacts.count==fact_count"
+    "assertforallfact_indexin0..<facts.count:notfacts[fact_index].known"
+    "andfacts[fact_index].reachable==reachable"
+    "andfacts[fact_index].may_live==reachable"
+    "andfacts[fact_index].may_consumed==reachable"
 )
 if unknown_vector_contract not in binding_flow_source:
     raise SystemExit("the ownership fallback no longer proves its all-rows loop invariant")
@@ -72,8 +89,8 @@ unknown_flow_source = compact(CONTROL_FLOW.read_text())
 unknown_flow_contract = (
     "defownership_flow_unknown(flow:mutableOwnershipFrontier&)->voidcan[Abort.Panic]:"
     "ensurenotflow.coverage_complete"
-    "flow.coverage_complete<-false"
     "ownership_bindings_unknown(&flow.facts,flow.reachable)"
+    "flow.coverage_complete<-false"
 )
 if unknown_flow_contract not in unknown_flow_source:
     raise SystemExit("ownership flow fallback no longer establishes its whole-array unknown invariant")

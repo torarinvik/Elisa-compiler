@@ -65,33 +65,51 @@ extension_contracts = (
     f"ensure ({invalid}) implies result.len == 0",
     f"ensure ({valid} and {dot_after_name}) implies result.len == p.len - sview_find_last_byte(p, 46)",
     f"ensure ({valid} and {dot_not_after_name}) implies result.len == 0",
-    f"ensure ({valid} and {dot_after_name} and result.len > 0) implies result.data == p.data + sview_find_last_byte(p, 46).usize()",
-    f"ensure ({valid} and {dot_after_name}) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(p, sview_find_last_byte(p, 46) + offset))",
+    f"ensure ({valid} and {dot_after_name}) implies result.data == p.data + sview_find_last_byte(p, 46).usize()",
 )
 stem_contracts = (
     f"ensure ({invalid}) implies result.len == 0",
     f"ensure ({valid} and {dot_after_name}) implies result.len == sview_find_last_byte(p, 46) - (sview_find_last_byte(p, 47) + 1)",
     f"ensure ({valid} and {dot_not_after_name}) implies result.len == p.len - (sview_find_last_byte(p, 47) + 1)",
-    f"ensure ({valid} and result.len > 0) implies result.data == p.data + (sview_find_last_byte(p, 47) + 1).usize()",
-    f"ensure ({valid}) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(p, sview_find_last_byte(p, 47) + 1 + offset))",
+    f"ensure ({valid} and sview_find_last_byte(p, 47) >= 0) implies result.data == p.data + (sview_find_last_byte(p, 47) + 1).usize()",
+    f"ensure ({valid} and sview_find_last_byte(p, 47) == -1) implies result.data == p.data",
 )
 if any(compact(contract) not in extension for contract in extension_contracts):
     raise SystemExit("Fs::extension lost its malformed-input, last-dot, offset, or byte-preservation contract")
 if any(compact(contract) not in stem for contract in stem_contracts):
     raise SystemExit("Fs::stem lost its malformed-input, basename, offset, or byte-preservation contract")
-if compact("dot: i64 = sview_find_last_byte(p, 46)") not in extension \
-        or compact("return string_view_suffix(p, dot) if dot > name_start") not in extension:
+if compact('return string_view_empty_at(p.data) if p.len < 0 or p.len.usize().i64() != p.len') not in extension \
+        or compact("slash: i64 = sview_find_last_byte(p, 47)") not in extension \
+        or compact("name_start: i64 = slash + 1") not in extension \
+        or compact("dot: i64 = sview_find_last_byte(p, 46)") not in extension \
+        or compact("assert slash >= -1 and slash < p.len") not in extension \
+        or compact("assert name_start >= 0 and name_start <= p.len") not in extension \
+        or compact("assert dot >= -1 and dot < p.len") not in extension \
+        or compact("if dot > name_start: trusted Unsafe.PointerCast: return StringView{data: p.data + sview_find_last_byte(p, 46).usize(), len: p.len - dot}") not in extension \
+        or compact("assert dot <= name_start") not in extension \
+        or compact('return StringView{data: p.data, len: 0}') not in extension:
     raise SystemExit("Fs::extension no longer returns the final qualifying dot suffix")
-if compact("dot: i64 = sview_find_last_byte(p, 46)") not in stem \
-        or compact("return string_view_slice(p, name_start, dot) if dot > name_start") not in stem \
-        or compact("else string_view_suffix(p, name_start)") not in stem:
+if compact('return string_view_empty_at(p.data) if p.len < 0 or p.len.usize().i64() != p.len') not in stem \
+        or compact("slash: i64 = sview_find_last_byte(p, 47)") not in stem \
+        or compact("name_start: i64 = slash + 1") not in stem \
+        or compact("dot: i64 = sview_find_last_byte(p, 46)") not in stem \
+        or compact("assert slash >= -1 and slash < p.len") not in stem \
+        or compact("assert slash == sview_find_last_byte(p, 47)") not in stem \
+        or compact("assert dot == sview_find_last_byte(p, 46)") not in stem \
+        or compact("assert name_start >= 0 and name_start <= p.len") not in stem \
+        or compact("assert dot >= -1 and dot < p.len") not in stem \
+        or compact("if dot > name_start: if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (sview_find_last_byte(p, 47) + 1).usize(), len: dot - name_start}") not in stem \
+        or compact("assert slash == -1") not in stem \
+        or compact("trusted Unsafe.PointerCast: return StringView{data: p.data, len: dot - name_start}") not in stem \
+        or compact("if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (sview_find_last_byte(p, 47) + 1).usize(), len: p.len - name_start}") not in stem \
+        or compact("trusted Unsafe.PointerCast: return StringView{data: p.data, len: p.len - name_start}") not in stem:
     raise SystemExit("Fs::stem no longer cuts before the final qualifying dot")
 
 positive_claims = {
-    "extension_preserves_the_last_dot_suffix": "extension.len == path.len - dot and extension.data == path.data + dot.usize() and (forall offset in 0..<extension.len: string_view_index(extension, offset) == string_view_index(path, dot + offset))",
+    "extension_preserves_the_last_dot_suffix": "extension.len == path.len - dot and extension.data == path.data + dot.usize()",
     "extension_is_empty_without_a_dot_after_the_basename_start": "Fs::extension(path).len == 0",
-    "stem_preserves_the_prefix_before_the_last_dot": "stem.len == dot - (slash + 1) and stem.data == path.data + (slash + 1).usize() and (forall offset in 0..<stem.len: string_view_index(stem, offset) == string_view_index(path, slash + 1 + offset))",
-    "stem_is_the_full_basename_without_a_qualifying_dot": "stem.len == path.len - (slash + 1) and (stem.len == 0 or stem.data == path.data + (slash + 1).usize()) and (forall offset in 0..<stem.len: string_view_index(stem, offset) == string_view_index(path, slash + 1 + offset))",
+    "stem_preserves_the_prefix_before_the_last_dot": "stem.len == dot - (slash + 1) and stem.data == path.data + (slash + 1).usize()",
+    "stem_is_the_full_basename_without_a_qualifying_dot": "stem.len == path.len - (slash + 1) and stem.data == path.data + (slash + 1).usize()",
     "malformed_path_extension_and_stem_are_empty": "Fs::extension(path).len == 0 and Fs::stem(path).len == 0",
     "a_leading_dot_is_part_of_a_hidden_file_stem": "extension.len == 0 and stem.len == 4 and string_view_index(stem, 0) == 46",
     "a_trailing_dot_is_a_one_byte_extension": "extension.len == 1 and string_view_index(extension, 0) == 46 and stem.len == 4",

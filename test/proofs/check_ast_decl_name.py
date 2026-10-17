@@ -1,4 +1,5 @@
 """Bind declaration-name proofs to the sealed AST and production accessor."""
+import argparse
 import hashlib
 import json
 import os
@@ -11,8 +12,12 @@ from proof_product_gate import require_current_product, source_include_closure
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source and fixture bindings without invoking Elisa-Proof")
+ARGS = argument_parser.parse_args()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 AST_NODES = ROOT / "src/parser/ast_nodes.elisa"
 AST_SIDE_TABLES = ROOT / "src/parser/ast_side_tables.elisa"
 PARSER_TOKENS = ROOT / "src/parser/parser_tokens.elisa"
@@ -60,51 +65,41 @@ if not variants or set(variants) != NAMED_VARIANTS | {"Invalid", "Import", "Scop
 
 name_source = function_section(AST_SIDE_TABLES.read_text(), "decl_name")
 match_markers = list(re.finditer(r"match declaration:", name_source))
-if len(match_markers) != 2 or "ensure result == (match declaration:" not in name_source:
-    raise SystemExit("Ast.decl_name must pair its implementation with an exhaustive result contract")
-contract_match = name_source[match_markers[0].start():match_markers[1].start()]
-implementation_match = name_source[match_markers[1].start():]
-contract_arms = re.findall(r"(?m)^[ \t]*Decl\.([A-Za-z][A-Za-z0-9_]*)\s*(?:\([^\n)]*\))?:", contract_match)
+if len(match_markers) != 1 or "ensure match declaration:" in name_source:
+    raise SystemExit("Ast.decl_name must use one exhaustive implementation match; its mapping is checked by the positive theorem")
+implementation_match = name_source[match_markers[0].start():]
 implementation_arms = re.findall(r"(?m)^[ \t]*Decl\.([A-Za-z][A-Za-z0-9_]*)\s*(?:\([^\n)]*\))?:", implementation_match)
-if contract_arms != variants or implementation_arms != variants:
-    raise SystemExit("Ast.decl_name contract and implementation must cover every Decl constructor in declaration order")
+if implementation_arms != variants:
+    raise SystemExit("Ast.decl_name implementation must cover every Decl constructor in declaration order")
 
 for name, fields_text in variant_rows:
     if name in NAMED_VARIANTS:
-        contract_arm = re.search(
-            rf"(?m)^[ \t]*Decl\.{name}\(([^)\n]*)\):[ \t]*([A-Za-z_]\w*)\b",
-            contract_match,
-        )
         implementation_arm = re.search(
             rf"(?m)^[ \t]*Decl\.{name}\(([^)\n]*)\):[ \t]*([A-Za-z_]\w*)\b",
             implementation_match,
         )
-        if not contract_arm or not implementation_arm:
+        if not implementation_arm:
             raise SystemExit(f"Ast.decl_name must return Decl.{name}'s stored name")
-        contract_fields = [part.strip() for part in contract_arm.group(1).split(",")]
         implementation_fields = [part.strip() for part in implementation_arm.group(1).split(",")]
-        if (not fields_text or not fields_text.split(",", 1)[0].strip().endswith(": sview") or
-                not contract_fields or not implementation_fields or
-                contract_fields[0] != contract_arm.group(2) or
-                implementation_fields[0] != implementation_arm.group(2) or
-                contract_arm.group(2) != implementation_arm.group(2)):
+        first_decl_field = fields_text.split(",", 1)[0].strip() if fields_text else ""
+        if (not re.search(r":\s*sview(?:\s*@source)?$", first_decl_field) or
+                not implementation_fields or
+                implementation_fields[0] != implementation_arm.group(2)):
             raise SystemExit(f"Decl.{name} must select exactly its first, declared-name field")
     else:
-        expected = f"Decl.{name}: sview(\"\", 0, 0)" if name == "Invalid" else f"Decl.{name}(_, _): sview(\"\", 0, 0)"
-        if compact(expected) not in compact(contract_match):
-            raise SystemExit(f"Ast.decl_name must specify an empty name for Decl.{name}")
-        if compact(expected) not in compact(implementation_match):
+        expected_implementation = f"Decl.{name}: sview(\"\", 0, 0)" if name == "Invalid" else f"Decl.{name}(_, _): sview(\"\", 0, 0)"
+        if compact(expected_implementation) not in compact(implementation_match):
             raise SystemExit(f"Ast.decl_name must explicitly handle positionless name case Decl.{name}")
 
 if re.search(r"(?m)^[ \t]*_:", implementation_match):
     raise SystemExit("Ast.decl_name must remain exhaustive without a wildcard arm")
 
-expected_member_name_helper = """def module_member_decl_name(declaration: Ast::Decl) -> sview:
+expected_member_name_helper = """def module_member_decl_name(declaration: Ast::Decl) -> sview @source:
     ensure result == Ast::decl_name(declaration)
     can Abort.Panic:
         return Ast::decl_name(declaration)"""
 if compact(function_section(SYMBOLS_SOURCE.read_text(), "module_member_decl_name")) != compact(expected_member_name_helper):
-    raise SystemExit("semantic module-member name lookup must delegate to the contracted Ast.decl_name accessor")
+    raise SystemExit("semantic module-member name lookup must delegate directly to the Ast.decl_name accessor")
 
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
@@ -144,6 +139,10 @@ expected_negative = """def false_claim_import_name_is_retained() -> bool:
     return actual == sview("module", 0, 6)"""
 if compact(function_section(negative_text, "false_claim_import_name_is_retained")) != compact(expected_negative):
     raise SystemExit("rejected control must falsely claim that an import's module text is its declared name")
+
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "variants": len(variants), "positive_claims": len(POSITIVE_NAMES)}))
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

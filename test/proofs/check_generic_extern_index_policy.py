@@ -69,20 +69,19 @@ expected_scan = '''
 expected_contains = '''
 def contains(names: darray[sview]&, target_name: sview) -> bool:
     ensure result == contains_from(names, target_name, 0)
-    for index in 0..<names.count |names, target_name|:
+    found: mutable bool = false
+    for index in 0..<names.count |found|:
         invariant index <= names.count
-        invariant contains_from(names, target_name, index) == contains_from(names, target_name, 0)
+        invariant contains_from(names, target_name, 0) == (found or contains_from(names, target_name, index))
         assert contains_from(names, target_name, index) == (
             names[index] == target_name or contains_from(names, target_name, index + 1.usize())
         )
         if names[index] == target_name:
-            assert contains_from(names, target_name, index)
-            return true
-        assert contains_from(names, target_name, index) == contains_from(names, target_name, index + 1.usize())
-        assert contains_from(names, target_name, index + 1.usize()) == contains_from(names, target_name, 0)
+            found <- true
+        assert contains_from(names, target_name, 0) == (found or contains_from(names, target_name, index + 1.usize()))
     assert contains_from(names, target_name, names.count) == false
-    assert contains_from(names, target_name, 0) == false
-    return false
+    assert contains_from(names, target_name, 0) == found
+    return found
 '''
 if "moduleSemanticGenericExternIndexPolicy:" not in compact(policy_text):
     raise SystemExit("generic-extern index policy module is missing")

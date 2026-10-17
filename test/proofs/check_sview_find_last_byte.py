@@ -54,25 +54,31 @@ def declarations(source: str) -> set[str]:
 
 runtime_text = RUNTIME.read_text()
 reverse_search = compact(function_section(runtime_text, "sview_find_last_byte"))
-required_contract = (
-    "ensure ((view.len < 0 or view.len.usize().i64() != view.len) implies result == -1) "
-    "and result >= -1 and (result >= 0 implies result < view.len "
-    "and string_view_index(view, result) == byte.i64() "
-    "and (forall later in result + 1..<view.len: string_view_index(view, later) != byte.i64())) "
-    "and ((view.len >= 0 and view.len.usize().i64() == view.len and result == -1) implies "
-    "(forall candidate in 0..<view.len: string_view_index(view, candidate) != byte.i64()))"
+required_contracts = (
+    "ensure (view.len < 0 or view.len.usize().i64() != view.len) implies result == -1",
+    "ensure result >= -1",
+    "ensure (result >= 0) implies result < view.len",
+    "ensure (result >= 0) implies string_view_index(view, result) == byte.i64()",
+    "ensure (result >= 0) implies (forall later in result + 1..<view.len: string_view_index(view, later) != byte.i64())",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result == -1) implies (forall candidate in 0..<view.len: string_view_index(view, candidate) != byte.i64())",
 )
-if compact(required_contract) not in reverse_search:
+if any(compact(contract) not in reverse_search for contract in required_contracts):
     raise SystemExit("reverse byte search lost its sentinel, match, maximality, or absence contract")
 
 filename = compact(function_section(runtime_text, "filename"))
 required_filename_contract = (
     "ensure (p.len >= 0 and p.len.usize().i64() == p.len) implies "
-    "(result.len == p.len - (sview_find_last_byte(p, 47) + 1) "
-    "and (result.len == 0 or result.data == p.data + (sview_find_last_byte(p, 47) + 1).usize()))"
+    "result.len == p.len - (sview_find_last_byte(p, 47) + 1)"
 )
 if compact(required_filename_contract) not in filename \
-        or compact("return string_view_suffix(p, slash + 1)") not in filename:
+        or compact("ensure (p.len >= 0 and p.len.usize().i64() == p.len and sview_find_last_byte(p, 47) >= 0) implies result.data == p.data + (sview_find_last_byte(p, 47) + 1).usize()") not in filename \
+        or compact("ensure (p.len >= 0 and p.len.usize().i64() == p.len and sview_find_last_byte(p, 47) == -1) implies result.data == p.data") not in filename \
+        or compact('return string_view_empty_at(p.data) if p.len < 0 or p.len.usize().i64() != p.len') not in filename \
+        or compact("slash: i64 = sview_find_last_byte(p, 47)") not in filename \
+        or compact("assert slash == sview_find_last_byte(p, 47)") not in filename \
+        or compact("if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (sview_find_last_byte(p, 47) + 1).usize(), len: p.len - (slash + 1)}") not in filename \
+        or compact("assert slash == -1") not in filename \
+        or compact("trusted Unsafe.PointerCast: return StringView{data: p.data, len: p.len - (slash + 1)}") not in filename:
     raise SystemExit("Fs.filename lost its last-separator suffix length or backing offset")
 
 parent = compact(function_section(runtime_text, "parent"))
@@ -83,7 +89,13 @@ required_parent_contract = (
     "or (sview_find_last_byte(p, 47) == -1 and result.len == 0))"
 )
 if compact(required_parent_contract) not in parent \
-        or compact('return string_view_prefix(p, slash) if slash >= 0 else sview("", 0, 0)') not in parent:
+        or compact('return string_view_empty_at(p.data) if p.len < 0 or p.len.usize().i64() != p.len') not in parent \
+        or compact("assert slash == sview_find_last_byte(p, 47)") not in parent \
+        or compact("assert slash >= -1 and slash < p.len") not in parent \
+        or compact('if slash >= 0: return string_view_empty_at(p.data) if slash == 0') not in parent \
+        or compact("return StringView{data: p.data, len: slash}") not in parent \
+        or compact("assert slash == -1") not in parent \
+        or compact('return string_view_empty_at(p.data)') not in parent:
     raise SystemExit("Fs.parent lost its pre-separator prefix or no-separator empty-view contract")
 
 required_loop_steps = (

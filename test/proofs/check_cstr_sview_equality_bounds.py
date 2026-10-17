@@ -19,6 +19,7 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 COLLECTIONS = ROOT / "elisacore_std/collections.elisa"
+COLLECTIONS_INTERFACE = ROOT / "elisacore_std/collections.elisai"
 POSITIVE = HERE / "cstr_sview_equality_bounds.elisa"
 NEGATIVE = HERE / "cstr_sview_equality_bounds_rejected.elisa"
 
@@ -50,59 +51,58 @@ def declarations(source: str) -> set[str]:
 
 
 collections_text = COLLECTIONS.read_text()
+if compact("extern ctx_cstr_eq_sview(text: cstr, expected_length: i64, view: sview) -> bool") not in compact(COLLECTIONS_INTERFACE.read_text()):
+    raise SystemExit("collection interface no longer carries the explicit expected C-string extent")
 compare = compact(function_section(collections_text, "ctx_cstr_eq_sview"))
 contracts = (
     "ensure (view.len < 0 or view.len.usize().i64() != view.len) implies result == false",
-    "ensure text.len != view.len implies result == false",
-    "ensure result implies (view.len >= 0 and view.len.usize().i64() == view.len and text.len == view.len)",
-    "ensure (view.len == 0 and text.len == 0) implies result == true",
+    "ensure expected_length != view.len implies result == false",
+    "ensure result implies (view.len >= 0 and view.len.usize().i64() == view.len and expected_length == view.len)",
 )
 if any(compact(contract) not in compare for contract in contracts):
-    raise SystemExit("ctx_cstr_eq_sview lost its invalid-extent, length, or empty-input contract")
+    raise SystemExit("ctx_cstr_eq_sview lost its invalid-extent or expected-length contract")
 steps = (
     "false return if view.len < 0",
     "len: usize = view.len.usize()",
-    "text_len: i64 = text.len",
     "false return if len.i64() != view.len",
-    "false return if text_len != view.len",
-    "i: mutable usize = 0",
-    "while i < len:",
-    "decreases len - i",
-    "invariant i <= len",
-    "invariant i.i64().usize() == i",
-    "invariant len.i64() == view.len",
-    "invariant text_len == view.len",
+    "false return if expected_length != view.len",
+    "for i in 0..<len:",
     "view_byte: u8 = view[i].u8()",
     "text_byte: mutable u8 = 0",
     "trusted Unsafe.UncheckedIndex: text_byte <- text[i].u8()",
+    "false return if text_byte == 0",
     "false return if text_byte != view_byte",
-    "i <- i + 1.usize()",
-    "return true",
+    "terminator: mutable u8 = 1",
+    "trusted Unsafe.UncheckedIndex: terminator <- text[len].u8()",
+    "false return if terminator != 0",
 )
 positions = [compare.find(compact(step)) for step in steps]
-if any(position < 0 for position in positions) or positions != sorted(positions):
+if any(position < 0 for position in positions) or positions != sorted(positions) \
+        or compare.rfind(compact("return true")) <= positions[-1]:
     raise SystemExit("ctx_cstr_eq_sview lost its extent guards, bounded loop, or byte comparison")
-if "view.data[" in compare or "text[len]" in compare or "trustedUnsafe.UncheckedIndex:while" in compare:
-    raise SystemExit("ctx_cstr_eq_sview regressed to raw view reads, a one-past-end terminator read, or a trusted loop")
+if "view.data[" in compare or compare.count("text[len]") != 1 \
+        or compact("trusted Unsafe.UncheckedIndex: terminator <- text[len].u8()") not in compare \
+        or "trustedUnsafe.UncheckedIndex:while" in compare:
+    raise SystemExit("ctx_cstr_eq_sview regressed to raw view reads or lost its guarded C-string terminator check")
 
 positive_claims = {
-    "malformed_view_never_matches_a_cstr": "not ctx_cstr_eq_sview(text, view)",
-    "unequal_lengths_never_match": "not ctx_cstr_eq_sview(text, view)",
-    "a_reported_match_has_a_valid_equal_extent": "not ctx_cstr_eq_sview(text, view) or (view.len >= 0 and view.len.usize().i64() == view.len and text.len == view.len)",
-    "equal_empty_cstr_and_view_match": "ctx_cstr_eq_sview(text, view)",
+    "malformed_view_never_matches_a_cstr": "not ctx_cstr_eq_sview(text, expected_length, view)",
+    "unequal_lengths_never_match": "not ctx_cstr_eq_sview(text, expected_length, view)",
+    "a_reported_match_has_a_valid_equal_extent": "not ctx_cstr_eq_sview(text, expected_length, view) or (view.len >= 0 and view.len.usize().i64() == view.len and expected_length == view.len)",
+    "equal_empty_cstr_and_view_match": "ctx_cstr_eq_sview(empty_text, 0, view)",
 }
 positive_requires = {
-    "malformed_view_never_matches_a_cstr": "requires view.len < 0 or view.len.usize().i64() != view.len",
-    "unequal_lengths_never_match": "requires text.len != view.len",
-    "equal_empty_cstr_and_view_match": "requires text.len == 0 and view.len == 0",
+    "malformed_view_never_matches_a_cstr": "requires expected_length == text.len and (view.len < 0 or view.len.usize().i64() != view.len)",
+    "unequal_lengths_never_match": "requires expected_length == text.len and expected_length != view.len",
+    "equal_empty_cstr_and_view_match": "requires view.len == 0",
 }
 negative_claims = {
-    "a_malformed_view_can_match_a_cstr": "ctx_cstr_eq_sview(text, view)",
-    "unequal_lengths_can_match": "ctx_cstr_eq_sview(text, view)",
+    "a_malformed_view_can_match_a_cstr": "ctx_cstr_eq_sview(text, expected_length, view)",
+    "unequal_lengths_can_match": "ctx_cstr_eq_sview(text, expected_length, view)",
 }
 negative_requires = {
-    "a_malformed_view_can_match_a_cstr": "requires view.len < 0 or view.len.usize().i64() != view.len",
-    "unequal_lengths_can_match": "requires text.len != view.len",
+    "a_malformed_view_can_match_a_cstr": "requires expected_length == text.len and (view.len < 0 or view.len.usize().i64() != view.len)",
+    "unequal_lengths_can_match": "requires expected_length == text.len and expected_length != view.len",
 }
 for path, claims, requirements, label in (
     (POSITIVE, positive_claims, positive_requires, "positive"),
@@ -118,8 +118,7 @@ for path, claims, requirements, label in (
         section = compact(function_section(fixture, name))
         if compact("ensure result == true") not in section \
                 or compact(claim) not in section \
-                or (name in requirements and compact(requirements[name]) not in section) \
-                or compact("ctx_cstr_eq_sview(text, view)") not in section:
+                or (name in requirements and compact(requirements[name]) not in section):
             raise SystemExit(f"{label} C-string/StringView theorem {name} lost its claim or source binding")
 
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
@@ -143,7 +142,7 @@ provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
-    HERE / "proof_product_gate.py", COLLECTIONS, POSITIVE, NEGATIVE, *source_closure,
+    HERE / "proof_product_gate.py", COLLECTIONS, COLLECTIONS_INTERFACE, POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

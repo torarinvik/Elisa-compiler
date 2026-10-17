@@ -80,32 +80,29 @@ for name, required in contracts.items():
 
 for name, required in {
     "arena_dict_find_index": (
-        "while probed < m.capacity:",
-        "decreases m.capacity - probed",
-        "invariant probed <= m.capacity",
+        "for _ in 0..<m.capacity:",
         "invariant slot < m.capacity",
         "invariant insert_slot == m.capacity or insert_slot < m.capacity",
         "if insert_slot != m.capacity: assert insert_slot < m.capacity",
     ),
     "arena_set_find_index": (
-        "while probed < s.capacity:",
-        "decreases s.capacity - probed",
-        "invariant probed <= s.capacity",
+        "for _ in 0..<s.capacity:",
         "invariant slot < s.capacity",
         "invariant insert_slot == s.capacity or insert_slot < s.capacity",
         "if insert_slot != s.capacity: assert insert_slot < s.capacity",
     ),
     "arena_dict_find_cstr_view_index": (
-        "while remaining > 0:",
-        "decreases remaining",
-        "invariant remaining <= capacity",
-        "invariant slot < capacity",
-        "invariant insert_slot == capacity or insert_slot < capacity",
+        "for probe in 0..<capacity:",
+        "slot: usize = start_slot + probe if probe < wrap_at else probe - wrap_at",
+        "assert slot < capacity",
+        "break if items[slot].state == COLLECTION_BUCKET_EMPTY",
+        "if items[slot].state == COLLECTION_BUCKET_OCCUPIED: candidate_text: cstr = items[slot].key if ctx_cstr_eq_sview(candidate_text, key.len, key): assert slot < m.capacity return DictProbeResult{index: slot, found: true}",
+        "for probe in 0..<capacity: slot: usize = start_slot + probe if probe < wrap_at else probe - wrap_at assert slot < capacity if items[slot].state == COLLECTION_BUCKET_TOMBSTONE or items[slot].state == COLLECTION_BUCKET_EMPTY: return DictProbeResult{index: slot, found: false}",
     ),
 }.items():
     section = compact(function_section(source, name))
     if any(compact(fragment) not in section for fragment in required):
-        raise SystemExit(f"{name} lost a finite-loop, slot-bound, or tombstone-candidate invariant")
+        raise SystemExit(f"{name} lost a finite-loop, slot-bound, or tombstone-candidate check")
 
 positive_claims = {
     "dictionary_find_index_stays_within_positive_capacity": "probe.index < m.capacity",

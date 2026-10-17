@@ -90,12 +90,8 @@ def requires_declared_key_spelling_check(key_spelling: sview) -> bool:
 '''
 expected_display = '''
 def diagnostic_spelling(declared_spelling: sview) -> sview:
-    ensure when declared_spelling:
-        "dstr" -> result == "darray[u8]"
-        _ -> result == declared_spelling
-    return match declared_spelling:
-        "dstr": "darray[u8]"
-        _: declared_spelling
+    ensure result == ("darray[u8]" if declared_spelling == "dstr" else declared_spelling)
+    return "darray[u8]" if declared_spelling == "dstr" else declared_spelling
 '''
 if "moduleSemanticRuntimeDictKeyPolicy:" not in compact(policy_text):
     raise SystemExit("runtime dictionary-key policy module is missing")

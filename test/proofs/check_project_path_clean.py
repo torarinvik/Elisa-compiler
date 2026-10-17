@@ -95,16 +95,45 @@ expected_build = compact("""
     out: mutable darray[u8] = []
     if path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH:
         out.push(ProjectSystemPathByte::ASCII_FORWARD_SLASH)
+    assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+        out.count > 0.usize() and
+        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    )
     for index in 0..<body.count |out, body, path|:
         invariant not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
             out.count > 0.usize() and
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
         )
+        assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+            out.count > 0.usize() and
+            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+        )
         out.push(body[index])
+        assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+            out.count > 0.usize() and
+            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+        )
+    assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+        out.count > 0.usize() and
+        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    )
 """)
 if build != expected_build:
     raise SystemExit("path_clean root-preserving output loops changed or gained a root-mutating operation")
-if compact("if out.count == 0.usize(): out.push(46) return out") not in cleaner:
+if compact("""
+    if out.count == 0.usize():
+        out.push(46)
+    assert (path.count != 0.usize()) or (out.count == 1.usize() and out[0.usize()] == 46)
+    assert not (path.count == 1.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+        out.count == 1.usize() and
+        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    )
+    assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+        out.count > 0.usize() and
+        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    )
+    return out
+""") not in cleaner:
     raise SystemExit("path_clean no longer uses the relative empty-path fallback")
 for fragment in (
     'include "./project_paths.elisa"',

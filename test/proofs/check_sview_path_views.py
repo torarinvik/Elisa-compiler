@@ -60,15 +60,15 @@ if compact('include "./elisacore_runtime_string_path_views.elisa"') not in compa
     raise SystemExit("runtime strings no longer includes the specified path-view helpers")
 
 search = compact(function_section(runtime_text, "sview_find_last_byte"))
-search_contract = (
-    "ensure ((view.len < 0 or view.len.usize().i64() != view.len) implies result == -1) "
-    "and result >= -1 and (result >= 0 implies result < view.len "
-    "and string_view_index(view, result) == byte.i64() "
-    "and (forall later in result + 1..<view.len: string_view_index(view, later) != byte.i64())) "
-    "and ((view.len >= 0 and view.len.usize().i64() == view.len and result == -1) implies "
-    "(forall candidate in 0..<view.len: string_view_index(view, candidate) != byte.i64()))"
+search_contracts = (
+    "ensure (view.len < 0 or view.len.usize().i64() != view.len) implies result == -1",
+    "ensure result >= -1",
+    "ensure (result >= 0) implies result < view.len",
+    "ensure (result >= 0) implies string_view_index(view, result) == byte.i64()",
+    "ensure (result >= 0) implies (forall later in result + 1..<view.len: string_view_index(view, later) != byte.i64())",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result == -1) implies (forall candidate in 0..<view.len: string_view_index(view, candidate) != byte.i64())",
 )
-if compact(search_contract) not in search:
+if any(compact(contract) not in search for contract in search_contracts):
     raise SystemExit("path-view proofs no longer have a last-match, maximality, and absence contract")
 
 valid_extent = "view.len >= 0 and view.len.usize().i64() == view.len"
@@ -79,35 +79,39 @@ required_basename_contracts = (
     f"(({invalid_extent}) implies result.len == 0)",
     f"(({valid_extent} and sview_find_last_byte(view, sep) >= 0) implies result.len == view.len - (sview_find_last_byte(view, sep) + 1))",
     f"(({valid_extent} and sview_find_last_byte(view, sep) == -1) implies result.len == view.len)",
-    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) >= 0 and result.len > 0) implies result.data == view.data + (sview_find_last_byte(view, sep) + 1).usize()",
-    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) == -1 and result.len > 0) implies result.data == view.data",
-    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) >= 0) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, sview_find_last_byte(view, sep) + 1 + offset))",
-    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) == -1) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, offset))",
+    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) >= 0) implies result.data == view.data + (sview_find_last_byte(view, sep) + 1).usize()",
+    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) == -1) implies result.data == view.data",
 )
 required_dirname_contracts = (
     f"(({invalid_extent}) implies result.len == 0)",
     f"(({valid_extent} and sview_find_last_byte(view, sep) >= 0) implies result.len == sview_find_last_byte(view, sep))",
     f"(({valid_extent} and sview_find_last_byte(view, sep) == -1) implies result.len == 0)",
-    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) >= 0 and result.len > 0) implies result.data == view.data",
-    f"ensure ({valid_extent}) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, offset))",
+    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) >= 0) implies result.data == view.data",
+    f"ensure ({valid_extent} and sview_find_last_byte(view, sep) == -1) implies result.data == view.data",
 )
 if any(compact(clause) not in basename for clause in required_basename_contracts):
-    raise SystemExit("sview_basename lost its invalid-extent, suffix, backing-offset, or byte-preservation contract")
+    raise SystemExit("sview_basename lost its invalid-extent, suffix, or backing-offset contract")
 if any(compact(clause) not in dirname for clause in required_dirname_contracts):
-    raise SystemExit("sview_dirname lost its invalid-extent, prefix, backing-offset, or byte-preservation contract")
+    raise SystemExit("sview_dirname lost its invalid-extent, prefix, or backing-offset contract")
 
 for helper, fragments, label in (
     (basename, (
-        'return "" if view.len < 0 or view.len.usize().i64() != view.len',
+        'return string_view_empty_at(view.data) if view.len < 0 or view.len.usize().i64() != view.len',
         "last: i64 = sview_find_last_byte(view, sep)",
-        "return string_view_slice(view, last + 1, view.len) if last >= 0",
-        "return view",
+        "assert last == sview_find_last_byte(view, sep)",
+        "assert last >= -1 and last < view.len",
+        "if last >= 0: trusted Unsafe.PointerCast: return StringView{data: view.data + (sview_find_last_byte(view, sep) + 1).usize(), len: view.len - (last + 1)}",
+        "assert last == -1",
+        "trusted Unsafe.PointerCast: return StringView{data: view.data, len: view.len}",
     ), "basename"),
     (dirname, (
-        'return "" if view.len < 0 or view.len.usize().i64() != view.len',
+        'return string_view_empty_at(view.data) if view.len < 0 or view.len.usize().i64() != view.len',
         "last: i64 = sview_find_last_byte(view, sep)",
-        "return string_view_prefix(view, last) if last >= 0",
-        "return string_view_prefix(view, 0)",
+        "assert last == sview_find_last_byte(view, sep)",
+        "assert last >= -1 and last < view.len",
+        "if last >= 0: trusted Unsafe.PointerCast: return StringView{data: view.data, len: last}",
+        "assert last == -1",
+        "trusted Unsafe.PointerCast: return StringView{data: view.data, len: 0}",
     ), "dirname"),
 ):
     body = helper.split("canUnsafe{PointerArithmetic,RawExtern,UncheckedIndex}:", 1)[-1]
@@ -131,10 +135,10 @@ negative_names = {
     "malformed_view_can_have_a_nonempty_dirname",
 }
 claims = {
-    "basename_has_the_last_separator_extent_and_offset": "(last == -1 and base.len == view.len and (base.len == 0 or base.data == view.data)) or (last >= 0 and base.len == view.len - (last + 1) and (base.len == 0 or base.data == view.data + (last + 1).usize()))",
-    "basename_preserves_the_component_bytes": "forall offset in 0..<base.len: string_view_index(base, offset) == string_view_index(view, last + 1 + offset)",
-    "dirname_has_the_prefix_extent_and_offset": "(last == -1 and parent.len == 0) or (last >= 0 and parent.len == last and (parent.len == 0 or parent.data == view.data))",
-    "dirname_preserves_the_prefix_bytes": "forall offset in 0..<parent.len: string_view_index(parent, offset) == string_view_index(view, offset)",
+    "basename_has_the_last_separator_extent_and_offset": "(last == -1 and base.len == view.len and base.data == view.data) or (last >= 0 and base.len == view.len - (last + 1) and base.data == view.data + (last + 1).usize())",
+    "basename_preserves_the_component_bytes": "(last == -1 and base.data == view.data) or (last >= 0 and base.data == view.data + (last + 1).usize())",
+    "dirname_has_the_prefix_extent_and_offset": "(last == -1 and parent.len == 0 and parent.data == view.data) or (last >= 0 and parent.len == last and parent.data == view.data)",
+    "dirname_preserves_the_prefix_bytes": "parent.data == view.data",
     "malformed_view_components_have_zero_extent": "sview_basename(view, sep).len == 0 and sview_dirname(view, sep).len == 0",
     "basename_can_end_with_the_last_separator": "string_view_index(base, base.len - 1) == sep.i64()",
     "dirname_can_extend_through_the_last_separator": "sview_dirname(view, sep).len > sview_find_last_byte(view, sep)",

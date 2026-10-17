@@ -78,15 +78,34 @@ if MUL_1 * MUL_1_INV & MASK_64 != 1 or MUL_2 * MUL_2_INV & MASK_64 != 1:
 
 inverse_body = compact(function_section(collections_text, "ctx_unhash_u64"))
 inverse_steps = (
-    "undo_shift_31: u64 = hash ^ (hash >> 31) ^ (hash >> 62)",
-    "undo_multiply_2: u64 = undo_shift_31 * CTX_HASH_U64_INV_MUL_2",
-    "undo_shift_27: u64 = undo_multiply_2 ^ (undo_multiply_2 >> 27) ^ (undo_multiply_2 >> 54)",
-    "undo_multiply_1: u64 = undo_shift_27 * CTX_HASH_U64_INV_MUL_1",
-    "return undo_multiply_1 ^ (undo_multiply_1 >> 30) ^ (undo_multiply_1 >> 60)",
+    "ensure result == ctx_unhash_xor_30(ctx_unhash_mul_1(ctx_unhash_xor_27(ctx_unhash_mul_2(ctx_unhash_xor_31(hash)))))",
+    "return ctx_unhash_xor_30(ctx_unhash_mul_1(ctx_unhash_xor_27(ctx_unhash_mul_2(ctx_unhash_xor_31(hash)))))",
 )
 inverse_positions = [inverse_body.find(compact(step)) for step in inverse_steps]
 if any(position < 0 for position in inverse_positions) or inverse_positions != sorted(inverse_positions):
-    raise SystemExit("ghost inverse no longer reverses the hash stages in reverse order")
+    raise SystemExit("scalar inverse no longer reverses the hash stages in reverse order")
+for name, relation in (
+    ("ctx_unhash_xor_31", "ensure result == (value ^ (value >> 31) ^ (value >> 62))"),
+    ("ctx_unhash_xor_31", "ensure result ^ (result >> 31) == value"),
+    ("ctx_unhash_xor_27", "ensure result == (value ^ (value >> 27) ^ (value >> 54))"),
+    ("ctx_unhash_xor_27", "ensure result ^ (result >> 27) == value"),
+    ("ctx_unhash_xor_30", "ensure result == (value ^ (value >> 30) ^ (value >> 60))"),
+    ("ctx_unhash_xor_30", "ensure result ^ (result >> 30) == value"),
+    ("ctx_unhash_mul_1", "ensure result == value * CTX_HASH_U64_INV_MUL_1"),
+    ("ctx_unhash_mul_1", "ensure result * 0xbf58476d1ce4e5b9 == value"),
+    ("ctx_unhash_mul_2", "ensure result == value * CTX_HASH_U64_INV_MUL_2"),
+    ("ctx_unhash_mul_2", "ensure result * 0x94d049bb133111eb == value"),
+):
+    if compact(relation) not in compact(function_section(collections_text, name)):
+        raise SystemExit(f"{name} lost its one-round inverse contract")
+for name, cutpoints in (
+    ("ctx_unhash_xor_31", ("assert first_shift >> 31 == second_shift", "assert second_shift >> 31 == 0", "assert candidate >> 31 == shifted_candidate", "assert candidate ^ shifted_candidate == value", "assert candidate ^ (candidate >> 31) == value", "assert candidate == (value ^ (value >> 31) ^ (value >> 62))")),
+    ("ctx_unhash_xor_27", ("assert first_shift >> 27 == second_shift", "assert second_shift >> 27 == 0", "assert candidate >> 27 == shifted_candidate", "assert candidate ^ shifted_candidate == value", "assert candidate ^ (candidate >> 27) == value", "assert candidate == (value ^ (value >> 27) ^ (value >> 54))")),
+    ("ctx_unhash_xor_30", ("assert first_shift >> 30 == second_shift", "assert second_shift >> 30 == 0", "assert candidate >> 30 == shifted_candidate", "assert candidate ^ shifted_candidate == value", "assert candidate ^ (candidate >> 30) == value", "assert candidate == (value ^ (value >> 30) ^ (value >> 60))")),
+):
+    section = compact(function_section(collections_text, name))
+    if any(compact(cutpoint) not in section for cutpoint in cutpoints):
+        raise SystemExit(f"{name} lost its one-round XOR proof cutpoints")
 
 positive_claims = {
     "inverse_multipliers_are_units_modulo_64_bits": "0xbf58476d1ce4e5b9 * CTX_HASH_U64_INV_MUL_1 == 1 and 0x94d049bb133111eb * CTX_HASH_U64_INV_MUL_2 == 1",

@@ -70,6 +70,15 @@ def function_section(source: str, name: str) -> str:
 source_text = SOURCE.read_text()
 source_compact = compact(source_text)
 environment_text = ENV.read_text()
+find_byte = compact(function_section(source_text, "find_byte"))
+if not all(compact(fragment) in find_byte for fragment in (
+    "def find_byte(text:sview,needle:u8)->usize:",
+    "ensure result <= text.len",
+    "ensure result == text.len or text[result] == needle",
+    "ensure (forall candidate in 0..<result: text[candidate] != needle)",
+    "ensure result == find_byte_spec(text, needle)",
+)):
+    raise SystemExit("runtime byte search no longer exposes its exact ghost-search result")
 trim_bounds_spec = compact(function_section(source_text, "trim_bounds_spec"))
 if not all(fragment in trim_bounds_spec for fragment in (
     "ghostdeftrim_bounds_spec(text:sview)",
@@ -87,6 +96,16 @@ if not all(fragment in trim_bounds_spec_from for fragment in (
     "return(first,trim_end_spec(text,first,text.len))",
 )):
     raise SystemExit("ghost trim bounds helper no longer shares the leading-trim endpoint")
+trim_spec = compact(function_section(source_text, "trim_spec"))
+if not all(fragment in trim_spec for fragment in (
+    "ghostdeftrim_spec(text:sview)->sview:",
+    "ensuretext.len<0impliesresult.len==0",
+    "ensureresult.len>=0",
+    "ensuretext.len>=0impliesresult.len<=text.len",
+    "return\"\"iftext.len<0",
+    "returntext[trim_bounds_spec(text).start:trim_bounds_spec(text).end]",
+)):
+    raise SystemExit("ghost trim view no longer exposes a total bounded-length contract")
 for spec_name in ("find_from_spec", "find_spec"):
     if "ensureresult<=text.len" not in compact(function_section(source_text, spec_name)):
         raise SystemExit(f"ghost {spec_name} no longer exposes the bounded search-result fact")
@@ -200,36 +219,38 @@ def find(text: sview, needle: sview) -> usize:
         needle.len > text.len - candidate or
         text[candidate:candidate + needle.len] != needle
     )
-    text_length: usize = text.len
-    needle_length: usize = needle.len
-    assert text_length == text.len
-    assert needle_length == needle.len
     if needle.len == 0 or text.len < needle.len:
         return text.len
     assert needle.len > 0 and needle.len <= text.len
-    assert needle_length > 0 and needle_length <= text_length
-    search_limit: usize = text_length - needle_length + BYTE_INDEX_STEP
-    assert search_limit <= text_length
+    search_limit: usize = text.len - needle.len + BYTE_INDEX_STEP
+    assert search_limit <= text.len
     index: mutable usize = 0
-    while index < search_limit |index, search_limit, text, needle, needle_length, text_length|:
+    while index < search_limit |index, search_limit, text, needle|:
         decreases search_limit - index
         invariant index <= search_limit
-        invariant index == 0 or (forall candidate in 0..<index:
-            candidate <= text_length - needle_length and
-            needle_length <= text_length - candidate and
-            text[candidate:candidate + needle_length] != needle
-        )
-        assert index <= text_length - needle_length
+        invariant forall candidate in 0..<index:
+            candidate <= text.len - needle.len and
+            text[candidate:candidate + needle.len] != needle
         assert index <= text.len - needle.len
-        if text[index:index + needle_length] == needle:
-            assert needle.len > 0 and needle.len <= text.len
-            assert needle_length > 0 and needle_length <= text_length
+        assert index + needle.len <= text.len
+        if text[index:index + needle.len] == needle:
+            assert index < text.len
             assert index <= text.len - needle.len
+            assert text[index:index + needle.len] == needle
+            assert needle.len == 0 or text.len < needle.len or (forall candidate in 0..<index:
+                needle.len > text.len - candidate or
+                text[candidate:candidate + needle.len] != needle
+            )
             return index
+        else:
+            assert text[index:index + needle.len] != needle
+            assert (forall candidate in 0..<(index + BYTE_INDEX_STEP):
+                candidate <= text.len - needle.len and
+                text[candidate:candidate + needle.len] != needle
+            )
         index <- index + BYTE_INDEX_STEP
     assert index == search_limit
-    assert (forall candidate in 0..<text.len:
-        needle.len == 0 or
+    assert needle.len == 0 or text.len < needle.len or (forall candidate in 0..<text.len:
         needle.len > text.len - candidate or
         text[candidate:candidate + needle.len] != needle
     )
