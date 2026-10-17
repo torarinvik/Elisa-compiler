@@ -242,6 +242,9 @@ if any(compact(fragment) not in reference_at_offset_body for fragment in (
 reference_at_bounds_body = compact(function_section(text_source, "easm_compose_span_reference_at_bounds"))
 if compact("ensure wanted < 0 implies not result.valid") not in reference_at_bounds_body:
     raise SystemExit("recursive span base case lost its negative-index invalidity contract")
+reference_from_body = compact(function_section(text_source, "easm_compose_span_reference_from"))
+if compact("ensure wanted < current implies not result.valid") not in reference_from_body:
+    raise SystemExit("recursive span model lost its below-current invalidity contract")
 trimmed_span_body = compact(function_section(text_source, "easm_compose_trimmed_span"))
 if any(compact(fragment) not in trimmed_span_body for fragment in (
     "ghost def easm_compose_trimmed_span(",
