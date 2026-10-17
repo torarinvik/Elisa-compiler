@@ -120,11 +120,12 @@ required_parse_contracts = (
     "text[digit_index]<=ASCII_DIGIT_NINE",
 )
 required_parse_steps = (
-    "valid:mutablebool=text.len>0andtext.len.usize().i64()==text.len",
+    "valid:bool=text.len>0andtext.len.usize().i64()==text.len",
+    "ifnotvalid:return(false,0)",
     "position:mutableusize=0",
     "ifvalid:iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:position<-1",
     "negative:bool=position==1",
-    "ifvalidandtext.len==1andnegative:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-false",
+    "ifvalidandtext.len==1andnegative:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0return(false,0)",
     "ifvalid:assertposition<text.lenassertstart<text.len",
     "assertnotnegativeorposition>=1",
     "assertnotnegativeorvalue<=0",
@@ -141,9 +142,9 @@ required_parse_steps = (
     "invariantnotvalidordecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "invariantnotvalidordecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
     "invariantnotvalidor(foralldigit_indexin0..<position:(negativeanddigit_index==0andtext[digit_index]==ASCII_MINUS)or(text[digit_index]>=ASCII_DIGIT_ZEROandtext[digit_index]<=ASCII_DIGIT_NINE))",
-    "ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-falsebreak",
+    "return(false,0)ifbyte<ASCII_DIGIT_ZEROorbyte>ASCII_DIGIT_NINE",
     "append_negative_digit(value,digit)",
-    "ifnotstep.valid:assertnotdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==0valid<-falsebreak",
+    "return(false,0)ifnotstep.valid",
     "assertstep.valid",
     "assertstep.value<=0",
     "append_positive_digit(value,digit)",
@@ -151,11 +152,8 @@ required_parse_steps = (
     "position<-position+1",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).valid==decimal_parse_reference(text).valid",
     "assertdecimal_parse_reference_from(text,position,negative,value,position>start).value==decimal_parse_reference(text).value",
-    "ifvalid:assertposition==text.lenassertdecimal_parse_reference_from(text,position,negative,value,position>start).validassertdecimal_parse_reference_from(text,position,negative,value,position>start).value==valueassertdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==value",
+    "assertposition==text.lenassertdecimal_parse_reference_from(text,position,negative,value,position>start).validassertdecimal_parse_reference_from(text,position,negative,value,position>start).value==valueassertdecimal_parse_reference(text).validassertdecimal_parse_reference(text).value==value",
     "return(true,value)",
-    "assertnotdecimal_parse_reference(text).valid",
-    "assertdecimal_parse_reference(text).value==0",
-    "return(false,0)",
 )
 if not all(fragment in parse_source for fragment in required_parse_contracts + required_parse_steps):
     raise SystemExit("signed parser lost its syntax, sign, failure, or loop-safety proof contract")
