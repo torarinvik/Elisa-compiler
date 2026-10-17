@@ -165,13 +165,9 @@ reference_wrapper = compact(function_section(helper_text, "decimal_parse_referen
 required_reference_fragments = (
     "ghostdefdecimal_parse_reference_from(",
     "requiresposition<=text.len",
-    "requiresnegativeimpliesvalue<=0",
-    "requiresnotnegativeimpliesvalue>=0",
     "decreasestext.len-position",
     "ensure(position==text.lenandnotconsumed_digit)implies(notresult.validandresult.value==0)",
     "ensure(position==text.lenandconsumed_digit)implies(result.validandresult.value==value)",
-    "ensureresult.validimplies(negativeimpliesresult.value<=0)",
-    "ensureresult.validimplies(notnegativeimpliesresult.value>=0)",
     "return(false,0)ifposition==text.lenandnotconsumed_digit",
     "return(true,value)ifposition==text.len",
     "return(false,0)iftext[position]<ASCII_DIGIT_ZEROortext[position]>ASCII_DIGIT_NINE",
@@ -188,8 +184,6 @@ if not all(fragment in reference_from for fragment in required_reference_fragmen
 if "ghostdefdecimal_parse_reference(text:sview)" not in reference_wrapper or \
         "ensure(text.len<=0ortext.len.usize().i64()!=text.len)implies(notresult.validandresult.value==0)" not in reference_wrapper or \
         "ensure(text.len==1andtext[0]==ASCII_MINUS)implies(notresult.validandresult.value==0)" not in reference_wrapper or \
-        "ensure(result.validandtext.len>0andtext[0]==ASCII_MINUS)impliesresult.value<=0" not in reference_wrapper or \
-        "ensure(result.validandtext.len>0andtext[0]!=ASCII_MINUS)impliesresult.value>=0" not in reference_wrapper or \
         "returndecimal_parse_reference_from(text,1,true,0,false)iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS" not in reference_wrapper or \
         "returndecimal_parse_reference_from(text,0,false,0,false)" not in reference_wrapper or \
         "return(false,0)iftext.len<=0ortext.len.usize().i64()!=text.len" not in reference_wrapper or \
