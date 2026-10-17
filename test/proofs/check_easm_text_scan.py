@@ -192,7 +192,7 @@ def find(text: sview, needle: sview) -> usize:
     while index < search_limit |index, search_limit, text, needle, needle_length, text_length|:
         decreases search_limit - index
         invariant index <= search_limit
-        invariant (forall candidate in 0..<index:
+        invariant index == 0 or (forall candidate in 0..<index:
             candidate <= text_length - needle_length and
             needle_length <= text_length - candidate and
             text[candidate:candidate + needle_length] != needle
