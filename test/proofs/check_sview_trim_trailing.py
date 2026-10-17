@@ -62,9 +62,9 @@ required_trim_contracts = (
 if any(compact(contract) not in trim for contract in required_trim_contracts):
     raise SystemExit("trailing trim lost its bounded maximal-prefix postcondition")
 required_loop_steps = (
-    'return sview("", 0, 0) if view.len < 0',
+    'return "" if view.len < 0',
     "view_len: usize = view.len.usize()",
-    'return sview("", 0, 0) if view_len.i64() != view.len',
+    'return "" if view_len.i64() != view.len',
     "assert view.len >= 0 and view_len.i64() == view.len",
     "hi: mutable i64 = view.len",
     "while hi > 0 and string_view_index(view, hi - 1) == byte.i64():",
