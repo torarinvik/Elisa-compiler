@@ -132,7 +132,13 @@ required_contracts = (
     "result.known implies table.ref_pos.count == table.ref_binding_ids.count",
     "result.known implies not table.ref_owner_index_valid or table.ref_owner_next.count == table.ref_pos.count",
     "result.known implies not table.ref_owner_index_valid or owner.value.usize() < table.ref_owner_heads.count",
-    "result.known implies exists candidate in 0..<table.ref_pos.count:",
+    "result.known implies exists candidate in 0..<table.ref_binding_ids.count:",
+    "ownership_lookup_candidate_matches(table, candidate, result.binding_id, owner, position)",
+    "def ownership_lookup_candidate_matches(",
+    "requires candidate < table.ref_pos.count and candidate < table.ref_binding_ids.count",
+    "indexed_singleton_exact: bool = ownership_lookup_indexed_singleton_exact(table, owner, position)",
+    "fallback_singleton_exact: bool = ownership_lookup_fallback_singleton_exact(table, owner, position)",
+    "assert ownership_lookup_candidate_matches(table, result_index, binding_id, owner, position)",
     "not result.known implies result.binding_id.owner.value == INVALID_DECL_ID_VALUE",
     "not result.known implies result.binding_id.serial == FIRST_BINDING_SERIAL",
     "table.ref_owner_heads[owner.value.usize()].usize() != SYMBOL_INDEX_ROW_NONE.usize()",
@@ -143,14 +149,13 @@ required_contracts = (
     "table.ref_owner_counts[owner.value.usize()] == 1.u32()",
     "table.ref_owner_observed_counts[owner.value.usize()] == 1.usize()",
     "if table.ref_owner_index_valid:",
-    "if not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
-    "and table.ref_pos.count == table.ref_binding_ids.count and table.ref_pos.count == 1 and table.ref_binding_ids.count == 1",
+    "if fallback_singleton_exact:",
+    "and table.ref_pos.count == 1 and table.ref_binding_ids.count == 1",
     "fallback_binding_id: BindingId = table.ref_binding_ids[0]",
     "return (true, fallback_binding_id)",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
     "result_binding_id: mutable BindingId = missing",
-    "result_binding_id <- table.ref_binding_ids[result_index]",
     "result_binding_id <- id",
     "result_binding_id <- missing",
     "lookup_valid: mutable bool = true",
@@ -161,21 +166,22 @@ required_contracts = (
     "if not lookup_valid:",
     "for step in 0..<expected_count",
     "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
-    "and (table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].offset != position.offset or table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].end_offset != position.end_offset)) implies not result.known",
-    "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
+    "ensure ownership_lookup_indexed_singleton_span_mismatch(table, owner, position) implies not result.known",
+    "ensure ownership_lookup_indexed_conflicting_rows(table, owner, position) implies not result.known",
+    "ensure ownership_lookup_indexed_matching_self_loop(table, owner, position) implies not result.known",
     "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
     "invariant step <= expected_count",
     "invariant (step == 0 implies row == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()].usize())",
     "invariant not found or result_index < table.ref_pos.count",
-    "invariant not found or table.ref_binding_ids[result_index].owner.value == owner.value",
-    "invariant not found or ownership_binding_ids_equal(result_binding_id, table.ref_binding_ids[result_index])",
+    "invariant not found or result_index < table.ref_binding_ids.count",
+    "invariant not found or ownership_lookup_candidate_matches(table, result_index, result_binding_id, owner, position)",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
 if not re.search(
-    r"if not lookup_valid:\s+found <- false\s+result_index <- 0\s+"
+    r"if not lookup_valid:\s+found <- false\s+result_index <- 0\s+result_binding_id <- missing\s+"
     r"if found:\s+assert owner\.value != INVALID_DECL_ID_VALUE\s+"
     r"assert owner\.value\.usize\(\) < table\.symbols\.count\s+"
     r"assert position\.end_offset > position\.offset\s+"
@@ -185,10 +191,7 @@ if not re.search(
     r"assert result_index < table\.ref_pos\.count\s+"
     r"assert result_index < table\.ref_binding_ids\.count\s+"
     r"binding_id: BindingId = result_binding_id\s+"
-    r"assert ownership_binding_ids_equal\(binding_id, table\.ref_binding_ids\[result_index\]\)\s+"
-    r"assert binding_id\.owner\.value == owner\.value\s+"
-    r"assert table\.ref_pos\[result_index\]\.offset == position\.offset\s+"
-    r"assert table\.ref_pos\[result_index\]\.end_offset == position\.end_offset\s+"
+    r"assert ownership_lookup_candidate_matches\(table, result_index, binding_id, owner, position\)\s+"
     r"return \(true, binding_id\)\s+"
     r"assert missing\.owner\.value == INVALID_DECL_ID_VALUE\s+"
     r"assert missing\.serial == FIRST_BINDING_SERIAL\s+"
@@ -196,17 +199,18 @@ if not re.search(
     lookup_text,
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
-lookup_lines = lookup_text.splitlines()
+lookup_function_text = lookup_text.split("def ownership_binding_at_position", 1)[1]
+lookup_lines = lookup_function_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
-if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 10:
+if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 8:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "contract_count": 15,
-                      "invariant_count": 10, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
+                      "invariant_count": 8, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, TABLE_SOURCE, POS_SOURCE,
