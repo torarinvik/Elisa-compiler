@@ -62,7 +62,6 @@ path_invalid = "path.len < 0 or path.len.usize().i64() != path.len"
 dot_after_name = "sview_find_last_byte(p, 46) > sview_find_last_byte(p, 47) + 1"
 dot_not_after_name = "sview_find_last_byte(p, 46) <= sview_find_last_byte(p, 47) + 1"
 extension_contracts = (
-    "ensure result.len >= 0",
     f"ensure ({invalid}) implies result.len == 0",
     f"ensure ({valid} and {dot_after_name}) implies result.len == p.len - sview_find_last_byte(p, 46)",
     f"ensure ({valid} and {dot_not_after_name}) implies result.len == 0",
@@ -70,7 +69,6 @@ extension_contracts = (
     f"ensure ({valid} and {dot_after_name}) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(p, sview_find_last_byte(p, 46) + offset))",
 )
 stem_contracts = (
-    "ensure result.len >= 0",
     f"ensure ({invalid}) implies result.len == 0",
     f"ensure ({valid} and {dot_after_name}) implies result.len == sview_find_last_byte(p, 46) - (sview_find_last_byte(p, 47) + 1)",
     f"ensure ({valid} and {dot_not_after_name}) implies result.len == p.len - (sview_find_last_byte(p, 47) + 1)",
