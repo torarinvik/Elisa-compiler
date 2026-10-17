@@ -1,5 +1,44 @@
 # Incremental compilation design
 
+## Active implementation objective (2026-10-17)
+
+Develop fast incremental compilation across ordinary edits, rather than waiting
+for the outstanding compiler proof diagnostics to reach zero. All development
+and measurements now run locally. The existing whole-object cache and narrow
+Global-authority experiment below are foundations, not completion of this goal.
+
+A local profiled bootstrap at core `a5f8100b` and stage1 `c2e8b8551e94`
+took 111.82 seconds wall time, 107.74 seconds user time, 32.17 seconds system
+time, and 5,091,180,544 bytes peak RSS. It stopped at semantic diagnostics;
+it establishes no optimization, emission, or linking baseline. The Go CPU profile
+sampled substantial allocation/clearing cost (`runtime.memclrNoHeapPointers`
+46.76%, `runtime.madvise` 14.84%). Child solver CPU is outside that profile.
+These are one-run observations, not a speedup claim. Raw local evidence is in
+`build/verification/incremental-baseline/` (ignored build artifacts).
+
+The implementation must make unchanged function analysis reusable. Start with
+tracked semantic queries and a versioned function-result representation; avoid
+persisting mutable AST, SymbolTable, or LLVM handles. Separate body identity from
+the callable interface, including contracts, inferred effects and borrows,
+constant evaluation, ghost definitions, generic specialization and inlining
+dependencies. Track lookup-set dependencies as well as selected callees: adding
+an overload or implementation can change an unchanged caller's resolution.
+
+Retained results must rebind diagnostics to current source anchors, replay
+errors as well as successful results, and invalidate on changes to options,
+compiler semantics, dependencies, target, or runtime inputs. Corruption and
+unsupported cases must take the clean path. Reuse must not require an entirely
+error-free translation unit. Persistent exact-query SMT reuse can be a supporting
+layer, but is not a replacement for semantic dependency tracking.
+
+Qualify cold, unchanged, independent body edit, callee body edit, signature or
+contract edit, constant edit, added/removed overload or implementation, include
+edit, source relocation, and corrupt-cache cases. Compare clean and incremental
+diagnostics, inferred results, native behavior and output policy. Report visited
+and reused functions plus phase time; measure with whole-object avoidance
+disabled when testing partial reuse. Keep backend artifact reuse as a subsequent
+boundary with explicit optimizer dependencies and cold/warm parity.
+
 ## Local implementation status (2026-10-11)
 
 Historical VAST timings are motivation, not the current local baseline;
