@@ -182,19 +182,7 @@ def find(text: sview, needle: sview) -> usize:
     needle_length: usize = needle.len
     assert text_length == text.len
     assert needle_length == needle.len
-    if needle.len == 0:
-        assert (forall candidate in 0..<text.len:
-            needle.len == 0 or
-            needle.len > text.len - candidate or
-            text[candidate:candidate + needle.len] != needle
-        )
-        return text.len
-    if text.len < needle.len:
-        assert (forall candidate in 0..<text.len:
-            needle.len == 0 or
-            needle.len > text.len - candidate or
-            text[candidate:candidate + needle.len] != needle
-        )
+    if needle.len == 0 or text.len < needle.len:
         return text.len
     assert needle.len > 0 and needle.len <= text.len
     assert needle_length > 0 and needle_length <= text_length
