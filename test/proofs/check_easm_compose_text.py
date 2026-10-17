@@ -188,13 +188,8 @@ if any(compact(fragment) not in reference_at_bounds_body for fragment in (
     "ensure result.valid implies result.start <= result.end",
     "ensure result.valid implies result.end <= text.len",
     "ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_at_offset(text, open, close_offset)) implies result.valid",
-    "values: sview = text[base:source_end]",
-    "argument_count: i64 = easm_compose_argument_count_spec(values)",
-    "comma_count: i64 = easm_compose_comma_count_from(values, 0.usize())",
-    "assert values.len == source_end - base",
-    "assert argument_count == easm_compose_span_argument_count_at_offset(text, open, close_offset)",
-    "assert wanted < 0 or wanted >= argument_count or wanted <= comma_count",
-    "return easm_compose_span_reference_from(values, base, source_end, 0, 0, 0, wanted)",
+    "return ComposeSpan{start: 0, end: 0, valid: false} if not (wanted >= 0 and wanted < easm_compose_span_argument_count_at_offset(text, open, close_offset))",
+    "return easm_compose_span_reference_from(text[open + 1.usize():open + close_offset], open + 1.usize(), open + close_offset, 0, 0, 0, wanted)",
 )):
     raise SystemExit("named compose-span bounds helper lost its source-slice contracts")
 close_offset_body = compact(function_section(text_source, "easm_compose_close_offset"))
@@ -220,6 +215,7 @@ if any(compact(fragment) not in span_count_at_offset_body for fragment in (
     "ensure open >= text.len implies result == 0",
     "ensure close_offset == 0 implies result == 0",
     "ensure (open < text.len and close_offset > 0) implies result == easm_compose_argument_count_spec(text[open + 1.usize():open + close_offset])",
+    "ensure (open < text.len and close_offset > 0) implies (result == 0 or result == 1 + easm_compose_comma_count_from(text[open + 1.usize():open + close_offset], 0.usize()))",
     "return 0 if open >= text.len",
     "return 0 if close_offset == 0",
     "return easm_compose_argument_count_spec(text[open + 1.usize():open + close_offset])",

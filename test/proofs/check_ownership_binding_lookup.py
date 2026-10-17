@@ -175,6 +175,7 @@ for contract in required_contracts:
         raise AssertionError(f"required source contract missing: {contract}")
 if not re.search(
     r"if not lookup_valid:\s+found <- false\s+result_index <- 0\s+"
+    r"result_binding_id <- missing\s+"
     r"if found:\s+assert owner\.value != INVALID_DECL_ID_VALUE\s+"
     r"assert owner\.value\.usize\(\) < table\.symbols\.count\s+"
     r"assert position\.end_offset > position\.offset\s+"
@@ -188,11 +189,14 @@ if not re.search(
     r"assert binding_id\.owner\.value == owner\.value\s+"
     r"assert table\.ref_pos\[result_index\]\.offset == position\.offset\s+"
     r"assert table\.ref_pos\[result_index\]\.end_offset == position\.end_offset\s+"
+    r"assert ownership_lookup_candidate_matches\(table, result_index, owner, position, binding_id\)\s+"
     r"return \(true, binding_id\)\s+"
     r"assert missing\.owner\.value == INVALID_DECL_ID_VALUE\s+"
     r"assert missing\.serial == FIRST_BINDING_SERIAL\s+"
+    r"assert not \(\s+.*?\s+\)\s+"
     r"return \(false, missing\)",
     lookup_text,
+    re.DOTALL,
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
 lookup_lines = lookup_text.splitlines()

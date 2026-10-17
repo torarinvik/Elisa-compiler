@@ -60,6 +60,20 @@ ghost def message_of_from(names: darray[sview]&, messages: darray[sview]&, calle
         return message_of_from(names, messages, callee_name, probe + 1, true, messages[probe])
     return message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far)
 '''
+expected_step = '''
+def message_of_step(names: darray[sview]&, messages: darray[sview]&, callee_name: sview, probe: usize, found_so_far: bool, message_so_far: sview) -> bool:
+    requires names.count == messages.count and probe < names.count
+    ensure message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).found == message_of_from(names, messages, callee_name, probe + 1, result, messages[probe] if names[probe] == callee_name else message_so_far).found
+    ensure message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).message == message_of_from(names, messages, callee_name, probe + 1, result, messages[probe] if names[probe] == callee_name else message_so_far).message
+    if names[probe] == callee_name:
+        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).found == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).found
+        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).message == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).message
+        return true
+    else:
+        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).found == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).found
+        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).message == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).message
+        return found_so_far
+'''
 expected_scan = '''
 def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: sview) -> (found: bool, message: sview):
     requires names.count == messages.count
@@ -72,24 +86,25 @@ def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: svi
     for probe in 0..<names.count |found, message|:
         invariant probe <= names.count
         invariant message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found and message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-        current_probe: usize = probe
-        current_found: bool = found
-        current_message: sview = message
-        assert current_probe < names.count
-        assert current_probe + 1 <= names.count
-        if names[current_probe] == callee_name:
-            found <- true
-            message <- messages[current_probe]
-        assert message_of_from(names, messages, callee_name, current_probe, current_found, current_message).found == message_of_from(names, messages, callee_name, current_probe + 1, found, message).found
-        assert message_of_from(names, messages, callee_name, current_probe, current_found, current_message).message == message_of_from(names, messages, callee_name, current_probe + 1, found, message).message
-        assert message_of_from(names, messages, callee_name, current_probe + 1, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-        assert message_of_from(names, messages, callee_name, current_probe + 1, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-    assert found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-    assert message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-    return (found, message)
+        assert probe < names.count
+        assert probe + 1 <= names.count
+        next_found: bool = message_of_step(names, messages, callee_name, probe, found, message)
+        next_message: sview = messages[probe] if names[probe] == callee_name else message
+        assert message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, probe + 1, next_found, next_message).found
+        assert message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, probe + 1, next_found, next_message).message
+        found <- next_found
+        message <- next_message
+        assert message_of_from(names, messages, callee_name, probe + 1, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
+        assert message_of_from(names, messages, callee_name, probe + 1, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
+    answer: (found: bool, message: sview) = (found, message)
+    assert answer.found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
+    assert answer.message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
+    return answer
 '''
 if compact(function_section(source_text, "message_of_from")) != compact(expected_model):
     raise SystemExit("recursive deprecated-message model changed without updating its proof")
+if compact(function_section(source_text, "message_of_step")) != compact(expected_step):
+    raise SystemExit("one-row deprecated-message step no longer preserves the recursive model")
 if compact(function_section(source_text, "message_of")) != compact(expected_scan):
     raise SystemExit("production deprecated-message loop no longer refines its recursive model")
 

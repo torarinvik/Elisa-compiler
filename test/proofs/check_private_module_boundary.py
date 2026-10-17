@@ -66,14 +66,15 @@ def prefix_matches(text: sview, prefix: sview) -> bool:
             index >= prefix.len or text[index] == prefix[index]
         )
     )
-    prefix_length: usize = prefix.len
-    false return if text.len < prefix_length
-    while index < prefix_length |index: usize = 0, text, prefix, prefix_length|:
-        decreases prefix_length - index
-        invariant index <= prefix_length and prefix_length <= text.len
+    false return if text.len < prefix.len
+    while index < prefix.len |index: usize = 0, text, prefix|:
+        decreases prefix.len - index
+        invariant index <= prefix.len and prefix.len <= text.len
         invariant forall checked in 0..<index: text[checked] == prefix[checked]
         false return if text[index] != prefix[index]
         index <- index + 1.usize()
+    assert forall checked in 0..<prefix.len:
+        text[checked] == prefix[checked]
     return true
 '''
 expected_within = '''

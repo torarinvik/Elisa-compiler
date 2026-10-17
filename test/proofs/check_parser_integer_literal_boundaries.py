@@ -33,7 +33,17 @@ if "def parse_int_literal_value(text: sview) -> i64:" not in source:
     raise AssertionError("production integer-literal decoder changed")
 reference_from = source.split("ghost def parse_int_literal_reference_from(", 1)[1].split("ghost def parse_int_literal_reference(", 1)[0]
 reference = source.split("ghost def parse_int_literal_reference(", 1)[1].split("def parse_int_literal_value(", 1)[0]
+step = source.split("def parse_int_literal_step(", 1)[1].split("def parse_int_literal_value(", 1)[0]
 decoder = source.split("def parse_int_literal_value(", 1)[1]
+for fragment in (
+        "requires index < text.len",
+        "ensure result.next_index > index and result.next_index <= text.len",
+        "ensure parse_int_literal_reference_from(text, index, is_hex, value) == parse_int_literal_reference_from(text, result.next_index, is_hex, result.next_value)",
+        "return (text.len, 0)",
+        "next_value: u64 = maximum if value > (maximum - digit.u64()) / base else value * base + digit.u64()",
+):
+    if fragment not in step:
+        raise AssertionError(f"production one-byte parser step lost its progress/refinement contract: {fragment}")
 for fragment in (
         "requires index <= text.len",
         "decreases text.len - index",
@@ -51,6 +61,7 @@ for fragment in (
         "while index < n |index, result, text, is_hex, n, start_index|:",
         "invariant index <= n",
         "invariant parse_int_literal_reference_from(text, index, is_hex, result) == parse_int_literal_reference_from(text, start_index, is_hex, 0)",
+        "assert result.i64() == parse_int_literal_reference(text)",
 ):
     if fragment not in decoder:
         raise AssertionError(f"production integer parser lost its source-level refinement: {fragment}")
@@ -64,9 +75,9 @@ if "return parse_int_literal_reference(text)" not in positive_text:
     raise AssertionError("universal proof no longer exposes the recursive reference fold")
 if 'include "./parser_integer_literal.elisa"' not in parser_source:
     raise AssertionError("production parser no longer includes the decoder")
-if ("result * base + digit.u64()" not in source or
-        "maximum if result > (maximum - digit.u64()) / base" not in source or
-        "base: u64 = 16 if is_hex else 10" not in source):
+if ("value * base + digit.u64()" not in step or
+        "maximum if value > (maximum - digit.u64()) / base" not in step or
+        "base: u64 = 16 if is_hex else 10" not in step):
     raise AssertionError("production decoder accumulation or overflow guard changed")
 for fragment in (
     "(is_hex and byte >= 97 and byte <= 102)",
@@ -74,7 +85,7 @@ for fragment in (
     "(byte - 97 + 10).i64()",
     "(byte - 65 + 10).i64()",
 ):
-    if fragment not in reference_from or fragment not in decoder:
+    if fragment not in reference_from or fragment not in step:
         raise AssertionError(f"production hexadecimal decoder lost a digit class or mapping: {fragment}")
 
 theorems = {

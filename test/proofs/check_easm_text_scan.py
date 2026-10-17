@@ -90,6 +90,29 @@ if not all(fragment in trim_bounds_spec_from for fragment in (
 for spec_name in ("find_from_spec", "find_spec"):
     if "ensureresult<=text.len" not in compact(function_section(source_text, spec_name)):
         raise SystemExit(f"ghost {spec_name} no longer exposes the bounded search-result fact")
+find_byte_from_spec = compact(function_section(source_text, "find_byte_from_spec"))
+if not all(fragment in find_byte_from_spec for fragment in (
+    "ghostdeffind_byte_from_spec(text:sview,needle:u8,index:usize)->usize:",
+    "requiresindex<=text.len",
+    "decreasestext.len-index",
+    "ensureresult>=index",
+    "ensureresult<=text.len",
+    "ensureresult==text.lenortext[result]==needle",
+    "forallcandidateinindex..<result:text[candidate]!=needle",
+    "returntext.lenifindex==text.len",
+    "returnindexiftext[index]==needle",
+    "returnfind_byte_from_spec(text,needle,index+BYTE_INDEX_STEP)",
+)):
+    raise SystemExit("recursive byte-search specification lost its bounded first-match contract")
+find_byte_spec = compact(function_section(source_text, "find_byte_spec"))
+if not all(fragment in find_byte_spec for fragment in (
+    "ghostdeffind_byte_spec(text:sview,needle:u8)->usize:",
+    "ensureresult<=text.len",
+    "ensureresult==text.lenortext[result]==needle",
+    "forallcandidatein0..<result:text[candidate]!=needle",
+    "returnfind_byte_from_spec(text,needle,0.usize())",
+)):
+    raise SystemExit("byte-search specification no longer exposes the first matching byte")
 if 'include "easm_text_scan.elisa"' not in environment_text:
     raise SystemExit("backend environment does not import the verified EASM text scanner")
 if environment_text.index('include "easm_text_scan.elisa"') > environment_text.index('include "easm_verify_provenance.elisa"'):

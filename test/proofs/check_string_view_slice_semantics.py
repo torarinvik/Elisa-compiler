@@ -58,10 +58,9 @@ positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 slice_body = compact(function_section(runtime_text, "string_view_slice"))
 required_slice_steps = (
-    'empty:sview=sview("",0,0)',
-    "returnemptyifview.len<0",
+    'return""ifview.len<0',
     "view_len:usize=view.len.usize()",
-    "returnemptyifview_len.i64()!=view.len",
+    'return""ifview_len.i64()!=view.len',
     "low:i64=startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0",
     "high:i64=view.lenifend<0elselowifend<lowelseendifend<=view.lenelseview.len",
     "assert0<=lowandlow<=view.len",
@@ -69,7 +68,7 @@ required_slice_steps = (
     "assertlow==(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)",
     "asserthigh==(view.lenifend<0else(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)ifend<(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)elseendifend<=view.lenelseview.len)",
     "asserthigh-low==((view.lenifend<0else(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)ifend<(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)elseendifend<=view.lenelseview.len)-(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0))",
-    "returnemptyifhigh==low",
+    'return""ifhigh==low',
     "trustedUnsafe.PointerCast:returnStringView{data:view.data+(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0).usize(),len:high-low}",
 )
 slice_positions = [slice_body.find(step) for step in required_slice_steps]
@@ -83,10 +82,33 @@ if any(compact(contract) not in slice_body for contract in required_slice_contra
     raise SystemExit("StringView slice lost its exact clamped length or backing-address contract")
 prefix_body = compact(function_section(runtime_text, "string_view_prefix"))
 suffix_body = compact(function_section(runtime_text, "string_view_suffix"))
-if "returnstring_view_slice(view,0,end)" not in prefix_body:
-    raise SystemExit("StringView prefix no longer delegates with a zero start and requested end")
-if "returnstring_view_slice(view,start,view.len)" not in suffix_body:
-    raise SystemExit("StringView suffix no longer delegates with the requested start and view length")
+required_prefix_steps = (
+    'return""ifview.len<0',
+    "view_len:usize=view.len.usize()",
+    'return""ifview_len.i64()!=view.len',
+    "high:i64=view.lenifend<0elseendifend<=view.lenelseview.len",
+    "assert0<=highandhigh<=view.len",
+    "asserthigh==(view.lenifend<0elseendifend<=view.lenelseview.len)",
+    'return""ifhigh==0',
+    "trustedUnsafe.PointerCast:returnStringView{data:view.data,len:high}",
+)
+prefix_positions = [prefix_body.find(step) for step in required_prefix_steps]
+if any(position < 0 for position in prefix_positions) or prefix_positions != sorted(prefix_positions):
+    raise SystemExit("StringView prefix lost its ordered validity, clamped extent, or bounded view construction")
+required_suffix_steps = (
+    'return""ifview.len<0',
+    "view_len:usize=view.len.usize()",
+    'return""ifview_len.i64()!=view.len',
+    "low:i64=startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0",
+    "assert0<=lowandlow<=view.len",
+    "assertlow==(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)",
+    "assertview.len-low==view.len-(startifstart>0andstart<=view.lenelseview.lenifstart>view.lenelse0)",
+    'return""iflow==view.len',
+    "trustedUnsafe.PointerCast:returnStringView{data:view.data+low.usize(),len:view.len-low}",
+)
+suffix_positions = [suffix_body.find(step) for step in required_suffix_steps]
+if any(position < 0 for position in suffix_positions) or suffix_positions != sorted(suffix_positions):
+    raise SystemExit("StringView suffix lost its ordered validity, clamped offset, or bounded view construction")
 
 model_texts = (
     compact(function_section(positive_text, "string_view_slice_bounds")),
