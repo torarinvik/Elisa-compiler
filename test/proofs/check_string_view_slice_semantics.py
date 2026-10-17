@@ -78,6 +78,7 @@ if any(position < 0 for position in slice_positions) or slice_positions != sorte
 required_slice_contracts = (
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == ((view.len if end < 0 else (start if start > 0 and start <= view.len else view.len if start > view.len else 0) if end < (start if start > 0 and start <= view.len else view.len if start > view.len else 0) else end if end <= view.len else view.len) - (start if start > 0 and start <= view.len else view.len if start > view.len else 0))",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
+    "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies (forall offset in 0..<result.len: string_view_index(result, offset) == string_view_index(view, (start if start > 0 and start <= view.len else view.len if start > view.len else 0) + offset))",
 )
 if any(compact(contract) not in slice_body for contract in required_slice_contracts):
     raise SystemExit("StringView slice lost its exact clamped length or backing-address contract")
