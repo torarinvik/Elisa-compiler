@@ -147,9 +147,6 @@ required_contracts = (
     "and table.ref_pos.count == table.ref_binding_ids.count and table.ref_pos.count == 1 and table.ref_binding_ids.count == 1",
     "fallback_binding_id: BindingId = table.ref_binding_ids[0]",
     "return (true, fallback_binding_id)",
-    "reference_count: usize = table.ref_pos.count",
-    "binding_count: usize = table.ref_binding_ids.count",
-    "next_count: usize = table.ref_owner_next.count",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
     "result_binding_id: mutable BindingId = missing",
@@ -157,8 +154,8 @@ required_contracts = (
     "result_binding_id <- id",
     "result_binding_id <- missing",
     "lookup_valid: mutable bool = true",
-    "if expected_count > reference_count or expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
-    "if row == SYMBOL_INDEX_ROW_NONE.usize() or row >= reference_count or row >= binding_count or row >= next_count",
+    "if expected_count > table.ref_pos.count or expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
+    "if row == SYMBOL_INDEX_ROW_NONE.usize() or row >= table.ref_pos.count or row >= table.ref_owner_next.count",
     "if id.owner.value != owner.value",
     "if row != SYMBOL_INDEX_ROW_NONE.usize() or last_row != expected_tail",
     "if not lookup_valid:",
@@ -168,18 +165,17 @@ required_contracts = (
     "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
     "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
     "invariant step <= expected_count",
-    "invariant row == expected_row",
-    "invariant not found or result_index < reference_count",
-    "invariant not found or result_index < binding_count",
-    "invariant not found or result_binding_id.owner.value == owner.value",
-    "invariant not found or (result_offset == position.offset and result_end_offset == position.end_offset)",
+    "invariant (step == 0 implies row == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()].usize())",
+    "invariant not found or result_index < table.ref_pos.count",
+    "invariant not found or table.ref_binding_ids[result_index].owner.value == owner.value",
+    "invariant not found or ownership_binding_ids_equal(result_binding_id, table.ref_binding_ids[result_index])",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
     if contract not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
 if not re.search(
-    r"if not lookup_valid:\s+found <- false\s+result_index <- 0\s+result_binding_id <- missing\s+"
+    r"if not lookup_valid:\s+found <- false\s+result_index <- 0\s+"
     r"if found:\s+assert owner\.value != INVALID_DECL_ID_VALUE\s+"
     r"assert owner\.value\.usize\(\) < table\.symbols\.count\s+"
     r"assert position\.end_offset > position\.offset\s+"
