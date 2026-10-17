@@ -102,7 +102,7 @@ required_span_fragments = (
     "assert close <= text.len",
     "value_length: usize = values.len",
     "assert value_length == close - base",
-    "while cursor <= value_length",
+    "while cursor <= value_length |cursor, value_length, start, current, values, base, close, wanted, text, expected_span|",
     "decreases value_length - cursor",
     "invariant cursor <= value_length",
     "invariant start <= cursor",
