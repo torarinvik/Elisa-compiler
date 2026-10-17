@@ -166,8 +166,7 @@ if not all(fragment in source_compact for fragment in required_source):
 expected_find = """
 def find(text: sview, needle: sview) -> usize:
     ensure result <= text.len
-    ensure needle.len == 0 implies result == text.len
-    ensure text.len < needle.len implies result == text.len
+    ensure (needle.len == 0 or text.len < needle.len) implies result == text.len
     ensure result < text.len implies (
         needle.len > 0 and
         needle.len <= text.len and
