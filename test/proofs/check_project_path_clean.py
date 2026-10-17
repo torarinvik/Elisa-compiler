@@ -98,7 +98,7 @@ expected_build = compact("""
     out: mutable darray[u8] = []
     if path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH:
         out.push(ProjectSystemPathByte::ASCII_FORWARD_SLASH)
-    for index in 0..<body.count |out, body, path, rooted|:
+    for index in 0..<body.count |out, body, path|:
         invariant not rooted or (
             out.count > 0.usize() and
             out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH

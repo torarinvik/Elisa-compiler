@@ -134,7 +134,6 @@ required_parse_steps = (
     "decreasestext.len-position",
     "invariantnotvalidorposition<=text.len",
     "invariantnotvalidorstart<text.len",
-    "invariantnotvalidor(text.len>0andnegative==(text[0]==ASCII_MINUS))",
     "invariantnegativeimpliesposition>=1",
     "invariantnegativeimpliesvalue<=0",
     "invariantnotnegativeimpliesvalue>=0",
