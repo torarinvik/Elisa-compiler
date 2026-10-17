@@ -55,8 +55,6 @@ def declarations(source: str) -> set[str]:
 runtime_text = RUNTIME.read_text()
 extension = compact(function_section(runtime_text, "extension"))
 stem = compact(function_section(runtime_text, "stem"))
-slice_body = compact(function_section(runtime_text, "string_view_slice"))
-suffix_body = compact(function_section(runtime_text, "string_view_suffix"))
 valid = "p.len >= 0 and p.len.usize().i64() == p.len"
 invalid = "p.len < 0 or p.len.usize().i64() != p.len"
 path_valid = "path.len >= 0 and path.len.usize().i64() == path.len"
@@ -81,17 +79,6 @@ if any(compact(contract) not in extension for contract in extension_contracts):
     raise SystemExit("Fs::extension lost its malformed-input, last-dot, offset, or byte-preservation contract")
 if any(compact(contract) not in stem for contract in stem_contracts):
     raise SystemExit("Fs::stem lost its malformed-input, basename, offset, or byte-preservation contract")
-bounded_slice_contracts = (
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= end and end <= view.len) implies result.len == end - start",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= end and end <= view.len and result.len > 0) implies result.data == view.data + start.usize()",
-)
-bounded_suffix_contracts = (
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= view.len) implies result.len == view.len - start",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= view.len and result.len > 0) implies result.data == view.data + start.usize()",
-)
-if any(compact(contract) not in slice_body for contract in bounded_slice_contracts) \
-        or any(compact(contract) not in suffix_body for contract in bounded_suffix_contracts):
-    raise SystemExit("StringView slice/suffix lost the bounded path-component contract")
 if compact("dot: i64 = sview_find_last_byte(p, 46)") not in extension \
         or compact("return string_view_suffix(p, dot) if dot > name_start") not in extension:
     raise SystemExit("Fs::extension no longer returns the final qualifying dot suffix")

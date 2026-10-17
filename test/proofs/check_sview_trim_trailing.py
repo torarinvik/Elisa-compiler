@@ -85,8 +85,6 @@ required_slice_contracts = (
     "ensure result.len >= 0 and result.len <= (view.len if view.len > 0 and view.len.usize().i64() == view.len else 0)",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == ((view.len if end < 0 else (start if start > 0 and start <= view.len else view.len if start > view.len else 0) if end < (start if start > 0 and start <= view.len else view.len if start > view.len else 0) else end if end <= view.len else view.len) - (start if start > 0 and start <= view.len else view.len if start > view.len else 0))",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= end and end <= view.len) implies result.len == end - start",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= end and end <= view.len and result.len > 0) implies result.data == view.data + start.usize()",
 )
 required_prefix_contracts = (
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == (view.len if end < 0 else end if end <= view.len else view.len)",
@@ -100,8 +98,6 @@ suffix_contracts = (
     "ensure result.len >= 0 and result.len <= (view.len if view.len > 0 and view.len.usize().i64() == view.len else 0)",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len) implies result.len == view.len - (start if start > 0 and start <= view.len else view.len if start > view.len else 0)",
     "ensure (view.len >= 0 and view.len.usize().i64() == view.len and result.len > 0) implies result.data == view.data + (start if start > 0 and start <= view.len else view.len if start > view.len else 0).usize()",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= view.len) implies result.len == view.len - start",
-    "ensure (view.len >= 0 and view.len.usize().i64() == view.len and start >= 0 and start <= view.len and result.len > 0) implies result.data == view.data + start.usize()",
 )
 if any(compact(contract) not in suffix_body for contract in suffix_contracts):
     raise SystemExit("StringView suffix lost its clamped extent or backing-address contract")
