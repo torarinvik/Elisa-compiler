@@ -191,8 +191,11 @@ if any(compact(fragment) not in close_offset_body for fragment in (
 span_count_from_open_body = compact(function_section(text_source, "easm_compose_span_argument_count_from_open"))
 if any(compact(fragment) not in span_count_from_open_body for fragment in (
     "requires open <= text.len",
+    "ensure open >= text.len implies result == 0",
+    "ensure open < text.len implies result == easm_compose_span_argument_count_at_offset(text, open, easm_compose_close_offset(text, open))",
     "return 0 if open >= text.len",
-    "return easm_compose_span_argument_count_at_offset(text, open, easm_compose_close_offset(text, open))",
+    "close_offset: usize = easm_compose_close_offset(text, open)",
+    "return easm_compose_span_argument_count_at_offset(text, open, close_offset)",
 )):
     raise SystemExit("span argument count no longer uses a total open-relative return tree")
 span_count_at_offset_body = compact(function_section(text_source, "easm_compose_span_argument_count_at_offset"))
@@ -211,7 +214,10 @@ reference_from_open_body = compact(function_section(text_source, "easm_compose_s
 if compact("ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_from_open(text, open)) implies result.valid") not in reference_from_open_body \
         or compact("requires open <= text.len") not in reference_from_open_body \
         or compact("return ComposeSpan{start: 0, end: 0, valid: false} if open >= text.len") not in reference_from_open_body \
-        or compact("return easm_compose_span_reference_at_offset(text, open, easm_compose_close_offset(text, open), wanted)") not in reference_from_open_body:
+        or compact("argument_count: i64 = easm_compose_span_argument_count_at_offset(text, open, close_offset)") not in reference_from_open_body \
+        or compact("assert argument_count == easm_compose_span_argument_count_from_open(text, open)") not in reference_from_open_body \
+        or compact("span: ComposeSpan = easm_compose_span_reference_at_offset(text, open, close_offset, wanted)") not in reference_from_open_body \
+        or compact("return span") not in reference_from_open_body:
     raise SystemExit("recursive span helper lost its open-relative validity contract")
 reference_at_offset_body = compact(function_section(text_source, "easm_compose_span_reference_at_offset"))
 if any(compact(fragment) not in reference_at_offset_body for fragment in (
