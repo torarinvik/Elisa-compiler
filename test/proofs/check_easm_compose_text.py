@@ -99,6 +99,7 @@ required_span_fragments = (
     'open: usize = EasmTextScan::find(text, "(")',
     "if wanted < 0:",
     "return ComposeSpan{start: 0, end: 0, valid: false}",
+    "assert wanted >= 0",
     'close_offset: usize = EasmTextScan::find(text[open:text.len], ")")',
     "assert close_offset > 0.usize()",
     "close: usize = close_offset + open",
