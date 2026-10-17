@@ -147,6 +147,7 @@ required_contracts = (
     "if not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
     "and table.ref_pos.count == table.ref_binding_ids.count and table.ref_pos.count == 1 and table.ref_binding_ids.count == 1",
     "fallback_binding_id: BindingId = table.ref_binding_ids[0]",
+    "assert ownership_lookup_candidate_matches(table, 0, owner, position, fallback_binding_id)",
     "return (true, fallback_binding_id)",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
     "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
@@ -196,7 +197,7 @@ if not re.search(
 ):
     raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
 lookup_lines = lookup_text.splitlines()
-if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
+if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 14:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
 if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 4:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
@@ -204,7 +205,7 @@ if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
-    print(json.dumps({"source_bound": True, "contract_count": 15,
+    print(json.dumps({"source_bound": True, "contract_count": 14,
                       "invariant_count": 4, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
