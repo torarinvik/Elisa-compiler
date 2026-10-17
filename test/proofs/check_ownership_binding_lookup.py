@@ -168,6 +168,11 @@ required_contracts = (
     "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
     "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
     "invariant step <= expected_count",
+    "invariant row == expected_row",
+    "invariant not found or result_index < reference_count",
+    "invariant not found or result_index < binding_count",
+    "invariant not found or result_binding_id.owner.value == owner.value",
+    "invariant not found or (result_offset == position.offset and result_end_offset == position.end_offset)",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
@@ -198,14 +203,14 @@ if not re.search(
 lookup_lines = lookup_text.splitlines()
 if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 15:
     raise AssertionError("ownership lookup contract set changed; review and update this proof gate")
-if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 1:
+if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 10:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "contract_count": 15,
-                      "invariant_count": 1, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
+                      "invariant_count": 10, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
     raise SystemExit(0)
 
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, TABLE_SOURCE, POS_SOURCE,
