@@ -10,14 +10,14 @@ CACHE="$WORK/cache"
 mkdir -p "$CACHE"
 
 cat >"$WORK/check.elisa" <<'ELISA'
+# globals
 global mutable counter: i64 = 0
 
 def pure() -> i64:
     return 7
 
 def read_counter() -> i64:
-    can Global.Read:
-        return counter
+    return pure()
 
 def second_read() -> i64:
     can Global.Read:
@@ -95,14 +95,21 @@ compare_without_cache_report() {
     diff -u "$WORK/$left.clean.err" "$WORK/$right.clean.err"
 }
 
+assert_authority_skip_counters() {
+    local stem="$1"
+    grep -Eq 'effect_source_bodies_skipped=1 ungranted_panic_bodies_skipped=1 global_permission_axis_scans_skipped=4' "$WORK/$stem.err"
+}
+
 run_check cold "$WORK/check.elisa" cold
 run_check enabled "$WORK/check.elisa" first
 compare_without_cache_report cold first
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=8 matched_eligible_bodies=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/first.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=2 matched_eligible_bodies=0 visited=8 rejected=6 ga_walks_skipped=3 published=yes' "$WORK/first.err"
+assert_authority_skip_counters first
 
 run_check enabled "$WORK/check.elisa" warm
 compare_without_cache_report cold warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 eligible_bodies=8 matched_eligible_bodies=8 visited=8 rejected=0 ga_walks_skipped=6 published=yes' "$WORK/warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=2 eligible_bodies=2 matched_eligible_bodies=2 visited=8 rejected=6 ga_walks_skipped=3 published=yes' "$WORK/warm.err"
+assert_authority_skip_counters warm
 
 python3 - "$WORK/check.elisa" <<'PY'
 from pathlib import Path
@@ -115,15 +122,18 @@ PY
 run_check cold "$WORK/check.elisa" edited-cold
 run_check enabled "$WORK/check.elisa" edited-warm
 compare_without_cache_report edited-cold edited-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=7 eligible_bodies=8 matched_eligible_bodies=7 visited=8 rejected=0 ga_walks_skipped=4 published=yes' "$WORK/edited-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=1 eligible_bodies=2 matched_eligible_bodies=1 visited=8 rejected=6 ga_walks_skipped=3 published=yes' "$WORK/edited-warm.err"
+assert_authority_skip_counters edited-warm
 
 run_check cold "$WORK/check.elisa" options-cold permissive
 run_check enabled "$WORK/check.elisa" options-warm permissive
 compare_without_cache_report options-cold options-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=8 matched_eligible_bodies=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/options-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=2 matched_eligible_bodies=0 visited=8 rejected=6 ga_walks_skipped=2 published=yes' "$WORK/options-warm.err"
+assert_authority_skip_counters options-warm
 run_check enabled "$WORK/check.elisa" options-confirm-warm permissive
 compare_without_cache_report options-cold options-confirm-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 eligible_bodies=8 matched_eligible_bodies=8 visited=8 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/options-confirm-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=2 eligible_bodies=2 matched_eligible_bodies=2 visited=8 rejected=6 ga_walks_skipped=2 published=yes' "$WORK/options-confirm-warm.err"
+assert_authority_skip_counters options-confirm-warm
 
 cache_file="$(find "$CACHE" -type f -name '*.elisa-semantic' -print -quit)"
 [[ -n "$cache_file" ]]
@@ -178,7 +188,8 @@ PY
 run_check cold "$WORK/check.elisa" forged-cold permissive
 run_check enabled "$WORK/check.elisa" forged-warm permissive
 compare_without_cache_report forged-cold forged-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=8 eligible_bodies=8 matched_eligible_bodies=8 visited=8 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/forged-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=2 eligible_bodies=2 matched_eligible_bodies=2 visited=8 rejected=6 ga_walks_skipped=2 published=yes' "$WORK/forged-warm.err"
+assert_authority_skip_counters forged-warm
 python3 - "$cache_file" "$ROOT/src/semantic/incremental_semantic_options.elisa" <<'PY'
 from pathlib import Path
 import re
@@ -209,7 +220,8 @@ printf 'corrupt' >"$cache_file"
 run_check cold "$WORK/check.elisa" corrupt-cold permissive
 run_check enabled "$WORK/check.elisa" corrupt-warm permissive
 compare_without_cache_report corrupt-cold corrupt-warm
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=8 matched_eligible_bodies=0 visited=8 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/corrupt-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=2 matched_eligible_bodies=0 visited=8 rejected=6 ga_walks_skipped=2 published=yes' "$WORK/corrupt-warm.err"
+assert_authority_skip_counters corrupt-warm
 
 # Changing strictness must invalidate the cached semantic snapshot and change the
 # actual grant result for the same source, in both directions.
@@ -258,10 +270,10 @@ ELISA
 run_check cold "$WORK/generated.elisa" generated-cold
 run_check enabled "$WORK/generated.elisa" generated-first
 compare_without_cache_report generated-cold generated-first
-grep -Eq 'incremental-ga-cache: input=generated prior=miss matched=0 eligible_bodies=2 matched_eligible_bodies=0 visited=2 rejected=0 ga_walks_skipped=0 published=yes' "$WORK/generated-first.err"
+grep -Eq 'incremental-ga-cache: input=generated prior=miss matched=0 eligible_bodies=2 matched_eligible_bodies=0 visited=2 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/generated-first.err"
 run_check enabled "$WORK/generated.elisa" generated-warm
 compare_without_cache_report generated-cold generated-warm
-grep -Eq 'incremental-ga-cache: input=generated prior=valid matched=2 eligible_bodies=2 matched_eligible_bodies=2 visited=2 rejected=0 ga_walks_skipped=2 published=yes' "$WORK/generated-warm.err"
+grep -Eq 'incremental-ga-cache: input=generated prior=valid matched=2 eligible_bodies=2 matched_eligible_bodies=2 visited=2 rejected=0 ga_walks_skipped=3 published=yes' "$WORK/generated-warm.err"
 
 # Errorful translation units still publish current-source facts. Diagnostics
 # must remain byte-for-byte identical for cold, first-cache, and warm runs.
@@ -278,10 +290,10 @@ run_check cold "$WORK/errorful.elisa" errorful-cold
 run_check enabled "$WORK/errorful.elisa" errorful-first
 compare_without_cache_report errorful-cold errorful-first
 [[ "$(<"$WORK/errorful-first.status")" != 0 ]]
-grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=[12] matched_eligible_bodies=0 visited=2 rejected=[01] ga_walks_skipped=0 published=yes' "$WORK/errorful-first.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 eligible_bodies=2 matched_eligible_bodies=0 visited=2 rejected=0 ga_walks_skipped=4 published=yes' "$WORK/errorful-first.err"
 run_check enabled "$WORK/errorful.elisa" errorful-warm
 compare_without_cache_report errorful-cold errorful-warm
 [[ "$(<"$WORK/errorful-warm.status")" != 0 ]]
-grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=[1-2] eligible_bodies=[12] matched_eligible_bodies=[1-2] visited=2 rejected=[01] ga_walks_skipped=[1-2] published=yes' "$WORK/errorful-warm.err"
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=2 eligible_bodies=2 matched_eligible_bodies=2 visited=2 rejected=0 ga_walks_skipped=4 published=yes' "$WORK/errorful-warm.err"
 
-echo "incremental GA cache control OK: cold/warm and errorful diagnostic parity, grant-only skip boundaries, strict/permissive grant invalidation, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"
+echo "incremental GA cache control OK: cold/warm diagnostic parity, direct-call replay, effect-source/panic/Global-permission skips, strict/permissive grant invalidation, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"

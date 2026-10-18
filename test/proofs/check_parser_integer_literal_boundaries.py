@@ -37,9 +37,9 @@ step = source.split("def parse_int_literal_step(", 1)[1].split("def parse_int_li
 decoder = source.split("def parse_int_literal_value(", 1)[1]
 for fragment in (
         "requires index < text.len",
-        "ensure result.next_index > index and result.next_index <= text.len",
+        "requires text[index].u8() == 95 or",
+        "ensure result.next_index == index + 1",
         "ensure parse_int_literal_reference_from(text, index, is_hex, value) == parse_int_literal_reference_from(text, result.next_index, is_hex, result.next_value)",
-        "return (text.len, 0)",
         "next_value: u64 = maximum if value > (maximum - digit.u64()) / base else value * base + digit.u64()",
 ):
     if fragment not in step:
@@ -58,7 +58,8 @@ if "return parse_int_literal_reference_from(text, 2, true, 0).i64() if n >= 2 an
 for fragment in (
         "ensure result == parse_int_literal_reference(text)",
         "assert start_index <= n",
-        "while index < n |index, result, text, is_hex, n, start_index|:",
+        "for index in start_index..<n |result, text, is_hex, n, start_index|:",
+        "invariant index >= start_index",
         "invariant index <= n",
         "invariant parse_int_literal_reference_from(text, index, is_hex, result) == parse_int_literal_reference_from(text, start_index, is_hex, 0)",
         "assert result.i64() == parse_int_literal_reference(text)",
@@ -85,8 +86,14 @@ for fragment in (
     "(byte - 97 + 10).i64()",
     "(byte - 65 + 10).i64()",
 ):
-    if fragment not in reference_from or fragment not in step:
+    if fragment not in reference_from:
         raise AssertionError(f"production hexadecimal decoder lost a digit class or mapping: {fragment}")
+for fragment in (
+    "(byte - 97 + 10).i64()",
+    "(byte - 65 + 10).i64()",
+):
+    if fragment not in step:
+        raise AssertionError(f"production hexadecimal step lost a digit mapping: {fragment}")
 
 theorems = {
     "production_integer_decoder_matches_recursive_reference_for_every_text",

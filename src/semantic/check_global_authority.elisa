@@ -2794,26 +2794,78 @@ extend Semantic:
                 state.local_callees.truncate(mark)
                 state.local_global_origins.truncate(mark)
 
-        # These facts are freshly rescanned from the current source. A `can` grant is
-        # not irrelevant: it can seed the function's exported row even with no matching
-        # operation in the body. Trusted grants and panic sites do not affect this walk's
-        # Global rows unless accompanied by a call or direct global access.
+        # Only a current-source record with no facts can skip this pass. This also
+        # preserves the walker's depth diagnostics for trusted grants, panic sites,
+        # and other syntax that has its own checker behavior.
         def ga_incremental_facts_are_authority_irrelevant(record: IncrementalFunctionFactRecord, snapshot: IncrementalSemanticSnapshot&) -> bool:
             can Abort.Panic:
-                return false if:
-                    record.direct_fact_start > snapshot.direct_facts.count
-                    record.direct_fact_count > snapshot.direct_facts.count - record.direct_fact_start
-                for fact_index in record.direct_fact_start..<(record.direct_fact_start + record.direct_fact_count):
-                    fact: IncrementalDirectFact = snapshot.direct_facts[fact_index]
-                    return false if not (fact.kind == IncrementalFactKind.TrustedGrant or fact.kind == IncrementalFactKind.PanicSite)
+                return false if record.direct_fact_count != 0
+                return false if record.direct_fact_start > snapshot.direct_facts.count
                 return true
 
-        def ga_functions(declarations: darray[Ast::Decl]&, module_scope: usize, state: mutable GlobalAuthority&, table: lmut SymbolTable, reusable_empty_offsets: mutable dict[u64, u8]&, incremental_skip_count: mutable u64&, depth: u32, origin: Ast::Pos) -> void:
+        def ga_incremental_record_is_direct_call_only(record_index: usize, snapshot: IncrementalSemanticSnapshot&) -> bool:
+            can Abort.Panic:
+                return false if record_index >= snapshot.functions.count
+                record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                return false if not record.cacheable or record.direct_fact_count == 0
+                return false if record.direct_fact_start > snapshot.direct_facts.count or record.direct_fact_count > snapshot.direct_facts.count - record.direct_fact_start
+                for relative in 0..<record.direct_fact_count |snapshot|:
+                    fact: IncrementalDirectFact = snapshot.direct_facts[record.direct_fact_start + relative]
+                    return false if fact.owner != record_index or fact.kind != IncrementalFactKind.DirectCall or fact.active_grant_count != 0
+                    return false if not (Semantic::incremental_direct_call_name(snapshot, fact) is callee_name)
+                return true
+
+        # Direct-call-only records may replace the inference body walk after each
+        # fact target has been resolved against this invocation's function index.
+        # Never persist or trust a numeric function slot.
+        def ga_incremental_direct_call_targets(record_index: usize, snapshot: IncrementalSemanticSnapshot&, state: GlobalAuthority&, targets: mutable darray[usize]&) -> bool:
+            can Abort.Panic:
+                return false if record_index >= snapshot.functions.count
+                record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                return false if not record.cacheable or record.direct_fact_count == 0
+                return false if record.direct_fact_start > snapshot.direct_facts.count or record.direct_fact_count > snapshot.direct_facts.count - record.direct_fact_start
+                for relative in 0..<record.direct_fact_count |targets, snapshot, state|:
+                    fact: IncrementalDirectFact = snapshot.direct_facts[record.direct_fact_start + relative]
+                    return false if fact.owner != record_index or fact.kind != IncrementalFactKind.DirectCall or fact.active_grant_count != 0
+                    if Semantic::incremental_direct_call_name(snapshot, fact) is callee_name:
+                        # The cold call walk evaluates the callee identifier too.
+                        # A same-named local or imported global therefore contributes
+                        # its own Global.Read effect; replay only the call edge when
+                        # normal global lookup cannot resolve this spelling.
+                        global_target: usize = ga_resolve(callee_name, state.module_scope, false, state.globals, state.global_scopes, state)
+                        return false if global_target < state.globals.count
+                        target: usize = ga_resolve_function(callee_name, state.module_scope, false, state)
+                        return false if target >= state.functions.count
+                        return false if state.functions[target] != callee_name or state.function_scopes[target] != state.module_scope
+                        return false if state.parameter_counts[target] != 0 or state.function_variadic[target]
+                        candidate: mutable usize = ga_candidate_head(target, state)
+                        selected: mutable usize = state.functions.count
+                        matches: mutable usize = 0
+                        while candidate < state.functions.count |candidate, selected, matches, state|:
+                            if state.functions[candidate] == callee_name and state.function_scopes[candidate] == state.module_scope:
+                                selected <- candidate
+                                matches <- matches + 1
+                            candidate <- state.function_next[candidate]
+                        return false if matches != 1 or selected != target
+                        targets.push(target)
+                    else:
+                        return false
+                return targets.count == record.direct_fact_count
+
+        def ga_replay_direct_call_edges(targets: darray[usize]&, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                replay_position: Ast::Pos = ga_position_value(0, 0, 0, 0, 0, 0)
+                for target in targets |state, table| -> table:
+                    need_read: mutable bool = false
+                    need_write: mutable bool = false
+                    table <- ga_resolved_call_candidate(target, replay_position, need_read, need_write, state, table) can Global{Read,Write}
+
+        def ga_functions(declarations: darray[Ast::Decl]&, module_scope: usize, state: mutable GlobalAuthority&, table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot&, reusable_empty_offsets: mutable dict[u64, u8]&, replay_call_records: mutable dict[u64, usize]&, incremental_skip_count: mutable u64&, use_current_snapshot_facts: bool, depth: u32, origin: Ast::Pos) -> void:
             can Memory.Allocate, Abort.Panic:
                 if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT:
                     ga_mark_walk_overflow(origin, state)
                     return
-                for declaration in declarations |state, table, reusable_empty_offsets, incremental_skip_count| -> table:
+                for declaration in declarations |state, table, snapshot, reusable_empty_offsets, replay_call_records, incremental_skip_count, use_current_snapshot_facts| -> table:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, _, _, at):
                             state.module_scope <- module_scope
@@ -2832,12 +2884,20 @@ extend Semantic:
                                 state.local_callees.push(GLOBAL_AUTHORITY_NONE)
                                 state.local_global_origins.push(GLOBAL_AUTHORITY_NONE)
                             # Signature effects declare the exported row, not local authority.
-                            # The current collector rescans each body; a compatible prior
-                            # match may skip this Global-specific walk only when every current
-                            # fact is a trusted grant or panic site. `can` grants, calls, and
-                            # global accesses still require normal inference and reporting.
-                            # Persisted facts never authorize a skip.
-                            if reusable_empty_offsets.get(at.offset.u64()) is reusable_marker:
+                            # The current collector has already rescanned this body. Only
+                            # direct top-level declarations have snapshot anchors; nested
+                            # module/scoped declarations always take the regular walk.
+                            replay_record: usize = owner if replay_call_records.get(at.offset.u64()) is owner else snapshot.functions.count
+                            replayed_direct_calls: mutable bool = false
+                            if use_current_snapshot_facts and not state.report and replay_record < snapshot.functions.count:
+                                replay_targets: mutable darray[usize] = []
+                                replayed_direct_calls <- ga_incremental_direct_call_targets(replay_record, snapshot, state, &replay_targets)
+                                if replayed_direct_calls:
+                                    table <- ga_replay_direct_call_edges(replay_targets, state, table) can Global{Read,Write}
+                                    incremental_skip_count <- incremental_skip_count + 1
+                            if replayed_direct_calls:
+                                pass
+                            elif use_current_snapshot_facts and reusable_empty_offsets.get(at.offset.u64()) is reusable_marker:
                                 incremental_skip_count <- incremental_skip_count + 1
                             else:
                                 table <- ga_body(body, state, table) can Global{Read,Write}
@@ -2852,9 +2912,9 @@ extend Semantic:
                             state.local_callees.clear()
                             state.local_global_origins.clear()
                         Decl.Module(name, body, at):
-                            table <- ga_functions(body, ga_module_path(module_scope, name, state), state, table, reusable_empty_offsets, incremental_skip_count, depth + 1, at) can Global{Read,Write}
+                            table <- ga_functions(body, ga_module_path(module_scope, name, state), state, table, snapshot, reusable_empty_offsets, replay_call_records, incremental_skip_count, false, depth + 1, at) can Global{Read,Write}
                         Decl.Scoped(body, at):
-                            table <- ga_functions(body, module_scope, state, table, reusable_empty_offsets, incremental_skip_count, depth + 1, at) can Global{Read,Write}
+                            table <- ga_functions(body, module_scope, state, table, snapshot, reusable_empty_offsets, replay_call_records, incremental_skip_count, false, depth + 1, at) can Global{Read,Write}
                         _:
                             pass
 
@@ -2914,15 +2974,43 @@ extend Semantic:
                 ga_allocate_return_rows(&state)
                 ga_unknown_callback(&state) can Global{Read,Write}
                 reusable_empty_offsets: mutable dict[u64, u8] = {}
-                if snapshot.surface_compatible and snapshot.current_anchors.count == snapshot.functions.count:
-                    for record_index in 0..<snapshot.functions.count |reusable_empty_offsets, snapshot|:
+                replay_call_records: mutable dict[u64, usize] = {}
+                use_current_snapshot_facts: mutable bool = false
+                # Inline grants add authority effects by source span during the regular
+                # expression walk. Current body facts do not yet bind those annotation
+                # spans to a function, so keep both empty-fact skips and direct-call
+                # replay cold whenever this translation unit has any inline grant.
+                if snapshot.functions.count > 0 and snapshot.current_anchors.count == snapshot.functions.count and state.inline_refs.count == 0:
+                    for record_index in 0..<snapshot.functions.count |use_current_snapshot_facts, snapshot|:
                         record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
-                        continue if not record.cacheable or not record.matched_previous or not ga_incremental_facts_are_authority_irrelevant(record, snapshot)
+                        if record.cacheable and (ga_incremental_facts_are_authority_irrelevant(record, snapshot) or ga_incremental_record_is_direct_call_only(record_index, snapshot)):
+                            use_current_snapshot_facts <- true
+                if use_current_snapshot_facts:
+                    # Exact source offsets bind only when unique. The collector scans
+                    # current AST bodies even on a cold cache, so previous-match flags
+                    # and declaration-surface compatibility are not reuse preconditions.
+                    offset_owners: mutable dict[u64, usize] = {}
+                    missing_offset_owner: usize = snapshot.functions.count + 1
+                    for record_index in 0..<snapshot.functions.count |offset_owners, snapshot, missing_offset_owner|:
                         offset: u64 = snapshot.current_anchors[record_index].definition_offset.u64()
-                        reusable_empty_offsets <- reusable_empty_offsets.put(offset, 1) can Global{Read,Write}
+                        previous_owner: usize = owner if offset_owners.get(offset) is owner else missing_offset_owner
+                        if previous_owner == missing_offset_owner:
+                            offset_owners <- offset_owners.put(offset, record_index) can Global{Read,Write}
+                        else:
+                            offset_owners <- offset_owners.put(offset, snapshot.functions.count) can Global{Read,Write}
+                    for record_index in 0..<snapshot.functions.count |offset_owners, reusable_empty_offsets, snapshot|:
+                        offset: u64 = snapshot.current_anchors[record_index].definition_offset.u64()
+                        unique_owner: usize = owner if offset_owners.get(offset) is owner else snapshot.functions.count
+                        continue if unique_owner != record_index
+                        record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                        continue if not record.cacheable
+                        if ga_incremental_facts_are_authority_irrelevant(record, snapshot):
+                            reusable_empty_offsets <- reusable_empty_offsets.put(offset, 1) can Global{Read,Write}
+                        elif ga_incremental_record_is_direct_call_only(record_index, snapshot):
+                            replay_call_records <- replay_call_records.put(offset, record_index) can Global{Read,Write}
                 PhaseTimer::end_span("authority:collect_setup", setup_span)
                 inference_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
-                table <- ga_functions(file.top_decls, 0, &state, table, &reusable_empty_offsets, incremental_skip_count, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
+                table <- ga_functions(file.top_decls, 0, &state, table, snapshot, &reusable_empty_offsets, &replay_call_records, incremental_skip_count, use_current_snapshot_facts, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
                 if state.walk_overflow:
                     ga_mark_all_possible_global_effects(&state)
                 PhaseTimer::end_span("authority:inference_walk", inference_span)
@@ -3032,7 +3120,7 @@ extend Semantic:
                     report_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                     state.report <- true
                     state.progress_functions <- 0
-                    table <- ga_functions(file.top_decls, 0, &state, table, &reusable_empty_offsets, incremental_skip_count, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
+                    table <- ga_functions(file.top_decls, 0, &state, table, snapshot, &reusable_empty_offsets, &replay_call_records, incremental_skip_count, use_current_snapshot_facts, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
                     PhaseTimer::end_span("authority:report_walk", report_span)
                 # Export facts after the generic checker has run; this checker owns
                 # mandatory Global call authority with lexical declaration identities.

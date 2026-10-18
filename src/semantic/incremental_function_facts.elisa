@@ -7,7 +7,7 @@ extend Semantic:
         # Bump whenever a semantic change can alter the meaning of facts consumed by
         # checker replay. This is deliberately separate from the wire schema: a cache
         # can decode correctly yet describe different checker semantics.
-        const INCREMENTAL_SEMANTIC_ENGINE_VERSION: u64 = 1
+        const INCREMENTAL_SEMANTIC_ENGINE_VERSION: u64 = 3
         const INCREMENTAL_FACT_HASH_OFFSET: u64 = 14695981039346656037
         const INCREMENTAL_NO_ANCHOR: u32 = 4294967295
         const INCREMENTAL_FACT_HASH_PRIME: u64 = 1099511628211
@@ -131,6 +131,13 @@ extend Semantic:
             name: sview
 
     private:
+        def ifc_read_u32(bytes: darray[u8]&, start: usize) -> u32:
+            can Abort.Panic:
+                value: mutable u32 = 0
+                for shift in 0..<4 |value|:
+                    value <- value | (bytes[start + shift].u32() << (shift * 8))
+                return value
+
         def ifc_append_u32(snapshot: mutable IncrementalSemanticSnapshot&, value: u32) -> void:
             can Memory.Allocate, Abort.Panic:
                 encoded: u8[4]
@@ -441,8 +448,11 @@ extend Semantic:
                         # the authority checker. Until that fact has its own kind, fail
                         # closed instead of treating a name as a pure value.
                         return false
-                    Expr.Paren(inner, _):
-                        return ifc_walk_expr(inner, owner, path, body_start, body_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, active, snapshot)
+                    Expr.Paren(_, _):
+                        # The authority walker has a recursive expression-depth limit.
+                        # Until this collector tracks the same depth, parenthesized trees
+                        # stay cold even when their leaves are otherwise supported.
+                        return false
                     Expr.Call(callee, arguments, labels, position):
                         return false if arguments.count != 0 or labels.count != 0
                         if callee is Ast::Expr.Ident(name, _):
@@ -497,8 +507,11 @@ extend Semantic:
                                     operator != TokenKind.LArrow
                                     not ifc_walk_expr(value, owner, path, body_start, body_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, active, snapshot)
                                 if target is Ast::Expr.Ident(name, position):
+                                    # A local may be a reference parameter whose write
+                                    # reaches a caller's mutable global. Keep local LArrow
+                                    # assignments cold until parameter aliasing is modeled.
                                     if ifc_contains(locals, name):
-                                        pass
+                                        return false
                                     elif ifc_string_name_contains(mutable_globals, name, mutable_globals_index):
                                         anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
                                         if anchor != INCREMENTAL_NO_ANCHOR:
@@ -509,23 +522,11 @@ extend Semantic:
                                         return false
                                 else:
                                     return false
-                        Stmt.Block(kind, clause, _, body, position):
-                            return false if kind != "can" and kind != "trusted"
-                            active_mark: usize = active.count
-                            local_mark: usize = locals.count
-                            grant_kind: IncrementalGrantKind = IncrementalGrantKind.Can if kind == "can" else IncrementalGrantKind.Trusted
-                            scope_anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
-                            return false if scope_anchor == INCREMENTAL_NO_ANCHOR
-                            for name in clause |active, snapshot|:
-                                if scope_anchor != INCREMENTAL_NO_ANCHOR:
-                                    fact_kind: IncrementalFactKind = IncrementalFactKind.CanGrant if grant_kind == IncrementalGrantKind.Can else IncrementalFactKind.TrustedGrant
-                                    ifc_push_fact(snapshot, owner, fact_kind, name, path, scope_anchor, active)
-                                else:
-                                    return false
-                                active.push(IncrementalFactWalkGrant{kind: grant_kind, name: name})
-                            return false if not ifc_walk_body(body, owner, path, body_start, body_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, active, snapshot)
-                            active.truncate(active_mark)
-                            locals.truncate(local_mark)
+                        Stmt.Block(_, _, _, _, _):
+                            # Nested block depth has independent diagnostics in semantic
+                            # walkers; do not skip those walkers until that budget is part
+                            # of the current-source fact proof.
+                            return false
                         _:
                             return false
                 return true
@@ -618,10 +619,34 @@ extend Semantic:
                 return ifc_equal(previous.bytes, previous.declaration_surface_start, previous.declaration_surface_length, current.bytes, current.declaration_surface_start, current.declaration_surface_length)
 
     public:
+        # Resolve a portable direct-call fact back to its current source-level name.
+        # The serialized subject is a length-prefixed (path, name) key; callers must
+        # still resolve that name against the current declaration/index inventory.
+        def incremental_direct_call_name(snapshot: IncrementalSemanticSnapshot&, fact: IncrementalDirectFact) -> sview?:
+            can Abort.Panic:
+                return null if fact.kind != IncrementalFactKind.DirectCall
+                return null if fact.subject_start > snapshot.bytes.count or fact.subject_length > snapshot.bytes.count - fact.subject_start
+                return null if snapshot.source_path_start > snapshot.bytes.count or snapshot.source_path_length > snapshot.bytes.count - snapshot.source_path_start
+                return null if fact.subject_length < 8
+                path_length: usize = ifc_read_u32(snapshot.bytes, fact.subject_start).usize()
+                return null if path_length > fact.subject_length - 8
+                path_start: usize = fact.subject_start + 4
+                return null if path_length != snapshot.source_path_length
+                return null if not ifc_equal(snapshot.bytes, path_start, path_length, snapshot.bytes, snapshot.source_path_start, snapshot.source_path_length)
+                name_length_start: usize = path_start + path_length
+                name_length: usize = ifc_read_u32(snapshot.bytes, name_length_start).usize()
+                name_start: usize = name_length_start + 4
+                return null if name_length == 0 or name_length != fact.subject_length - (path_length + 8)
+                if ifc_byte_span(snapshot.bytes, name_start, name_length) is name:
+                    return name
+                return null
+
         # Supported functions are unique, top-level, nongeneric defs with ordinary block
         # bodies and scalar builtin return types. Calls must be direct, zero-argument, and
         # unambiguous. Locals are untyped literals; local identifier reads stay cold because
-        # they can hide mutable places or callback values. Every unsupported construct misses.
+        # they can hide mutable places or callback values. Nested blocks and parenthesized
+        # expressions stay cold until their walker depth behavior is modeled. Every unsupported
+        # construct misses.
         def incremental_collect_function_facts(file: Ast::File&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, options_key: darray[u8]&, previous: IncrementalSemanticSnapshot&, has_previous: bool) -> IncrementalSemanticSnapshot:
             can Memory.Allocate, Abort.Panic:
                 snapshot: mutable IncrementalSemanticSnapshot = IncrementalSemanticSnapshot{schema_version: INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: semantic_fingerprint, options_fingerprint: options_fingerprint, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, surface_compatible: false}
@@ -760,3 +785,63 @@ extend Semantic:
                             snapshot.bodies_matched <- snapshot.bodies_matched + 1
 
                 return ifc_canonical_layout(snapshot)
+
+        # Rebind an exact-input, compiler-produced session snapshot to the current parse.
+        # This intentionally rebuilds only invocation-local source anchors; the session key
+        # proves the source, token stream, declaration surface, options, and fact semantics
+        # are unchanged, so the supported body fact walkers need not run again.
+        def incremental_reanchor_exact_snapshot(file: Ast::File&, tokens: darray[Lexer::Token]&, snapshot: mutable IncrementalSemanticSnapshot&) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                return false if snapshot.schema_version != INCREMENTAL_FUNCTION_FACTS_SCHEMA
+                return false if snapshot.functions.count > 1000000 or snapshot.direct_facts.count > 1000000 or snapshot.active_grants.count > 1000000
+                snapshot.current_anchors.truncate(0)
+                snapshot.bodies_visited <- 0
+                snapshot.bodies_matched <- 0
+                snapshot.bodies_rejected <- 0
+                definition_cursor: mutable usize = 0
+                previous_span_end: mutable usize = 0
+                record_index: mutable usize = 0
+                spans_ordered: mutable bool = true
+                for declaration in file.top_decls |snapshot, tokens, definition_cursor, previous_span_end, record_index, spans_ordered|:
+                    match declaration:
+                        Decl.Func(name, _, _, _, _, _, position):
+                            return false if record_index >= snapshot.functions.count
+                            while definition_cursor < tokens.count and (tokens[definition_cursor].kind != TokenKind.Def or tokens[definition_cursor].start != position.offset):
+                                definition_cursor <- definition_cursor + 1
+                            definition_found: bool = definition_cursor < tokens.count and tokens[definition_cursor].kind == TokenKind.Def and tokens[definition_cursor].start == position.offset
+                            return false if not definition_found
+                            span: IncrementalFactTokenSpan = ifc_token_span(tokens, definition_cursor)
+                            if span.found:
+                                spans_ordered <- false if span.skip_start < previous_span_end
+                                previous_span_end <- span.skip_end if span.skip_end > previous_span_end
+                                definition_cursor <- span.skip_end
+                            elif definition_cursor < tokens.count:
+                                definition_cursor <- definition_cursor + 1
+                            return false if not spans_ordered
+                            record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                            return false if record.key_start > snapshot.bytes.count or record.key_length > snapshot.bytes.count - record.key_start or record.key_length < 8
+                            path_length: usize = ifc_read_u32(snapshot.bytes, record.key_start).usize()
+                            return false if path_length > record.key_length - 8 or path_length != snapshot.source_path_length
+                            path_start: usize = record.key_start + 4
+                            return false if not ifc_equal(snapshot.bytes, path_start, path_length, snapshot.bytes, snapshot.source_path_start, snapshot.source_path_length)
+                            name_length_start: usize = path_start + path_length
+                            name_length: usize = ifc_read_u32(snapshot.bytes, name_length_start).usize()
+                            name_start: usize = name_length_start + 4
+                            return false if name_length != record.key_length - path_length - 8 or name_length != name.len
+                            for name_offset in 0..<name_length |snapshot, name|:
+                                return false if snapshot.bytes[name_start + name_offset] != name[name_offset]
+                            return false if record.cacheable and not span.found
+                            return false if span.found and (span.body_start > span.body_end or span.body_end > tokens.count)
+                            snapshot.current_anchors.push(IncrementalFunctionSourceAnchor{definition_offset: position.offset, body_token_start: span.body_start, body_token_end: span.body_end})
+                            if record.cacheable:
+                                snapshot.functions[record_index].matched_previous <- true
+                                snapshot.bodies_matched <- snapshot.bodies_matched + 1
+                            else:
+                                snapshot.functions[record_index].matched_previous <- false
+                                snapshot.bodies_rejected <- snapshot.bodies_rejected + 1
+                            record_index <- record_index + 1
+                        _:
+                            pass
+                return false if record_index != snapshot.functions.count or snapshot.current_anchors.count != snapshot.functions.count
+                snapshot.surface_compatible <- true
+                return true

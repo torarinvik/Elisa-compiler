@@ -229,27 +229,36 @@ publication, and scheduling only cache misses remain to be implemented and teste
 Producer and loaded LLVM identities must be verified against actual artifacts;
 environment paths or supplied digest strings alone cannot authorize a hit.
 
-The function-fact collector and snapshot codec are now connected to an explicit
+The function-fact collector and snapshot codec are connected to an explicit
 `ELISA_STAGE1_INCREMENTAL_CACHE_DIR` opt-in. The driver reloads a bounded,
-versioned snapshot, recollects facts against the exact current AST/source/token
-tuple, and only offers a prior body match when the declaration surface matches.
-Every candidate body is rescanned from the current AST before admission; the
-sidecar's cacheable bit and fact counts never authorize a skip. The only checker
-work skipped is the two Global-authority body walks for a current-source-verified,
-cacheable body with zero direct facts and an exact prior body match. Other bodies,
-checkers, closure construction, and report publication stay on the cold path. The
-snapshot stores portable facts; invocation-local body anchors are rebuilt and
-rebound on each parse. Publication is allowed for errorful translation units
-because this sidecar stores only current-source observations; semantic diagnostics
-are recomputed on every invocation. This does not satisfy diagnostic replay for
-future cached semantic results. This is a narrow work-avoidance experiment, not
-yet a qualified incremental-compilation speedup.
+versioned snapshot and recollects facts from the exact current AST/source/token
+tuple. Persisted flags and facts remain hints for matching only; they never
+authorize a checker skip. Current-source records with unique top-level definition
+anchors, successful supported-body scans, and zero direct facts can skip the
+Global-authority inference walk and, when enabled, its report walk, repeated
+effect-source body scans, and the two per-body panic-coverage walks, including on
+cold runs. A direct-call-only body can also replace the Global-authority inference
+walk after its targets are resolved against the current function index; its report
+walk stays cold. When Global permission enforcement is enabled, Read/Write axes
+project freshly collected facts for eligible flat bodies without local bindings,
+while retaining each function slot; zero-fact bodies contribute empty axes. The
+panic pass still builds its wrapper index and annotation views and visits
+declarations; only bound-name collection and its body walkers are skipped. The conservative collector rejects
+local reference writes, nested grant blocks, parenthesized expressions, and
+unsupported syntax so these skips preserve authority behavior and walker-depth
+diagnostics. Global-authority replay also stays cold for the whole unit when
+inline-grant annotations are present, because their spans are not yet bound to
+function facts. Other bodies, checkers, closure construction, and report publication
+stay on the cold path. Invocation-local body anchors are rebuilt on each parse.
+Semantic diagnostics are recomputed every invocation; this does not replay
+semantic results or qualify an incremental-compilation speedup.
 
-The existing narrow parity controls pass cold, first-cache, warm, body-edited,
-option-changed, structurally valid forged-sidecar, and corrupted-cache runs for
-diagnostics and exit status, and compare canonical effect rows in a direct
-checker control at O0 and O2. They validate the implemented downstream
-Global-authority walk skip, not reuse of semantic body analysis. Existing
+The existing narrow parity controls previously covered cold, first-cache, warm,
+body-edited, option-changed, structurally valid forged-sidecar, and corrupted-cache
+runs for diagnostics and exit status, plus canonical effect rows in direct checker
+controls. They predate the current-source skip expansion and tightened fact
+eligibility; those changes still need parity and performance qualification. They
+do not validate reuse of semantic body analysis. Existing
 Global-permission, static-generation, and source-identity shadow gates also pass.
 Further invalidation workloads must cover dependencies before eligibility expands.
 No timing claim is made from these parity controls. Small cross-language
@@ -302,9 +311,9 @@ Cache reuse is valid only when it produces the same diagnostics, inferred effect
 
 `src/driver/elisac_includes.elisa` expands includes into one flat source buffer and carries an original-file line map. `src/driver/elisac.elisa` tokenizes and parses that buffer into one `Ast::File`, then calls `run_semantic_gate` before creating one LLVM module. This means the first implementation should cache function bodies inside the translation unit; treating include files as independent compilation units would change name lookup and module semantics.
 
-In `src/semantic/semantic_api.elisa`, `collect_effect_sources` runs before `check_ungranted_panic`, and `check_mutable_global_authority` follows it. The panic checker and authority checker currently perform separate body walks. `check_mutable_global_authority` creates a fresh `GlobalAuthority`, collects declarations and lexical indexes, analyzes bodies through `ga_functions`, closes call/effect rows, publishes rows to `SymbolTable`, and walks bodies again to issue enforced diagnostics. Its numeric function slots, lexical scope numbers, AST nodes, offsets, and interned references are invocation-local and cannot be written to disk as identities.
+In `src/semantic/semantic_api.elisa`, `collect_effect_sources` runs before `check_ungranted_panic`, and `check_mutable_global_authority` follows it. The body passes still compute from current AST facts: zero-fact records bypass supported body walks, direct-call-only records can seed Global-authority inference after current target resolution, and Global-permission axes project current direct facts for flat bodies without local bindings. Both call-based projections fall back to the AST when ordinary global lookup resolves the callee spelling, preserving the cold walk's callee-identifier read. `check_mutable_global_authority` still creates a fresh `GlobalAuthority`, collects declarations and lexical indexes, closes call/effect rows, publishes rows to `SymbolTable`, and walks unsupported or fact-bearing bodies outside the direct-call-only case. Its numeric function slots, lexical scope numbers, AST nodes, offsets, and interned references are invocation-local and cannot be written to disk as identities.
 
-The compiler has content-addressed caches for a complete unchanged stage1 object build in `scripts/elisac_stage1.sh`, plus build/runtime object provenance helpers. Those caches do not help when one function changes because the object key covers the complete compile invocation. The semantic sidecar is an opt-in prototype; it currently saves only narrowly eligible Global-authority body walks and does not cache codegen or the other semantic passes.
+The compiler has content-addressed caches for a complete unchanged stage1 object build in `scripts/elisac_stage1.sh`, plus build/runtime object provenance helpers. Those caches do not help when one function changes because the object key covers the complete compile invocation. The semantic sidecar is an opt-in prototype; it currently saves narrowly eligible body walks in the Global-authority, effect-source, panic-coverage, and Global-permission passes. It does not cache codegen, pass-level indexes, closure construction, or diagnostics.
 
 The backend has a useful body boundary: `src/backend/codegen_module.elisa` declares module entities before `emit_module_bodies`, and `src/backend/codegen_declare.elisa` contains `emit_function_body`. It currently emits into one shared LLVM module. `src/backend/llvm_c.elisa` binds bitcode writing, but not bitcode parsing or module linking. Reusing a body therefore needs an explicit fragment restore path; skipping `emit_function_body` alone would leave the new module without that body.
 
@@ -407,7 +416,9 @@ Start codegen reuse with `-O0`, without debug/profiling/coverage metadata, and w
 
 1. **Instrument the baseline.** On the exact local compiler seed and host in a quiet window, record phase wall/CPU time for `check_ungranted_panic`, `check_mutable_global_authority`, their combined interval, number of function bodies visited, number of resolved calls/edges, and current diagnostics/effect-row report. Do not infer the 993-second cost from unrelated historical self-host timings.
 2. **Collect and bind facts.** The opt-in driver path now passes the exact analyzed source and tokens alongside the AST, while policy options still come from the original source. Ordinary, expanded `static generate`, and early `pymodule` gates use the paired frontend inputs. The collector remains deliberately narrow; unsupported bodies stay cold. The separate shadow observer remains observational and must not be confused with checker reuse.
-3. **Persist and consume one proven case.** An opt-in sidecar uses bounded no-follow, nonblocking reads, schema/semantic/options validation, recollection against current source, exclusive temporary-file creation, and atomic rename publication. A symlink or FIFO at the cache-file path is a miss; a stale or pre-existing temporary path fails publication closed instead of being followed. These flags protect the final path component only; the configured cache directory is not pinned against symlink substitution. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker skips only current-source-verified, prior-matched zero-direct-fact bodies in both Global-authority walks, then rebuilds indexes, call/effect closure, rows, and diagnostics as usual. The direct control checks diagnostic and canonical-row parity; the CLI control checks cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and exact counters. Its `panic_only` fixture grants `Abort.Panic` through `trusted`, so it remains semantically clean and does not cover errorful publication. An errorful translation-unit control has been added to compare cold, first-cache, and warm diagnostics, exit status, publication, and a warm authority skip; runtime verification remains pending a fresh Stage1 product. Both available products checked—the default `bin/elisac-stage1` and `build/goal-compiler-latest-b11e/bin/elisac-stage1`—report provenance schema `elisa-stage1-provenance-v1`, while the current checker requires v5. A fresh seed attempt using a Stage0 binary rebuilt from the current dirty Go tree (SHA-256 `83d2e903…91bb2`) with a 12 GiB guard exited 1 during semantic analysis; its log contains 97 located non-warning diagnostics and 32,078 warning rows (`/tmp/elisa-incremental-current-seed.log`). It did not produce a current Stage1 binary. The present controls validate only downstream Global-authority walk skipping; they do not pass the semantic-reuse acceptance gate because all candidate bodies are still rescanned. This narrow checker-work reduction is not an end-to-end performance result.
+3. **Persist and consume one proven case.** An opt-in sidecar uses bounded no-follow, nonblocking reads, schema/semantic/options validation, recollection against current source, exclusive temporary-file creation, and atomic rename publication. A symlink or FIFO at the cache-file path is a miss; a stale or pre-existing temporary path fails publication closed instead of being followed. These flags protect the final path component only; the configured cache directory is not pinned against symlink substitution. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker uses current-source-verified, uniquely anchored, cacheable zero-direct-fact top-level bodies to skip Global-authority inference/report walks, repeated effect-source scans, and two panic-coverage body scans. It also replays direct-call-only records into Global-authority inference after resolving targets against the fresh function index, and projects current direct facts into Global-permission Read/Write axes for flat bodies without local bindings. Both retain function slots and closure/row work. The direct control compares diagnostics and canonical rows with Global-permission enforcement enabled, and asserts effect-source, panic-coverage, and Global-permission axis counters. The CLI control covers cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and asserts GA plus effect-source, panic-coverage, and Global-permission axis counters. These expanded controls have not been run against a fresh Stage1 product. Both available products checked—the default `bin/elisac-stage1` and `build/goal-compiler-latest-b11e/bin/elisac-stage1`—report provenance schema `elisa-stage1-provenance-v1`, while the current checker requires v5. A fresh seed attempt using a Stage0 binary rebuilt from the current dirty Go tree (SHA-256 `83d2e903…91bb2`) with a 12 GiB guard exited 1 during semantic analysis; its log contains 97 located non-warning diagnostics and 32,078 warning rows (`/tmp/elisa-incremental-current-seed.log`). It did not produce a current Stage1 binary. This narrow checker-work reduction is not an end-to-end performance result.
+3a. **Replay one dependency fact.** Current-source-only direct-call records may replace a supported caller's Global-authority inference walk after ordinary global lookup misses and every target resolves uniquely against the fresh function index. Keep report walks and cold fallback. Add warm/cold controls for callee `Global.Read`/`Global.Write` changes, body relocation, and ambiguous target invalidation before widening eligibility.
+3b. **Use a trusted process-local semantic session.** `run_semantic_gate_incremental_with_session` accepts a bounded caller-owned session. It stores exact analyzed bytes, the complete source/include graph identity, exact options, input phase, semantic version, and a validated portable snapshot. Exact-input hits decode the snapshot and rebuild source anchors from the fresh parse before skipping the fact collector. The current compiler entry point handles one request and calls the session-disabled wrapper, so no production path gets a session hit yet; a long-lived host must retain a session and call the session-aware API for cross-request reuse. Persisted sidecars still take the current-source collector path because they are untrusted. Session admission is byte-identical input only; body-level reuse across edits is not implemented by this session. Keep diagnostics on the normal current-source path until a separate location-rebinding result format is proven. The session stores only owned portable facts and grants, never AST, SymbolTable, line-map, or LLVM handles. It keeps one bounded translation-unit entry; changed admission inputs or malformed facts clear it and run cold.
 4. **Prove invalidation.** Compare warm incremental output byte-for-byte with cold output for: unchanged build; a body-only edit with unchanged API; a callee body edit that adds/removes `Global.Read` or `Global.Write`; a callee effect-contract change; adding an overload after a previous lookup; changing an import or alias that resolves a previous miss; changing a global from immutable to mutable or changing its type/layout; changing a protocol method contract/conformance; changing strict/global options; and corrupting or versioning out the cache.
 5. **Add body codegen fragments.** Cache and restore eligible `-O0` LLVM function bodies in a newly created module, then test link validity, object/executable parity, and invalidation for function API, type/global layout, callee ABI, target, and codegen flags.
 6. **Expand eligibility and optimization.** Add callback/generic/debug support only with explicit fingerprints and controls. Consider cross-function optimized reuse only with an import/summary model and runtime parity evidence.
@@ -424,14 +435,24 @@ Without stable identity, or when the cache directory is unset, the driver runs t
 ordinary cold semantic gate.
 
 The current replay seam does not consume stored facts as authority effects. It
-rescans each supported body from the current AST, rebuilds current anchors, and
-validates exact body and declaration-surface matching. A prior record's cacheable
-bit and direct-fact count cannot authorize a skip. The checker skips only a
-current-source-verified, unchanged body with zero direct facts, keeping every body
-that could contribute a Global fact on the full path. The current serialized
-controls cover body edits, semantic-option changes, a valid-checksum forged
-sidecar, and corrupt cache data. Dependency-change invalidation remains to be
-added before eligibility expands. The manual
+rescans each supported body from the current AST and rebuilds current anchors;
+persisted cacheability and fact counts cannot authorize a skip. A freshly scanned, cacheable zero-fact record can skip Global-authority walks,
+effect-source scans, panic-coverage body scans, and Global-permission body-axis
+collectors only at a unique top-level definition offset. Direct-call-only records
+can also seed Global-authority inference after fresh target resolution.
+Global-permission axes project direct facts for flat fact-bearing bodies without
+local bindings. Collection still appends every function slot, then closes the
+call graph and publishes rows. Panic coverage
+still builds its annotation and concrete-wrapper indexes and traverses the
+declaration tree. Local reference writes, nested blocks, parenthesized
+expressions, duplicate anchors, and unsupported syntax stay cold. Global-authority
+replay also stays cold for the whole unit when inline-grant annotations are present.
+This still
+rescans every candidate body and recomputes semantic diagnostics; it does not
+replay results. The current serialized controls cover body edits, semantic-option
+changes, a valid-checksum forged sidecar, and corrupt cache data, but the expanded
+current-source skip and tighter eligibility need fresh parity qualification.
+Dependency-change invalidation remains to be added before eligibility expands. The manual
 `INCREMENTAL_SEMANTIC_ENGINE_VERSION` must be bumped whenever changes can alter
 collector eligibility or the meaning of facts consumed by replay.
 
@@ -452,19 +473,43 @@ eligibility. `visited` counts function candidates passed through the collector,
 including candidates rejected before `ifc_walk_body`; `matched` counts records
 whose body and declaration surface match after current facts were recollected.
 A matched body is only a source/cache match; it does not mean its semantic result
-was reused. `ga_walks_skipped` is the current measure of avoided checker work and
-counts only Global-authority body walks skipped. Any future local-initializer
-products must be reported separately from function-body counts.
+was reused. `ga_walks_skipped` counts Global-authority body walks skipped.
+`effect_source_bodies_skipped` counts function bodies whose repeated effect-source
+scans were bypassed. `ungranted_panic_bodies_skipped` counts function bodies whose
+bound-name collection and two panic-coverage body scans were bypassed.
+`global_permission_axis_scans_skipped` counts Read/Write body collectors replaced
+by current-fact projection or by an empty zero-fact result. Each eligible function
+contributes two when Global-permission enforcement is enabled and the file has at
+least one mutable global. Fact projection currently keeps bodies with local
+bindings or nested control flow on the AST path. Each metric counts bodies or axes
+once per pass, not individual helper walks. Any future
+local-initializer products must be reported separately from function-body counts.
 
 The current-source fact scan also allows `collect_effect_sources` to skip its
-second body walk for a uniquely anchored, cacheable function with zero direct
-facts. This applies on cache hits and misses because the evidence is recollected
-from the current AST; stale sidecar flags and names do not authorize the skip.
-Duplicate or malformed anchors and unsupported bodies remain on the cold path.
-The report counts these as `effect_source_walks_skipped`, separately from
-`ga_walks_skipped`. The optimization does not skip `check_ungranted_panic`,
-authority indexing/closure, code generation, or linking. LLVM fragment loading
-remains a separate later stage.
+repeated body scans for a uniquely anchored, cacheable top-level function with
+zero direct facts. This applies on cache hits and misses because the evidence is
+recollected from the current AST; stale sidecar flags and names do not authorize
+the skip. Duplicate or malformed anchors and unsupported bodies remain on the
+cold path. The report counts these bodies as `effect_source_bodies_skipped`,
+separately from `ga_walks_skipped`. A second Global-authority case consumes a
+record only when every current fact is a direct call with no active grants. It
+resolves all targets uniquely against the fresh function index before adding
+edges, then skips that body's inference walk; the report walk remains cold to
+preserve exact diagnostic locations. The same proof skips only the body-bound-name,
+panic statement, and grant-coverage scans in `check_ungranted_panic`; effect-wrapper
+indexing/closure, code generation, and linking remain on the full path. With
+Global-permission enforcement enabled, the same current-source fact pass also
+replaces the local-name, Global.Read/Write, and direct-call collectors for eligible
+top-level functions. Zero-fact records contribute false direct bits; flat
+fact-bearing bodies without local bindings project their direct read/write facts
+and call edges. Their function slots remain so closure and effect-row publication
+still include the complete declaration set. Bodies with local bindings, nested
+control flow, or nested declarations stay cold. The direct checker control enables
+Global-permission enforcement, compares canonical rows, and asserts axis-scan
+counters; the CLI control enables it with `# globals` and asserts the same counter
+alongside the other pass counters. Runtime parity for these updated controls is
+still pending a fresh Stage1 product. LLVM fragment loading remains a separate
+later stage.
 
 ### Driver source context boundary
 

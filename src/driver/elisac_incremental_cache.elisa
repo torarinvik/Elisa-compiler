@@ -5,6 +5,86 @@ struct IncrementalCacheRead:
     bytes: darray[u8]
 
 
+struct IncrementalSemanticSession:
+    enabled: bool
+    valid: mutable bool
+    analyzed_source: mutable darray[u8]
+    identity: mutable SourceIdentity::Capture
+    options_key: mutable darray[u8]
+    generated_input: mutable bool
+    semantic_fingerprint: mutable u64
+    snapshot_bytes: mutable darray[u8]
+
+const IGC_SESSION_IDENTITY_VISIT_LIMIT: usize = 65536
+
+
+def incremental_semantic_session_new() -> IncrementalSemanticSession can[Memory.Allocate]:
+    return IncrementalSemanticSession{enabled: true, valid: false, analyzed_source: [], identity: SourceIdentity::empty(false), options_key: [], generated_input: false, semantic_fingerprint: 0, snapshot_bytes: []}
+
+
+def igc_session_matches(session: IncrementalSemanticSession&, analyzed_source: u8&, analyzed_length: usize, identity: SourceIdentity::Capture&, options_key: darray[u8]&, semantic_fingerprint: u64, generated_input: bool) -> bool can[Abort.Panic, Unsafe.PointerArithmetic]:
+    return false if not session.enabled or not session.valid
+    return false if session.semantic_fingerprint != semantic_fingerprint or session.generated_input != generated_input
+    return false if analyzed_length != session.analyzed_source.count or options_key.count != session.options_key.count
+    return false if not SourceIdentity::usable(identity) or not SourceIdentity::equal(session.identity, identity)
+    for index in 0..<options_key.count |session, options_key|:
+        return false if session.options_key[index] != options_key[index]
+    for index in 0..<analyzed_length |session, analyzed_source|:
+        source_byte: u8& = analyzed_source + index
+        source_value: u8 = source_byte
+        return false if session.analyzed_source[index] != source_value
+    return true
+
+
+def igc_session_store(session: mutable IncrementalSemanticSession&, analyzed_source: u8&, analyzed_length: usize, identity: SourceIdentity::Capture&, options_key: darray[u8]&, generated_input: bool, semantic_fingerprint: u64, snapshot: Semantic::IncrementalSemanticSnapshot&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast}]:
+    session.valid <- false
+    return false if not session.enabled or not SourceIdentity::usable(identity)
+    return false if identity.paths.count > IGC_SESSION_IDENTITY_VISIT_LIMIT or identity.edges.count != identity.paths.count - 1
+    encoded: Semantic::IncrementalSnapshotEncodeResult = Semantic::incremental_encode_snapshot(snapshot)
+    return false if not encoded.valid
+    session_size: usize = analyzed_length
+    return false if session_size > Semantic::INCREMENTAL_SNAPSHOT_CODEC_LIMIT
+    return false if identity.bytes.count > Semantic::INCREMENTAL_SNAPSHOT_CODEC_LIMIT - session_size
+    session_size <- session_size + identity.bytes.count
+    return false if options_key.count > Semantic::INCREMENTAL_SNAPSHOT_CODEC_LIMIT - session_size
+    session_size <- session_size + options_key.count
+    return false if encoded.bytes.count > Semantic::INCREMENTAL_SNAPSHOT_CODEC_LIMIT - session_size
+    session_size <- session_size + encoded.bytes.count
+    # Bound the copied include-graph tables as well as their path bytes. The capture
+    # is capped above, so these products and their sum cannot overflow usize.
+    identity_metadata: usize = identity.paths.count * 40 + identity.edges.count * 16
+    return false if identity_metadata > Semantic::INCREMENTAL_SNAPSHOT_CODEC_LIMIT - session_size
+    session_size <- session_size + identity_metadata
+    session.analyzed_source.truncate(0)
+    for index in 0..<analyzed_length |session, analyzed_source|:
+        source_byte: u8& = analyzed_source + index
+        source_value: u8 = source_byte
+        session.analyzed_source.push(source_value)
+    session.identity.enabled <- identity.enabled
+    session.identity.valid <- identity.valid
+    session.identity.complete <- identity.complete
+    session.identity.root <- identity.root
+    session.identity.bytes.truncate(0)
+    for byte in identity.bytes |session|:
+        session.identity.bytes.push(byte)
+    session.identity.paths.truncate(0)
+    for path in identity.paths |session|:
+        session.identity.paths.push(path)
+    session.identity.edges.truncate(0)
+    for edge in identity.edges |session|:
+        session.identity.edges.push(edge)
+    session.options_key.truncate(0)
+    for byte in options_key |session|:
+        session.options_key.push(byte)
+    session.snapshot_bytes.truncate(0)
+    for byte in encoded.bytes |session|:
+        session.snapshot_bytes.push(byte)
+    session.generated_input <- generated_input
+    session.semantic_fingerprint <- semantic_fingerprint
+    session.valid <- true
+    return true
+
+
 def igc_cache_path(cache_directory: darray[u8]&, source_path: sview) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
     path: mutable darray[u8] = []
     for index in 0..<cache_directory.count |path, cache_directory|:
@@ -107,41 +187,65 @@ def igc_write_atomic(path: darray[u8]&, bytes: darray[u8]&, semantic_fingerprint
     return write_valid
 
 
-def run_semantic_gate_incremental(file: Ast::File&, policy_source: u8&, policy_length: usize, analyzed_source: u8&, analyzed_length: usize, tokens: darray[Lexer::Token]&, identity: SourceIdentity::Capture&, cache_directory: darray[u8]&, report_cache: bool, generated_input: bool) -> i64 can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+def run_semantic_gate_incremental_with_session(file: Ast::File&, policy_source: u8&, policy_length: usize, analyzed_source: u8&, analyzed_length: usize, tokens: darray[Lexer::Token]&, identity: SourceIdentity::Capture&, cache_directory: darray[u8]&, report_cache: bool, generated_input: bool, session: mutable IncrementalSemanticSession&) -> i64 can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
     options: Semantic::IncrementalSemanticOptions = stage1_semantic_options(policy_source, policy_length)
     semantic_fingerprint: u64 = Semantic::INCREMENTAL_SEMANTIC_ENGINE_VERSION
     options_key: mutable darray[u8] = []
     options_key_valid: mutable bool = false
     options_fingerprint: mutable u64 = 0
-    if cache_directory.count > 0:
+    if cache_directory.count > 0 or session.enabled:
         options_key_valid <- Semantic::incremental_semantic_options_encode(options, &options_key)
         if options_key_valid:
             options_fingerprint <- Semantic::incremental_semantic_options_key_fingerprint(options_key)
     snapshot: mutable Semantic::IncrementalSemanticSnapshot = Semantic::incremental_empty_snapshot()
     cache_path: mutable darray[u8] = []
     cache_admitted: mutable bool = false
+    admission_inputs_valid: mutable bool = false
     cache_loaded: mutable bool = false
-    # Key validity is tracked separately: zero is a possible 64-bit fingerprint value.
-    if cache_directory.count > 0 and options_key_valid and SourceIdentity::usable(identity) and identity.root < identity.paths.count:
+    source_path: mutable sview = ""
+    identity_usable: bool = SourceIdentity::usable(identity) and identity.root < identity.paths.count
+    if identity_usable:
         root: SourceIdentity::PathRecord = identity.paths[identity.root]
-        source_path: sview = bytes_view_range_ref(identity.bytes, root.start, root.length)
-        if source_path.len > 0:
+        source_path <- bytes_view_range_ref(identity.bytes, root.start, root.length)
+    admission_inputs_valid <- source_path.len > 0 and options_key_valid and identity_usable
+    session_hit: mutable bool = false
+    if session.enabled and options_key_valid and identity_usable and source_path.len > 0:
+        session_hit <- igc_session_matches(session, analyzed_source, analyzed_length, identity, options_key, semantic_fingerprint, generated_input)
+        if session_hit:
+            decoded_session: Semantic::IncrementalSnapshotDecodeResult = Semantic::incremental_decode_snapshot(session.snapshot_bytes, semantic_fingerprint, options_fingerprint, options_key)
+            if decoded_session.valid:
+                snapshot <- decoded_session.snapshot
+                session_hit <- Semantic::incremental_reanchor_exact_snapshot(file, tokens, &snapshot)
+            else:
+                session_hit <- false
+    if session.enabled and not session_hit:
+        session.valid <- false
+
+    snapshot_current: mutable bool = session_hit
+    if admission_inputs_valid:
+        if cache_directory.count > 0:
             igc_mkdir(cache_directory)
             cache_path <- igc_cache_path(cache_directory, source_path)
-            stored: IncrementalCacheRead = igc_read_cache(cache_path)
+            cache_admitted <- true
+        if not session_hit:
             previous: mutable Semantic::IncrementalSemanticSnapshot = Semantic::incremental_empty_snapshot()
             has_previous: mutable bool = false
-            if stored.valid:
-                decoded: Semantic::IncrementalSnapshotDecodeResult = Semantic::incremental_decode_snapshot(stored.bytes, semantic_fingerprint, options_fingerprint, options_key)
-                if decoded.valid:
-                    previous <- decoded.snapshot
-                    has_previous <- true
-                    cache_loaded <- true
+            if cache_directory.count > 0:
+                stored: IncrementalCacheRead = igc_read_cache(cache_path)
+                if stored.valid:
+                    decoded: Semantic::IncrementalSnapshotDecodeResult = Semantic::incremental_decode_snapshot(stored.bytes, semantic_fingerprint, options_fingerprint, options_key)
+                    if decoded.valid:
+                        previous <- decoded.snapshot
+                        has_previous <- true
+                        cache_loaded <- true
             snapshot <- Semantic::incremental_collect_function_facts(file, analyzed_source, analyzed_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, previous, has_previous)
-            cache_admitted <- true
+            snapshot_current <- true
 
     incremental_skip_count: mutable u64 = 0
-    semantic_errors: i64 = run_semantic_gate_with_snapshot(file, policy_source, policy_length, options, snapshot, &incremental_skip_count) can Global{Read,Write}
+    effect_source_bodies_skipped: mutable u64 = 0
+    ungranted_panic_bodies_skipped: mutable u64 = 0
+    global_permission_axis_scans_skipped: mutable u64 = 0
+    semantic_errors: i64 = run_semantic_gate_with_snapshot(file, policy_source, policy_length, options, snapshot, &incremental_skip_count, &effect_source_bodies_skipped, &ungranted_panic_bodies_skipped, &global_permission_axis_scans_skipped) can Global{Read,Write}
     cache_published: mutable bool = false
     # This sidecar stores only facts collected from the current AST/source and
     # is revalidated by the authority checker before it can skip a walk. It does
@@ -151,6 +255,8 @@ def run_semantic_gate_incremental(file: Ast::File&, policy_source: u8&, policy_l
         encoded: Semantic::IncrementalSnapshotEncodeResult = Semantic::incremental_encode_snapshot(snapshot)
         if encoded.valid:
             cache_published <- igc_write_atomic(cache_path, encoded.bytes, semantic_fingerprint, options_fingerprint, options_key)
+    if session.enabled and snapshot_current and not session_hit:
+        _ = igc_session_store(session, analyzed_source, analyzed_length, identity, options_key, generated_input, semantic_fingerprint, snapshot)
 
     if report_cache:
         report: mutable darray[u8] = []
@@ -189,8 +295,26 @@ def run_semantic_gate_incremental(file: Ast::File&, policy_source: u8&, policy_l
             report.extend("yes")
         else:
             report.extend("no")
-        if not cache_admitted:
+        report.extend(" effect_source_bodies_skipped=")
+        append_decimal(&report, effect_source_bodies_skipped.u32())
+        report.extend(" ungranted_panic_bodies_skipped=")
+        append_decimal(&report, ungranted_panic_bodies_skipped.u32())
+        report.extend(" global_permission_axis_scans_skipped=")
+        append_decimal(&report, global_permission_axis_scans_skipped.u32())
+        report.extend(" session=")
+        if not session.enabled:
+            report.extend("off")
+        elif session_hit:
+            report.extend("hit")
+        else:
+            report.extend("miss")
+        if not admission_inputs_valid:
             report.extend(" reason=unstable-source-or-options")
         report.push(10)
         write_stderr(report)
     return semantic_errors
+
+
+def run_semantic_gate_incremental(file: Ast::File&, policy_source: u8&, policy_length: usize, analyzed_source: u8&, analyzed_length: usize, tokens: darray[Lexer::Token]&, identity: SourceIdentity::Capture&, cache_directory: darray[u8]&, report_cache: bool, generated_input: bool) -> i64 can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+    session: mutable IncrementalSemanticSession = IncrementalSemanticSession{enabled: false, valid: false, analyzed_source: [], identity: SourceIdentity::empty(false), options_key: [], generated_input: false, semantic_fingerprint: 0, snapshot_bytes: []}
+    return run_semantic_gate_incremental_with_session(file, policy_source, policy_length, analyzed_source, analyzed_length, tokens, identity, cache_directory, report_cache, generated_input, &session)
