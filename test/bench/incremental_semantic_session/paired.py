@@ -149,6 +149,16 @@ class DarwinRusageInfoV4(ctypes.Structure):
     _fields_ = [("uuid", ctypes.c_ubyte * 16), ("values", ctypes.c_uint64 * 35)]
 
 
+class DarwinTimebaseInfo(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+def mach_ticks_to_ns(ticks: int, numer: int, denom: int) -> int:
+    if ticks < 0 or numer <= 0 or denom <= 0:
+        raise ValueError("invalid Mach timebase or tick count")
+    return ticks * numer // denom
+
+
 class DarwinProcessCounters:
     """Read cumulative retired instructions and cycles for one macOS PID."""
 
@@ -160,6 +170,15 @@ class DarwinProcessCounters:
         self.proc_pid_rusage = self.libproc.proc_pid_rusage
         self.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
         self.proc_pid_rusage.restype = ctypes.c_int
+        self.libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        timebase = self.libsystem.mach_timebase_info
+        timebase.argtypes = [ctypes.POINTER(DarwinTimebaseInfo)]
+        timebase.restype = ctypes.c_int
+        info = DarwinTimebaseInfo()
+        if timebase(ctypes.byref(info)) != 0 or info.numer == 0 or info.denom == 0:
+            raise RuntimeError("could not establish Mach CPU-time units")
+        self.timebase_numer = int(info.numer)
+        self.timebase_denom = int(info.denom)
 
     def snapshot(self, pid: int) -> dict[str, int]:
         info = DarwinRusageInfoV4()
@@ -170,7 +189,9 @@ class DarwinProcessCounters:
         return {
             "instructions_retired": int(info.values[self.INSTRUCTIONS_INDEX]),
             "cycles_elapsed": int(info.values[self.CYCLES_INDEX]),
-            "cpu_time_ns": int(info.values[0] + info.values[1]),
+            "cpu_time_ns": mach_ticks_to_ns(
+                int(info.values[0] + info.values[1]), self.timebase_numer, self.timebase_denom
+            ),
         }
 
 
@@ -430,6 +451,9 @@ def run_arm(
         "process_counters": {
             "status": "ok",
             "method": "macOS proc_pid_rusage RUSAGE_INFO_V4",
+            "cpu_time_unit": "nanoseconds converted from Mach absolute ticks",
+            "mach_timebase_numer": process_counters.timebase_numer,
+            "mach_timebase_denom": process_counters.timebase_denom,
             **counter_totals,
             "pid": compiler_pid,
             "scope": "exact Stage1 child process; per-request deltas cover each check response",

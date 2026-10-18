@@ -1,11 +1,13 @@
 import math
 import os
 import sys
+import time
 import unittest
 
 from paired import (
     DarwinProcessCounters,
     counter_delta,
+    mach_ticks_to_ns,
     paired_counter_measurements,
     paired_timing_summary,
     timing_arm_kinds,
@@ -13,6 +15,15 @@ from paired import (
 
 
 class PairedTimingSummaryTest(unittest.TestCase):
+    def test_converts_mach_ticks_with_integer_precision(self) -> None:
+        self.assertEqual(mach_ticks_to_ns(3, 125, 3), 125)
+        self.assertEqual(mach_ticks_to_ns(1, 125, 3), 41)
+        self.assertEqual(mach_ticks_to_ns(123, 1, 1), 123)
+        self.assertEqual(mach_ticks_to_ns(2**63, 125, 3), 2**63 * 125 // 3)
+        for values in [(-1, 1, 1), (1, 0, 1), (1, 1, 0)]:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                mach_ticks_to_ns(*values)
+
     def test_reports_paired_median_geomean_and_wins(self) -> None:
         summary = paired_timing_summary([0.8, 1.25, 1.0], "fixture control")
 
@@ -57,6 +68,21 @@ class PairedTimingSummaryTest(unittest.TestCase):
         delta = counter_delta(before, after)
         self.assertGreater(delta["instructions_retired"], 0)
         self.assertGreater(delta["cycles_elapsed"], 0)
+        self.assertGreater(checksum, 0)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS process counters are Darwin-specific")
+    def test_process_cpu_time_uses_nanoseconds(self) -> None:
+        counters = DarwinProcessCounters()
+        start = time.process_time_ns()
+        before = counters.snapshot(os.getpid())
+        checksum = sum((index * index) ^ (index >> 3) for index in range(600_000))
+        after = counters.snapshot(os.getpid())
+        elapsed = time.process_time_ns() - start
+        measured = counter_delta(before, after)["cpu_time_ns"]
+        # The reads include slightly different Python/syscall overhead. This
+        # checks units, not timing performance or exact scheduling equivalence.
+        self.assertGreater(measured / elapsed, 0.8)
+        self.assertLess(measured / elapsed, 1.2)
         self.assertGreater(checksum, 0)
 
 
