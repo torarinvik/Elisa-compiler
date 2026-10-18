@@ -108,6 +108,17 @@ send_check() {
     printf '%s\n' "$report_line" >>"$REPORTS"
 }
 
+assert_no_graph_restore() {
+    local report="$1"
+    local context="$2"
+    [[ ! "$report" =~ session=hit([[:space:]]|$) ]] \
+        || fail "$context unexpectedly hit the retained session: $report"
+    [[ "$report" =~ source_input_admitted=no([[:space:]]|$) ]] \
+        || fail "$context unexpectedly admitted the previous declaration surface: $report"
+    [[ "$report" =~ function_body_facts_restored=0([[:space:]]|$) ]] \
+        || fail "$context restored function facts across a changed input surface: $report"
+}
+
 write_valid_source 1
 ELISA_STAGE1_BIN="$STAGE1" ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
     "${PYTHON_BIN:-python3}" -c 'import os, sys; os.setsid(); os.execvp("bash", ["bash", *sys.argv[1:]])' \
@@ -204,6 +215,81 @@ second_warm_unknown_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc '
 
 write_valid_source 2 1
 send_check 0
+
+# A warm root source that imports another file must not keep its previous result
+# when only the included file's body changes. Compare the retained host's error
+# and recovery with cold checks so include identity participates in invalidation.
+INCLUDED="$WORK/included-helper.elisa"
+cat >"$INCLUDED" <<'EOF'
+def include_helper() -> i64:
+    return 40
+EOF
+cat >"$SOURCE" <<'EOF'
+include "included-helper.elisa"
+
+def main() -> i64:
+    return include_helper()
+EOF
+send_check 0
+include_seed_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$include_seed_report" "the new include surface"
+
+cat >"$INCLUDED" <<'EOF'
+def include_helper() -> i64:
+    return include_stale_symbol
+EOF
+include_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/include-cold.stdout" 2>"$WORK/include-cold.stderr" || include_cold_status=$?
+[[ "$include_cold_status" -ne 0 ]] || fail "cold check accepted the unresolved name from an edited include"
+include_cold_diagnostic="$(grep -F 'error:' "$WORK/include-cold.stderr" | grep -F 'include_stale_symbol' | tail -n 1 || true)"
+[[ -n "$include_cold_diagnostic" ]] || fail "cold check missed the unresolved name from the edited include"
+send_check 1
+include_edit_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$include_edit_report" "the edited include"
+include_warm_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'include_stale_symbol' | tail -n 1 || true)"
+[[ "$include_warm_diagnostic" == "$include_cold_diagnostic" ]] \
+    || fail "edited-include diagnostic differs from cold: cold=[$include_cold_diagnostic] warm=[$include_warm_diagnostic]"
+send_check 1
+include_repeat_report="$(tail -n 1 "$REPORTS")"
+[[ "$include_repeat_report" =~ session=hit([[:space:]]|$) ]] \
+    || fail "expected an exact hit for the repeated invalid include: $include_repeat_report"
+include_repeat_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'include_stale_symbol' | tail -n 1 || true)"
+[[ "$include_repeat_diagnostic" == "$include_cold_diagnostic" ]] \
+    || fail "repeated invalid-include diagnostic differs from cold: cold=[$include_cold_diagnostic] warm=[$include_repeat_diagnostic]"
+
+cat >"$INCLUDED" <<'EOF'
+def include_helper() -> i64:
+    return 41
+EOF
+send_check 0
+include_recovery_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$include_recovery_report" "the recovered include"
+
+# Changing a function parameter type changes the declaration surface even when
+# that function's body bytes are identical. The session must invalidate body
+# facts whose result could depend on the changed signature.
+cat >"$SOURCE" <<'EOF'
+def signature_helper(value: i64) -> i64:
+    return 40
+
+def main() -> i64:
+    return signature_helper(1)
+EOF
+send_check 0
+cat >"$SOURCE" <<'EOF'
+def signature_helper(value: bool) -> i64:
+    return 40
+
+def main() -> i64:
+    return signature_helper(true)
+EOF
+signature_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/signature-cold.stdout" 2>"$WORK/signature-cold.stderr" || signature_cold_status=$?
+[[ "$signature_cold_status" -eq 0 ]] || fail "cold check rejected the signature-edited source: $(tail -n 8 "$WORK/signature-cold.stderr")"
+send_check 0
+signature_edit_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$signature_edit_report" "the signature edit"
+
 printf 'quit\n' >&3 || fail "could not send quit command"
 exec 3>&-
 if ! wait "$SERVER_PID"; then

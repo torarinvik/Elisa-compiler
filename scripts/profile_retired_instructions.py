@@ -18,6 +18,7 @@ single-process compiler mode such as `-emit check` for compiler comparisons.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -149,6 +150,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", type=Path, help="keep the .trace bundle at this path")
     parser.add_argument("--time-limit", default="30m", help="maximum trace duration (default: 30m)")
+    parser.add_argument("--stdin", type=Path, help="redirect target stdin from this file")
     parser.add_argument(
         "--env",
         action="append",
@@ -167,6 +169,20 @@ def main() -> int:
     executable = Path(command[0]).expanduser().resolve(strict=True)
     if not executable.is_file():
         parser.error(f"executable is not a file: {executable}")
+    stdin_path: Path | None = None
+    stdin_sha256: str | None = None
+    if args.stdin is not None:
+        try:
+            stdin_path = args.stdin.expanduser().resolve(strict=True)
+        except OSError as error:
+            parser.error(f"cannot resolve stdin file {args.stdin}: {error}")
+        if not stdin_path.is_file():
+            parser.error(f"stdin path is not a file: {stdin_path}")
+        digest = hashlib.sha256()
+        with stdin_path.open("rb") as input_file:
+            for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        stdin_sha256 = digest.hexdigest()
     if shutil.which("xcrun") is None or shutil.which("codesign") is None:
         parser.error("Xcode command-line tools with xctrace and codesign are required")
     try:
@@ -221,6 +237,8 @@ def main() -> int:
         ]
         for assignment in args.env:
             record_command.extend(["--env", assignment])
+        if stdin_path is not None:
+            record_command.extend(["--target-stdin", str(stdin_path)])
         record_command.extend(
             [
                 "--launch",
@@ -249,6 +267,7 @@ def main() -> int:
                     "trace_end_reason": end_reason,
                     "complete": end_reason == "Target app exited",
                     "target_exit_status": int(target_status) if target_status else None,
+                    "stdin_sha256": stdin_sha256,
                     "trace": str(trace) if args.trace else None,
                 },
                 sort_keys=True,

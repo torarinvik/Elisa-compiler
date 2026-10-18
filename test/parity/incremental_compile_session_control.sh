@@ -11,10 +11,19 @@ REQUESTS="$WORK/requests"
 REPLIES="$WORK/replies"
 SERVER_LOG="$WORK/server.stderr"
 SERVER_PID=""
+LAST_REPORT=""
 
 cleanup() {
     if [[ -n "$SERVER_PID" ]]; then
-        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        # compile-session may have solver or tool children. Keep the process tree in its
+        # own group so a failed assertion cannot leave them blocked on the request FIFO.
+        kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
+        local cleanup_attempt=0
+        while (( cleanup_attempt < 20 )) && kill -0 -- "-$SERVER_PID" 2>/dev/null; do
+            sleep 0.1
+            cleanup_attempt=$((cleanup_attempt + 1))
+        done
+        kill -KILL -- "-$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
     exec 3>&- 2>/dev/null || true
@@ -74,6 +83,7 @@ send_compile() {
     [[ "$reports_after" -eq "$((reports_before + 1))" ]] || fail "expected one cache report, got $reports_before->$reports_after"
     [[ "$report_line" =~ session=$expected_session([[:space:]]|$) ]] \
         || fail "expected session=$expected_session, got: $report_line"
+    LAST_REPORT="$report_line"
 }
 
 compare_object() {
@@ -85,10 +95,30 @@ compare_object() {
     fi
 }
 
+assert_graph_body_edit() {
+    local report="$LAST_REPORT"
+    local restored cold_scans
+    [[ "$report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
+        || fail "body edit did not admit the unchanged SourceInput query: $report"
+    if [[ "$report" =~ function_body_facts_restored=([0-9]+) ]]; then
+        restored="${BASH_REMATCH[1]}"
+    else
+        fail "body edit report omitted graph-restored body count: $report"
+    fi
+    if [[ "$report" =~ cold_body_scans=([0-9]+) ]]; then
+        cold_scans="${BASH_REMATCH[1]}"
+    else
+        fail "body edit report omitted cold body-scan count: $report"
+    fi
+    [[ "$restored" -ge 1 ]] || fail "expected the unchanged helper to restore from the query graph: $report"
+    [[ "$cold_scans" -eq 1 ]] || fail "expected only the edited main body to be cold-scanned: $report"
+}
+
 write_source 1
 cold_object cold-first
 mkfifo "$REQUESTS" "$REPLIES"
 env -u ELISA_STAGE1_PERMISSIVE -u ELISA_STAGE1_INCREMENTAL_CACHE_DIR ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
+    "${PYTHON_BIN:-python3}" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
     "$STAGE1" compile-session -emit obj -O0 -o "$WORK/session.o" "$SOURCE" \
     <"$REQUESTS" >"$REPLIES" 2>"$SERVER_LOG" &
 SERVER_PID=$!
@@ -104,6 +134,7 @@ compare_object cold-first
 write_source 2
 cold_object cold-edited
 send_compile 0 edit
+assert_graph_body_edit
 compare_object cold-edited
 
 # Errorful translation units must remain rejected, replay the same diagnostic on
