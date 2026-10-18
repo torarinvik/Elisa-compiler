@@ -74,22 +74,34 @@ cacheable body. The declaration-surface control must invalidate that reuse.
 The runner compares the complete per-request compiler transcript after removing
 only cache/timing instrumentation, so status and diagnostics must match between
 modes. Prime, exact-repeat, body-edit, and invalidation timings remain separate
-in `paired.json`, with timing summaries grouped by workload; only body edits
-enter the paired timing ratios. Per-request
-phase wall/CPU times and outer process wall times are recorded. Retired
-instructions and cycles are marked unavailable because the guarded shell
-launcher owns the timed PID while Stage1 runs as its child; launcher counters
-would not represent compiler work.
+in `paired.json`, with timing summaries grouped by workload. Body edits remain
+the primary paired timing summary; prime, exact-repeat, and declaration-surface
+controls also receive separate paired ratios, geometric means, and win counts.
+Control ratios are descriptive and are not folded into the body-edit aggregate.
+The primary performance measure is the exact Stage1 process's retired
+instructions, sampled with macOS `proc_pid_rusage` immediately around each
+request. Cycles, per-request phase wall/CPU times, request wall times, and outer
+process wall times are recorded as supporting measurements. The runner finds
+the Stage1 child of the guarded launcher and fails if it cannot identify that
+process, so shell-launcher work is excluded from compiler instruction counts.
+These are Stage1-process counters, not process-tree totals: child tools such as
+Z3 are excluded. If a workload invokes a solver, report its cost separately or
+aggregate child-process counters before making a total-work claim.
+The normal host load gate still applies to keep cache and scheduling conditions
+comparable; instruction counts are the primary comparison because they are less
+sensitive to scheduling delay than wall time.
 
-Each workload/pair now runs two routing arms first, with
-`ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1`, then two separate timing arms with
+Each workload/pair runs two routing arms with
+`ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1` and two separate timing arms with
 that setting explicitly `0`. Routing arms enforce all reuse, invalidation, and
 NameLookup-counter assertions. Timing arms require no cache report, preserve
 status/diagnostic parity between graph modes and against the corresponding
 routing arm, and retain phase timing. Only timing arms enter performance
 summaries; routing evidence is stored separately in `routing_arms` in
-`paired.json`. Each kind alternates graph-on/off order across pairs. This doubles
-the number of host launches relative to the previous instrumented runner.
+`paired.json`. Arm-kind order is counterbalanced across pairs (routing-first on
+even pairs, timing-first on odd pairs), and graph-on/off order alternates within
+each kind. This doubles the number of host launches relative to the previous
+instrumented runner.
 
 Earlier results that enabled chain counting inside timed arms include asymmetric
 telemetry overhead: graph-off traverses and counts more rows. Do not combine

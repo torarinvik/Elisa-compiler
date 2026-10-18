@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -105,6 +106,156 @@ def timing_rows(lines: list[str]) -> list[dict[str, Any]]:
         if match:
             rows.append({"phase": match.group(1), "wall_ms": float(match.group(2)), "cpu_ms": float(match.group(3))})
     return rows
+
+
+def paired_timing_summary(ratios: list[float], label: str) -> dict[str, Any]:
+    if not ratios or any(not math.isfinite(ratio) or ratio <= 0 for ratio in ratios):
+        raise RuntimeError(f"{label}: paired request timing produced an invalid graph-on/off ratio")
+    return {
+        "median_paired_graph_on_over_off_ratio": statistics.median(ratios),
+        "geometric_mean_paired_graph_on_over_off_ratio": math.exp(
+            sum(math.log(ratio) for ratio in ratios) / len(ratios)
+        ),
+        "paired_graph_on_wins": sum(ratio < 1.0 for ratio in ratios),
+        "paired_graph_off_wins": sum(ratio > 1.0 for ratio in ratios),
+        "paired_ties": sum(ratio == 1.0 for ratio in ratios),
+        "paired_request_ratios": ratios,
+    }
+
+
+def paired_counter_summary(ratios: list[float], label: str) -> dict[str, Any]:
+    if not ratios or any(not math.isfinite(ratio) or ratio <= 0 for ratio in ratios):
+        raise RuntimeError(f"{label}: paired process-counter ratio is invalid")
+    return {
+        "median_paired_graph_on_over_off_ratio": statistics.median(ratios),
+        "geometric_mean_paired_graph_on_over_off_ratio": math.exp(
+            sum(math.log(ratio) for ratio in ratios) / len(ratios)
+        ),
+        "paired_graph_on_wins": sum(ratio < 1.0 for ratio in ratios),
+        "paired_graph_off_wins": sum(ratio > 1.0 for ratio in ratios),
+        "paired_ties": sum(ratio == 1.0 for ratio in ratios),
+        "paired_request_ratios": ratios,
+    }
+
+
+def timing_arm_kinds(pair_index: int) -> tuple[bool, bool]:
+    """Return routing/timing order, counterbalanced across adjacent pairs."""
+    return (True, False) if pair_index % 2 == 0 else (False, True)
+
+
+class DarwinRusageInfoV4(ctypes.Structure):
+    # sys/resource.h: the UUID is followed by 35 uint64 fields; instructions
+    # and cycles are fields 30 and 31, respectively.
+    _fields_ = [("uuid", ctypes.c_ubyte * 16), ("values", ctypes.c_uint64 * 35)]
+
+
+class DarwinProcessCounters:
+    """Read cumulative retired instructions and cycles for one macOS PID."""
+
+    INSTRUCTIONS_INDEX = 29
+    CYCLES_INDEX = 30
+
+    def __init__(self) -> None:
+        self.libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        self.proc_pid_rusage = self.libproc.proc_pid_rusage
+        self.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        self.proc_pid_rusage.restype = ctypes.c_int
+
+    def snapshot(self, pid: int) -> dict[str, int]:
+        info = DarwinRusageInfoV4()
+        buffer = ctypes.cast(ctypes.byref(info), ctypes.POINTER(ctypes.c_void_p))
+        if self.proc_pid_rusage(pid, 4, buffer) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, f"proc_pid_rusage({pid}) failed")
+        return {
+            "instructions_retired": int(info.values[self.INSTRUCTIONS_INDEX]),
+            "cycles_elapsed": int(info.values[self.CYCLES_INDEX]),
+            "cpu_time_ns": int(info.values[0] + info.values[1]),
+        }
+
+
+def find_stage1_pid(launcher_pid: int, stage1: Path, timeout_seconds: float) -> int:
+    """Find the guarded shell's direct Stage1 child, which owns compiler work."""
+    deadline = time.monotonic() + min(timeout_seconds, 10.0)
+    expected = stage1.resolve()
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    proc_pidpath = libproc.proc_pidpath
+    proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    proc_pidpath.restype = ctypes.c_int
+    while time.monotonic() < deadline:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        matches: list[int] = []
+        for line in listing.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                continue
+            try:
+                pid, parent = int(fields[0]), int(fields[1])
+            except ValueError:
+                continue
+            if parent != launcher_pid:
+                continue
+            path_buffer = ctypes.create_string_buffer(4096)
+            if proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
+                continue
+            executable = Path(os.fsdecode(path_buffer.value))
+            if executable.resolve() == expected:
+                matches.append(pid)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(f"found multiple Stage1 children for launcher pid {launcher_pid}: {matches}")
+        time.sleep(0.01)
+    raise RuntimeError(f"could not find Stage1 child of launcher pid {launcher_pid}")
+
+
+def counter_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    delta = {key: after[key] - before[key] for key in before}
+    if any(value < 0 for value in delta.values()):
+        raise RuntimeError("Stage1 process counters moved backwards")
+    return delta
+
+
+def paired_counter_measurements(
+    arms: list[dict[str, Any]],
+    pair_count: int,
+    labels: tuple[str, ...] | list[str],
+    field: str,
+    description: str,
+) -> dict[str, Any]:
+    per_label: dict[str, Any] = {}
+    aggregate_ratios: list[float] = []
+    for label in labels:
+        ratios: list[float] = []
+        off_samples: list[int] = []
+        on_samples: list[int] = []
+        for pair_index in range(pair_count):
+            off_arm = next(arm for arm in arms if arm["pair"] == pair_index and arm["mode"] == "graph-off")
+            on_arm = next(arm for arm in arms if arm["pair"] == pair_index and arm["mode"] == "graph-on")
+            off_value = next(request[field] for request in off_arm["requests"] if request["label"] == label)
+            on_value = next(request[field] for request in on_arm["requests"] if request["label"] == label)
+            if off_value <= 0 or on_value <= 0:
+                raise RuntimeError(f"{description} {label}: process-counter sample must be positive")
+            off_samples.append(off_value)
+            on_samples.append(on_value)
+            ratios.append(on_value / off_value)
+        per_label[label] = {
+            "graph_off_median": statistics.median(off_samples),
+            "graph_on_median": statistics.median(on_samples),
+            "graph_on_over_off_median_ratio": statistics.median(on_samples) / statistics.median(off_samples),
+            "paired_samples": len(ratios),
+            **paired_counter_summary(ratios, f"{description} {label}"),
+        }
+        aggregate_ratios.extend(ratios)
+    return {
+        "per_label": per_label,
+        "paired_aggregate": paired_counter_summary(aggregate_ratios, description),
+    }
 
 
 class PipeLineReader:
@@ -210,6 +361,13 @@ def run_arm(
         bufsize=0,
         start_new_session=True,
     )
+    try:
+        compiler_pid = find_stage1_pid(proc.pid, stage1, timeout_seconds)
+        process_counters = DarwinProcessCounters()
+    except BaseException:
+        stop_process_group(proc)
+        raise
+    counter_totals = {"instructions_retired": 0, "cycles_elapsed": 0, "cpu_time_ns": 0}
     reader = PipeLineReader(proc)
     results: list[dict[str, Any]] = []
     request_specs: list[tuple[str, str | None]] = [("prime", None), ("exact-repeat", None)]
@@ -222,11 +380,15 @@ def run_arm(
             for request_index, (label, next_source) in enumerate(request_specs):
                 if next_source is not None:
                     source.write_text(next_source, encoding="utf-8")
+                counters_before = process_counters.snapshot(compiler_pid)
                 before = time.perf_counter_ns()
                 proc.stdin.write(b"check\n")
                 proc.stdin.flush()
                 status, lines = read_response(reader, time.monotonic() + timeout_seconds)
                 request_wall_ms = (time.perf_counter_ns() - before) / 1_000_000
+                request_counters = counter_delta(counters_before, process_counters.snapshot(compiler_pid))
+                for key, value in request_counters.items():
+                    counter_totals[key] += value
                 raw_log.write(f"=== request={request_index} label={label} status={status} ===\n")
                 raw_log.writelines(line + "\n" for line in lines)
                 if status != "0":
@@ -239,6 +401,7 @@ def run_arm(
                     "label": label,
                     "status": int(status),
                     "request_wall_ms": request_wall_ms,
+                    **request_counters,
                     "timings": timing_rows(lines),
                     "cache": fields,
                     "diagnostic_sha256": digest_bytes("\n".join(normalized_transcript(lines)).encode()),
@@ -265,13 +428,11 @@ def run_arm(
         "order": order,
         "process_wall_ms": elapsed_ms,
         "process_counters": {
-            "status": "unavailable",
-            "method": "not collected",
-            "instructions_retired": None,
-            "cycles_elapsed": None,
-            "process_tree_cpu_seconds": None,
-            "command_real_seconds": None,
-            "scope": "Stage1 runs as a child of the guarded shell launcher; launcher PID counters are not compiler counters",
+            "status": "ok",
+            "method": "macOS proc_pid_rusage RUSAGE_INFO_V4",
+            **counter_totals,
+            "pid": compiler_pid,
+            "scope": "exact Stage1 child process; per-request deltas cover each check response",
         },
         "source_path": str(source),
         "initial_source_sha256": digest_bytes(source_versions[0].encode()),
@@ -469,17 +630,19 @@ def main() -> int:
         "stage1_sha256": digest_file(stage1),
         "stage1_provenance_sha256": digest_file(Path(str(stage1) + ".provenance.json")),
         "runner_sha256": digest_file(Path(__file__).resolve()),
-        "process_counter_method": "unavailable: guarded Stage1 shell launcher owns the measured PID; no compiler instruction attribution",
+        "process_counter_method": "macOS proc_pid_rusage(RUSAGE_INFO_V4) sampled on the exact Stage1 compiler child PID; process-level retired instructions, cycles, and CPU time (not LLVM instruction attribution)",
         "pairs": args.pairs,
         "functions": args.functions,
         "body_edits_per_arm": args.body_edits,
         "source_identity": "same absolute temporary source path within each workload across graph modes and pairs",
         "semantic_execution_mode": "default parallel mode; ELISA_SEMANTIC_SERIAL is cleared for each arm",
-        "warm_measurement": "body-edit requests only; prime and exact-repeat are reported separately per workload",
+        "warm_measurement": "body edits are the primary paired summary; prime, exact-repeat, and declaration-surface controls also receive paired summaries",
         "name_lookup_hit_semantics": "call-facts uses one unique callee per body; warm raw hits must exceed the prime same-request duplicate baseline, exposing aggregate prior-request reuse",
         "name_lookup_chain_visit_semantics": "both modes count only symbol/member hash-chain rows visited by the fused NameLookup cold classifier; direct name_known callers (including RegionNew, value-block captures, and flow checks) and qualified Expr.Scope probes are excluded; warm reductions can include same-request duplicate reads and do not represent all resolver name-chain work",
         "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body; zero-fact expects no direct facts",
-        "timing_instrumentation": "separate routing arms enable cache reports and assert reuse; timing arms disable cache reports and chain-visit counting, retain phase timing, and must match routing-arm diagnostics; summaries contain timing arms only",
+        "primary_performance_metric": "Stage1 process retired instructions from macOS proc_pid_rusage; wall time and cycles are supporting measurements",
+        "timing_instrumentation": "separate routing arms enable cache reports and assert reuse; timing arms disable cache reports and chain-visit counting, retain phase timing, collect exact Stage1 process counters, and must match routing-arm diagnostics; summaries contain timing arms only",
+        "arm_kind_ordering": "routing-first on even pairs and timing-first on odd pairs to counterbalance run-order drift",
         "diagnostic_parity": "all per-request compiler transcript lines after timing/cache instrumentation removal",
         "benchmark_host_lock": str(host_lock_path),
         "host_qualification": str(host_qualification),
@@ -543,7 +706,8 @@ def main() -> int:
                     else ("graph-on", "graph-off")
                 )
                 routing_pair: dict[str, dict[str, Any]] = {}
-                for collect_cache_report in (True, False):
+                timing_pair: dict[str, dict[str, Any]] = {}
+                for collect_cache_report in timing_arm_kinds(pair_index):
                     pair_arms: dict[str, dict[str, Any]] = {}
                     for order_index, mode in enumerate(order):
                         try:
@@ -586,18 +750,19 @@ def main() -> int:
                         for pinned_path, expected_hash in pins.items():
                             if digest_file(Path(pinned_path)) != expected_hash:
                                 raise SystemExit(f"pinned benchmark input changed during run: {pinned_path}")
-                    validate_pair(
-                        pair_arms["graph-off"],
-                        pair_arms["graph-on"],
-                        args.functions,
-                        workload,
-                        require_reports=collect_cache_report,
-                    )
                     if collect_cache_report:
+                        validate_pair(
+                            pair_arms["graph-off"],
+                            pair_arms["graph-on"],
+                            args.functions,
+                            workload,
+                            require_reports=True,
+                        )
                         routing_pair = pair_arms
                     else:
-                        for mode in order:
-                            validate_pair(routing_pair[mode], pair_arms[mode], args.functions, workload, require_reports=False)
+                        timing_pair = pair_arms
+                for mode in order:
+                    validate_pair(routing_pair[mode], timing_pair[mode], args.functions, workload, require_reports=False)
     finally:
         temp.cleanup()
 
@@ -650,19 +815,65 @@ def main() -> int:
                     request["request_wall_ms"] for request in on_arm["requests"] if request["label"] == label
                 )
                 paired_ratios.append(on_value / off_value)
-        if any(not math.isfinite(ratio) or ratio <= 0 for ratio in paired_ratios):
-            raise RuntimeError(f"{workload}: paired request timing produced an invalid graph-on/off ratio")
+        body_edit_summary = paired_timing_summary(paired_ratios, f"{workload} body edits")
+        control_labels = ("prime", "exact-repeat", "declaration-surface-edit")
+        process_counter_summary = {
+            "primary_metric": "instructions_retired",
+            "instructions_retired": {
+                "body_edits": paired_counter_measurements(
+                    workload_arms,
+                    args.pairs,
+                    edit_labels,
+                    "instructions_retired",
+                    f"{workload} body edit instructions",
+                ),
+                "controls": paired_counter_measurements(
+                    workload_arms,
+                    args.pairs,
+                    control_labels,
+                    "instructions_retired",
+                    f"{workload} control instructions",
+                ),
+            },
+            "cycles_elapsed": {
+                "body_edits": paired_counter_measurements(
+                    workload_arms, args.pairs, edit_labels, "cycles_elapsed", f"{workload} body edit cycles"
+                ),
+                "controls": paired_counter_measurements(
+                    workload_arms, args.pairs, control_labels, "cycles_elapsed", f"{workload} control cycles"
+                ),
+            },
+        }
+        paired_controls: dict[str, Any] = {}
+        for label in control_labels:
+            control_ratios: list[float] = []
+            for pair_index in range(args.pairs):
+                off_arm = next(
+                    arm for arm in workload_arms if arm["pair"] == pair_index and arm["mode"] == "graph-off"
+                )
+                on_arm = next(
+                    arm for arm in workload_arms if arm["pair"] == pair_index and arm["mode"] == "graph-on"
+                )
+                off_value = next(
+                    request["request_wall_ms"] for request in off_arm["requests"] if request["label"] == label
+                )
+                on_value = next(
+                    request["request_wall_ms"] for request in on_arm["requests"] if request["label"] == label
+                )
+                control_ratios.append(on_value / off_value)
+            control_summary = paired_timing_summary(control_ratios, f"{workload} {label}")
+            control_summary["paired_control_samples"] = len(control_ratios)
+            paired_controls[label] = control_summary
         summaries[workload] = {
             "per_edit": per_edit,
-            "median_paired_graph_on_over_off_ratio": statistics.median(paired_ratios),
-            "geometric_mean_paired_graph_on_over_off_ratio": math.exp(
-                sum(math.log(ratio) for ratio in paired_ratios) / len(paired_ratios)
-            ),
-            "paired_graph_on_wins": sum(ratio < 1.0 for ratio in paired_ratios),
-            "paired_graph_off_wins": sum(ratio > 1.0 for ratio in paired_ratios),
-            "paired_ties": sum(ratio == 1.0 for ratio in paired_ratios),
+            **body_edit_summary,
+            "primary_metric": "instructions_retired",
+            "primary_instruction_summary": process_counter_summary["instructions_retired"]["body_edits"][
+                "paired_aggregate"
+            ],
+            "process_counters": process_counter_summary,
             "paired_edit_samples": len(paired_ratios),
-            "paired_request_ratios": paired_ratios,
+            "paired_controls": paired_controls,
             "control_medians_ms": {
                 label: {
                     mode: statistics.median(
