@@ -7,11 +7,33 @@ which measures disk-sidecar reuse with fresh compiler processes.
 
 The graph remains opt-in and is not qualified for production use by this
 benchmark alone. The runner measures function-body fact reuse and resolver
-NameLookup hits separately. Its call-heavy workload checks that resolver hits
-occur, but the inactive fast path currently leaves the graph-off chain-visit
-baseline at zero; no avoided-chain-work conclusion is valid until that baseline
-is restored. The semantic checker still walks function bodies, so production
-use requires a fresh source-matched paired run with repeatable end-to-end gains.
+NameLookup hits separately. Each `call-facts` body calls a distinct leaf, with
+an alternate leaf for the edited body. A call's callee is still classified
+twice within one request, so the runner compares warm hit totals with the prime
+same-request baseline; warm totals must exceed that baseline to show aggregate
+prior-request reuse. Both graph modes report the chain rows visited by the
+NameLookup classification probe. The runner requires cold graph-on visits at
+prime and fewer graph-on visits than
+graph-off on exact-repeat and body-edit requests. Those reductions can still
+include same-request duplicate checks. The counter covers only global symbol and
+module-member hash-chain rows visited by the fused classifier. Active graph
+requests eagerly finalize an exact resolver surface once, including region
+membership, even when a workload has no NameLookup reads; they still scan lexical
+bindings before every query, including hits. The cold
+fallback scans `region_names`, while active queries read the precomputed region
+bit. Surface construction and local scans are outside the chain counter, though
+surface construction is included in graph-on whole-request timing. This fixture
+has no local or region names, so it does not measure those costs. Bare module
+identifiers used as `Expr.Field` or namespace-call objects now also use
+NameLookup; qualified `Expr.Scope` module-prefix and member
+probes still resolve directly through `name_is_module`, `ancestor_names_module`,
+`two_part_names_module`, and `module_declares_member`. Those probes are outside both
+the cache and this counter. This fixture uses only bare same-module callees and
+contains no module-field or qualified-path expressions, so it does not measure
+those paths.
+The semantic checker still walks function bodies, so these routing checks do not
+establish a compiler speedup. Production use requires a fresh source-matched paired
+run with repeatable end-to-end gains.
 
 Run on macOS after the source-matched Stage1 product is available:
 
@@ -29,14 +51,18 @@ semantic host and uses the same absolute source path within a workload; each
 workload uses a separate path. The sequence includes a
 prime request, an exact-source repeat, several one-body edits with unchanged
 declarations, and a declaration-surface edit.
+The runner clears `ELISA_SEMANTIC_SERIAL` so both arms use the default parallel
+semantic pass mode regardless of the invoking shell environment.
 
 Each pair runs two workloads. `zero-fact` uses literal-return function bodies,
 which exercise body reuse while serializing empty direct-fact payloads.
 `call-facts` uses zero-argument direct calls in the function bodies, so restored
 bodies carry direct-call facts as well as their body records. The edited body
-switches between two leaf functions. Results and source hashes are grouped by
-workload so the empty-payload control cannot hide the cost of copying actual
-facts.
+calls a distinct leaf per function; the edited body switches to a separate
+alternate leaf. The report exposes `direct_fact_count`, and the runner asserts
+one direct-call fact per `bench_*` body in `call-facts` and zero in `zero-fact`.
+Results and source hashes are grouped by workload so the empty-payload control
+cannot hide the cost of copying actual facts.
 
 For every body edit, graph-off must report typed-snapshot fallback reuse and
 graph-on must report SourceInput admission plus restoration of every unchanged
@@ -51,9 +77,37 @@ instructions and cycles are marked unavailable because the guarded shell
 launcher owns the timed PID while Stage1 runs as its child; launcher counters
 would not represent compiler work.
 
+Current timed arms set `ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1` to collect path
+counters. That enables per-row name-classification chain counting; graph-off
+traverses more rows and therefore pays more counter work than graph-on hits.
+The reported timing ratios include this asymmetric telemetry overhead and may
+overstate graph-on gains. Treat them as instrumentation-biased, not
+production-equivalent, until a counter-disabled timing arm exists. Performance
+qualification should collect routing counters in separate arms and time with
+reporting disabled.
+
+Warm exact-repeat timings are kept separate because SourceInput admission
+currently copies the declaration surface for validation. Compare separate
+`--functions` runs to inspect how that warm cost scales with surface size.
+The current call-facts fixture uses positive same-module names only. The separate
+`test/parity/incremental_semantic_session_control.sh` now checks a missing name,
+declaration addition, removal, and exact-repeat negative lookup. That control still
+needs a fresh source-matched Stage1 run before NameLookup invalidation is
+correctness-qualified. This sequence is invalidation/reuse correctness coverage,
+not avoided-chain-work evidence: a fresh missing name exits at the O(1)
+`name_indexed` gate before symbol or member chains are walked.
+
 Results from a shared Mac are exploratory. Graph-on/off counters show which
 path ran; they do not prove the graph is faster. The query layer still performs
 key construction, hashing, equality, dependency validation, and retained-memory
-management, and the semantic checker still runs. Keep `COMPLETE` and the pinned
+management, and the semantic checker still runs. The previous NameLookup key
+copied the full session identity and source path for every spelling, creating
+O(unique names × identity/path bytes) retained key data. The current source
+replaces that with a versioned `(module, name)` key; relevant declaration,
+visibility, and region changes are represented by the exact resolver-surface
+query input, and identity/options changes clear the session-local graph. Cold
+misses still construct the compact key once for evaluation and again for commit.
+This key compaction has not been build- or performance-qualified.
+Keep `COMPLETE` and the pinned
 input hashes with results; `ABORTED.txt` marks incomplete runs whose partial
 timings must not be compared.

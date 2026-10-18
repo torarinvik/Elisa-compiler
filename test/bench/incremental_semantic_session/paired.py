@@ -52,15 +52,12 @@ def fixture(functions: int, edit_version: int, payload_mode: str, add_surface_fu
         "# Many cacheable, independent bodies make the collector's reuse path visible.\n\n",
     ]
     if payload_mode == "call-facts":
-        pieces.extend(
-            (
-                "def fact_leaf_a() -> i64:\n    return 1\n\n",
-                "def fact_leaf_b() -> i64:\n    return 2\n\n",
-            )
-        )
+        for index in range(functions):
+            pieces.append(f"def fact_leaf_{index:04d}() -> i64:\n    return {index}\n\n")
+        pieces.append("def fact_leaf_alt() -> i64:\n    return 999\n\n")
     for index in range(functions):
         if payload_mode == "call-facts":
-            target = "fact_leaf_b" if index == 0 and edit_version % 2 == 1 else "fact_leaf_a"
+            target = "fact_leaf_alt" if index == 0 and edit_version % 2 == 1 else f"fact_leaf_{index:04d}"
             body = f"    return {target}()\n"
         else:
             value = edit_version if index == 0 else index
@@ -188,6 +185,7 @@ def run_arm(
         "ELISA_STAGE1_INCREMENTAL_SHADOW",
         "ELISA_STAGE1_INCREMENTAL_SHADOW_REPORT",
         "ELISA_STAGE1_PERMISSIVE",
+        "ELISA_SEMANTIC_SERIAL",
     ):
         env.pop(key, None)
     env.update(
@@ -291,23 +289,28 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             raise RuntimeError(f"{workload}: request {index} omitted NameLookup measurement counters")
         if int(left["cache"]["name_lookup_hits"]) != 0:
             raise RuntimeError(f"{workload}: graph-off request {index} unexpectedly hit NameLookup")
-        if workload == "call-facts" and (
-            right["label"] == "exact-repeat" or right["label"].startswith("body-edit-")
-        ):
-            lookup_hits = int(right["cache"]["name_lookup_hits"])
-            off_visits = int(left["cache"]["name_lookup_classification_chain_visits"])
+        if workload == "call-facts":
+            prime_hits = int(on_requests[0]["cache"]["name_lookup_hits"])
             on_visits = int(right["cache"]["name_lookup_classification_chain_visits"])
-            if lookup_hits <= 0:
-                raise RuntimeError(f"call-facts graph-on request {index} recorded no NameLookup hits")
-            if on_visits >= off_visits:
-                raise RuntimeError(
-                    f"call-facts graph-on request {index} did not reduce name-classification chain visits: "
-                    f"graph-on={on_visits} graph-off={off_visits} hits={lookup_hits}"
-                )
+            if right["label"] == "prime" and on_visits <= 0:
+                raise RuntimeError("call-facts graph-on prime did not record cold NameLookup chain visits")
+            if right["label"] == "exact-repeat" or right["label"].startswith("body-edit-"):
+                off_visits = int(left["cache"]["name_lookup_classification_chain_visits"])
+                warm_hits = int(right["cache"]["name_lookup_hits"])
+                if warm_hits <= prime_hits:
+                    raise RuntimeError(
+                        f"call-facts graph-on {right['label']} did not exceed its prime same-request hit baseline: "
+                        f"prime={prime_hits} warm={warm_hits}"
+                    )
+                if off_visits <= 0 or on_visits >= off_visits:
+                    raise RuntimeError(
+                        f"call-facts graph-on {right['label']} did not reduce classification-chain visits: "
+                        f"graph_off={off_visits} graph_on={on_visits} hits={warm_hits} prime_hits={prime_hits}"
+                    )
         for field in ("eligible_bodies", "matched_eligible_bodies"):
             if left["cache"].get(field) != right["cache"].get(field):
                 raise RuntimeError(f"{workload}: graph-on/off request {index} has different {field} counts")
-        expected_eligible = functions + (3 if workload == "call-facts" else 1)
+        expected_eligible = functions * 2 + 2 if workload == "call-facts" else functions + 1
         if left["label"] == "declaration-surface-edit":
             expected_eligible += 1
         eligible = int(left["cache"].get("eligible_bodies", "-1"))
@@ -316,6 +319,14 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
                 f"{workload}: request {left['label']} admitted {eligible} cacheable bodies; "
                 f"fixture expects {expected_eligible}"
             )
+        expected_direct_facts = functions if workload == "call-facts" else 0
+        for mode, request in (("graph-off", left), ("graph-on", right)):
+            direct_facts = int(request["cache"].get("direct_fact_count", "-1"))
+            if direct_facts != expected_direct_facts:
+                raise RuntimeError(
+                    f"{workload}: {mode} request {request['label']} recorded {direct_facts} direct facts; "
+                    f"fixture expects {expected_direct_facts}"
+                )
     if len(off_requests) < 3:
         raise RuntimeError(f"{workload}: benchmark needs at least one body edit")
     for index, (left, right) in enumerate(zip(off_requests, on_requests)):
@@ -336,6 +347,14 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
                 f"graph-on edit {index} did not restore every unchanged cacheable body: "
                 f"restored={restored} expected={expected_restored} functions={functions}"
             )
+        publish_skips = int(on_cache.get("body_query_publish_skips", "-1"))
+        if publish_skips != restored:
+            raise RuntimeError(
+                f"graph-on edit {index} did not skip publication evaluation for each restored body: "
+                f"skipped={publish_skips} restored={restored}"
+            )
+        if int(off_cache.get("body_query_publish_skips", "-1")) != 0:
+            raise RuntimeError(f"graph-off edit {index} unexpectedly skipped body-query publication")
     surface_index = next(index for index, request in enumerate(off_requests) if request["label"] == "declaration-surface-edit")
     for mode, request in (("graph-off", off_requests[surface_index]), ("graph-on", on_requests[surface_index])):
         cache = request["cache"]
@@ -343,6 +362,8 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             raise RuntimeError(f"{mode} declaration-surface edit admitted stale SourceInput")
         if cache.get("function_body_facts_restored") != "0" or cache.get("prior_snapshot_fact_fallbacks") != "0":
             raise RuntimeError(f"{mode} declaration-surface edit reused body facts across changed declarations")
+        if cache.get("body_query_publish_skips") != "0":
+            raise RuntimeError(f"{mode} declaration-surface edit skipped publication after invalidation")
 
 
 def main() -> int:
@@ -443,7 +464,12 @@ def main() -> int:
         "functions": args.functions,
         "body_edits_per_arm": args.body_edits,
         "source_identity": "same absolute temporary source path within each workload across graph modes and pairs",
+        "semantic_execution_mode": "default parallel mode; ELISA_SEMANTIC_SERIAL is cleared for each arm",
         "warm_measurement": "body-edit requests only; prime and exact-repeat are reported separately per workload",
+        "name_lookup_hit_semantics": "call-facts uses one unique callee per body; warm raw hits must exceed the prime same-request duplicate baseline, exposing aggregate prior-request reuse",
+        "name_lookup_chain_visit_semantics": "both modes count resolver classification hash-chain visits; warm reductions can still include same-request duplicate callee hits",
+        "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body; zero-fact expects no direct facts",
+        "timing_instrumentation": "ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 enables per-row name-classification chain counters in timed arms; graph-off visits more rows, so ratios include asymmetric telemetry overhead and may overstate graph-on gains; timings are not production-equivalent until a counter-disabled timing arm exists",
         "diagnostic_parity": "all per-request compiler transcript lines after timing/cache instrumentation removal",
         "benchmark_host_lock": str(host_lock_path),
         "host_qualification": str(host_qualification),

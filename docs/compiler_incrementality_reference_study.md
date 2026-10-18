@@ -31,7 +31,7 @@ rustc records query dependencies and fingerprints. When an input changes, depend
 
 The serialized graph stores node keys, value fingerprints, and dependency edges, then builds its node-to-index reverse map lazily per query kind on the first lookup. A successful green check promotes the old node and its edges into the current graph; disk-backed query values needed in the new cache can be loaded in a later promotion pass. These steps trade eager indexing and eager value loading for incremental maintenance, but they still have a cost on no-change builds. Measure reverse-index construction, green-node promotion, and cache promotion alongside queries skipped before treating a high green count as a speedup. See [`LazyNodeIndex` and its profiled per-kind map](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/serialized.rs#L115-L185), [serialized graph lookup](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/serialized.rs#L234-L248), [`try_mark_previous_green` edge promotion](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/graph.rs#L947-L1034), and [cache promotions](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/graph.rs#L1065-L1089).
 
-For Elisa, the useful rule is: propagate change from semantic result fingerprints, not merely from changed source text or a changed dependency. Recompute at the right boundary, compare the canonical result, and stop invalidation when that result is unchanged. Query dependencies must capture the reads that determined the result, including resolution candidate sets and failed lookups. Elisa's current graph has no per-semantic-query force-from-key path; its two active query kinds remain collector groundwork until they are attached to semantic reads that can safely fall back to ordinary evaluation.
+For Elisa, the useful rule is: propagate change from semantic result fingerprints, not merely from changed source text or a changed dependency. Recompute at the right boundary, compare the canonical result, and stop invalidation when that result is unchanged. Query dependencies must capture the reads that determined the result, including resolution candidate sets and failed lookups. Elisa now has a request-scoped `NameLookup` query at the serial `Expr.Ident` read site, alongside collector `SourceInput` and `FunctionBodyFacts` queries. It caches only `(known, module_only)` from exact surface facts rebuilt from the current symbol table; it does not skip body checking or derive persistent per-name inputs from declaration deltas. Elisa also lacks rustc's generalized force-from-dep-node scheduling path, so this resolver query remains a narrow read-site prototype rather than reuse of semantic analysis units.
 
 Sources: [Rust incremental compilation guide](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html), [detailed red-green explanation](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation-in-detail.html), [`try_mark_green` implementation at the inspected commit](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/graph.rs#L909-L1000), [rustc incremental implementation](https://github.com/rust-lang/rust/tree/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_incremental).
 
@@ -140,15 +140,15 @@ Sources, object files, IR, assembly, and the exact build commands are under `bui
 
 1. **Connect the existing O0 shard artifact cache as a narrow production milestone.** The backend already has APIs for preparing verified logical shards and emitting a cache miss from the exact snapshot; the Stage1 helper already provides content-addressed tickets and atomic object bundles. The driver does not connect them yet. Start with plain native `-O0` object output, exact loaded-toolchain and target recipe validation, deterministic logical merge order, and a cold fallback for unsupported inputs. Keep it opt-in until clean/warm parity, one-shard invalidation, corruption recovery, and end-to-end measurements pass. This is the smallest existing boundary that can avoid native object generation without trusting persisted semantic results.
 
-2. **Move reuse into real semantic read sites and qualify the existing host.** One-shot CLI compilation still uses a disabled session, while the opt-in `compile-session` and `semantic-session` hosts keep an enabled session across requests. Query-graph evaluation within those hosts is separately opt-in with `ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1` because retained arena capacity is not yet bounded. `compile-session` still rereads and reparses the current source, reruns semantic checking, and rebuilds and emits LLVM state; the query graph currently reuses only `SourceInput` and `FunctionBodyFacts`, with exact old-surface/body proof still gating a hit. A declaration-surface change invalidates every function query through the shared source dependency. The next step is to record typed dependencies at actual semantic reads, including missing-name results, then measure retained edits through object emission while keeping current diagnostics authoritative.
+2. **Move reuse into real semantic read sites and qualify the existing host.** One-shot CLI compilation still uses a disabled session, while the opt-in `compile-session` and `semantic-session` hosts keep an enabled session across requests. Query-graph evaluation within those hosts is separately opt-in with `ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1` because retained arena capacity is not yet bounded. `compile-session` still rereads and reparses the current source, reruns semantic checking, and rebuilds and emits LLVM state. The graph serves `SourceInput`, `FunctionBodyFacts`, and an opt-in `NameLookup` query at serial `Expr.Ident` classification. The body-fact route still requires exact old-surface/body proof. NameLookup uses finalized exact per-name surface facts rather than a whole-file `SourceInput` edge, so unrelated declaration changes can leave it green while changes to the matching symbol, member, visibility, or region facts change its input. The next step is to qualify the read-site path on retained edits through object emission while keeping current diagnostics authoritative; the surface-index changes have no build, parity, or benchmark qualification.
 
-3. **Add a real dependency at a semantic read site.** A narrow first slice is the translation-unit global suffix of `name_known` for `Expr.Ident`: keep special/reflection builtins, local bindings, and region names ahead of it, then cache only the exact global membership result, including both `Known` and `Missing`. The full-check pipeline builds the symbol and module-member indices with `collect_range` before `resolve_declarations`; that resolver walk is serial and precedes the parallel pass batches, which makes it the safest first consumer of the mutable session graph. The current global lookup already uses an expected-O(1) name index, so a query layer is initially a dependency-correctness prototype until counters and retained-edit timings show that graph overhead is repaid. Never retain `DeclId`, `BindingId`, AST pointers, or symbol-table rows.
+3. **Refine the first real dependency at a semantic read site.** The initial translation-unit `Expr.Ident` slice is wired into the serial resolver walk: it queries and caches the composite `(known, module_only)` classification before global symbol/member-chain scans, while preserving local binding and region-name behavior. The full-check pipeline finalizes a collision-safe exact-spelling surface after declarations, aliases, imports, and region annotations are collected, before `resolve_declarations`; that serial walk precedes the parallel pass batches and remains the safest first consumer of the mutable session graph. The surface stores the explicit `name_indexed` gate, total and non-module symbol counts, module presence, member-row multiplicity, imported visibility, and region membership, plus an exact `(module owner, member)` index for current-module visibility. Empty spellings get stable negative inputs. The versioned query key contains only the current module and exact name; its input carries the current resolver facts. Session identity/options mismatches clear the graph, so those bytes do not need to be repeated in each name key. A changed unrelated declaration can therefore leave a NameLookup green, while changes to that spelling's declarations, alias rows, imported/current-module visibility, or region membership change its input. `SourceInput` remains a request-generation guard, not a NameLookup dependency. If index construction is invalid, the resolver skips the query and uses the fused cold classifier. The graph remains a dependency-correctness prototype until counters and retained-edit timings show that graph overhead is repaid. Never retain `DeclId`, `BindingId`, AST pointers, or symbol-table rows.
 
-   The current `SourceInput` value contains options and declaration-surface bytes, not function-body bytes, so it stays green on body-only edits. Using it as a first `NameLookup` dependency can safely reuse lookup outcomes across those edits. A later fine-grained step must avoid leaving every lookup dependent on `SourceInput`, because any declaration-surface edit then invalidates all names, including unrelated ones. Give direct lookup its own `(namespace identity, exact name)` dependency, including negative results, and track import/current-module visibility as a separate dependency. Reserve whole-namespace dependencies for reads that enumerate or otherwise depend on the complete namespace. For `name_known`, preserve the existing short-circuits and record the exact boolean computed from the non-module symbol chain, module-member chain, and visibility rules. A green hit must be checked before traversing those global chains; computing `name_known` first and passing its boolean as the query input would save no lookup work. Declaration and import deltas must update exact membership/visibility results, including absent-to-present transitions; keep the declaration-surface dependency as a conservative fallback until that delta feed is complete. Because `bound` entries and `sview` names can point into request-owned source storage, copy name bytes into the key or intern a session-owned `NameId`; do not retain either view or binding row. Only remove the full-surface fallback after every reused body fact records its complete external reads; otherwise recompute the body. Validate the boundary with three edits: an unrelated declaration keeps the relevant query green, adding a previously missing referenced name invalidates it, and changing the referenced declaration or visible candidate set invalidates it. A green query is not a compile-time win unless downstream semantic work is actually skipped.
+   `SourceInput` still contains options and declaration-surface bytes for collector/body queries, but NameLookup validates the current resolver facts directly. Its per-name input includes empty-name results, so adding a previously missing symbol or member changes that negative input; removals, alias multiplicity, import visibility, current-module membership, and region-name edits update the same input. `current_module` is part of the stable key, while exact current-module member presence is an input fact. Imported module and selective imported-member visibility are finalized before resolution. The full-check pipeline performs this finalization; the ordinary `resolve_declarations` wrapper uses a disabled context, and nonstandard callers without a finalized surface stay cold. The key copies exact name bytes and retains no request-owned view or binding row. This query covers only global `(known, module_only)` classification. It does not cache overload selection, call resolution, or the checker result, so a green NameLookup does not skip the body checker. NameLookup nodes have empty dependency lists, so add/remove controls exercise exact-input mismatch, recomputation, and diagnostic parity rather than reverse-edge dependency invalidation. The unindexed missing-name case exits at the O(1) `name_indexed` gate; the separate indexed hidden-member case exercises a chain miss followed by retained hits on body edits.
 
    Keep this boolean global-name-existence query separate from call/overload resolution: adding an overload can change the selected call while the name remains `Known`. Cache candidate selection only through a query that records its candidate-set and visibility reads. Zig's `Sema.lookupInNamespace` records `(namespace owner, interned identifier)` before probing pub/private maps, so missing results are dependencies too; its update path invalidates that exact name on add/remove/publicity changes and reserves whole-namespace invalidation for broader member-set changes. For Elisa's later `VisibleNameSet`, use a stable namespace/module ID plus session-owned `NameId` even on misses, and fingerprint the exact visible candidate set so unrelated declarations stay green. Likewise, local binder lookup currently uses a table-local `BindingId` tied to `DeclId`; keep it within the current table or reanalyze the body until a stable scope/binder identity exists.
 
-   One later code-shape optimization is visible in `resolve_expr_walk.elisa`: an `Expr.Ident` first calls `name_known` and then `name_is_module_only`, which walks the same symbol-name chain again. A shared query result such as `(known, module_only)` could avoid that second chain walk, but keep `bound_last_index`, `record_reference`, and unique-function reference selection on the current table.
+   `resolver_name_classification` stores the composite `(known, module_only)` result for a graph hit, and its fused cold classifier walks the global symbol and member chains once on a miss. The opt-in full-check path eagerly builds an exact per-spelling surface over symbols, members, imports, and regions on every graph-active request, even when the file has no NameLookup reads; this scans O(symbols + members + regions) and builds both the spelling and `(module, member)` indexes. That setup is included in whole-request timing but not the chain counter. Valid finalized facts provide region membership before the query, so hits no longer scan `region_names`; invalid or missing facts skip the query and use the cold classifier's region scan. Lexical `bound` scans still run before every lookup, including hits. `value_chain_is_module` routes bare identifiers used as field or namespace-call objects through that same classifier. The qualified `Expr.Scope` path still probes module prefixes and members directly through `name_is_module`, `ancestor_names_module`, `two_part_names_module`, and `module_declares_member`; those reads are outside both `NameLookup` and the counter, which counts only chain rows visited by the fused classifier. Metrics-enabled chain walks still test the tracking flag per row. The current source replaces the prior full-identity/path NameLookup key with a versioned `(module,name)` key, removing the former O(unique names × identity/path bytes) duplication. Every active lookup encodes its exact key and input into request-scoped scratch buffers for evaluation; a miss reuses those bytes at commit rather than rebuilding them. The graph copies committed bytes into session-owned storage, so it does not retain request-buffer references. Encoding, hashing, graph probes, and scratch-buffer growth are outside the chain-visit counter and may outweigh saved chain walks for short names. This key reduction has no build or performance qualification. It is safe only while the graph remains session-local and the collision-safe surface input captures every changing resolver fact; identity/options mismatches currently clear the graph. Lazy surface construction on first global lookup is a candidate if measurements show eager setup erases lookup savings, with failed construction memoized so unsupported surfaces do not trigger a repeated prepass. Lexical `bound` scans and surface construction need separate workloads because neither is represented by the chain counter. The surface-index changes have no build, parity, or retained-edit timing qualification, so treat the current counters as path-specific evidence rather than a compile-time result. Keep `bound_last_index`, `record_reference`, and unique-function reference selection on the current table.
 
 4. **Make one bounded data-layout change at a time.** Elisa already has dense query and edge pools, compact IDs, a free list, and forward/reverse links, so a second analysis-unit table would mostly duplicate existing structure. The current prototype stores the query node's six key/input/result byte-span fields as checked `u32` values. The 8 MiB and 16 MiB pool caps bound logical payloads; they do not hard-bound retained capacity, because array growth and map overhead are estimated and graph clearing truncates storage without releasing capacity. The session epoch eventually releases its region, but retained high-water memory within that epoch still needs measurement or capacity-aware admission. With current incoming-edge validation fields, the estimated node record is 112 bytes instead of 136 bytes with `usize` spans on a conventional 64-bit layout. This saves 24 bytes (about 1.5 MiB at the 65,536-node cap) before allocator and hash-index effects. Compare actual allocated bytes and graph traversal timings before keeping or crediting the change. Treat Zig's implicit-dependee edge and reusable dummy-head scheme as a separate, higher-invariant experiment; its storage savings do not justify changing Elisa's simpler explicit endpoints without measurements.
 
@@ -156,7 +156,7 @@ Sources, object files, IR, assembly, and the exact build commands are under `bui
 
 ## Elisa prototype from this study
 
-The current worktree has a private query graph in
+The study's initial worktree had a private query graph in
 `src/semantic/incremental_function_facts.elisa`: session-scoped 32-bit query and
 edge handles, exact owned keys and values, contiguous query/edge arrays, a free
 list, forward plus reverse adjacency, and reusable invalidation scratch. Opaque
@@ -167,46 +167,100 @@ when a canonical result changes. The session collector consults `SourceInput`
 and `FunctionBodyFacts` nodes and publishes after the authoritative snapshot is
 stored. A body hit still requires the old exact declaration-surface and body
 proof, restores bytes from the graph after comparing them with the prior typed
-facts, and falls back to the existing typed-fact copy on a graph miss. This is
-not yet a net performance result; graph publication, validation, and payload
-decoding add work, and no parity or retained-edit benchmark qualifies the path.
-Other declared query kinds, including `FunctionSummary`, `VisibleNameSet`,
-`NameLookup`, `TypeOf`, and `ConstantValue`, have no callers. The next semantic step is a real typed
-dependency at a read site, such as a complete scope/name lookup that records
-both found and missing outcomes. Do not persist `DeclId`, `BindingId`, AST
-pointers, or `SymbolTable` rows as query identity.
+facts, and falls back to the existing typed-fact copy on a graph miss. An Oct 18
+update also connects `NameLookup` at `Expr.Ident`: the driver reacquires a request
+context after collection, and the serial declaration-resolution walk checks the
+cached `(known, module_only)` result before scanning global symbol chains. This
+path remains opt-in and has no source-matched parity or retained-edit performance
+qualification; graph publication, validation, surface copies, and payload
+decoding add work. Other declared query kinds, including `FunctionSummary`,
+`VisibleNameSet`, `TypeOf`, and `ConstantValue`, still have no callers. Do not
+persist `DeclId`, `BindingId`, AST pointers, or `SymbolTable` rows as query
+identity.
 
-The session graph does not yet reach the resolver: the driver calls
-`run_semantic_gate_with_snapshot`, which passes an `IncrementalSemanticSnapshot`
-through `semantic_api.elisa` into `resolve_declarations`, but does not pass the
-session. Query handles are session/request/context-generation bound, so a
-read-site integration must explicitly thread or reacquire the active session
-context; do not put handles into the portable snapshot. Start only at the
-`Expr.Ident` call in `resolve_expr_walk`; `name_known` also serves region,
-flow, value-block, and where-scope paths. Keep `ga_resolve` separate because
-global-authority inference has its own scope/import search and dependencies.
+The resolver context is explicitly reacquired for each semantic request because
+query handles are session/request/context-generation bound; handles stay out of
+the portable snapshot. The first consumer is intentionally the serial
+`Expr.Ident` walk in `resolve_expr_walk`; `name_known` also serves region, flow,
+value-block, and where-scope paths, which are not covered. Keep `ga_resolve`
+separate because global-authority inference has its own scope/import search and
+dependencies.
 
 One future graph-scaling concern is invalidation fan-out. `ifq_mark_reverse_closure`
 starts a new visitation generation for each root, so multiple changed roots with
 overlapping downstream dependents can revisit that shared closure. Zig's
 `markTransitiveDependersPotentiallyOutdated` recurses when a unit first enters
 `potentially_outdated`; later roots update its pending-dependency count without
-walking its dependents again. The current Elisa graph is only collector groundwork
-with `SourceInput` and `FunctionBodyFacts`, so this is not an established hot-path
-cost. Once more query kinds and read-site dependencies are connected, consider a
-multi-root invalidation pass or request-wide visitation set, preserving `Dirty`
-over `PotentiallyDirty` and the graph's dependency-generation checks.
+walking its dependents again. Stage1 now has a resolver `NameLookup` consumer in addition to collector queries,
+but no current profile establishes this fan-out as a hot-path cost. The paired
+runner compares graph-off/on classification-chain visits on retained requests;
+the total hit counter can still include same-request duplicate callee
+classification. Once additional read-site dependencies are connected and
+measured, consider a multi-root invalidation pass or request-wide visitation
+set, preserving `Dirty` over `PotentiallyDirty` and dependency-generation checks.
 
 The Core name-selection adapter in `src/semantic/incremental_lookup_query.go`
-remains a probe rather than a live resolver path: production expression
-analysis still invokes `lookupVisibleGlobal` directly, while the adapter is
-called from tests. Its `lookupSelectionInputs` builder also regenerates the
-candidate list and performs current symbol/visibility lookups before query
-evaluation. That can validate the selection recipe, but it does not yet avoid
-the resolver work it models. A performance integration needs to query at the
-actual resolver read site and publish current binding changes from declaration
-deltas (including absent names), then show that reused results skip the
-original lookup work.
+is separate from the live Stage1 resolver path. Core production expression
+analysis still invokes `lookupVisibleGlobal` and `lookupVisibleType` directly,
+while the adapter is called from tests. Its `lookupSelectionInputs` builder
+also regenerates the candidate list and performs current symbol/visibility
+lookups before query evaluation. That can validate the selection recipe, but it
+does not yet avoid the Core resolver work it models. The smallest useful
+integration point is after declaration collection completes and before body
+analysis: publish or diff shared exact facts keyed by lookup domain and
+qualified name, then let the production evaluator lazily walk candidates in
+existing order and read those facts until it finds the winner. It should return
+only the canonical selected name and rebind it through the current symbol, type,
+or permission table. Missing names must be recorded as dependencies; publish
+visibility and alias facts, and preserve present-but-nil global bindings.
+Earlier declaration-phase lookups should retain the cold map path.
+
+Selection alone does not remove every related scan. A successful bare value
+lookup is followed by wildcard-`using` ambiguity detection, and a failed type
+lookup can scan candidates again to diagnose an inaccessible private name.
+Those need compatible query facts/results or explicit cold fallbacks. Preserve
+local shadowing and the separate enclosing-member lookup rules. The session
+database retains inputs and tombstones until removed, so production integration
+also needs active query/input retirement or a bounded reset policy as names and
+contexts change. Each root evaluation takes the database gate and encodes its
+key; an Analyzer-local memo can avoid repeated same-request evaluations, while
+batching adaptive resolver reads would require a prepass. Measure these costs
+and verify that hits skip the original map probes before claiming acceleration.
+The current Core baseline is already a cheap `Symbols` map probe per candidate
+(`globalScope` has no parent) and memoizes candidate lists per Analyzer. A
+first-candidate hit is therefore especially unlikely to repay a graph query and
+the required current-object rebind; prioritize repeated same-request reads or
+long candidate-miss prefixes only if profiles show they are material.
+
+A first resolver-coverage audit also found correctness-sensitive direct reads
+that should be reconciled before claiming a unified NameLookup path. User-written
+type-name classification has direct-first probes in `analyzer_generics.go`,
+`analyzer_type_constructor_calls.go`, `analyzer_surface_types.go`,
+`analyzer_resolve_types.go`, `analyzer_func_types.go`,
+`analyzer_where_refinements.go`, `analyzer_decl_structs.go`, and
+`analyzer_region_polymorphism.go`; these can bypass namespace/`using` precedence
+or private visibility and can affect type construction or generated region
+signatures. `analyzer_foreign_enum.go` already performs visibility-aware lookup
+but retains an exact-name fallback with the same risk. After normal expression
+resolution, `function_sink_analysis.go`, `optimization_call_facts.go`,
+`analyzer_expr_call_args.go`, `region_store_flow_summary.go`,
+`region_store_scan_param_writes.go`, `analyzer_storage_view_origins.go`,
+`analyzer_param_retention.go`, `progress_safety.go`, and
+`analyzer_ensure_reflexive.go` contain bare-global or bare-name fallback reads;
+where possible these should consume the canonical resolved symbol rather than
+resolve a second spelling independently. Treat these as staged coverage work,
+not as evidence that a generic name-selection query can replace every read.
+
+Some direct reads intentionally answer a different question and should remain
+separate: `::`-syntax diagnostics test raw namespace membership,
+declaration/exports code checks conflicts for the exact name being defined,
+trusted-runtime checks verify exact APIs, and rebinds of an already selected
+canonical symbol are correct. `extension_methods.go` enumerates and ranks an
+overload set, so a first-visible-name query cannot replace it. Likewise,
+permission declaration and include-graph traversals are distinct from user
+permission-reference selection. Keep the current specialized semantics and
+share a selected binding only where the read truly means ordinary source-name
+resolution.
 
 The current body-query path also copies each body span into a temporary byte
 array before graph evaluation and publication (`ifq_snapshot_span_copy`), then
@@ -217,6 +271,9 @@ bytes) passes to a cache hit, so restored-fact counts alone do not show saved
 work. A future span-based evaluate/commit path can hash and compare directly
 against the snapshot's owned bytes while retaining exact equality as the
 collision check; measure the end-to-end retained-edit path before adopting it.
+Publication also checks request-local restored-body markers. Collection appends
+these in function-record order, and publication now lower-bound searches by
+record index instead of scanning all markers for every cacheable body.
 
 The compile-session still runs the canonical semantic pipeline after collecting
 these facts: `run_semantic_gate_incremental_with_session` passes the snapshot to

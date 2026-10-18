@@ -607,7 +607,39 @@ session collector checks cached `SourceInput` and `FunctionBodyFacts` results. A
 query is attempted only after the trusted prior snapshot proves an exact declaration
 surface, cacheable prior record, and exact body match. A body hit decodes canonical
 query bytes into the current request snapshot, validating each fact against the
-previous snapshot's typed facts before it bypasses the body walker.
+previous snapshot's typed facts before it bypasses the body walker. A resolver
+`NameLookup` query is connected at `Expr.Ident` classification: the driver reacquires a
+request context after collection, and the serial declaration-resolution walk checks the
+cached `(known, module_only)` result before scanning global symbol/member chains. Key
+schema 2 stores only current module and exact name; the session-local graph resets when
+identity or options change. After declarations, aliases, imports, and region annotations
+are collected, the full-check pipeline finalizes a collision-safe exact-spelling surface
+index. This prepass currently runs on every graph-active full check, including requests
+with no NameLookup reads, and costs O(symbols + members + regions). Building it on the
+first eligible global-name query could avoid setup for no-reference files; if explored,
+memoize failed finalization so unsupported surfaces do not repeat the prepass. The input
+records total and non-module
+symbol counts, module presence, module-member row multiplicity, imported visibility,
+current-module membership, region-name presence, the `name_indexed` gate bit, and the
+forced-builtin class. This preserves the existing visibility/count rule while giving
+negative names stable all-zero surface facts. NameLookup has no `SourceInput` edge; the
+SourceInput handle remains a request-generation guard. Unrelated declaration changes can
+leave a name query green, while additions/removals, aliases, visibility, current-module,
+and region changes update the matching input. The resolver checks lexical bindings before
+querying; on a miss it passes that known local miss and the indexed region fact to the cold
+classifier. If the index is unavailable or fails completeness checks, it skips the query
+and uses the cold classifier, including its region-name scan. The ordinary
+`resolve_declarations` wrapper uses a disabled context, so it remains on that path.
+This input is complete for the current resolver because its symbol and module-member rows
+come from the parsed expanded unit, while imports contribute visibility annotations and
+aliases over rows already in that table; this path does not read an external module
+interface. If interface summaries become resolver inputs, they must be explicit query
+inputs or the lookup must fall back cold, since `SourceIdentity` records include paths and
+edges rather than external-file contents. The surface-index changes have source review
+only; no build, parity run, or benchmark has verified them.
+This can reuse classification across body-only edits because the declaration surface
+omits function bodies, while every declaration-surface change invalidates all these
+name queries. The resolver still performs the indexed chain walk on misses.
 If graph lookup, admission, evaluation, or result restoration misses, the collector
 falls back to copying prior typed facts when the current declaration surface and
 body exactly match; malformed or incompatible prior facts fall through to the AST
@@ -615,15 +647,20 @@ body scan. This preserves the existing safe reuse path when graph limits reject 
 query. After a successful snapshot store, the private publisher seeds or updates
 source and cacheable body nodes, which can repopulate a cleared graph; generation
 exhaustion permanently disables graph use for that session. After collection,
-publication rebuilds and reevaluates the source query and every cacheable body query,
-including unchanged body queries already evaluated and validated on collector hits.
-The common graph-hit path therefore copies and hashes the same source/body inputs in
-both phases; it serializes and commits direct-fact results only on misses. A per-
-request record of validated hits could skip post-store reevaluation after reacquiring
-fresh handles, but old handles cannot cross the context-generation change. This is a
-concrete redundant-work candidate, not a measured cost.
-No source-matched retained-edit benchmark of this graph path is
-available, and the implementation was not built or runtime-qualified in this slice.
+publication rebuilds and reevaluates the source query. For body-query hits restored
+successfully during collection, request-local markers let publication reacquire a
+fresh body-query handle and skip duplicate body copying, hashing, and evaluation only
+when graph generation, exact query key, body-record span, result generations, Green
+dependencies, and graph health still match. The markers contain request-local IDs
+and generation evidence, never query handles; graph clears and retries invalidate
+them. The `body_query_publish_skips` counter exposes validated skips. Misses and
+unrestored bodies keep the existing publication path. The resolver's `SourceInput`
+admission also copies the declaration surface into a temporary span and again into
+the encoded input before evaluation on each semantic request. A span-backed evaluator
+could avoid those copies while keeping exact equality. These work-reduction paths are
+not measured costs or speedup claims. No source-matched retained-edit benchmark has
+qualified the graph path, and the implementation has not passed runtime parity or
+performance qualification.
 Persistent `semantic-session` and `compile-session` hosts keep graph evaluation and
 publication disabled by default. Set `ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1` to
 opt in; the typed snapshot and exact-fact fallback remain active in either mode.
@@ -654,6 +691,33 @@ exact-source session return because that path bypasses the graph. These counters
 describe routing only; do not claim a production query engine or speedup until
 parity controls and measured results show the graph improves the retained-edit
 path.
+
+The paired retained-session harness now has `zero-fact` and `call-facts` workloads.
+The latter uses a distinct leaf callee per body and requires warm `NameLookup` hit
+totals to exceed the prime request's same-request duplicate baseline, exposing
+aggregate prior-request reuse. It also asserts `direct_fact_count` is one per
+`bench_*` body, while the `zero-fact` workload asserts there are no direct facts.
+Both workloads compare complete non-telemetry transcripts and body-edit fact
+restores. Both graph modes report NameLookup classification-chain visits. That
+counter covers only the global symbol and module-member chains traversed by the
+fused classifier; it excludes direct qualified `Expr.Scope` probes through
+`name_is_module`, `ancestor_names_module`, `two_part_names_module`, and
+`module_declares_member`. Lexical bound-name checks still run before the query;
+region membership comes from the finalized surface on active queries and is scanned
+only on the cold fallback. The benchmark fixture has no locals, region names, or
+qualified paths and does not measure those costs.
+For `call-facts`, the runner requires positive cold visits on the graph-on prime request,
+then fewer visits than graph-off on exact-repeat and body-edit requests. The prime request
+seeds the graph and is reported separately from warm body-edit timing ratios. Chain-visit
+reductions can include both duplicate same-request reads and retained hits; the counters do
+not partition those sources. Timed arms set `ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1`,
+which adds per-row chain-counter work; graph-off visits more rows, so current ratios
+include asymmetric telemetry overhead and may overstate graph-on gains. Treat these
+timings as instrumentation-biased, not production-equivalent, until a counter-disabled
+timing arm exists. The harness records request timers but does not capture compiler
+process instructions or cycles. It has not produced a source-qualified performance
+result, so its assertions and timing ratios are qualification machinery, not evidence
+of a speedup.
 
 Graph admission caps owned key bytes at 8 MiB, canonical input/result bytes at 16
 MiB, query nodes and their possible hash-index entries at 65,536, edge slots and
@@ -862,8 +926,9 @@ Unsupported bodies and decoded disk snapshots keep the ordinary checker path;
 the portable sidecar codec does not serialize these lint facts. The report's
 `self_assignment_bodies_scanned` and `self_assignment_bodies_reused` fields count
 those per-body scans and reuses separately from authority facts. It still rebuilds
-the parse tree for every request; the query graph only backs this narrow body-fact
-path and does not replay full checker results or reuse LLVM/native artifacts.
+the parse tree for every request. The query graph backs this narrow body-fact path
+and also has an opt-in resolver `NameLookup` route at `Expr.Ident` classification;
+it does not replay full checker results or reuse LLVM/native artifacts.
 It is intentionally tied to one source path and fixed process environment for
 its lifetime; launch a fresh host to change compiler options or source identity.
 Ordinary CLI compilation remains one-shot. The host control is wired into
@@ -890,9 +955,12 @@ semantic-gate callsites receive an explicit session reference. One-shot compilat
 uses a disabled session, preserving disk-sidecar behavior. Repeated compilation
 uses the retained in-process session for validated function facts and self-assignment
 findings, then still runs current semantic checking, LLVM IR generation, optimization,
-and artifact emission. The query graph reuses only `SourceInput` and
-`FunctionBodyFacts` results; a body hit restores canonical facts into the current
-snapshot. No source-matched retained-edit benchmark qualifies this graph path yet.
+and artifact emission. The query graph reuses `SourceInput` and
+`FunctionBodyFacts` results and, when `ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1`, can
+cache resolver `NameLookup` classification for `Expr.Ident`. A body hit restores
+canonical facts into the current snapshot; a name hit skips the global symbol-chain
+classification on that resolver walk. No source-matched retained-edit benchmark
+qualifies this graph path yet.
 The host does not reuse parse trees, other semantic query kinds, LLVM modules, or
 native objects. LLVM object, IR, bitcode, executable, wasm, and Python
 extension requests dispose their builder, module, target data, target machine, and

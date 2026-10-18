@@ -48,6 +48,7 @@ extend Semantic:
         const INCREMENTAL_SEMANTIC_QUERY_PER_DEPENDENCY_LIMIT: usize = 4096
         const INCREMENTAL_SEMANTIC_QUERY_RETAINED_BYTES_LIMIT: usize = 33554432
         private const INCREMENTAL_SEMANTIC_QUERY_KEY_VERSION: u32 = 1
+        private const INCREMENTAL_SEMANTIC_NAME_LOOKUP_KEY_VERSION: u32 = 2
         private const INCREMENTAL_SEMANTIC_QUERY_RESULT_VERSION: u32 = 1
 
         private const enum IncrementalSemanticQueryKind of u8:
@@ -310,10 +311,16 @@ extend Semantic:
         struct IncrementalSemanticNameLookupContext[@r]:
             private:
                 session: mutable IncrementalSemanticSession[r]&? @r
-                source_input: IncrementalSemanticQueryHandle[r]
+                source_input: mutable IncrementalSemanticQueryHandle[r]
                 active: mutable bool
+                track_stats: bool
                 lookup_hits: mutable u64
                 classification_chain_visits: mutable u64
+                # Reused for one synchronous evaluate -> cold-classify -> commit sequence.
+                # Query graph APIs consume these buffers synchronously and copy stored bytes.
+                lookup_key_scratch: mutable darray[u8]
+                lookup_input_scratch: mutable darray[u8]
+                lookup_scratch_ready: mutable bool
 
         struct IncrementalSemanticNameLookupResult:
             hit: bool
@@ -1405,11 +1412,10 @@ extend Semantic:
 
         def incremental_collect_function_facts[@output](file: Ast::File&, source: u8& @output, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, options_key: darray[u8]&, previous: IncrementalSemanticSnapshot&, has_previous: bool) -> IncrementalSemanticSnapshot @output:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast:
-                region local_session:
-                    disabled_session: mutable IncrementalSemanticSession[local_session] @local_session = incremental_semantic_session_new[local_session](false) can Memory.Allocate
-                    request_metrics: mutable IncrementalFunctionFactsRequestMetrics = IncrementalFunctionFactsRequestMetrics{function_body_facts_restored: 0, body_query_publish_skips: 0, prior_snapshot_fact_fallbacks: 0, cold_body_scans: 0, source_input_admitted: false, validated_body_query_generation: 0, validated_body_query_hits: []}
-                    empty_identity: darray[u8] = []
-                    return ifc_collect_function_facts[local_session,output](file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, empty_identity, previous, has_previous, false, &request_metrics, &disabled_session)
+                disabled_session: mutable IncrementalSemanticSession[output] @output = incremental_semantic_session_new[output](false) can Memory.Allocate
+                request_metrics: mutable IncrementalFunctionFactsRequestMetrics = IncrementalFunctionFactsRequestMetrics{function_body_facts_restored: 0, body_query_publish_skips: 0, prior_snapshot_fact_fallbacks: 0, cold_body_scans: 0, source_input_admitted: false, validated_body_query_generation: 0, validated_body_query_hits: []}
+                empty_identity: darray[u8] = []
+                return ifc_collect_function_facts[output,output](file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, empty_identity, previous, has_previous, false, &request_metrics, &disabled_session)
 
         # Rebind an exact-input, compiler-produced session snapshot to the current parse.
         # This intentionally rebuilds only invocation-local source anchors; the session key
@@ -1509,20 +1515,23 @@ extend Semantic:
 
     public:
         def incremental_semantic_name_lookup_context_disabled[@r]() -> IncrementalSemanticNameLookupContext[r] @r:
-            return IncrementalSemanticNameLookupContext{session: null, source_input: ifq_query_handle_invalid(), active: false, lookup_hits: 0, classification_chain_visits: 0}
+            return IncrementalSemanticNameLookupContext{session: null, source_input: ifq_query_handle_invalid(), active: false, track_stats: false, lookup_hits: 0, classification_chain_visits: 0, lookup_key_scratch: [], lookup_input_scratch: [], lookup_scratch_ready: false}
 
         def incremental_semantic_name_lookup_context_is_active[@r](context: IncrementalSemanticNameLookupContext[r]&) -> bool:
             return context.active
 
+        def incremental_semantic_name_lookup_context_tracks_stats[@r](context: IncrementalSemanticNameLookupContext[r]&) -> bool:
+            return context.track_stats
+
         # The resolver starts a new graph phase after collection and publication. Rebuild
         # SourceInput from the authoritative session snapshot so exact-source hits and edits
         # enter resolution with a current, Green dependency handle.
-        def incremental_semantic_name_lookup_context_begin_request[@session](session: mutable IncrementalSemanticSession[session]& @session) -> IncrementalSemanticNameLookupContext[session] @session can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]:
-            context: mutable IncrementalSemanticNameLookupContext[session] = IncrementalSemanticNameLookupContext{session: session, source_input: ifq_query_handle_invalid(), active: false, lookup_hits: 0, classification_chain_visits: 0}
+        def incremental_semantic_name_lookup_context_begin_request[@session](session: mutable IncrementalSemanticSession[session]& @session, track_stats: bool) -> IncrementalSemanticNameLookupContext[session] @session can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]:
+            context: mutable IncrementalSemanticNameLookupContext[session] = IncrementalSemanticNameLookupContext{session: session, source_input: ifq_query_handle_invalid(), active: false, track_stats: track_stats, lookup_hits: 0, classification_chain_visits: 0, lookup_key_scratch: [], lookup_input_scratch: [], lookup_scratch_ready: false}
             return context if not session.enabled or not session.query_graph_enabled or not session.valid or session.query_graph_poisoned or not session.snapshot.declaration_surface_valid
             return context if session.snapshot.source_path_length == 0 or session.snapshot.source_path_start > session.snapshot.bytes.count or session.snapshot.source_path_length > session.snapshot.bytes.count - session.snapshot.source_path_start
             return context if session.snapshot.declaration_surface_start > session.snapshot.bytes.count or session.snapshot.declaration_surface_length > session.snapshot.bytes.count - session.snapshot.declaration_surface_start
-            source_path: sview = ""
+            source_path: mutable sview = ""
             if ifc_byte_span(session.snapshot.bytes, session.snapshot.source_path_start, session.snapshot.source_path_length) is path_view:
                 source_path <- path_view
             return context if source_path.len == 0
@@ -1532,7 +1541,7 @@ extend Semantic:
             return context if source_key.count == 0
             declaration_surface: darray[u8] = ifq_snapshot_span_copy(session.snapshot.bytes, session.snapshot.declaration_surface_start, session.snapshot.declaration_surface_length)
             source_value: darray[u8] = ifq_source_query_value(session.snapshot.options_key, declaration_surface)
-            source_handle: IncrementalSemanticQueryHandle[session] = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.SourceInput, source_key)
+            source_handle: IncrementalSemanticQueryHandle[session] = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.SourceInput, source_key) can Global{Read,Write}
             no_dependencies: darray[IncrementalSemanticQueryHandle[session]] = []
             evaluation: IncrementalSemanticQueryEvaluation = ifq_query_evaluate(session, source_handle, source_value, no_dependencies)
             if not evaluation.hit or not ifq_query_value_equals(session, evaluation.result_start, evaluation.result_length, source_value):
@@ -1541,37 +1550,47 @@ extend Semantic:
             context.active <- true
             return context
 
-        def incremental_semantic_name_lookup_evaluate[@r](context: mutable IncrementalSemanticNameLookupContext[r]&, current_module: sview, name: sview, region_name_present: bool) -> IncrementalSemanticNameLookupResult can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]:
+        def incremental_semantic_name_lookup_evaluate[@r](context: mutable IncrementalSemanticNameLookupContext[r]&, current_module: sview, name: sview, surface: ResolverNameLookupSurface) -> IncrementalSemanticNameLookupResult can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]:
             miss: IncrementalSemanticNameLookupResult = IncrementalSemanticNameLookupResult{hit: false, known: false, module_only: false}
-            return miss if not context.active
+            context.lookup_scratch_ready <- false
+            return miss if not context.active or not surface.valid
             if context.session is session:
-                return miss if not ifq_name_lookup_key_fits(session, current_module, name)
-                key: darray[u8] = ifq_name_lookup_key(session, current_module, name)
-                return miss if key.count == 0
-                input: darray[u8] = ifq_name_lookup_input(region_name_present)
-                dependencies: darray[IncrementalSemanticQueryHandle[r]] = [context.source_input]
-                handle: IncrementalSemanticQueryHandle[r] = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.NameLookup, key)
-                evaluation: IncrementalSemanticQueryEvaluation = ifq_query_evaluate(session, handle, input, dependencies)
+                # A graph-budget clear invalidates the request handle and resets its
+                # generation. Stop before constructing per-name keys and arrays; the
+                # resolver will use its ordinary cold classification from here on.
+                if not ifq_query_handle_is_valid(session, context.source_input):
+                    context.active <- false
+                    return miss
+                return miss if not ifq_name_lookup_key_encode(current_module, name, context.lookup_key_scratch)
+                ifq_name_lookup_input_encode(name, surface, context.lookup_input_scratch)
+                context.lookup_scratch_ready <- true
+                # The complete resolver surface is the query input. The SourceInput handle
+                # remains a request-lifetime/graph-generation guard on the context, but a
+                # declaration edit changes only names whose exact facts changed.
+                dependencies: darray[IncrementalSemanticQueryHandle[r]] = []
+                handle: IncrementalSemanticQueryHandle[r] = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.NameLookup, context.lookup_key_scratch) can Global{Read,Write}
+                evaluation: IncrementalSemanticQueryEvaluation = ifq_query_evaluate(session, handle, context.lookup_input_scratch, dependencies)
                 decoded: IncrementalSemanticNameLookupResult = ifq_name_lookup_result_decode(session, evaluation)
                 if decoded.hit:
-                    context.lookup_hits <- context.lookup_hits + 1 if context.lookup_hits < 18446744073709551615
+                    context.lookup_hits <- context.lookup_hits + 1 if context.track_stats and context.lookup_hits < 18446744073709551615
+                    context.lookup_scratch_ready <- false
                     return decoded
             return miss
 
-        def incremental_semantic_name_lookup_commit[@r](context: IncrementalSemanticNameLookupContext[r]&, current_module: sview, name: sview, region_name_present: bool, known: bool, module_only: bool) -> bool can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]:
-            return false if not context.active
+        def incremental_semantic_name_lookup_commit[@r](context: mutable IncrementalSemanticNameLookupContext[r]&, known: bool, module_only: bool) -> bool can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]:
+            ready: bool = context.lookup_scratch_ready
+            context.lookup_scratch_ready <- false
+            return false if not context.active or not ready
             if context.session is session:
-                return false if not ifq_name_lookup_key_fits(session, current_module, name)
-                key: darray[u8] = ifq_name_lookup_key(session, current_module, name)
-                return false if key.count == 0
-                input: darray[u8] = ifq_name_lookup_input(region_name_present)
+                return false if not ifq_query_handle_is_valid(session, context.source_input)
                 result: darray[u8] = ifq_name_lookup_result(known, module_only)
-                dependencies: darray[IncrementalSemanticQueryHandle[r]] = [context.source_input]
-                handle: IncrementalSemanticQueryHandle[r] = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.NameLookup, key)
-                return ifq_query_commit(session, handle, input, dependencies, result)
+                dependencies: darray[IncrementalSemanticQueryHandle[r]] = []
+                handle: IncrementalSemanticQueryHandle[r] = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.NameLookup, context.lookup_key_scratch) can Global{Read,Write}
+                return ifq_query_commit(session, handle, context.lookup_input_scratch, dependencies, result)
             return false
 
         def incremental_semantic_name_lookup_record_chain_visits[@r](context: mutable IncrementalSemanticNameLookupContext[r]&, visits: u64) -> void:
+            return if not context.track_stats
             context.classification_chain_visits <- context.classification_chain_visits + visits if context.classification_chain_visits <= 18446744073709551615 - visits
             context.classification_chain_visits <- 18446744073709551615 if context.classification_chain_visits > 18446744073709551615 - visits
 
@@ -1731,44 +1750,50 @@ extend Semantic:
                 value.extend(declaration_surface)
                 return value
 
-        # Name lookup identity uses only stable bytes. SymbolTable row IDs and declaration
-        # IDs are rebuilt for every semantic gate and must never enter this key.
-        def ifq_name_lookup_key_fits[@r](session: IncrementalSemanticSession[r]& @r, module_name: sview, name: sview) -> bool:
+        # NameLookup is session-local and its exact resolver-surface projection is the
+        # query input. Session identity/options changes clear the graph, so duplicating the
+        # full include identity and source path in every spelling key is unnecessary.
+        # Keep only stable module/name bytes; SymbolTable rows and declaration IDs are
+        # rebuilt for every semantic gate and must never enter the key.
+        def ifq_name_lookup_key_fits(module_name: sview, name: sview) -> bool:
             can Abort.Panic:
-                prefix_length: usize = 20
-                return false if session.identity_key.count > INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT - prefix_length
-                remaining: mutable usize = INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT - prefix_length - session.identity_key.count
-                return false if session.snapshot.source_path_length > remaining
-                remaining <- remaining - session.snapshot.source_path_length
-                return false if module_name.len > remaining
-                remaining <- remaining - module_name.len
-                return name.len <= remaining
+                prefix_length: usize = 12
+                return false if module_name.len > INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT - prefix_length
+                remaining: mutable usize = INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT - prefix_length - module_name.len
+                return false if name.len > remaining
+                return false if module_name.len > 4294967295 or name.len > 4294967295
+                return true
 
-        def ifq_name_lookup_key[@r](session: IncrementalSemanticSession[r]& @r, module_name: sview, name: sview) -> darray[u8]:
+        def ifq_name_lookup_key_encode(module_name: sview, name: sview, key: mutable darray[u8]&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                key: mutable darray[u8] = []
-                return key if not ifq_name_lookup_key_fits(session, module_name, name)
-                return key if session.identity_key.count > 4294967295 or session.snapshot.source_path_length > 4294967295 or module_name.len > 4294967295 or name.len > 4294967295
-                return key if session.snapshot.source_path_start > session.snapshot.bytes.count or session.snapshot.source_path_length > session.snapshot.bytes.count - session.snapshot.source_path_start
-                key.reserve(20 + session.identity_key.count + session.snapshot.source_path_length + module_name.len + name.len)
-                ifc_append_u32_bytes(key, INCREMENTAL_SEMANTIC_QUERY_KEY_VERSION)
-                ifc_append_u32_bytes(key, session.identity_key.count.u32())
-                key.extend(session.identity_key)
-                ifc_append_u32_bytes(key, session.snapshot.source_path_length.u32())
-                if session.snapshot.source_path_length > 0 and ifc_byte_span(session.snapshot.bytes, session.snapshot.source_path_start, session.snapshot.source_path_length) is source_path:
-                    key.extend(source_path)
+                key.truncate(0)
+                return false if not ifq_name_lookup_key_fits(module_name, name)
+                key.reserve(12 + module_name.len + name.len)
+                ifc_append_u32_bytes(key, INCREMENTAL_SEMANTIC_NAME_LOOKUP_KEY_VERSION)
                 ifc_append_u32_bytes(key, module_name.len.u32())
                 key.extend(module_name)
                 ifc_append_u32_bytes(key, name.len.u32())
                 key.extend(name)
-                return key
+                return true
 
-        def ifq_name_lookup_input(region_name_present: bool) -> darray[u8]:
+        def ifq_name_lookup_input_encode(name: sview, surface: ResolverNameLookupSurface, input: mutable darray[u8]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                input: mutable darray[u8] = []
-                ifc_append_u32_bytes(input, INCREMENTAL_SEMANTIC_QUERY_RESULT_VERSION)
-                input.push(1 if region_name_present else 0)
-                return input
+                input.truncate(0)
+                input.reserve(22)
+                # Schema 2 is an exact, collision-safe projection of the resolver surface.
+                # Keep the name in the key; these fields encode every changing fact used by
+                # resolver name classification, including empty-name misses.
+                ifc_append_u32_bytes(input, 2)
+                input.push(1 if surface.name_indexed else 0)
+                ifc_append_u32_bytes(input, surface.symbol_count)
+                ifc_append_u32_bytes(input, surface.nonmodule_symbol_count)
+                ifc_append_u32_bytes(input, surface.member_count)
+                input.push(1 if surface.module_present else 0)
+                input.push(1 if surface.imported_visible_member else 0)
+                input.push(1 if surface.current_module_member else 0)
+                input.push(1 if surface.region_name_present else 0)
+                forced_builtin: bool = name == "_" or name == "old" or name == "ensures" or name == "variants" or name == "fields"
+                input.push(1 if forced_builtin else 0)
 
         def ifq_name_lookup_result(known: bool, module_only: bool) -> darray[u8]:
             can Memory.Allocate, Abort.Panic:
@@ -1786,6 +1811,7 @@ extend Semantic:
                 known_byte: u8 = session.query_value_bytes[evaluation.result_start + 4]
                 module_byte: u8 = session.query_value_bytes[evaluation.result_start + 5]
                 return miss if known_byte > 1 or module_byte > 1
+                return miss if known_byte == 0 and module_byte == 1
                 return IncrementalSemanticNameLookupResult{hit: true, known: known_byte == 1, module_only: module_byte == 1}
 
         def ifq_function_query_key(snapshot: IncrementalSemanticSnapshot&, record: IncrementalFunctionFactRecord) -> darray[u8]:
@@ -2831,19 +2857,31 @@ extend Semantic:
                 return false if not request_metrics.source_input_admitted or session.query_graph_poisoned
                 return false if request_metrics.validated_body_query_generation != session.query_graph_generation
                 return false if not ifq_query_handle_is_valid(session, query_handle)
-                for marker in request_metrics.validated_body_query_hits |session, record, query_key, query_handle, dependencies|:
-                    continue if not marker.direct_facts_restored
-                    continue if marker.function_record_index != record_index or marker.query_id.value != query_handle.node.value
-                    continue if marker.graph_generation != session.query_graph_generation or marker.source_result_generation != source_result_generation
-                    continue if marker.body_start != record.body_start or marker.body_length != record.body_length
-                    continue if not ifq_query_key_matches(session, marker.query_id, IncrementalSemanticQueryKind.FunctionBodyFacts, query_key)
-                    node: IncrementalSemanticQueryNode = session.query_nodes[marker.query_id.value.usize()]
-                    continue if node.status != IncrementalSemanticQueryStatus.Green or not node.has_committed_value
-                    continue if node.result_generation != marker.query_result_generation or not ifq_query_node_value_state_is_valid(session, node)
-                    dependency_check: IncrementalSemanticQueryDependencyCheck = ifq_query_dependencies_check(session, marker.query_id, dependencies)
-                    continue if not dependency_check.valid or not dependency_check.equal or not dependency_check.results_current or not dependency_check.all_dependencies_green
-                    return true
-                return false
+                # Collection appends at most one marker per function record, in
+                # increasing record order. Lower-bound the sparse list so a warm
+                # request does not scan N markers once for each of N cacheable bodies.
+                low: mutable usize = 0
+                high: mutable usize = request_metrics.validated_body_query_hits.count
+                while low < high |low, high, request_metrics, record_index|:
+                    middle: usize = low + (high - low) / 2
+                    marker: IncrementalSemanticBodyQueryHitMarker = request_metrics.validated_body_query_hits[middle]
+                    if marker.function_record_index < record_index:
+                        low <- middle + 1
+                    else:
+                        high <- middle
+                return false if low >= request_metrics.validated_body_query_hits.count
+                marker: IncrementalSemanticBodyQueryHitMarker = request_metrics.validated_body_query_hits[low]
+                return false if not marker.direct_facts_restored
+                return false if marker.function_record_index != record_index or marker.query_id.value != query_handle.node.value
+                return false if marker.graph_generation != session.query_graph_generation or marker.source_result_generation != source_result_generation
+                return false if marker.body_start != record.body_start or marker.body_length != record.body_length
+                return false if not ifq_query_key_matches(session, marker.query_id, IncrementalSemanticQueryKind.FunctionBodyFacts, query_key)
+                node: IncrementalSemanticQueryNode = session.query_nodes[marker.query_id.value.usize()]
+                return false if node.status != IncrementalSemanticQueryStatus.Green or not node.has_committed_value
+                return false if node.result_generation != marker.query_result_generation or not ifq_query_node_value_state_is_valid(session, node)
+                dependency_check: IncrementalSemanticQueryDependencyCheck = ifq_query_dependencies_check(session, marker.query_id, dependencies)
+                return false if not dependency_check.valid or not dependency_check.equal or not dependency_check.results_current or not dependency_check.all_dependencies_green
+                return true
 
         # Publish graph values only after ifc_session_store has made this exact snapshot
         # authoritative. Query handles are reacquired under the committed context.
@@ -2865,7 +2903,7 @@ extend Semantic:
                 dependencies: mutable darray[IncrementalSemanticQueryHandle[session]] = []
                 dependencies.push(source_handle)
                 body_query_publish_skips: mutable u32 = 0
-                for record_index in 0..<snapshot.functions.count |session, snapshot, identity_key, source_path, source_handle, dependencies|:
+                for record_index in 0..<snapshot.functions.count |session, snapshot, identity_key, source_path, source_handle, dependencies, source_input_hit_current, request_metrics, body_query_publish_skips|:
                     record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
                     continue if not record.cacheable
                     continue if not ifq_function_query_key_fits(record)
@@ -2919,7 +2957,7 @@ extend Semantic:
                 if not context_matches:
                     incremental_semantic_session_reset(session)
                 else:
-                    prior: mutable IncrementalSemanticSnapshot = ifc_clone_session_snapshot(&session.snapshot)
+                    prior: mutable IncrementalSemanticSnapshot = ifc_clone_session_snapshot(session.snapshot)
                     if ifc_session_source_matches(session, source, source_length):
                         current: mutable IncrementalSemanticSnapshot = prior
                         if ifc_equal_view(current.bytes, current.source_path_start, current.source_path_length, source_path) and incremental_reanchor_exact_snapshot(file, tokens, source, source_length, &current):

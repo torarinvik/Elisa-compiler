@@ -19,25 +19,6 @@ extend Semantic:
         # native stack limit; exceeding it is diagnosed rather than silently skipping a subtree.
         const EXPRESSION_ANALYSIS_DEPTH_LIMIT: u32 = 128
 
-        # Whether `name` resolves EXCLUSIVELY to Module symbol(s) and is not a
-        # bound local/param — the "namespace used as a value" test.
-        def name_is_module_only(table: SymbolTable&, bound: darray[sview]&, name: sview) -> bool:
-            can Abort.Panic:
-                return false if any bound_name in bound where bound_name == name
-                # Walk this name's own hash chain, not every symbol in the program. The
-                # chain is hash-keyed, so a colliding OTHER name can appear on it — the
-                # per-row name compare stays load-bearing (it now runs O(chain), not O(n)).
-                saw_module: mutable bool = false
-                row: mutable u32 = symbol_chain_head(table, name)
-                while row != SYMBOL_INDEX_ROW_NONE |saw_module, row, table, name|:
-                    table.incremental_name_lookup_chain_visits <- table.incremental_name_lookup_chain_visits + 1 if table.incremental_name_lookup_chain_visits < 18446744073709551615
-                    symbol: Symbol& = &table.symbols[row.usize()]
-                    return false if symbol.name == name and symbol.kind != SymbolKind.Module
-                    saw_module <- true if symbol.name == name
-                    row <- table.symbol_name_next[row.usize()]
-                return saw_module
-
-
         # Whether module `owner` declares a member named `name` — a walk of `name`'s own
         # member hash chain, the same chain name_indexed uses.
         def module_declares_member(table: SymbolTable&, owner: sview, name: sview) -> bool:
@@ -135,11 +116,12 @@ extend Semantic:
         # Whether a VALUE-position object names a module: a bare identifier (module-only,
         # unshadowed -- the existing rule) or a pure `::` chain (`Pack::Sub`) that names a
         # declared module, absolutely or relative to the current module.
-        def value_chain_is_module(table: SymbolTable&, bound: darray[sview]&, object: Ast::Expr) -> bool:
-            can Memory.Allocate, Abort.Panic:
+        def value_chain_is_module[@lookup](table: mutable SymbolTable&, bound: darray[sview]&, object: Ast::Expr, lookup_context: mutable IncrementalSemanticNameLookupContext[lookup]& @lookup) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 match object:
                     Expr.Ident(chain_ident_name, chain_ident_pos):
-                        return name_known(table, bound, chain_ident_name) and name_is_module_only(table, bound, chain_ident_name)
+                        classification: (known: bool, module_only: bool) = resolver_name_classification(table, bound, chain_ident_name, lookup_context)
+                        return classification.known and classification.module_only
                     Expr.Scope(chain_scope_base, chain_scope_name, chain_scope_pos):
                         names: mutable darray[sview] = []
                         dotted: mutable darray[bool] = []
@@ -207,7 +189,6 @@ extend Semantic:
                 symbol_count: mutable usize = 0
                 symbol_row: mutable u32 = symbol_chain_head(table, name)
                 while symbol_row != SYMBOL_INDEX_ROW_NONE |symbol_count, symbol_row, table, name|:
-                    table.incremental_name_lookup_chain_visits <- table.incremental_name_lookup_chain_visits + 1 if table.incremental_name_lookup_chain_visits < 18446744073709551615
                     chain_symbol: Symbol& = &table.symbols[symbol_row.usize()]
                     symbol_count <- symbol_count + 1 if chain_symbol.name == name and chain_symbol.kind != SymbolKind.Module
                     symbol_row <- table.symbol_name_next[symbol_row.usize()]
@@ -215,7 +196,6 @@ extend Semantic:
                 visible_member: mutable bool = false
                 member_row: mutable u32 = member_chain_head(table, name)
                 while member_row != SYMBOL_INDEX_ROW_NONE |member_count, visible_member, member_row, table, name|:
-                    table.incremental_name_lookup_chain_visits <- table.incremental_name_lookup_chain_visits + 1 if table.incremental_name_lookup_chain_visits < 18446744073709551615
                     member_index: usize = member_row.usize()
                     if table.module_member_name[member_index] == name:
                         member_count <- member_count + 1
@@ -225,28 +205,289 @@ extend Semantic:
                 return visible_member or symbol_count > member_count or symbol_count == 0
 
 
+        # Resolve the composite result used at expression-identifier read sites.
+        # Unlike the general helpers above, this cold path fuses their work: the
+        # symbol chain is traversed once to compute both name existence counts and
+        # module-only classification. A true bound-membership-checked flag means
+        # the caller already established that no local binding matches.
+        def resolver_name_classification_cold(table: mutable SymbolTable&, bound: darray[sview]&, name: sview, bound_membership_checked: bool, region_membership_known: bool, region_name_present: bool) -> (known: bool, module_only: bool) can[Abort.Panic]:
+            if not bound_membership_checked:
+                return (true, false) if any bound_name in bound where bound_name == name
+
+            is_reflection_builtin: bool = match name:
+                "variants" | "fields": true
+                _: false
+            forced_known: mutable bool = name == "_" or name == "old" or name == "ensures" or is_reflection_builtin
+            if not forced_known:
+                region_present: mutable bool = region_name_present
+                if not region_membership_known:
+                    region_present <- any region_name in table.region_names where region_name == name
+                forced_known <- region_present
+
+            return (false, false) if not forced_known and not name_indexed(table, name)
+
+            nonmodule_count: mutable usize = 0
+            saw_module: mutable bool = false
+            symbol_row: mutable u32 = symbol_chain_head(table, name)
+            while symbol_row != SYMBOL_INDEX_ROW_NONE |nonmodule_count, saw_module, symbol_row, table, name, forced_known|:
+                table.incremental_name_lookup_chain_visits <- table.incremental_name_lookup_chain_visits + 1 if table.incremental_name_lookup_metrics_enabled and table.incremental_name_lookup_chain_visits < 18446744073709551615
+                chain_symbol: Symbol& = &table.symbols[symbol_row.usize()]
+                if chain_symbol.name == name:
+                    if chain_symbol.kind == SymbolKind.Module:
+                        saw_module <- true
+                    elif forced_known:
+                        return (true, false)
+                    else:
+                        nonmodule_count <- nonmodule_count + 1
+                symbol_row <- table.symbol_name_next[symbol_row.usize()]
+
+            known: mutable bool = forced_known
+            if not forced_known:
+                member_count: mutable usize = 0
+                visible_member: mutable bool = false
+                member_row: mutable u32 = member_chain_head(table, name)
+                while member_row != SYMBOL_INDEX_ROW_NONE |member_count, visible_member, member_row, table, name|:
+                    table.incremental_name_lookup_chain_visits <- table.incremental_name_lookup_chain_visits + 1 if table.incremental_name_lookup_metrics_enabled and table.incremental_name_lookup_chain_visits < 18446744073709551615
+                    member_index: usize = member_row.usize()
+                    if table.module_member_name[member_index] == name:
+                        member_count <- member_count + 1
+                        owner: sview = table.module_member_owner[member_index]
+                        visible_member <- true if owner == table.current_module or (any imported in table.imported_modules where imported == owner) or (any brought in table.imported_members where brought == name)
+                    member_row <- table.member_name_next[member_index]
+                known <- visible_member or nonmodule_count > member_count or nonmodule_count == 0
+
+            return (known, known and saw_module and nonmodule_count == 0)
+
+
+        # Return the open-addressed surface slot for `name`, comparing the full spelling
+        # after the hash probe. Call only when slots are non-empty.
+        def resolver_name_surface_slot(table: SymbolTable&, name: sview) -> usize:
+            can Abort.Panic:
+                mask: usize = table.resolver_name_surface.slots.count - 1
+                slot: mutable usize = name_hash(name).usize() & mask
+                while table.resolver_name_surface.slots[slot] != SYMBOL_INDEX_ROW_NONE |slot, table, name, mask|:
+                    row: usize = table.resolver_name_surface.slots[slot].usize()
+                    return slot if table.resolver_name_surface.names[row] == name
+                    slot <- (slot + 1) & mask
+                return slot
+
+
+        def resolver_name_surface_grow(table: mutable SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                capacity: mutable usize = 16
+                while capacity < (table.resolver_name_surface.names.count + 1) * 2 |capacity, table|:
+                    capacity <- capacity * 2
+                table.resolver_name_surface.slots <- table.resolver_name_surface.slots.truncate(0)
+                table.resolver_name_surface.slots <- table.resolver_name_surface.slots.reserve(capacity)
+                for slot_index in 0..<capacity |table|:
+                    table.resolver_name_surface.slots <- table.resolver_name_surface.slots.push(SYMBOL_INDEX_ROW_NONE)
+                for row in 0..<table.resolver_name_surface.names.count |table|:
+                    slot: usize = resolver_name_surface_slot(table, table.resolver_name_surface.names[row])
+                    table.resolver_name_surface.slots[slot] <- row.u32()
+
+
+        # Get or create the exact-name summary row. Row IDs reserve u32::MAX as empty.
+        def resolver_name_surface_add(table: mutable SymbolTable&, name: sview @source) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                if table.resolver_name_surface.slots.count < (table.resolver_name_surface.names.count + 1) * 2:
+                    resolver_name_surface_grow(table)
+                slot: usize = resolver_name_surface_slot(table, name)
+                existing: u32 = table.resolver_name_surface.slots[slot]
+                return existing if existing != SYMBOL_INDEX_ROW_NONE
+                if table.resolver_name_surface.names.count >= 4294967295.usize():
+                    table.resolver_name_surface.valid <- false
+                    return SYMBOL_INDEX_ROW_NONE
+                row: u32 = table.resolver_name_surface.names.count.u32()
+                table.resolver_name_surface.names <- table.resolver_name_surface.names.push(name)
+                table.resolver_name_surface.symbol_counts <- table.resolver_name_surface.symbol_counts.push(0)
+                table.resolver_name_surface.nonmodule_counts <- table.resolver_name_surface.nonmodule_counts.push(0)
+                table.resolver_name_surface.module_present <- table.resolver_name_surface.module_present.push(false)
+                table.resolver_name_surface.member_counts <- table.resolver_name_surface.member_counts.push(0)
+                table.resolver_name_surface.imported_visible <- table.resolver_name_surface.imported_visible.push(false)
+                table.resolver_name_surface.region_present <- table.resolver_name_surface.region_present.push(false)
+                table.resolver_name_surface.slots[slot] <- row
+                return row
+
+
+        def resolver_member_pair_hash(owner: sview, name: sview) -> u64:
+            can Abort.Panic:
+                return struct_field_pair_hash(owner, name)
+
+
+        def resolver_member_pair_slot(table: SymbolTable&, owner: sview, name: sview) -> usize:
+            can Abort.Panic:
+                mask: usize = table.resolver_name_surface.member_pairs.slots.count - 1
+                slot: mutable usize = resolver_member_pair_hash(owner, name).usize() & mask
+                while table.resolver_name_surface.member_pairs.slots[slot] != SYMBOL_INDEX_ROW_NONE |slot, table, owner, name, mask|:
+                    row: usize = table.resolver_name_surface.member_pairs.slots[slot].usize()
+                    return slot if table.resolver_name_surface.member_pairs.owners[row] == owner and table.resolver_name_surface.member_pairs.names[row] == name
+                    slot <- (slot + 1) & mask
+                return slot
+
+
+        def resolver_member_pair_grow(table: mutable SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                capacity: mutable usize = 16
+                while capacity < (table.resolver_name_surface.member_pairs.names.count + 1) * 2 |capacity, table|:
+                    capacity <- capacity * 2
+                table.resolver_name_surface.member_pairs.slots <- table.resolver_name_surface.member_pairs.slots.truncate(0)
+                table.resolver_name_surface.member_pairs.slots <- table.resolver_name_surface.member_pairs.slots.reserve(capacity)
+                for slot_index in 0..<capacity |table|:
+                    table.resolver_name_surface.member_pairs.slots <- table.resolver_name_surface.member_pairs.slots.push(SYMBOL_INDEX_ROW_NONE)
+                for row in 0..<table.resolver_name_surface.member_pairs.names.count |table|:
+                    slot: usize = resolver_member_pair_slot(table, table.resolver_name_surface.member_pairs.owners[row], table.resolver_name_surface.member_pairs.names[row])
+                    table.resolver_name_surface.member_pairs.slots[slot] <- row.u32()
+
+
+        def resolver_member_pair_add(table: mutable SymbolTable&, owner: sview @source, name: sview @source) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if table.resolver_name_surface.member_pairs.slots.count < (table.resolver_name_surface.member_pairs.names.count + 1) * 2:
+                    resolver_member_pair_grow(table)
+                slot: usize = resolver_member_pair_slot(table, owner, name)
+                return true if table.resolver_name_surface.member_pairs.slots[slot] != SYMBOL_INDEX_ROW_NONE
+                if table.resolver_name_surface.member_pairs.names.count >= 4294967295.usize():
+                    return false
+                row: u32 = table.resolver_name_surface.member_pairs.names.count.u32()
+                table.resolver_name_surface.member_pairs.owners <- table.resolver_name_surface.member_pairs.owners.push(owner)
+                table.resolver_name_surface.member_pairs.names <- table.resolver_name_surface.member_pairs.names.push(name)
+                table.resolver_name_surface.member_pairs.slots[slot] <- row
+                return true
+
+
+        def resolver_member_pair_contains(table: SymbolTable&, owner: sview, name: sview) -> bool:
+            can Abort.Panic:
+                return false if not table.resolver_name_surface.member_pairs.valid or table.resolver_name_surface.member_pairs.slots.count == 0
+                slot: usize = resolver_member_pair_slot(table, owner, name)
+                return table.resolver_name_surface.member_pairs.slots[slot] != SYMBOL_INDEX_ROW_NONE
+
+
+        # Build these summaries once after all declaration rows and visibility annotations
+        # have been collected. Queries then validate one spelling and one module/member pair
+        # without traversing the symbol, member, or region-name chains.
+        def resolver_finalize_name_surface(table: mutable SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.resolver_name_surface.valid <- false
+                table.resolver_name_surface.member_pairs.valid <- false
+                table.resolver_name_surface.names <- table.resolver_name_surface.names.truncate(0)
+                table.resolver_name_surface.slots <- table.resolver_name_surface.slots.truncate(0)
+                table.resolver_name_surface.symbol_counts <- table.resolver_name_surface.symbol_counts.truncate(0)
+                table.resolver_name_surface.nonmodule_counts <- table.resolver_name_surface.nonmodule_counts.truncate(0)
+                table.resolver_name_surface.module_present <- table.resolver_name_surface.module_present.truncate(0)
+                table.resolver_name_surface.member_counts <- table.resolver_name_surface.member_counts.truncate(0)
+                table.resolver_name_surface.imported_visible <- table.resolver_name_surface.imported_visible.truncate(0)
+                table.resolver_name_surface.region_present <- table.resolver_name_surface.region_present.truncate(0)
+                table.resolver_name_surface.member_pairs.owners <- table.resolver_name_surface.member_pairs.owners.truncate(0)
+                table.resolver_name_surface.member_pairs.names <- table.resolver_name_surface.member_pairs.names.truncate(0)
+                table.resolver_name_surface.member_pairs.slots <- table.resolver_name_surface.member_pairs.slots.truncate(0)
+                return if:
+                    not table.symbol_name_index_valid
+                    table.symbol_name_next.count != table.symbols.count
+                    table.module_member_owner.count != table.module_member_name.count
+                    table.member_name_next.count != table.module_member_name.count
+                imported_modules: mutable NameSet = empty_name_set()
+                imported_members: mutable NameSet = empty_name_set()
+                for imported_module in table.imported_modules:
+                    name_set_add(&imported_modules, imported_module)
+                for imported_member in table.imported_members:
+                    name_set_add(&imported_members, imported_member)
+                symbol_count: usize = table.symbols.count
+                for symbol_index in 0..<symbol_count |table, imported_modules, imported_members|:
+                    symbol_name: sview @source = table.symbols[symbol_index].name
+                    symbol_kind: SymbolKind = table.symbols[symbol_index].kind
+                    if not name_indexed(table, symbol_name):
+                        return
+                    surface_row: u32 = resolver_name_surface_add(table, symbol_name)
+                    return if surface_row == SYMBOL_INDEX_ROW_NONE
+                    row: usize = surface_row.usize()
+                    return if table.resolver_name_surface.symbol_counts[row] == 4294967295
+                    table.resolver_name_surface.symbol_counts[row] <- table.resolver_name_surface.symbol_counts[row] + 1
+                    if symbol_kind == SymbolKind.Module:
+                        table.resolver_name_surface.module_present[row] <- true
+                    else:
+                        return if table.resolver_name_surface.nonmodule_counts[row] == 4294967295
+                        table.resolver_name_surface.nonmodule_counts[row] <- table.resolver_name_surface.nonmodule_counts[row] + 1
+                for member_index in 0..<table.module_member_name.count |table, imported_modules, imported_members|:
+                    member_name: sview = table.module_member_name[member_index]
+                    member_owner: sview = table.module_member_owner[member_index]
+                    surface_row: u32 = resolver_name_surface_add(table, member_name)
+                    return if surface_row == SYMBOL_INDEX_ROW_NONE
+                    row: usize = surface_row.usize()
+                    return if table.resolver_name_surface.member_counts[row] == 4294967295
+                    table.resolver_name_surface.member_counts[row] <- table.resolver_name_surface.member_counts[row] + 1
+                    table.resolver_name_surface.imported_visible[row] <- true if name_set_contains(imported_modules, member_owner) or name_set_contains(imported_members, member_name)
+                    return if not resolver_member_pair_add(table, member_owner, member_name)
+                region_name_count: usize = table.region_names.count
+                for region_index in 0..<region_name_count |table|:
+                    region_name: sview @source = table.region_names[region_index]
+                    surface_row: u32 = resolver_name_surface_add(table, region_name)
+                    return if surface_row == SYMBOL_INDEX_ROW_NONE
+                    table.resolver_name_surface.region_present[surface_row.usize()] <- true
+                table.resolver_name_surface.member_pairs.valid <- true
+                table.resolver_name_surface.valid <- true
+
+
+        def resolver_name_surface_for_lookup(table: SymbolTable&, current_module: sview, name: sview) -> ResolverNameLookupSurface:
+            can Abort.Panic:
+                invalid: ResolverNameLookupSurface = ResolverNameLookupSurface{valid: false, name_indexed: false, symbol_count: 0, nonmodule_symbol_count: 0, module_present: false, member_count: 0, imported_visible_member: false, current_module_member: false, region_name_present: false}
+                return invalid if not table.resolver_name_surface.valid or not table.resolver_name_surface.member_pairs.valid
+                symbol_count: mutable u32 = 0
+                nonmodule_count: mutable u32 = 0
+                module_present: mutable bool = false
+                member_count: mutable u32 = 0
+                imported_visible: mutable bool = false
+                region_present: mutable bool = false
+                if table.resolver_name_surface.slots.count > 0:
+                    slot: usize = resolver_name_surface_slot(table, name)
+                    surface_row: u32 = table.resolver_name_surface.slots[slot]
+                    if surface_row != SYMBOL_INDEX_ROW_NONE:
+                        row: usize = surface_row.usize()
+                        symbol_count <- table.resolver_name_surface.symbol_counts[row]
+                        nonmodule_count <- table.resolver_name_surface.nonmodule_counts[row]
+                        module_present <- table.resolver_name_surface.module_present[row]
+                        member_count <- table.resolver_name_surface.member_counts[row]
+                        imported_visible <- table.resolver_name_surface.imported_visible[row]
+                        region_present <- table.resolver_name_surface.region_present[row]
+                return ResolverNameLookupSurface{valid: true, name_indexed: name_indexed(table, name), symbol_count: symbol_count, nonmodule_symbol_count: nonmodule_count, module_present: module_present, member_count: member_count, imported_visible_member: imported_visible, current_module_member: resolver_member_pair_contains(table, current_module, name), region_name_present: region_present}
+
+
         # The expression resolver caches the composite classification used by an
         # Expr.Ident. Locals are already answered by the lexical bound set, so they
         # bypass the global query and retain the existing short-circuit behavior.
-        def resolver_name_classification[@lookup](table: lmut SymbolTable, bound: darray[sview]&, name: sview, lookup_context: mutable IncrementalSemanticNameLookupContext[lookup]& @lookup) -> (known: bool, module_only: bool) can[Memory.Allocate, Abort.Panic, Global{Read,Write}]:
+        def resolver_name_classification[@lookup](table: mutable SymbolTable&, bound: darray[sview]&, name: sview, lookup_context: mutable IncrementalSemanticNameLookupContext[lookup]& @lookup) -> (known: bool, module_only: bool) can[Memory.Allocate, Abort.Panic, Global{Read,Write}]:
+            track_stats: bool = table.incremental_name_lookup_metrics_enabled
             if not incremental_semantic_name_lookup_context_is_active(lookup_context):
-                known: bool = name_known(table, bound, name)
-                module_only: bool = known and name_is_module_only(table, bound, name)
-                return (known, module_only)
+                # Avoid even reading the per-table counter on ordinary non-reporting
+                # requests. The actual classification remains the same cold path.
+                if not track_stats:
+                    return resolver_name_classification_cold(table, bound, name, false, false, false)
+                chain_visits_before: u64 = table.incremental_name_lookup_chain_visits
+                result: (known: bool, module_only: bool) = resolver_name_classification_cold(table, bound, name, false, false, false)
+                chain_visits_after: u64 = table.incremental_name_lookup_chain_visits
+                incremental_semantic_name_lookup_record_chain_visits(lookup_context, chain_visits_after - chain_visits_before)
+                return result
             return (true, false) if any bound_name in bound where bound_name == name
-            region_name_present: bool = any region_name in table.region_names where region_name == name
+            surface: ResolverNameLookupSurface = resolver_name_surface_for_lookup(table, table.current_module, name)
+            if not surface.valid:
+                # A direct/nonstandard declaration-resolution caller may not have passed
+                # through the full-check surface finalizer. Preserve the old cold behavior.
+                chain_visits_before: u64 = table.incremental_name_lookup_chain_visits if track_stats else 0
+                result: (known: bool, module_only: bool) = resolver_name_classification_cold(table, bound, name, true, false, false)
+                if track_stats:
+                    chain_visits_after: u64 = table.incremental_name_lookup_chain_visits
+                    incremental_semantic_name_lookup_record_chain_visits(lookup_context, chain_visits_after - chain_visits_before)
+                return result
             cached: mutable IncrementalSemanticNameLookupResult = IncrementalSemanticNameLookupResult{hit: false, known: false, module_only: false}
             can Unsafe.PointerCast:
-                cached <- incremental_semantic_name_lookup_evaluate(&lookup_context, table.current_module, name, region_name_present) can Global{Read,Write}
+                cached <- incremental_semantic_name_lookup_evaluate(lookup_context, table.current_module, name, surface) can Global{Read,Write}
             return (cached.known, cached.module_only) if cached.hit
-            chain_visits_before: u64 = table.incremental_name_lookup_chain_visits
-            known: bool = name_known(table, bound, name)
-            module_only: bool = known and name_is_module_only(table, bound, name)
-            chain_visits_after: u64 = table.incremental_name_lookup_chain_visits
-            incremental_semantic_name_lookup_record_chain_visits(&lookup_context, chain_visits_after - chain_visits_before)
+            chain_visits_before: u64 = table.incremental_name_lookup_chain_visits if track_stats else 0
+            result: (known: bool, module_only: bool) = resolver_name_classification_cold(table, bound, name, true, true, surface.region_name_present)
+            if track_stats:
+                chain_visits_after: u64 = table.incremental_name_lookup_chain_visits
+                incremental_semantic_name_lookup_record_chain_visits(lookup_context, chain_visits_after - chain_visits_before)
             can Unsafe.PointerCast:
-                _ = incremental_semantic_name_lookup_commit(&lookup_context, table.current_module, name, region_name_present, known, module_only) can Global{Read,Write}
-            return (known, module_only)
+                _ = incremental_semantic_name_lookup_commit(lookup_context, result.known, result.module_only) can Global{Read,Write}
+            return result
 
 
         # Allocate a lexical identity owned by the current function. The serial is

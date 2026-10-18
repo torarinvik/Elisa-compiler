@@ -95,6 +95,15 @@ read_status() {
 
 send_check() {
     local expected="$1"
+    local cold_status=0
+    local server_bytes_before
+    local server_request_stderr="$WORK/server-request.stderr"
+    local cold_request_stderr="$WORK/cold-request.stderr"
+    "$STAGE1" -emit check "$SOURCE" >"$WORK/cold-request.stdout" 2>"$WORK/cold-request.raw.stderr" || cold_status=$?
+    [[ "$cold_status" == "$expected" ]] \
+        || fail "cold check status $cold_status differs from expected session status $expected"
+    sed '/^incremental-ga-cache:/d' "$WORK/cold-request.raw.stderr" >"$cold_request_stderr"
+    server_bytes_before="$(wc -c <"$WORK/server.stderr")"
     local reports_before
     reports_before="$(grep -Ec 'session=(hit|edit|miss|off)([[:space:]]|$)' "$WORK/server.stderr" || true)"
     printf 'check\n' >&3 || fail "could not send check command"
@@ -105,6 +114,11 @@ send_check() {
     reports_after="$(grep -Ec 'session=(hit|edit|miss|off)([[:space:]]|$)' "$WORK/server.stderr" || true)"
     [[ "$reports_after" -eq "$((reports_before + 1))" ]] || fail "expected one cache report for this request, got $reports_before->$reports_after"
     [[ -n "$report_line" ]] || fail "missing cache report for this request"
+    tail -c "+$((server_bytes_before + 1))" "$WORK/server.stderr" \
+        | sed '/^incremental-ga-cache:/d' >"$server_request_stderr"
+    if ! diff -u "$cold_request_stderr" "$server_request_stderr"; then
+        fail "cold and retained-session diagnostics differ for this request"
+    fi
     printf '%s\n' "$report_line" >>"$REPORTS"
 }
 
@@ -156,6 +170,28 @@ assert_graph_body_edit() {
         || fail "$context used the prior-snapshot fallback instead of the query graph: $report"
 }
 
+assert_body_walker_skips() {
+    local report="$1"
+    local context="$2"
+    local expected="$3"
+    local effect_source_skips
+    local ungranted_panic_skips
+    if [[ "$report" =~ effect_source_bodies_skipped=([0-9]+)([[:space:]]|$) ]]; then
+        effect_source_skips="${BASH_REMATCH[1]}"
+    else
+        fail "$context report omitted effect-source skip accounting: $report"
+    fi
+    if [[ "$report" =~ ungranted_panic_bodies_skipped=([0-9]+)([[:space:]]|$) ]]; then
+        ungranted_panic_skips="${BASH_REMATCH[1]}"
+    else
+        fail "$context report omitted panic-coverage skip accounting: $report"
+    fi
+    [[ "$effect_source_skips" -eq "$expected" ]] \
+        || fail "$context expected $expected effect-source body skips: $report"
+    [[ "$ungranted_panic_skips" -eq "$expected" ]] \
+        || fail "$context expected $expected ungranted-panic body skips: $report"
+}
+
 write_valid_source 40
 ELISA_STAGE1_BIN="$STAGE1" ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1 ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
     "${PYTHON_BIN:-python3}" -c 'import os, sys; os.setsid(); os.execvp("bash", ["bash", *sys.argv[1:]])' \
@@ -167,7 +203,11 @@ exec 4<"$REPLIES"
 
 # First request seeds a small session snapshot.
 send_check 0
+ordinary_seed_report="$(tail -n 1 "$REPORTS")"
+assert_body_walker_skips "$ordinary_seed_report" "the ordinary seed" 1
 send_check 0
+ordinary_repeat_report="$(tail -n 1 "$REPORTS")"
+assert_body_walker_skips "$ordinary_repeat_report" "the ordinary repeat" 1
 
 # A supported helper edit and inserted comment leave the declaration surface stable,
 # so the unchanged main body can restore while lint warning anchors shift by one line.
@@ -240,6 +280,8 @@ cold_unknown_diagnostic="$(grep -F 'error:' "$WORK/invalid-cold.stderr" | grep -
 cold_unknown_count="$(grep -F 'error:' "$WORK/invalid-cold.stderr" | grep -Fc 'unknown_name' || true)"
 [[ "$cold_unknown_count" -eq 1 ]] || fail "expected one cold unresolved-name diagnostic, got $cold_unknown_count"
 send_check 1
+invalid_report="$(tail -n 1 "$REPORTS")"
+assert_body_walker_skips "$invalid_report" "the errorful source" 1
 first_warm_unknown_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'unknown_name' | tail -n 1 || true)"
 first_warm_unknown_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'unknown_name' || true)"
 [[ "$first_warm_unknown_count" -eq 1 && "$first_warm_unknown_diagnostic" == "$cold_unknown_diagnostic" ]] \
@@ -249,6 +291,185 @@ second_warm_unknown_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep 
 second_warm_unknown_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'unknown_name' || true)"
 [[ "$second_warm_unknown_count" -eq 2 && "$second_warm_unknown_diagnostic" == "$cold_unknown_diagnostic" ]] \
     || fail "repeated warm diagnostic differs from cold or has wrong multiplicity: cold=[$cold_unknown_diagnostic] warm_count=$second_warm_unknown_count warm=[$second_warm_unknown_diagnostic]"
+
+# An unindexed miss has no symbol/member chain work to skip. Keep it as a
+# correctness and add/remove invalidation control without requiring a graph hit.
+cat >"$SOURCE" <<'EOF'
+def main() -> i64:
+    return newly_added_name + 0
+EOF
+name_lookup_hits_from_report() {
+    local report="$1"
+    if [[ "$report" =~ name_lookup_hits=([0-9]+)([[:space:]]|$) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        fail "cache report omitted name-lookup hit accounting: $report"
+    fi
+}
+absent_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/name-absent-cold.stdout" 2>"$WORK/name-absent-cold.stderr" || absent_cold_status=$?
+[[ "$absent_cold_status" -ne 0 ]] || fail "cold check accepted the unresolved name before adding its declaration"
+absent_cold_diagnostic="$(grep -F 'error:' "$WORK/name-absent-cold.stderr" | grep -F 'newly_added_name' | tail -n 1 || true)"
+[[ -n "$absent_cold_diagnostic" ]] || fail "cold check missed the absent declaration: $(tail -n 8 "$WORK/name-absent-cold.stderr")"
+absent_server_count_before="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+send_check 1
+absent_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$absent_report" "the absent name"
+assert_body_walker_skips "$absent_report" "the absent-name source" 0
+absent_name_hits="$(name_lookup_hits_from_report "$absent_report")"
+[[ "$absent_name_hits" -eq 0 ]] || fail "fresh absent-name request unexpectedly had prior NameLookup hits: $absent_report"
+absent_warm_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'newly_added_name' | tail -n 1 || true)"
+absent_warm_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+[[ "$absent_warm_count" -eq "$((absent_server_count_before + 1))" && "$absent_warm_diagnostic" == "$absent_cold_diagnostic" ]] \
+    || fail "absent-name diagnostic differs from cold or has wrong multiplicity: cold=[$absent_cold_diagnostic] warm_count=$absent_warm_count warm=[$absent_warm_diagnostic]"
+
+cat >"$SOURCE" <<'EOF'
+const newly_added_name: i64 = 7
+
+def main() -> i64:
+    return newly_added_name + 0
+EOF
+declared_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/name-declared-cold.stdout" 2>"$WORK/name-declared-cold.stderr" || declared_cold_status=$?
+[[ "$declared_cold_status" -eq 0 ]] || fail "cold check rejected the newly declared constant: $(tail -n 8 "$WORK/name-declared-cold.stderr")"
+send_check 0
+declared_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$declared_report" "the declaration addition"
+declared_warm_missing_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+[[ "$declared_warm_missing_count" -eq 0 ]] \
+    || fail "the declared name retained a stale negative diagnostic: $declared_warm_missing_count"
+
+cat >"$SOURCE" <<'EOF'
+def main() -> i64:
+    return newly_added_name + 0
+EOF
+removed_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/name-removed-cold.stdout" 2>"$WORK/name-removed-cold.stderr" || removed_cold_status=$?
+[[ "$removed_cold_status" -ne 0 ]] || fail "cold check accepted the identifier after removing its declaration"
+removed_cold_diagnostic="$(grep -F 'error:' "$WORK/name-removed-cold.stderr" | grep -F 'newly_added_name' | tail -n 1 || true)"
+[[ -n "$removed_cold_diagnostic" ]] || fail "cold check missed the removed declaration: $(tail -n 8 "$WORK/name-removed-cold.stderr")"
+server_unknown_count_before_remove="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+send_check 1
+removed_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$removed_report" "the declaration removal"
+removed_warm_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'newly_added_name' | tail -n 1 || true)"
+removed_warm_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+[[ "$removed_warm_count" -eq "$((server_unknown_count_before_remove + 1))" && "$removed_warm_diagnostic" == "$removed_cold_diagnostic" ]] \
+    || fail "declaration removal differs from cold or has wrong multiplicity: cold=[$removed_cold_diagnostic] warm_count=$removed_warm_count warm=[$removed_warm_diagnostic]"
+send_check 1
+removed_repeat_report="$(tail -n 1 "$REPORTS")"
+[[ "$removed_repeat_report" =~ session=hit([[:space:]]|$) ]] \
+    || fail "expected an exact hit for the repeated negative lookup: $removed_repeat_report"
+removed_repeat_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'newly_added_name' | tail -n 1 || true)"
+removed_repeat_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+[[ "$removed_repeat_count" -eq "$((removed_warm_count + 1))" && "$removed_repeat_diagnostic" == "$removed_cold_diagnostic" ]] \
+    || fail "repeated negative lookup differs from cold or has wrong multiplicity: cold=[$removed_cold_diagnostic] warm_count=$removed_repeat_count warm=[$removed_repeat_diagnostic]"
+
+# A nested module function is indexed under its short name as well as recorded
+# as a module member. With no root declaration or import, that one-to-one pair
+# is an indexed negative result; declaration changes must invalidate it.
+cat >"$SOURCE" <<'EOF'
+module Foreign:
+    def indexed_name() -> i64:
+        return 8
+
+def main() -> i64:
+    return indexed_name + 0
+EOF
+indexed_negative_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/indexed-negative-cold.stdout" 2>"$WORK/indexed-negative-cold.stderr" || indexed_negative_cold_status=$?
+[[ "$indexed_negative_cold_status" -ne 0 ]] || fail "cold check accepted the indexed hidden module member"
+indexed_negative_cold_diagnostic="$(grep -F 'error:' "$WORK/indexed-negative-cold.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
+[[ -n "$indexed_negative_cold_diagnostic" ]] || fail "cold check missed the indexed negative name: $(tail -n 8 "$WORK/indexed-negative-cold.stderr")"
+indexed_server_count_before="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+send_check 1
+indexed_negative_seed_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$indexed_negative_seed_report" "the indexed negative name"
+[[ "$(name_lookup_hits_from_report "$indexed_negative_seed_report")" -eq 0 ]] \
+    || fail "fresh indexed-negative request unexpectedly had a prior NameLookup hit: $indexed_negative_seed_report"
+indexed_negative_seed_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
+indexed_negative_seed_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+[[ "$indexed_negative_seed_count" -eq "$((indexed_server_count_before + 1))" && "$indexed_negative_seed_diagnostic" == "$indexed_negative_cold_diagnostic" ]] \
+    || fail "indexed-negative seed differs from cold or has wrong multiplicity: cold=[$indexed_negative_cold_diagnostic] warm_count=$indexed_negative_seed_count warm=[$indexed_negative_seed_diagnostic]"
+
+for edit_value in 1 2; do
+    cat >"$SOURCE" <<EOF
+module Foreign:
+    def indexed_name() -> i64:
+        return 8
+
+def main() -> i64:
+    return indexed_name + $edit_value
+EOF
+    send_check 1
+    indexed_edit_report="$(tail -n 1 "$REPORTS")"
+    [[ ! "$indexed_edit_report" =~ session=hit([[:space:]]|$) ]] \
+        || fail "indexed negative body edit unexpectedly hit the complete-file snapshot: $indexed_edit_report"
+    [[ "$indexed_edit_report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
+        || fail "indexed negative body edit failed to retain its unchanged declaration surface: $indexed_edit_report"
+    [[ "$(name_lookup_hits_from_report "$indexed_edit_report")" -eq 1 ]] \
+        || fail "indexed negative body edit expected exactly one retained NameLookup hit: $indexed_edit_report"
+    if [[ "$indexed_edit_report" =~ name_lookup_classification_chain_visits=([0-9]+)([[:space:]]|$) ]]; then
+        indexed_edit_chain_visits="${BASH_REMATCH[1]}"
+    else
+        fail "cache report omitted indexed-negative chain accounting: $indexed_edit_report"
+    fi
+    [[ "$indexed_edit_chain_visits" -eq 0 ]] \
+        || fail "indexed negative body edit still walked resolver chains: $indexed_edit_report"
+    indexed_edit_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
+    indexed_edit_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+    [[ "$indexed_edit_count" -eq "$((indexed_negative_seed_count + edit_value))" && "$indexed_edit_diagnostic" == "$indexed_negative_cold_diagnostic" ]] \
+        || fail "indexed negative body edit differs from cold or has wrong multiplicity: cold=[$indexed_negative_cold_diagnostic] warm_count=$indexed_edit_count warm=[$indexed_edit_diagnostic]"
+done
+
+# Adding a root declaration makes the module-backed name known; removing it
+# restores the indexed negative. Both surface changes must invalidate the result.
+cat >"$SOURCE" <<'EOF'
+const indexed_name: i64 = 7
+
+module Foreign:
+    def indexed_name() -> i64:
+        return 8
+
+def main() -> i64:
+    return indexed_name + 0
+EOF
+indexed_visible_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/indexed-visible-cold.stdout" 2>"$WORK/indexed-visible-cold.stderr" || indexed_visible_cold_status=$?
+[[ "$indexed_visible_cold_status" -eq 0 ]] || fail "cold check rejected the name after adding its root declaration: $(tail -n 8 "$WORK/indexed-visible-cold.stderr")"
+send_check 0
+indexed_visible_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$indexed_visible_report" "the indexed-name root declaration addition"
+[[ "$(name_lookup_hits_from_report "$indexed_visible_report")" -eq 0 ]] \
+    || fail "adding the root declaration reused a stale negative NameLookup result: $indexed_visible_report"
+indexed_visible_server_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+[[ "$indexed_visible_server_count" -eq "$((indexed_negative_seed_count + 2))" ]] \
+    || fail "adding the root declaration retained an indexed-name diagnostic: seed=$indexed_negative_seed_count after=$indexed_visible_server_count"
+
+cat >"$SOURCE" <<'EOF'
+module Foreign:
+    def indexed_name() -> i64:
+        return 8
+
+def main() -> i64:
+    return indexed_name + 0
+EOF
+indexed_negative_remove_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/indexed-negative-remove-cold.stdout" 2>"$WORK/indexed-negative-remove-cold.stderr" || indexed_negative_remove_status=$?
+[[ "$indexed_negative_remove_status" -ne 0 ]] || fail "cold check accepted the indexed negative after removing its root declaration"
+indexed_negative_remove_diagnostic="$(grep -F 'error:' "$WORK/indexed-negative-remove-cold.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
+[[ "$indexed_negative_remove_diagnostic" == "$indexed_negative_cold_diagnostic" ]] \
+    || fail "root declaration removal cold diagnostic differs: seed=[$indexed_negative_cold_diagnostic] removed=[$indexed_negative_remove_diagnostic]"
+indexed_negative_server_count_before_remove="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+send_check 1
+indexed_negative_remove_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$indexed_negative_remove_report" "the indexed-name root declaration removal"
+[[ "$(name_lookup_hits_from_report "$indexed_negative_remove_report")" -eq 0 ]] \
+    || fail "removing the root declaration reused a stale positive NameLookup result: $indexed_negative_remove_report"
+indexed_negative_remove_server_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+indexed_negative_remove_warm="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
+[[ "$indexed_negative_remove_server_count" -eq "$((indexed_negative_server_count_before_remove + 1))" && "$indexed_negative_remove_warm" == "$indexed_negative_remove_diagnostic" ]] \
+    || fail "root declaration removal differs from cold or has wrong multiplicity: cold=[$indexed_negative_remove_diagnostic] warm_count=$indexed_negative_remove_server_count warm=[$indexed_negative_remove_warm]"
 
 write_valid_source 41 1
 send_check 0
