@@ -313,18 +313,26 @@ compiler efficiency across representative projects.
 
 Prior-snapshot function-key lookup is indexed on `main` (integrated at
 `93cc402c`). Seven paired shared-Mac warm-cache runs showed a median paired
-speedup of about 5.0x for the dense 4,096-helper case, with identical prior
-snapshot bytes, diagnostics and reuse counts. Small and low-query cases were
-near parity. These are exploratory opt-in warm-cache results, not qualified
-Linux results or evidence of default cold-compilation speed.
+speedup of about 5.0x by the runner's `wall_seconds` metric for the dense
+4,096-helper case, with identical prior snapshot bytes, diagnostics and reuse
+counts. This is outer wall time and includes `/usr/bin/time -l` wrapper startup
+and capture overhead. Small and low-query cases were near parity by the same
+metric. The runner separately records and reports `compiler_real_seconds`; that
+metric does not underlie these headline ratios unless its specific paired ratio
+is quoted. These are exploratory opt-in warm-cache results, not qualified Linux
+results or evidence of default cold-compilation speed.
 
 Current-function name uniqueness now also uses an index. Its exact-name hash buckets retain byte
 comparison and reject a name immediately after the second exact match. In seven
 shared-Mac pairs, a 4,097-function collector workload with mostly unsupported
-generic bodies had a 3.046x median paired speedup; full canonical encoded
-snapshot bytes matched in every pair. This span excludes parsing, object
-emission and linking. The full self-host compiler seed and incremental correctness gate passed,
-including uniqueness and prior-key controls at O0/O2, exact legacy encoding,
+generic bodies had a 3.046x median paired speedup by runner `wall_seconds`, the
+outer wall metric that includes `/usr/bin/time -l` wrapper startup and capture
+overhead; full canonical encoded snapshot bytes matched in every pair. The
+runner separately records and reports `compiler_real_seconds`; that metric does
+not underlie this headline ratio unless its specific paired ratio is quoted.
+This span excludes parsing, object emission and linking. The full self-host
+compiler seed and incremental correctness gate passed, including uniqueness and
+prior-key controls at O0/O2, exact legacy encoding,
 warm/cold diagnostic and effect-row parity, source revalidation of forged
 sidecars, body/option invalidation, generated input and corruption misses.
 These correctness checks support integration; the timing result remains scoped
@@ -606,14 +614,33 @@ body exactly match; malformed or incompatible prior facts fall through to the AS
 body scan. This preserves the existing safe reuse path when graph limits reject a
 query. After a successful snapshot store, the private publisher seeds or updates
 source and cacheable body nodes, which can repopulate a cleared graph; generation
-exhaustion permanently disables graph use for that session. Publication rebuilds
-each cacheable body's query key and copies its body input for evaluation on every
-stored edit; it serializes and commits the direct-fact result only on a query miss.
+exhaustion permanently disables graph use for that session. After collection,
+publication rebuilds and reevaluates the source query and every cacheable body query,
+including unchanged body queries already evaluated and validated on collector hits.
+The common graph-hit path therefore copies and hashes the same source/body inputs in
+both phases; it serializes and commits direct-fact results only on misses. A per-
+request record of validated hits could skip post-store reevaluation after reacquiring
+fresh handles, but old handles cannot cross the context-generation change. This is a
+concrete redundant-work candidate, not a measured cost.
 No source-matched retained-edit benchmark of this graph path is
 available, and the implementation was not built or runtime-qualified in this slice.
-The 16 MiB value cap is enforced at graph admission/commit after some source-value,
-body-input, and canonical-result temporaries may already have been assembled; add
-length-only preflights before expanding graph use to large inputs.
+Persistent `semantic-session` and `compile-session` hosts keep graph evaluation and
+publication disabled by default. Set `ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1` to
+opt in; the typed snapshot and exact-fact fallback remain active in either mode.
+Per-value preflight guards are now present in the live source: the collector and
+publisher check the exact encoded `SourceInput` size before making its graph value
+copy, body lengths above 16 MiB skip graph copies, `ifq_query_evaluate` returns a miss
+before hashing an oversized input, and direct-fact result size is validated against
+the same per-value limit before serialization reserves or appends bytes. The typed
+snapshot remains the fallback for values rejected by these checks. The collector
+still assembles the proposed declaration surface needed for exact snapshot
+comparison. These checks do not preflight remaining aggregate graph capacity: a
+permitted body copy or canonical result can still be materialized before commit
+discovers that the 32 MiB value pool has insufficient room. The aggregate logical
+cap also excludes these pre-admission temporaries. A remaining-capacity preflight or
+span-based evaluation path could reduce that transient peak; keep the graph opt-in.
+These guards have source review only and still need parity and retained-session
+performance evidence.
 The opt-in `incremental-ga-cache` report now separates request-local
 `function_body_facts_restored`, `prior_snapshot_fact_fallbacks`, and
 `cold_body_scans` counts. They are mutually exclusive per collector candidate and

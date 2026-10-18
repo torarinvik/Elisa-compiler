@@ -103,11 +103,19 @@ pins, fingerprints, libraries = {}, {}, {}
 # carry an older platform.sh, but both products must be checked against the same current LLVM.
 benchmark_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(benchmark_root / "scripts"))
+counter_helper = benchmark_root / "test/bench/codegen_perf"
+sys.path.insert(0, str(counter_helper))
 from bench_load_gate import (
     LoadGateError,
     check_load_gate,
     load_average,
     wait_for_sustained_load_gate,
+)
+from process_counter import (
+    METHOD_DESCRIPTION as COUNTER_METHOD,
+    new_report_path,
+    read_report,
+    wrap_command,
 )
 
 system = platform.system()
@@ -146,6 +154,7 @@ for path in {
     benchmark_root / "scripts/platform.sh",
     benchmark_root / "scripts/bench_load_gate.py",
     benchmark_root / "scripts/stage1_provenance.py",
+    counter_helper / "process_counter.py",
     host_qualification,
     *(root / "scripts/platform.sh" for root, _ in products.values()),
     *(root / "scripts/stage1_provenance.py" for root, _ in products.values()),
@@ -153,7 +162,9 @@ for path in {
     resolved = path.resolve()
     pins[str(resolved)] = digest(resolved)
 metadata = {
-    "status": "exploratory paired full-process warm incremental checks; not cold compile timing",
+    "status": "exploratory paired full-process warm sidecar-backed incremental checks; not cold compile timing",
+    "incremental_reuse_scope": "durable semantic snapshot/fact reuse across fresh ordinary CLI processes; not in-memory query-graph reuse across a persistent compile-server session",
+    "fresh_process_per_sample": True,
     "platform": platform.platform(),
     "pairs": args.pairs,
     "benchmark_host_lock": str(host_lock_path),
@@ -161,6 +172,9 @@ metadata = {
     "host_qualification_sha256": digest(host_qualification),
     "runner_sha256": digest(Path(__file__).resolve()),
     "compiler_process_timeout_seconds": args.timeout_seconds,
+    "retired_instruction_counter": COUNTER_METHOD,
+    "retired_instruction_counter_scope": "launched compiler process PID, queried with proc_pid_rusage; child tools are excluded",
+    "cpu_seconds_scope": "compiler command and terminated descendants, from wait4 user and system time",
     "elisa_force_contracts_inherited": "set" if "ELISACORE_FORCE_CONTRACTS" in os.environ else "unset",
     "elisa_force_contracts_effective": "unset for prime and measured invocations",
     "source_inputs": fingerprints,
@@ -169,24 +183,32 @@ metadata = {
 }
 (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
-def run_compiler(command, env, cwd):
-    proc = subprocess.Popen(
-        command, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+def run_compiler(command, env, cwd, *, measure_counters=False):
+    report_path = new_report_path(args.output) if measure_counters else None
+    measured_command = wrap_command(command, report_path)
     try:
-        stdout, stderr = proc.communicate(timeout=args.timeout_seconds)
-    except subprocess.TimeoutExpired as error:
+        started = time.perf_counter_ns()
+        proc = subprocess.Popen(
+            measured_command, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        stdout, stderr = proc.communicate()
-        raise subprocess.TimeoutExpired(command, args.timeout_seconds, stdout, stderr) from error
-    result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
-    if result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, command, stdout, stderr)
-    return result
+            stdout, stderr = proc.communicate(timeout=args.timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+            raise subprocess.TimeoutExpired(command, args.timeout_seconds, stdout, stderr) from error
+        wall_seconds = (time.perf_counter_ns() - started) / 1e9
+        result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, command, stdout, stderr)
+        return result, read_report(report_path), report_path is not None, wall_seconds
+    finally:
+        if report_path is not None:
+            report_path.unlink(missing_ok=True)
 
 rows = []
 report_pattern = re.compile(r"^incremental-ga-cache:.*$", re.MULTILINE)
@@ -217,7 +239,7 @@ def correctness_evidence(workload, source, original, edited, cache_directory, ar
     command = [str(binary), '-emit', 'check', str(source)]
     source.write_bytes(original)
     enforce_load_gate(f"before correctness prime {workload['directory']}/{arm}")
-    primed = run_compiler(command, env, root)
+    primed, _, _, _ = run_compiler(command, env, root)
     enforce_load_gate(f"after correctness prime {workload['directory']}/{arm}")
     prime_stderr = primed.stderr.decode()
     prime_reports = report_pattern.findall(prime_stderr)
@@ -228,7 +250,7 @@ def correctness_evidence(workload, source, original, edited, cache_directory, ar
     prior_hash = hashlib.sha256(prior_files[0].read_bytes()).hexdigest()
     source.write_bytes(edited)
     enforce_load_gate(f"before correctness sample {workload['directory']}/{arm}")
-    result = run_compiler(command, env, root)
+    result, _, _, _ = run_compiler(command, env, root)
     enforce_load_gate(f"after correctness sample {workload['directory']}/{arm}")
     stderr = result.stderr.decode()
     reports = report_pattern.findall(stderr)
@@ -333,7 +355,7 @@ for workload in manifest['workloads']:
             command = [str(binary), '-emit', 'check', str(source)]
             enforce_load_gate(f"before priming {name}/{arm}/{pair + 1}")
             source.write_bytes(original)
-            primed = run_compiler(command, env, root)
+            primed, _, _, _ = run_compiler(command, env, root)
             enforce_load_gate(f"after priming {name}/{arm}/{pair + 1}")
             (directory / f'{arm}-{pair}-prime.stderr').write_bytes(primed.stderr)
             prior_files = list(cache_directory.glob('*.elisa-semantic'))
@@ -345,9 +367,7 @@ for workload in manifest['workloads']:
             source.write_bytes(edited)
             load_before = enforce_load_gate(f"before timed sample {name}/{arm}/{pair + 1}")
             before = resource.getrusage(resource.RUSAGE_CHILDREN)
-            start = time.perf_counter_ns()
-            result = run_compiler(command, env, root)
-            wall = (time.perf_counter_ns() - start) / 1e9
+            result, counter, counter_wrapped, wall = run_compiler(command, env, root, measure_counters=True)
             after = resource.getrusage(resource.RUSAGE_CHILDREN)
             load_after = enforce_load_gate(f"after timed sample {name}/{arm}/{pair + 1}")
             stderr = result.stderr.decode()
@@ -361,7 +381,24 @@ for workload in manifest['workloads']:
             evidence[arm] = (result.stdout, clean, reports, prior_hash)
             (directory / f'{arm}-{pair}.stderr').write_bytes(result.stderr)
             (directory / f'{arm}-{pair}.stdout').write_bytes(result.stdout)
-            rows.append({"workload": name, "pair": pair, "arm": arm, "wall_seconds": wall, "cpu_seconds": after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime, "load_before": load_before[0], "load_after": load_after[0], "report": reports[0], "prior_snapshot_sha256": prior_hash})
+            process_tree_cpu_seconds = counter.process_tree_cpu_seconds
+            if process_tree_cpu_seconds is None and not counter_wrapped:
+                process_tree_cpu_seconds = after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime
+            rows.append({
+                "workload": name,
+                "pair": pair,
+                "arm": arm,
+                "wall_seconds": wall,
+                "compiler_real_seconds": counter.command_real_seconds,
+                "cpu_seconds": process_tree_cpu_seconds,
+                "retired_instructions": counter.instructions_retired,
+                "cycles_elapsed": counter.cycles_elapsed,
+                "counter_status": counter.status,
+                "load_before": load_before[0],
+                "load_after": load_after[0],
+                "report": reports[0],
+                "prior_snapshot_sha256": prior_hash,
+            })
         if evidence['parent'] != evidence['candidate']:
             raise RuntimeError(f"parent/candidate timed evidence mismatch for {name}, pair {pair + 1}: {evidence}")
     print('completed ' + name, flush=True)
@@ -374,11 +411,50 @@ for arm, (root, binary) in products.items():
 with (args.output / 'samples.csv').open('w', newline='') as stream:
     writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
 summaries = {}
+def paired_metric_summary(samples, field, label):
+    pairs = []
+    for pair in range(args.pairs):
+        parent = next(row[field] for row in samples if row["pair"] == pair and row["arm"] == "parent")
+        candidate = next(row[field] for row in samples if row["pair"] == pair and row["arm"] == "candidate")
+        if (
+            not isinstance(parent, (int, float))
+            or isinstance(parent, bool)
+            or not isinstance(candidate, (int, float))
+            or isinstance(candidate, bool)
+            or parent <= 0
+            or candidate <= 0
+        ):
+            return {
+                "status": "unavailable",
+                f"median_parent_{label}": None,
+                f"median_candidate_{label}": None,
+                f"median_paired_{label}_ratio_parent_over_candidate": None,
+                f"geomean_paired_{label}_ratio_parent_over_candidate": None,
+                f"candidate_{label}_wins": None,
+            }
+        pairs.append((parent, candidate, parent / candidate))
+    ratios = [ratio for _, _, ratio in pairs]
+    return {
+        "status": "available",
+        f"median_parent_{label}": statistics.median(parent for parent, _, _ in pairs),
+        f"median_candidate_{label}": statistics.median(candidate for _, candidate, _ in pairs),
+        f"median_paired_{label}_ratio_parent_over_candidate": statistics.median(ratios),
+        f"geomean_paired_{label}_ratio_parent_over_candidate": math.exp(sum(map(math.log, ratios)) / len(ratios)),
+        f"candidate_{label}_wins": sum(ratio > 1 for ratio in ratios),
+    }
+
 for workload in manifest['workloads']:
     name = workload['directory']
     samples = [row for row in rows if row['workload'] == name]
     ratios = [next(r['wall_seconds'] for r in samples if r['pair'] == pair and r['arm'] == 'parent') / next(r['wall_seconds'] for r in samples if r['pair'] == pair and r['arm'] == 'candidate') for pair in range(args.pairs)]
-    summaries[name] = {"median_paired_wall_speedup_parent_over_candidate": statistics.median(ratios), "geomean_paired_wall_speedup_parent_over_candidate": math.exp(sum(map(math.log, ratios)) / len(ratios)), "candidate_wins": sum(r > 1 for r in ratios)}
+    summaries[name] = {
+        "median_paired_wall_speedup_parent_over_candidate": statistics.median(ratios),
+        "geomean_paired_wall_speedup_parent_over_candidate": math.exp(sum(map(math.log, ratios)) / len(ratios)),
+        "candidate_wins": sum(r > 1 for r in ratios),
+        "compiler_real_seconds": paired_metric_summary(samples, "compiler_real_seconds", "compiler_real_seconds"),
+        "retired_instructions": paired_metric_summary(samples, "retired_instructions", "retired_instructions"),
+        "cycles": paired_metric_summary(samples, "cycles_elapsed", "cycles"),
+    }
 (args.output / 'summary.json').write_text(json.dumps(summaries, indent=2) + "\n")
 (args.output / 'COMPLETE').write_text("paired experiment completed\n")
 run_completed = True

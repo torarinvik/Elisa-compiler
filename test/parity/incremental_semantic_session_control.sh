@@ -36,7 +36,7 @@ write_valid_source() {
     local shifted="${2:-0}"
     cat >"$SOURCE" <<EOF
 def helper() -> i64:
-    return 40
+    return $result
 EOF
     if [[ "$shifted" == 1 ]]; then
         printf '# source-position shift\n' >>"$SOURCE"
@@ -56,7 +56,7 @@ def captured_lint() -> i64:
     return state
 
 def main() -> i64:
-    return helper() + $result
+    return helper()
 EOF
 }
 
@@ -111,16 +111,53 @@ send_check() {
 assert_no_graph_restore() {
     local report="$1"
     local context="$2"
+    local expected_cold_scans="${3:-}"
     [[ ! "$report" =~ session=hit([[:space:]]|$) ]] \
         || fail "$context unexpectedly hit the retained session: $report"
     [[ "$report" =~ source_input_admitted=no([[:space:]]|$) ]] \
         || fail "$context unexpectedly admitted the previous declaration surface: $report"
     [[ "$report" =~ function_body_facts_restored=0([[:space:]]|$) ]] \
         || fail "$context restored function facts across a changed input surface: $report"
+    [[ "$report" =~ prior_snapshot_fact_fallbacks=0([[:space:]]|$) ]] \
+        || fail "$context restored typed snapshot facts across a changed input surface: $report"
+    if [[ -n "$expected_cold_scans" ]]; then
+        [[ "$report" =~ cold_body_scans=([0-9]+)([[:space:]]|$) ]] \
+            || fail "$context report omitted cold body-scan accounting: $report"
+        [[ "${BASH_REMATCH[1]}" -eq "$expected_cold_scans" ]] \
+            || fail "$context expected $expected_cold_scans cold body scans: $report"
+    fi
 }
 
-write_valid_source 1
-ELISA_STAGE1_BIN="$STAGE1" ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
+assert_graph_body_edit() {
+    local report="$1"
+    local context="$2"
+    local expected_cold_scans="${3:-1}"
+    local cold_body_scans
+    local restored_body_facts
+    [[ ! "$report" =~ session=hit([[:space:]]|$) ]] \
+        || fail "$context unexpectedly hit the retained session: $report"
+    [[ "$report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
+        || fail "$context failed to admit its unchanged declaration surface: $report"
+    if [[ "$report" =~ cold_body_scans=([0-9]+)([[:space:]]|$) ]]; then
+        cold_body_scans="${BASH_REMATCH[1]}"
+    else
+        fail "$context report omitted cold body scan accounting: $report"
+    fi
+    [[ "$cold_body_scans" -eq "$expected_cold_scans" ]] \
+        || fail "$context expected $expected_cold_scans cold body scans: $report"
+    if [[ "$report" =~ function_body_facts_restored=([0-9]+)([[:space:]]|$) ]]; then
+        restored_body_facts="${BASH_REMATCH[1]}"
+    else
+        fail "$context report omitted restored body-fact accounting: $report"
+    fi
+    [[ "$restored_body_facts" -eq 1 ]] \
+        || fail "$context did not restore exactly the unchanged function body: $report"
+    [[ "$report" =~ prior_snapshot_fact_fallbacks=0([[:space:]]|$) ]] \
+        || fail "$context used the prior-snapshot fallback instead of the query graph: $report"
+}
+
+write_valid_source 40
+ELISA_STAGE1_BIN="$STAGE1" ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1 ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
     "${PYTHON_BIN:-python3}" -c 'import os, sys; os.setsid(); os.execvp("bash", ["bash", *sys.argv[1:]])' \
     "$ROOT/scripts/elisac_stage1.sh" semantic-session "$SOURCE" \
     <"$REQUESTS" >"$REPLIES" 2>"$WORK/server.stderr" &
@@ -132,9 +169,9 @@ exec 4<"$REPLIES"
 send_check 0
 send_check 0
 
-# A body edit and inserted comment shift unchanged lint bodies by one line. Their
-# reused anchors must point to the new source positions.
-write_valid_source 2 1
+# A supported helper edit and inserted comment leave the declaration surface stable,
+# so the unchanged main body can restore while lint warning anchors shift by one line.
+write_valid_source 41 1
 send_check 0
 
 # Grow request and retained snapshot vectors, plus the include identity key. Then
@@ -213,12 +250,11 @@ second_warm_unknown_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc '
 [[ "$second_warm_unknown_count" -eq 2 && "$second_warm_unknown_diagnostic" == "$cold_unknown_diagnostic" ]] \
     || fail "repeated warm diagnostic differs from cold or has wrong multiplicity: cold=[$cold_unknown_diagnostic] warm_count=$second_warm_unknown_count warm=[$second_warm_unknown_diagnostic]"
 
-write_valid_source 2 1
+write_valid_source 41 1
 send_check 0
 
-# A warm root source that imports another file must not keep its previous result
-# when only the included file's body changes. Compare the retained host's error
-# and recovery with cold checks so include identity participates in invalidation.
+# Adding an include changes the source identity and starts a fresh retained snapshot.
+# Later body-only edits at that same include path can reuse unaffected function facts.
 INCLUDED="$WORK/included-helper.elisa"
 cat >"$INCLUDED" <<'EOF'
 def include_helper() -> i64:
@@ -232,8 +268,23 @@ def main() -> i64:
 EOF
 send_check 0
 include_seed_report="$(tail -n 1 "$REPORTS")"
-assert_no_graph_restore "$include_seed_report" "the new include surface"
+assert_no_graph_restore "$include_seed_report" "the new include surface" 2
 
+# A supported body-only edit at the same include path preserves SourceIdentity
+# and declaration surface. The edited include body must scan cold while main
+# restores its unchanged function-body facts.
+cat >"$INCLUDED" <<'EOF'
+def include_helper() -> i64:
+    return 41
+EOF
+send_check 0
+include_supported_edit_report="$(tail -n 1 "$REPORTS")"
+assert_graph_body_edit "$include_supported_edit_report" "the supported include body edit" 1
+
+# An unresolved call is outside the supported body grammar. This first transition
+# still admits the previous cacheable surface: the changed helper cold-scans while
+# unchanged main restores. Publication then includes the unsupported body in the
+# surface, so recovery from it must cold-fallback.
 cat >"$INCLUDED" <<'EOF'
 def include_helper() -> i64:
     return include_stale_symbol
@@ -245,7 +296,7 @@ include_cold_diagnostic="$(grep -F 'error:' "$WORK/include-cold.stderr" | grep -
 [[ -n "$include_cold_diagnostic" ]] || fail "cold check missed the unresolved name from the edited include"
 send_check 1
 include_edit_report="$(tail -n 1 "$REPORTS")"
-assert_no_graph_restore "$include_edit_report" "the edited include"
+assert_graph_body_edit "$include_edit_report" "the unsupported include transition" 1
 include_warm_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'include_stale_symbol' | tail -n 1 || true)"
 [[ "$include_warm_diagnostic" == "$include_cold_diagnostic" ]] \
     || fail "edited-include diagnostic differs from cold: cold=[$include_cold_diagnostic] warm=[$include_warm_diagnostic]"
@@ -263,7 +314,7 @@ def include_helper() -> i64:
 EOF
 send_check 0
 include_recovery_report="$(tail -n 1 "$REPORTS")"
-assert_no_graph_restore "$include_recovery_report" "the recovered include"
+assert_no_graph_restore "$include_recovery_report" "the recovered include body after an unsupported state" 2
 
 # Changing a function parameter type changes the declaration surface even when
 # that function's body bytes are identical. The session must invalidate body
@@ -281,14 +332,30 @@ def signature_helper(value: bool) -> i64:
     return 40
 
 def main() -> i64:
-    return signature_helper(true)
+    return signature_helper(1)
 EOF
 signature_cold_status=0
 "$STAGE1" -emit check "$SOURCE" >"$WORK/signature-cold.stdout" 2>"$WORK/signature-cold.stderr" || signature_cold_status=$?
-[[ "$signature_cold_status" -eq 0 ]] || fail "cold check rejected the signature-edited source: $(tail -n 8 "$WORK/signature-cold.stderr")"
-send_check 0
+[[ "$signature_cold_status" -ne 0 ]] || fail "cold check accepted an argument that no longer matches the edited signature"
+signature_cold_diagnostic="$(grep -F 'error:' "$WORK/signature-cold.stderr" | tail -n 1 || true)"
+[[ -n "$signature_cold_diagnostic" ]] || fail "cold check reported no diagnostic for the signature edit"
+send_check 1
 signature_edit_report="$(tail -n 1 "$REPORTS")"
-assert_no_graph_restore "$signature_edit_report" "the signature edit"
+assert_no_graph_restore "$signature_edit_report" "the signature edit" 2
+signature_warm_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | tail -n 1 || true)"
+[[ "$signature_warm_diagnostic" == "$signature_cold_diagnostic" ]] \
+    || fail "signature-edit diagnostic differs from cold: cold=[$signature_cold_diagnostic] warm=[$signature_warm_diagnostic]"
+
+cat >"$SOURCE" <<'EOF'
+def signature_helper(value: bool) -> i64:
+    return 40
+
+def main() -> i64:
+    return signature_helper(true)
+EOF
+send_check 0
+signature_recovery_report="$(tail -n 1 "$REPORTS")"
+assert_no_graph_restore "$signature_recovery_report" "the recovered signature edit" 2
 
 printf 'quit\n' >&3 || fail "could not send quit command"
 exec 3>&-
@@ -323,9 +390,8 @@ state_line13_count="$(count_warning_at state 13)"
 [[ "$state_line12_count" -eq 2 && "$state_line13_count" -eq 4 ]] || fail "expected captured-loop warning anchors to shift from line 12 to 13, got $state_line12_count/$state_line13_count"
 shifted_report="$(sed -n '3p' "$REPORTS")"
 [[ "$shifted_report" =~ session=edit([[:space:]]|$) ]] || fail "expected the inserted-line request to reuse the prior semantic snapshot: $shifted_report"
+assert_graph_body_edit "$shifted_report" "the shifted helper edit" 3
 [[ "$shifted_report" =~ self_assignment_bodies_reused=2([[:space:]]|$) ]] || fail "expected exactly two complete self-assignment body ranges to reuse on the inserted-line request: $shifted_report"
-[[ "$shifted_report" =~ function_body_facts_restored=[1-9][0-9]*([[:space:]]|$) ]] || fail "expected a query-graph body-fact restore on the inserted-line request: $shifted_report"
-[[ "$shifted_report" =~ source_input_admitted=yes([[:space:]]|$) ]] || fail "expected the unchanged declaration surface to be admitted by the query graph: $shifted_report"
 cold_report="$(sed -n '1p' "$REPORTS")"
 if [[ "$cold_report" =~ visited=([0-9]+) ]]; then
     cold_visited="${BASH_REMATCH[1]}"

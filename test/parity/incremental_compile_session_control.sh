@@ -47,10 +47,10 @@ write_source() {
     local value="$1"
     cat >"$SOURCE" <<EOF
 def helper() -> i64:
-    return 40
+    return $value
 
 def main() -> i64:
-    return helper() + $value
+    return helper()
 EOF
 }
 
@@ -110,14 +110,14 @@ assert_graph_body_edit() {
     else
         fail "body edit report omitted cold body-scan count: $report"
     fi
-    [[ "$restored" -ge 1 ]] || fail "expected the unchanged helper to restore from the query graph: $report"
-    [[ "$cold_scans" -eq 1 ]] || fail "expected only the edited main body to be cold-scanned: $report"
+    [[ "$restored" -eq 1 ]] || fail "expected exactly the unchanged main body to restore from the query graph: $report"
+    [[ "$cold_scans" -eq 1 ]] || fail "expected only the edited helper body to be cold-scanned: $report"
 }
 
-write_source 1
+write_source 40
 cold_object cold-first
 mkfifo "$REQUESTS" "$REPLIES"
-env -u ELISA_STAGE1_PERMISSIVE -u ELISA_STAGE1_INCREMENTAL_CACHE_DIR ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
+env -u ELISA_STAGE1_PERMISSIVE -u ELISA_STAGE1_INCREMENTAL_CACHE_DIR ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1 ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
     "${PYTHON_BIN:-python3}" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
     "$STAGE1" compile-session -emit obj -O0 -o "$WORK/session.o" "$SOURCE" \
     <"$REQUESTS" >"$REPLIES" 2>"$SERVER_LOG" &
@@ -130,8 +130,8 @@ compare_object cold-first
 send_compile 0 hit
 compare_object cold-first
 
-# Editing only main must preserve object parity and reuse the unchanged helper.
-write_source 2
+# Editing only the helper must preserve object parity and reuse the unchanged main.
+write_source 41
 cold_object cold-edited
 send_compile 0 edit
 assert_graph_body_edit
@@ -167,7 +167,7 @@ second_warm_unknown_diagnostics="$(grep -F 'unknown_name' "$SERVER_LOG" | tail -
 [[ "$two_warm_unknown_count" -eq "$((cold_unknown_count * 2))" && "$second_warm_unknown_diagnostics" == "$cold_unknown_diagnostics" ]] \
     || fail "repeated warm diagnostics differ from cold: expected_count=$((cold_unknown_count * 2)) got=$two_warm_unknown_count"
 
-write_source 3
+write_source 42
 cold_object cold-recovered
 send_compile 0 edit
 compare_object cold-recovered

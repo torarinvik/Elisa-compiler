@@ -1,6 +1,6 @@
 # Warm incremental fact lookup benchmark
 
-This measures opt-in semantic-cache reuse after one function-body edit. It does not measure cold compilation, object emission, linking, or generated-program runtime.
+This measures opt-in sidecar-backed semantic-fact reuse after one function-body edit. Each prime and edit launches a fresh ordinary `elisac` process, so the run exercises the durable snapshot/cache path, not in-memory query-graph reuse across a long-lived compile-server session. It does not measure cold compilation, object emission, linking, or generated-program runtime.
 
 Generate the source-only corpus:
 
@@ -42,9 +42,17 @@ Each pair must have identical prior snapshot bytes, diagnostics and reuse counts
 Product/provenance/LLVM/source/corpus and benchmark-harness hashes are checked before timing,
 after correctness preflight, and after all pairs. The load gate runs before and after each
 preflight compile, then before and after priming and timed samples; a failure writes
-`ABORTED.txt`. Raw samples include CPU time and host load. Saved prior
-snapshots allow admission inputs to be inspected afterward. `COMPLETE` marks a fully written
-summary; unexpected exits write `ABORTED.txt` when possible. The runner uses the newest
-installed Homebrew LLVM and does not invoke `brew update`.
+`ABORTED.txt`. Raw samples include outer wall time, compiler-command real time, process-tree CPU
+time, retired instructions, elapsed cycles, counter status and host load. On macOS,
+`/usr/bin/time -l` gets retired instructions and cycles from `proc_pid_rusage` for the launched
+compiler process; those hardware counters exclude child tools. Its user and system CPU times come
+from `wait4` and include the command's terminated descendants. The `real` field measures command
+elapsed time; the outer Python wall measurement also includes wrapper startup and capture
+overhead. Unavailable hardware counters remain blank and are marked unavailable. Instruction
+counts provide a work measure that does not grow merely because another process received more CPU
+time, while the host lock and load gate still keep paired wall-time samples controlled. Saved
+prior snapshots allow admission inputs to be inspected afterward.
+`COMPLETE` marks a fully written summary; unexpected exits write `ABORTED.txt` when possible.
+The runner uses the newest installed Homebrew LLVM and does not invoke `brew update`.
 
 The small and low-query cases expose index construction overhead. Dense cases use supported scalar-returning helpers; low-query cases keep only one supported helper among generic declarations. Results from a shared Mac are exploratory and do not qualify Linux performance or comparisons with other languages.

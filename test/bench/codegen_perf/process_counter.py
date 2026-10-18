@@ -18,8 +18,19 @@ MACOS_TIME_METHOD = "macOS /usr/bin/time -l"
 class ProcessCounter:
     instructions_retired: int | None
     cycles_elapsed: int | None
-    child_cpu_seconds: float | None
+    process_tree_cpu_seconds: float | None
     status: str
+    command_real_seconds: float | None = None
+
+    @property
+    def child_cpu_seconds(self) -> float | None:
+        """Compatibility alias used by the cross-language benchmark runner."""
+        return self.process_tree_cpu_seconds
+
+    @property
+    def wall_seconds(self) -> float | None:
+        """Compatibility alias for the wrapped command's real elapsed time."""
+        return self.command_real_seconds
 
 
 def method_description() -> str:
@@ -74,7 +85,7 @@ def read_report(report_path: Path | None) -> ProcessCounter:
 
     instruction_count = integer_for("instructions retired")
     cycle_count = integer_for("cycles elapsed")
-    number = r"\d+(?::\d{2})*(?:\.\d+)?"
+    number = r"\d+(?::\d{2})*(?:[.,]\d+)?"
     cpu_match = re.search(
         rf"^\s*({number})\s+real\s+({number})\s+user\s+({number})\s+sys\s*$",
         report,
@@ -83,20 +94,28 @@ def read_report(report_path: Path | None) -> ProcessCounter:
 
     def duration_seconds(value: str) -> float:
         parts = value.split(":")
-        seconds = float(parts[-1])
+        seconds = float(parts[-1].replace(",", "."))
         multiplier = 60
         for part in reversed(parts[:-1]):
             seconds += int(part) * multiplier
             multiplier *= 60
         return seconds
 
-    cpu_seconds = None
+    process_tree_cpu_seconds = None
+    command_real_seconds = None
     if cpu_match is not None:
+        command_real_seconds = duration_seconds(cpu_match.group(1))
         user_seconds = duration_seconds(cpu_match.group(2))
         system_seconds = duration_seconds(cpu_match.group(3))
-        cpu_seconds = user_seconds + system_seconds
+        process_tree_cpu_seconds = user_seconds + system_seconds
 
     status = "available" if instruction_count is not None and cycle_count is not None else "unavailable"
     if status == "unavailable":
         instruction_count = cycle_count = None
-    return ProcessCounter(instruction_count, cycle_count, cpu_seconds, status)
+    return ProcessCounter(
+        instruction_count,
+        cycle_count,
+        process_tree_cpu_seconds,
+        status,
+        command_real_seconds,
+    )
