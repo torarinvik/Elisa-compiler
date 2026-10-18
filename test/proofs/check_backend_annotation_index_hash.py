@@ -98,6 +98,7 @@ def annotation_index_hash(text: sview) -> u64:
     for offset in 0..<text.len |hash, text|:
         invariant offset <= text.len
         invariant hash == annotation_index_hash_prefix(text, offset, ANNOTATION_INDEX_HASH_OFFSET)
+        assert annotation_index_hash_prefix(text, offset + 1.usize(), ANNOTATION_INDEX_HASH_OFFSET) == ((hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME)
         hash <- (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME
     assert hash == annotation_index_hash_prefix(text, text.len, ANNOTATION_INDEX_HASH_OFFSET)
     return hash
