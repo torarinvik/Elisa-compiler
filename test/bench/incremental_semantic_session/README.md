@@ -16,13 +16,14 @@ NameLookup classification probe. The runner requires cold graph-on visits at
 prime and fewer graph-on visits than
 graph-off on exact-repeat and body-edit requests. Those reductions can still
 include same-request duplicate checks. The counter covers only global symbol and
-module-member hash-chain rows visited by the fused classifier. Active graph
-requests eagerly finalize an exact resolver surface once, including region
-membership, even when a workload has no NameLookup reads; they still scan lexical
-bindings before every query, including hits. The cold
-fallback scans `region_names`, while active queries read the precomputed region
-bit. Surface construction and local scans are outside the chain counter, though
-surface construction is included in graph-on whole-request timing. This fixture
+module-member hash-chain rows visited by the fused classifier. An active graph
+request builds its exact resolver surface lazily when it reaches its first
+unbound name; requests with no eligible NameLookup reads skip that build. The
+first eligible read still pays the full surface scan, and every query scans lexical
+bindings before checking the cache. The cold fallback scans `region_names`, while
+active queries read the precomputed region bit. Surface construction and local
+scans are outside the chain counter, though surface construction is included in
+graph-on whole-request timing. This fixture
 has no local or region names, so it does not measure those costs. Bare module
 identifiers used as `Expr.Field` or namespace-call objects now also use
 NameLookup; qualified `Expr.Scope` module-prefix and member
