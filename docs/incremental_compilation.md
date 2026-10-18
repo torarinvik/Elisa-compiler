@@ -196,6 +196,11 @@ qualify a reliable overall advantage over fresh compilation. These samples
 establish the audit's cost on this synthetic workload, not professional compiler
 iteration latency. Raw logs and source snapshots are retained under
 `build/verification/incremental-audit-options-20261018/`.
+The full isolated semantic suite passed in 62.390 seconds; focused compile-server
+and LLVM/native parity checks also passed. Read-only overlays excluded concurrent
+verifier implementations and their matching new tests. The incremental source
+snapshots match Core commit `de3a9a8428d6`; that commit also includes separate
+verifier work which these isolated checks do not qualify.
 The full general semantic and backend reuse objective remains unfinished.
 
 ## Historical local implementation snapshot (2026-10-11)
