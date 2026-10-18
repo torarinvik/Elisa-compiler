@@ -1,0 +1,160 @@
+# Opt-in persistent semantic-check host. Each `check` rereads one source path from disk,
+# rebuilds its include identity, tokens, and AST in a request region, then carries the opaque
+# semantic session into the next request. The lexer also retains one reusable line-map buffer.
+# This is intentionally a semantic service, not a replacement for the one-shot object protocol.
+
+const ELISAC_INCREMENTAL_SERVER_COMMAND_LIMIT: usize = 32
+
+
+def incremental_server_write_status(status: i64) -> void can[Abort.Panic, Console, Unsafe.PointerCast]:
+    result_byte: u8 = 48 if status == 0 else 49
+    response: mutable array[u8, 2] = [result_byte, 10]
+    offset: mutable usize = 0
+    while offset < 2 |offset, response|:
+        response_ptr: void& = (&response[offset]).cast[void&] can Unsafe.PointerCast
+        written: isize = write(1, response_ptr, 2 - offset)
+        return if written <= 0
+        return if written.usize() > 2 - offset
+        offset <- offset + written.usize()
+
+
+def incremental_server_write_invalid_command() -> void can[Abort.Panic, Console, Unsafe.PointerCast]:
+    response: mutable array[u8, 2] = [50, 10]
+    offset: mutable usize = 0
+    while offset < 2 |offset, response|:
+        response_ptr: void& = (&response[offset]).cast[void&] can Unsafe.PointerCast
+        written: isize = write(1, response_ptr, 2 - offset)
+        return if written <= 0
+        return if written.usize() > 2 - offset
+        offset <- offset + written.usize()
+
+
+def incremental_server_check[@session](path: cstr, session: mutable Semantic::IncrementalSemanticSession& @session, report_cache: bool) -> i64 can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+    PhaseTimer::request_start() can Global{Read,Write}
+    request_status: mutable i64 = 1
+    region request:
+        # Every request-owned buffer, including the root read and diagnostics, is inside
+        # this region. The caller itself lives in the session region, so allocating even
+        # small temporaries before this block would otherwise retain them for the server's
+        # entire lifetime.
+        path_bytes: mutable darray[u8] @request = []
+        push_cstr(&path_bytes, path)
+        if not source_readable(path):
+            message: mutable darray[u8] = []
+            message.extend("error: could not read source ")
+            message.extend(path_bytes)
+            message.push(10)
+            write_stderr(message)
+        else:
+            root_source: mutable darray[u8] @request = read_file(path)
+            if root_source.count == 0:
+                message: mutable darray[u8] = []
+                message.extend("error: source is empty ")
+                message.extend(path_bytes)
+                message.push(10)
+                write_stderr(message)
+            else:
+                root_ptr: u8& @request = &root_source[0]
+                identity: mutable SourceIdentity::Capture = SourceIdentity::empty(true) can Memory.Allocate
+                expanded_source: mutable darray[u8] @request = []
+                included_seen: mutable darray[u8] = []
+                include_active: mutable darray[u8] = []
+                line_map: mutable darray[u8] = []
+                emitted_lines: mutable u32 = 0
+                cycle_detected: mutable bool = false
+                read_failed: mutable bool = false
+                expanded_ok: bool = expand_includes_with_source_identity_and_root_source(path_bytes, &expanded_source, &included_seen, &include_active, 0, &line_map, &emitted_lines, &cycle_detected, &read_failed, &identity, root_source) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+                if not expanded_ok:
+                    message: mutable darray[u8] = []
+                    if cycle_detected:
+                        message.extend("error: cyclic include detected from ")
+                    else:
+                        message.extend("error: could not read source or included file from ")
+                    message.extend(path_bytes)
+                    message.push(10)
+                    write_stderr(message)
+                else:
+                    # Publish into the lexer's reusable process-owned buffer. This keeps diagnostics
+                    # current without retaining a new libc environment string for every edit.
+                    Lexer::line_map_publish(line_map) can Global{Read,Write}
+                    analyzed_ptr: u8& @request = &expanded_source[0]
+                    analyzed_length: usize = expanded_source.count
+                    tokens: mutable darray[Lexer::Token] = frontend_tokenize_expanded_unit(analyzed_ptr, analyzed_ptr, analyzed_length)
+                    file: mutable Ast::File = frontend_parser_parse_file_with_length(analyzed_ptr, analyzed_length, tokens) can Global{Read,Write}
+                    if file.errors.count != 0:
+                        for parse_error_index in 0..<file.errors.count |file|:
+                            report_parse_error(file.errors[parse_error_index])
+                    else:
+                        pymodule_expand_wildcard_exports(file)
+                        generated_source: mutable darray[u8] @request = []
+                        generated_tokens: mutable darray[Lexer::Token] = []
+                        generated: mutable bool = frontend_preprocess_static_generate(analyzed_ptr, analyzed_length, tokens, file, generated_source)
+                        if generated:
+                            analyzed_ptr <- &generated_source[0]
+                            analyzed_length <- generated_source.count
+                            generated_tokens <- frontend_tokenize_expanded_unit(analyzed_ptr, analyzed_ptr, analyzed_length)
+                            generated_file: mutable Ast::File = frontend_parser_parse_file_with_length(analyzed_ptr, analyzed_length, generated_tokens) can Global{Read,Write}
+                            if generated_file.errors.count != 0:
+                                for generated_error_index in 0..<generated_file.errors.count |generated_file|:
+                                    report_parse_error(generated_file.errors[generated_error_index])
+                            else:
+                                pymodule_expand_wildcard_exports(generated_file)
+                                request_status <- run_semantic_gate_incremental_with_session(generated_file, root_ptr, root_source.count, analyzed_ptr, analyzed_length, generated_tokens, identity, [], report_cache, true, session) can Global{Read,Write}
+                        else:
+                            request_status <- run_semantic_gate_incremental_with_session(file, root_ptr, root_source.count, analyzed_ptr, analyzed_length, tokens, identity, [], report_cache, false, session) can Global{Read,Write}
+    PhaseTimer::mark("semantic-session-check") can Global{Read,Write}
+    return request_status
+
+
+def run_incremental_semantic_server(argc: i64, argv: mutable void&) -> i64 can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerCast,RawExtern}]:
+    if argc != 3:
+        usage: mutable darray[u8] = []
+        usage.extend("usage: elisac-stage1 semantic-session SOURCE\nprotocol: write `check` or `quit` on stdin; each check prints 0 (accepted), 1 (rejected), or 2 (invalid command) on stdout\n")
+        write_stderr(usage)
+        return 2
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    source_path: cstr = slots[2].cast[cstr]
+    _ = setenv("ELISA_STAGE1_SRC", source_path, 1)
+    region session_state:
+        report_cache: bool = env_flag_is_one("ELISA_STAGE1_INCREMENTAL_CACHE_REPORT") can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+        session: mutable Semantic::IncrementalSemanticSession @session_state = Semantic::incremental_semantic_session_new(true) can Memory.Allocate
+        command: mutable darray[u8] @session_state = []
+        while true |command, session|:
+            command.truncate(0)
+            command_too_long: mutable bool = false
+            input_eof: mutable bool = false
+            saw_input: mutable bool = false
+            line_terminated: mutable bool = false
+            while true |command, command_too_long, input_eof, saw_input, line_terminated|:
+                byte: mutable u8 = 0
+                amount: isize = read(0, &byte, 1)
+                if amount == 0:
+                    input_eof <- true
+                    break
+                if amount < 0:
+                    message: mutable darray[u8] = []
+                    message.extend("error: could not read semantic-session command\n")
+                    write_stderr(message)
+                    return 1
+                saw_input <- true
+                if byte == 10:
+                    line_terminated <- true
+                    break
+                if command.count < ELISAC_INCREMENTAL_SERVER_COMMAND_LIMIT:
+                    command.push(byte)
+                else:
+                    command_too_long <- true
+            if input_eof and not saw_input:
+                return 0
+            if line_terminated and command.count > 0 and command[command.count - 1] == 13:
+                command.truncate(command.count - 1)
+            if command_too_long:
+                incremental_server_write_invalid_command()
+                continue
+            if command.count == 4 and command[0] == 113 and command[1] == 117 and command[2] == 105 and command[3] == 116:
+                return 0
+            if command.count == 5 and command[0] == 99 and command[1] == 104 and command[2] == 101 and command[3] == 99 and command[4] == 107:
+                status: i64 = incremental_server_check(source_path, &session, report_cache) can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
+                incremental_server_write_status(status)
+            else:
+                incremental_server_write_invalid_command()

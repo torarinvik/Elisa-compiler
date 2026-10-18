@@ -13,18 +13,20 @@
 #
 # Linkage is rewritten identically in every partition so cross-partition references
 # resolve: a function or mutable/external global with internal or private linkage
-# becomes a HIDDEN external symbol renamed under the `elisa.part.` prefix. The live
-# emitter's names are partition-local. Cache snapshots add a stable source-unit
-# namespace because their objects can be linked with other translation units.
+# becomes a HIDDEN external symbol named `elisa.part.<module-ordinal>`. After each
+# translation unit's shard merge, these bridge definitions are localized before the
+# object can be linked with other units.
 # Mutable and external globals and local constants are owned by partition 0. Keeping one
 # local-constant definition preserves address identity when distinct functions take its
 # address. linkonce/weak definitions are left in every
 # partition. A global alias stays in the partition that defines its aliasee; elsewhere
 # its uses are redirected to the aliasee's declaration and the alias becomes private.
 #
-# The partitioning is a pure function of the module, so the merged object is
-# deterministic: two builds from the same compiler and source are byte-identical, which
-# is what the gen2/gen3 fixpoint compares. Unset or 1 keeps the single-object path.
+# The partitioning is a pure function of the module and logical job count. With those
+# inputs fixed, the merged object is deterministic, which is what the gen2/gen3 fixpoint
+# compares. Source and output paths do not affect bridge names. Other module metadata,
+# including debug source paths, can still affect snapshot/object bytes. Unset or 1 keeps
+# the single-object path.
 
 extern fork() -> i32
 extern waitpid(pid: i32, status: mutable i32&, options: i32) -> i32
@@ -34,11 +36,11 @@ extern setpgid(pid: i32, pgid: i32) -> i32
 extern kill_backend(pid: i32, signal: i32) -> i32
 extern LLVMGetFirstGlobal(m: LLVMModuleRef) -> LLVMValueRef?
 extern LLVMGetNextGlobal(global_value: LLVMValueRef) -> LLVMValueRef?
-extern LLVMGetFirstGlobalAlias(m: LLVMModuleRef) -> cstr?
-extern LLVMGetNextGlobalAlias(alias: cstr) -> cstr?
-extern LLVMGetFirstGlobalIFunc(m: LLVMModuleRef) -> cstr?
+extern LLVMGetFirstGlobalAlias(m: LLVMModuleRef) -> LLVMValueRef?
+extern LLVMGetNextGlobalAlias(alias: LLVMValueRef) -> LLVMValueRef?
+extern LLVMGetFirstGlobalIFunc(m: LLVMModuleRef) -> LLVMValueRef?
 extern LLVMGetNextGlobalIFunc(ifunc: LLVMValueRef) -> LLVMValueRef?
-extern LLVMGetComdat(value: LLVMValueRef) -> cstr?
+extern LLVMGetComdat(value: LLVMValueRef) -> LLVMComdatRef?
 extern LLVMAliasGetAliasee(alias: LLVMValueRef) -> LLVMValueRef
 extern LLVMIsDeclaration(global_value: LLVMValueRef) -> i32
 extern LLVMIsGlobalConstant(global_value: LLVMValueRef) -> i32
@@ -77,9 +79,9 @@ extend Backend:
         const PART_MIN_WEIGHT_PER_JOB: i64 = 20000
         # Logical cache ownership is independent from ELISA_STAGE1_JOBS. The selected
         # count is the largest dense FNV bucket count no greater than this cap.
-        # Changing this rule or the name hash requires an ownership-version bump.
+        # Changing this rule or the bridge-symbol scheme requires a version bump.
         const PART_CACHE_MAX_LOGICAL_SHARDS: usize = 16
-        const PART_CACHE_OWNERSHIP_VERSION: u32 = 6
+        const PART_CACHE_OWNERSHIP_VERSION: u32 = 8
 
     public:
         const PART_CACHE_PREP_UNSUPPORTED: u8 = 0
@@ -93,10 +95,11 @@ extend Backend:
             snapshot_path: darray[u8]
 
         struct PartCachePreparedSet:
-            status: u8
+            status: mutable u8
             logical_shards: usize
+            bridge_symbol_names: mutable darray[u8]
             ownership_version: u32
-            shards: darray[PartCachePreparedShard]
+            shards: mutable darray[PartCachePreparedShard]
 
     private:
         def part_cache_inline_asm_value_kind() -> u32:
@@ -121,33 +124,6 @@ extend Backend:
             logical_shards: usize
             function_owners: darray[i64]
             global_owners: darray[i64]
-
-        # Stable across edits to one source unit. Two independently seeded 64-bit
-        # FNV streams keep the linker namespace compact while making cross-unit
-        # collisions vanishingly unlikely; the canonical source path is the input.
-        struct PartSymbolNamespace:
-            high: u64
-            low: u64
-
-        def part_symbol_namespace(source_unit: sview) -> PartSymbolNamespace can[Abort.Panic]:
-            high: mutable u64 = 14695981039346656037
-            low: mutable u64 = 7809847782465536322
-            for index in 0..<source_unit.len |high, low, source_unit|:
-                byte: u64 = source_unit[index].u64()
-                high <- (high ^ byte) * 1099511628211
-                low <- (low ^ (byte ^ 165.u64())) * 1099511628211
-            high <- (high ^ source_unit.len.u64()) * 1099511628211
-            low <- (low ^ source_unit.len.u64()) * 1099511628211
-            return PartSymbolNamespace{high: high, low: low}
-
-        def part_push_hex_u64(buffer: mutable darray[u8]&, value: u64) -> void can[Abort.Panic, Memory.Allocate]:
-            for digit_index in 0..<16 |buffer, value|:
-                shift: u64 = (15 - digit_index).u64() * 4
-                digit: u8 = ((value >> shift) & 15.u64()).u8()
-                if digit < 10:
-                    buffer.push(48 + digit)
-                else:
-                    buffer.push(87 + digit)
 
         def part_cache_name_is_stable(name: u8&, length: usize) -> bool can[Unsafe.PointerCast]:
             return false if length == 0
@@ -174,6 +150,33 @@ extend Backend:
                 return false if byte_ref != prefix[index]
             return true
 
+        def part_value_name_is_reserved(value: LLVMValueRef) -> bool can[Unsafe.PointerCast]:
+            name_length: mutable usize = 0
+            name: u8& = LLVMGetValueName2(value, &name_length)
+            part_cache_name_is_reserved(name, name_length)
+
+        # Local definitions are rewritten into hidden external symbols while the forked
+        # shards are linked. A source-level @link_name can already occupy that namespace,
+        # so those modules must use the serial path before any symbol is rewritten.
+        def part_module_has_reserved_symbol_prefix(m: LLVMModuleRef) -> bool can[Unsafe.PointerCast]:
+            global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
+            while global_opt is global_value |global_opt|:
+                return true if part_value_name_is_reserved(global_value)
+                global_opt <- LLVMGetNextGlobal(global_value)
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |function_opt|:
+                return true if part_value_name_is_reserved(function)
+                function_opt <- LLVMGetNextFunction(function)
+            alias_opt: mutable LLVMValueRef? = LLVMGetFirstGlobalAlias(m)
+            while alias_opt is alias |alias_opt|:
+                return true if part_value_name_is_reserved(alias)
+                alias_opt <- LLVMGetNextGlobalAlias(alias)
+            ifunc_opt: mutable LLVMValueRef? = LLVMGetFirstGlobalIFunc(m)
+            while ifunc_opt is ifunc |ifunc_opt|:
+                return true if part_value_name_is_reserved(ifunc)
+                ifunc_opt <- LLVMGetNextGlobalIFunc(ifunc)
+            return false
+
         # The live O0 partition keeps foreign bodies available_externally, but a
         # cache snapshot strips them. An alwaysinline caller can therefore acquire
         # code from a foreign body during backend emission; reject such modules until
@@ -198,6 +201,46 @@ extend Backend:
                 for operand_index in 0..<operand_count |operand_index, value|:
                     operand: LLVMValueRef = LLVMGetOperand(value, operand_index)
                     return true if part_cache_constant_has_unsupported_value(operand, depth + 1, inline_asm_kind)
+            return false
+
+        # Live parallel emission can safely localize generated bridges only when
+        # inline assembly cannot refer to a bridge name without an LLVM GlobalValue
+        # declaration. Unlike cache admission, block addresses alone do not require
+        # serial emission, so this scan checks only InlineAsm values.
+        def part_cache_constant_has_inline_asm(value: LLVMValueRef, depth: u32, inline_asm_kind: u32) -> bool can[Unsafe.PointerCast]:
+            kind: u32 = LLVMGetValueKind(value)
+            return true if kind == inline_asm_kind
+            return false if kind == PART_VALUE_KIND_FUNCTION or kind == PART_VALUE_KIND_GLOBAL_ALIAS or kind == PART_VALUE_KIND_GLOBAL_IFUNC or kind == PART_VALUE_KIND_GLOBAL_VARIABLE
+            if LLVMIsAConstant(value) != null:
+                return true if depth >= PART_CACHE_CONSTANT_DEPTH_LIMIT
+                operand_count: u32 = LLVMGetNumOperands(value)
+                for operand_index in 0..<operand_count |operand_index, value|:
+                    operand: LLVMValueRef = LLVMGetOperand(value, operand_index)
+                    return true if part_cache_constant_has_inline_asm(operand, depth + 1, inline_asm_kind)
+            return false
+
+        def part_module_has_inline_asm(m: LLVMModuleRef) -> bool can[Unsafe.PointerCast]:
+            inline_asm_kind: u32 = part_cache_inline_asm_value_kind()
+            return true if inline_asm_kind == 0
+            global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
+            while global_opt is global_value |global_opt|:
+                if LLVMIsDeclaration(global_value) == 0:
+                    return true if part_cache_constant_has_inline_asm(LLVMGetInitializer(global_value), 0, inline_asm_kind)
+                global_opt <- LLVMGetNextGlobal(global_value)
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |function_opt|:
+                if LLVMIsDeclaration(function) == 0:
+                    block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                    while block_opt is block |block_opt|:
+                        inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                        while inst_opt is inst |inst_opt|:
+                            operand_count: u32 = LLVMGetNumOperands(inst)
+                            for operand_index in 0..<operand_count |operand_index, inst|:
+                                operand: LLVMValueRef = LLVMGetOperand(inst, operand_index)
+                                return true if part_cache_constant_has_inline_asm(operand, 0, inline_asm_kind)
+                            inst_opt <- LLVMGetNextInstruction(inst)
+                        block_opt <- LLVMGetNextBasicBlock(block)
+                function_opt <- LLVMGetNextFunction(function)
             return false
 
         # Body stripping can invalidate a BlockAddress or remove function-level
@@ -281,7 +324,7 @@ extend Backend:
                     # generated duplicate spellings acquire a suffix rejected above.
                     identities.push(PartCacheFunctionIdentity{hash: part_cache_symbol_hash(name_bytes, name_length), defined: true})
                 function_opt <- LLVMGetNextFunction(function)
-            definitions: usize = 0
+            definitions: mutable usize = 0
             for identity in identities:
                 definitions <- definitions + 1 if identity.defined
             return null if definitions == 0
@@ -336,13 +379,41 @@ extend Backend:
             for shard in shards:
                 _ = unlink_backend((&shard.snapshot_path[0]).cast[cstr] can Unsafe.PointerCast)
 
+        # Exact generated names expected after merging every shard for one unit. This
+        # list travels with the prepared set so localization validates membership, not
+        # only the number of symbols that a tool happened to report.
+        def part_cache_bridge_symbol_names(m: LLVMModuleRef, function_owners: darray[i64]&, global_owners: darray[i64]&) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            names: mutable darray[u8] = []
+            ordinal: mutable i64 = 0
+            global_index: mutable usize = 0
+            global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
+            while global_opt is global_value |names, ordinal, global_index, global_opt, global_owners|:
+                if global_owners[global_index] >= 0 and part_linkage_is_local(LLVMGetLinkage(global_value)):
+                    emit_tokens_push_sview_backend(names, "elisa.part.")
+                    part_push_decimal(names, ordinal)
+                    names.push(10)
+                ordinal <- ordinal + 1
+                global_index <- global_index + 1
+                global_opt <- LLVMGetNextGlobal(global_value)
+            function_index: mutable usize = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |names, ordinal, function_index, function_opt, function_owners|:
+                if function_owners[function_index] >= 0 and part_linkage_is_local(LLVMGetLinkage(function)):
+                    emit_tokens_push_sview_backend(names, "elisa.part.")
+                    part_push_decimal(names, ordinal)
+                    names.push(10)
+                ordinal <- ordinal + 1
+                function_index <- function_index + 1
+                function_opt <- LLVMGetNextFunction(function)
+            names
+
         # Keep one LLVM clone alive only while its restricted snapshot is verified and
         # written. The defer also covers allocation/panic exits from restriction and IO.
-        def part_cache_prepare_one_shard(m: LLVMModuleRef, function_owners: darray[i64]&, global_owners: darray[i64]&, snapshot_prefix: darray[u8]&, prefix_length: usize, logical_shard: usize, unit_namespace: PartSymbolNamespace) -> PartCachePreparedShard? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def part_cache_prepare_one_shard(m: LLVMModuleRef, function_owners: darray[i64]&, global_owners: darray[i64]&, snapshot_prefix: darray[u8]&, prefix_length: usize, logical_shard: usize) -> PartCachePreparedShard? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             clone: LLVMModuleRef = LLVMCloneModule(m)
             defer block:
                 LLVMDisposeModule(clone)
-            part_cache_restrict_module(clone, function_owners, global_owners, logical_shard.i64(), unit_namespace)
+            part_cache_restrict_module(clone, function_owners, global_owners, logical_shard.i64())
             return null if LLVMVerifyModule(clone, PART_VERIFY_RETURN_STATUS, null) != 0
             snapshot_path: mutable darray[u8] = part_cache_snapshot_path(snapshot_prefix, prefix_length, logical_shard)
             write_status: i32 = LLVMWriteBitcodeToFile(clone, (&snapshot_path[0]).cast[cstr] can Unsafe.PointerCast)
@@ -357,41 +428,43 @@ extend Backend:
         # disposed immediately; the unique prefix must be in a private directory, and a
         # future miss path must parse only its selected snapshot.
     public:
-        def prepare_part_cache_shards(m: LLVMModuleRef, snapshot_prefix: darray[u8]&, source_unit: sview) -> PartCachePreparedSet can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def prepare_part_cache_shards(m: LLVMModuleRef, snapshot_prefix: darray[u8]&) -> PartCachePreparedSet can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             prefix_length: usize = part_cache_snapshot_prefix_length(snapshot_prefix)
-            if prefix_length == 0 or source_unit.len == 0:
-                return PartCachePreparedSet{status: PART_CACHE_PREP_UNSUPPORTED, logical_shards: 0, ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
-            unit_namespace: PartSymbolNamespace = part_symbol_namespace(source_unit)
+            if prefix_length == 0:
+                return PartCachePreparedSet{status: PART_CACHE_PREP_UNSUPPORTED, logical_shards: 0, bridge_symbol_names: [], ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
             if LLVMVerifyModule(m, PART_VERIFY_RETURN_STATUS, null) != 0:
-                return PartCachePreparedSet{status: PART_CACHE_PREP_FAILED, logical_shards: 0, ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
+                return PartCachePreparedSet{status: PART_CACHE_PREP_FAILED, logical_shards: 0, bridge_symbol_names: [], ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
+            if part_module_has_reserved_symbol_prefix(m):
+                return PartCachePreparedSet{status: PART_CACHE_PREP_UNSUPPORTED, logical_shards: 0, bridge_symbol_names: [], ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
             owners_opt: PartCacheOwnerAnalysis? = part_cache_stable_owners(m)
             if owners_opt is owners:
                 shards: mutable darray[PartCachePreparedShard] = []
                 shards.reserve(owners.logical_shards)
+                bridge_symbol_names: darray[u8] = part_cache_bridge_symbol_names(m, owners.function_owners, owners.global_owners)
                 keep_snapshots: mutable bool = false
                 defer block:
                     if not keep_snapshots:
                         part_cache_remove_snapshots(shards)
                 for logical_shard in 0..<owners.logical_shards |shards, owners|:
-                    if part_cache_prepare_one_shard(m, owners.function_owners, owners.global_owners, snapshot_prefix, prefix_length, logical_shard, unit_namespace) is prepared:
+                    if part_cache_prepare_one_shard(m, owners.function_owners, owners.global_owners, snapshot_prefix, prefix_length, logical_shard) is prepared:
                         shards.push(prepared)
                     else:
-                        return PartCachePreparedSet{status: PART_CACHE_PREP_FAILED, logical_shards: owners.logical_shards, ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
+                        return PartCachePreparedSet{status: PART_CACHE_PREP_FAILED, logical_shards: owners.logical_shards, bridge_symbol_names: [], ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
                 keep_snapshots <- true
-                return PartCachePreparedSet{status: PART_CACHE_PREP_READY, logical_shards: owners.logical_shards, ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: shards}
-            return PartCachePreparedSet{status: PART_CACHE_PREP_UNSUPPORTED, logical_shards: 0, ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
+                return PartCachePreparedSet{status: PART_CACHE_PREP_READY, logical_shards: owners.logical_shards, bridge_symbol_names: bridge_symbol_names, ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: shards}
+            return PartCachePreparedSet{status: PART_CACHE_PREP_UNSUPPORTED, logical_shards: 0, bridge_symbol_names: [], ownership_version: PART_CACHE_OWNERSHIP_VERSION, shards: []}
 
     private:
         # Applies the existing partition linkage rules to a clone, but strips every
         # foreign body. The live O0 parallel emitter keeps its COW-friendly path below.
-        def part_cache_restrict_module(m: LLVMModuleRef, function_owners: darray[i64]&, global_owners: darray[i64]&, part: i64, unit_namespace: PartSymbolNamespace) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def part_cache_restrict_module(m: LLVMModuleRef, function_owners: darray[i64]&, global_owners: darray[i64]&, part: i64) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             ordinal: mutable i64 = 0
             global_index: mutable usize = 0
             global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
             while global_opt is global_value |ordinal, global_index, global_opt, part, global_owners|:
                 owner: i64 = global_owners[global_index]
                 if owner >= 0:
-                    part_cache_externalize(global_value, ordinal, unit_namespace)
+                    part_externalize(global_value, ordinal)
                     if owner != part:
                         elisa_part_clear_initializer(global_value, null)
                         LLVMSetLinkage(global_value, PART_LINKAGE_EXTERNAL)
@@ -403,18 +476,80 @@ extend Backend:
             while function_opt is function |ordinal, function_index, function_opt, function_owners, part|:
                 owner: i64 = function_owners[function_index]
                 if owner >= 0:
-                    part_cache_externalize(function, ordinal, unit_namespace)
+                    part_externalize(function, ordinal)
                     if owner != part:
                         part_strip_body(function)
                 ordinal <- ordinal + 1
                 function_index <- function_index + 1
                 function_opt <- LLVMGetNextFunction(function)
 
+        # The live emitter applies its ownership policy to every defined partitioned
+        # function/global. This is the number of bridge definitions expected after `ld -r`.
+        def part_module_bridge_symbol_names(m: LLVMModuleRef) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            names: mutable darray[u8] = []
+            ordinal: mutable i64 = 0
+            global_opt: mutable LLVMValueRef? = LLVMGetFirstGlobal(m)
+            while global_opt is global_value |names, ordinal, global_opt|:
+                if part_global_owned(global_value) and part_linkage_is_local(LLVMGetLinkage(global_value)):
+                    emit_tokens_push_sview_backend(names, "elisa.part.")
+                    part_push_decimal(names, ordinal)
+                    names.push(10)
+                ordinal <- ordinal + 1
+                global_opt <- LLVMGetNextGlobal(global_value)
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |names, ordinal, function_opt|:
+                if part_function_owned(function) and part_linkage_is_local(LLVMGetLinkage(function)):
+                    emit_tokens_push_sview_backend(names, "elisa.part.")
+                    part_push_decimal(names, ordinal)
+                    names.push(10)
+                ordinal <- ordinal + 1
+                function_opt <- LLVMGetNextFunction(function)
+            names
+
     public:
         def dispose_part_cache_shards(prepared: mutable PartCachePreparedSet&) -> void:
             part_cache_remove_snapshots(prepared.shards)
             prepared.shards.clear()
+            prepared.bridge_symbol_names.clear()
             prepared.status <- PART_CACHE_PREP_UNSUPPORTED
+
+        # A cache miss must be emitted from the exact restricted snapshot whose bytes
+        # were admitted to the ticket. This O0 primitive parses that file in the active
+        # context, verifies it, and emits one object without rebuilding or repartitioning
+        # the parent module. The caller supplies an O0 target machine matching the
+        # snapshot's triple and data layout, and a private staging object path; this
+        # function does not validate those preconditions. The caller treats false as
+        # fatal and removes any partial staging object.
+        def emit_part_cache_snapshot_o0(machine: void&, ctx: LLVMContextRef, snapshot_path: cstr, object_path: cstr) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # LLVM's C API writes raw pointers to out-parameters. Opaque handle
+            # optionals are tagged Elisa values, so use ABI-shaped pointer cells
+            # here and cast only after checking that LLVM returned a pointer.
+            buffer_storage: mutable void&? = null
+            error_storage: mutable void&? = null
+            error_slot: mutable u8&& = (&error_storage).cast[mutable u8&&] can Unsafe.PointerCast
+            buffer_out: void& = (&buffer_storage).cast[void&] can Unsafe.PointerCast
+            error_out: void& = (&error_storage).cast[void&] can Unsafe.PointerCast
+            read_status: i32 = LLVMCreateMemoryBufferWithContentsOfFile(snapshot_path, buffer_out, error_out)
+            if error_storage is error_raw:
+                error_message: cstr = error_slot[0].cast[cstr] can Unsafe.PointerCast
+                LLVMDisposeMessage(error_message)
+            if buffer_storage is buffer_raw:
+                buffer: LLVMMemoryBufferRef = buffer_raw.cast[LLVMMemoryBufferRef] can Unsafe.PointerCast
+                if read_status != 0:
+                    LLVMDisposeMemoryBuffer(buffer)
+                    return false
+                module_storage: mutable void&? = null
+                module_out: void& = (&module_storage).cast[void&] can Unsafe.PointerCast
+                parse_status: i32 = LLVMParseBitcodeInContext2(ctx, buffer, module_out)
+                LLVMDisposeMemoryBuffer(buffer)
+                if module_storage is module_raw:
+                    module: LLVMModuleRef = module_raw.cast[LLVMModuleRef] can Unsafe.PointerCast
+                    defer block:
+                        LLVMDisposeModule(module)
+                    return false if parse_status != 0
+                    return false if LLVMVerifyModule(module, PART_VERIFY_RETURN_STATUS, null) != 0
+                    return emit_object(machine, module, object_path)
+            return false
 
     private:
         def part_linkage_is_local(linkage: u32) -> bool:
@@ -447,48 +582,16 @@ extend Backend:
             linkage: u32 = LLVMGetLinkage(g)
             part_linkage_is_partitioned(linkage)
 
-        # A local symbol becomes a hidden external for references between shards.
-        # Cross-unit cache snapshots use part_cache_externalize below.
+        # A local symbol becomes a hidden external for references between shards. Its
+        # ordinal is deterministic within this module and identical in every shard. After
+        # the per-unit merge, localize this reserved prefix so independently compiled units
+        # (including duplicate instances of the same source) cannot collide.
         def part_externalize(value: LLVMValueRef, ordinal: i64) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             linkage: u32 = LLVMGetLinkage(value)
             return if not part_linkage_is_local(linkage)
-            name_length: mutable usize = 0
-            name_bytes: u8& = LLVMGetValueName2(value, &name_length)
             renamed: mutable darray[u8] = []
             emit_tokens_push_sview_backend(renamed, "elisa.part.")
-            if name_length == 0:
-                emit_tokens_push_sview_backend(renamed, "anon.")
-                part_push_decimal(renamed, ordinal)
-            else:
-                for name_index in 0..<name_length |renamed, name_bytes|:
-                    byte_ref: u8& = name_bytes + name_index
-                    renamed.push(byte_ref)
-            renamed_length: usize = renamed.count
-            renamed.push(0)
-            LLVMSetValueName2(value, (&renamed[0]).cast[cstr], renamed_length)
-            LLVMSetLinkage(value, PART_LINKAGE_EXTERNAL)
-            LLVMSetVisibility(value, PART_VISIBILITY_HIDDEN)
-
-        # Cache snapshots may be linked with objects from other source units. Give
-        # each local symbol a stable namespace derived from the canonical source path;
-        # the live parallel-emission path keeps its established partition-local names.
-        def part_cache_externalize(value: LLVMValueRef, ordinal: i64, unit_namespace: PartSymbolNamespace) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            linkage: u32 = LLVMGetLinkage(value)
-            return if not part_linkage_is_local(linkage)
-            name_length: mutable usize = 0
-            name_bytes: u8& = LLVMGetValueName2(value, &name_length)
-            renamed: mutable darray[u8] = []
-            emit_tokens_push_sview_backend(renamed, "elisa.part.")
-            part_push_hex_u64(renamed, unit_namespace.high)
-            part_push_hex_u64(renamed, unit_namespace.low)
-            emit_tokens_push_sview_backend(renamed, ".")
-            if name_length == 0:
-                emit_tokens_push_sview_backend(renamed, "anon.")
-                part_push_decimal(renamed, ordinal)
-            else:
-                for name_index in 0..<name_length |renamed, name_bytes|:
-                    byte_ref: u8& = name_bytes + name_index
-                    renamed.push(byte_ref)
+            part_push_decimal(renamed, ordinal)
             renamed_length: usize = renamed.count
             renamed.push(0)
             LLVMSetValueName2(value, (&renamed[0]).cast[cstr], renamed_length)
@@ -589,14 +692,13 @@ extend Backend:
                 ordinal <- ordinal + 1
                 function_index <- function_index + 1
                 function_opt <- LLVMGetNextFunction(function)
-            alias_cstr_opt: mutable cstr? = LLVMGetFirstGlobalAlias(m)
-            while alias_cstr_opt is alias_cstr |alias_cstr_opt|:
-                alias: LLVMValueRef = alias_cstr.cast[LLVMValueRef] can Unsafe.PointerCast
+            alias_opt: mutable LLVMValueRef? = LLVMGetFirstGlobalAlias(m)
+            while alias_opt is alias |alias_opt|:
                 aliasee: LLVMValueRef = LLVMAliasGetAliasee(alias)
                 if LLVMIsDeclaration(aliasee) != 0 or LLVMGetLinkage(aliasee) == PART_LINKAGE_AVAILABLE_EXTERNALLY:
                     LLVMReplaceAllUsesWith(alias, aliasee)
                     LLVMSetLinkage(alias, PART_LINKAGE_PRIVATE)
-                alias_cstr_opt <- LLVMGetNextGlobalAlias(alias_cstr)
+                alias_opt <- LLVMGetNextGlobalAlias(alias)
 
         # Runs in a forked child and never returns: serve parts [first, stop). While more than
         # one part is left, fork a child for the upper half and keep the lower; then emit
@@ -657,6 +759,98 @@ extend Backend:
                     buffer.push(path_byte)
             buffer.push(39)
 
+        def part_llvm_tool(name: cstr, override_name: cstr, buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if getenv(override_name) is explicit:
+                part_push_cstr(buffer, explicit.cast[cstr] can Unsafe.PointerCast)
+                return if buffer.count > 0
+            if getenv("ELISA_LLVM_BIN_DIR") is llvm_bin:
+                part_push_cstr(buffer, llvm_bin.cast[cstr] can Unsafe.PointerCast)
+                if buffer.count > 0:
+                    buffer.push(47) if buffer[buffer.count - 1] != 47
+                    part_push_cstr(buffer, name)
+                    return
+            part_push_cstr(buffer, name)
+
+        def part_write_temp_symbols(contents: darray[u8]&, path: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            directory: mutable darray[u8] = []
+            if getenv("TMPDIR") is tmpdir:
+                part_push_cstr(directory, tmpdir.cast[cstr] can Unsafe.PointerCast)
+            if directory.count == 0:
+                emit_tokens_push_sview_backend(directory, "/tmp")
+            directory.pop() if directory.count > 0 and directory[directory.count - 1] == 47
+            for byte in directory |path|:
+                path.push(byte)
+            emit_tokens_push_sview_backend(path, "/elisa-part-expected.XXXXXX")
+            path.push(0)
+            fd: i32 = part_mkstemp((&path[0]).cast[cstr] can Unsafe.PointerCast)
+            return false if fd < 0
+            offset: mutable usize = 0
+            while offset < contents.count |offset, contents|:
+                data: u8& = (&contents[offset]).cast[u8&] can Unsafe.PointerCast
+                written: i64 = part_write(fd, data, contents.count - offset)
+                if written <= 0:
+                    _ = part_close(fd)
+                    _ = unlink_backend((&path[0]).cast[cstr] can Unsafe.PointerCast)
+                    return false
+                offset <- offset + written.usize()
+            if part_close(fd) != 0:
+                _ = unlink_backend((&path[0]).cast[cstr] can Unsafe.PointerCast)
+                return false
+            return true
+
+    public:
+        # Localize the generated bridge definitions after all shards for one translation
+        # unit have been merged. `bridge_symbol_names` comes from the original module/prepared
+        # set; exact-name validation makes missing tools or an incomplete scan fail closed.
+        # The path is NUL-terminated. The caller must do this before linking the unit with
+        # another translation unit or publishing its merged object to the shard cache.
+        def localize_part_bridges(object_path: darray[u8]&, bridge_symbol_names: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Write, Blocking.IO]:
+            return true if bridge_symbol_names.count == 0
+            return false if object_path.count == 0 or object_path[object_path.count - 1] != 0
+            expected_path: mutable darray[u8] = []
+            if not part_write_temp_symbols(bridge_symbol_names, expected_path):
+                _ = unlink_backend((&object_path[0]).cast[cstr] can Unsafe.PointerCast)
+                return false
+            defer block:
+                _ = unlink_backend((&expected_path[0]).cast[cstr] can Unsafe.PointerCast)
+            nm_tool: mutable darray[u8] = []
+            objcopy_tool: mutable darray[u8] = []
+            part_llvm_tool("llvm-nm", "ELISA_LLVM_NM", nm_tool)
+            part_llvm_tool("llvm-objcopy", "ELISA_LLVM_OBJCOPY", objcopy_tool)
+            command: mutable darray[u8] = []
+            emit_tokens_push_sview_backend(command, "raw=$(mktemp \"${TMPDIR:-/tmp}/elisa-part-raw.XXXXXX\" 2>/dev/null) || exit 1; symbols=$(mktemp \"${TMPDIR:-/tmp}/elisa-part-symbols.XXXXXX\" 2>/dev/null) || { rm -f \"$raw\"; exit 1; }; verify=$(mktemp \"${TMPDIR:-/tmp}/elisa-part-verify.XXXXXX\" 2>/dev/null) || { rm -f \"$raw\" \"$symbols\"; exit 1; }; trap 'rm -f \"$raw\" \"$symbols\" \"$verify\"' 0; ")
+            part_shell_quote(command, nm_tool)
+            emit_tokens_push_sview_backend(command, " --defined-only -g --format=posix ")
+            part_shell_quote(command, object_path)
+            emit_tokens_push_sview_backend(command, " > \"$raw\" 2>/dev/null || exit 1; awk 'FNR==NR { expected[$0]=1; next } { name=$1; normalized=name; if (substr(normalized,1,1)==\"_\") normalized=substr(normalized,2); if (index(normalized,\"elisa.part.\")==1) { if (!(normalized in expected) || found[normalized]++) bad=1; print name } } END { for (name in expected) if (!(name in found)) bad=1; if (bad) exit 1 }' ")
+            part_shell_quote(command, expected_path)
+            emit_tokens_push_sview_backend(command, " \"$raw\" > \"$symbols\" || exit 1; test -s \"$symbols\" || exit 1; ")
+            part_shell_quote(command, objcopy_tool)
+            emit_tokens_push_sview_backend(command, " --localize-symbols=")
+            emit_tokens_push_sview_backend(command, "\"$symbols\" ")
+            part_shell_quote(command, object_path)
+            emit_tokens_push_sview_backend(command, " >/dev/null 2>&1 || exit 1; ")
+            part_shell_quote(command, nm_tool)
+            emit_tokens_push_sview_backend(command, " --defined-only -g --format=posix ")
+            part_shell_quote(command, object_path)
+            emit_tokens_push_sview_backend(command, " > \"$verify\" 2>/dev/null || exit 1; awk '{ name=$1; if (substr(name,1,1)==\"_\") name=substr(name,2); if (index(name,\"elisa.part.\")==1) found=1 } END { exit(found ? 1 : 0) }' \"$verify\" || exit 1 >/dev/null 2>&1")
+            command.push(0)
+            line_map: mutable darray[u8] = []
+            line_map_hidden: bool = Lexer::line_map_suspend(&line_map) can Global.Write
+            localization_ok: bool = system_backend((&command[0]).cast[cstr] can Unsafe.PointerCast) == 0
+            Lexer::line_map_resume(&line_map, line_map_hidden) can Global.Write
+            if localization_ok:
+                return true
+            _ = unlink_backend((&object_path[0]).cast[cstr] can Unsafe.PointerCast)
+            return false
+
+        # Cache callers merge restored hits and emitted misses before publication. Require
+        # the prepared set so the same verified bridge inventory used to write snapshots
+        # also gates post-merge localization of the combined object.
+        def localize_part_cache_output(object_path: darray[u8]&, prepared: PartCachePreparedSet&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Write, Blocking.IO]:
+            return false if prepared.status != PART_CACHE_PREP_READY
+            localize_part_bridges(object_path, prepared.bridge_symbol_names)
+
     public:
         # ELISA_STAGE1_JOBS, clamped to 1..64; 1 when unset or malformed.
         def parallel_emit_jobs() -> i64 can[Abort.Panic, Unsafe.PointerCast]:
@@ -679,7 +873,7 @@ extend Backend:
         # Emit `m` to `path` with `jobs` forked code generators; serial when jobs <= 1.
         # The module is unchanged in the parent.
         # OPTIMIZED: `machine` was configured above -O0 (see part_restrict_module).
-        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, optimized: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+        def emit_object_parallel(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, optimized: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Write, Blocking.IO]:
             return (emit_object_parallel_status(machine, m, path, requested_jobs, false, optimized) can Global.Write) == 0
 
         # emit_object_parallel for a module NOT yet verified: the LLVM verifier runs first,
@@ -688,17 +882,26 @@ extend Backend:
         # (its diagnostic is printed; no object is written), 4 = emission failed. For an
         # unoptimised machine only. A serial
         # emission verifies first, exactly as before.
-        def emit_object_parallel_verifying(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+        def emit_object_parallel_verifying(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Write, Blocking.IO]:
             return emit_object_parallel_status(machine, m, path, requested_jobs, true, false) can Global.Write
 
-        def emit_object_parallel_status(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, verify: bool, optimized: bool) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Blocking.IO]:
+        def emit_object_parallel_status(machine: void&, m: LLVMModuleRef, path: cstr, requested_jobs: i64, verify: bool, optimized: bool) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Write, Blocking.IO]:
             jobs: mutable i64 = requested_jobs
             weights: mutable darray[i64] = []
             total: mutable i64 = 0
+            bridge_symbol_names: mutable darray[u8] = []
             if requested_jobs > 1:
-                weights <- part_function_weights(m)
-                total <- part_total_weight(weights)
-                jobs <- part_effective_jobs(total, requested_jobs)
+                if part_module_has_reserved_symbol_prefix(m):
+                    jobs <- 1
+                else:
+                    weights <- part_function_weights(m)
+                    total <- part_total_weight(weights)
+                    jobs <- part_effective_jobs(total, requested_jobs)
+                    if jobs > 1:
+                        bridge_symbol_names <- part_module_bridge_symbol_names(m)
+                        if bridge_symbol_names.count > 0 and part_module_has_inline_asm(m):
+                            jobs <- 1
+                            bridge_symbol_names.clear()
             # Verify before any worker forks: instruction selection over IR the verifier rejects
             # can crash or hang LLVM, and a hung worker would block the waitpid below.
             return 2 if verify and LLVMVerifyModule(m, PART_VERIFY_PRINT_MESSAGE, null) != 0
@@ -737,6 +940,7 @@ extend Backend:
             emit_tokens_push_sview_backend(command, " -r -o ")
             out_storage: mutable darray[u8] = []
             part_push_cstr(out_storage, path)
+            out_storage.push(0)
             part_shell_quote(command, out_storage)
             for part in 0..<jobs.usize() |command, path|:
                 command.push(32)
@@ -753,10 +957,26 @@ extend Backend:
             for part in 0..<jobs.usize() |path|:
                 part_file: darray[u8] = part_path(path, part.i64())
                 _ = unlink_backend((&part_file[0]).cast[cstr])
-            return 0 if all_ok
-            return 4
+            if not all_ok:
+                _ = unlink_backend(path)
+                return 4
+            if not localize_part_bridges(out_storage, bridge_symbol_names):
+                # The helper removes a failed or partially localized merged object.
+                # Re-emit the original module serially so a missing tool or mismatch
+                # cannot expose external bridge symbols to another translation unit.
+                if emit_object(machine, m, path):
+                    return 0
+                _ = unlink_backend(path)
+                return 4
+            return 0
 
 @link_name("system")
 extern system_backend(command: cstr) -> i32
 @link_name("unlink")
 extern unlink_backend(path: cstr) -> i32
+@link_name("mkstemp")
+extern part_mkstemp(template: cstr) -> i32
+@link_name("write")
+extern part_write(fd: i32, data: u8&, count: usize) -> i64
+@link_name("close")
+extern part_close(fd: i32) -> i32

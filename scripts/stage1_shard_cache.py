@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Exact preoptimization shard tickets and atomic object/diagnostic bundles.
 
-The backend must attest loaded_llvm is the loaded library, verify/restrict the
-snapshot, and use the SAME per-shard cold pipeline. This helper does not infer
-those facts from a caller-supplied path. A hit precedes optimization/emission.
+The native caller must attest that producer/loaded_llvm identify its running
+images, verify/restrict the snapshot, and use the SAME per-shard cold pipeline.
+On Linux, the caller may pass inherited `/proc/self/fd/N` paths; this helper
+preserves those paths so every revalidation reads the same open file description.
+A hit precedes optimization/emission.
 """
 import contextlib
 import fcntl
@@ -34,8 +36,22 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def artifact_path(path):
+    """Resolve normal files, but preserve inherited Linux fd pins verbatim."""
+    raw = os.fspath(path)
+    if isinstance(raw, bytes):
+        raw = os.fsdecode(raw)
+    prefix = "/proc/self/fd/"
+    if raw.startswith(prefix):
+        suffix = raw[len(prefix):]
+        if not suffix.isascii() or not suffix.isdecimal() or str(int(suffix)) != suffix:
+            raise ValueError("invalid inherited artifact descriptor path")
+        return Path(raw)
+    return Path(raw).resolve(strict=True)
+
+
 def fingerprint(path, *, allow_empty=False, limit=MAX_BYTES):
-    path = Path(path).resolve(strict=True)
+    path = artifact_path(path)
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
         if not stat.S_ISREG(before.st_mode):
@@ -96,10 +112,14 @@ def prepare(snapshot, producer, loaded_llvm, runtime, options, profiles=()):
     pins = {}
     artifacts = {}
     for name, path in (("producer", producer), ("loaded_llvm", loaded_llvm), ("runtime", runtime)):
-        pin = {"path": str(Path(path).resolve(strict=True)), "identity": fingerprint(path)}
+        pinned_path = artifact_path(path)
+        pin = {"path": str(pinned_path), "identity": fingerprint(pinned_path)}
         pins[name] = pin
         artifacts[name] = pin["identity"]
-    profile_pins = [{"path": str(Path(path).resolve(strict=True)), "identity": fingerprint(path)} for path in profiles]
+    profile_pins = []
+    for path in profiles:
+        pinned_path = artifact_path(path)
+        profile_pins.append({"path": str(pinned_path), "identity": fingerprint(pinned_path)})
     pins["profiles"] = profile_pins
     artifacts["profiles"] = [pin["identity"] for pin in profile_pins]
     ticket = {"schema": SCHEMA, "pins": pins, "recipe": {"options": dict(options), "artifacts": artifacts},
@@ -438,7 +458,8 @@ class BatchInvocation:
 
     def _shared(self, path):
         self.metrics["shared_artifact_reads"] += 1
-        return {"path": str(Path(path).resolve(strict=True)), "identity": fingerprint(path)}
+        pinned_path = artifact_path(path)
+        return {"path": str(pinned_path), "identity": fingerprint(pinned_path)}
 
     def _read_shared(self):
         pins = {name: self._shared(path) for name, path in self.paths.items()}

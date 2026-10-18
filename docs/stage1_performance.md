@@ -35,8 +35,8 @@ Generated-code quality is never traded for compile speed.
   `ELISA_HOST_LINUX=1 ELISA_HOST_X86_64=1`.
 - Profiling: ptrace attach is blocked on the box; `valgrind --tool=callgrind` works, and so
   does launching under gdb and interrupting with SIGINT. A stage1 binary built by stage1 with
-  `ELISA_STAGE1_JOBS>1` keeps its internal functions as `elisa.part.*` symbols, so it
-  symbolizes; the stage0 seed does not.
+  `ELISA_STAGE1_JOBS>1` keeps its internal functions as local `elisa.part.*` symbol-table
+  entries after merging and localization, so it symbolizes; the stage0 seed does not.
 
 ## Results (wall seconds)
 

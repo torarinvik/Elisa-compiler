@@ -7,6 +7,11 @@ for the outstanding compiler proof diagnostics to reach zero. All development
 and measurements now run locally. The existing whole-object cache and narrow
 Global-authority experiment below are foundations, not completion of this goal.
 
+For low-level profile and generated-code caveats, see the
+[incremental bottleneck review](incremental_bottleneck_review.md).
+For the Zig, rustc, Clang/LLVM, and GCC design comparison, see the
+[compiler incrementality reference study](compiler_incrementality_reference_study.md).
+
 A local profiled bootstrap at core `a5f8100b` and stage1 `c2e8b8551e94`
 took 111.82 seconds wall time, 107.74 seconds user time, 32.17 seconds system
 time, and 5,091,180,544 bytes peak RSS. It stopped at semantic diagnostics;
@@ -38,6 +43,19 @@ diagnostics, inferred results, native behavior and output policy. Report visited
 and reused functions plus phase time; measure with whole-object avoidance
 disabled when testing partial reuse. Keep backend artifact reuse as a subsequent
 boundary with explicit optimizer dependencies and cold/warm parity.
+
+## Zig-inspired graph and artifact-identity foundations (2026-10-18)
+
+The Stage1 semantic session now owns compact query and edge IDs, exact query-key
+bytes, contiguous query and edge pools, reverse and forward adjacency, dependency
+replacement, and reverse invalidation. This is a storage/API foundation only:
+semantic read sites do not record these edges, result fingerprints are not
+replayed, and checker behavior and edit performance are unchanged. The target
+descriptor also records both module and machine triples/layouts plus CPU and
+features, rejecting mismatched pairs. Executable/LLVM path discovery is
+available on Linux and macOS, while mapped-image digest attestation remains
+unsupported; therefore the O0 shard cache remains disconnected from the driver.
+These changes do not qualify incremental speedup.
 
 ## Bootstrap query publication measurement (2026-10-18)
 
@@ -250,8 +268,31 @@ diagnostics. Global-authority replay also stays cold for the whole unit when
 inline-grant annotations are present, because their spans are not yet bound to
 function facts. Other bodies, checkers, closure construction, and report publication
 stay on the cold path. Invocation-local body anchors are rebuilt on each parse.
-Semantic diagnostics are recomputed every invocation; this does not replay
-semantic results or qualify an incremental-compilation speedup.
+For the disk-sidecar path, semantic diagnostics are recomputed every invocation;
+that path does not replay semantic results or qualify an incremental-compilation
+speedup.
+
+The opaque `IncrementalSemanticSession` handle also supports edits within the
+same canonical include graph, options, phase, and semantic version. Semantic
+owns its retained state. The session compares an
+exact declaration surface that retains function headers, then copies facts only for
+functions whose tokenized bodies are unchanged; copied owners and byte spans are
+rebuilt in the new snapshot, and current parse anchors are regenerated. Changed or
+unsupported bodies take the collector walk. Disk sidecars never authorize this
+cross-edit fact reuse. Ordinary one-shot CLI compilation still uses the
+session-disabled wrapper. The opt-in `semantic-session` host retains one session
+across requests and calls the session-aware entry point; its protocol has not yet
+been qualified by an end-to-end control.
+
+The long-lived session also retains bounded self-assignment linter facts per
+function. When the function key and body tokens match exactly, it rebinds saved
+target and statement token ordinals to the current source, then replays those
+diagnostics. Bodies without complete, valid anchors use the original streaming
+checker. These linter facts are process-local and omitted from disk sidecars.
+`self_assignment_bodies_scanned` and `self_assignment_bodies_reused` report this
+path separately from direct-fact matching. The session linter path has not yet
+had an end-to-end parity or performance control, so it does not establish a
+compiler speedup.
 
 The existing narrow parity controls previously covered cold, first-cache, warm,
 body-edited, option-changed, structurally valid forged-sidecar, and corrupted-cache
@@ -418,7 +459,48 @@ Start codegen reuse with `-O0`, without debug/profiling/coverage metadata, and w
 2. **Collect and bind facts.** The opt-in driver path now passes the exact analyzed source and tokens alongside the AST, while policy options still come from the original source. Ordinary, expanded `static generate`, and early `pymodule` gates use the paired frontend inputs. The collector remains deliberately narrow; unsupported bodies stay cold. The separate shadow observer remains observational and must not be confused with checker reuse.
 3. **Persist and consume one proven case.** An opt-in sidecar uses bounded no-follow, nonblocking reads, schema/semantic/options validation, recollection against current source, exclusive temporary-file creation, and atomic rename publication. A symlink or FIFO at the cache-file path is a miss; a stale or pre-existing temporary path fails publication closed instead of being followed. These flags protect the final path component only; the configured cache directory is not pinned against symlink substitution. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker uses current-source-verified, uniquely anchored, cacheable zero-direct-fact top-level bodies to skip Global-authority inference/report walks, repeated effect-source scans, and two panic-coverage body scans. It also replays direct-call-only records into Global-authority inference after resolving targets against the fresh function index, and projects current direct facts into Global-permission Read/Write axes for flat bodies without local bindings. Both retain function slots and closure/row work. The direct control compares diagnostics and canonical rows with Global-permission enforcement enabled, and asserts effect-source, panic-coverage, and Global-permission axis counters. The CLI control covers cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and asserts GA plus effect-source, panic-coverage, and Global-permission axis counters. These expanded controls have not been run against a fresh Stage1 product. Both available products checked—the default `bin/elisac-stage1` and `build/goal-compiler-latest-b11e/bin/elisac-stage1`—report provenance schema `elisa-stage1-provenance-v1`, while the current checker requires v5. A fresh seed attempt using a Stage0 binary rebuilt from the current dirty Go tree (SHA-256 `83d2e903…91bb2`) with a 12 GiB guard exited 1 during semantic analysis; its log contains 97 located non-warning diagnostics and 32,078 warning rows (`/tmp/elisa-incremental-current-seed.log`). It did not produce a current Stage1 binary. This narrow checker-work reduction is not an end-to-end performance result.
 3a. **Replay one dependency fact.** Current-source-only direct-call records may replace a supported caller's Global-authority inference walk after ordinary global lookup misses and every target resolves uniquely against the fresh function index. Keep report walks and cold fallback. Add warm/cold controls for callee `Global.Read`/`Global.Write` changes, body relocation, and ambiguous target invalidation before widening eligibility.
-3b. **Use a trusted process-local semantic session.** `run_semantic_gate_incremental_with_session` accepts a bounded caller-owned session. It stores exact analyzed bytes, the complete source/include graph identity, exact options, input phase, semantic version, and a validated portable snapshot. Exact-input hits decode the snapshot and rebuild source anchors from the fresh parse before skipping the fact collector. The current compiler entry point handles one request and calls the session-disabled wrapper, so no production path gets a session hit yet; a long-lived host must retain a session and call the session-aware API for cross-request reuse. Persisted sidecars still take the current-source collector path because they are untrusted. Session admission is byte-identical input only; body-level reuse across edits is not implemented by this session. Keep diagnostics on the normal current-source path until a separate location-rebinding result format is proven. The session stores only owned portable facts and grants, never AST, SymbolTable, line-map, or LLVM handles. It keeps one bounded translation-unit entry; changed admission inputs or malformed facts clear it and run cold.
+3b. **Use a trusted process-local semantic session.** The driver’s
+`run_semantic_gate_incremental_with_session` accepts an opaque
+`Semantic::IncrementalSemanticSession` created by Semantic. Its private state stores
+exact analyzed bytes, the complete serialized source/include graph identity, exact
+options, input phase, semantic version, and a size-bounded typed snapshot validated
+when it enters the session. Exact-input hits deep-copy the private facts and rebuild
+source anchors from the fresh parse before skipping the fact collector. For body
+edits within the same graph and options, the collector reads the private prior
+snapshot directly, compares an exact declaration surface that retains function
+headers, and reuses facts only for bodies with identical token streams; changed or
+unsupported bodies are scanned. The binary snapshot codec remains the disk-sidecar
+format. The report uses `prior=session` and `session=edit` when this path reuses a
+body, while exact-input hits report `session=hit`.
+
+The opt-in `elisac-stage1 semantic-session SOURCE` host retains one session across
+`check` requests and reparses each saved source version in a request-scoped region.
+Each process is tied to one source path and fixed environment options; callers
+start another host when either changes. The opaque session and one reusable
+process-owned line-map buffer outlive a request; parsed source, tokens, and AST
+remain request-local.
+This protocol currently has no end-to-end test control, so session reuse behavior
+and request-region reclamation still need qualification. The ordinary compiler
+entry continues to call the session-disabled wrapper. Persisted sidecars still take
+the current-source collector path because they are untrusted. Keep diagnostics on
+the normal current-source path until a separate location-rebinding result format is
+proven. The session stores only owned portable facts and grants, never AST,
+SymbolTable, line-map, or LLVM handles. It keeps one bounded translation-unit
+entry; changed admission inputs or invalid private snapshots clear it and run cold.
+
+An exact session hit still deep-copies the retained portable snapshot before
+reanchoring, and every request still lexes and parses the whole file. The first
+host therefore validates the trusted session boundary; it does not yet prove
+low-cost unchanged checks or edit-to-executable speedups.
+
+The ordinary `main` path consumes one request and returns. It allocates
+`source_bytes` in the program-lived `@source` region because the AST borrows those
+bytes. The separate semantic-session command gives each request a temporary region
+and publishes the new map into a reusable process-owned lexer buffer. The host
+calls `PhaseTimer::request_start` and marks each completed check so
+semantic timing rows exclude idle time between edits. Other process globals still
+need lifecycle review.
+
 4. **Prove invalidation.** Compare warm incremental output byte-for-byte with cold output for: unchanged build; a body-only edit with unchanged API; a callee body edit that adds/removes `Global.Read` or `Global.Write`; a callee effect-contract change; adding an overload after a previous lookup; changing an import or alias that resolves a previous miss; changing a global from immutable to mutable or changing its type/layout; changing a protocol method contract/conformance; changing strict/global options; and corrupting or versioning out the cache.
 5. **Add body codegen fragments.** Cache and restore eligible `-O0` LLVM function bodies in a newly created module, then test link validity, object/executable parity, and invalidation for function API, type/global layout, callee ABI, target, and codegen flags.
 6. **Expand eligibility and optimization.** Add callback/generic/debug support only with explicit fingerprints and controls. Consider cross-function optimized reuse only with an import/summary model and runtime parity evidence.
@@ -431,12 +513,20 @@ The driver supplies the exact source bytes and token stream that produced each A
 plus a stable source-unit identity. For expanded `static generate` input, the AST,
 source, and tokens come from the expanded frontend result; policy headers continue
 to come from the original source. Early `pymodule` gates use the same pairing.
-Without stable identity, or when the cache directory is unset, the driver runs the
-ordinary cold semantic gate.
+Without stable identity, the driver resets any session and runs the ordinary cold
+semantic gate. An empty cache directory disables sidecars; a host that retains an
+opaque session can still use the session-aware entry point. The opt-in
+`semantic-session` command is that host; ordinary compile commands remain one-shot.
 
-The current replay seam does not consume stored facts as authority effects. It
-rescans each supported body from the current AST and rebuilds current anchors;
-persisted cacheability and fact counts cannot authorize a skip. A freshly scanned, cacheable zero-fact record can skip Global-authority walks,
+In ordinary one-shot CLI compilation, the session-disabled wrapper does not consume stored
+facts as authority effects. It rescans each supported body from the current AST
+and rebuilds current anchors; sidecar cacheability and fact counts cannot
+authorize a skip. The driver also exposes a session-aware internal entry point
+that accepts only the opaque Semantic-owned session type. Its session operation
+decodes private state and can reuse trusted in-process facts after checking the
+exact declaration surface and unchanged body tokens. The opt-in semantic-session
+host retains that session across requests; ordinary one-shot CLI calls still use
+the disabled wrapper. A freshly scanned, cacheable zero-fact record can skip Global-authority walks,
 effect-source scans, panic-coverage body scans, and Global-permission body-axis
 collectors only at a unique top-level definition offset. Direct-call-only records
 can also seed Global-authority inference after fresh target resolution.
@@ -447,33 +537,70 @@ still builds its annotation and concrete-wrapper indexes and traverses the
 declaration tree. Local reference writes, nested blocks, parenthesized
 expressions, duplicate anchors, and unsupported syntax stay cold. Global-authority
 replay also stays cold for the whole unit when inline-grant annotations are present.
-This still
-rescans every candidate body and recomputes semantic diagnostics; it does not
-replay results. The current serialized controls cover body edits, semantic-option
+Ordinary one-shot CLI compilation still rescans every candidate body and recomputes semantic
+diagnostics; it does not replay results. In the opt-in session host, only the
+self-assignment linter currently replays complete rebound diagnostics; all other
+semantic diagnostics are recomputed. The current serialized controls cover body edits, semantic-option
 changes, a valid-checksum forged sidecar, and corrupt cache data, but the expanded
 current-source skip and tighter eligibility need fresh parity qualification.
 Dependency-change invalidation remains to be added before eligibility expands. The manual
 `INCREMENTAL_SEMANTIC_ENGINE_VERSION` must be bumped whenever changes can alter
 collector eligibility or the meaning of facts consumed by replay.
 
-This trust policy also sets a hard limit on reuse: exact body equality proves
-that the cached record names the current body, but it does not prove that the
+This trust policy sets a hard limit on sidecar reuse: exact body equality proves
+that a cached record names the current body, but it does not prove that the
 record's semantic observations are true. A checksum detects accidental damage;
-it does not authenticate those observations. While sidecars remain untrusted,
-the compiler must recollect facts before they can affect checker behavior. To
-skip recollection, a later milestone must define and enforce a trusted cache
-boundary (including how its artifacts are authenticated and invalidated) or
-retain recollection and limit reuse to downstream checker work. Do not treat a
-body hash, schema check, or structural validation as a substitute for that
-decision.
+it does not authenticate those observations. In the driver path, disk sidecars
+therefore require current-source recollection before their facts can affect
+checker behavior. The low-level checker bridges accept snapshots and have a
+trusted-caller contract; the type system does not prevent other Semantic API
+callers from passing decoded sidecar data to them. The current driver obeys this
+contract. The opaque session API supplies a separate process-local provenance
+boundary: only
+Semantic can create or advance the session state, which stores facts emitted by
+the current collector and checks exact options, include identity, declaration
+surface, and body tokens before reusing them. That
+boundary is exercised by the opt-in semantic-session host, but its protocol and
+request-lifetime behavior still need an end-to-end control. Ordinary one-shot CLI
+compilation continues to recollect. Do not treat a body hash, schema check, or
+structural validation alone as a substitute for session provenance.
+
+### Typed semantic query graph status
+
+`IncrementalSemanticSession` now contains a typed query-node and bidirectional-edge
+scaffold, but it is not a production dependency graph yet. The only current
+`incremental_semantic_query_*` definitions are in
+`src/semantic/incremental_function_facts.elisa`; semantic collection and checking
+have no call sites that record dependencies or consume graph results. These
+operations are private while their lifecycle is incomplete. They cannot read or
+commit input/result fingerprints or mark a recomputed query Green, so the scaffold
+cannot authorize semantic reuse. Its invalidation operation marks the full reverse
+closure Dirty and cannot stop propagation when an intermediate result is unchanged.
+
+The dense query-node record now keeps status and adjacency handles ahead of the
+wide key spans and fingerprints. Under conventional 64-bit struct alignment,
+the new field order is estimated at 56 bytes per node versus 72 bytes before;
+this is not a measured Elisa layout or speedup. The graph still has no semantic
+callers, so profiling it should wait until an evaluate/commit path exists.
+
+Before using this graph for reuse, add a session-owned evaluate/commit boundary
+that validates exact inputs and dependencies, records the canonical result, and
+marks a query Green only after a successful commit. Dependency-set changes must
+invalidate the query and its dependers. Query handles also need session/generation
+validation, since the current bare indices can alias across sessions or after reset.
+Bound retained nodes, key bytes, edges, and update work; any overflow or graph
+corruption must discard the graph and take the cold path. Until these boundaries
+have semantic callers and parity controls, describe this as scaffolding only.
 
 The report counts `eligible_bodies` and `matched_eligible_bodies` by unique
 cacheable function record, so a body with multiple facts cannot inflate
-eligibility. `visited` counts function candidates passed through the collector,
-including candidates rejected before `ifc_walk_body`; `matched` counts records
-whose body and declaration surface match after current facts were recollected.
-A matched body is only a source/cache match; it does not mean its semantic result
-was reused. `ga_walks_skipped` counts Global-authority body walks skipped.
+eligibility. `visited` counts candidates passed through the collector walk,
+including candidates rejected before `ifc_walk_body`; it excludes session bodies
+whose facts were copied. `matched` counts exact body matches under a compatible
+declaration surface. Exact-input session hits recompute the match flags for all
+current cacheable records during reanchoring; they do not carry forward a prior
+edit's match ratio. For sidecars those bodies were rescanned; `session=edit`
+means at least one matching body actually reused in-process facts. `ga_walks_skipped` counts Global-authority body walks skipped.
 `effect_source_bodies_skipped` counts function bodies whose repeated effect-source
 scans were bypassed. `ungranted_panic_bodies_skipped` counts function bodies whose
 bound-name collection and two panic-coverage body scans were bypassed.
@@ -561,3 +688,53 @@ need explicit locality measurements and stable-placement work. General semantic
 replay, avoiding complete LLVM generation/optimization, persistence, normal CLI
 integration and representative edit-to-executable qualification remain required
 for the full professional incremental-compilation goal.
+
+## Self-host bottleneck review (2026-10-18)
+
+The recorded Stage1 self-host profile puts semantic checking at 46% of samples,
+LLVM IR construction at 39%, and O0 object emission at 4% (`docs/build-speed-notes.md`).
+This sets the work order: semantic-result and body-IR reuse can address the dominant
+repeated work; a native-object cache alone cannot. The Core compile-server cache
+still helps object-heavy requests, as its source-to-object measurements above show,
+but it does not skip frontend analysis or current-module construction.
+
+The local static artifacts are historical and do not match this checkout. The
+2026-08-05 `build/s1_driver.ll` has 1,079,457 instructions across 5,020 functions;
+`Semantic.check_full` alone contains 492 call sites. The 2026-09-14 Stage1 object
+`build/field-lifetimes-20260914/selfhost/elisac_stage1_gen2.o` disassembles to 7,691
+arm64 instructions for `Semantic.check_full_into` (451 calls, 205 branches, about
+5.5 KiB of stack frame) and 4,457 for `Backend.emit_module_core` (116 calls, 206
+branches, about 18 KiB of stack frame). These counts explain why the unoptimized
+self-hosted compiler has substantial frontend and IR work, but are not current-tip
+timings or a matched IR/assembly pair. The saved August IR also fails to assemble
+with the installed LLVM at a typed `insertvalue` mismatch, so it cannot provide a
+current assembly comparison. Regenerate a source-matched IR/object pair before
+using instruction counts to choose a local code-generation micro-optimization.
+An IR emission attempt with the available 2026-10-11 Stage1 product also failed on
+current standard-library/backend syntax before code generation, so it cannot refresh
+these artifacts.
+
+## Stage1 semantic-session host (2026-10-18)
+
+`elisac-stage1 semantic-session SOURCE` is an opt-in persistent host for the
+Stage1 semantic session. Send one `check` line for each saved edit and `quit` to
+stop it. Each check rereads the same source path, rebuilds the include graph,
+line map, tokens, and AST, and returns `0` for accepted, `1` for rejected, or
+`2` for an invalid protocol command on stdout; compiler diagnostics remain on
+stderr. The parsed tree and its source live in a request region. The host keeps
+one reusable line-map buffer, and an identical map preserves the lexer's parsed
+lookup tables. Only the opaque semantic session survives between requests.
+
+This first host reuses the existing validated function-fact path for an exact
+repeat or a source edit. In the trusted in-process session only, it also reuses
+complete self-assignment findings for supported top-level function bodies and
+rebinds their target and statement locations against the fresh token stream.
+Unsupported bodies and decoded disk snapshots keep the ordinary checker path;
+the portable sidecar codec does not serialize these lint facts. The report's
+`self_assignment_bodies_scanned` and `self_assignment_bodies_reused` fields count
+those per-body scans and reuses separately from authority facts. This does not
+yet retain parse trees, skip parsing, record/replay tracked semantic query
+results, or reuse LLVM/native artifacts.
+It is intentionally tied to one source path and fixed process environment for
+its lifetime; launch a fresh host to change compiler options or source identity.
+Ordinary CLI compilation remains one-shot.

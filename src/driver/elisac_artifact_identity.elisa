@@ -1,0 +1,128 @@
+# Native artifact discovery for opt-in compiler caches.
+#
+# This module reports useful paths for diagnostics and future cache qualification.
+# A path or backing-file descriptor does not attest the bytes mapped when the loader
+# started. In particular, Linux MAP_PRIVATE pages can differ from a later read of
+# their backing inode; callers must keep cache admission disabled until a platform
+# bridge verifies loaded-image contents.
+
+const module ArtifactIdentityStatus:
+    PATHS_UNSUPPORTED: i64 = 0
+    PATHS_AVAILABLE: i64 = 1
+    MAPPED_PINS_UNSUPPORTED: i64 = 0
+
+
+struct ArtifactDlInfo:
+    # POSIX Dl_info is four native pointers. Keep these as raw, non-optional pointers
+    # so Elisa's tagged optional representation cannot change the C struct layout.
+    image_path: cstr
+    image_base: void&
+    symbol_name: cstr
+    symbol_address: void&
+
+
+struct NativeArtifactIdentity:
+    path_status: i64
+    mapped_pins_status: i64
+    producer_path: darray[u8]
+    loaded_llvm_path: darray[u8]
+
+
+static if ELISA_TARGET_OS_LINUX:
+    @link_name("readlink")
+    extern artifact_identity_readlink(path: cstr, buffer: u8&, size: usize) -> isize
+static else:
+    static if ELISA_TARGET_OS_MACOS:
+        @link_name("_NSGetExecutablePath")
+        extern artifact_identity_get_executable_path(buffer: cstr, size: mutable u32&) -> i32
+
+
+static if ELISA_TARGET_OS_POSIX:
+    @link_name("dlopen")
+    extern artifact_identity_dlopen(path: cstr, mode: i32) -> void&
+    @link_name("dlsym")
+    extern artifact_identity_dlsym(handle: void&, name: cstr) -> void&
+    @link_name("dlclose")
+    extern artifact_identity_dlclose(handle: void&) -> i32
+    @link_name("dladdr")
+    extern artifact_identity_dladdr(address: void&, info: mutable ArtifactDlInfo&) -> i32
+
+
+module ArtifactIdentity:
+    public:
+        # Returned paths are absolute byte strings without trailing NULs. Mapped-image
+        # pins intentionally remain unsupported: these paths cannot prove which bytes
+        # the process loaded or detect a backing-file mutation before discovery.
+        def discover() -> NativeArtifactIdentity can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            identity: mutable NativeArtifactIdentity = NativeArtifactIdentity{
+                path_status: ArtifactIdentityStatus::PATHS_UNSUPPORTED,
+                mapped_pins_status: ArtifactIdentityStatus::MAPPED_PINS_UNSUPPORTED,
+                producer_path: [],
+                loaded_llvm_path: []
+            }
+
+            producer: mutable darray[u8] = []
+            loaded_llvm: mutable darray[u8] = []
+            paths_ready: mutable bool = false
+
+            static if ELISA_TARGET_OS_LINUX:
+                paths_ready <- artifact_identity_linux_executable(&producer) and artifact_identity_llvm_image(&loaded_llvm)
+            static else:
+                static if ELISA_TARGET_OS_MACOS:
+                    paths_ready <- artifact_identity_macos_executable(&producer) and artifact_identity_llvm_image(&loaded_llvm)
+
+            if paths_ready:
+                identity.path_status <- ArtifactIdentityStatus::PATHS_AVAILABLE
+                identity.producer_path <- producer
+                identity.loaded_llvm_path <- loaded_llvm
+            return identity
+
+
+    private:
+        static if ELISA_TARGET_OS_LINUX:
+            def artifact_identity_linux_executable(path: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+                path.resize(8192.usize())
+                amount: isize = artifact_identity_readlink("/proc/self/exe", &path[0], path.count)
+                return false if amount <= 0 or amount.usize() >= path.count
+                path.resize(amount.usize())
+                return path.count > 0.usize() and path[0] == 47
+
+
+        static else:
+            static if ELISA_TARGET_OS_MACOS:
+                def artifact_identity_macos_executable(path: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+                    path.resize(8192.usize())
+                    path_capacity: mutable u32 = path.count.u32()
+                    path_buffer: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+                    return false if artifact_identity_get_executable_path(path_buffer, &path_capacity) != 0
+                    length: mutable usize = 0.usize()
+                    while length < path.count |length, path|:
+                        break if path[length] == 0
+                        length <- length + 1.usize()
+                    return false if length == 0.usize() or length >= path.count or path[0] != 47
+                    path.resize(length)
+                    return true
+
+
+        static if ELISA_TARGET_OS_POSIX:
+            def artifact_identity_llvm_image(path: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+                # Resolve the function through the process-wide dynamic symbol table.
+                # A direct function reference may identify an ELF PLT stub in the
+                # executable rather than the shared LLVM image.
+                process_handle: void& = artifact_identity_dlopen(zeroed, 2)
+                return false if process_handle == zeroed
+                defer block:
+                    _ = artifact_identity_dlclose(process_handle)
+                symbol_address: void& = artifact_identity_dlsym(process_handle, "LLVMContextCreate")
+                return false if symbol_address == zeroed
+                info: mutable ArtifactDlInfo = zeroed
+                if artifact_identity_dladdr(symbol_address, &info) == 0 or info.image_path == zeroed:
+                    return false
+                cursor: mutable usize = 0.usize()
+                while cursor < 8192.usize() |cursor, path, info|:
+                    byte: u8 = info.image_path[cursor].u8()
+                    break if byte == 0
+                    path.push(byte)
+                    cursor <- cursor + 1.usize()
+                return false if cursor == 0.usize() or cursor >= 8192.usize()
+                return path[0] == 47

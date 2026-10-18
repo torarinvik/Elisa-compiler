@@ -81,21 +81,43 @@ if "const LEXER_LINE_MAP_CAPACITY: usize = 65536" not in cache_text:
     raise SystemExit("line-map cache capacity changed; revisit the overflow proof")
 
 ready = function_section(cache_text, "line_map_cache_ready")
-if ready.count("return lexer_line_map_state == 1") != 2:
-    raise SystemExit("line-map cache readiness no longer requires the ready state on both paths")
-if "return false" not in ready:
+override_start = ready.find("if lexer_line_map_override_active:")
+environment_start = ready.find('if getenv("ELISA_STAGE1_LINE_MAP") is value_bytes:')
+if override_start < 0 or environment_start <= override_start:
+    raise SystemExit("line-map cache readiness lost its ordered override/environment paths")
+override_branch = ready[override_start:environment_start]
+environment_branch = ready[environment_start:]
+if override_branch.count("return lexer_line_map_state == 1") != 2:
+    raise SystemExit("override line-map readiness must use cached state or rebuilt state")
+if environment_branch.count("return lexer_line_map_state == 1") != 2:
+    raise SystemExit("environment line-map readiness must use cached state or rebuilt state")
+if "return false" not in environment_branch:
     raise SystemExit("line-map cache readiness no longer fails closed without an environment map")
-require_ordered(ready, (
+def require_cached_or_rebuilt_path(branch: str, key_guard: str, key_store: str,
+                                   label: str) -> None:
+    guard_index = branch.find(key_guard)
+    cached_return_index = branch.find("return lexer_line_map_state == 1", guard_index + len(key_guard))
+    build_index = branch.find("line_map_cache_build()", cached_return_index + 1)
+    store_index = branch.find(key_store, build_index + len("line_map_cache_build()"))
+    rebuilt_return_index = branch.find("return lexer_line_map_state == 1", store_index + len(key_store))
+    if min(guard_index, cached_return_index, build_index, store_index, rebuilt_return_index) < 0 or not (
+        guard_index < cached_return_index < build_index < store_index < rebuilt_return_index
+    ):
+        raise SystemExit(f"{label} changed the checked cached/rebuild readiness order")
+
+
+require_cached_or_rebuilt_path(
+    override_branch,
+    "if lexer_line_map_key == 1 and lexer_line_map_state != 0:",
+    "lexer_line_map_key <- 1",
+    "override line-map cache readiness",
+)
+require_cached_or_rebuilt_path(
+    environment_branch,
     "if key == lexer_line_map_key and lexer_line_map_state != 0:",
-    "line_map_cache_build()",
     "lexer_line_map_key <- key",
-), "line-map cache readiness")
-ready_returns = [match.start() for match in re.finditer("return lexer_line_map_state == 1", ready)]
-key_guard = ready.find("if key == lexer_line_map_key and lexer_line_map_state != 0:")
-build_call = ready.find("line_map_cache_build()")
-key_store = ready.find("lexer_line_map_key <- key")
-if len(ready_returns) != 2 or not (key_guard < ready_returns[0] < build_call < key_store < ready_returns[1]):
-    raise SystemExit("line-map cache readiness no longer returns cached state only after key validation or rebuild")
+    "environment line-map cache readiness",
+)
 
 build = function_section(cache_text, "line_map_cache_build")
 overflow_guard = "if lexer_line_map_count >= LEXER_LINE_MAP_CAPACITY can Global.Read:"
@@ -160,9 +182,17 @@ expected_selector = compact("""def choose_line_map_result(state: i64, cached_res
 if compact(function_section(positive_text, "choose_line_map_result")) != expected_selector:
     raise SystemExit("proof model no longer matches the cache-versus-parser result selection")
 for name, expected in {
-    "overflow_uses_per_call_map": "def overflow_uses_per_call_map(cached_result: i64, parsed_result: i64) -> bool: ensure result == true return (cached_result if LINE_MAP_CACHE_NOT_READY == LINE_MAP_CACHE_READY else parsed_result) == parsed_result",
-    "every_nonready_state_uses_per_call_map": "def every_nonready_state_uses_per_call_map(state: i64, cached_result: i64, parsed_result: i64) -> bool: requires state != LINE_MAP_CACHE_READY ensure result == true return (cached_result if state == LINE_MAP_CACHE_READY else parsed_result) == parsed_result",
-    "ready_state_uses_cache": "def ready_state_uses_cache(state: i64, cached_result: i64, parsed_result: i64) -> bool: requires state == LINE_MAP_CACHE_READY ensure result == true return (cached_result if state == LINE_MAP_CACHE_READY else parsed_result) == cached_result",
+    "overflow_uses_per_call_map": """def overflow_uses_per_call_map(cached_result: i64, parsed_result: i64) -> bool:
+    ensure result == true
+    return (cached_result if LINE_MAP_CACHE_NOT_READY == LINE_MAP_CACHE_READY else parsed_result) == parsed_result""",
+    "every_nonready_state_uses_per_call_map": """def every_nonready_state_uses_per_call_map(state: i64, cached_result: i64, parsed_result: i64) -> bool:
+    requires state != LINE_MAP_CACHE_READY
+    ensure result == true
+    return (cached_result if state == LINE_MAP_CACHE_READY else parsed_result) == parsed_result""",
+    "ready_state_uses_cache": """def ready_state_uses_cache(state: i64, cached_result: i64, parsed_result: i64) -> bool:
+    requires state == LINE_MAP_CACHE_READY
+    ensure result == true
+    return (cached_result if state == LINE_MAP_CACHE_READY else parsed_result) == cached_result""",
 }.items():
     if compact(function_section(positive_text, name)) != compact(expected):
         raise SystemExit(f"{name} no longer proves the corresponding state-selected result")
@@ -170,9 +200,10 @@ if 'include "./lexer_line_map_cache_overflow.elisa"' not in NEGATIVE.read_text()
     raise SystemExit("overflow false control no longer imports the result selector")
 if "def nonready_state_uses_partial_cache(" not in NEGATIVE.read_text():
     raise SystemExit("partial-cache false control is missing")
-if compact(function_section(NEGATIVE.read_text(), "nonready_state_uses_partial_cache")) != compact(
-    "def nonready_state_uses_partial_cache(state: i64, cached_result: i64, parsed_result: i64) -> bool: requires state != LINE_MAP_CACHE_READY ensure result == true return (cached_result if state == LINE_MAP_CACHE_READY else parsed_result) == cached_result"
-):
+if compact(function_section(NEGATIVE.read_text(), "nonready_state_uses_partial_cache")) != compact("""def nonready_state_uses_partial_cache(state: i64, cached_result: i64, parsed_result: i64) -> bool:
+    requires state != LINE_MAP_CACHE_READY
+    ensure result == true
+    return (cached_result if state == LINE_MAP_CACHE_READY else parsed_result) == cached_result"""):
     raise SystemExit("partial-cache control no longer asserts the false overflow selection")
 
 try:

@@ -215,9 +215,13 @@ run_stage1_driver_guarded() {
   local driver_poll_us=2000 driver_poll_cap_us
   process_seconds_to_us "$driver_rss_poll_seconds"
   driver_poll_cap_us="$PROCESS_US"
-  # stdin is closed rather than fed: the stdin wire protocol is still the driver's other
-  # front door, and leaving a terminal attached would make it wait for one.
-  "$BIN" "${driver_args[@]+${driver_args[@]}}" </dev/null &
+  # Ordinary CLI requests never consume stdin. The persistent semantic-session subcommand
+  # owns a line protocol, so preserve the caller's stream only for that explicit mode.
+  if [[ "${driver_args[0]:-}" == "semantic-session" ]]; then
+    "$BIN" "${driver_args[@]+${driver_args[@]}}" <&0 &
+  else
+    "$BIN" "${driver_args[@]+${driver_args[@]}}" </dev/null &
+  fi
   driver_pid=$!
   while kill -0 "$driver_pid" 2>/dev/null; do
     # The compiler can finish between kill(0) and the RSS read. Do not let that ordinary

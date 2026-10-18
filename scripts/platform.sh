@@ -21,6 +21,8 @@
 #                            optional elisa_native_callback_* hooks; ld64's -dead_strip drops
 #                            the referencing code on macOS, GNU --gc-sections does not, and a
 #                            Linux twin of pymodule_runtime_fallback.c is the proper fix).
+#                            Linux also links -ldl for native loader introspection when the
+#                            selected LLVM link recipe does not already provide it.
 #   ELISA_LD_ALLOW_UNDEFINED -Wl,-undefined,dynamic_lookup | -Wl,--unresolved-symbols=ignore-all
 #   ELISA_SHARED_MODULE_FLAGS  -bundle -undefined dynamic_lookup | -shared -fPIC
 #   ELISA_BREW_BIN           /opt/homebrew/bin on Darwin when present, else empty
@@ -119,7 +121,11 @@ if [[ "$ELISA_HOST_OS" == Darwin ]]; then
 else
     export ELISA_LD_DEAD_STRIP="-Wl,--gc-sections"
     export ELISA_LD_STACK_512M=""
-    export ELISA_LINK_EXE_FLAGS="-no-pie -Wl,--unresolved-symbols=ignore-all"
+    ELISA_LINK_EXE_FLAGS="-no-pie -Wl,--unresolved-symbols=ignore-all"
+    if [[ "$ELISA_HOST_OS" == Linux && ! " $ELISA_LLVM_LIBS " =~ [[:space:]]-ldl([[:space:]]|$) ]]; then
+        ELISA_LINK_EXE_FLAGS+=" -ldl"
+    fi
+    export ELISA_LINK_EXE_FLAGS
     export ELISA_LD_ALLOW_UNDEFINED="-Wl,--unresolved-symbols=ignore-all"
     export ELISA_SHARED_MODULE_FLAGS="-shared -fPIC"
 fi
