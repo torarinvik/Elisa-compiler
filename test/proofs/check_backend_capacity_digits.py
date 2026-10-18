@@ -92,7 +92,7 @@ for required in (
     if compact(required) not in primary:
         raise SystemExit(f"capacity literal parser lost digit-policy wiring: {required}")
 fold = compact(function_section(capacity, "fold_const_capacity_text"))
-if compact("false return if cursor != text.len") not in fold:
+if compact("return false if cursor != text.len") not in fold:
     raise SystemExit("capacity parser no longer rejects a trailing malformed separator or suffix")
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:

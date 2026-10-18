@@ -89,7 +89,7 @@ if 'include "./codegen_const_capacity.elisa"' not in struct_text or 'include "./
     raise SystemExit("backend facade no longer includes constant-capacity span parsing")
 if 'include "./codegen_match_arm_facts.elisa"' not in packed_meta_text:
     raise SystemExit("backend match lowering no longer includes the scalar-pattern parser")
-if "true return if parse_int_literal(text, out_value)" not in pattern_facts_text:
+if "return true if parse_int_literal(text, out_value)" not in pattern_facts_text:
     raise SystemExit("match scalar parsing no longer routes integer pattern text through parse_int_literal")
 if "fold_const_capacity_text" not in block_binding_text:
     raise SystemExit("region/with header lowering no longer routes raw capacity spans through the checked parser")

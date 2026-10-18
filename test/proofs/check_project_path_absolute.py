@@ -47,7 +47,7 @@ if 'include "./project_paths.elisa"' not in project_text:
     raise SystemExit("project system no longer imports the proved path predicate")
 if 'include "./project.elisa"' not in driver_text:
     raise SystemExit("compiler driver no longer imports the project system")
-if "path_clean(path) return if path_is_absolute(path)" not in normalized:
+if "return path_clean(path) if path_is_absolute(path)" not in normalized:
     raise SystemExit("absolute-path resolution no longer uses the proved predicate")
 if 'include "../../src/driver/project.elisa"' not in POSITIVE.read_text():
     raise SystemExit("positive proof no longer imports production project code")

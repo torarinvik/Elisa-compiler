@@ -65,17 +65,17 @@ negative_text = NEGATIVE.read_text()
 expected_absolute = '''
 def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize, count: usize) -> bool:
     can Abort.Panic:
-        false return if from > count or count > names.count
+        return false if from > count or count > names.count
         cursor: mutable usize = 0
         candidate_length: usize = candidate.len
         prefix_length: usize = prefix.len
         if prefix_length > 0:
             for offset in 0..<prefix_length |cursor, candidate, candidate_length, prefix|:
-                false return if cursor >= candidate_length or candidate[cursor] != prefix[offset]
+                return false if cursor >= candidate_length or candidate[cursor] != prefix[offset]
                 assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
                 assert cursor <= candidate_length
-            false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
+            return false if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
             assert cursor <= candidate_length and candidate_length - cursor >= 2
             cursor <- cursor + 2.usize()
             assert cursor <= candidate_length
@@ -83,13 +83,13 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
             invariant from <= index
             invariant index <= count
             if index > from:
-                false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
+                return false if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
                 assert cursor <= candidate_length and candidate_length - cursor >= 2
                 cursor <- cursor + 2.usize()
                 assert cursor <= candidate_length
             segment: sview = names[index]
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
-                false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
+                return false if cursor >= candidate_length or candidate[cursor] != segment[offset]
                 assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
                 assert cursor <= candidate_length
@@ -98,41 +98,41 @@ def absolute(candidate: sview, prefix: sview, names: darray[sview]&, from: usize
 expected_relative = '''
 def relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: usize) -> bool:
     can Abort.Panic:
-        false return if count == 0 or count > names.count
+        return false if count == 0 or count > names.count
         path_length: mutable usize = 0
         candidate_length: usize = candidate.len
-        false return if candidate_length < 3
+        return false if candidate_length < 3
         for index in 0..<count |path_length, names, candidate_length|:
             segment_length: usize = (names[index]).len
-            false return if path_length > candidate_length or segment_length > candidate_length - path_length
+            return false if path_length > candidate_length or segment_length > candidate_length - path_length
             path_length <- path_length + segment_length
             if index + 1.usize() < count:
-                false return if candidate_length - path_length < 2
+                return false if candidate_length - path_length < 2
                 path_length <- path_length + 2.usize()
-        false return if path_length > candidate_length - 3.usize()
+        return false if path_length > candidate_length - 3.usize()
         ancestor_length: usize = candidate_length - path_length - 2.usize()
-        false return if candidate[ancestor_length] != 58 or candidate[ancestor_length + 1.usize()] != 58
+        return false if candidate[ancestor_length] != 58 or candidate[ancestor_length + 1.usize()] != 58
         enclosing_length: usize = enclosing.len
-        false return if enclosing_length < ancestor_length
+        return false if enclosing_length < ancestor_length
         if enclosing_length > ancestor_length:
             false return if enclosing_length - ancestor_length < 2
             false return if enclosing[ancestor_length] != 58 or enclosing[ancestor_length + 1.usize()] != 58
         for offset in 0..<ancestor_length |candidate, enclosing|:
             invariant ancestor_length <= candidate_length
             invariant ancestor_length <= enclosing_length
-            false return if candidate[offset] != enclosing[offset]
+            return false if candidate[offset] != enclosing[offset]
         cursor: mutable usize = ancestor_length + 2.usize()
                 assert cursor <= candidate_length
         for index in 0..<count |cursor, candidate, candidate_length, names|:
             invariant index <= count
             if index > 0:
-                false return if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
+                return false if cursor > candidate_length or candidate_length - cursor < 2 or candidate[cursor] != 58 or candidate[cursor + 1.usize()] != 58
                         assert cursor <= candidate_length and candidate_length - cursor >= 2
                 cursor <- cursor + 2.usize()
                         assert cursor <= candidate_length
             segment: sview = names[index]
             for offset in 0..<segment.len |cursor, candidate, candidate_length, segment|:
-                false return if cursor >= candidate_length or candidate[cursor] != segment[offset]
+                return false if cursor >= candidate_length or candidate[cursor] != segment[offset]
                         assert cursor < candidate_length
                 cursor <- cursor + 1.usize()
                         assert cursor <= candidate_length

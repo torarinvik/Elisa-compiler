@@ -85,15 +85,15 @@ for name in (
 
 paths_equal = function_section(source, "line_map_cache_paths_equal")
 require_ordered(paths_equal, (
-    "false return if left_stop < left_start or right_stop < right_start or left_stop - left_start != right_stop - right_start",
+    "return false if left_stop < left_start or right_stop < right_start or left_stop - left_start != right_stop - right_start",
     "for path_offset in 0..<(left_stop - left_start)",
-    "false return if map_storage[left_start + path_offset] != map_storage[right_start + path_offset]",
+    "return false if map_storage[left_start + path_offset] != map_storage[right_start + path_offset]",
     "return true",
 ), "path equality")
 equality_shape = source_line_sequence(paths_equal, (
-    "false return if left_stop < left_start or right_stop < right_start or left_stop - left_start != right_stop - right_start",
+    "return false if left_stop < left_start or right_stop < right_start or left_stop - left_start != right_stop - right_start",
     "for path_offset in 0..<(left_stop - left_start) |map_storage, left_start, right_start|:",
-    "false return if map_storage[left_start + path_offset] != map_storage[right_start + path_offset]",
+    "return false if map_storage[left_start + path_offset] != map_storage[right_start + path_offset]",
     "return true",
 ), "path equality")
 length_indent, loop_indent, byte_check_indent, success_indent = [indent for _, indent in equality_shape]

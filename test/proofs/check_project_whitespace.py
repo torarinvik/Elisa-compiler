@@ -243,9 +243,9 @@ for fragment in (
     if compact(fragment) not in compact(extend_view_body):
         raise SystemExit(f"production view copy no longer preserves fallback bytes: {fragment}")
 for fragment in (
-    "false return if value.count.i64() != text.len.i64()",
+    "return false if value.count.i64() != text.len.i64()",
     "for index in 0..<value.count |value, text|",
-    "false return if value[index] != text[index.i64()]",
+    "return false if value[index] != text[index.i64()]",
     "return true",
 ):
     if compact(fragment) not in compact(equal_view_body):

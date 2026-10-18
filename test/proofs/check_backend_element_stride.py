@@ -179,7 +179,7 @@ def scalar_type_of_name(name: sview, target_bits: u32) -> ValueType:
 
 if compact(function_section(VALUE_TYPE.read_text(), "target_pointer_bits")) != compact("""
 def target_pointer_bits() -> u32:
-    32 return if getenv("ELISA_STAGE1_WASM") is wasm_target
+    return 32 if getenv("ELISA_STAGE1_WASM") is wasm_target
     return 64
 """):
     raise SystemExit("pointer-sized scalar widths no longer resolve to 32 or 64 bits")
@@ -213,11 +213,11 @@ def parse_bit_width(name: sview, maximum: u32, allow_signed: bool) -> u32 can[Ab
 sub_byte_backing = compact(function_section(bitfields_text, "sub_byte_backing_type"))
 if sub_byte_backing != compact("""
 def sub_byte_backing_type(name: sview) -> ValueType can[Abort.Panic]:
-    unmodeled_type() return if name.len < 2.usize()
+    return unmodeled_type() if name.len < 2.usize()
     head: u8 = name[0]
-    unmodeled_type() return if head != 117 and head != 105
+    return unmodeled_type() if head != 117 and head != 105
     width: u32 = parse_bit_width(name, 7, true)
-    unmodeled_type() return if width == 0
+    return unmodeled_type() if width == 0
     return ValueType{kind: TypeKind.Unsigned, bits: width} if head == 117 else ValueType{kind: TypeKind.Signed, bits: width}
 """):
     raise SystemExit("sub-byte enum backing widths no longer have the proved signed/unsigned 1..7 range")

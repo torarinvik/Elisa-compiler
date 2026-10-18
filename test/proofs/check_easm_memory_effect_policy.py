@@ -150,7 +150,7 @@ expected_reads_contract = code_compact("""
     false return if pseudo
     false return if op == "lea" or op == "leaq"
     false return if op == "fnstcw" or op == "stmxcsr"
-    false return if op == "pop" or op == "popq"
+    return false if op == "pop" or op == "popq"
     return source_memory or (destination_memory and destination_reads_memory(op))
 """)
 if reads_contract != expected_reads_contract:

@@ -194,7 +194,7 @@ def enclosing_try_function(table: SymbolTable&, try_line: u32, try_offset: u32) 
             if try_offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset <= try_offset and symbol.offset >= best_offset:
                 best_offset <- symbol.offset
                 best_offset_line <- symbol.line
-    (best_offset_line, best_offset) return if best_offset != FALLIBLE_FUNCTION_NO_OFFSET
+    return (best_offset_line, best_offset) if best_offset != FALLIBLE_FUNCTION_NO_OFFSET
     return (best_line, FALLIBLE_FUNCTION_NO_OFFSET)
 """
 expected_builder = """

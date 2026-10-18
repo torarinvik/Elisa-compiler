@@ -90,13 +90,13 @@ if 'include "./bit_int_endpoints.elisa"' not in PARSER_TEXT:
 
 unsigned_steps = (
     "span: i64 = 1 << bits.usize()",
-    "(false, 0, 0) return if span < SemanticBitIntWidth::BIT_INT_MIN_WIDTH or span > SemanticBitIntEndpoints::I64_MAX",
+    "return (false, 0, 0) if span < SemanticBitIntWidth::BIT_INT_MIN_WIDTH or span > SemanticBitIntEndpoints::I64_MAX",
     "high: i64 = SemanticBitIntEndpoints::unsigned_high_from_span(span)",
     "return (true, SemanticBitIntWidth::BIT_INT_PREFIX_MIN, high)",
 )
 signed_steps = (
     "span: i64 = 1 << (bits - SemanticBitIntWidth::BIT_INT_MIN_WIDTH).usize()",
-    "(false, 0, 0) return if span < SemanticBitIntWidth::BIT_INT_MIN_WIDTH or span > SemanticBitIntEndpoints::SIGNED_SPAN_MAX",
+    "return (false, 0, 0) if span < SemanticBitIntWidth::BIT_INT_MIN_WIDTH or span > SemanticBitIntEndpoints::SIGNED_SPAN_MAX",
     "low: i64 = SemanticBitIntEndpoints::signed_low_from_span(span)",
     "high: i64 = SemanticBitIntEndpoints::signed_high_from_span(span)",
     "return (true, low, high)",

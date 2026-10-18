@@ -155,7 +155,7 @@ validate_model()
 
 # Mutation controls guard the length check, byte mismatch check, and selected span.
 mutated_length = project_text.replace(
-    "false return if length != right.count", "false return if length == right.count", 1
+    "return false if length != right.count", "false return if length == right.count", 1
 )
 if mutated_length == project_text or not source_errors(mutated_length, source_text):
     raise SystemExit("source gate failed to reject accepting only unequal span lengths")

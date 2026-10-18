@@ -67,11 +67,11 @@ if compact("return LexerTypeSuffix::is_valid_type_suffix(view)") not in valid_su
 reader = compact(function_section(core_text, "read_type_suffix_at"))
 reader_steps = (
     "first: char = char_at(source, source_length, start)",
-    "null return if not (first == 'u' or first == 'i' or first == 'f')",
+    "return null if not (first == 'u' or first == 'i' or first == 'f')",
     "probe: mutable usize = start + 1",
     "match make_source_view(source, source_length, start, probe):",
     "valid: bool = Lexer::valid_suffix(suffix)",
-    "suffix return if valid",
+    "return suffix if valid",
 )
 reader_positions = [reader.find(compact(step)) for step in reader_steps]
 if any(position < 0 for position in reader_positions) or reader_positions != sorted(reader_positions):

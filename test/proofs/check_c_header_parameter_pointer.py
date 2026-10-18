@@ -100,9 +100,9 @@ expected_emitter = compact("""def header_exported_functions(file: Ast::File&, st
                             return_pointer: mutable bool = false
                             for annotation in file.enum_annotations |return_pointer, function_name|:
                                 return_pointer <- true if CHeaderReturnPointer::matches_marker(annotation.owner, annotation.name, function_name)
-                            false return if return_type.kind == TypeKind.Unmodeled
+                            return false if return_type.kind == TypeKind.Unmodeled
                             if not header_c_name_for_source_type(return_type_name, out):
-                                false return if not header_type_name(file, return_type, &structs, out)
+                                return false if not header_type_name(file, return_type, &structs, out)
                             out.push(32)
                             for _return_star in 0..<header_pointer_depth(return_type, &structs) |out|:
                                 out.push(42)
@@ -114,9 +114,9 @@ expected_emitter = compact("""def header_exported_functions(file: Ast::File&, st
                                 header_push(out, ", ") if parameter_index > 0
                                 parameter: ExternParam = file.extern_params[param_start.usize() + parameter_index]
                                 parameter_type: ValueType = header_type_from_name(parameter.type_name, &structs)
-                                false return if parameter_type.kind == TypeKind.Unmodeled
+                                return false if parameter_type.kind == TypeKind.Unmodeled
                                 if not header_c_name_for_source_type(parameter.type_name, out):
-                                    false return if not header_type_name(file, parameter_type, &structs, out)
+                                    return false if not header_type_name(file, parameter_type, &structs, out)
                                 out.push(32)
                                 ordinary_pointer_depth: mutable i64 = 0
                                 ordinary_pointer_depth <- header_pointer_depth(parameter_type, &structs) if not parameter.provenance_bearing

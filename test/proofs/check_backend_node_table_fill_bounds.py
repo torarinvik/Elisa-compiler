@@ -189,7 +189,7 @@ if "NE:i32=33" not in llvm_bindings or "UGT:i32=34" not in llvm_bindings:
 target_pointer_bits = compact(function_section(VALUE_TYPE.read_text(), "target_pointer_bits"))
 if target_pointer_bits != compact("""
 def target_pointer_bits() -> u32:
-    32 return if getenv("ELISA_STAGE1_WASM") is wasm_target
+    return 32 if getenv("ELISA_STAGE1_WASM") is wasm_target
     return 64
 """):
     raise SystemExit("node_table_fill target-size model must match the compiler's wasm32 and 64-bit targets")

@@ -127,12 +127,12 @@ validate_model()
 
 # Confirm the source binding notices reversed precedence or reversed first-hit selection.
 mutated_local = source_text.replace(
-    "direct return if file_exists(direct)", "direct return if not file_exists(direct)", 1
+    "return direct if file_exists(direct)", "direct return if not file_exists(direct)", 1
 )
 if mutated_local == source_text or not source_errors(mutated_local):
     raise SystemExit("source gate failed to reject a reversed local-directory existence check")
 mutated_candidate = source_text.replace(
-    "candidate return if file_exists(candidate)", "candidate return if not file_exists(candidate)", 1
+    "return candidate if file_exists(candidate)", "candidate return if not file_exists(candidate)", 1
 )
 if mutated_candidate == source_text or not source_errors(mutated_candidate):
     raise SystemExit("source gate failed to reject a reversed configured-directory existence check")

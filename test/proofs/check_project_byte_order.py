@@ -52,8 +52,8 @@ order_body = project_text.split(order_signature, 1)[1].split("\n    def ", 1)[0]
 expected_comparator = """
 limit: usize = left.count if left.count < right.count else right.count
 for index in 0..<limit |left, right|:
-    true return if left[index] < right[index]
-    false return if left[index] > right[index]
+    return true if left[index] < right[index]
+    return false if left[index] > right[index]
 return left.count < right.count
 """
 if compact(order_body) != compact(expected_comparator):
@@ -75,8 +75,8 @@ def project_bytes_less_model(left: darray[u8]&, right: darray[u8]&) -> bool:
         invariant index <= limit
         invariant project_bytes_less_at(left, right, index) == project_bytes_less_at(left, right, 0)
         if index < left.count and index < right.count:
-            true return if left[index] < right[index]
-            false return if left[index] > right[index]
+            return true if left[index] < right[index]
+            return false if left[index] > right[index]
             index <- index + 1
         else:
             return left.count < right.count

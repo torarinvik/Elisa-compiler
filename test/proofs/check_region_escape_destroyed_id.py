@@ -50,10 +50,10 @@ for name, value in (
 
 production = compact("def destroyed_region_id_contains(" + function_body(source, "destroyed_region_id_contains"))
 for fragment in (
-    "false return if candidate == NO_REGION_BINDING",
-    "true return if candidate == UNKNOWN_REGION_DEPENDENCY and regions.count > 0",
+    "return false if candidate == NO_REGION_BINDING",
+    "return true if candidate == UNKNOWN_REGION_DEPENDENCY and regions.count > 0",
     "for region in regions:",
-    "true return if region == candidate or region == DESTROYED_REGION_ALL",
+    "return true if region == candidate or region == DESTROYED_REGION_ALL",
     "return false",
 ):
     if compact(fragment) not in production:

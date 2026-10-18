@@ -137,7 +137,7 @@ if compact("""
     raise SystemExit("path_clean no longer uses the relative empty-path fallback")
 for fragment in (
     'include "./project_paths.elisa"',
-    "path_clean(path) return if path_is_absolute(path)",
+    "return path_clean(path) if path_is_absolute(path)",
     "return path_clean(joined)",
 ):
     if compact(fragment) not in compact(project_text + path_text):

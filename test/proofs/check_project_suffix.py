@@ -34,10 +34,10 @@ for fragment in (
     "ensure suffix.len.i64() >= 0 or result == false",
     "want: i64 = suffix.len.i64()",
     "false return if want < 0",
-    "false return if value.count.i64() < want",
+    "return false if value.count.i64() < want",
     "offset: usize = value.count - want.usize()",
     "for index in 0..<want |value, suffix, offset|",
-    "false return if value[offset + index.usize()] != suffix[index]",
+    "return false if value[offset + index.usize()] != suffix[index]",
     "return true",
 ):
     if fragment not in matcher_body:
@@ -48,7 +48,7 @@ if 'include "./project.elisa"' not in DRIVER.read_text():
     raise SystemExit("compiler driver no longer imports the production project system")
 resolve_text = RESOLVE.read_text()
 for fragment in (
-    'true return if bytes_ends_with_view(path, ".elisa")',
+    'return true if bytes_ends_with_view(path, ".elisa")',
     'return bytes_ends_with_view(path, ".elisai")',
 ):
     if fragment not in resolve_text:

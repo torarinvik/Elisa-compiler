@@ -65,7 +65,7 @@ expected_global_emitter = compact("""def header_exported_globals(file: Ast::File
                     target: sview = annotation.owner
                     public_name: sview = header_export_alias(annotation)
                     global_type: ValueType = header_global_type(structs, target)
-                    false return if global_type.kind == TypeKind.Unmodeled
+                    return false if global_type.kind == TypeKind.Unmodeled
                     header_push(out, "extern ")
                     global_source: sview = header_global_source_type(file, target)
                     if global_source != "" and header_c_name_for_source_type(global_source, out):
@@ -73,7 +73,7 @@ expected_global_emitter = compact("""def header_exported_globals(file: Ast::File
                         header_push(out, public_name)
                         out.push(59)
                     else:
-                        false return if not header_decl(file, global_type, public_name, structs, out)
+                        return false if not header_decl(file, global_type, public_name, structs, out)
                     alignment: u32 = struct_alignment(global_type, structs)
                     if alignment != 0:
                         _ = out.pop()

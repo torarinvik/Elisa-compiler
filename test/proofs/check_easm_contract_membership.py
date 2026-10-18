@@ -65,7 +65,7 @@ for value in values:
         end: mutable usize = cursor
         while end < value.len and value[end] != 44 |end, value|:
             end <- end + 1
-        true return if easm_equal(easm_trim(value[cursor:end]), needle)
+        return true if easm_equal(easm_trim(value[cursor:end]), needle)
         break if end >= value.len
         cursor <- end + 1.usize()
 return false

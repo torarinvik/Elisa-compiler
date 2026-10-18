@@ -135,12 +135,12 @@ if (compact(build_lines[ready_index - 1].strip()) != compact("can Global.Write:"
 
 original = function_section(facade_text, "source_original_line")
 require_ordered(original, (
-    "(line_map_cached_original_line(flat_line) can Global.Read) return if (line_map_cache_ready() can Global{Read,Write})",
+    "return (line_map_cached_original_line(flat_line) can Global.Read) if (line_map_cache_ready() can Global{Read,Write})",
     "return source_original_line_from_map(flat_line)",
 ), "original-line cache fallback")
 runtime_std = function_section(facade_text, "source_line_is_runtime_std")
 require_ordered(runtime_std, (
-    "(line_map_cached_is_runtime_std(flat_line) can Global.Read) return if (line_map_cache_ready() can Global{Read,Write})",
+    "return (line_map_cached_is_runtime_std(flat_line) can Global.Read) if (line_map_cache_ready() can Global{Read,Write})",
     "return source_line_is_runtime_std_from_map(flat_line)",
 ), "runtime-stdlib cache fallback")
 

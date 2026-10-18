@@ -24,7 +24,7 @@ POSITIVE_NAMES = {
     "first_unrepresentable_slot_is_rejected",
 }
 NEGATIVE_NAMES = {"false_claim_first_unrepresentable_slot_fits"}
-GUARD = "unmodeled_type() return if structs.function_types.fn_pool_returns.count > MAX_FN_TYPE_SLOT"
+GUARD = "return unmodeled_type() if structs.function_types.fn_pool_returns.count > MAX_FN_TYPE_SLOT"
 
 if not __debug__:
     raise SystemExit("run without Python -O")

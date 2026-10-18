@@ -90,7 +90,7 @@ require_in_order(abi_text, "abi_span_is_ci", "def abi_span_is_ci(text: darray[u8
 ))
 require_in_order(abi_text, "abi_word_in_span", "def abi_word_in_span(text: darray[u8]&, span_start: usize, span_stop: usize, needle: sview) -> bool:", (
     "stop: usize = span_stop if span_stop <= text.count else text.count",
-    "false return if span_start > stop",
+    "return false if span_start > stop",
     "for start in span_start..<stop |text, needle, length, stop, span_start|",
     "continue if length > stop - start",
     "continue if not abi_span_is(text, start, needle)",
@@ -99,7 +99,7 @@ require_in_order(abi_text, "abi_word_in_span", "def abi_word_in_span(text: darra
 ))
 require_in_order(abi_text, "abi_register_in_span", "def abi_register_in_span(text: darray[u8]&, span_start: usize, span_stop: usize, spelling: sview) -> bool:", (
     "stop: usize = span_stop if span_stop <= text.count else text.count",
-    "false return if span_start > stop",
+    "return false if span_start > stop",
     "for start in span_start..<stop |text, spelling, length, stop|",
     "continue if length > stop - start",
     "continue if not abi_span_is(text, start, spelling)",

@@ -68,12 +68,12 @@ def collect(expression: Ast::Expr, names: mutable darray[sview]&, dotted: mutabl
                 names.push(ident_name)
                 return true
             Ast::Expr.Field(field_object, field_name, field_pos):
-                false return if not collect(field_object, names, dotted)
+                return false if not collect(field_object, names, dotted)
                 names.push(field_name)
                 dotted.push(true)
                 return true
             Ast::Expr.Scope(scope_base, scope_name, scope_pos):
-                false return if not collect(scope_base, names, dotted)
+                return false if not collect(scope_base, names, dotted)
                 names.push(scope_name)
                 dotted.push(false)
                 return true
@@ -101,7 +101,7 @@ scope_arm = semantic_classifier[semantic_classifier.find("Expr.Scope("):]
 qualified_fragments = (
     "false return if not type_path_collect(object, names, dotted) or names.count == 0",
     "false return if any was_dotted in dotted where was_dotted",
-    "false return if any bound_name in bound where bound_name == names[0]",
+    "return false if any bound_name in bound where bound_name == names[0]",
     "row: u32 = binding_nominal_declaration(object, table.current_module, table)",
     "return row != SYMBOL_INDEX_ROW_NONE",
 )

@@ -225,7 +225,7 @@ exact_steps(inference_text, "type_param_position", (
     (4, "return -1 if pstart > generics.params.count"),
     (4, "return -1 if count > generics.params.count - pstart"),
     (4, "for k in 0..<count |generics, pstart, name, count|:"),
-    (8, "k.i64() return if generics.params[pstart + k] == name"),
+    (8, "return k.i64() if generics.params[pstart + k] == name"),
 ), "type parameter lookup")
 exact_steps(value_inference_text, "generic_usize_value_position", (
     (4, "return -1 if slot >= generics.param_start.count or slot >= generics.param_count.count"),
@@ -247,7 +247,7 @@ exact_steps(generic_call_text, "generic_call_function_row_matches", (
     (4, "false return if row_start > fns.param_types.count"),
     (4, "false return if param_count > fns.param_types.count - row_start"),
     (4, "for param_offset in 0..<param_count |expected_start, row_start, structs, fns|:"),
-    (8, "false return if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
+    (8, "return false if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
 ), "generic callable signature comparison")
 
 row_models = {
@@ -498,11 +498,11 @@ call_return = next((line for _, line in call_model_lines if line.startswith("ret
 call_source_lines = normalized_lines(function_section(generic_call_text, "generic_call_function_row_matches"))
 call_source_map = {
     "expected_total": ("false return if expected_start > structs.function_types.fn_pool_params.count", "false return if param_count > structs.function_types.fn_pool_params.count - expected_start"),
-    "expected_start": ("expected_start: usize = structs.function_types.fn_pool_param_start[fn_slot]", "false return if expected_start > structs.function_types.fn_pool_params.count", "false return if param_count > structs.function_types.fn_pool_params.count - expected_start", "false return if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
+    "expected_start": ("expected_start: usize = structs.function_types.fn_pool_param_start[fn_slot]", "false return if expected_start > structs.function_types.fn_pool_params.count", "false return if param_count > structs.function_types.fn_pool_params.count - expected_start", "return false if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
     "row_total": ("false return if row_start > fns.param_types.count", "false return if param_count > fns.param_types.count - row_start"),
-    "row_start": ("row_start: usize = fns.param_start[row_index]", "false return if row_start > fns.param_types.count", "false return if param_count > fns.param_types.count - row_start", "false return if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
+    "row_start": ("row_start: usize = fns.param_start[row_index]", "false return if row_start > fns.param_types.count", "false return if param_count > fns.param_types.count - row_start", "return false if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
     "parameter_count": ("param_count: usize = structs.function_types.fn_pool_param_count[fn_slot]", "false return if fns.param_count[row_index] != param_count", "for param_offset in 0..<param_count |expected_start, row_start, structs, fns|:"),
-    "offset": ("for param_offset in 0..<param_count |expected_start, row_start, structs, fns|:", "false return if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
+    "offset": ("for param_offset in 0..<param_count |expected_start, row_start, structs, fns|:", "return false if not value_type_identity_equal(fns.param_types[row_start + param_offset], structs.function_types.fn_pool_params[expected_start + param_offset])"),
 }
 for model_arg, expected_source in call_source_map.items():
     if model_arg not in call_requires and model_arg not in call_return:

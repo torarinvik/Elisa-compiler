@@ -86,7 +86,7 @@ incremental_span_steps = (
     "def ifc_byte_span(source: darray[u8]&, start: usize, length: usize) -> sview?:",
     "assert start <= source.count",
     "assert length <= source.count - start",
-    "null return if length == 0",
+    "return null if length == 0",
     "return Lexer::make_source_view(&source[0], source.count, start, start + length)",
 )
 incremental_span_positions = [incremental_span.find(compact(step)) for step in incremental_span_steps]

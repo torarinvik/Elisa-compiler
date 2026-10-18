@@ -62,14 +62,14 @@ classifier = function_section(lexer_text, "source_line_map_path_is_runtime_std")
 require_ordered(classifier, (
     "static if ELISA_TARGET_OS_WINDOWS: return false",
     "static else: static if ELISA_TARGET_OS_WASM: return false",
-    "static else: false return if path_stop <= path_start or path_stop - path_start > 8191.usize()",
+    "static else: return false if path_stop <= path_start or path_stop - path_start > 8191.usize()",
     "false return if not source_line_map_path_has_runtime_std_component(map_storage, path_start, path_stop)",
-    "false return if lexer_realpath(path_cstr, realpath_buffer_ref) is null",
+    "return false if lexer_realpath(path_cstr, realpath_buffer_ref) is null",
     "while resolved_length < realpath_buffer.count",
     "break if realpath_buffer[resolved_length] == 0",
-    "false return if resolved_length == realpath_buffer.count or resolved_length <= trusted_prefix.count",
+    "return false if resolved_length == realpath_buffer.count or resolved_length <= trusted_prefix.count",
     "for prefix_index in 0..<trusted_prefix.count",
-    "false return if realpath_buffer[prefix_index] != trusted_prefix[prefix_index]",
+    "return false if realpath_buffer[prefix_index] != trusted_prefix[prefix_index]",
     "return true",
 ), "runtime-stdlib path classifier")
 classifier_compact = compact(classifier)
@@ -80,7 +80,7 @@ if (classifier_compact.count("returnfalse") != 2 or
 
 component = function_section(lexer_text, "source_line_map_path_has_runtime_std_component")
 require_ordered(component, (
-    "false return if path_stop <= path_start",
+    "return false if path_stop <= path_start",
     'marker: sview = "elisacore_std/"',
     "marker_length: usize = marker.len",
     "marker_start: mutable usize = path_start",
@@ -88,7 +88,7 @@ require_ordered(component, (
     "matched: mutable bool = true",
     "for marker_offset in 0..<marker_length",
     "matched <- false if map_storage[marker_start + marker_offset] != marker[marker_offset]",
-    "true return if matched and marker_start > path_start and map_storage[marker_start - 1.usize()] == SOURCE_LINE_MAP_PATH_SEPARATOR",
+    "return true if matched and marker_start > path_start and map_storage[marker_start - 1.usize()] == SOURCE_LINE_MAP_PATH_SEPARATOR",
     "marker_start <- marker_start + 1.usize()",
     "return false",
 ), "stdlib component prefilter")
@@ -116,7 +116,7 @@ require_ordered(root, (
 ), "trusted root prefix construction")
 
 direct_caller = function_section(lexer_text, "source_line_is_runtime_std_from_map")
-if compact("false return if not source_runtime_std_root_prefix(&trusted_prefix)") not in compact(direct_caller):
+if compact("return false if not source_runtime_std_root_prefix(&trusted_prefix)") not in compact(direct_caller):
     raise SystemExit("direct classifier caller no longer requires a valid trusted root")
 if "realpath_buffer.resize(8192.usize())" not in compact(direct_caller):
     raise SystemExit("direct classifier caller changed the realpath buffer capacity")

@@ -143,7 +143,7 @@ if compact(step_body) != expected_step_body:
 
 core_text = CORE.read_text()
 require_ordered(function_section(core_text, "consume_indentation_trivia"), (
-    "false return if not lexer.is_block_comment_start()",
+    "return false if not lexer.is_block_comment_start()",
     "lexer <- lexer.skip_block_comment()",
 ), "indentation trivia block-comment caller")
 require_ordered(function_section(TOKENS.read_text(), "next_token"), (

@@ -82,16 +82,16 @@ for call_site in (
         raise SystemExit(f"region/with capacity lowering no longer uses the proved parser: {call_site}")
 expected_operator = compact("""def capacity_span_operator(text: sview, cursor: usize) -> (operator: TokenKind, width: usize, precedence: i32) can[Abort.Panic]:
             length: usize = text.len
-            (TokenKind.Eof, 0, -1.i32()) return if cursor >= length
+            return (TokenKind.Eof, 0, -1.i32()) if cursor >= length
             if cursor + 1.usize() < length:
                 first: u8 = text[cursor]
                 second: u8 = text[cursor + 1.usize()]
-                (TokenKind.LShift, 2, BackendCapacityPrecedence::SHIFT) return if first == 60 and second == 60
-                (TokenKind.RShift, 2, BackendCapacityPrecedence::SHIFT) return if first == 62 and second == 62
-                (TokenKind.EqEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 61 and second == 61
-                (TokenKind.BangEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 33 and second == 61
-                (TokenKind.LtEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 60 and second == 61
-                (TokenKind.GtEq, 2, BackendCapacityPrecedence::COMPARISON) return if first == 62 and second == 61
+                return (TokenKind.LShift, 2, BackendCapacityPrecedence::SHIFT) if first == 60 and second == 60
+                return (TokenKind.RShift, 2, BackendCapacityPrecedence::SHIFT) if first == 62 and second == 62
+                return (TokenKind.EqEq, 2, BackendCapacityPrecedence::COMPARISON) if first == 61 and second == 61
+                return (TokenKind.BangEq, 2, BackendCapacityPrecedence::COMPARISON) if first == 33 and second == 61
+                return (TokenKind.LtEq, 2, BackendCapacityPrecedence::COMPARISON) if first == 60 and second == 61
+                return (TokenKind.GtEq, 2, BackendCapacityPrecedence::COMPARISON) if first == 62 and second == 61
             return match text[cursor]:
                 60: (TokenKind.Lt, 1, BackendCapacityPrecedence::COMPARISON)
                 62: (TokenKind.Gt, 1, BackendCapacityPrecedence::COMPARISON)

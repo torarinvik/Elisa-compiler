@@ -83,7 +83,7 @@ if "return(name_hash(function)*SEMANTIC_HASH_PRIME)^name_hash(tag)" not in key_b
 cache_source = function_section(helper_text, "pgs_callee_fields")
 cache_body = compact(cache_source)
 cache_fragments = (
-    'false return if tag == "" or callee == ""',
+    'return false if tag == "" or callee == ""',
     "callee_hash:u64=name_hash(callee)",
     "key:u64=(callee_hash*SEMANTIC_HASH_PRIME)^name_hash(tag)",
     "cached:mutableu32=pgs_lookup_head(prior,key)",
@@ -117,7 +117,7 @@ require_same_scope_after(cache_source,
 published_source = function_section(helper_text, "pgs_callee_fields_published")
 published_body = compact(published_source)
 published_fragments = (
-    'false return if tag == "" or callee == ""',
+    'return false if tag == "" or callee == ""',
     "triple:mutableu32=pgs_published_head(table,pgs_key(callee,tag))",
     "whiletriple!=SYMBOL_INDEX_ROW_NONE",
     "iftable.param_growth_rows[row]==calleeandtable.param_growth_rows[row+1]==tag:",

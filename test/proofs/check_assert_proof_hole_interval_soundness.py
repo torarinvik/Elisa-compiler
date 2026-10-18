@@ -48,12 +48,12 @@ except IndexError as error:
     raise SystemExit("production assert proof-hole interval decision is missing") from error
 
 production_rules = (
-    "(min_known and min_value >= 1) return if operator == TokenKind.Gt",
-    "(min_known and min_value >= 0) return if operator == TokenKind.GtEq",
-    "(max_known and max_value <= (0 - 1)) return if operator == TokenKind.Lt",
-    "(max_known and max_value <= 0) return if operator == TokenKind.LtEq",
-    "(min_known and max_known and min_value == 0 and max_value == 0) return if operator == TokenKind.EqEq",
-    "((min_known and min_value >= 1) or (max_known and max_value <= (0 - 1))) return if operator == TokenKind.BangEq",
+    "return (min_known and min_value >= 1) if operator == TokenKind.Gt",
+    "return (min_known and min_value >= 0) if operator == TokenKind.GtEq",
+    "return (max_known and max_value <= (0 - 1)) if operator == TokenKind.Lt",
+    "return (max_known and max_value <= 0) if operator == TokenKind.LtEq",
+    "return (min_known and max_known and min_value == 0 and max_value == 0) if operator == TokenKind.EqEq",
+    "return ((min_known and min_value >= 1) or (max_known and max_value <= (0 - 1))) if operator == TokenKind.BangEq",
 )
 observed_rules = tuple(line.strip() for line in aph_provable.splitlines() if "return if operator == TokenKind." in line)
 if observed_rules != production_rules:

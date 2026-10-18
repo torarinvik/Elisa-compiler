@@ -67,7 +67,7 @@ production_shapes = {
     "ref_type_can_grow": """
 def ref_type_can_grow(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-        false return if value_type.kind != TypeKind.Ref
+        return false if value_type.kind != TypeKind.Ref
         target: ValueType = ref_target_of(value_type, structs)
         true return if target.kind == TypeKind.DArray
         true return if is_growable_container_struct(target, structs)
@@ -77,7 +77,7 @@ def ref_type_can_grow(value_type: ValueType, structs: mutable StructTable&) -> b
     "value_type_carries_caller_region": """
 def value_type_carries_caller_region(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
     can Abort.Panic:
-        false return if value_type.kind != TypeKind.Ref
+        return false if value_type.kind != TypeKind.Ref
         target: ValueType = ref_target_of(value_type, structs)
         true return if target.kind == TypeKind.DArray
         true return if is_growable_container_struct(target, structs)
@@ -86,13 +86,13 @@ def value_type_carries_caller_region(value_type: ValueType, structs: mutable Str
 """,
     "value_type_returns_caller_region": """
 def value_type_returns_caller_region(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
-    true return if value_type_owns_region_storage(value_type, structs, 0)
+    return true if value_type_owns_region_storage(value_type, structs, 0)
     return ast_value_needs_arena(value_type, structs)
 """,
     "signature_needs_arena": """
 def signature_needs_arena(params: darray[ParamDecl]&, return_value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-        false return if params_manage_arena(params, structs)
+        return false if params_manage_arena(params, structs)
         return value_type_returns_caller_region(return_value_type, structs)
 """,
 }

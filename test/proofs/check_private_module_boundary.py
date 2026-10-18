@@ -66,12 +66,12 @@ def prefix_matches(text: sview, prefix: sview) -> bool:
             index >= prefix.len or text[index] == prefix[index]
         )
     )
-    false return if text.len < prefix.len
+    return false if text.len < prefix.len
     while index < prefix.len |index: usize = 0, text, prefix|:
         decreases prefix.len - index
         invariant index <= prefix.len and prefix.len <= text.len
         invariant forall checked in 0..<index: text[checked] == prefix[checked]
-        false return if text[index] != prefix[index]
+        return false if text[index] != prefix[index]
         index <- index + 1.usize()
     assert forall checked in 0..<prefix.len:
         text[checked] == prefix[checked]
@@ -90,7 +90,7 @@ def within_module(current_module: sview, owner: sview) -> bool can[Abort.Panic]:
         )
     )
     can Abort.Panic:
-        true return if current_module == owner
+        return true if current_module == owner
         false return if owner.len == 0 or current_module.len <= owner.len
         false return if current_module.len - owner.len <= MODULE_SEPARATOR_LENGTH
         false return if not prefix_matches(current_module, owner)

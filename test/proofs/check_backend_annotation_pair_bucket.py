@@ -123,7 +123,7 @@ for name, expected in (
 
 expected_builder = """
 def annotation_pairs_ready(annotations: darray[Ast::EnumAnnotation]&) -> bool can[Abort.Panic]:
-    false return if annotations.count == 0
+    return false if annotations.count == 0
     base: mutable uintptr = 0
     can Unsafe.PointerCast:
         base <- (&annotations[0]).cast[uintptr]
@@ -189,12 +189,12 @@ def annotation_pair_find(annotations: darray[Ast::EnumAnnotation]&, owner: sview
         cursor: mutable u32 = (annotation_pair_heads can Global.Read)[annotation_pair_bucket(owner, name)] if from_row < 0 else (annotation_pair_next can Global.Read)[from_row.usize()]
         while cursor != 0 |cursor, annotations, owner, name|:
             row: usize = cursor.usize() - 1
-            row.i64() return if annotations[row].owner == owner and annotations[row].name == name
+            return row.i64() if annotations[row].owner == owner and annotations[row].name == name
             cursor <- (annotation_pair_next can Global.Read)[row]
         return -1
     start: usize = 0 if from_row < 0 else from_row.usize() + 1
     for row in start..<annotations.count |annotations, owner, name|:
-        row.i64() return if annotations[row].owner == owner and annotations[row].name == name
+        return row.i64() if annotations[row].owner == owner and annotations[row].name == name
     return -1
 """
 require_function(INDEX_SOURCE, "annotation_pair_cache_invalidate", expected_invalidator)

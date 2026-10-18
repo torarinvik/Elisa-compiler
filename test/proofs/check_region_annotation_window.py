@@ -67,7 +67,7 @@ negative_text = NEGATIVE.read_text()
 
 sortedness = function_chunk(source, "region_annotations_line_sorted")
 for fragment in (
-    "false return if annotations.count == 0",
+    "return false if annotations.count == 0",
     "first_line: u32 = annotations[0].line",
     "last_line: u32 = annotations[annotations.count - 1].line",
     "sorted: mutable bool = true",
@@ -86,7 +86,7 @@ for fragment in (
 
 start = compact(function_chunk(source, "region_annotation_window_start"))
 for fragment in (
-    "0 return if not (region_annotations_line_sorted(annotations) can Global{Read,Write})",
+    "return 0 if not (region_annotations_line_sorted(annotations) can Global{Read,Write})",
     "lower: mutable usize = 0",
     "upper: mutable usize = annotations.count",
     "while lower < upper |lower, upper, annotations, low|:",
@@ -101,7 +101,7 @@ for fragment in (
 
 end = compact(function_chunk(source, "region_annotation_window_end"))
 for fragment in (
-    "annotations.count return if not (region_annotations_line_sorted(annotations) can Global{Read,Write})",
+    "return annotations.count if not (region_annotations_line_sorted(annotations) can Global{Read,Write})",
     "lower: mutable usize = 0",
     "upper: mutable usize = annotations.count",
     "while lower < upper |lower, upper, annotations, high|:",

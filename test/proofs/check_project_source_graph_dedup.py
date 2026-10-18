@@ -148,7 +148,7 @@ validate_model()
 
 # Reject loss of exact lookup, miss-only insertion, and aligned StrList metadata writes.
 mutated_lookup = source_text.replace(
-    "index return if strlist_entry_equals(files, index, path)", "index return", 1
+    "return index if strlist_entry_equals(files, index, path)", "index return", 1
 )
 if mutated_lookup == source_text or not source_errors(mutated_lookup, project_text):
     raise SystemExit("source gate failed to reject unconditional source graph lookup")

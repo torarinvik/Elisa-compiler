@@ -106,9 +106,9 @@ type_classifier = compact(function_section(source, "subscript_base_is_type_argum
 accept_else = compact(function_section(source, "accept_subscript_else"))
 subscript = compact(function_section(source, "subscript_suffix"))
 required_classifier = (
-    "false return if parser.peek() != TokenKind.Else",
+    "return false if parser.peek() != TokenKind.Else",
     "after: TokenKind = parser.peek_at(1)",
-    "true return if after == TokenKind.Return or after == TokenKind.Raise or after == TokenKind.Break or after == TokenKind.Continue",
+    "return true if after == TokenKind.Return or after == TokenKind.Raise or after == TokenKind.Break or after == TokenKind.Continue",
     "return after == TokenKind.Ident and parser.peek_at(2) == TokenKind.Colon",
 )
 classifier_positions = [classifier.find(compact(fragment)) for fragment in required_classifier]
@@ -132,7 +132,7 @@ if set(re.findall(r'"([^"]*)"', type_classifier)) != {"cast", "call_as"}:
     raise SystemExit("the reinterpret method allowlist must remain closed")
 
 required_accept = (
-    "false return if parser.peek() != TokenKind.Else",
+    "return false if parser.peek() != TokenKind.Else",
     "false return if parser.else_introduces_recovery_clause()",
     "parser, _ <- parser.advance()",
     "return true",

@@ -98,7 +98,7 @@ if 'include "./parser_expr_suffixes.elisa"' not in EXPR_LITERALS.read_text():
 
 signature = "def where_view_suffix(parser: lmut Parser, source: Ast::Expr) -> Ast::Expr:"
 expected_prefix = [
-    "source return if not parser.in_where_group",
+    "return source if not parser.in_where_group",
     "where_token: Token = parser.cursor()",
     "source return if parser.peek() != TokenKind.Ident or not ParserWhereSuffixKeyword::is_where_keyword(Lexer::text_or_empty(where_token, parser.source))",
     "parser, _ <- parser.advance()",
@@ -135,7 +135,7 @@ else:
     raise SystemExit("keyword source gate accepted a changed implementation arm")
 
 mutated_suffix = suffix_text.replace(
-    "source return if not parser.in_where_group",
+    "return source if not parser.in_where_group",
     "source return if parser.in_where_group",
     1,
 )

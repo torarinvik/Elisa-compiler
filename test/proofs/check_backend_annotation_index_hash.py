@@ -127,7 +127,7 @@ def annotation_pair_present(structs: StructTable&, annotations: darray[Ast::Enum
     can Abort.Panic:
         row: mutable i64 = annotation_owner_first(structs, owner)
         while row >= 0 |row, structs, annotations, owner, name|:
-            true return if annotations[row.usize()].owner == owner and annotations[row.usize()].name == name
+            return true if annotations[row.usize()].owner == owner and annotations[row.usize()].name == name
             row <- structs.annotations.annotation_owner_next[row.usize()]
         return false
 ''')

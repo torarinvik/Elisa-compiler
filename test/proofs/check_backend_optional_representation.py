@@ -90,7 +90,7 @@ optional_is_niche = compact(function_section(OPTIONALS.read_text(), "optional_is
 expected_optional_is_niche = compact("""
 def optional_is_niche(optional_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
     can Abort.Panic:
-        false return if optional_type.kind != TypeKind.Optional
+        return false if optional_type.kind != TypeKind.Optional
         niche_payload: ValueType = optional_payload_of(optional_type, structs)
         return BackendOptionalRepresentationPolicy::pointer_payload_uses_niche(
             niche_payload.kind == TypeKind.Ref,
@@ -144,7 +144,7 @@ if wrap.count("LLVMIntPredicate::NE") != 1 or optional_tag.count("LLVMIntPredica
 type_table_text = TYPE_TABLES.read_text()
 if compact(function_section(type_table_text, "optional_payload_of")) != compact("""
 def optional_payload_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
-    unmodeled_type() return if value_type.kind != TypeKind.Optional
+    return unmodeled_type() if value_type.kind != TypeKind.Optional
     return copied_type(structs.interned_types.optional_targets[value_type.bits.usize()])
 """):
     raise SystemExit("optional payload lookup no longer checks the variant tag before reading its interned payload")

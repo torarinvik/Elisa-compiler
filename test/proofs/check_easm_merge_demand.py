@@ -400,9 +400,9 @@ def easm_equal(a: sview, b: sview) -> bool:
 """,
     "easm_starts": """
 def easm_starts(text: sview, prefix: sview) -> bool:
-    false return if text.len < prefix.len
+    return false if text.len < prefix.len
     for index in 0..<prefix.len |text, prefix|:
-        false return if text[index] != prefix[index]
+        return false if text[index] != prefix[index]
     return true
 """,
 }

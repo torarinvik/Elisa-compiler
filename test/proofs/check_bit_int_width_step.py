@@ -185,7 +185,7 @@ def require_source_contract(helper_text: str, parser_text: str, endpoints_text: 
     invalid_step = compact("if not step.valid: ok <- false")
     valid_update = compact("bits <- step.value index <- index + 1")
     final_rejection = compact(
-        "(false, 0, 0) return if not ok or not SemanticBitIntWidth::supported_final_width(bits)"
+        "return (false, 0, 0) if not ok or not SemanticBitIntWidth::supported_final_width(bits)"
     )
     positions = [parser.find(part) for part in (parser_initial_state, parser_guard, digit_value, parser_call, invalid_step, valid_update, final_rejection)]
     if any(position < 0 for position in positions) or positions != sorted(positions):

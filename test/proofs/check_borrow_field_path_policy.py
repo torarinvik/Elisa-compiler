@@ -73,7 +73,7 @@ def wildcard_matches(candidate: sview, field: sview, prefix_end: usize) -> bool:
             invariant index <= prefix_end
             invariant (forall prior in 0..<index:
                 candidate[prior] == field[prior])
-            false return if candidate[index] != field[index]
+            return false if candidate[index] != field[index]
             index <- index + INDEX_STEP
         return true
 """

@@ -139,7 +139,7 @@ if 'include "./codegen_value_type.elisa"' not in env_text:
     raise SystemExit("Backend environment no longer assembles the ValueType wrappers")
 if "builtin_state_marker_type(type_name)" not in ANNOTATION_SCOPE.read_text():
     raise SystemExit("typestate annotation resolution no longer maps through the proved wrapper")
-if compact("state_marker: ValueType = builtin_state_marker_type(type_name) state_marker return if state_marker.bits != 0") not in compact(ANNOTATION_SCOPE.read_text()):
+if compact("state_marker: ValueType = builtin_state_marker_type(type_name) return state_marker if state_marker.bits != 0") not in compact(ANNOTATION_SCOPE.read_text()):
     raise SystemExit("annotation resolution no longer preserves nonzero marker identities")
 if "builtin_state_marker_name(value_type.bits)" not in NAME_MANGLING.read_text():
     raise SystemExit("generic name mangling no longer reverses the proved marker tag")

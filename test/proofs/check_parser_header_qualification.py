@@ -77,11 +77,11 @@ if qualifier != expected_qualifier:
 if 'include "./parser_header_qualification.elisa"' not in IMPORTER.read_text():
     raise SystemExit("production parser assembly no longer includes the qualified-header helper")
 expected_peek = compact("""def peek_at(parser: Parser&, offset: usize) -> TokenKind:
-            TokenKind.Eof return if parser.position >= parser.tokens.count
+            return TokenKind.Eof if parser.position >= parser.tokens.count
             remaining: usize = parser.tokens.count - parser.position
-            TokenKind.Eof return if offset >= remaining
+            return TokenKind.Eof if offset >= remaining
             token_index: usize = parser.position + offset
-            TokenKind.Eof return if token_index >= parser.tokens.count
+            return TokenKind.Eof if token_index >= parser.tokens.count
             return parser.tokens[token_index].kind""")
 if compact(function_section(CURSOR.read_text(), "peek_at")) != expected_peek:
     raise SystemExit("parser lookahead no longer checks remaining length before adding and indexing")

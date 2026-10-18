@@ -48,11 +48,11 @@ def require_parser_fold(source: str) -> list[str]:
     parser = function_source(source, "bit_int_window")
     required_steps = (
         "length: usize = type_name.len",
-        "(false, 0, 0) return if length < 2",
+        "return (false, 0, 0) if length < 2",
         "lead: u8 = type_name[0]",
         "is_unsigned: bool = lead == 117",
         "is_signed: bool = lead == 105",
-        "(false, 0, 0) return if not (is_unsigned or is_signed)",
+        "return (false, 0, 0) if not (is_unsigned or is_signed)",
         "bits: mutable i64 = SemanticBitIntWidth::BIT_INT_PREFIX_MIN",
         "index: mutable usize = 1",
         "ok: mutable bool = true",
@@ -63,7 +63,7 @@ def require_parser_fold(source: str) -> list[str]:
         "step: (valid: bool, value: i64) = SemanticBitIntWidth::append_digit(bits, digit_value)",
         "if not step.valid: ok <- false",
         "bits <- step.value index <- index + 1",
-        "(false, 0, 0) return if not ok or not SemanticBitIntWidth::supported_final_width(bits)",
+        "return (false, 0, 0) if not ok or not SemanticBitIntWidth::supported_final_width(bits)",
     )
     if not ordered(parser, required_steps):
         errors.append("bit-int digit scan no longer follows the bounded recursive-fold model")

@@ -300,7 +300,7 @@ provenance_propagate = source_body(
     "def easm_provenance_flow_propagate(target: i64, incoming: ProvenanceFlow, entries: mutable darray[ProvenanceFlow]&, counts: mutable darray[i64]&) -> bool:",
 )
 expected_provenance_propagate = """
-false return if target < 0 or target >= entries.count.i64()
+return false if target < 0 or target >= entries.count.i64()
 if not entries[target.usize()].valid:
     entries[target.usize()] <- incoming
     counts[target.usize()] <- 1
@@ -333,9 +333,9 @@ if compact(empty_provenance) != compact(expected_empty_provenance):
     raise SystemExit("empty provenance state must keep 16 empty carrier slots and clear validity/ambiguity")
 provenance_equal = source_body(model_source, "def easm_provenance_flow_equal(a: ProvenanceFlow, b: ProvenanceFlow) -> bool:")
 expected_provenance_equal = """
-false return if a.valid != b.valid or a.ambiguous != b.ambiguous or a.types.count != b.types.count
+return false if a.valid != b.valid or a.ambiguous != b.ambiguous or a.types.count != b.types.count
 for index in 0..<a.types.count |a, b|:
-    false return if a.types[index] != b.types[index]
+    return false if a.types[index] != b.types[index]
 return true
 """
 if compact(provenance_equal) != compact(expected_provenance_equal):
@@ -344,7 +344,7 @@ provenance_transfer = source_body(
     model_source,
     "def easm_provenance_flow_transfer(instruction: Instruction, incoming: ProvenanceFlow) -> ProvenanceFlow:",
 )
-xchg_transfer_prefix = provenance_transfer.split("out return if destination_slot < 0", 1)[0]
+xchg_transfer_prefix = provenance_transfer.split("return out if destination_slot < 0", 1)[0]
 expected_xchg_transfer_prefix = """
 out: mutable ProvenanceFlow = incoming
 implicit_clobbers: mutable i64 = EasmRegisterMasks::implicit_result_write_mask(instruction.op)
@@ -357,7 +357,7 @@ if implicit_clobbers != 0:
             out.types[slot] <- ""
     out.ambiguous <- out.ambiguous & (~implicit_clobbers)
     return out
-out return if easm_starts(instruction.op, "cmp") or easm_starts(instruction.op, "test") or easm_starts(instruction.op, "push") or easm_starts(instruction.op, "jmp") or easm_starts(instruction.op, "ret")
+return out if easm_starts(instruction.op, "cmp") or easm_starts(instruction.op, "test") or easm_starts(instruction.op, "push") or easm_starts(instruction.op, "jmp") or easm_starts(instruction.op, "ret")
 destination_operand: sview = easm_substitute_operand(easm_last_operand(instruction.text), instruction)
 source: sview = easm_substitute_operand(easm_first_operand(instruction.text), instruction)
 destination: sview = easm_register_operand(destination_operand)

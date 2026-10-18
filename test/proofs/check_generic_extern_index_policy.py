@@ -106,8 +106,8 @@ if compact(function_section(resolver_text, "index_receiver_is_generic_extern")) 
 
 semantic_classifier = compact(function_section(resolver_text, "index_receiver_is_semantic_type_application"))
 ordered_fragments = (
-    "false return if any bound_name in bound where bound_name == base_name",
-    "true return if index_receiver_is_generic_extern(object, table)",
+    "return false if any bound_name in bound where bound_name == base_name",
+    "return true if index_receiver_is_generic_extern(object, table)",
     "if table.symbol_name_index_valid and table.symbol_name_indexed_rows == table.symbols.count and table.symbol_name_next.count == table.symbols.count:",
     "for symbol in table.symbols:",
 )

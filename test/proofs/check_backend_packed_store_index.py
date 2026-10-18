@@ -351,7 +351,7 @@ if mutated_push_call == codegen_calls_text or not validate_source(
     raise SystemExit("source gate failed to reject bypassing the count-preserving darray.push emitter")
 
 mutated_node_key_type = annotation_text.replace(
-    'ValueType{kind: TypeKind.Signed, bits: 32} return if container_name == "NodeKey"',
+    'return ValueType{kind: TypeKind.Signed, bits: 32} if container_name == "NodeKey"',
     'ValueType{kind: TypeKind.Signed, bits: 64} return if container_name == "NodeKey"',
     1,
 )

@@ -70,7 +70,7 @@ require_ordered(function_section(lexer_text, "try_consume_line_directive"), (
     "number_start: usize = cursor",
     "ScanLine, '0'..='9':",
     "decimal_digit_value(char_at(lexer.source, lexer.source_length, cursor).u8())",
-    "false return if cursor == number_start",
+    "return false if cursor == number_start",
 ), "#line decimal number scanner")
 
 positive_names = {
