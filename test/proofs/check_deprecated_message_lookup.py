@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,11 @@ from proof_product_gate import require_current_product, source_include_closure
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source bindings without requiring the pinned proof product")
+ARGS = argument_parser.parse_args()
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/semantic/deprecated_message_lookup.elisa"
 CONSUMER = ROOT / "src/semantic/check_deprecated_call.elisa"
@@ -51,80 +56,44 @@ semantic_text = SEMANTIC.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
-expected_model = '''
-ghost def message_of_from(names: darray[sview]&, messages: darray[sview]&, callee_name: sview, probe: usize, found_so_far: bool, message_so_far: sview) -> (found: bool, message: sview):
-    requires names.count == messages.count and probe <= names.count
-    decreases names.count - probe
-    ensure (probe == names.count) implies (result.found == found_so_far and result.message == message_so_far)
-    ensure (probe < names.count and names[probe] == callee_name) implies (
-        result.found == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).found and
-        result.message == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).message
-    )
-    ensure (probe < names.count and names[probe] != callee_name) implies (
-        result.found == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).found and
-        result.message == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).message
-    )
-    return (found_so_far, message_so_far) if probe == names.count
-    if names[probe] == callee_name:
-        return message_of_from(names, messages, callee_name, probe + 1, true, messages[probe])
-    return message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far)
+expected_index_model = '''
+ghost def message_index_from(names: darray[sview]&, callee_name: sview, remaining: usize) -> usize:
+    requires remaining <= names.count
+    decreases remaining
+    return names.count if remaining == 0
+    return remaining - 1 if names[remaining - 1] == callee_name
+    return message_index_from(names, callee_name, remaining - 1)
 '''
-expected_step = '''
-def message_of_step(names: darray[sview]&, messages: darray[sview]&, callee_name: sview, probe: usize, found_so_far: bool, message_so_far: sview) -> bool:
-    requires names.count == messages.count and probe < names.count
-    ensure message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).found == message_of_from(names, messages, callee_name, probe + 1, result, messages[probe] if names[probe] == callee_name else message_so_far).found
-    ensure message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).message == message_of_from(names, messages, callee_name, probe + 1, result, messages[probe] if names[probe] == callee_name else message_so_far).message
-    if names[probe] == callee_name:
-        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).found == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).found
-        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).message == message_of_from(names, messages, callee_name, probe + 1, true, messages[probe]).message
-        return true
-    else:
-        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).found == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).found
-        assert message_of_from(names, messages, callee_name, probe, found_so_far, message_so_far).message == message_of_from(names, messages, callee_name, probe + 1, found_so_far, message_so_far).message
-        return found_so_far
+expected_index_scan = '''
+def message_index(names: darray[sview]&, callee_name: sview) -> usize:
+    ensure result == message_index_from(names, callee_name, names.count)
+    index: mutable usize = names.count
+    while index > 0 |index, names, callee_name|:
+        decreases index
+        invariant index <= names.count
+        invariant message_index_from(names, callee_name, index) == message_index_from(names, callee_name, names.count)
+        probe: usize = index - 1
+        if names[probe] == callee_name:
+            return probe
+        index <- probe
+    return names.count
 '''
-expected_scan = '''
-def message_of(names: darray[sview]&, messages: darray[sview]&, callee_name: sview) -> (found: bool, message: sview):
-    requires names.count == messages.count
-    ensure result.found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-    ensure result.message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-    found: mutable bool = false
-    message: mutable sview = sview("", 0, 0)
-    assert message_of_from(names, messages, callee_name, 0, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-    assert message_of_from(names, messages, callee_name, 0, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-    for probe in 0..<names.count |found, message|:
-        invariant probe <= names.count
-        invariant message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found and message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-        assert probe < names.count
-        assert probe + 1 <= names.count
-        next_found: bool = message_of_step(names, messages, callee_name, probe, found, message)
-        next_message: sview = messages[probe] if names[probe] == callee_name else message
-        assert message_of_from(names, messages, callee_name, probe, found, message).found == message_of_from(names, messages, callee_name, probe + 1, next_found, next_message).found
-        assert message_of_from(names, messages, callee_name, probe, found, message).message == message_of_from(names, messages, callee_name, probe + 1, next_found, next_message).message
-        found <- next_found
-        message <- next_message
-        assert message_of_from(names, messages, callee_name, probe + 1, found, message).found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-        assert message_of_from(names, messages, callee_name, probe + 1, found, message).message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-    answer: (found: bool, message: sview) = (found, message)
-    assert answer.found == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).found
-    assert answer.message == message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0)).message
-    return answer
-'''
-if compact(function_section(source_text, "message_of_from")) != compact(expected_model):
-    raise SystemExit("recursive deprecated-message model changed without updating its proof")
-if compact(function_section(source_text, "message_of_step")) != compact(expected_step):
-    raise SystemExit("one-row deprecated-message step no longer preserves the recursive model")
-if compact(function_section(source_text, "message_of")) != compact(expected_scan):
-    raise SystemExit("production deprecated-message loop no longer refines its recursive model")
-
+if compact(function_section(source_text, "message_index_from")) != compact(expected_index_model):
+    raise SystemExit("recursive deprecated-message index model changed without updating its proof")
+if compact(function_section(source_text, "message_index")) != compact(expected_index_scan):
+    raise SystemExit("production deprecated-message index scan no longer refines its recursive model")
 expected_wrapper = '''
-def deprecated_message_of(callee_name: sview, names: darray[sview]&, messages: darray[sview]&) -> (found: bool, message: sview):
+def deprecated_message_index(callee_name: sview, names: darray[sview]&, messages: darray[sview @source]&) -> usize:
     requires names.count == messages.count
     can Abort.Panic:
-        return SemanticDeprecatedMessageLookup::message_of(names, messages, callee_name)
+        return SemanticDeprecatedMessageLookup::message_index(names, callee_name)
 '''
-if compact(function_section(consumer_text, "deprecated_message_of")) != compact(expected_wrapper):
+if compact(function_section(consumer_text, "deprecated_message_index")) != compact(expected_wrapper):
     raise SystemExit("semantic consumer no longer delegates lookup to the proved helper")
+if "messages:darray[sview@source]&" not in compact(function_section(consumer_text, "deprecated_call_expression")) or \
+        "messages:mutabledarray[sview@source]&" not in compact(function_section(consumer_text, "collect_deprecated_functions")) or \
+        "messages:mutabledarray[sview@source]@source=[]" not in compact(function_section(consumer_text, "check_deprecated_call")):
+    raise SystemExit("deprecated message views no longer retain their source region through diagnostic creation")
 if consumer_text.count('include "./deprecated_message_lookup.elisa"') != 1:
     raise SystemExit("deprecated-call consumer must include the isolated lookup exactly once")
 if semantic_text.count('include "./check_deprecated_call.elisa"') != 1:
@@ -144,10 +113,15 @@ if "requiresnames.count==messages.count" not in pair_append or \
 for name in ("deprecated_call_expression", "deprecated_call_statements", "deprecated_call_walk"):
     if "requiresnames.count==messages.count" not in compact(function_section(consumer_text, name)):
         raise SystemExit(f"{name} no longer carries the parallel-array lookup precondition")
+call_expression = compact(function_section(consumer_text, "deprecated_call_expression"))
+if "deprecated_message_index(callee_name,names,messages)ifcallee_name!=\"\"elsenames.count" not in call_expression or \
+        "actual:messages[message_index]" not in call_expression or \
+        "ifmessage_index<names.count" not in call_expression:
+    raise SystemExit("deprecated-call diagnostics no longer use the bounds-checked scalar message index")
 root_check = compact(function_section(consumer_text, "check_deprecated_call"))
 root_order = (
     "names:mutabledarray[sview]=[]",
-    "messages:mutabledarray[sview]=[]",
+    "messages:mutabledarray[sview@source]@source=[]",
     "assertnames.count==messages.count",
     "collect_deprecated_functions(file.top_decls,file.annotation_args,names,messages)",
     "assertnames.count==messages.count",
@@ -186,25 +160,23 @@ def production_lookup_matches_recursive_model(names: darray[sview]&, messages: d
     requires names.count == messages.count
     ensure result == true
     can Abort.Panic:
-        return SemanticDeprecatedMessageLookup::message_of(names, messages, callee_name) == SemanticDeprecatedMessageLookup::message_of_from(names, messages, callee_name, 0, false, sview("", 0, 0))
+        return SemanticDeprecatedMessageLookup::message_index(names, callee_name) == SemanticDeprecatedMessageLookup::message_index_from(names, callee_name, names.count)
 ''',
     "missing_name_has_no_message": '''
 def missing_name_has_no_message() -> bool can[Abort.Panic]:
     ensure result == true
     can Abort.Panic:
         names: darray[sview] = ["old_api", "other_api"]
-        messages: darray[sview] = ["old", "other"]
-        answer: (found: bool, message: sview) = SemanticDeprecatedMessageLookup::message_of(names, messages, "new_api")
-        return not answer.found and answer.message == ""
+        index: usize = SemanticDeprecatedMessageLookup::message_index(names, "new_api")
+        return index == names.count
 ''',
     "empty_table_has_no_message": '''
 def empty_table_has_no_message() -> bool can[Abort.Panic]:
     ensure result == true
     can Abort.Panic:
         names: darray[sview] = []
-        messages: darray[sview] = []
-        answer: (found: bool, message: sview) = SemanticDeprecatedMessageLookup::message_of(names, messages, "old_api")
-        return not answer.found and answer.message == ""
+        index: usize = SemanticDeprecatedMessageLookup::message_index(names, "old_api")
+        return index == names.count
 ''',
     "duplicate_name_uses_last_message": '''
 def duplicate_name_uses_last_message() -> bool can[Abort.Panic]:
@@ -212,8 +184,8 @@ def duplicate_name_uses_last_message() -> bool can[Abort.Panic]:
     can Abort.Panic:
         names: darray[sview] = ["old_api", "other_api", "old_api"]
         messages: darray[sview] = ["first", "unrelated", "last"]
-        answer: (found: bool, message: sview) = SemanticDeprecatedMessageLookup::message_of(names, messages, "old_api")
-        return answer.found and answer.message == "last"
+        index: usize = SemanticDeprecatedMessageLookup::message_index(names, "old_api")
+        return index == 2 and messages[index] == "last"
 ''',
     "one_name_returns_its_parallel_message": '''
 def one_name_returns_its_parallel_message() -> bool can[Abort.Panic]:
@@ -221,8 +193,8 @@ def one_name_returns_its_parallel_message() -> bool can[Abort.Panic]:
     can Abort.Panic:
         names: darray[sview] = ["old_api"]
         messages: darray[sview] = ["use new_api"]
-        answer: (found: bool, message: sview) = SemanticDeprecatedMessageLookup::message_of(names, messages, "old_api")
-        return answer.found and answer.message == "use new_api"
+        index: usize = SemanticDeprecatedMessageLookup::message_index(names, "old_api")
+        return index == 0 and messages[index] == "use new_api"
 ''',
 }
 for name, expected in expected_positive.items():
@@ -235,18 +207,16 @@ def false_claim_duplicate_name_uses_first_message() -> bool can[Abort.Panic]:
     ensure result == true
     can Abort.Panic:
         names: darray[sview] = ["old_api", "old_api"]
-        messages: darray[sview] = ["first", "last"]
-        answer: (found: bool, message: sview) = SemanticDeprecatedMessageLookup::message_of(names, messages, "old_api")
-        return answer.found and answer.message == "first"
+        index: usize = SemanticDeprecatedMessageLookup::message_index(names, "old_api")
+        return index == 0
 ''',
     "false_claim_missing_name_is_found": '''
 def false_claim_missing_name_is_found() -> bool can[Abort.Panic]:
     ensure result == true
     can Abort.Panic:
         names: darray[sview] = ["old_api"]
-        messages: darray[sview] = ["deprecated"]
-        answer: (found: bool, message: sview) = SemanticDeprecatedMessageLookup::message_of(names, messages, "new_api")
-        return answer.found
+        index: usize = SemanticDeprecatedMessageLookup::message_index(names, "new_api")
+        return index < names.count
 ''',
 }
 for name, expected in expected_negative.items():
@@ -254,6 +224,10 @@ for name, expected in expected_negative.items():
         raise SystemExit(f"false-claim theorem {name} changed without updating its source-bound proof gate")
 
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "proof_closure_files": len(source_closure)}, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

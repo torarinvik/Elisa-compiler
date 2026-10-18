@@ -1,17 +1,23 @@
 """Admit the proof of the sole foreign-enum validator naming exception."""
+import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source and proof bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = ROOT.parent / "elisa-proof"
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 HELPER = ROOT / "src/semantic/foreign_enum_validator_name.elisa"
 CHECK = ROOT / "src/semantic/check_extern_enum.elisa"
@@ -21,6 +27,24 @@ NEGATIVE = HERE / "foreign_enum_validator_name_rejected.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
+
+
+def compact(text: str) -> str:
+    return "".join(text.split())
+
+
+def function_section(source: str, name: str) -> str:
+    matches = list(re.finditer(rf"^[ \t]*def {re.escape(name)}\(", source, re.MULTILINE))
+    if len(matches) != 1:
+        raise SystemExit(f"expected exactly one function named {name}")
+    start = matches[0].start()
+    following = re.search(r"^[ \t]*def [A-Za-z_][A-Za-z0-9_]*\(", source[matches[0].end():], re.MULTILINE)
+    end = matches[0].end() + following.start() if following else len(source)
+    lines = source[start:end].splitlines()
+    while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith(("#", "@"))):
+        lines.pop()
+    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
 
 helper_text = HELPER.read_text()
 check_text = CHECK.read_text()
@@ -41,19 +65,35 @@ def is_validator_of(function_name: sview, enum_name: sview) -> bool can[Abort.Pa
     ensure result == (
         function_name.len >= enum_name.len
         and function_name.len - enum_name.len == "__from_c".len
-        and (forall prefix_index in 0..<enum_name.len: prefix_index >= function_name.len or function_name[prefix_index] == enum_name[prefix_index])
-        and (forall suffix_index in 0..<"__from_c".len: enum_name.len + suffix_index >= function_name.len or function_name[enum_name.len + suffix_index] == "__from_c"[suffix_index])
+        and function_name[0:enum_name.len] == enum_name
+        and function_name[enum_name.len:function_name.len] == "__from_c"
     )
-    can Abort.Panic:
-        return (
-            function_name.len >= enum_name.len
-            and function_name.len - enum_name.len == "__from_c".len
-            and (forall prefix_index in 0..<enum_name.len: prefix_index >= function_name.len or function_name[prefix_index] == enum_name[prefix_index])
-            and (forall suffix_index in 0..<"__from_c".len: enum_name.len + suffix_index >= function_name.len or function_name[enum_name.len + suffix_index] == "__from_c"[suffix_index])
-        )
+    return (
+        function_name.len >= enum_name.len
+        and function_name.len - enum_name.len == "__from_c".len
+        and function_name[0:enum_name.len] == enum_name
+        and function_name[enum_name.len:function_name.len] == "__from_c"
+    )
 '''
 if compact(function_section(helper_text, "is_validator_of")) != compact(expected_helper):
-    raise SystemExit("production validator-name predicate must return its overflow-safe prefix/suffix contract")
+    raise SystemExit("production validator-name predicate must return its overflow-safe exact prefix/suffix slice contract")
+
+expected_positive = '''
+def validator_name_predicate_matches_prefix_and_suffix_spec(
+    function_name: sview,
+    enum_name: sview
+) -> bool can[Abort.Panic]:
+    ensure result == (
+        function_name.len >= enum_name.len
+        and function_name.len - enum_name.len == "__from_c".len
+        and function_name[0:enum_name.len] == enum_name
+        and function_name[enum_name.len:function_name.len] == "__from_c"
+    )
+    can Abort.Panic:
+        return ForeignEnumName::is_validator_of(function_name, enum_name)
+'''
+if compact(function_section(positive_text, "validator_name_predicate_matches_prefix_and_suffix_spec")) != compact(expected_positive):
+    raise SystemExit("positive proof no longer states the exact production prefix/suffix contract")
 
 positive_names = {
     "is_validator_of",
@@ -72,6 +112,10 @@ negative_names = {
 for name in negative_names:
     if f"def {name}(" not in negative_text:
         raise SystemExit(f"negative control missing: {name}")
+
+if ARGS.source_only:
+    print("foreign-enum validator source bindings passed")
+    raise SystemExit(0)
 
 try:
     product_manifest = require_current_product(BIN, PROVER)

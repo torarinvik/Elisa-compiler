@@ -73,6 +73,7 @@ def name_in(names: darray[sview]&, candidate: sview) -> bool:
         invariant index <= names.count
         invariant name_in_from(names, candidate, index) == name_in_from(names, candidate, 0)
         return true if names[index] == candidate
+    assert(false == name_in_from(names, candidate, 0))
     return false
 '''
 if compact(function_section(source_text, "name_in_from")) != compact(expected_model):

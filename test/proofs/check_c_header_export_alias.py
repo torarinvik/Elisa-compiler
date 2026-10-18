@@ -54,9 +54,7 @@ if 'include "./c_header_export_alias.elisa"' not in HEADER.read_text():
 
 expected_adapter = compact("""def header_export_alias(marker: Ast::EnumAnnotation) -> sview:
             ensure result == (marker.detail_name if marker.detail_name != "" else marker.owner)
-            public_name: sview = CHeaderExportAlias::public_name(marker.owner, marker.detail_name)
-            assert public_name == (marker.detail_name if marker.detail_name != "" else marker.owner)
-            return public_name""")
+            return marker.detail_name if marker.detail_name != "" else marker.owner""")
 if compact(function_section(HEADER.read_text(), "header_export_alias")) != expected_adapter:
     raise SystemExit("production header alias adapter no longer forwards the proved source fields")
 

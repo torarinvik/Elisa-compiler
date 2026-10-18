@@ -84,6 +84,7 @@ if compact_code(function_section(hash_text, "annotation_index_hash_suffix")) != 
 ghost def annotation_index_hash_suffix(text: sview, index: usize, hash: u64) -> u64:
     requires index <= text.len
     decreases text.len - index
+    ensure index < text.len implies result == annotation_index_hash_suffix(text, index + 1, (hash ^ text[index].u64()) * ANNOTATION_INDEX_HASH_PRIME)
     return hash if index == text.len
     return annotation_index_hash_suffix(text, index + 1, (hash ^ text[index].u64()) * ANNOTATION_INDEX_HASH_PRIME)
 '''):
@@ -93,12 +94,18 @@ if compact_code(function_section(hash_text, "annotation_index_hash")) != compact
 def annotation_index_hash(text: sview) -> u64:
     ensure result == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
     hash: mutable u64 = ANNOTATION_INDEX_HASH_OFFSET
-    for offset in 0..<text.len |hash, text|:
+    offset: mutable usize = 0
+    while offset < text.len |offset, hash, text|:
+        decreases text.len - offset
         invariant offset <= text.len
         invariant annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
+        assert annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, offset + 1, (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME)
         hash <- (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME
+        offset <- offset + 1.usize()
+        assert annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
     return hash
 '''):
+
     raise SystemExit("production owner hash contract or loop invariant changed without updating its proof")
 
 if "const ANNOTATION_INDEX_HASH_OFFSET: u64 = 14695981039346656037" not in hash_text:

@@ -304,9 +304,7 @@ parser_body = parser_text.split("def easm_parse_i64_checked(text: sview)", 1)[1]
     "def easm_parse_i64(text: sview)", 1
 )[0]
 required_parser_fragments = (
-    "ensure result.valid == EasmCheckedDecimal::decimal_parse_reference(text).valid",
-    "ensure result.value == EasmCheckedDecimal::decimal_parse_reference(text).value",
-    "ensure not result.valid implies result.value == 0",
+    "ensure result.valid == EasmCheckedDecimal::decimal_parse_reference(text).valid and result.value == EasmCheckedDecimal::decimal_parse_reference(text).value and (result.valid or result.value == 0)",
     "return EasmCheckedDecimal::parse_signed(text)",
 )
 if not all(fragment in parser_body for fragment in required_parser_fragments):
@@ -324,7 +322,7 @@ if "candidate:i64=valueifvalue>greatestelsegreatest" not in size_bound_step_sour
 unchecked_parse_source = compact(function_section(parser_text, "easm_parse_i64"))
 if "ensureresult==easm_parse_i64_spec(text)" not in unchecked_parse_source or \
         "parsed:(valid:bool,value:i64)=easm_parse_i64_checked(text)" not in unchecked_parse_source or \
-        "returnparsed.valueifparsed.validelse0" not in unchecked_parse_source:
+        "value:i64=parsed.valueifparsed.validelse0assertvalue==easm_parse_i64_spec(text)returnvalue" not in unchecked_parse_source:
     raise SystemExit("legacy size-fact parser no longer matches the checked-decimal specification")
 
 layout_parser_text = LAYOUT_PARSER.read_text()

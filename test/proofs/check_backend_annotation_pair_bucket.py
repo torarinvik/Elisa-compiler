@@ -81,6 +81,7 @@ expected_owner_spec = """
 ghost def annotation_pair_owner_hash_suffix(owner: sview, index: usize, hash: u64) -> u64:
     requires index <= owner.len
     decreases owner.len - index
+    ensure index < owner.len implies result == annotation_pair_owner_hash_suffix(owner, index + 1.usize(), (hash ^ owner[index].u64()) * ANNOTATION_PAIR_HASH_PRIME)
     return hash if index == owner.len
     return annotation_pair_owner_hash_suffix(owner, index + 1.usize(), (hash ^ owner[index].u64()) * ANNOTATION_PAIR_HASH_PRIME)
 """
@@ -88,30 +89,39 @@ expected_name_spec = """
 ghost def annotation_pair_name_hash_suffix(name: sview, index: usize, hash: u64) -> u64:
     requires index <= name.len
     decreases name.len - index
+    ensure index < name.len implies result == annotation_pair_name_hash_suffix(name, index + 1.usize(), (hash ^ name[index].u64()) * ANNOTATION_PAIR_HASH_PRIME)
     return hash if index == name.len
     return annotation_pair_name_hash_suffix(name, index + 1.usize(), (hash ^ name[index].u64()) * ANNOTATION_PAIR_HASH_PRIME)
 """
 expected_pair_spec = """
 ghost def annotation_pair_hash_spec(owner: sview, name: sview) -> u64:
-    owner_hash: u64 = annotation_pair_owner_hash_suffix(owner, 0.usize(), ANNOTATION_PAIR_HASH_OFFSET)
-    delimited_hash: u64 = (owner_hash ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME
-    return annotation_pair_name_hash_suffix(name, 0.usize(), delimited_hash)
+    return annotation_pair_name_hash_suffix(name, 0.usize(), (annotation_pair_owner_hash_suffix(owner, 0.usize(), ANNOTATION_PAIR_HASH_OFFSET) ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME)
 """
 expected_bucket = """
 def annotation_pair_bucket(owner: sview, name: sview) -> usize can[Abort.Panic]:
     ensure result == (annotation_pair_hash_spec(owner, name) % ANNOTATION_PAIR_BUCKETS.u64()).usize()
     ensure result < ANNOTATION_PAIR_BUCKETS
     hash: mutable u64 = ANNOTATION_PAIR_HASH_OFFSET
-    for offset in 0..<owner.len |hash, owner|:
+    offset: mutable usize = 0
+    while offset < owner.len |offset, hash, owner|:
+        decreases owner.len - offset
         invariant offset <= owner.len
         invariant annotation_pair_owner_hash_suffix(owner, offset, hash) == annotation_pair_owner_hash_suffix(owner, 0.usize(), ANNOTATION_PAIR_HASH_OFFSET)
+        assert annotation_pair_owner_hash_suffix(owner, offset, hash) == annotation_pair_owner_hash_suffix(owner, offset + 1.usize(), (hash ^ owner[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME)
         hash <- (hash ^ owner[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME
+        offset <- offset + 1.usize()
+        assert annotation_pair_owner_hash_suffix(owner, offset, hash) == annotation_pair_owner_hash_suffix(owner, 0.usize(), ANNOTATION_PAIR_HASH_OFFSET)
     owner_hash: u64 = hash
     hash <- (hash ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME
-    for offset in 0..<name.len |hash, name|:
+    offset <- 0.usize()
+    while offset < name.len |offset, hash, name, owner_hash|:
+        decreases name.len - offset
         invariant offset <= name.len
         invariant annotation_pair_name_hash_suffix(name, offset, hash) == annotation_pair_name_hash_suffix(name, 0.usize(), (owner_hash ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME)
+        assert annotation_pair_name_hash_suffix(name, offset, hash) == annotation_pair_name_hash_suffix(name, offset + 1.usize(), (hash ^ name[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME)
         hash <- (hash ^ name[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME
+        offset <- offset + 1.usize()
+        assert annotation_pair_name_hash_suffix(name, offset, hash) == annotation_pair_name_hash_suffix(name, 0.usize(), (owner_hash ^ 255.u64()) * ANNOTATION_PAIR_HASH_PRIME)
     return (hash % ANNOTATION_PAIR_BUCKETS.u64()).usize()
 """
 for name, expected in (
@@ -181,7 +191,8 @@ def annotation_pairs_ready(annotations: darray[Ast::EnumAnnotation]&) -> bool ca
 """
 expected_invalidator = """
 def annotation_pair_cache_invalidate() -> void can[Global.Write]:
-    annotation_pair_state <- 0
+    can Global.Write:
+        annotation_pair_state <- 0
 """
 expected_find = """
 def annotation_pair_find(annotations: darray[Ast::EnumAnnotation]&, owner: sview, name: sview, from_row: i64) -> i64 can[Abort.Panic]:

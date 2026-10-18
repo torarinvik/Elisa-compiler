@@ -263,4 +263,25 @@ run_check enabled "$WORK/generated.elisa" generated-warm
 compare_without_cache_report generated-cold generated-warm
 grep -Eq 'incremental-ga-cache: input=generated prior=valid matched=2 visited=2 rejected=0 ga_walks_skipped=2 published=yes' "$WORK/generated-warm.err"
 
-echo "incremental GA cache control OK: cold/warm parity, grant-only skip boundaries, strict/permissive grant invalidation, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"
+# Errorful translation units still publish current-source facts. Diagnostics
+# must remain byte-for-byte identical for cold, first-cache, and warm runs.
+CACHE="$WORK/errorful-cache"
+mkdir -p "$CACHE"
+cat >"$WORK/errorful.elisa" <<'ELISA'
+def pure() -> i64:
+    return 7
+
+def invalid() -> i64:
+    return "not an integer"
+ELISA
+run_check cold "$WORK/errorful.elisa" errorful-cold
+run_check enabled "$WORK/errorful.elisa" errorful-first
+compare_without_cache_report errorful-cold errorful-first
+[[ "$(<"$WORK/errorful-first.status")" != 0 ]]
+grep -Eq 'incremental-ga-cache: input=ordinary prior=miss matched=0 visited=2 rejected=[01] ga_walks_skipped=0 published=yes' "$WORK/errorful-first.err"
+run_check enabled "$WORK/errorful.elisa" errorful-warm
+compare_without_cache_report errorful-cold errorful-warm
+[[ "$(<"$WORK/errorful-warm.status")" != 0 ]]
+grep -Eq 'incremental-ga-cache: input=ordinary prior=valid matched=[1-2] visited=2 rejected=[01] ga_walks_skipped=[1-2] published=yes' "$WORK/errorful-warm.err"
+
+echo "incremental GA cache control OK: cold/warm and errorful diagnostic parity, grant-only skip boundaries, strict/permissive grant invalidation, forged-sidecar source revalidation, body/option invalidation, generated input, and corrupt-cache miss"

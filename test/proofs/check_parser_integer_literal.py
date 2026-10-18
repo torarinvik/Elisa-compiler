@@ -34,6 +34,8 @@ inputs.extend(source_include_closure([here / "parser_integer_literal.elisa",
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 source_text = (root / "src/parser/parser_integer_literal.elisa").read_text()
 step_text = source_text.split("def parse_int_literal_step(", 1)[1].split("def parse_int_literal_value(", 1)[0]
+value_text = source_text.split("def parse_int_literal_value(", 1)[1]
+loop_text = value_text.split("for index in start_index..<n |", 1)[1].split("assert n == text.len", 1)[0]
 proof_text = (here / "parser_integer_literal.elisa").read_text()
 rejected_text = (here / "parser_integer_literal_rejected.elisa").read_text()
 assert "def parse_int_literal_value(text: sview) -> i64:" in source_text
@@ -42,6 +44,11 @@ assert 'include "../../src/parser/parser_integer_literal.elisa"' in rejected_tex
 assert "return parse_int_literal_value(text)" in proof_text
 assert "return parse_int_literal_value(text)" in rejected_text
 assert "value * base + digit.u64()" in step_text and "maximum if value > (maximum - digit.u64()) / base" in step_text
+assert "ensure result.next_index == index + 1" in step_text
+assert "requires text[index].u8() == 95 or" in step_text
+assert loop_text.index("return 0") < loop_text.index("parse_int_literal_step(")
+assert "invariant index >= start_index" in loop_text
+assert "parse_int_literal_reference_from(text, index + 1, is_hex, result) ==" in loop_text
 
 
 def run(name):

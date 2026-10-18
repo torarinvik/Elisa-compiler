@@ -1,4 +1,5 @@
 """Admit source-linked proofs of ProjectSystem's exact whitespace byte set."""
+import argparse
 import hashlib
 import json
 import os
@@ -12,7 +13,11 @@ from proof_product_gate import require_current_product
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = ROOT.parent / "elisa-proof"
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source bindings without requiring the pinned proof product")
+ARGS = argument_parser.parse_args()
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 POSITIVE = HERE / "project_whitespace.elisa"
@@ -69,6 +74,9 @@ trim_start_body = function_body(
 trim_end_body = function_body(
     "bytes_trim_end", "def bytes_trim_end(value: darray[u8]&) -> usize:"
 )
+trim_end_from_body = function_body(
+    "bytes_trim_end_from", "def bytes_trim_end_from(value: darray[u8]&, first: usize) -> usize:"
+)
 blank_body = function_body(
     "bytes_is_blank", "def bytes_is_blank(value: darray[u8]&) -> bool:"
 )
@@ -96,12 +104,12 @@ for fragment in (
     "ensure result <= value.count",
     "ensure forall prefix in 0..<result: bytes_is_space(value[prefix])",
     "ensure result < value.count implies not bytes_is_space(value[result])",
-    "while first < value.count and bytes_is_space(value[first])",
-    "decreases value.count - first",
-    "invariant first <= value.count",
-    "invariant forall prefix in 0..<first: bytes_is_space(value[prefix])",
-    "first <- first + 1.usize()",
-    "assert forall prefix in 0..<first: bytes_is_space(value[prefix])",
+    "for index in 0..<value.count |first, value|",
+    "invariant first == index",
+    "if bytes_is_space(value[index]):",
+    "first <- index + 1.usize()",
+    "else:",
+    "break",
     "assert first <= value.count",
     "assert forall prefix in 0..<first: bytes_is_space(value[prefix])",
     "if first < value.count:",
@@ -111,25 +119,41 @@ for fragment in (
     if compact(fragment) not in compact(trim_start_body):
         raise SystemExit(f"production leading trim no longer has its bounded first-nonspace scan: {fragment}")
 for fragment in (
+    "requires first <= value.count",
+    "ensure result >= first",
+    "ensure result <= value.count",
+    "ensure forall suffix in result..<value.count: bytes_is_space(value[suffix])",
+    "ensure result > first implies not bytes_is_space(value[result - 1.usize()])",
+    "while last > first and (",
+    "value[last - 1.usize()] == ProjectSystemWhitespaceByte::ASCII_SPACE",
+    "value[last - 1.usize()] == ProjectSystemWhitespaceByte::ASCII_HORIZONTAL_TAB",
+    "value[last - 1.usize()] == ProjectSystemWhitespaceByte::ASCII_LINE_FEED",
+    "value[last - 1.usize()] == ProjectSystemWhitespaceByte::ASCII_CARRIAGE_RETURN",
+    "decreases last - first",
+    "invariant first <= last",
+    "invariant last <= value.count",
+    "invariant forall suffix in last..<value.count: (",
+    "next: usize = last - 1.usize()",
+    "assert first <= next",
+    "assert value[next] == ProjectSystemWhitespaceByte::ASCII_SPACE or",
+    "last <- last - 1.usize()",
+    "assert forall suffix in last..<value.count: bytes_is_space(value[suffix])",
+    "if last > first:",
+    "assert not bytes_is_space(value[last - 1.usize()])",
+    "return last",
+):
+    if compact(fragment) not in compact(trim_end_from_body):
+        raise SystemExit(f"production trailing trim helper lost its bounded interval proof: {fragment}")
+for fragment in (
     "ensure result >= bytes_trim_start(value)",
     "ensure result <= value.count",
     "ensure forall suffix in result..<value.count: bytes_is_space(value[suffix])",
     "ensure result > bytes_trim_start(value) implies not bytes_is_space(value[result - 1.usize()])",
     "first: usize = bytes_trim_start(value)",
+    "end: usize = bytes_trim_end_from(value, first)",
+    "assert end >= first",
     "assert first == bytes_trim_start(value)",
-    "while last > first and bytes_is_space(value[last - 1.usize()])",
-    "decreases last - first",
-    "invariant first <= last",
-    "invariant last <= value.count",
-    "invariant forall suffix in last..<value.count: bytes_is_space(value[suffix])",
-    "last <- last - 1.usize()",
-    "assert forall suffix in last..<value.count: bytes_is_space(value[suffix])",
-    "assert first <= last",
-    "assert last <= value.count",
-    "assert forall suffix in last..<value.count: bytes_is_space(value[suffix])",
-    "if last > first:",
-    "assert not bytes_is_space(value[last - 1.usize()])",
-    "return last",
+    "return end",
 ):
     if compact(fragment) not in compact(trim_end_body):
         raise SystemExit(f"production trailing trim no longer preserves the nonspace interval: {fragment}")
@@ -159,15 +183,23 @@ for name, required in (
         "ensure result == true",
         "ProjectSystem::bytes_trim_start(value)",
         "ProjectSystem::bytes_trim_end(value)",
-        "forall prefix in 0..<start", "start < value.count implies",
-        "forall suffix in end..<value.count", "end > start implies",
+        "assert start <= end", "assert end <= value.count",
+        "assert forall prefix in 0..<start",
+        "if start < value.count:",
+        "assert not ProjectSystem::bytes_is_space(value[start])",
+        "assert forall suffix in end..<value.count",
+        "if end > start:",
+        "assert not ProjectSystem::bytes_is_space(value[end - 1.usize()])",
+        "return true",
     )),
     ("production_trimmed_value_is_exactly_its_source_span", (
         "ensure result == true",
-        "return false if start > end or end > value.count",
+        "assert start <= end", "assert end <= value.count",
         "ProjectSystem::bytes_trimmed(value)",
-        "trimmed.count == end - start",
+        "assert trimmed.count == end - start",
+        "assert forall index in 0..<trimmed.count",
         "trimmed[index] == value[start + index]",
+        "return true",
     )),
 ):
     if f"def {name}(" not in positive_text:
@@ -245,6 +277,12 @@ def include_closure(roots: list[Path]) -> list[Path]:
             if child not in seen:
                 pending.append(child)
     return sorted(seen)
+
+
+if ARGS.source_only:
+    closure = include_closure([POSITIVE, NEGATIVE, PROJECT])
+    print(json.dumps({"source_bound": True, "proof_closure_files": len(closure)}, sort_keys=True))
+    raise SystemExit(0)
 
 
 try:

@@ -47,6 +47,12 @@ def function_section(source: str, name: str) -> str:
 
 
 policy_text = POLICY.read_text()
+if compact("""
+    struct LinearExitScanStep:
+        stopped: bool
+        report: bool
+""") not in compact(policy_text):
+    raise SystemExit("production linear exit policy lost its named scan-step result")
 expected_policy = {
     "previous_scan_index_spec": """
         ghost def previous_scan_index_spec(index: usize, count: usize) -> usize:
@@ -85,25 +91,38 @@ expected_policy = {
                 index <- index + 1
             return false
     """,
-    "scan_step_spec": """
-        ghost def scan_step_spec(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> (stopped: bool, report: bool):
-            stopped_after: bool = stopped or (loop_only and scope_name == "")
+    "scan_step_stopped_spec": """
+        ghost def scan_step_stopped_spec(scope_name: sview, stopped: bool, loop_only: bool) -> bool:
+            return stopped or (loop_only and scope_name == "")
+    """,
+    "scan_step_report_spec": """
+        ghost def scan_step_report_spec(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> bool:
             return (
-                stopped_after,
-                scope_name != "" and not stopped_after and
+                scope_name != "" and not scan_step_stopped_spec(scope_name, stopped, loop_only) and
                 not name_present_spec(consumed, scope_name) and
                 not name_present_spec(leaked, scope_name)
             )
     """,
+    "scan_step_spec": """
+        ghost def scan_step_spec(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> LinearExitScanStep:
+            return LinearExitScanStep{
+                stopped: scan_step_stopped_spec(scope_name, stopped, loop_only),
+                report: scan_step_report_spec(scope_name, stopped, loop_only, consumed, leaked)
+            }
+    """,
     "scan_step": """
-        def scan_step(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> (stopped: bool, report: bool) can[Abort.Panic]:
-            ensure result.stopped == scan_step_spec(scope_name, stopped, loop_only, consumed, leaked).stopped and result.report == scan_step_spec(scope_name, stopped, loop_only, consumed, leaked).report
+        def scan_step(scope_name: sview, stopped: bool, loop_only: bool, consumed: darray[sview]&, leaked: darray[sview]&) -> LinearExitScanStep can[Abort.Panic]:
+            ensure result.stopped == scan_step_stopped_spec(scope_name, stopped, loop_only)
+            ensure result.report == scan_step_report_spec(scope_name, stopped, loop_only, consumed, leaked)
             can Abort.Panic:
                 stopped_after: bool = stopped or (loop_only and scope_name == "")
                 report: bool = scope_name != "" and not stopped_after and
                     not name_present(consumed, scope_name) and
                     not name_present(leaked, scope_name)
-                return (stopped_after, report)
+                answer: LinearExitScanStep = LinearExitScanStep{stopped: stopped_after, report: report}
+                assert answer.stopped == scan_step_stopped_spec(scope_name, stopped, loop_only)
+                assert answer.report == scan_step_report_spec(scope_name, stopped, loop_only, consumed, leaked)
+                return answer
     """,
 }
 for name, expected in expected_policy.items():
@@ -119,13 +138,10 @@ if policy_include not in semantic_text or affine_include not in semantic_text or
 
 exit_scan = compact(function_section(AFFINE.read_text(), "linear_exit_leaks"))
 for required in (
-    "while scope_index > 0",
-    "decreases scope_index",
-    "invariant scope_index <= in_scope.count",
-    "invariant not stopped or loop_only",
-    "scope_index <- SemanticLinearExitLeakPolicy::previous_scan_index(scope_index, in_scope.count)",
+    "for scan_offset in 0..<in_scope.count",
+    "scope_index: usize = in_scope.count - (scan_offset + 1)",
     "scope_name: sview = in_scope[scope_index]",
-    "step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step(scope_name, stopped, loop_only, consumed, leaked)",
+    "step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step(scope_name, stopped, loop_only, consumed, leaked)",
     "stopped <- step.stopped",
     "leaked.push(scope_name) if step.report",
 ):
@@ -182,48 +198,51 @@ positive_bodies = {
     "scan_step_matches_its_transition_spec": """
         ensure result == true
         can Abort.Panic:
-            return SemanticLinearExitLeakPolicy::scan_step(scope_name, stopped, loop_only, consumed, leaked) == SemanticLinearExitLeakPolicy::scan_step_spec(scope_name, stopped, loop_only, consumed, leaked)
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step(scope_name, stopped, loop_only, consumed, leaked)
+            assert step.stopped == SemanticLinearExitLeakPolicy::scan_step_spec(scope_name, stopped, loop_only, consumed, leaked).stopped
+            assert step.report == SemanticLinearExitLeakPolicy::scan_step_spec(scope_name, stopped, loop_only, consumed, leaked).report
+            return true
     """,
     "loop_sentinel_stops_and_is_not_reported": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("", false, true, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("", false, true, [], [])
             return step.stopped and not step.report
     """,
     "stopped_state_is_sticky_for_outer_scope": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("outer", true, true, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("outer", true, true, [], [])
             return step.stopped and not step.report
     """,
     "return_scan_ignores_loop_sentinel": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("", false, false, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("", false, false, [], [])
             return not step.stopped and not step.report
     """,
     "live_unconsumed_scope_is_reported": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, [], [])
             return not step.stopped and step.report
     """,
     "consumed_scope_is_not_reported": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, ["resource"], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, ["resource"], [])
             return not step.report
     """,
     "previously_reported_scope_is_not_reported_twice": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, [], ["resource"])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, [], ["resource"])
             return not step.report
     """,
     "scope_before_loop_sentinel_remains_reportable": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("inner", false, true, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("inner", false, true, [], [])
             return not step.stopped and step.report
     """,
 }
@@ -240,31 +259,31 @@ negative_bodies = {
     "loop_sentinel_does_not_stop_scan": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("", false, true, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("", false, true, [], [])
             return not step.stopped
     """,
     "stopped_state_is_cleared": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("outer", true, true, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("outer", true, true, [], [])
             return not step.stopped
     """,
     "consumed_scope_is_reported": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, ["resource"], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, ["resource"], [])
             return step.report
     """,
     "previously_reported_scope_is_reported_again": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, [], ["resource"])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("resource", false, false, [], ["resource"])
             return step.report
     """,
     "loop_sentinel_is_reported_as_a_resource": """
         ensure result == true
         can Abort.Panic:
-            step: (stopped: bool, report: bool) = SemanticLinearExitLeakPolicy::scan_step("", false, true, [], [])
+            step: SemanticLinearExitLeakPolicy::LinearExitScanStep = SemanticLinearExitLeakPolicy::scan_step("", false, true, [], [])
             return step.report
     """,
 }

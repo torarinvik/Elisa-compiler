@@ -39,14 +39,15 @@ and reused functions plus phase time; measure with whole-object avoidance
 disabled when testing partial reuse. Keep backend artifact reuse as a subsequent
 boundary with explicit optimizer dependencies and cold/warm parity.
 
-## Local implementation status (2026-10-11)
+## Historical local implementation snapshot (2026-10-11)
 
 Historical VAST timings are motivation, not the current local baseline;
-qualification uses local compute and pinned compiler/runtime tuples. The current
-`main` worktree has an opt-in persistent-cache implementation for one narrow
-Global-authority case. A fresh self-host build and focused parity controls pass,
-but it is not the general semantic cache described below and has no performance
-qualification yet.
+qualification uses local compute and pinned compiler/runtime tuples.
+At that date, the `main` worktree had an opt-in persistent-cache implementation
+for one narrow Global-authority case. A fresh self-host build and focused parity
+controls passed then, but this was not the general semantic cache described
+below and had no performance qualification. The current status is recorded in
+the implementation stages below.
 
 Current-invocation authority event reuse has passed native diagnostic and ordered
 effect-array parity tests in isolated candidates. It reuses observations during
@@ -74,12 +75,17 @@ work skipped is the two Global-authority body walks for a current-source-verifie
 cacheable body with zero direct facts and an exact prior body match. Other bodies,
 checkers, closure construction, and report publication stay on the cold path. The
 snapshot stores portable facts; invocation-local body anchors are rebuilt and
-rebound on each parse. This is a narrow work-avoidance experiment, not yet a
-qualified incremental-compilation speedup.
+rebound on each parse. Publication is allowed for errorful translation units
+because this sidecar stores only current-source observations; semantic diagnostics
+are recomputed on every invocation. This does not satisfy diagnostic replay for
+future cached semantic results. This is a narrow work-avoidance experiment, not
+yet a qualified incremental-compilation speedup.
 
-The current acceptance controls pass cold, first-cache, warm, body-edited,
-option-changed, structurally valid forged-sidecar, and corrupted-cache runs for diagnostics and exit status, and
-compare canonical effect rows in a direct checker control at O0 and O2. Existing
+The existing narrow parity controls pass cold, first-cache, warm, body-edited,
+option-changed, structurally valid forged-sidecar, and corrupted-cache runs for
+diagnostics and exit status, and compare canonical effect rows in a direct
+checker control at O0 and O2. They validate the implemented downstream
+Global-authority walk skip, not reuse of semantic body analysis. Existing
 Global-permission, static-generation, and source-identity shadow gates also pass.
 Further invalidation workloads must cover dependencies before eligibility expands.
 No timing claim is made from these parity controls. Small cross-language
@@ -237,7 +243,7 @@ Start codegen reuse with `-O0`, without debug/profiling/coverage metadata, and w
 
 1. **Instrument the baseline.** On the exact local compiler seed and host in a quiet window, record phase wall/CPU time for `check_ungranted_panic`, `check_mutable_global_authority`, their combined interval, number of function bodies visited, number of resolved calls/edges, and current diagnostics/effect-row report. Do not infer the 993-second cost from unrelated historical self-host timings.
 2. **Collect and bind facts.** The opt-in driver path now passes the exact analyzed source and tokens alongside the AST, while policy options still come from the original source. Ordinary, expanded `static generate`, and early `pymodule` gates use the paired frontend inputs. The collector remains deliberately narrow; unsupported bodies stay cold. The separate shadow observer remains observational and must not be confused with checker reuse.
-3. **Persist and consume one proven case.** An opt-in sidecar uses bounded reads, schema/semantic/options validation, recollection against current source, and temporary-file-plus-rename publication. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker skips only current-source-verified, prior-matched zero-direct-fact bodies in both Global-authority walks, then rebuilds indexes, call/effect closure, rows, and diagnostics as usual. The direct control checks diagnostic and canonical-row parity; the CLI control checks cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and exact counters. These controls pass against the fresh self-hosted product; this narrow checker-work reduction is not an end-to-end performance result.
+3. **Persist and consume one proven case.** An opt-in sidecar uses bounded no-follow, nonblocking reads, schema/semantic/options validation, recollection against current source, exclusive temporary-file creation, and atomic rename publication. A symlink or FIFO at the cache-file path is a miss; a stale or pre-existing temporary path fails publication closed instead of being followed. These flags protect the final path component only; the configured cache directory is not pinned against symlink substitution. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker skips only current-source-verified, prior-matched zero-direct-fact bodies in both Global-authority walks, then rebuilds indexes, call/effect closure, rows, and diagnostics as usual. The direct control checks diagnostic and canonical-row parity; the CLI control checks cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and exact counters. Its `panic_only` fixture grants `Abort.Panic` through `trusted`, so it remains semantically clean and does not cover errorful publication. An errorful translation-unit control has been added to compare cold, first-cache, and warm diagnostics, exit status, publication, and a warm authority skip; runtime verification remains pending a fresh Stage1 product. Both available products checked—the default `bin/elisac-stage1` and `build/goal-compiler-latest-b11e/bin/elisac-stage1`—report provenance schema `elisa-stage1-provenance-v1`, while the current checker requires v5. A fresh seed attempt using a Stage0 binary rebuilt from the current dirty Go tree (SHA-256 `83d2e903…91bb2`) with a 12 GiB guard exited 1 during semantic analysis; its log contains 97 located non-warning diagnostics and 32,078 warning rows (`/tmp/elisa-incremental-current-seed.log`). It did not produce a current Stage1 binary. The present controls validate only downstream Global-authority walk skipping; they do not pass the semantic-reuse acceptance gate because all candidate bodies are still rescanned. This narrow checker-work reduction is not an end-to-end performance result.
 4. **Prove invalidation.** Compare warm incremental output byte-for-byte with cold output for: unchanged build; a body-only edit with unchanged API; a callee body edit that adds/removes `Global.Read` or `Global.Write`; a callee effect-contract change; adding an overload after a previous lookup; changing an import or alias that resolves a previous miss; changing a global from immutable to mutable or changing its type/layout; changing a protocol method contract/conformance; changing strict/global options; and corrupting or versioning out the cache.
 5. **Add body codegen fragments.** Cache and restore eligible `-O0` LLVM function bodies in a newly created module, then test link validity, object/executable parity, and invalidation for function API, type/global layout, callee ABI, target, and codegen flags.
 6. **Expand eligibility and optimization.** Add callback/generic/debug support only with explicit fingerprints and controls. Consider cross-function optimized reuse only with an import/summary model and runtime parity evidence.
@@ -264,6 +270,24 @@ sidecar, and corrupt cache data. Dependency-change invalidation remains to be
 added before eligibility expands. The manual
 `INCREMENTAL_SEMANTIC_ENGINE_VERSION` must be bumped whenever changes can alter
 collector eligibility or the meaning of facts consumed by replay.
+
+This trust policy also sets a hard limit on reuse: exact body equality proves
+that the cached record names the current body, but it does not prove that the
+record's semantic observations are true. A checksum detects accidental damage;
+it does not authenticate those observations. While sidecars remain untrusted,
+the compiler must recollect facts before they can affect checker behavior. To
+skip recollection, a later milestone must define and enforce a trusted cache
+boundary (including how its artifacts are authenticated and invalidated) or
+retain recollection and limit reuse to downstream checker work. Do not treat a
+body hash, schema check, or structural validation as a substitute for that
+decision.
+
+The current report counters also have different units: `visited` counts
+function candidates passed through the collector, including candidates rejected
+before `ifc_walk_body`; `matched` counts cacheable records whose body and
+declaration surface match after current facts were recollected. Neither counter
+means semantic analysis was reused. `ga_walks_skipped` is the current measure of
+checker work avoided and counts only the Global-authority body walks skipped.
 
 This experiment does not yet skip `collect_effect_sources`, `check_ungranted_panic`,
 authority indexing/closure, code generation, or linking. LLVM fragment loading

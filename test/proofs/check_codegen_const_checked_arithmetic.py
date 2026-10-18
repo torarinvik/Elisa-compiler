@@ -116,6 +116,19 @@ for declaration in (
     if compact(declaration) not in arithmetic_compact:
         raise SystemExit("checked arithmetic module no longer uses the exact signed-i64 bounds")
 
+# Keep the successful return paths explicit about the range facts needed by their
+# postconditions. The guards make these assertions true before any checked operation.
+success_path_assertions = {
+    "add_is_safe": ("assert left + right >= I64_MIN", "assert left + right <= I64_MAX"),
+    "subtract_is_safe": ("assert left - right >= I64_MIN", "assert left - right <= I64_MAX"),
+    "negation_is_safe": ("assert 0 - value >= I64_MIN", "assert 0 - value <= I64_MAX"),
+}
+for function_name, assertions in success_path_assertions.items():
+    body = compact(function_body(arithmetic_text, function_name))
+    return_position = body.rfind("return")
+    if any(body.find(compact(assertion)) < 0 or body.find(compact(assertion)) > return_position for assertion in assertions):
+        raise SystemExit(f"{function_name} must establish its successful arithmetic range before returning true")
+
 # The proof file includes the production module and calls these exact functions.
 # Require each production contract to describe its executable return expression.
 guard_specifications = {

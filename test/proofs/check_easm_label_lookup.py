@@ -88,6 +88,7 @@ required_contracts = (
 )
 if any(compact(contract) not in lookup for contract in required_contracts):
     raise SystemExit("EASM label lookup lost its sentinel, count, first-match, or miss contract")
+
 required_body = (
     "count: usize = instructions.count",
     "count_signed: i64 = count.i64()",

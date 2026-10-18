@@ -78,7 +78,8 @@ helper_names = {
     "easm_compose_comma_count_from", "easm_compose_span_argument_count",
     "easm_compose_close_offset", "easm_compose_span_argument_count_from_open",
     "easm_compose_span_from_trim_bounds", "easm_compose_trimmed_span",
-    "easm_compose_span_reference_from", "easm_compose_span_reference_at_bounds",
+    "easm_compose_span_reference_from", "easm_compose_span_wanted_in_range",
+    "easm_compose_span_reference_at_bounds",
     "easm_compose_span_reference_from_open", "easm_compose_span_reference",
 }
 if not helper_names <= declarations(text_source):
@@ -102,9 +103,7 @@ required_span_fragments = (
     "assert not easm_compose_span_reference(text, wanted).valid",
     "assert easm_compose_span_reference(text, wanted).start == 0",
     "assert easm_compose_span_reference(text, wanted).end == 0",
-    "assert ComposeSpan{start: 0, end: 0, valid: false}.valid == easm_compose_span_reference(text, wanted).valid",
-    "assert ComposeSpan{start: 0, end: 0, valid: false}.start == easm_compose_span_reference(text, wanted).start",
-    "assert ComposeSpan{start: 0, end: 0, valid: false}.end == easm_compose_span_reference(text, wanted).end",
+    "return ComposeSpan{start: 0, end: 0, valid: false}",
     "close_offset: usize = EasmTextScan::find_byte(text[open:text.len], 41)",
     "assert close_offset > 0.usize()",
     "close: usize = close_offset + open",
@@ -114,10 +113,11 @@ required_span_fragments = (
     "assert open == EasmTextScan::find_byte_spec(text, 40)",
     "assert close_offset == EasmTextScan::find_byte_spec(text[open:text.len], 41)",
     "assert values == text[open + 1.usize():open + close_offset]",
-    "assert easm_compose_span_reference_from_state(values, base, close, 0, 0, 0, wanted).valid == easm_compose_span_reference(text, wanted).valid",
-    "assert easm_compose_span_reference_from_state(values, base, close, 0, 0, 0, wanted).start == easm_compose_span_reference(text, wanted).start",
-    "assert easm_compose_span_reference_from_state(values, base, close, 0, 0, 0, wanted).end == easm_compose_span_reference(text, wanted).end",
     "assert current.usize() <= cursor",
+    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid == easm_compose_span_reference(text, wanted).valid",
+    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == easm_compose_span_reference(text, wanted).start",
+    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == easm_compose_span_reference(text, wanted).end",
+    "easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid == easm_compose_span_reference(text, wanted).valid and easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == easm_compose_span_reference(text, wanted).start and easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == easm_compose_span_reference(text, wanted).end",
     "while cursor <= value_length",
     "decreases value_length - cursor",
     "invariant (cursor <= value_length and base <= close and values.len == close - base and value_length == values.len and cursor <= close - base and start <= cursor and current >= 0 and current.usize() <= cursor and easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid == easm_compose_span_reference(text, wanted).valid and easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == easm_compose_span_reference(text, wanted).start and easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == easm_compose_span_reference(text, wanted).end)",
@@ -132,14 +132,10 @@ required_span_fragments = (
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid",
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == span_start",
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == span_end",
-    "assert ComposeSpan{start: span_start, end: span_end, valid: true}.valid == easm_compose_span_reference(text, wanted).valid",
-    "assert ComposeSpan{start: span_start, end: span_end, valid: true}.start == easm_compose_span_reference(text, wanted).start",
-    "assert ComposeSpan{start: span_start, end: span_end, valid: true}.end == easm_compose_span_reference(text, wanted).end",
+    "return ComposeSpan{start: span_start, end: span_end, valid: true}",
     "assert not easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid",
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == 0",
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == 0",
-    "return ComposeSpan{start: span_start, end: span_end, valid: true}",
-    "return ComposeSpan{start: 0, end: 0, valid: false}",
 )
 if any(compact(fragment) not in span_body for fragment in required_span_fragments):
     raise SystemExit("compose-span contract or source-bound loop invariant changed")
@@ -226,6 +222,13 @@ if any(compact(fragment) not in reference_state_body for fragment in (
 )):
     raise SystemExit("total loop-state wrapper lost its guards or recursive refinement")
 reference_at_bounds_body = compact(function_section(text_source, "easm_compose_span_reference_at_bounds"))
+span_wanted_in_range_body = compact(function_section(text_source, "easm_compose_span_wanted_in_range"))
+if any(compact(fragment) not in span_wanted_in_range_body for fragment in (
+    "ghost def easm_compose_span_wanted_in_range(values:sview,wanted:i64)->bool",
+    "ensure result == (wanted >= 0 and wanted < easm_compose_argument_count_spec(values))",
+    "return wanted >= 0 and wanted < easm_compose_argument_count_spec(values)",
+)):
+    raise SystemExit("compose-span range helper lost its exact source-slice argument bound")
 if any(compact(fragment) not in reference_at_bounds_body for fragment in (
     "ghost def easm_compose_span_reference_at_bounds(text:sview,open:usize,close_offset:usize,wanted:i64)",
     "requires open < text.len",
@@ -233,8 +236,8 @@ if any(compact(fragment) not in reference_at_bounds_body for fragment in (
     "ensure not result.valid implies result.start == 0 and result.end == 0",
     "ensure result.valid implies result.start <= result.end",
     "ensure result.valid implies result.end <= text.len",
-    "ensure (wanted >= 0 and wanted < easm_compose_span_argument_count_at_offset(text, open, close_offset)) implies result.valid",
-    "return ComposeSpan{start: 0, end: 0, valid: false} if not (wanted >= 0 and wanted < easm_compose_span_argument_count_at_offset(text, open, close_offset))",
+    "ensure (wanted >= 0 and wanted < easm_compose_argument_count_spec(text[open + 1.usize():open + close_offset])) implies result.valid",
+    "return ComposeSpan{start: 0, end: 0, valid: false} if not easm_compose_span_wanted_in_range(text[open + 1.usize():open + close_offset], wanted)",
     "return easm_compose_span_reference_from(text[open + 1.usize():open + close_offset], open + 1.usize(), open + close_offset, 0, 0, 0, wanted)",
 )):
     raise SystemExit("named compose-span bounds helper lost its source-slice contracts")

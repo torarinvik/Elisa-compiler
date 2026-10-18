@@ -1,6 +1,7 @@
 """Source-bind and replay declaration-name position lookup proofs."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,10 +12,14 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check production and proof bindings without requiring the pinned proof product")
+ARGS = argument_parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 LOOKUP = ROOT / "src/semantic/declaration_name_position_lookup.elisa"
 SYMBOLS = ROOT / "src/semantic/symbols.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
@@ -75,25 +80,24 @@ expected_lookup = '''
 def declaration_name_position(annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_offset: u32, declaration_line: u32) -> Ast::Pos:
     ensure Ast::pos_equal(result, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
     can Abort.Panic:
-        index: mutable usize = 0
-        while index < annotations.count |index|:
-            decreases annotations.count - index
-            invariant index <= annotations.count
-            invariant Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
+        answer: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+        for reverse in 0..<annotations.count |answer|:
+            invariant reverse <= annotations.count
+            invariant Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, annotations.count - reverse))
+            assert reverse < annotations.count
+            index: usize = annotations.count - reverse - 1
+            assert index + 1 == annotations.count - reverse
+            assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1))
             annotation: Ast::EnumAnnotation = annotations[index]
             eligible: bool = annotation.owner == "__lsp_decl_name" and annotation.name == name and annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0)
             if eligible:
-                assert Ast::pos_equal(annotation.pos, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
-                return annotation.pos
-            next_index: usize = index + 1
-            assert next_index <= annotations.count
-            assert Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, next_index))
-            assert Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, next_index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
-            index <- next_index
-            assert Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
-        assert index == annotations.count
-        assert Ast::pos_equal(Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
-        return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+                assert Ast::pos_equal(annotation.pos, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index))
+                answer <- annotation.pos
+            else:
+                assert Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1))
+            assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index))
+        assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
+        return answer
 '''
 if compact(function_section(lookup_text, "declaration_name_position")) != compact(expected_lookup):
     raise SystemExit("production name-position scan no longer refines the recursive first-match model")
@@ -193,6 +197,12 @@ if compact(function_section(negative_text, "duplicate_exact_name_annotations_cho
     raise SystemExit("rejected control must claim the last position for duplicate exact matches")
 
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "positive_theorems": len(POSITIVE_NAMES),
+                      "false_claim_controls": len(NEGATIVE_NAMES),
+                      "proof_closure_files": len(source_closure)}, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

@@ -48,6 +48,16 @@ def require_ordered(body: str, fragments: tuple[str, ...], label: str) -> None:
 
 
 helper_text = HELPER.read_text()
+multiply_safety = compact(function_section(helper_text, "multiply_is_defined"))
+expected_multiply_safety = compact("""def multiply_is_defined(left: i64, right: i64) -> bool:
+            ensure left < 0 or right < 0 implies not result
+            ensure left >= 0 and right >= 0 implies result == (right == 0 or left <= (ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM / right if right > 0 else ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM))
+            return false if left < 0 or right < 0
+            return true if right == ElisaCoreIRArithmetic::ZERO
+            assert right > 0
+            return left <= ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM / right""")
+if multiply_safety != expected_multiply_safety:
+    raise SystemExit("CoreIR multiplication predicate no longer matches its signed-i64 range law")
 binary_safety = compact(function_section(helper_text, "binary_is_defined"))
 expected_binary_safety = compact("""def binary_is_defined(operator: i64, left: i64, right: i64) -> bool:
             ensure left < 0 or right < 0 implies not result
@@ -79,11 +89,11 @@ expected_wrapper = compact("""def scalar_i64_binary_is_defined(operator: I64Bina
             ensure left < 0 or right < 0 implies not result
             ensure operator == I64BinaryOperator.Add and left >= 0 and right >= 0 implies result == (left <= ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM - right)
             ensure operator == I64BinaryOperator.Subtract and left >= 0 and right >= 0 implies result == true
-            ensure operator == I64BinaryOperator.Multiply and left >= 0 and right >= 0 implies result == (right == 0 or left <= (ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM / right if right > 0 else ElisaCoreIRArithmetic::SIGNED_I64_MAXIMUM))
+            ensure operator == I64BinaryOperator.Multiply and left >= 0 and right >= 0 implies result == ElisaCoreIRScalarSafety::multiply_is_defined(left, right)
             ensure operator == I64BinaryOperator.Divide and left >= 0 and right >= 0 implies result == (right != 0)
             return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::ADD_GUARD_CODE, left, right) if operator == I64BinaryOperator.Add
             return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::SUBTRACT_GUARD_CODE, left, right) if operator == I64BinaryOperator.Subtract
-            return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::MULTIPLY_GUARD_CODE, left, right) if operator == I64BinaryOperator.Multiply
+            return ElisaCoreIRScalarSafety::multiply_is_defined(left, right) if operator == I64BinaryOperator.Multiply
             return ElisaCoreIRScalarSafety::binary_is_defined(ElisaCoreIRArithmetic::DIVIDE_GUARD_CODE, left, right) if operator == I64BinaryOperator.Divide
             return false""")
 if wrapper != expected_wrapper:
