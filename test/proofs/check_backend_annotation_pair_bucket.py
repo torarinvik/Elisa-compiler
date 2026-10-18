@@ -96,8 +96,10 @@ def annotation_pair_bucket(owner: sview, name: sview) -> usize can[Abort.Panic]:
     ensure result < ANNOTATION_PAIR_BUCKETS
     hash: mutable u64 = ANNOTATION_PAIR_HASH_OFFSET
     for offset in 0..<owner.len |hash, owner|:
+        invariant 0 <= offset
         invariant offset <= owner.len
         invariant hash == annotation_pair_hash_prefix(owner, offset, ANNOTATION_PAIR_HASH_OFFSET)
+        assert annotation_pair_hash_prefix(owner, offset + 1.usize(), ANNOTATION_PAIR_HASH_OFFSET) == ((hash ^ owner[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME)
         hash <- (hash ^ owner[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME
     assert hash == annotation_pair_hash_prefix(owner, owner.len, ANNOTATION_PAIR_HASH_OFFSET)
     owner_hash: u64 = hash
@@ -107,8 +109,10 @@ def annotation_pair_bucket(owner: sview, name: sview) -> usize can[Abort.Panic]:
     hash <- delimited_hash
     assert hash == annotation_pair_hash_prefix(name, 0.usize(), delimited_hash)
     for offset in 0..<name.len |hash, name, delimited_hash|:
+        invariant 0 <= offset
         invariant offset <= name.len
         invariant hash == annotation_pair_hash_prefix(name, offset, delimited_hash)
+        assert annotation_pair_hash_prefix(name, offset + 1.usize(), delimited_hash) == ((hash ^ name[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME)
         hash <- (hash ^ name[offset].u64()) * ANNOTATION_PAIR_HASH_PRIME
     assert hash == annotation_pair_hash_prefix(name, name.len, delimited_hash)
     assert hash == annotation_pair_hash_spec(owner, name)
