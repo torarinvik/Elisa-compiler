@@ -31,6 +31,9 @@ probes still resolve directly through `name_is_module`, `ancestor_names_module`,
 the cache and this counter. This fixture uses only bare same-module callees and
 contains no module-field or qualified-path expressions, so it does not measure
 those paths.
+Other direct `name_known` checks also remain outside `classification_chain_visits`,
+including `Expr.RegionNew`, value-block captures, and flow checks. Treat the metric
+as fused NameLookup-classifier rows only, not total resolver name-chain work.
 The semantic checker still walks function bodies, so these routing checks do not
 establish a compiler speedup. Production use requires a fresh source-matched paired
 run with repeatable end-to-end gains.
@@ -106,8 +109,9 @@ O(unique names × identity/path bytes) retained key data. The current source
 replaces that with a versioned `(module, name)` key; relevant declaration,
 visibility, and region changes are represented by the exact resolver-surface
 query input, and identity/options changes clear the session-local graph. Cold
-misses still construct the compact key once for evaluation and again for commit.
-This key compaction has not been build- or performance-qualified.
+misses reuse the encoded request-local key and input for commit after cold
+classification. This key compaction and scratch reuse have not been build- or
+performance-qualified.
 Keep `COMPLETE` and the pinned
 input hashes with results; `ABORTED.txt` marks incomplete runs whose partial
 timings must not be compared.

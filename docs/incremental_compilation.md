@@ -613,11 +613,11 @@ request context after collection, and the serial declaration-resolution walk che
 cached `(known, module_only)` result before scanning global symbol/member chains. Key
 schema 2 stores only current module and exact name; the session-local graph resets when
 identity or options change. After declarations, aliases, imports, and region annotations
-are collected, the full-check pipeline finalizes a collision-safe exact-spelling surface
-index. This prepass currently runs on every graph-active full check, including requests
-with no NameLookup reads, and costs O(symbols + members + regions). Building it on the
-first eligible global-name query could avoid setup for no-reference files; if explored,
-memoize failed finalization so unsupported surfaces do not repeat the prepass. The input
+are collected, the first eligible unbound name-classification read lazily builds a
+collision-safe exact-spelling surface index. Requests with no eligible reads skip the
+O(symbols + members + regions) pass; any request that reaches one still pays that setup.
+The request context memoizes the build attempt, including failure, so unsupported
+surfaces use the cold classifier without repeating the prepass. The input
 records total and non-module
 symbol counts, module presence, module-member row multiplicity, imported visibility,
 current-module membership, region-name presence, the `name_indexed` gate bit, and the
@@ -698,13 +698,16 @@ totals to exceed the prime request's same-request duplicate baseline, exposing
 aggregate prior-request reuse. It also asserts `direct_fact_count` is one per
 `bench_*` body, while the `zero-fact` workload asserts there are no direct facts.
 Both workloads compare complete non-telemetry transcripts and body-edit fact
-restores. Both graph modes report NameLookup classification-chain visits. That
-counter covers only the global symbol and module-member chains traversed by the
-fused classifier; it excludes direct qualified `Expr.Scope` probes through
+restores. Both graph modes report NameLookup `classification_chain_visits`. That
+counter covers only symbol/member rows visited by the fused NameLookup cold
+classifier. Direct `name_known` callers such as `Expr.RegionNew`, value-block
+captures, and flow checks, plus qualified `Expr.Scope` probes through
 `name_is_module`, `ancestor_names_module`, `two_part_names_module`, and
-`module_declares_member`. Lexical bound-name checks still run before the query;
+`module_declares_member`, are excluded; this is not total resolver name-chain work.
+Lexical bound-name checks still run before the query;
 region membership comes from the finalized surface on active queries and is scanned
-only on the cold fallback. The benchmark fixture has no locals, region names, or
+only on the cold fallback. Surface construction is lazy at the first eligible unbound
+read; a request with no such read skips the prepass, while one eligible read still pays it. The benchmark fixture has no locals, region names, or
 qualified paths and does not measure those costs.
 For `call-facts`, the runner requires positive cold visits on the graph-on prime request,
 then fewer visits than graph-off on exact-repeat and body-edit requests. The prime request
@@ -958,8 +961,8 @@ findings, then still runs current semantic checking, LLVM IR generation, optimiz
 and artifact emission. The query graph reuses `SourceInput` and
 `FunctionBodyFacts` results and, when `ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1`, can
 cache resolver `NameLookup` classification for `Expr.Ident`. A body hit restores
-canonical facts into the current snapshot; a name hit skips the global symbol-chain
-classification on that resolver walk. No source-matched retained-edit benchmark
+canonical facts into the current snapshot; a name hit skips the fused classifier's
+symbol/member-chain walk for that NameLookup probe. No source-matched retained-edit benchmark
 qualifies this graph path yet.
 The host does not reuse parse trees, other semantic query kinds, LLVM modules, or
 native objects. LLVM object, IR, bitcode, executable, wasm, and Python

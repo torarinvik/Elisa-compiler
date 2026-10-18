@@ -467,7 +467,7 @@ def main() -> int:
         "semantic_execution_mode": "default parallel mode; ELISA_SEMANTIC_SERIAL is cleared for each arm",
         "warm_measurement": "body-edit requests only; prime and exact-repeat are reported separately per workload",
         "name_lookup_hit_semantics": "call-facts uses one unique callee per body; warm raw hits must exceed the prime same-request duplicate baseline, exposing aggregate prior-request reuse",
-        "name_lookup_chain_visit_semantics": "both modes count resolver classification hash-chain visits; warm reductions can still include same-request duplicate callee hits",
+        "name_lookup_chain_visit_semantics": "both modes count only symbol/member hash-chain rows visited by the fused NameLookup cold classifier; direct name_known callers (including RegionNew, value-block captures, and flow checks) and qualified Expr.Scope probes are excluded; warm reductions can include same-request duplicate reads and do not represent all resolver name-chain work",
         "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body; zero-fact expects no direct facts",
         "timing_instrumentation": "ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 enables per-row name-classification chain counters in timed arms; graph-off visits more rows, so ratios include asymmetric telemetry overhead and may overstate graph-on gains; timings are not production-equivalent until a counter-disabled timing arm exists",
         "diagnostic_parity": "all per-request compiler transcript lines after timing/cache instrumentation removal",
