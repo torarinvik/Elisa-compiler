@@ -1,4 +1,5 @@
 """Admit the signed multiplication overflow guards in Semantic's constant arithmetic."""
+import argparse
 import hashlib
 import json
 import os
@@ -8,12 +9,14 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true")
+args = argument_parser.parse_args()
+
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
-MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
-SOURCE = ROOT / "src/semantic/check_ensure_strict.elisa"
+SOURCE = ROOT / "src/semantic/linear_checked_arithmetic.elisa"
 INDEX_FOLD = ROOT / "src/semantic/check_index_out_of_bounds.elisa"
 POSITIVE = HERE / "linear_mul_overflow.elisa"
 NEGATIVE = HERE / "linear_mul_overflow_rejected.elisa"
@@ -50,29 +53,33 @@ if "constI64_MAX:i64=9223372036854775807" not in positive_text or \
     raise SystemExit("proof bounds must use named constants anchored to the source i64 extrema")
 
 multiply = compact(function_section(source_text, "linear_mul_safe"))
+safe_expression = compact("""(
+                left == 0 or right == 0 or left == 1 or right == 1
+                or (left == -1 and right != linear_i64_min())
+                or (right == -1 and left != linear_i64_min())
+                or (left > 0 and right > 0 and left <= linear_i64_max() / right)
+                or (left > 0 and right < 0 and right >= linear_i64_min() / left)
+                or (left < 0 and right > 0 and left >= linear_i64_min() / right)
+                or (left < 0 and right < 0 and left >= linear_i64_max() / right)
+            )""")
+guard = compact(function_section(source_text, "linear_mul_guard"))
+if "ensureresult==" + safe_expression not in guard or "return" + safe_expression not in guard:
+    raise SystemExit("multiplication guard must contract and return the exact signed-i64 safety predicate")
+if "ensureresult.known==linear_mul_guard(left,right)" not in multiply or \
+        "ifnotlinear_mul_guard(left,right):" not in multiply:
+    raise SystemExit("multiplication must branch directly on its contract-bearing safety guard")
 ordered_guards = (
-    "return(true,0)ifleft==0orright==0",
-    "return(true,right)ifleft==1",
-    "return(true,left)ifright==1",
-    "ifleft==-1:",
-    "return(false,0)ifright==linear_i64_min()",
-    "return(true,0-right)",
-    "ifright==-1:",
-    "return(false,0)ifleft==linear_i64_min()",
-    "return(true,0-left)",
-    "ifleft>0:",
-    "return(false,0)ifright>0andleft>linear_i64_max()/right",
-    "return(false,0)ifright<0andright<linear_i64_min()/left",
-    "else:",
-    "return(false,0)ifright>0andleft<linear_i64_min()/right",
-    "return(false,0)ifright<0andleft<linear_i64_max()/right",
+    "ifnotlinear_mul_guard(left,right):return(false,0)",
     "return(true,left*right)",
 )
-guard_positions = [multiply.find(fragment) for fragment in ordered_guards]
+guard_positions = []
+search_from = 0
+for fragment in ordered_guards:
+    position = multiply.find(fragment, search_from)
+    guard_positions.append(position)
+    search_from = position + len(fragment) if position >= 0 else search_from
 if any(position < 0 for position in guard_positions) or guard_positions != sorted(guard_positions):
-    raise SystemExit("multiplication must handle zero/units, reject MIN * -1, guard all sign quadrants, then return the product")
-if any(multiply.count(fragment) != 1 for fragment in ordered_guards):
-    raise SystemExit("multiplication guard branches must occur exactly once")
+    raise SystemExit("multiplication must return literal safety flags on both guard branches")
 
 arithmetic_dispatch = compact(function_section(source_text, "linear_arith_safe"))
 if "returnlinear_mul_safe(left,right)ifoperator==TokenKind.Star" not in arithmetic_dispatch:
@@ -132,6 +139,13 @@ negative_text = NEGATIVE.read_text()
 for name, shape in negative_shapes.items():
     if compact(shape) not in compact(function_section(negative_text, name)):
         raise SystemExit(f"{name} no longer challenges an overflowing sign-quadrant boundary")
+
+if args.source_only:
+    print("source_bound=True multiplication_quadrants=4 false_controls=6")
+    raise SystemExit(0)
+
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 
 try:
     product = require_current_product(BIN, PROVER)

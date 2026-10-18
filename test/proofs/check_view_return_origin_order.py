@@ -1,4 +1,5 @@
 """Admit the production view-return-origin bytewise ordering proof."""
+import argparse
 import hashlib
 import json
 import os
@@ -7,12 +8,14 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true")
+args = argument_parser.parse_args()
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = ROOT.parent / "elisa-proof"
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
-MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SORTED = ROOT / "src/semantic/view_return_origins_sorted.elisa"
 CONSTANTS = ROOT / "src/semantic/view_return_origin_constants.elisa"
 ORIGIN_BUILDER = ROOT / "src/semantic/view_return_origins.elisa"
@@ -55,6 +58,10 @@ required_source = (
     "ghost def vro_text_compare_reference_from(",
     "requires position <= left.len and position <= right.len",
     "decreases (left.len if left.len < right.len else right.len) - position",
+    "ensure (position == left.len or position == right.len) implies result == (VRO_COMPARE_LESS if left.len < right.len else VRO_COMPARE_GREATER if left.len > right.len else VRO_COMPARE_EQUAL)",
+    "ensure position < left.len and position < right.len and left[position] < right[position] implies result == VRO_COMPARE_LESS",
+    "ensure position < left.len and position < right.len and left[position] > right[position] implies result == VRO_COMPARE_GREATER",
+    "ensure position < left.len and position < right.len and left[position] == right[position] implies result == vro_text_compare_reference_from(left, right, position + VRO_BYTE_STEP)",
     "return VRO_COMPARE_LESS if left[position] < right[position]",
     "return VRO_COMPARE_GREATER if left[position] > right[position]",
     "ensure result == vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION)",
@@ -130,6 +137,13 @@ if "VRO_COMPARE_LESS" not in positive or "VRO_COMPARE_EQUAL" not in positive:
 for name in negative_names:
     if f"def {name}(" not in negative:
         raise SystemExit(f"negative comparator control missing: {name}")
+
+if args.source_only:
+    print("source_bound=True comparator_lemmas=2 negative_controls=4")
+    raise SystemExit(0)
+
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 
 try:
     product_manifest = require_current_product(BIN, PROVER)

@@ -69,11 +69,19 @@ ghost def contains_from(lines: darray[u32]&, target_line: u32, index: usize) -> 
 expected_scan = '''
 def contains(lines: darray[u32]&, target_line: u32) -> bool:
     ensure result == contains_from(lines, target_line, 0)
-    for index in 0..<lines.count |index|:
+    found: mutable bool = false
+    for index in 0..<lines.count |found|:
         invariant index <= lines.count
-        invariant contains_from(lines, target_line, index) == contains_from(lines, target_line, 0)
-        return true if lines[index] == target_line
-    return false
+        invariant contains_from(lines, target_line, 0) == (found or contains_from(lines, target_line, index))
+        assert contains_from(lines, target_line, index) == (
+            lines[index] == target_line or contains_from(lines, target_line, index + 1.usize())
+        )
+        if lines[index] == target_line:
+            found <- true
+        assert contains_from(lines, target_line, 0) == (found or contains_from(lines, target_line, index + 1.usize()))
+    assert contains_from(lines, target_line, lines.count) == false
+    assert contains_from(lines, target_line, 0) == found
+    return found
 '''
 if compact(function_section(source_text, "contains_from")) != compact(expected_model):
     raise SystemExit("recursive bound-marker model changed without updating its proof")

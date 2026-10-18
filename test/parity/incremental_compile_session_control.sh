@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Keep bytewise parity checks independent of profiling and trace settings inherited from the caller.
+unset ELISA_STAGE1_TIMINGS ELISA_STAGE1_TRACE
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/parity/test_incremental_compile_session_control.py"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 
@@ -12,6 +15,7 @@ REPLIES="$WORK/replies"
 SERVER_LOG="$WORK/server.stderr"
 SERVER_PID=""
 LAST_REPORT=""
+LAST_REQUEST_STDERR=""
 
 cleanup() {
     if [[ -n "$SERVER_PID" ]]; then
@@ -74,8 +78,9 @@ read_status() {
 send_compile() {
     local expected_status="$1"
     local expected_session="$2"
-    local reports_before reports_after report_line
+    local reports_before reports_after report_line lines_before lines_after
     reports_before="$(grep -Ec '^incremental-ga-cache:' "$SERVER_LOG" || true)"
+    lines_before="$(wc -l < "$SERVER_LOG")"
     printf 'compile\n' >&3 || fail "could not send compile request"
     read_status "$expected_status"
     report_line="$(grep -E '^incremental-ga-cache:.* session=(hit|edit|miss|off)([[:space:]]|$)' "$SERVER_LOG" | tail -n 1 || true)"
@@ -84,6 +89,15 @@ send_compile() {
     [[ "$report_line" =~ session=$expected_session([[:space:]]|$) ]] \
         || fail "expected session=$expected_session, got: $report_line"
     LAST_REPORT="$report_line"
+    # The cache report precedes backend work. The status, rather than that
+    # report, completes the request and therefore delimits its diagnostic stream.
+    lines_after="$(wc -l < "$SERVER_LOG")"
+    LAST_REQUEST_STDERR="$WORK/request-$reports_after.stderr"
+    : >"$LAST_REQUEST_STDERR"
+    if (( lines_after > lines_before )); then
+        sed -n "$((lines_before + 1)),${lines_after}p" "$SERVER_LOG" \
+            | sed '/^incremental-ga-cache:/d' >"$LAST_REQUEST_STDERR"
+    fi
 }
 
 compare_object() {
@@ -141,7 +155,7 @@ compare_object cold-edited
 # an exact repeat, and recover after a subsequent valid edit.
 cat >"$SOURCE" <<'EOF'
 def helper() -> i64:
-    return 40
+    return unknown_helper
 
 def main() -> i64:
     return unknown_name
@@ -150,22 +164,26 @@ invalid_status=0
 env -u ELISA_STAGE1_PERMISSIVE -u ELISA_STAGE1_INCREMENTAL_CACHE_DIR -u ELISA_STAGE1_INCREMENTAL_CACHE_REPORT \
     "$STAGE1" -emit obj -O0 -o "$WORK/invalid-cold.o" "$SOURCE" >"$WORK/invalid-cold.stdout" 2>"$WORK/invalid-cold.stderr" || invalid_status=$?
 [[ "$invalid_status" -ne 0 ]] || fail "cold compile unexpectedly accepted the unresolved-name source"
-cold_unknown_diagnostics="$(grep -F 'unknown_name' "$WORK/invalid-cold.stderr" || true)"
-[[ -n "$cold_unknown_diagnostics" ]] || fail "cold compile did not report the unresolved name"
-cold_unknown_count="$(grep -Fc 'unknown_name' "$WORK/invalid-cold.stderr" || true)"
-[[ "$cold_unknown_count" -gt 0 ]] || fail "cold unresolved-name diagnostic count was empty"
+cp "$WORK/invalid-cold.stderr" "$WORK/invalid-cold.diagnostics"
+[[ -s "$WORK/invalid-cold.diagnostics" ]] || fail "cold compile did not emit diagnostics"
+grep -Fq 'unknown_helper' "$WORK/invalid-cold.diagnostics" \
+    || fail "cold compile did not report the helper's unresolved name"
+grep -Fq 'unknown_name' "$WORK/invalid-cold.diagnostics" \
+    || fail "cold compile did not report the entry point's unresolved name"
 
 send_compile 1 edit
-first_warm_unknown_count="$(grep -Fc 'unknown_name' "$SERVER_LOG" || true)"
-first_warm_unknown_diagnostics="$(grep -F 'unknown_name' "$SERVER_LOG" | tail -n "$cold_unknown_count" || true)"
-[[ "$first_warm_unknown_count" -eq "$cold_unknown_count" && "$first_warm_unknown_diagnostics" == "$cold_unknown_diagnostics" ]] \
-    || fail "first warm diagnostics differ from cold: cold_count=$cold_unknown_count warm_count=$first_warm_unknown_count"
+if ! cmp -s "$WORK/invalid-cold.diagnostics" "$LAST_REQUEST_STDERR"; then
+    echo "incremental compile-session control FAILED: first warm diagnostics differ from cold" >&2
+    diff -u "$WORK/invalid-cold.diagnostics" "$LAST_REQUEST_STDERR" >&2 || true
+    exit 1
+fi
 
 send_compile 1 hit
-two_warm_unknown_count="$(grep -Fc 'unknown_name' "$SERVER_LOG" || true)"
-second_warm_unknown_diagnostics="$(grep -F 'unknown_name' "$SERVER_LOG" | tail -n "$cold_unknown_count" || true)"
-[[ "$two_warm_unknown_count" -eq "$((cold_unknown_count * 2))" && "$second_warm_unknown_diagnostics" == "$cold_unknown_diagnostics" ]] \
-    || fail "repeated warm diagnostics differ from cold: expected_count=$((cold_unknown_count * 2)) got=$two_warm_unknown_count"
+if ! cmp -s "$WORK/invalid-cold.diagnostics" "$LAST_REQUEST_STDERR"; then
+    echo "incremental compile-session control FAILED: repeated warm diagnostics differ from cold" >&2
+    diff -u "$WORK/invalid-cold.diagnostics" "$LAST_REQUEST_STDERR" >&2 || true
+    exit 1
+fi
 
 write_source 42
 cold_object cold-recovered

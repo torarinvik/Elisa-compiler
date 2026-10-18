@@ -236,22 +236,28 @@ subtract_positions = [semantic_subtract.find(fragment) for fragment in subtract_
 if any(position < 0 for position in subtract_positions) or subtract_positions != sorted(subtract_positions):
     raise SystemExit("backend subtraction guard no longer matches the proved semantic overflow conditions")
 
+semantic_safe_expression = compact("""(
+    left == 0 or right == 0 or left == 1 or right == 1
+    or (left == -1 and right != linear_i64_min())
+    or (right == -1 and left != linear_i64_min())
+    or (left > 0 and right > 0 and left <= linear_i64_max() / right)
+    or (left > 0 and right < 0 and right >= linear_i64_min() / left)
+    or (left < 0 and right > 0 and left >= linear_i64_min() / right)
+    or (left < 0 and right < 0 and left >= linear_i64_max() / right)
+)""")
 semantic_multiply = compact(function_body(semantic_text, "linear_mul_safe"))
 multiply_guards = (
-    "return(true,0)ifleft==0orright==0",
-    "return(true,right)ifleft==1",
-    "return(true,left)ifright==1",
-    "return(true,0-right)ifleft==-1andright!=linear_i64_min()",
-    "return(true,0-left)ifright==-1andleft!=linear_i64_min()",
-    "ifleft>0:",
-    "return(true,left*right)ifright>0andleft<=linear_i64_max()/right",
-    "return(true,left*right)ifright<0andright>=linear_i64_min()/left",
-    "else:",
-    "return(true,left*right)ifright>0andleft>=linear_i64_min()/right",
-    "return(true,left*right)ifright<0andleft>=linear_i64_max()/right",
-    "return(false,0)",
+    "ensureresult.known==" + semantic_safe_expression,
+    "safe:bool=" + semantic_safe_expression,
+    "return(safe,0)ifnotsafe",
+    "return(safe,left*right)",
 )
-multiply_positions = [semantic_multiply.find(fragment) for fragment in multiply_guards]
+multiply_positions = []
+search_from = 0
+for fragment in multiply_guards:
+    position = semantic_multiply.find(fragment, search_from)
+    multiply_positions.append(position)
+    search_from = position + len(fragment) if position >= 0 else search_from
 if any(position < 0 for position in multiply_positions) or multiply_positions != sorted(multiply_positions):
     raise SystemExit("backend multiplication guard no longer matches the proved semantic overflow conditions")
 

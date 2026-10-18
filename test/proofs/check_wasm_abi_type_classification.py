@@ -1,4 +1,5 @@
 """Admit the source-linked proof of WASM export type classification."""
+import argparse
 import hashlib
 import json
 import os
@@ -7,13 +8,14 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true")
+args = argument_parser.parse_args()
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
-MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
-MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 POSITIVE = HERE / "wasm_abi_type_classification.elisa"
 NEGATIVE = HERE / "wasm_abi_type_classification_rejected.elisa"
 SCALAR = ROOT / "src/driver/wasm_scalar_wasm_type.elisa"
@@ -36,17 +38,17 @@ expected_fragments = (
     "constWASM_ABI_NULLABLE_SUFFIX:u8=63",
     "constWASM_ABI_POINTER_SUFFIX:u8=38",
     "return(\"\",\"\")",
-    "(\"string\",\"i32\")returniftype_text==\"cstr\"",
-    "(\"pointer\",\"i32\")returnifhas_suffix(type_text,WASM_ABI_POINTER_SUFFIX)",
-    "(\"scalar\",scalar)returnifscalar!=\"\"",
-    "(\"scalar\",\"i32\")returnifcomponent",
+    "return(\"string\",\"i32\")iftype_text==\"cstr\"",
+    "return(\"pointer\",\"i32\")ifhas_suffix(type_text,WASM_ABI_POINTER_SUFFIX)",
+    "return(\"scalar\",scalar)ifscalar!=\"\"",
+    "return(\"scalar\",\"i32\")ifcomponent",
     "return(\"\",\"\")",
 )
 if any(fragment not in classifier_text for fragment in expected_fragments):
     raise SystemExit("production WASM ABI classifier no longer matches its closed case specification")
 for contract in (
     'ensure(result.binding=="string")== (not has_suffix(type_text,WASM_ABI_NULLABLE_SUFFIX) and type_text=="cstr")',
-    'ensure(result.binding=="pointer")== (not has_suffix(type_text,WASM_ABI_NULLABLE_SUFFIX) and has_suffix(type_text,WASM_ABI_POINTER_SUFFIX))',
+    'ensure(result.binding=="pointer")== (not has_suffix(type_text,WASM_ABI_NULLABLE_SUFFIX) and type_text!="cstr" and has_suffix(type_text,WASM_ABI_POINTER_SUFFIX))',
     'ensure(result.binding=="scalar")== (not has_suffix(type_text,WASM_ABI_NULLABLE_SUFFIX) and type_text!="cstr" and not has_suffix(type_text,WASM_ABI_POINTER_SUFFIX) and (WasmScalarWasmType::is_scalar_type_name(type_text) or component))',
     'ensure(result.binding=="")== (has_suffix(type_text,WASM_ABI_NULLABLE_SUFFIX) or (type_text!="cstr" and not has_suffix(type_text,WASM_ABI_POINTER_SUFFIX) and not WasmScalarWasmType::is_scalar_type_name(type_text) and not component))',
     'ensure(result.wasm_type=="i32")== (result.binding=="string" or result.binding=="pointer" or (result.binding=="scalar" and (type_text=="i8" or type_text=="u8" or type_text=="i16" or type_text=="u16" or type_text=="i32" or type_text=="u32" or type_text=="int" or type_text=="isize" or type_text=="usize" or type_text=="uintptr" or type_text=="bool" or not WasmScalarWasmType::is_scalar_type_name(type_text))))',
@@ -92,6 +94,14 @@ for declaration in (
 ):
     if f"def{declaration}(" not in positive_text:
         raise SystemExit(f"positive proof lost {declaration}")
+
+if args.source_only:
+    print("source_bound=True wasm_abi_cases=5")
+    raise SystemExit(0)
+
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
+MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 
 try:
     product_manifest = require_current_product(BIN, PROVER)

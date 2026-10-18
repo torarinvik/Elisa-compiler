@@ -343,7 +343,17 @@ def selected_external_linker(clang, clang_artifact, config_libdir, link_flags, p
     developer_dir = effective_developer_dir(host_os)
     executable_link_flags = os.environ.get("ELISA_LINK_EXE_FLAGS", "")
     path_env = os.environ.get("PATH", "")
+    probe_env = os.environ.copy()
+    if developer_dir:
+        probe_env["DEVELOPER_DIR"] = developer_dir
+    else:
+        probe_env.pop("DEVELOPER_DIR", None)
+    # Hash the exact inherited probe environment, without persisting its values.
+    probe_env_digest = hashlib.sha256(
+        json.dumps(probe_env, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     probe_environment = {
+        "environment_sha256": probe_env_digest,
         "host_os": host_os,
         "developer_dir": developer_dir,
         "path": path_env,
@@ -380,11 +390,6 @@ def selected_external_linker(clang, clang_artifact, config_libdir, link_flags, p
             f"-L{config_libdir}", *shlex.split(link_flags),
             *shlex.split(executable_link_flags), f"-Wl,-rpath,{config_libdir}",
         ]
-        probe_env = os.environ.copy()
-        if developer_dir:
-            probe_env["DEVELOPER_DIR"] = developer_dir
-        else:
-            probe_env.pop("DEVELOPER_DIR", None)
         try:
             result = subprocess.run(
                 probe_args, capture_output=True, text=True, env=probe_env, check=True
@@ -402,15 +407,9 @@ def selected_external_linker(clang, clang_artifact, config_libdir, link_flags, p
             if not argv or Path(argv[0]).name not in linker_names:
                 continue
             linker_command = argv[0]
-            # Clang compiles the probe's empty C input to a fresh temporary object
-            # (`<tmp>/null-<random>.o`) on every run. Record a stable placeholder so
-            # the toolchain fingerprint taken before and after a seed can match.
-            linker_argv = [
-                "<linker-probe-object>"
-                if re.fullmatch(r"null-[0-9a-zA-Z]+\.o", Path(arg).name) and Path(arg).parent != Path(".")
-                else arg
-                for arg in argv
-            ]
+            # Clang's random temporary object path is normalized after linker
+            # selection so the fingerprint stays stable across probe runs.
+            linker_argv = argv
             break
         if linker_command is None:
             diagnostic = (result.stderr or result.stdout).strip().splitlines()
@@ -833,7 +832,16 @@ def check_inputs(root, expected_inputs):
         exact_toolchain=True,
         previous_inputs=expected_inputs,
     )
-    changed = [key for key, value in current.items() if expected_inputs.get(key) != value]
+    changed = [
+        key
+        for key, value in current.items()
+        if (
+            toolchain_content_view(expected_inputs.get(key))
+            != toolchain_content_view(value)
+            if key in {"llvm_toolchain", "seed_configuration"}
+            else expected_inputs.get(key) != value
+        )
+    ]
     if changed:
         print(
             "Stage1 inputs changed during seed: " + ", ".join(changed),

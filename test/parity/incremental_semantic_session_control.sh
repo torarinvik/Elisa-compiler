@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Keep bytewise parity checks independent of profiling and trace settings inherited from the caller.
+unset ELISA_STAGE1_TIMINGS ELISA_STAGE1_TRACE
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"

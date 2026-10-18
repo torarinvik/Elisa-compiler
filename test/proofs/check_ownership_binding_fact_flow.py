@@ -31,7 +31,7 @@ inputs.extend(source_include_closure([proof, rejected]))
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def compact(source):
-    return "".join(source.split())
+    return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
 
 binding_flow_source = compact(semantic_sources[2].read_text())
 unknown_fact_contract = (
@@ -49,12 +49,20 @@ if unknown_fact_contract not in binding_flow_source:
 
 unknown_vector_contract = (
     "defownership_bindings_unknown(facts:mutabledarray[OwnershipBindingFact]&,reachable:bool)->voidcan[Abort.Panic]:"
-    "ensureforallfact_indexin0..<facts.count:notfacts[fact_index].known"
+    "ensurefacts.count==0or(forallfact_indexin0..<facts.count:notfacts[fact_index].known"
+    "andfacts[fact_index].reachable==reachable"
+    "andfacts[fact_index].may_live==reachable"
+    "andfacts[fact_index].may_consumed==reachable)"
+    "fact_count:usize=facts.count"
+    "index:mutableusize=0"
+    "assertfacts.count==fact_count"
+    "assertindex==0"
+    "assertforallfact_indexin0..<index:notfacts[fact_index].known"
     "andfacts[fact_index].reachable==reachable"
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
-    "fact_count:usize=facts.count"
-    "forindexin0..<fact_count|facts,fact_count,reachable|:"
+    "whileindex<fact_count|facts,index,fact_count,reachable|:"
+    "decreasesfact_count-index"
     "invariantindex<=fact_count"
     "invariantfacts.count==fact_count"
     "invariantforallfact_indexin0..<index:notfacts[fact_index].known"
@@ -63,6 +71,7 @@ unknown_vector_contract = (
     "andfacts[fact_index].may_consumed==reachable"
     "fact:OwnershipBindingFact=facts[index]"
     "facts[index]<-OwnershipBindingFact{binding_id:fact.binding_id,reachable:reachable,known:false,may_live:reachable,may_consumed:reachable}"
+    "assertfacts.count==fact_count"
     "assertnotfacts[index].known"
     "assertfacts[index].reachable==reachable"
     "assertfacts[index].may_live==reachable"
@@ -71,11 +80,18 @@ unknown_vector_contract = (
     "andfacts[fact_index].reachable==reachable"
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
+    "index<-index+1"
+    "assertindex<=fact_count"
     "assertfacts.count==fact_count"
-    "assertforallfact_indexin0..<facts.count:notfacts[fact_index].known"
+    "assertforallfact_indexin0..<index:notfacts[fact_index].known"
     "andfacts[fact_index].reachable==reachable"
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
+    "assertfacts.count==fact_count"
+    "assertfacts.count==0or(forallfact_indexin0..<facts.count:notfacts[fact_index].known"
+    "andfacts[fact_index].reachable==reachable"
+    "andfacts[fact_index].may_live==reachable"
+    "andfacts[fact_index].may_consumed==reachable)"
 )
 if unknown_vector_contract not in binding_flow_source:
     raise SystemExit("the ownership fallback no longer proves its all-rows loop invariant")

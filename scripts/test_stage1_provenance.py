@@ -20,6 +20,36 @@ stage1_provenance.source_revision = lambda _root: "test-revision"
 # Stage1 provenance requires LLVM_CONFIG and records its selected backend separately.
 stage1_provenance.llvm_toolchain_fingerprint = lambda _previous=None, exact=False: None
 
+# A volatile probe memoization key must not make a seed look like its real toolchain
+# changed; concrete linker identity and artifact content must remain part of the gate.
+probe_key_inputs = {
+    "llvm_toolchain": {
+        "external_linker": {
+            "path": "/usr/bin/ld",
+            "artifact_sha256": "a" * 64,
+            "linker_probe_cache_key": "before",
+        }
+    },
+    "seed_configuration": {"mode": "seed"},
+    "source_tree_sha256": "b" * 64,
+    "build_recipe_sha256": "c" * 64,
+}
+probe_key_current = {
+    **probe_key_inputs,
+    "llvm_toolchain": {
+        "external_linker": {
+            "path": "/usr/bin/ld",
+            "artifact_sha256": "a" * 64,
+            "linker_probe_cache_key": "after",
+        }
+    },
+}
+with patch.object(stage1_provenance, "input_fingerprint", return_value=probe_key_current):
+    assert stage1_provenance.check_inputs(".", probe_key_inputs) == 0
+probe_key_current["llvm_toolchain"]["external_linker"]["artifact_sha256"] = "d" * 64
+with patch.object(stage1_provenance, "input_fingerprint", return_value=probe_key_current):
+    assert stage1_provenance.check_inputs(".", probe_key_inputs) == 2
+
 # Compiler filenames are not stage provenance. Recognize the Go Stage0 build identity,
 # accept a hash-matched Stage1 manifest, and reject ambiguous binaries instead of guessing.
 with tempfile.TemporaryDirectory() as directory:

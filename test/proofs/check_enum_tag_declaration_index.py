@@ -103,10 +103,9 @@ def indexed_enum_tag_count(names: darray[sview]&, counts: darray[i64]&, name: sv
                 assert counts[index] == enum_tag_count_from(names, counts, name, 0)
                 return counts[index]
             assert names[index] != name
-            next_index: usize = index + 1
-            assert next_index <= names.count and next_index <= counts.count
-            assert enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, next_index)
-            assert enum_tag_count_from(names, counts, name, next_index) == enum_tag_count_from(names, counts, name, 0)
+            assert index + 1 <= names.count and index + 1 <= counts.count
+            assert enum_tag_count_from(names, counts, name, index) == enum_tag_count_from(names, counts, name, index + 1)
+            assert enum_tag_count_from(names, counts, name, index + 1) == enum_tag_count_from(names, counts, name, 0)
         assert scan_count == names.count or scan_count == counts.count
         assert enum_tag_count_from(names, counts, name, scan_count) == 0
         assert enum_tag_count_from(names, counts, name, 0) == 0
@@ -119,6 +118,7 @@ expected_reference = '''
 ghost def enum_tag_count_from(names: darray[sview]&, counts: darray[i64]&, name: sview, index: usize) -> i64:
     requires index <= names.count
     decreases names.count - index
+    ensure index < names.count and index < counts.count and names[index] != name implies result == enum_tag_count_from(names, counts, name, index + 1)
     return 0 if:
         index == names.count
         index >= counts.count

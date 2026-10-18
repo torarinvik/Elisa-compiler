@@ -40,47 +40,328 @@ extend Semantic:
                 TokenKind.PlusEq | TokenKind.MinusEq | TokenKind.StarEq | TokenKind.SlashEq | TokenKind.PercentEq | TokenKind.CaretEq | TokenKind.PipeEq | TokenKind.AmpEq | TokenKind.LShiftEq | TokenKind.RShiftEq | TokenKind.QAssign -> true
                 _ -> false
 
+        def gp_locals_copy(source: darray[sview]&, target: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for name in source |target|:
+                    target.push(name)
+
+        def gp_condition_target_bindings(expression: Ast::Expr, locals: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        locals.push(name)
+                    Expr.Call(_, arguments, _, _) | Expr.Array(arguments, _):
+                        for argument in arguments |locals|:
+                            gp_condition_target_bindings(argument, locals)
+                    Expr.Construct(_, fields, _):
+                        for field in fields |locals|:
+                            gp_condition_target_bindings(field.value, locals)
+                    _:
+                        pass
+
+        # Match the resolver's truthy-condition bindings: both sides of `and` bind,
+        # `or` only binds names present on both sides, and `is`/`as` bind their target.
+        def gp_condition_bindings(condition: Ast::Expr, locals: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        gp_condition_bindings(inner, locals)
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And:
+                            gp_condition_bindings(left, locals)
+                            gp_condition_bindings(right, locals)
+                        elif operator == TokenKind.Or:
+                            left_names: mutable darray[sview] = []
+                            right_names: mutable darray[sview] = []
+                            gp_condition_bindings(left, left_names)
+                            gp_condition_bindings(right, right_names)
+                            for candidate in left_names |right_names, locals|:
+                                locals.push(candidate) if any other in right_names where other == candidate
+                        elif operator == TokenKind.Is or operator == TokenKind.As:
+                            gp_condition_target_bindings(right, locals)
+                    _:
+                        pass
+
+        # The parser stores extra comprehension/query binders in SymbolTable annotations
+        # keyed by the comprehension head line. Keep them in the expression's lexical
+        # scope only; pre-collecting them at function scope would hide globals elsewhere.
+        def gp_query_binders_add(line: u32, table: SymbolTable&, locals: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                limit: mutable usize = table.query_binder_lines.count
+                limit <- table.query_binder_names.count if table.query_binder_names.count < limit
+                for index in 0..<limit |table, locals|:
+                    locals.push(table.query_binder_names[index]) if table.query_binder_lines[index] == line
+
+        # Resolver's deliberately narrow filter-pattern rule: a dotted constructor call
+        # with only bare identifier arguments is pattern syntax, so its argument names bind
+        # instead of being value reads or calls.
+        def gp_is_bare_pattern_filter(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        match callee:
+                            Expr.Field(head, _, _):
+                                match head:
+                                    Expr.Ident(_, _):
+                                        return false if arguments.count == 0
+                                        for argument in arguments:
+                                            match argument:
+                                                Expr.Ident(_, _):
+                                                    pass
+                                                _:
+                                                    return false
+                                        return true
+                                    _:
+                                        pass
+                            _:
+                                pass
+                    _:
+                        pass
+                return false
+
+        # Walk condition operands with the same binder flow as the resolver: `and` exposes
+        # left-side bindings to the right, `or` exposes only the intersection afterward,
+        # and an `is`/`as` target is syntax that binds names rather than a value expression.
+        def gp_condition_reads(condition: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        return gp_condition_reads(inner, globals, locals, table)
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And:
+                            return true if gp_condition_reads(left, globals, locals, table)
+                            return gp_condition_reads(right, globals, locals, table)
+                        elif operator == TokenKind.Or:
+                            left_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, left_locals)
+                            left_reads: bool = gp_condition_reads(left, globals, left_locals, table)
+                            right_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, right_locals)
+                            right_reads: bool = gp_condition_reads(right, globals, right_locals, table)
+                            gp_condition_bindings(condition, locals)
+                            return left_reads or right_reads
+                        elif operator == TokenKind.Is or operator == TokenKind.As:
+                            return true if gp_expression_reads(left, globals, locals, table)
+                            gp_condition_target_bindings(right, locals)
+                            return false
+                        else:
+                            return gp_expression_reads(left, globals, locals, table) or gp_expression_reads(right, globals, locals, table)
+                    _:
+                        return gp_expression_reads(condition, globals, locals, table)
+
+        def gp_filter_reads(condition: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And and gp_is_bare_pattern_filter(left):
+                            gp_condition_target_bindings(left, locals)
+                            return gp_condition_reads(right, globals, locals, table)
+                    _:
+                        pass
+                if gp_is_bare_pattern_filter(condition):
+                    gp_condition_target_bindings(condition, locals)
+                    return false
+                return gp_condition_reads(condition, globals, locals, table)
+
+        def gp_condition_writes(condition: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        return gp_condition_writes(inner, globals, locals, table)
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And:
+                            return true if gp_condition_writes(left, globals, locals, table)
+                            return gp_condition_writes(right, globals, locals, table)
+                        elif operator == TokenKind.Or:
+                            left_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, left_locals)
+                            left_writes: bool = gp_condition_writes(left, globals, left_locals, table)
+                            right_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, right_locals)
+                            right_writes: bool = gp_condition_writes(right, globals, right_locals, table)
+                            gp_condition_bindings(condition, locals)
+                            return left_writes or right_writes
+                        elif operator == TokenKind.Is or operator == TokenKind.As:
+                            return true if gp_expression_writes(left, globals, locals, table)
+                            gp_condition_target_bindings(right, locals)
+                            return false
+                        else:
+                            return gp_expression_writes(left, globals, locals, table) or gp_expression_writes(right, globals, locals, table)
+                    _:
+                        return gp_expression_writes(condition, globals, locals, table)
+
+        def gp_filter_writes(condition: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And and gp_is_bare_pattern_filter(left):
+                            gp_condition_target_bindings(left, locals)
+                            return gp_condition_writes(right, globals, locals, table)
+                    _:
+                        pass
+                if gp_is_bare_pattern_filter(condition):
+                    gp_condition_target_bindings(condition, locals)
+                    return false
+                return gp_condition_writes(condition, globals, locals, table)
+
+        def gp_condition_calls(condition: Ast::Expr, caller: sview, globals: darray[sview]&, locals: mutable darray[sview]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        gp_condition_calls(inner, caller, globals, locals, out_from, out_to, table)
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And:
+                            gp_condition_calls(left, caller, globals, locals, out_from, out_to, table)
+                            gp_condition_calls(right, caller, globals, locals, out_from, out_to, table)
+                        elif operator == TokenKind.Or:
+                            left_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, left_locals)
+                            gp_condition_calls(left, caller, globals, left_locals, out_from, out_to, table)
+                            right_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, right_locals)
+                            gp_condition_calls(right, caller, globals, right_locals, out_from, out_to, table)
+                            gp_condition_bindings(condition, locals)
+                        elif operator == TokenKind.Is or operator == TokenKind.As:
+                            gp_expression_calls(left, caller, globals, locals, out_from, out_to, table)
+                            gp_condition_target_bindings(right, locals)
+                        else:
+                            gp_expression_calls(left, caller, globals, locals, out_from, out_to, table)
+                            gp_expression_calls(right, caller, globals, locals, out_from, out_to, table)
+                    _:
+                        gp_expression_calls(condition, caller, globals, locals, out_from, out_to, table)
+
+        def gp_filter_calls(condition: Ast::Expr, caller: sview, globals: darray[sview]&, locals: mutable darray[sview]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And and gp_is_bare_pattern_filter(left):
+                            gp_condition_target_bindings(left, locals)
+                            gp_condition_calls(right, caller, globals, locals, out_from, out_to, table)
+                            return
+                    _:
+                        pass
+                if gp_is_bare_pattern_filter(condition):
+                    gp_condition_target_bindings(condition, locals)
+                    return
+                gp_condition_calls(condition, caller, globals, locals, out_from, out_to, table)
+
         # Whether EXPRESSION reads a global anywhere within it. The callee position is
         # walked too: a `global` holding a function value is read by calling it.
-        def gp_expression_reads(expression: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+        def gp_expression_reads(expression: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Ident(name, ident_line):
                         return gp_names_global(name, globals, locals)
                     Expr.Field(object, field, field_line):
-                        return gp_expression_reads(object, globals, locals)
+                        return gp_expression_reads(object, globals, locals, table)
+                    Expr.Scope(base, _, _):
+                        return gp_expression_reads(base, globals, locals, table)
+                    Expr.ShorthandMember(_, _):
+                        return false
                     Expr.Paren(inner, paren_line):
-                        return gp_expression_reads(inner, globals, locals)
+                        return gp_expression_reads(inner, globals, locals, table)
                     Expr.Unary(operator, operand, unary_line):
-                        return gp_expression_reads(operand, globals, locals)
+                        return gp_expression_reads(operand, globals, locals, table)
+                    Expr.Move(operand, _) | Expr.RegionNew(operand, _, _):
+                        return gp_expression_reads(operand, globals, locals, table)
                     Expr.Binary(left, operator, right, binary_line):
-                        return gp_expression_reads(left, globals, locals) or gp_expression_reads(right, globals, locals)
+                        condition_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, condition_locals)
+                        return gp_condition_reads(expression, globals, condition_locals, table)
                     Expr.Index(object, index_argument, index_line):
-                        return gp_expression_reads(object, globals, locals) or gp_expression_reads(index_argument, globals, locals)
+                        return gp_expression_reads(object, globals, locals, table) or gp_expression_reads(index_argument, globals, locals, table)
+                    Expr.Slice(object, low, high, _):
+                        return gp_expression_reads(object, globals, locals, table) or gp_expression_reads(low, globals, locals, table) or gp_expression_reads(high, globals, locals, table)
                     Expr.IndexN(object_n, arguments_n, index_n_line):
-                        return true if gp_expression_reads(object_n, globals, locals)
+                        return true if gp_expression_reads(object_n, globals, locals, table)
                         for argument_n in arguments_n:
-                            return true if gp_expression_reads(argument_n, globals, locals)
+                            return true if gp_expression_reads(argument_n, globals, locals, table)
                         return false
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        return true if gp_expression_reads(callee, globals, locals)
+                        return true if gp_called_expression_reads(callee, globals, locals, table)
                         for argument in arguments:
-                            return true if gp_expression_reads(argument, globals, locals)
+                            return true if gp_callback_argument_reads(argument, globals, locals, table)
+                        return false
+                    Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
+                        for candidate in candidates:
+                            for capture in candidate.captures:
+                                return true if gp_expression_reads(capture, globals, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_reads(argument, globals, locals, table)
                         return false
                     Expr.Array(elements, array_line):
                         for element in elements:
-                            return true if gp_expression_reads(element, globals, locals)
+                            return true if gp_expression_reads(element, globals, locals, table)
                         return false
                     Expr.Tuple(tuple_elements, tuple_line):
                         for tuple_element in tuple_elements:
-                            return true if gp_expression_reads(tuple_element, globals, locals)
+                            return true if gp_expression_reads(tuple_element, globals, locals, table)
                         return false
                     Expr.SetLit(set_elements, set_line):
                         for set_element in set_elements:
-                            return true if gp_expression_reads(set_element, globals, locals)
+                            return true if gp_expression_reads(set_element, globals, locals, table)
+                        return false
+                    Expr.DictLit(entries, _):
+                        for entry in entries:
+                            return true if gp_expression_reads(entry.key, globals, locals, table) or gp_expression_reads(entry.value, globals, locals, table)
+                        return false
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        match expression:
+                            Expr.RecordUpdate(base, _, _):
+                                return true if gp_expression_reads(base, globals, locals, table)
+                            _:
+                                pass
+                        for field in fields:
+                            return true if gp_expression_reads(field.value, globals, locals, table)
+                        return false
+                    Expr.If(condition, then_expression, else_expression, _):
+                        then_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, then_locals)
+                        return true if gp_condition_reads(condition, globals, then_locals, table)
+                        return true if gp_expression_reads(then_expression, globals, then_locals, table)
+                        else_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, else_locals)
+                        return gp_expression_reads(else_expression, globals, else_locals, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        return true if gp_expression_reads(scrutinee, globals, locals, table)
+                        for arm in arms |globals, locals|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, arm_locals)
+                            _ = gp_pattern_call_locals(arm.pattern, arm_locals)
+                            return true if gp_condition_reads(arm.guard, globals, arm_locals, table) or gp_body_reads(arm.body, globals, arm_locals, table)
+                        return false
+                    Expr.GetElse(guarded, recovery, _):
+                        return true if gp_expression_reads(guarded, globals, locals, table)
+                        recovery_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, recovery_locals)
+                        return gp_body_reads(recovery, globals, recovery_locals, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos):
+                        return true if gp_expression_reads(iterable, globals, locals, table)
+                        body_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, body_locals)
+                        body_locals.push(variable)
+                        gp_query_binders_add(comprehension_pos.line, table, body_locals)
+                        return gp_filter_reads(condition, globals, body_locals, table) or gp_expression_reads(body, globals, body_locals, table)
+                    Expr.Refinement(base, predicate, _):
+                        return true if gp_expression_reads(base, globals, locals, table)
+                        predicate_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, predicate_locals)
+                        return gp_condition_reads(predicate, globals, predicate_locals, table)
+                    # Creating a closure does not execute its body. The function-value
+                    # effect analysis owns callback effects; charging the enclosing
+                    # function here would make an unused lambda spuriously effectful.
+                    Expr.Lambda(_, _, _):
+                        return false
+                    Expr.Block(statements, value, _, _):
+                        block_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, block_locals)
+                        return gp_body_reads(statements, globals, block_locals, table) or gp_expression_reads(value, globals, block_locals, table)
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Absent | Expr.Invalid:
                         return false
                     _:
-                        return false
+                        # New expression variants stay conservative until their children
+                        # are added to this walk.
+                        return true
 
         # The root of an assignment target, looked through `.field`, `[i]` and parens —
         # `state.count <- 0` stores into the global `state`. stage0's globalStorageRoot.
@@ -103,35 +384,38 @@ extend Semantic:
         # Reads that occur INSIDE an assignment target rather than at its root:
         # `table[hot] <- 0` writes `table` and reads `hot`. The root itself is a store
         # location, not a read, which is why it is skipped here.
-        def gp_target_reads(target: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+        def gp_target_reads(target: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match target:
                     Expr.Index(object, index_argument, index_line):
-                        return gp_expression_reads(index_argument, globals, locals) or gp_target_reads(object, globals, locals)
+                        return gp_expression_reads(index_argument, globals, locals, table) or gp_target_reads(object, globals, locals, table)
                     Expr.IndexN(object_n, arguments_n, index_n_line):
                         for argument_n in arguments_n:
-                            return true if gp_expression_reads(argument_n, globals, locals)
-                        return gp_target_reads(object_n, globals, locals)
+                            return true if gp_expression_reads(argument_n, globals, locals, table)
+                        return gp_target_reads(object_n, globals, locals, table)
                     Expr.Field(object_f, field, field_line):
-                        return gp_target_reads(object_f, globals, locals)
+                        return gp_target_reads(object_f, globals, locals, table)
                     Expr.Paren(inner, paren_line):
-                        return gp_target_reads(inner, globals, locals)
+                        return gp_target_reads(inner, globals, locals, table)
                     _:
                         return false
 
         # Whether a body READS a mutable global. `trusted` only affects Unsafe tracking.
-        def gp_body_reads(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: darray[sview]&) -> bool:
+        def gp_body_reads(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
+                for statement in statements |locals|:
                     match statement:
                         Stmt.Expr(expression, line):
-                            return true if gp_expression_reads(expression, globals, locals)
+                            return true if gp_expression_reads(expression, globals, locals, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            return true if gp_expression_reads(value, globals, locals)
+                            return true if gp_expression_reads(value, globals, locals, table)
+                            locals.push(name)
                         Stmt.Assign(target, operator, value, line):
                             return true if:
-                                gp_expression_reads(value, globals, locals)
+                                gp_expression_reads(value, globals, locals, table)
                                 gp_is_compound_assign(operator) and gp_target_root_is_global(target, globals, locals)
+                            if operator == TokenKind.Assign and target is Expr.Ident(binding_name, _):
+                                locals.push(binding_name) if not gp_names_global(binding_name, globals, locals) and not gp_call_name_is_local(binding_name, locals)
                             # A global read INSIDE the target (`slots[cursor] <- 1` reads
                             # `cursor`) is NOT Global.Read to stage0: measured 2026-09-05,
                             # `store_at` requires [Global.Write] alone while the same index in
@@ -140,110 +424,583 @@ extend Semantic:
                             # under-report is recorded as an upstream item.
                         Stmt.Return(value, line):
                             if value is returned:
-                                return true if gp_expression_reads(returned, globals, locals)
+                                return true if gp_expression_reads(returned, globals, locals, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            return true if:
-                                gp_expression_reads(condition, globals, locals)
-                                gp_body_reads(then_body, globals, locals)
-                                gp_body_reads(else_body, globals, locals)
+                            then_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, then_locals)
+                            return true if gp_condition_reads(condition, globals, then_locals, table)
+                            return true if gp_body_reads(then_body, globals, then_locals, table)
+                            else_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, else_locals)
+                            return true if gp_body_reads(else_body, globals, else_locals, table)
                         Stmt.While(condition, while_body, line):
-                            return true if:
-                                gp_expression_reads(condition, globals, locals)
-                                gp_body_reads(while_body, globals, locals)
-                        Stmt.For(bind, variables, iterable, for_body, line):
-                            return true if:
-                                gp_expression_reads(iterable, globals, locals)
-                                gp_body_reads(for_body, globals, locals)
-                        Stmt.Block(_, _, _, block_body, _):
-                            return true if gp_body_reads(block_body, globals, locals)
+                            body_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, body_locals)
+                            return true if gp_condition_reads(condition, globals, body_locals, table)
+                            return true if gp_body_reads(while_body, globals, body_locals, table)
+                        Stmt.For(_, variables, iterable, for_body, line):
+                            base_expression: mutable Ast::Expr = iterable
+                            filter_expression: mutable Ast::Expr? = null
+                            filter_guard: mutable Ast::Expr? = null
+                            match iterable:
+                                Expr.Refinement(filter_base, filter_predicate, _):
+                                    match filter_base:
+                                        Expr.Refinement(inner_base, inner_predicate, _):
+                                            base_expression <- inner_base
+                                            filter_expression <- inner_predicate
+                                            filter_guard <- filter_predicate
+                                        _:
+                                            base_expression <- filter_base
+                                            filter_expression <- filter_predicate
+                                _:
+                                    pass
+                            return true if gp_expression_reads(base_expression, globals, locals, table)
+                            body_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, body_locals)
+                            for variable in variables |body_locals|:
+                                body_locals.push(variable)
+                            if filter_expression is filter_value:
+                                return true if gp_filter_reads(filter_value, globals, body_locals, table)
+                            if filter_guard is guard_value:
+                                guard_locals: mutable darray[sview] = []
+                                gp_locals_copy(body_locals, guard_locals)
+                                return true if gp_condition_reads(guard_value, globals, guard_locals, table)
+                            return true if gp_body_reads(for_body, globals, body_locals, table)
+                        Stmt.Contract(kind, expression, line):
+                            return true if gp_expression_reads(expression, globals, locals, table)
+                        Stmt.Block(_, _, binding, block_body, _):
+                            block_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, block_locals)
+                            block_locals.push(binding) if binding != ""
+                            return true if gp_body_reads(block_body, globals, block_locals, table)
                         Stmt.Match(scrutinee, arms, line):
-                            return true if gp_expression_reads(scrutinee, globals, locals)
-                            for arm in arms:
-                                return true if gp_body_reads(arm.body, globals, locals)
-                        _:
+                            return true if gp_expression_reads(scrutinee, globals, locals, table)
+                            for arm in arms |globals, locals|:
+                                arm_locals: mutable darray[sview] = []
+                                gp_locals_copy(locals, arm_locals)
+                                _ = gp_pattern_call_locals(arm.pattern, arm_locals)
+                                return true if gp_condition_reads(arm.guard, globals, arm_locals, table)
+                                return true if gp_body_reads(arm.body, globals, arm_locals, table)
+                        Stmt.Invalid | Stmt.Break(_, _) | Stmt.Continue(_, _):
                             pass
+                        _:
+                            return true
                 return false
+
+        # A direct lambda callee executes its body at this call site. A standalone
+        # lambda expression remains inert in `gp_expression_reads` because closure
+        # creation does not execute the body.
+        def gp_called_expression_reads(callee: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Lambda(parameters, body, _):
+                        lambda_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, lambda_locals)
+                        for parameter in parameters |lambda_locals|:
+                            lambda_locals.push(parameter)
+                        return gp_body_reads(body, globals, lambda_locals, table)
+                    Expr.Paren(inner, _):
+                        return gp_called_expression_reads(inner, globals, locals, table)
+                    _:
+                        if gp_direct_call_name(callee) != "" and not gp_namespace_root_is_local(callee, locals) and not gp_namespace_root_is_global(callee, globals, locals):
+                            return gp_expression_reads(callee, globals, locals, table)
+                        # An indirect or locally-bound callable may execute anonymous
+                        # code whose Global effects are not represented by named edges.
+                        return true
+
+        def gp_callback_argument_reads(argument: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            match argument:
+                Expr.Lambda(_, _, _) | Expr.Paren(_, _):
+                    return gp_called_expression_reads(argument, globals, locals, table)
+                _:
+                    return gp_expression_reads(argument, globals, locals, table)
 
         # Whether a body STORES into a mutable global. `trusted` only affects Unsafe tracking.
-        def gp_body_writes(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: darray[sview]&) -> bool:
+        def gp_body_writes(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
+                for statement in statements |locals|:
                     match statement:
+                        Stmt.Expr(expression, _):
+                            return true if gp_expression_writes(expression, globals, locals, table)
+                        Stmt.VarDecl(name, _, value, _):
+                            return true if gp_expression_writes(value, globals, locals, table)
+                            locals.push(name)
                         Stmt.Assign(target, operator, value, line):
-                            return true if gp_target_root_is_global(target, globals, locals)
+                            return true if gp_expression_writes(target, globals, locals, table) or gp_expression_writes(value, globals, locals, table)
+                            if operator == TokenKind.Assign:
+                                match target:
+                                    Expr.Ident(binding_name, _):
+                                        return true if gp_names_global(binding_name, globals, locals)
+                                        locals.push(binding_name) if not gp_call_name_is_local(binding_name, locals)
+                                    _:
+                                        return true if gp_target_root_is_global(target, globals, locals)
+                            else:
+                                return true if gp_target_root_is_global(target, globals, locals)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                return true if gp_expression_writes(returned, globals, locals, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            return true if:
-                                gp_body_writes(then_body, globals, locals)
-                                gp_body_writes(else_body, globals, locals)
+                            then_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, then_locals)
+                            return true if gp_condition_writes(condition, globals, then_locals, table)
+                            return true if gp_body_writes(then_body, globals, then_locals, table)
+                            else_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, else_locals)
+                            return true if gp_body_writes(else_body, globals, else_locals, table)
                         Stmt.While(condition, while_body, line):
-                            return true if gp_body_writes(while_body, globals, locals)
+                            body_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, body_locals)
+                            return true if gp_condition_writes(condition, globals, body_locals, table)
+                            return true if gp_body_writes(while_body, globals, body_locals, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            return true if gp_body_writes(for_body, globals, locals)
-                        Stmt.Block(_, _, _, block_body, _):
-                            return true if gp_body_writes(block_body, globals, locals)
+                            base_expression: mutable Ast::Expr = iterable
+                            filter_expression: mutable Ast::Expr? = null
+                            filter_guard: mutable Ast::Expr? = null
+                            match iterable:
+                                Expr.Refinement(filter_base, filter_predicate, _):
+                                    match filter_base:
+                                        Expr.Refinement(inner_base, inner_predicate, _):
+                                            base_expression <- inner_base
+                                            filter_expression <- inner_predicate
+                                            filter_guard <- filter_predicate
+                                        _:
+                                            base_expression <- filter_base
+                                            filter_expression <- filter_predicate
+                                _:
+                                    pass
+                            return true if gp_expression_writes(base_expression, globals, locals, table)
+                            body_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, body_locals)
+                            for variable in variables |body_locals|:
+                                body_locals.push(variable)
+                            if filter_expression is filter_value:
+                                return true if gp_filter_writes(filter_value, globals, body_locals, table)
+                            if filter_guard is guard_value:
+                                guard_locals: mutable darray[sview] = []
+                                gp_locals_copy(body_locals, guard_locals)
+                                return true if gp_condition_writes(guard_value, globals, guard_locals, table)
+                            return true if gp_body_writes(for_body, globals, body_locals, table)
+                        Stmt.Contract(_, expression, _):
+                            return true if gp_expression_writes(expression, globals, locals, table)
+                        Stmt.Block(_, _, binding, block_body, _):
+                            block_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, block_locals)
+                            block_locals.push(binding) if binding != ""
+                            return true if gp_body_writes(block_body, globals, block_locals, table)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms:
-                                return true if gp_body_writes(arm.body, globals, locals)
-                        _:
+                            return true if gp_expression_writes(scrutinee, globals, locals, table)
+                            for arm in arms |globals, locals|:
+                                arm_locals: mutable darray[sview] = []
+                                gp_locals_copy(locals, arm_locals)
+                                _ = gp_pattern_call_locals(arm.pattern, arm_locals)
+                                return true if gp_condition_writes(arm.guard, globals, arm_locals, table)
+                                return true if gp_body_writes(arm.body, globals, arm_locals, table)
+                        Stmt.Invalid | Stmt.Break(_, _) | Stmt.Continue(_, _):
                             pass
+                        _:
+                            return true
                 return false
 
-        # The functions this body calls DIRECTLY. Calls propagate Global effects through
-        # every lexical block; `trusted` only drops Unsafe tracking.
-        def gp_body_calls(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                for statement in statements |out|:
-                    match statement:
-                        Stmt.Expr(expression, line):
-                            gp_expression_calls(expression, out)
-                        Stmt.VarDecl(name, type_expression, value, line):
-                            gp_expression_calls(value, out)
-                        Stmt.Assign(target, operator, value, line):
-                            gp_expression_calls(value, out)
-                        Stmt.Return(value, line):
-                            if value is returned:
-                                gp_expression_calls(returned, out)
-                        Stmt.If(condition, then_body, else_body, line):
-                            gp_expression_calls(condition, out)
-                            gp_body_calls(then_body, out)
-                            gp_body_calls(else_body, out)
-                        Stmt.While(condition, while_body, line):
-                            gp_expression_calls(condition, out)
-                            gp_body_calls(while_body, out)
-                        Stmt.For(bind, variables, iterable, for_body, line):
-                            gp_expression_calls(iterable, out)
-                            gp_body_calls(for_body, out)
-                        Stmt.Block(_, _, _, block_body, _):
-                            gp_body_calls(block_body, out)
-                        Stmt.Match(scrutinee, arms, line):
-                            gp_expression_calls(scrutinee, out)
-                            for arm in arms |out|:
-                                gp_body_calls(arm.body, out)
-                        _:
-                            pass
-
-        # Every direct callee inside an expression. `called_function_name` normalizes a
-        # module-qualified call (`M::f()`) to the declaration registry's key (`f`).
-        def gp_expression_calls(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+        # Value blocks and recovery expressions can contain statement lists; walk those
+        # lists on the write axis as well as the ordinary expression children. This keeps
+        # the cold fallback conservative when a nested value form performs an assignment.
+        def gp_expression_writes(expression: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match expression:
-                    Expr.Call(callee, arguments, argument_names, call_line):
-                        callee_name: sview = called_function_name(expression)
-                        out.push(callee_name) if callee_name != ""
-                        for argument in arguments |out|:
-                            gp_expression_calls(argument, out)
-                    Expr.Binary(left, operator, right, binary_line):
-                        gp_expression_calls(left, out)
-                        gp_expression_calls(right, out)
-                    Expr.Unary(operator, operand, unary_line):
-                        gp_expression_calls(operand, out)
-                    Expr.Paren(inner, paren_line):
-                        gp_expression_calls(inner, out)
-                    Expr.Index(object, index_argument, index_line):
-                        gp_expression_calls(object, out)
-                        gp_expression_calls(index_argument, out)
+                    Expr.Slice(object, low, high, _):
+                        return gp_expression_writes(object, globals, locals, table) or gp_expression_writes(low, globals, locals, table) or gp_expression_writes(high, globals, locals, table)
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Paren(object, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _):
+                        return gp_expression_writes(object, globals, locals, table)
+                    Expr.ShorthandMember(_, _) | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.Absent | Expr.Invalid:
+                        return false
+                    Expr.Binary(left, _, right, _):
+                        condition_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, condition_locals)
+                        return gp_condition_writes(expression, globals, condition_locals, table)
+                    Expr.Index(left, right, _):
+                        return gp_expression_writes(left, globals, locals, table) or gp_expression_writes(right, globals, locals, table)
+                    Expr.Refinement(base, predicate, _):
+                        if gp_expression_writes(base, globals, locals, table):
+                            return true
+                        predicate_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, predicate_locals)
+                        return gp_condition_writes(predicate, globals, predicate_locals, table)
+                    Expr.IndexN(object, arguments, _):
+                        return true if gp_expression_writes(object, globals, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_writes(argument, globals, locals, table)
+                        return false
+                    Expr.Call(callee, arguments, _, _):
+                        return true if gp_called_expression_writes(callee, globals, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_writes(argument, globals, locals, table)
+                        return false
+                    Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
+                        for candidate in candidates:
+                            for capture in candidate.captures:
+                                return true if gp_expression_writes(capture, globals, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_writes(argument, globals, locals, table)
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements:
+                            return true if gp_expression_writes(element, globals, locals, table)
+                        return false
+                    Expr.DictLit(entries, _):
+                        for entry in entries:
+                            return true if gp_expression_writes(entry.key, globals, locals, table) or gp_expression_writes(entry.value, globals, locals, table)
+                        return false
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        match expression:
+                            Expr.RecordUpdate(base, _, _):
+                                return true if gp_expression_writes(base, globals, locals, table)
+                            _:
+                                pass
+                        for field in fields:
+                            return true if gp_expression_writes(field.value, globals, locals, table)
+                        return false
+                    Expr.If(condition, then_expression, else_expression, _):
+                        then_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, then_locals)
+                        return true if gp_condition_writes(condition, globals, then_locals, table)
+                        return true if gp_expression_writes(then_expression, globals, then_locals, table)
+                        else_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, else_locals)
+                        return gp_expression_writes(else_expression, globals, else_locals, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        return true if gp_expression_writes(scrutinee, globals, locals, table)
+                        for arm in arms |globals, locals|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, arm_locals)
+                            _ = gp_pattern_call_locals(arm.pattern, arm_locals)
+                            return true if gp_condition_writes(arm.guard, globals, arm_locals, table) or gp_body_writes(arm.body, globals, arm_locals, table)
+                        return false
+                    Expr.GetElse(guarded, recovery, _):
+                        return true if gp_expression_writes(guarded, globals, locals, table)
+                        recovery_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, recovery_locals)
+                        return gp_body_writes(recovery, globals, recovery_locals, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos):
+                        return true if gp_expression_writes(iterable, globals, locals, table)
+                        body_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, body_locals)
+                        body_locals.push(variable)
+                        gp_query_binders_add(comprehension_pos.line, table, body_locals)
+                        return gp_filter_writes(condition, globals, body_locals, table) or gp_expression_writes(body, globals, body_locals, table)
+                    Expr.Lambda(_, _, _):
+                        return false
+                    Expr.Block(statements, value, _, _):
+                        block_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, block_locals)
+                        return gp_body_writes(statements, globals, block_locals, table) or gp_expression_writes(value, globals, block_locals, table)
+                    _:
+                        return true
+
+        def gp_call_locals_copy(source: darray[sview]&, target: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for name in source |target|:
+                    target.push(name)
+
+        def gp_call_name_is_local(name: sview, locals: darray[sview]&) -> bool:
+            can Abort.Panic:
+                for local in locals:
+                    return true if local == name
+                return false
+
+        def gp_called_expression_writes(callee: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Lambda(parameters, body, _):
+                        lambda_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, lambda_locals)
+                        for parameter in parameters |lambda_locals|:
+                            lambda_locals.push(parameter)
+                        return gp_body_writes(body, globals, lambda_locals, table)
+                    Expr.Paren(inner, _):
+                        return gp_called_expression_writes(inner, globals, locals, table)
+                    _:
+                        if gp_direct_call_name(callee) != "" and not gp_namespace_root_is_local(callee, locals) and not gp_namespace_root_is_global(callee, globals, locals):
+                            return gp_expression_writes(callee, globals, locals, table)
+                        return true
+
+        def gp_callback_argument_writes(argument: Ast::Expr, globals: darray[sview]&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            match argument:
+                Expr.Lambda(_, _, _) | Expr.Paren(_, _):
+                    return gp_called_expression_writes(argument, globals, locals, table)
+                _:
+                    return gp_expression_writes(argument, globals, locals, table)
+
+        def gp_callback_argument_calls(argument: Ast::Expr, caller: sview, globals: darray[sview]&, locals: mutable darray[sview]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Lambda(parameters, body, _):
+                        lambda_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, lambda_locals)
+                        for parameter in parameters |lambda_locals|:
+                            lambda_locals.push(parameter)
+                        gp_body_calls(body, caller, globals, lambda_locals, out_from, out_to, table)
+                    Expr.Paren(inner, _):
+                        gp_callback_argument_calls(inner, caller, globals, locals, out_from, out_to, table)
+                    _:
+                        gp_expression_calls(argument, caller, globals, locals, out_from, out_to, table)
+
+        # Pattern bindings are in scope in their arm's guard and body. `Other` retains
+        # syntax that this checker cannot classify, so callers conservatively add an
+        # unknown-target edge for that arm rather than trusting a possibly shadowed name.
+        def gp_pattern_call_locals(pattern: Ast::Pattern, locals: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.Rest(name):
+                        locals.push(name)
+                    Pattern.TypeBind(_, binder):
+                        locals.push(binder)
+                    Pattern.As(name, inner):
+                        locals.push(name)
+                        for sub in inner |locals|:
+                            return true if gp_pattern_call_locals(sub, locals)
+                    Pattern.Variant(_, fields) | Pattern.Struct(_, fields) | Pattern.Field(_, fields) | Pattern.Tuple(fields) | Pattern.Or(fields):
+                        for sub in fields |locals|:
+                            return true if gp_pattern_call_locals(sub, locals)
+                    Pattern.Other(_):
+                        return true
                     _:
                         pass
+                return false
+
+        def gp_namespace_root_is_local(expression: Ast::Expr, locals: darray[sview]&) -> bool:
+            match expression:
+                Expr.Ident(name, _):
+                    return gp_call_name_is_local(name, locals)
+                Expr.Scope(base, _, _) | Expr.Field(base, _, _) | Expr.Paren(base, _):
+                    return gp_namespace_root_is_local(base, locals)
+                _:
+                    return false
+
+        def gp_namespace_root_is_global(expression: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            match expression:
+                Expr.Ident(name, _):
+                    return gp_names_global(name, globals, locals)
+                Expr.Scope(base, _, _) | Expr.Field(base, _, _) | Expr.Paren(base, _):
+                    return gp_namespace_root_is_global(base, globals, locals)
+                _:
+                    return false
+
+        def gp_unknown_call_edge(caller: sview, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out_from.push(caller)
+                out_to.push("<gp-any-function>")
+
+        def gp_direct_call_name(callee: Ast::Expr) -> sview:
+            match callee:
+                Expr.Ident(name, _):
+                    return name
+                # Namespace calls have a statically named root. A field call may be a
+                # method or a stored callback, so leave it to the unknown-call path.
+                Expr.Scope(_, name, _):
+                    return name
+                Expr.Paren(inner, _):
+                    return gp_direct_call_name(inner)
+                _:
+                    return ""
+
+        # The functions this body may call DIRECTLY. The local stack follows source order
+        # and branch scopes, so a function-typed local does not create a false edge to a
+        # same-named root function. `trusted` only drops Unsafe tracking.
+        def gp_body_calls(statements: darray[Ast::Stmt], caller: sview, globals: darray[sview]&, locals: mutable darray[sview]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |caller, locals, out_from, out_to|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            gp_expression_calls(expression, caller, globals, locals, out_from, out_to, table)
+                        Stmt.VarDecl(name, _, value, _):
+                            gp_expression_calls(value, caller, globals, locals, out_from, out_to, table)
+                            locals.push(name)
+                        Stmt.Assign(target, operator, value, _):
+                            gp_expression_calls(target, caller, globals, locals, out_from, out_to, table)
+                            gp_expression_calls(value, caller, globals, locals, out_from, out_to, table)
+                            if operator == TokenKind.Assign and target is Expr.Ident(binding_name, _):
+                                locals.push(binding_name) if not gp_names_global(binding_name, globals, locals) and not gp_call_name_is_local(binding_name, locals)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                gp_expression_calls(returned, caller, globals, locals, out_from, out_to, table)
+                        Stmt.If(condition, then_body, else_body, _):
+                            then_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, then_locals)
+                            gp_condition_calls(condition, caller, globals, then_locals, out_from, out_to, table)
+                            gp_body_calls(then_body, caller, globals, then_locals, out_from, out_to, table)
+                            else_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, else_locals)
+                            gp_body_calls(else_body, caller, globals, else_locals, out_from, out_to, table)
+                        Stmt.While(condition, while_body, _):
+                            body_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, body_locals)
+                            gp_condition_calls(condition, caller, globals, body_locals, out_from, out_to, table)
+                            gp_body_calls(while_body, caller, globals, body_locals, out_from, out_to, table)
+                        Stmt.For(_, variables, iterable, for_body, _):
+                            base_expression: mutable Ast::Expr = iterable
+                            filter_expression: mutable Ast::Expr? = null
+                            filter_guard: mutable Ast::Expr? = null
+                            match iterable:
+                                Expr.Refinement(filter_base, filter_predicate, _):
+                                    match filter_base:
+                                        Expr.Refinement(inner_base, inner_predicate, _):
+                                            base_expression <- inner_base
+                                            filter_expression <- inner_predicate
+                                            filter_guard <- filter_predicate
+                                        _:
+                                            base_expression <- filter_base
+                                            filter_expression <- filter_predicate
+                                _:
+                                    pass
+                            gp_expression_calls(base_expression, caller, globals, locals, out_from, out_to, table)
+                            body_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, body_locals)
+                            for variable in variables |body_locals|:
+                                body_locals.push(variable)
+                            gp_filter_calls(filter_value, caller, globals, body_locals, out_from, out_to, table) if filter_expression is filter_value
+                            if filter_guard is guard_value:
+                                guard_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(body_locals, guard_locals)
+                                gp_condition_calls(guard_value, caller, globals, guard_locals, out_from, out_to, table)
+                            gp_body_calls(for_body, caller, globals, body_locals, out_from, out_to, table)
+                        Stmt.Block(_, _, binding, block_body, _):
+                            block_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, block_locals)
+                            block_locals.push(binding) if binding != ""
+                            gp_body_calls(block_body, caller, globals, block_locals, out_from, out_to, table)
+                        Stmt.Match(scrutinee, arms, _):
+                            gp_expression_calls(scrutinee, caller, globals, locals, out_from, out_to, table)
+                            for arm in arms |caller, locals, out_from, out_to|:
+                                arm_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(locals, arm_locals)
+                                unknown_pattern: bool = gp_pattern_call_locals(arm.pattern, arm_locals)
+                                gp_unknown_call_edge(caller, out_from, out_to) if unknown_pattern
+                                gp_condition_calls(arm.guard, caller, globals, arm_locals, out_from, out_to, table)
+                                gp_body_calls(arm.body, caller, globals, arm_locals, out_from, out_to, table)
+                        Stmt.Contract(_, expression, _):
+                            gp_expression_calls(expression, caller, globals, locals, out_from, out_to, table)
+                        Stmt.Invalid | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                            pass
+                        _:
+                            gp_unknown_call_edge(caller, out_from, out_to)
+
+        # Every direct callee and nested call in an expression. A module-qualified call
+        # (`M::f()`) maps to the declaration registry key `f`; when the namespace root is
+        # a local, the spelling is shadowed and contributes no root-function edge.
+        def gp_expression_calls(expression: Ast::Expr, caller: sview, globals: darray[sview]&, locals: mutable darray[sview]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        callee_name: sview = gp_direct_call_name(callee)
+                        callee_is_local: bool = gp_namespace_root_is_local(callee, locals)
+                        callee_is_global: bool = gp_namespace_root_is_global(callee, globals, locals)
+                        if callee_name != "" and not callee_is_local and not callee_is_global:
+                            out_from.push(caller)
+                            out_to.push(callee_name)
+                        elif callee_is_local or callee_is_global or not (callee is Expr.Lambda(_, _, _)):
+                            # A local callback or computed callee may target any function;
+                            # never bind it to a root function with the same spelling.
+                            gp_unknown_call_edge(caller, out_from, out_to)
+                        match callee:
+                            Expr.Lambda(parameters, body, _):
+                                lambda_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(locals, lambda_locals)
+                                for parameter in parameters |lambda_locals|:
+                                    lambda_locals.push(parameter)
+                                gp_body_calls(body, caller, globals, lambda_locals, out_from, out_to, table)
+                            _:
+                                gp_expression_calls(callee, caller, globals, locals, out_from, out_to, table)
+                        for argument in arguments |caller, locals, out_from, out_to|:
+                            gp_callback_argument_calls(argument, caller, globals, locals, out_from, out_to, table)
+                    Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
+                        for candidate in candidates |caller, locals, out_from, out_to|:
+                            if candidate.callee != "" and not gp_call_name_is_local(candidate.callee, locals):
+                                out_from.push(caller)
+                                out_to.push(candidate.callee)
+                            for capture in candidate.captures |caller, locals, out_from, out_to|:
+                                gp_expression_calls(capture, caller, globals, locals, out_from, out_to, table)
+                        for argument in arguments |caller, locals, out_from, out_to|:
+                            gp_callback_argument_calls(argument, caller, globals, locals, out_from, out_to, table)
+                    Expr.Field(object, _, _) | Expr.Paren(object, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _):
+                        gp_expression_calls(object, caller, globals, locals, out_from, out_to, table)
+                    Expr.Scope(base, _, _):
+                        gp_expression_calls(base, caller, globals, locals, out_from, out_to, table)
+                    Expr.Binary(_, _, _, _):
+                        condition_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, condition_locals)
+                        gp_condition_calls(expression, caller, globals, condition_locals, out_from, out_to, table)
+                    Expr.Index(left, right, _):
+                        gp_expression_calls(left, caller, globals, locals, out_from, out_to, table)
+                        gp_expression_calls(right, caller, globals, locals, out_from, out_to, table)
+                    Expr.Refinement(base, predicate, _):
+                        gp_expression_calls(base, caller, globals, locals, out_from, out_to, table)
+                        predicate_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, predicate_locals)
+                        gp_condition_calls(predicate, caller, globals, predicate_locals, out_from, out_to, table)
+                    Expr.Slice(object, low, high, _):
+                        gp_expression_calls(object, caller, globals, locals, out_from, out_to, table)
+                        gp_expression_calls(low, caller, globals, locals, out_from, out_to, table)
+                        gp_expression_calls(high, caller, globals, locals, out_from, out_to, table)
+                    Expr.IndexN(object, arguments, _):
+                        gp_expression_calls(object, caller, globals, locals, out_from, out_to, table)
+                        for argument in arguments |caller, locals, out_from, out_to|:
+                            gp_expression_calls(argument, caller, globals, locals, out_from, out_to, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |caller, locals, out_from, out_to|:
+                            gp_expression_calls(element, caller, globals, locals, out_from, out_to, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |caller, locals, out_from, out_to|:
+                            gp_expression_calls(entry.key, caller, globals, locals, out_from, out_to, table)
+                            gp_expression_calls(entry.value, caller, globals, locals, out_from, out_to, table)
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        match expression:
+                            Expr.RecordUpdate(base, _, _):
+                                gp_expression_calls(base, caller, globals, locals, out_from, out_to, table)
+                            _:
+                                pass
+                        for field in fields |caller, locals, out_from, out_to|:
+                            gp_expression_calls(field.value, caller, globals, locals, out_from, out_to, table)
+                    Expr.If(condition, then_expression, else_expression, _):
+                        then_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, then_locals)
+                        gp_condition_calls(condition, caller, globals, then_locals, out_from, out_to, table)
+                        gp_expression_calls(then_expression, caller, globals, then_locals, out_from, out_to, table)
+                        else_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, else_locals)
+                        gp_expression_calls(else_expression, caller, globals, else_locals, out_from, out_to, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        gp_expression_calls(scrutinee, caller, globals, locals, out_from, out_to, table)
+                        for arm in arms |caller, locals, out_from, out_to|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, arm_locals)
+                            unknown_pattern: bool = gp_pattern_call_locals(arm.pattern, arm_locals)
+                            gp_unknown_call_edge(caller, out_from, out_to) if unknown_pattern
+                            gp_condition_calls(arm.guard, caller, globals, arm_locals, out_from, out_to, table)
+                            gp_body_calls(arm.body, caller, globals, arm_locals, out_from, out_to, table)
+                    Expr.GetElse(guarded, recovery, _):
+                        gp_expression_calls(guarded, caller, globals, locals, out_from, out_to, table)
+                        recovery_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, recovery_locals)
+                        gp_body_calls(recovery, caller, globals, recovery_locals, out_from, out_to, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos):
+                        gp_expression_calls(iterable, caller, globals, locals, out_from, out_to, table)
+                        body_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, body_locals)
+                        body_locals.push(variable)
+                        gp_query_binders_add(comprehension_pos.line, table, body_locals)
+                        gp_filter_calls(condition, caller, globals, body_locals, out_from, out_to, table)
+                        gp_expression_calls(body, caller, globals, body_locals, out_from, out_to, table)
+                    Expr.Lambda(_, _, _):
+                        pass
+                    Expr.Block(statements, value, _, _):
+                        block_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, block_locals)
+                        gp_body_calls(statements, caller, globals, block_locals, out_from, out_to, table)
+                        gp_expression_calls(value, caller, globals, block_locals, out_from, out_to, table)
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _) | Expr.Absent | Expr.Invalid:
+                        pass
+                    _:
+                        gp_unknown_call_edge(caller, out_from, out_to)
 
         # Fact projection is admitted only for the collector's flat body grammar. Local
         # bindings are excluded here because this checker pre-collects shadowing names,
@@ -271,13 +1028,13 @@ extend Semantic:
         # source. Direct-call subjects are decoded only after their source-path key has
         # been checked against this snapshot. A malformed fact span falls back to the
         # established AST walkers.
-        def gp_project_direct_facts(record_index: usize, globals: darray[sview]&, want_write: bool, snapshot: IncrementalSemanticSnapshot&, projected_direct: mutable bool&, projected_callees: mutable darray[sview]&) -> bool:
+        def gp_project_direct_facts[@snapshot](record_index: usize, globals: darray[sview]&, want_write: bool, snapshot: IncrementalSemanticSnapshot[snapshot]&, projected_direct: mutable bool&, caller: sview, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return false if record_index >= snapshot.functions.count
                 record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
                 return false if record.direct_fact_start > snapshot.direct_facts.count
                 return false if record.direct_fact_count > snapshot.direct_facts.count - record.direct_fact_start
-                for fact_index in record.direct_fact_start ..< record.direct_fact_start + record.direct_fact_count |snapshot, projected_direct, projected_callees|:
+                for fact_index in record.direct_fact_start ..< record.direct_fact_start + record.direct_fact_count |snapshot, projected_direct|:
                     fact: IncrementalDirectFact = snapshot.direct_facts[fact_index]
                     return false if fact.owner != record_index
                     if fact.kind == IncrementalFactKind.GlobalRead and not want_write:
@@ -292,7 +1049,6 @@ extend Semantic:
                             # disambiguate that case, so leave it to the AST walker.
                             for global_name in globals:
                                 return false if global_name == callee
-                            projected_callees.push(callee)
                         else:
                             return false
                     elif fact.kind == IncrementalFactKind.GlobalRead or fact.kind == IncrementalFactKind.GlobalWrite or fact.kind == IncrementalFactKind.PanicSite:
@@ -302,6 +1058,17 @@ extend Semantic:
                         pass
                     else:
                         return false
+                # Validate the complete record before publishing any call edges. If a
+                # fact is malformed, the caller can still take the AST fallback without
+                # leaving partial edges behind.
+                for fact_index in record.direct_fact_start ..< record.direct_fact_start + record.direct_fact_count |snapshot, out_from, out_to|:
+                    fact: IncrementalDirectFact = snapshot.direct_facts[fact_index]
+                    if fact.kind == IncrementalFactKind.DirectCall:
+                        if incremental_direct_call_name(snapshot, fact) is callee:
+                            out_from.push(caller)
+                            out_to.push(callee)
+                        else:
+                            return false
                 return true
 
         # One axis (Read or Write) over the whole declaration tree: direct observations
@@ -309,7 +1076,7 @@ extend Semantic:
         # replace the body collectors; the function slot stays present for closure and
         # row publication. Nested declarations stay cold because facts anchor only direct
         # top-level functions.
-        def gp_axis_facts(declarations: darray[Ast::Decl], globals: darray[sview]&, want_write: bool, snapshot: IncrementalSemanticSnapshot&, offsets: dict[u64, usize]&, axis_scans_skipped: mutable u64&, use_snapshot_facts: bool, out_names: mutable darray[sview]&, out_direct: mutable darray[bool]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&) -> void:
+        def gp_axis_facts[@snapshot](declarations: darray[Ast::Decl], globals: darray[sview]&, want_write: bool, snapshot: IncrementalSemanticSnapshot[snapshot]&, offsets: dict[u64, usize]&, axis_scans_skipped: mutable u64&, use_snapshot_facts: bool, out_names: mutable darray[sview]&, out_direct: mutable darray[bool]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |snapshot, offsets, axis_scans_skipped, use_snapshot_facts, out_names, out_direct, out_from, out_to|:
                     match declaration:
@@ -320,37 +1087,35 @@ extend Semantic:
                             record_index <- incremental_current_body_record_index(line, snapshot, offsets) if use_snapshot_facts
                             if record_index < snapshot.functions.count:
                                 record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
-                                if record.direct_fact_count == 0:
+                                if record.cacheable and record.direct_fact_count == 0:
                                     # No global access or call can occur in this verified
                                     # zero-fact body, even when it has literal local binds.
                                     out_direct.push(false)
                                     axis_scans_skipped <- axis_scans_skipped + 1
                                     projected <- true
-                                elif gp_fact_projection_body_safe(body):
+                                elif record.cacheable and gp_fact_projection_body_safe(body):
                                     direct: mutable bool = false
-                                    callees: mutable darray[sview] = []
-                                    if gp_project_direct_facts(record_index, globals, want_write, snapshot, &direct, &callees):
+                                    if gp_project_direct_facts(record_index, globals, want_write, snapshot, &direct, name, out_from, out_to):
                                         out_direct.push(direct)
-                                        for callee in callees |out_from, out_to|:
-                                            out_from.push(name)
-                                            out_to.push(callee)
                                         axis_scans_skipped <- axis_scans_skipped + 1
                                         projected <- true
                             if not projected:
                                 locals: mutable darray[sview] = []
                                 for parameter in parameters |locals|:
                                     locals.push(parameter.name)
-                                collect_local_names(body, locals)
-                                out_direct.push(gp_body_writes(body, globals, locals) if want_write else gp_body_reads(body, globals, locals))
-                                callees: mutable darray[sview] = []
-                                gp_body_calls(body, callees)
-                                for callee in callees |out_from, out_to|:
-                                    out_from.push(name)
-                                    out_to.push(callee)
+                                # The cold walkers now extend this binding stack in
+                                # source order and copy it at branch/scope boundaries.
+                                # A function-wide pre-collection would let a nested local
+                                # hide a same-named global outside its lexical scope.
+                                out_direct.push(gp_body_writes(body, globals, locals, table) if want_write else gp_body_reads(body, globals, locals, table))
+                                call_locals: mutable darray[sview] = []
+                                for parameter in parameters |call_locals|:
+                                    call_locals.push(parameter.name)
+                                gp_body_calls(body, name, globals, call_locals, out_from, out_to, table)
                         Decl.Module(module_name, module_body, module_line):
-                            gp_axis_facts(module_body, globals, want_write, snapshot, offsets, axis_scans_skipped, false, out_names, out_direct, out_from, out_to)
+                            gp_axis_facts(module_body, globals, want_write, snapshot, offsets, axis_scans_skipped, false, out_names, out_direct, out_from, out_to, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            gp_axis_facts(scoped_body, globals, want_write, snapshot, offsets, axis_scans_skipped, false, out_names, out_direct, out_from, out_to)
+                            gp_axis_facts(scoped_body, globals, want_write, snapshot, offsets, axis_scans_skipped, false, out_names, out_direct, out_from, out_to, table)
                         _:
                             pass
 
@@ -377,8 +1142,13 @@ extend Semantic:
                     edge: mutable usize = 0
                     while edge < edge_from.count |edge, changed, direct|:
                         caller_slot: i64 = gp_slot_of(names, edge_from[edge])
-                        callee_slot: i64 = gp_slot_of(names, edge_to[edge])
-                        carries: bool = caller_slot >= 0 and callee_slot >= 0 and direct[callee_slot.usize()] and not direct[caller_slot.usize()]
+                        carries: mutable bool = false
+                        if caller_slot >= 0 and edge_to[edge] == "<gp-any-function>":
+                            for callee_slot in 0..<direct.count |carries, caller_slot, direct|:
+                                carries <- true if direct[callee_slot] and not direct[caller_slot.usize()]
+                        else:
+                            callee_slot: i64 = gp_slot_of(names, edge_to[edge])
+                            carries <- true if caller_slot >= 0 and callee_slot >= 0 and direct[callee_slot.usize()] and not direct[caller_slot.usize()]
                         if carries:
                             direct[caller_slot.usize()] <- true
                             changed <- true
@@ -404,7 +1174,7 @@ extend Semantic:
         # Infer the Global family for every function in the file. Runs between
         # collect_effect_sources and check_ungranted_panic, so the rows are in place
         # before any call site is judged against them.
-        def check_global_permissions(file: Ast::File&, table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot&, offsets: dict[u64, usize]&, axis_scans_skipped: mutable u64&, use_snapshot_facts: bool) -> void:
+        def check_global_permissions[@snapshot](file: Ast::File&, table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot[snapshot]&, offsets: dict[u64, usize]&, axis_scans_skipped: mutable u64&, use_snapshot_facts: bool) -> void:
             can Memory.Allocate, Abort.Panic:
                 globals: mutable darray[sview @source] = []
                 collect_mutable_globals(file.top_decls, globals)
@@ -414,14 +1184,14 @@ extend Semantic:
                 read_direct: mutable darray[bool] = []
                 read_from: mutable darray[sview] = []
                 read_to: mutable darray[sview] = []
-                gp_axis_facts(file.top_decls, globals, false, snapshot, offsets, axis_scans_skipped, use_snapshot_facts, read_names, read_direct, read_from, read_to)
+                gp_axis_facts(file.top_decls, globals, false, snapshot, offsets, axis_scans_skipped, use_snapshot_facts, read_names, read_direct, read_from, read_to, table)
                 gp_close_axis(read_names, read_direct, read_from, read_to)
 
                 write_names: mutable darray[sview] = []
                 write_direct: mutable darray[bool] = []
                 write_from: mutable darray[sview] = []
                 write_to: mutable darray[sview] = []
-                gp_axis_facts(file.top_decls, globals, true, snapshot, offsets, axis_scans_skipped, use_snapshot_facts, write_names, write_direct, write_from, write_to)
+                gp_axis_facts(file.top_decls, globals, true, snapshot, offsets, axis_scans_skipped, use_snapshot_facts, write_names, write_direct, write_from, write_to, table)
                 gp_close_axis(write_names, write_direct, write_from, write_to)
 
                 while read_slot < read_names.count |read_slot: usize = 0, table| -> table:

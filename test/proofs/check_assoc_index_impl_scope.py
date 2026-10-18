@@ -63,19 +63,25 @@ ghost def line_is_impl_scope_from(annotations: darray[Ast::EnumAnnotation]&, lin
     requires index <= annotations.count
     decreases annotations.count - index
     return false if index == annotations.count
-    annotation: Ast::EnumAnnotation = annotations[index]
-    return true if annotation.owner == "__impl_scope" and annotation.line == line
+    return true if annotations[index].owner == "__impl_scope" and annotations[index].line == line
     return line_is_impl_scope_from(annotations, line, index + 1)
 '''
 expected_scan = '''
 def line_is_impl_scope(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> bool:
     ensure result == line_is_impl_scope_from(annotations, line, 0)
-    for index in 0..<annotations.count |index|:
+    found: mutable bool = false
+    for index in 0..<annotations.count |found|:
         invariant index <= annotations.count
-        invariant line_is_impl_scope_from(annotations, line, index) == line_is_impl_scope_from(annotations, line, 0)
-        annotation: Ast::EnumAnnotation = annotations[index]
-        return true if annotation.owner == "__impl_scope" and annotation.line == line
-    return false
+        invariant line_is_impl_scope_from(annotations, line, 0) == (found or line_is_impl_scope_from(annotations, line, index))
+        assert line_is_impl_scope_from(annotations, line, index) == (
+            (annotations[index].owner == "__impl_scope" and annotations[index].line == line) or line_is_impl_scope_from(annotations, line, index + 1.usize())
+        )
+        if annotations[index].owner == "__impl_scope" and annotations[index].line == line:
+            found <- true
+        assert line_is_impl_scope_from(annotations, line, 0) == (found or line_is_impl_scope_from(annotations, line, index + 1.usize()))
+    assert line_is_impl_scope_from(annotations, line, annotations.count) == false
+    assert line_is_impl_scope_from(annotations, line, 0) == found
+    return found
 '''
 if compact(function_section(source_text, "line_is_impl_scope_from")) != compact(expected_model):
     raise SystemExit("recursive impl-scope model changed without updating its proof")

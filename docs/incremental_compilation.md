@@ -54,8 +54,11 @@ replayed, and checker behavior and edit performance are unchanged. The target
 descriptor also records both module and machine triples/layouts plus CPU and
 features, rejecting mismatched pairs. Executable/LLVM path discovery is
 available on Linux and macOS, while mapped-image digest attestation remains
-unsupported; therefore the O0 shard cache remains disconnected from the driver.
-These changes do not qualify incremental speedup.
+unsupported; the Stage1 CLI's O0 shard-cache route therefore remains unwired.
+The separate Go Core compile-server does have a narrow caller: named incremental
+object requests route through `IncrementalObjectSession.WriteObject` after fresh
+analysis. That source integration does not qualify the Stage1 CLI path or a
+current-tree end-to-end speedup.
 
 ## Bootstrap query publication measurement (2026-10-18)
 
@@ -281,7 +284,8 @@ rebuilt in the new snapshot, and current parse anchors are regenerated. Changed 
 unsupported bodies take the collector walk. Disk sidecars never authorize this
 cross-edit fact reuse. Ordinary one-shot CLI compilation still uses the
 session-disabled wrapper. The opt-in `semantic-session` host retains one session
-across requests and calls the session-aware entry point. The new
+across requests; the opt-in `compile-session` host retains a source-bound session
+for up to 32 requests per epoch. Both call the session-aware entry point. The new
 `test/parity/incremental_semantic_session_control.sh` control drives cold, exact,
 edited, invalid, and restored requests through the normal Stage1 wrapper. It checks
 the status protocol and the reported session hit/edit decisions; it still needs to
@@ -482,6 +486,265 @@ diagnostics present in Gate V are absent in W, but V used a different Stage0 rev
 count change is not a controlled source-only comparison. Gate W produces no Stage1 runtime or
 incremental-reuse qualification.
 
+Gate X used the same Core HEAD and Stage0 binary as W, with a different frozen compiler source
+snapshot (tracked working-diff SHA-256 `fe2b695993f0a4233b25c3b7b68e8d5b5119a33d2cbf35267876fea1c2bd3009`).
+It also exited 1 without producing Stage1 and reported 25,398 warnings and 114 non-warning
+diagnostics. The broadened request-region signatures did not clear the resolver lifetime
+cluster; the 11 `resolve_expr_walk` argument-6 errors and the related `resolve_flow`, `resolve`,
+and `semantic_api` errors remain. Gate X added a region-binding mismatch at
+`driver/elisac_source_probes.elisa:285`, where the `request` region is bound to both `borrow`
+and `request`. This is a useful same-bootstrap comparison with W, but X also changes the EASM
+proof source and still provides no Stage1 or incremental runtime qualification. The live source
+has since changed `run_semantic_gate_with_lookup_context` to bind its context to `@request`,
+matching the Semantic API; Gate X predates this wrapper correction, which Gate Y later checks
+against the matching signatures.
+
+Gate Y froze compiler HEAD `a350f7f87559e2192ad20a9100398e1ccb92c1ac` with tracked working-diff
+SHA-256 `7c2a5d21812a6d2934453bde0452063b644d05294fbc54e13685342d85b679ef`; the frozen `src/`
+matched the live tree at freeze. It used clean Core HEAD `cbaa661924bc481c8769c9cdd1d6906e9819d87e`
+and Stage0 SHA-256 `de9801afab1c61a487fdd44aa13ef9565d3581b0ac6ccb212bb97166a63fb068`. Stage0
+exited 1 and produced no Stage1 object. The original log was overwritten by a duplicate seed
+refusal and contained 84 NUL bytes, so the owners repeated the same frozen inputs with a separate
+StoreScan trace log. That clean rerun also exited 1 without an object and contained 25,398 warning
+lines and 111 non-warning diagnostic headers. The source-probe `request`/`borrow` mismatch from X
+is absent. The clean trace has 43 broad `call may store` reports; 14 use the function-local-
+reference wording. Thirteen resolver reports are formal-6 cases: `from=3` is a local
+`darray[sview]` lexical-binding array (11 in `resolve_expr_walk`, one in `resolve_flow`, one in
+`resolve`), while `from=1` and `from=2` are not local. The separate `semantic_api` report is
+formal 22 from a stack `SymbolTable`. Core emits these diagnostics through its Go
+`queueCallArgumentStoreChecks` / `returnBorrowCallArgStoreFlow` path. The trace identifies the
+source argument but stops at the direct `AddrOfExpr`; it does not yet prove the internal StoreFlow
+summary edge. A six-formal reproducer is structural evidence, not yet a source-matched explanation
+of that edge. The separate `STORESCAN`/`CHAIN` rows at `key.reserve` come from Core's
+`region_struct_target_store_scan` analysis and must not be treated as proof for the
+`LOCALSTORE` diagnostics. A W-to-Y multiset comparison keyed by relative source path and full
+diagnostic message, ignoring line/column spans, found 109 common non-warning records, four W-only
+and two Y-only. The four
+removed are the `driver/project.elisa` start-trim postcondition, loop-decreases warning, and two
+loop invariants; the two added are the `bytes_trim_end_from` postcondition and an
+`backend/easm_operand_scan.elisa` `scan_instruction` postcondition. Exact path/span/message
+multiset comparison instead yields 102 common, 11 W-only, and 9 Y-only records because some EASM
+diagnostics moved; comparing unique exact keys yields 96 common, 9 W-only, and 6 Y-only.
+The grouped comparison describes message-level changes, not one-to-one span correspondence. The
+assoc-index wrapper also had one invariant and two postcondition failures.
+Neither Y run qualifies semantic reuse or runtime parity because neither produced a Stage1
+compiler. The clean trace rerun uses the same pre-fix Core Stage0 and is diagnostic evidence only.
+The unresolved formal-6 StoreFlow reports later prompted Core commit `1366c770`, which suppressed
+scalar DArray push flows using the resolved argument type. Review found that pointer-to-integer
+casts can preserve address provenance, including through scalar locals and helper returns whose
+StoreFlow summary currently drops scalar return edges. An expression-independence WIP narrowed
+the direct case but did not cover those paths, so Core commit `e97b9983` withdrew the shortcut;
+`region_store_flow_summary.go` now matches the prior Core baseline `cbaa6619`. The restored-source
+focused StoreFlow/StoreScan controls passed in 0.545 seconds. These are Core-only results and do
+not resolve Gate Y's diagnostics or qualify a Stage1 build or incremental speedup.
+Core `b5df0720` now has an uncommitted reserve-specific StoreFlow summary path and a new focused
+test. At this snapshot the handling is not yet propagated through the other retention consumers:
+local view provenance, filled-value analysis, struct-target scanning, parameter-write scanning,
+and StoreFlow edge-kind analysis still classify `reserve` through the broad
+`containerGrowthMethods` set. That set also drives allocation/region inference, where reserve must
+remain a growth operation, so retention analysis needs its own operation-specific payload
+classification and direct scanner controls. This review does not attribute Gate Y's `LOCALSTORE`
+reports to those separate analyses. The builtin implementation validates reserve's sole argument
+as `usize`, returns the receiver, and invalidates receiver-derived views; this supports excluding
+capacity from retained payload while preserving receiver mutation. A separate repro checkout is
+testing StoreScan/local-provenance behavior for the `name`→`key` `RAISE`/`CHAIN` path. It is not the
+current Core working tree. Its six focused reserve/alias tests pass as structural checks, but its
+synthetic helper-return test injects handled return names rather than exercising the full callee
+summary; cross-function scalar-formal address provenance remains open. Keep that scalar-push
+optimization unpromoted. Neither candidate yet has a source-matched Stage1 qualification.
+After the freeze, the live `semantic/assoc_index_bound_marker.elisa` removed three ghost
+postconditions present in Gate Y and changed the scan body; its proof checker has since been
+updated in the live worktree, but that updated proof has not been run against a current compiler.
+The `driver/project.elisa` trim loops also changed after Gate Y, and
+`check_project_whitespace.py` was updated to follow them; that proof control likewise has not
+been run against a current compiler.
+The live `semantic/linear_checked_arithmetic.elisa` source and its proof fixture also changed, as
+did `driver/wasm_abi_type_classification.elisa`, `semantic/view_return_origins_sorted.elisa`, and
+`backend/easm_model.elisa` with their proof controls. The separately named `storeflow-patched`
+snapshot's
+`GATE-V-MANIFEST.json` pins compiler HEAD `423420b1` and overlays only
+`parser_stmt_when.elisa`, `incremental_function_facts.elisa`, and `resolve_expr_walk.elisa` from
+the live-vs-Gate-U delta. Its supplemental `snapshot.manifest` is stale Gate Y metadata. A direct
+comparison shows the snapshot still differs from live `src/` in these five files. The old seed
+attempt used Core `1366c770` (Stage0 SHA-256 `35af8e93bc6942f0310c59af3739bb527a5d5c896bb6b2d2b9ffb9c276b9dc6d`)
+but terminated with status 143 (signal 15), emitting no diagnostics and no object. It is not a
+current-source gate. Gate Y and its trace rerun also do not cover these current inputs.
+The installed Stage0 at `/Users/torarinvikbjarko/Documents/Coding Projects/Go projects/Elisa-core/compiler/bin/elisac`
+is a clean build of Core `e97b9983`, SHA-256
+`7b3333859c1ed4fc8acb1eb46390e9995aab1f3fcd80175f3c79452243d42faf`. Core has since advanced to
+merge commit `b5df0720` and then commit `0c3a8062`, which adds the reserve-specific StoreFlow
+summary handling and regression. The installed e97 Stage0 binary does not represent that source.
+A candidate was built at `/private/tmp/elisac-core-storeflow-reserve-current` from b5df plus the
+reserve working diff (SHA-256 `a00b9417b94397cad09330da872589e13ba83e3aef9df063076ea279ef021737`),
+with `vcs.modified=true`; its binary SHA-256 is
+`6abed96431e437f9401a2804f043fb45c196d61b5af9229df171e22f894aac4d`. The Core semantic suite
+passed on that candidate (`ok elisacore/src/semantic 118.448s`). Core then committed the exact
+reserve source/test as clean HEAD `0c3a8062`; both changed file hashes match the full-suite input
+manifest. A Mach-O comparison reports that all file-backed sections match the clean committed
+build except four metadata differences: the 59-byte Go build-ID prefix in `__text`, 63 bytes in
+`__rodata`, 64 bytes in `__go_buildinfo`, and one byte in `__data` for the `runtime.modinfo` string
+length. The reserve functions' disassembly matches. Keep the dirty-tree VCS provenance explicit;
+the binaries are not byte-identical. A clean committed Stage0 is available at `compiler/bin/elisac`, SHA-256
+`0cc10df1e515ededcf3b85914620a8f0ec7d7899d6220e4c7c44e87ddf2859aa` (`vcs.modified=false`), while
+the failed 515ac seed described below used the earlier `6abed964…` candidate binary.
+
+The source-matched-at-launch Stage1 seed ran from
+`/private/tmp/elisa-stage1-live-515ac-20261018-1025`. At launch, its 1,087-file `src/` and the
+`elisacore_std/` tree matched live exactly. The exact content fingerprints from
+`scripts/stage1_provenance.py inputs` matched between snapshot and live at launch: source tree
+`c4f0ecbbdc8120c0b48edc9d0f7d835e6bb0dfa13b03453f0ad149255ef792fe`, build recipes
+`a8a727f09ebdab279c1cde7d2b62e1226ff1a57c4d17484d880adc9383c44bba`, and source-stat fingerprint
+`eb3c1fde3cd60fd01f0d8781f7b4b64e0f9e3a7e1d5d0561cbe007307a0e0864`. The run used LLVM/Clang
+23.1.3 with clang SHA-256
+`efdad95de9f1ee4863117fd89a89bdb1a2389298a6d3c444e042aadf92d95448`. An independent tree
+inventory found 1,087 source files and 45 standard-library files with empty `diff -qr` at launch.
+This snapshot has package metadata but no `GATE-V-MANIFEST.json`. The run later failed with status
+1 and produced no Stage1 object. Its log contains 25,510
+located records: 25,398 explicit warning rows, 30 proof-lint notices (28 invariants and two
+loop-decreases), and 82 hard diagnostics (31 lifetime-store rows, 50 ensure-postcondition failures,
+and one ghost-purity error). The 31 lifetime rows comprise 29 `call may store` errors and two
+direct longer-lived-store errors. The 50 ensure failures include 40 in dirty files: 18
+`linear_mul_safe`, nine EASM compose-span, five view-origin swap, five project trim, two EASM label
+index, and one Wasm classification; the other ten are in untouched files. This is source
+correlation, not a clean-baseline comparison. It has no resolver lookup-context
+formal-6 report and no prior `semantic_api` formal-22 report; remaining lifetime reports include
+`resolve.elisa:147` argument 2 and `semantic_api.elisa:867` argument 2. This is consistent with the
+reserve-capacity false edge being absent, but does not prove causality: there is no same-source
+unpatched baseline or exact resolver StoreFlow `(1,3)` / wrapper `(2,5)` summary. A located-record
+multiset comparison with Gate Y reports 91 common, 20 Gate-Y-only, and 21 current-only
+records. Gate-Y-only includes 14 local-store reports, two assoc-index postconditions, and one EASM
+scan postcondition; current-only includes 16 linear-arithmetic postconditions and five view-origin
+diagnostics. Gate-Y-only assoc-index failures and the current run's assoc-index diagnostics are
+unqualified against the latest two assoc-index source edits; the parser diagnostic is likewise
+stale against the scalar-parser commit. Other independent proof blockers include `project.elisa:202/221`, repeated
+`linear_mul_safe` postconditions, `wasm_abi_type_classification.elisa`'s `classify` postcondition,
+and the view-origin reference-swap/ghost-helper checks. These are not StoreFlow evidence. This is
+not a controlled A/B: the Stage1 sources and Core bootstrap differ. Later live-tree comparisons
+became unstable while other agents edited the checkout, so use the frozen source fingerprint for
+this run and do not treat a point-in-time `diff -qr` list as the current mismatch set. A parser
+edit after launch contributes one non-warning diagnostic, so the run qualifies only the frozen
+pre-parser-fix snapshot's failed seed, not the latest live source. With no object, it also provides
+no current Stage1 IR, assembly, runtime, or incremental qualification. The live
+`check_project_whitespace.py` checker was updated for the post-Gate-Y trim loops, but its proof
+control has not been run against a current compiler.
+
+A separate seed, `/private/tmp/elisa-stage1-live-f54f-20261018-1035`, used the clean installed
+Stage0 SHA-256 `0cc10df1e515ededcf3b85914620a8f0ec7d7899d6220e4c7c44e87ddf2859aa` and a frozen
+`src/` plus `elisacore_std/` content fingerprint of
+`9b4a82364500024f27396485ec90739bd1391ea16246db67aed9147c9b31106d`. It finished with status 1,
+log SHA-256 `781015b229ec083660ba423ac8ad7042c934c594240788f6c1b527204a2f92b7`, and no object.
+The 25,509 located rows comprise 25,398 ordinary warnings, 29 proof-lint notices (27 invariant
+fallbacks and two loop-decreases), and 82 hard diagnostics (29 call-may-store lifetime errors, two
+direct longer-lived-store errors, 50 ensure-postcondition failures, and one ghost-purity error).
+Compared with the 515ac log by normalized path and message, 109 diagnostics are common, three are
+old-only, and two are new-only; the parser scalar-step proof is cleared, while the updated
+assoc-index scope proof still fails. Relative to the copied f54f source, 26 of the 50 ensure
+failures are in four changed files (18 linear arithmetic, five view-origin, two EASM model, one
+WASM ABI classification); the other 24 ensure failures and all 31 lifetime-store errors are in
+source files identical to live at that comparison. These are source correlations across distinct
+Core/source snapshots, not causal evidence for the reserve change.
+The single ghost-purity error at `view_return_origins_sorted.elisa:35` comes from body assertions in
+the frozen snapshot that were later removed in favor of an ensures relation. Thus 27 hard rows map
+to changed source (26 ensures plus that ghost error); the other 55 are in files identical to live
+at that comparison.
+This is a distinct run from the failed 515ac seed above. Concurrent edits made live-source
+comparisons unstable; at one later comparison, checkout hash `ef0ec9606e12a9930b68263eb851c9056cc68c209b960971e6e01e4511936ae3` differed in five source files, including `incremental_function_facts.elisa` with the new clone/reanchor spans. Bind this failed result and its 10-second phase sample only to the frozen fingerprint and Stage0 binary, not to current-source behavior or timing of the new spans.
+
+A later validation run at `/private/tmp/elisa-stage1-live-f54f-current-20261018-1045` used frozen
+reported frozen-input identifier `1aaa6e778e2fdc78465c89456c9a4a974f5ce9eed75099af8ed851ea341ad7c8` and the same
+clean Stage0 SHA. The snapshot contains clone/reanchor spans but predates sidecar spans. A later
+live comparison found two tracked source differences, both limited to timing instrumentation:
+`elisac_incremental_cache.elisa` adds sidecar spans and `incremental_function_facts.elisa` removes
+redundant effect annotations from clone/reanchor timer calls. The seed failed with status 1, log SHA-256
+`53213c914ce021f70bebf2f6d96ca901357f102602f2863b52dd02fecf9cc7b2`, and no object. Its 25,491
+located rows comprise 25,402 ordinary warnings (including four redundant `can Global{Read,Write}`
+warnings on timer calls), 29 proof-lint notices (27 invariants and two loop-decreases), and 60 hard
+diagnostics (31 lifetime-store errors and 29 ensure-postcondition failures). Compared with the
+1035 run, ensure failures fell from 50 to 29 and the ghost-purity failure cleared: 16 resolved in
+linear arithmetic, four in view-origin ordering, and one in WASM ABI classification. All 31
+lifetime-store errors remained in unchanged source files. The two
+`check_never_leak_threading_walk:118` and `semantic_api:867` lifetime errors remain. `ELISA_STAGE1_TIMINGS`
+was unset on wrapper and compiler, so this run cannot report clone/reanchor span values; it is a
+separate proof/source validation, not a timing run. The 29 remaining ensures are nine EASM compose,
+five project trim, two each in EASM model, linear arithmetic, assoc-index scope, iterator alias,
+and ownership lookup, plus one each in declaration-name position, reference-initializer typestate,
+assoc-index bounds, view-origin ordering, and ownership flow. The four redundant timer-effect
+warnings were removed from the live clone/reanchor calls after this run; that cleanup was not
+validated by this snapshot.
+
+A separate Stage1 retry used candidate Stage0 binary SHA-256
+`b92221eb76e98f1e47b7f0f14659ffb8c1ee8f4da5390046b22afc591a2484c9`, built from detached Core
+HEAD `cbaa661924bc481c8769c9cdd1d6906e9819d87e` plus a tracked diff (SHA-256
+`cf73f04da2a67434c49d3cae7b0b8b2e3859f52bdc18663ad5c055e72af4ec9d`) and four untracked repro
+tests (aggregate dirty-tree fingerprint `95a845f82975d2452ae8b432d7d0fad75d06abc6c8bb87ec4f10f812c6e712ac`).
+It is a combined dirty WIP, not a single-change build. The input was the same reported
+frozen-input identifier `1aaa6e778e2fdc78465c89456c9a4a974f5ce9eed75099af8ed851ea341ad7c8`
+used above, not the current live Stage1 tree. The candidate run failed with status 1 and produced
+no object. Its log is `/private/tmp/elisa-stage1-candidate-seed-20261018.log`, SHA-256
+`4b073ca57045369277f3c0bb6560a9d9b3bad1e0dccbf975951eae1e96e667e8`. The exact tally is 25,510
+located headers: 25,404 warnings by severity (25,402 `warning:` rows plus two unprefixed timer
+effect diagnostics classified as warnings), 27 invariant fallback notices, two loop-decrease
+fallback notices, and 77 hard diagnostics (27 ensure failures and 50 StoreFlow/lifetime reports).
+The two timer calls at `elisac_incremental_cache.elisa:262` and `:266` report missing
+`can[Global]` facts but are warning-level in this run. Against the installed clean Stage0 run on the
+same frozen Stage1 input, hard rows changed from 60 to 77: StoreFlow/lifetime reports rose from 31
+to 50, ensure failures fell from 29 to 27, and the two timer warnings were new. The raw `call may store` count rose from 29 to 45; the new set also
+includes local-reference reports in `resolve_expr_walk.elisa`, `resolve_flow.elisa`, `resolve.elisa`,
+and `semantic_api.elisa`, plus region-value reports in `check_readonly_ref.elisa` and
+`check_call_argument_exclusivity_refs.elisa`. Static follow-up suggests the 14 new local-reference
+reports concern a request-local lookup context passed synchronously through resolver helpers, with
+no observed storage into the symbol table or session snapshot; they may be a no-escape summary
+false positive, but this needs code-path confirmation. The two region-value reports are separate
+and still need triage. Source review found the exclusivity helper has no current call sites and
+returns neither local accumulator; the readonly checker passes a local `SymbolTable` through a
+synchronous recursive walk and returns no table. These also look like possible no-escape false
+positives around mutable out-parameters, pending confirmation against the candidate StoreFlow
+summary. Three additional candidate-only reports say values escape an `in auto:` scope
+in `check_borrow_after_move.elisa:1272`, `:1277`, and `:1278`; the two direct longer-lived-region
+store rows in `check_global_permissions.elisa` are present in both runs. Thus the net StoreFlow/lifetime
+increase is 16 new call-store rows plus three new scope-escape rows, not a change to those two
+existing direct stores. The diagnostic delta alone does not establish whether the new reports are
+soundness gains or regressions. The two assoc-index-scope ensure failures absent from the candidate
+output were still present in the frozen source, so this is changed proof behavior from the combined
+Core WIP, not validation of a Stage1 source fix. The live Stage1 tree has since changed three files
+(`assoc_index_bound_marker.elisa`, `assoc_index_impl_scope.elisa`, and
+`linear_checked_arithmetic.elisa`); this run does not cover those edits. The live tree also gained
+explicit timer grants after this candidate snapshot; the later clean-Stage0 seed below includes
+them, though it failed on other proof diagnostics. The
+candidate's enclosing driver function already carries global effects and neighboring timer calls
+are accepted; a branch-local effect-fact issue is another possible explanation for the two missing
+local grants, so the diagnostic does not establish the root cause. A later clean-Stage0 seed below
+includes the explicit grants and reports no hard `can[Global]` failures at those sites, though it
+still reports ordinary effect warnings for `Abort`, `Memory`, and `Unsafe`; the broader seed failed
+and does not establish a complete fix. No timing environment was enabled, and the failed candidate
+seed provides no Stage1 artifact, parity, or incremental-performance qualification.
+
+A subsequent installed-clean-Stage0 run used the seed owner's launch-time combined `src` plus
+`elisacore_std` fingerprint `18b864939acc553e997670dd9c3fd97e5877a7ad1f8f17a32043dbefad1f41c5`
+(1,132 files). It used the same Stage0 SHA above and the timer-grant and three assoc/arithmetic
+edits reported present at launch. The owner says the later `backend/easm_compose_text.elisa`
+named-local rewrite postdates this seed. The scratch path was reused and changed after the run, so
+the reported launch fingerprint is the source identity; rehashing its current contents or comparing
+them with the current checkout does not establish the compiled bytes.
+The run failed with status 1, produced no Stage1 object, and wrote
+`/private/tmp/elisa-stage1-source-fixes-seed-20261018.log` (SHA-256
+`17182d484f985ad9b63ea527251a800f48d195c000edc25ed8d9b933aa5aa1c2`). Its 25,492 located rows
+are 25,402 warnings, 27 invariant fallback notices, two loop-decrease fallback notices, and 61 hard
+diagnostics: 30 failed ensures and 31 lifetime/store reports (29 `call may store` rows and two
+direct stores at `check_global_permissions.elisa:336` and `:349`). The two candidate missing-
+`can[Global]` warnings are absent; warnings for other effects at the timer calls remain. The
+`line_is_impl_scope_from` ensures absent in the combined-Core candidate output are also absent here.
+A normalized comparison with the old 1045 log shows its two `linear_mul_safe` ensures at lines 62/63
+are absent, but four ensures at lines 47, 50, 66, and 67 plus an `easm_operand_scan.elisa:537`
+ensure appear. The earlier scratch source directory was reused and later changed, so this raw log
+comparison is triage only, not a controlled source attribution. Use the seed owner's launch-time
+combined fingerprint rather than rehashing the reused scratch path: a later inspection found the
+directory had changed, and its present
+contents do not prove the exact bytes compiled. The run also predates a later live edit to
+`backend/easm_compose_text.elisa`; its nine `easm_compose_span` ensure failures do not validate that
+new assertion form. This remains a failed proof seed, not Stage1 object, parity, or incremental-speed
+qualification.
+
 3a. **Replay one dependency fact.** Current-source-only direct-call records may replace a supported caller's Global-authority inference walk after ordinary global lookup misses and every target resolves uniquely against the fresh function index. Keep report walks and cold fallback. Add warm/cold controls for callee `Global.Read`/`Global.Write` changes, body relocation, and ambiguous target invalidation before widening eligibility.
 3b. **Use a trusted process-local semantic session.** The driver’s
 `run_semantic_gate_incremental_with_session` accepts an opaque
@@ -501,10 +764,12 @@ The opt-in `elisac-stage1 semantic-session SOURCE` host retains one session acro
 `check` requests and reparses the source on each request. Each process is tied to
 one source path and fixed environment options; callers start another host when
 either changes. The opaque session and one reusable process-owned line-map buffer
-outlive a request. The current server also allocates source buffers, parser AST
-and source-view storage, and parser/semantic name stores in program `@source`, so
-these parse-generation allocations remain live for the process lifetime; only
-diagnostics and other scratch are bounded by `request_scratch`.
+outlive a request. The driver now opens `request_scratch` around source
+processing, but parser/AST payloads and parser names remain typed in global
+`@source`. The current Stage1 seed rejects request-region arguments at parser
+calls, so this wrapper has not established per-request reclamation. The source
+and name allocation lifetime remains unqualified until the parser representation
+and API accept that boundary.
 `test/parity/incremental_semantic_session_control.sh` exercises the protocol through
 the Stage1 wrapper, including repeated requests and an edit that introduces then
 removes a semantic error. A fresh Stage1 run is still needed to qualify session
@@ -517,21 +782,55 @@ proven. The session stores only owned portable facts and grants, never AST,
 SymbolTable, line-map, or LLVM handles. It keeps one bounded translation-unit
 entry; changed admission inputs or invalid private snapshots clear it and run cold.
 
-An exact session hit still deep-copies the retained portable snapshot before
-reanchoring, and every request still lexes and parses the whole file. The first
-host therefore validates the trusted session boundary; it does not yet prove
-low-cost unchanged checks or edit-to-executable speedups.
+An exact session hit currently calls `ifc_clone_session_snapshot` before testing
+whether source bytes match, then `incremental_reanchor_exact_snapshot` scans
+declaration/token spans and mutates request anchors, reuse flags, and counters.
+Simply moving the equality check ahead of the clone would expose session-owned
+facts to those mutations. Source review narrows the split: reanchor reads retained
+`bytes`, `direct_facts`, and `active_grants`, while it writes current anchors,
+matched/reuse counters, `functions[*].matched_previous`, and
+`self_assignment_ranges[*].reused_previous/complete`. A safe no-op optimization
+can share immutable pools and move only these mutable fields into a request-local
+overlay, or copy just mutable record/range metadata. Changed-source requests also
+look eligible to read a retained snapshot directly: a static alias/lifetime audit
+found no mutation counterexample, and the collector receives `prior` read-only
+while building the replacement separately. Removing that clone still needs a
+borrowed-view implementation that pins the session snapshot until collection
+finishes; make the clone source parameter immutable as part of that change. The
+live source now times clone and exact reanchor
+separately, though the clone span includes non-exact prior-snapshot requests and
+the spans have no matched profile yet. Add copy-byte/record counts and compare
+complete cold/warm results; hold the session snapshot stable until semantic replay
+ends and take the cold path on invalid self-assignment data. Every request still
+lexes and parses the whole file, so the current host validates the trusted session
+boundary but does not yet prove low-cost unchanged checks or edit-to-executable
+speedups.
 
-The ordinary `main` path consumes one request and returns. It allocates
-`source_bytes` in the program-lived `@source` region because the AST borrows those
-bytes. The semantic-session command's `request_scratch` bounds diagnostics and
-other scratch, but its source, parser AST/source-view storage, and parser/semantic
-name stores remain in `@source`; that server has no request/epoch cap. Compile-
-session processing uses a `request_source` scope for local work and starts a fresh
-session region after 32 requests, but `source_bytes` and generated `expanded`
-text, AST/source views, and name stores also remain in `@source`. Neither host
-currently reclaims the full parse generation. Both publish the new map into a
-reusable process-owned lexer buffer. The semantic host calls
+There is another no-op cost when the same driver request also enables a disk
+cache through `ELISA_STAGE1_INCREMENTAL_CACHE_DIR`: `elisac_incremental_cache.elisa` admits the cache path before session
+lookup, then its common tail re-encodes the snapshot and atomically writes the
+sidecar even when `session_hit` is true. Live source now times serialization and
+publication separately with `incremental-sidecar-encode` and
+`incremental-sidecar-write`; both f54f snapshots predate these spans, so they have no
+source-matched timings yet. A future skip must be conditional on a
+known successful publication for the same path and content identity; set that
+marker only after atomic publication succeeds. Cold starts, edits, and missing or
+invalid sidecars still need publication. If a warm hit skips writing, preserve the
+meaning of the existing `published=yes` report and add a separate skip/reuse
+counter. Measure session-only and session-plus-sidecar modes separately, and
+verify a fresh process can load the sidecar after repeated warm checks.
+
+The ordinary `main` path consumes one request and returns. The semantic-session
+and compile-session hosts open request regions around source processing;
+compile-session also starts a fresh semantic-session region after 32 requests.
+However, the parser API, AST payloads, and parser name store still declare
+source-backed data in global `@source`, and the current exact-source Stage1 seed
+reports request-region arguments rejected at parser call sites. These wrappers
+alone therefore do not prove that a full parse generation is reclaimed. A
+passing source-matched lifetime check and repeated-edit memory control are
+required to establish which buffers die at request end and which remain
+process-lived. Both hosts publish the new map into a reusable process-owned
+lexer buffer. The semantic host calls
 `PhaseTimer::request_start` and marks each completed check so semantic timing rows
 exclude idle time between edits. Other process globals still need lifecycle review.
 
@@ -550,7 +849,9 @@ to come from the original source. Early `pymodule` gates use the same pairing.
 Without stable identity, the driver resets any session and runs the ordinary cold
 semantic gate. An empty cache directory disables sidecars; a host that retains an
 opaque session can still use the session-aware entry point. The opt-in
-`semantic-session` command is that host; ordinary compile commands remain one-shot.
+`semantic-session` and `compile-session` commands are persistent hosts;
+`compile-session` keeps one authoritative source snapshot per epoch and resets it
+when request identity changes. Ordinary one-shot compile commands remain stateless.
 
 In ordinary one-shot CLI compilation, the session-disabled wrapper does not consume stored
 facts as authority effects. It rescans each supported body from the current AST
@@ -559,8 +860,8 @@ authorize a skip. The driver also exposes a session-aware internal entry point
 that accepts only the opaque Semantic-owned session type. Its session operation
 decodes private state and can reuse trusted in-process facts after checking the
 exact declaration surface and unchanged body tokens. The opt-in semantic-session
-host retains that session across requests; ordinary one-shot CLI calls still use
-the disabled wrapper. A freshly scanned, cacheable zero-fact record can skip Global-authority walks,
+and compile-session hosts retain that session across requests; ordinary one-shot CLI
+calls still use the disabled wrapper. A freshly scanned, cacheable zero-fact record can skip Global-authority walks,
 effect-source scans, panic-coverage body scans, and Global-permission body-axis
 collectors only at a unique top-level definition offset. Direct-call-only records
 can also seed Global-authority inference after fresh target resolution.
@@ -581,6 +882,13 @@ Dependency-change invalidation remains to be added before eligibility expands. T
 `INCREMENTAL_SEMANTIC_ENGINE_VERSION` must be bumped whenever changes can alter
 collector eligibility or the meaning of facts consumed by replay.
 
+The current compile-session control has no global declarations, so
+`check_global_permissions` exits before `gp_project_direct_facts`; it does not
+exercise Global.Read/Write projection or direct-call effect closure. Add a separate
+current-source parity case with a mutable-global read/write and a caller edge, and
+compare cold/warm diagnostics plus canonical rows before treating those counters as
+consumer coverage.
+
 This trust policy sets a hard limit on sidecar reuse: exact body equality proves
 that a cached record names the current body, but it does not prove that the
 record's semantic observations are true. A checksum detects accidental damage;
@@ -594,8 +902,8 @@ boundary: only
 Semantic can create or advance the session state, which stores facts emitted by
 the current collector and checks exact options, include identity, declaration
 surface, and body tokens before reusing them. That
-boundary is exercised by the opt-in semantic-session host, but its protocol and
-request-lifetime behavior still need an end-to-end control. Ordinary one-shot CLI
+boundary is exercised by the opt-in semantic-session and compile-session hosts,
+but their protocol and request-lifetime behavior still need end-to-end controls. Ordinary one-shot CLI
 compilation continues to recollect. Do not treat a body hash, schema check, or
 structural validation alone as a substitute for session provenance.
 
@@ -630,11 +938,14 @@ previous snapshot's typed facts before it bypasses the body walker. A resolver
 `NameLookup` query is connected at `Expr.Ident` classification: the driver reacquires a
 request context after collection, and the serial declaration-resolution walk checks the
 cached `(known, module_only)` result before scanning global symbol/member chains. Key
-schema 2 stores only current module and exact name; the session-local graph resets when
-identity or options change. After declarations, aliases, imports, and region annotations
+schema 2 stores only current module and exact name; input schema 3 packs six boolean
+surface facts into one flags byte alongside the exact count fields. The session-local
+graph resets when identity or options change. After declarations, aliases, imports, and region annotations
 are collected, the first eligible unbound name-classification read lazily builds a
 collision-safe exact-spelling surface index. Requests with no eligible reads skip the
-O(symbols + members + regions) pass; any request that reaches one still pays that setup.
+O(import annotations + symbols + members + regions) pass; any request that reaches one
+still pays that setup because the builder first reconstructs imported-module and
+imported-member sets from the import annotations, then indexes the declaration surface.
 The request context memoizes the build attempt, including failure, so unsupported
 surfaces use the cold classifier without repeating the prepass. The input
 records total and non-module
@@ -659,6 +970,195 @@ only; no build, parity run, or benchmark has verified them.
 This can reuse classification across body-only edits because the declaration surface
 omits function bodies, while every declaration-surface change invalidates all these
 name queries. The resolver still performs the indexed chain walk on misses.
+The current body-fact query has a coarser dependency: each `FunctionBodyFacts`
+node depends on the whole `SourceInput`, whose value includes the declaration
+surface and options. A declaration change can therefore make every body query
+non-green even when an unrelated function body and its facts are unchanged. The
+same broad surface match also gates the current prior-snapshot reuse path; if the
+surface differs, the collector cold-scans candidate bodies. Thus an unrelated
+declaration edit can currently force supported bodies through the scan. The
+next useful graph step is to record the actual name observations used by the fact
+walker as dependencies, scoped to the canonical direct facts this syntax walk
+emits. For `GlobalRead`/`GlobalWrite`, record mutable-global membership plus the
+owner's local/binder shadowing; this walk does not inspect all-global presence on
+that path. For zero-argument `DirectCall`s, capture resolver-visible shadowing
+and candidate selection/eligibility, including imports, modules, extern/scoped
+declarations, visibility, and added or removed names. The collector's local
+`all_globals` and function-candidate arrays do not cover that complete lookup
+surface, so they cannot alone authorize reuse. Preserve the builtin-versus-call
+classification for `panic()`. These projections must come from a complete current
+resolver lookup surface; otherwise retain the `SourceInput` dependency and
+cold-scan. Semantic resolution and type checking still run on the current
+AST/SymbolTable, so a signature change that does not alter walker eligibility or
+direct-fact bytes need not invalidate this query. Preserve namespace-wide
+dependencies where uniqueness or all-name enumeration matters, and the
+whole-surface dependency as a conservative fallback whenever extraction is
+incomplete or syntax is unsupported. Relax the broad surface gate only for an
+exactly matched body record whose complete observed dependency set revalidates.
+Retained-session controls should keep body bytes unchanged across these transitions
+and compare cold/warm full diagnostics, canonical inferred rows, and body-reuse
+versus-rescan counters: an unrelated declaration leaves the body green;
+adding/removing a referenced global or call target invalidates only its users;
+renaming an owner parameter so a fixed body identifier changes from local to
+mutable-global resolution invalidates that fact; a referenced global changing
+mutable→readonly→mutable invalidates and then restores the read fact; and adding or
+removing a same-named global shadows or reveals a zero-argument call as the resolver
+does. Include callee eligibility/effect-row changes as well as declaration-class
+collisions in the call tests. The following is a proposed retained-session control;
+the existing include-body unresolved-name transition in
+`test/parity/incremental_semantic_session_control.sh` is narrower and does not
+cover this callee/row/effect combination. Change a previously supported callee
+to unsupported nested flow while adding a `Global` access and an ungranted
+panic/effect call. Require cold/warm diagnostics and inferred-row parity, prove
+an unaffected sibling remains reusable, and require the changed callee to take
+the current-AST cold scan so no prior typed facts survive the eligibility
+transition.
+Do not persist request-local declaration IDs or handles in those dependencies.
+
+A conservative rollout can first relax `SourceInput` only for bodies whose prior
+collector explicitly records a complete empty declaration-observation manifest.
+Derive this class from a closed syntax shape, not `direct_fact_count == 0`: for
+example, exactly one bare `return` whose expression is a self-contained integer,
+float, string, character, or boolean literal, with no local bindings, grants,
+calls, identifiers, or additional statements. Zero emitted direct facts alone is
+not proof of an empty dependency set because body-local forms may be omitted from
+that fact vocabulary. Key the context by exact body bytes and current owner
+eligibility; keep the whole-surface dependency for bodies with observed names or
+calls until their projections and owner-removal publication are complete.
+
+For the current collector, keep the first dependency manifest scoped to observations
+from bodies that are already cacheable. `ifc_walk_expr` rejects absent/readonly
+globals, owner-local-shadowed names, ambiguous calls, and unsupported call targets,
+so those bodies already take the cold path; negative/ambiguous lookup edges are
+needed only if a later change broadens eligibility. Include the current owner
+parameter/local-shadowing projection for each recorded identifier or zero-argument
+call: adding a parameter with the same spelling can change whether the walker emits
+a global fact while the global's own projection stays identical. The body query key
+is currently path plus function name, so add the owner's current eligibility result
+and ordered parameter/binder names before relaxing the whole-surface admission gate.
+Eligibility depends on unique-name status, alias-aware return-type support,
+defaults, generic/inline-grant status, and valid source spans; encode these observed
+facts canonically rather than relying on raw header text alone. The current
+uniqueness check only rejects duplicate top-level `Decl.Func` names; it does not
+establish uniqueness against resolver-visible extern, nested/module/scoped, or
+imported candidates. Keep such calls cold until the current callable-resolution
+inventory is complete, and add same-name collision tests across those declaration
+forms. Collect or precompute the
+complete body dependency set before query evaluation; later resolver `NameLookup`
+hits cannot validate an earlier body-fact query. If extraction is incomplete or
+over budget, retain `SourceInput` and cold-scan.
+
+Projection precision matters when this manifest is implemented. For this walker's
+`GlobalRead`/`GlobalWrite` observations, `ifc_walk_expr` checks owner locals and then
+membership in `mutable_globals`; it does not consult `all_globals` on that path.
+Therefore the minimum global projection for those facts is mutable-global membership
+plus the owner's parameter/local-shadowing context. Keep a separate `all_globals`
+shadow check and exact candidate multiplicity/eligibility projection for `DirectCall`
+resolution. Adding `all_globals` presence to every global-read projection would be
+sound but would invalidate bodies on declaration changes the walker does not observe.
+The current candidate census only enumerates top-level `Decl.Func` and global
+`Decl.Const`; it does not by itself represent resolver-visible `Decl.Import`,
+`Decl.Module`, `Decl.Scoped`, or `Decl.Extern` names. Do not let a
+`DirectCall` context turn green from those local arrays alone unless resolution
+rules prove the omitted declaration forms cannot affect selection. Include their
+current visibility/uniqueness effects in the canonical projection, or retain the
+whole-surface/cold path. Add same-name add/remove controls for each declaration form.
+An unchanged import line also does not prove that its provider's contents stayed
+the same. A `DirectCall` through an imported/module provider needs that provider's
+stable identity and revision/content in the context, or a current resolver-visible
+callable projection; if neither is available during collection, keep that call cold.
+
+Graph reuse must also refresh saved projections, not merely rebind old dependency
+IDs: dependency checks validate edge status and result generations but do not
+recompute a name query's input against the current translation unit. Persist a
+bounded, validated prior edge manifest, reevaluate each referenced name/call
+projection in the current request, then pass those current handles to the body
+query. On a body miss, rescan it and commit the replacement dependency set.
+Malformed edges, cap overflow, unsupported projections, or incomplete extraction
+must cold-scan (and poison the graph if required) before publication.
+
+To limit dependency-edge fan-out, an alternative is one per-body
+`FunctionFactContext` query. Build its canonical input from the validated prior
+fact manifest, the current projection for each observed fact, owner eligibility,
+and the owner's parameter/binder names; evaluate it before `FunctionBodyFacts`,
+which depends on that single context node. Unrelated declarations then leave the
+context bytes unchanged, while a changed observed projection dirties the body
+through the reverse edge. Keep exact length-delimited bytes and collision-safe
+equality. On a body miss, cold-scan and publish the refreshed context and fact
+result together. This still requires a complete current changed/removed-name
+manifest from the compiler adapter; the generic frame/catalog layer cannot infer
+omitted declarations or attest that its enumeration is complete.
+When a stable function key becomes ineligible because its body or header changed,
+do not skip context publication while leaving the old context node Green. Commit a
+canonical ineligible context result for that key, or explicitly stale the prior
+context/body node before skipping publication, so a later request cannot reuse
+facts from the previously eligible version. Stage current context bytes during
+collection and publish only after the replacement snapshot stores successfully.
+A fresh session or sidecar without a complete validated prior manifest must take
+the cold scan; it cannot infer context equality from old fact record offsets alone.
+Collection and publication must use the same dependency set. The current publisher
+rebuilds a shared `[SourceInput]` dependency list for every cacheable body; if
+collection admits an empty-manifest body without that edge but publication
+reattaches it, declaration edits will still invalidate the body. Carry a validated
+dependency classification through the request snapshot or recompute it from the
+same complete manifest at publication, and assert the committed edge set in a
+control. Prefer one deterministic dependency builder for collection-time
+evaluation and post-store publication; retain request-local projection evidence
+separately from handles, then reacquire handles under the committed graph
+generation.
+
+This is the target behavior, not the current implementation. Collection attempts
+FunctionBodyFacts only after the complete SourceInput value fits and hits; the
+publisher also returns before visiting body nodes when that value is over cap.
+The outer publisher treats that predictable miss like aggregate exhaustion,
+clears the graph, and retries the same preflight. Thus an oversized SourceInput
+currently prevents context-only body queries and can discard unrelated graph
+state. Keep fixed-cap admission misses local; clear and rebuild only for actual
+aggregate-capacity or structural failures.
+
+Query-value capacity is part of this dependency policy. A valid source surface
+whose `SourceInput` key or value exceeds its cap must still allow a fitting
+context-only body query to publish; an invalid surface keeps its body records
+ineligible. Treat predictable admission misses separately from graph-capacity
+failures so an over-cap `SourceInput` preflight does not clear unrelated query
+nodes and retry the same miss. After an actual graph clear, preserve or recompute
+each owner's dependency policy and reacquire handles in the new generation; the
+old validated-hit marker cannot authorize publication across that generation
+change. If publishing one owner's context itself fails its key, value, or edge
+budget, retry the committed snapshot once after the clear with the same per-owner
+policy. Clear and stop if the rebuilt working set still exceeds graph capacity.
+A fallback for one owner to `SourceInput` is an optional optimization when the
+failure is known to come from its context and the source dependency fits; leave
+that owner unpublished when neither dependency fits. Add retained-session
+controls for both a large declaration surface with small context-only bodies and
+a context payload that exceeds its own cap.
+
+The current validated-body-hit marker also records the `SourceInput` result
+generation and publication skip validation reacquires that handle. If an eligible
+body drops the broad source edge, update the marker to validate its exact current
+context dependency set (or disable the publish skip for that case); a source-only
+marker cannot authorize publication under a different dependency policy.
+
+The existing `NameLookup` query returns only `(known, module_only)` and omits
+binding types, signatures, attributes, and declaration identities. It can skip
+name classification, but cannot alone authorize body-fact reuse. Body reuse needs
+a distinct versioned canonical `FunctionFactName`/`CallTarget` projection or a
+complete declaration-surface fallback; this projection is not a semantic-resolution
+cache and need not serialize type details the fact walker does not observe. Do not
+persist request-local declaration IDs or handles.
+
+The query graph propagates dirtiness when a node's canonical result changes;
+changing its input alone advances the node's input bytes but does not increment
+its result generation or dirty its dependers (`ifq_query_commit`). Therefore a
+`FunctionBodyFacts` edge to the current `NameLookup` result is insufficient even
+if that lookup's input includes more resolver facts: the result can remain
+`(known, module_only)` across a binding change, such as a const becoming mutable
+or a same-name callable candidate being added. A body-context query must return
+the exact typed facts the body walker consumes (or its canonical fingerprint),
+so an observed dependency change changes the context result and reaches the body
+through the reverse edge. Add a same-classification/different-binding
+invalidation control before relying on this propagation.
+
 If graph lookup, admission, evaluation, or result restoration misses, the collector
 falls back to copying prior typed facts when the current declaration surface and
 body exactly match; malformed or incompatible prior facts fall through to the AST
@@ -794,8 +1294,19 @@ capacity plus replacement and invalidation costs before changing the representat
 source-level comparison and references are in
 [`compiler_incrementality_reference_study.md`](compiler_incrementality_reference_study.md).
 
-Dependency deduplication still uses nested scans; the 4,096-ID per-query admission
-cap bounds that work, but a future caller should measure it. The value pool is
+Dependency deduplication still uses nested scans. Current `SourceInput` and
+`NameLookup` callers pass no dependencies, and `FunctionBodyFacts` passes one
+`SourceInput` dependency, so current fanout does not make those scans a measured
+hot path; the 4,096-ID admission cap is a future bound. Preflight already
+deduplicates the checked IDs, making the apply-side duplicate scan redundant
+under its current private caller. If future queries record per-name or per-symbol
+dependencies, measure the complete check-and-commit path and dependency-count
+distribution before adding a scratch set. A more plausible near-term experiment
+is a scalar 0/1 dependency-check path: preflight currently creates both
+`dependency_ids` and `old_ids`, and `FunctionBodyFacts` checks its single source
+edge during evaluation and again during validated warm-hit publication. Measure
+the resulting scratch allocations and full retained-request time first; keep the
+existing generic validation path for larger sets. The value pool is
 append-only between graph clears. After each successful session snapshot store, the
 publisher records the current source and cacheable function results; on failure it
 clears and retries once, then leaves the committed semantic snapshot available to
@@ -853,6 +1364,61 @@ alongside the other pass counters. Runtime parity for these updated controls is
 still pending a fresh Stage1 product. LLVM fragment loading remains a separate
 later stage.
 
+The cold fallback is not yet a trustworthy semantic baseline for all local-name
+shadowing. `collect_local_names` recursively flattens `VarDecl` names from the
+whole function, while the resolver visits each initializer before binding that
+declaration and restores lexical scope across control-flow arms. For example,
+with mutable global `hot`, `prior: i64 = hot; hot: i64 = 1` resolves the first
+`hot` as the global, but the flat local set can hide that `Global.Read` from the
+Global-permission fallback. A declaration in one branch can likewise mask a
+same-named global read outside that branch. The function-value effect pass uses
+the same pre-collected locals. This is a cold-path correctness issue, not stale
+fact reuse; replace flat name collection with source-order lexical environments
+and scope push/pop, then require cold parity for declaration-order, branch,
+loop, block, and pattern-binding cases before widening body-fact reuse.
+
+The cold write walker has a complementary operator mismatch: it treats every
+assignment rooted in a mutable global as a store, while the resolver treats
+plain `=` as a new local binding and reserves `<-`/compound operators for
+existing places. Thus `global mutable hot: i64 = 0; def f(): hot = 1` can acquire a
+false `Global.Write` requirement. Model binding versus mutation in the same
+source-order environment.
+
+Call-edge discovery also treats a source spelling as callable identity. The
+resolver chooses a local binding before a same-named top-level function, but
+`called_function_name` and `gp_expression_calls` do not consult that binding.
+For example, `def through(bump: fn(i64) -> i64, n: i64) -> i64: return bump(n)`
+can be connected to a top-level effectful `bump` even though the call targets
+the function-value parameter, spuriously propagating its `Global.Write`. Build
+call edges from the current resolved binding and only map confirmed top-level
+callables to the declaration graph.
+
+Expression coverage in the cold Global walkers is also incomplete. Both
+`gp_expression_reads` and `gp_expression_calls` omit `Expr.If`, so a conditional
+value can hide a global read or a call edge even though the fact collector
+rejects that expression and correctly selects the cold path. For example:
+
+```elisa
+global mutable hot: i64 = 0
+def f(flag: bool) -> i64:
+    return if flag:
+        hot
+    else:
+        0
+```
+
+The cold visitor must recurse through every executable expression child and
+respect branch and pattern scopes. The statement walkers also omit Match guards,
+the call walker skips nested calls in a Call's callee and assignment target, and
+`Stmt.Contract` has no explicit kind-aware handling. The backend checks
+`requires`/`require` and `assert` predicates at runtime, defers `ensure`/`ensures`
+to each later return, and does not lower `decreases`, `invariant`, `changes`, or
+`preserves` as runtime predicates. The canonical visitor must include runtime
+and return-flow expression observations while keeping proof and frame clauses
+separate. These omissions already affect cold inference; complete fact manifests
+cannot make Global-row reuse sound until the canonical visitor covers them or
+rejects those forms.
+
 ### Driver source context boundary
 
 For each gate, `static generate` may replace the analyzed inputs. The existing
@@ -890,6 +1456,18 @@ at 576.30 ms. The shared host produced variable timings, including a slower
 incremental single-edit sample. These are synthetic O0 measurements, excluding
 final executable linking/execution, not self-compiler or project qualification.
 
+A separate synthetic `BenchmarkCompileServerNativeBodyEdit` profile from Core
+`cbaa6619` measured 1.20 seconds CPU over 1.78 seconds elapsed; `IncrementalObjectSession.WriteObject`
+accounted for 790 ms cumulative. The measured codegen implementation and benchmark harness files
+are unchanged through Core `e97b9983`, so the cache-order observation still applies to the current
+path. Source order in `llvm_incremental_object.go` confirms the current module is built and
+optimized before partition cloning, bitcode serialization, and per-partition cache lookup. The
+profile attributes about 250 ms to module build/optimization,
+100 ms to partition cloning, 180 ms to bitcode serialization, and 130 ms to target emission;
+inclusive Go/native counters overlap and are not disjoint costs. This synthetic sample is not
+end-user latency, but it shows why partition reuse alone does not skip frontend, IR construction,
+whole-module optimization, or partition serialization.
+
 The backend/server suites, targeted race/concurrency tests, native O0/O2/O3
 parity, LLVM boundary guards, debug relocation and anonymous-unit controls pass.
 Read-only overlays excluded unrelated loop-proof changes; these checks do not
@@ -898,8 +1476,11 @@ compiler hashes, raw samples and overlay sources are preserved in
 `build/verification/incremental-native-final-20261018/` in both repositories.
 
 Instruction-weight shard boundaries and complete declaration inventories remain
-sensitive to large body edits or declaration insertion/removal. Those workloads
-need explicit locality measurements and stable-placement work. General semantic
+sensitive to large body edits or declaration insertion/removal. The reviewed
+modulo-divisor ownership scheme can rebucket nearly every function after one
+insertion; fixed logical bucket IDs with empty buckets allowed would preserve
+placement better, with an ownership-version bump. These workloads need explicit
+locality measurements. General semantic
 replay, avoiding complete LLVM generation/optimization, persistence, normal CLI
 integration and representative edit-to-executable qualification remain required
 for the full professional incremental-compilation goal.
@@ -936,14 +1517,24 @@ Stage1 semantic session. Send one `check` line for each saved edit and `quit` to
 stop it. Each check rereads the same source path, rebuilds the include graph,
 line map, tokens, and AST, and returns `0` for accepted, `1` for rejected, or
 `2` for an invalid protocol command on stdout; compiler diagnostics remain on
-stderr. The current server puts root, expanded, and generated source buffers,
-parser AST nodes and source views, parser name storage, and synthesized semantic
-names in the program `@source` region. That region persists for the server
-lifetime; `request_scratch` bounds diagnostics and other request scratch but does
-not reclaim those per-check allocations. The host keeps one reusable line-map
-buffer, and an identical map preserves the lexer's parsed lookup tables. The
-opaque semantic session is intended to survive between requests, but
-source-backed parse and name storage currently survives too.
+stderr. The current server opens `request_scratch` around source processing in
+`src/driver/elisac_incremental_server.elisa:73-125`, but the parser API and AST
+payloads still declare source-backed data in global `@source`
+(`src/parser/parser.elisa:93` and `src/parser/ast_nodes.elisa`). Parser names
+also use the append-only `@source` `NameStore`. The request wrapper is therefore
+an intended lifetime change, not proof that each request’s source, AST, or names
+are reclaimed. The exact-source Stage1 seed currently fails its lifetime checks,
+and a retained-edit memory control has not qualified reclamation. The host also
+keeps a reusable lexer line-map buffer, and an identical map preserves the
+lexer’s parsed lookup tables. Every check still rereads and parses the source
+before semantic reuse, so cache hits do not avoid frontend work.
+
+The session snapshot copies analyzed bytes and portable facts into session-owned
+buffers. Its reviewed representation contains offsets and scalars rather than
+borrowed source views. A passing lifetime check must establish that source and
+AST views do not escape through semantic publication or diagnostics, and show
+which parser/name allocations remain in `@source`. Measure retained session,
+line-map, and any process-lived parser capacity across repeated edits.
 
 This first host reuses the existing validated function-fact path for an exact
 repeat or a source edit. In the trusted in-process session only, it also reuses
