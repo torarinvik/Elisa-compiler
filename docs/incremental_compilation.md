@@ -456,7 +456,13 @@ was reused. `ga_walks_skipped` is the current measure of avoided checker work an
 counts only Global-authority body walks skipped. Any future local-initializer
 products must be reported separately from function-body counts.
 
-This experiment does not yet skip `collect_effect_sources`, `check_ungranted_panic`,
+The current-source fact scan also allows `collect_effect_sources` to skip its
+second body walk for a uniquely anchored, cacheable function with zero direct
+facts. This applies on cache hits and misses because the evidence is recollected
+from the current AST; stale sidecar flags and names do not authorize the skip.
+Duplicate or malformed anchors and unsupported bodies remain on the cold path.
+The report counts these as `effect_source_walks_skipped`, separately from
+`ga_walks_skipped`. The optimization does not skip `check_ungranted_panic`,
 authority indexing/closure, code generation, or linking. LLVM fragment loading
 remains a separate later stage.
 
@@ -475,3 +481,38 @@ source-declaration membership. Matching a path, name, definition offset, and tok
 range is insufficient when bytes changed at the same offsets or synthetic callable
 rows entered the authority inventory. Invalid or ambiguous binding takes the cold
 checker path before any stored effect facts are applied.
+
+## Native partition reuse (2026-10-18)
+
+Core commit `1cb75ef0d05d` adds bounded in-process native partition reuse to the
+compile server's opt-in `mode=obj` path. It still rebuilds and optimizes current
+LLVM IR. Exact post-optimization partition bitcode plus resolved target settings
+authorize native reuse; a digest alone does not. Native cache entries own no
+semantic/LLVM handles. Source filenames provide stable unit identities; anonymous
+units and unsupported partition constructs take direct emission. Selective
+definition cloning reduces preparation overhead, and short cache/LRU locks allow
+independent O0 requests to compile concurrently. Address-significant private
+constants have one owner, preserving pointer equality across partitions.
+
+A final source-matched real-server run on the local M5 fixed both paths at eight
+partitions/workers. Nine novel constant body edits in 256 integer arithmetic
+functions measured HTTP source-to-object medians of 338.24 ms fresh and 280.01 ms
+incremental. Four-request warm batches measured 930.60 versus 558.22 ms medians
+over five batches: 4.30 versus 7.17 requests/second. Cold incremental was slower
+at 576.30 ms. The shared host produced variable timings, including a slower
+incremental single-edit sample. These are synthetic O0 measurements, excluding
+final executable linking/execution, not self-compiler or project qualification.
+
+The backend/server suites, targeted race/concurrency tests, native O0/O2/O3
+parity, LLVM boundary guards, debug relocation and anonymous-unit controls pass.
+Read-only overlays excluded unrelated loop-proof changes; these checks do not
+qualify verifier changes in the shared commit. Matching code and script hashes,
+compiler hashes, raw samples and overlay sources are preserved in
+`build/verification/incremental-native-final-20261018/` in both repositories.
+
+Instruction-weight shard boundaries and complete declaration inventories remain
+sensitive to large body edits or declaration insertion/removal. Those workloads
+need explicit locality measurements and stable-placement work. General semantic
+replay, avoiding complete LLVM generation/optimization, persistence, normal CLI
+integration and representative edit-to-executable qualification remain required
+for the full professional incremental-compilation goal.
