@@ -44,7 +44,8 @@ assert 'include "../../src/parser/parser_integer_literal.elisa"' in rejected_tex
 assert "return parse_int_literal_value(text)" in proof_text
 assert "return parse_int_literal_value(text)" in rejected_text
 assert "value * base + digit.u64()" in step_text and "maximum if value > (maximum - digit.u64()) / base" in step_text
-assert "ensure result.next_index == index + 1" in step_text
+assert "def parse_int_literal_step(text: sview, index: usize, is_hex: bool, value: u64) -> u64:" in source_text
+assert "ensure parse_int_literal_reference_from(text, index, is_hex, value) == parse_int_literal_reference_from(text, index + 1, is_hex, result)" in step_text
 assert "requires text[index].u8() == 95 or" in step_text
 assert loop_text.index("return 0") < loop_text.index("parse_int_literal_step(")
 assert "invariant index >= start_index" in loop_text

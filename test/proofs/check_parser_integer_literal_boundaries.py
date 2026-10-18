@@ -38,8 +38,8 @@ decoder = source.split("def parse_int_literal_value(", 1)[1]
 for fragment in (
         "requires index < text.len",
         "requires text[index].u8() == 95 or",
-        "ensure result.next_index == index + 1",
-        "ensure parse_int_literal_reference_from(text, index, is_hex, value) == parse_int_literal_reference_from(text, result.next_index, is_hex, result.next_value)",
+        "-> u64:",
+        "ensure parse_int_literal_reference_from(text, index, is_hex, value) == parse_int_literal_reference_from(text, index + 1, is_hex, result)",
         "next_value: u64 = maximum if value > (maximum - digit.u64()) / base else value * base + digit.u64()",
 ):
     if fragment not in step:
