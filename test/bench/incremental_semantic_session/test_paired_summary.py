@@ -8,6 +8,7 @@ from paired import (
     DarwinProcessCounters,
     counter_delta,
     mach_ticks_to_ns,
+    memory_observation,
     paired_counter_measurements,
     paired_timing_summary,
     timing_arm_kinds,
@@ -15,6 +16,16 @@ from paired import (
 
 
 class PairedTimingSummaryTest(unittest.TestCase):
+    def test_memory_gauges_can_decrease_without_counter_failure(self) -> None:
+        before = {"physical_footprint_bytes": 120, "lifetime_max_physical_footprint_bytes": 180}
+        after = {"physical_footprint_bytes": 100, "lifetime_max_physical_footprint_bytes": 190}
+        observation = memory_observation(before, after)
+        self.assertEqual(observation["physical_footprint_change_bytes"], -20)
+        before["physical_footprint_bytes"] = 999
+        self.assertEqual(observation["before"]["physical_footprint_bytes"], 120)
+        with self.assertRaises(RuntimeError):
+            counter_delta({"instructions_retired": 120}, {"instructions_retired": 100})
+
     def test_converts_mach_ticks_with_integer_precision(self) -> None:
         self.assertEqual(mach_ticks_to_ns(3, 125, 3), 125)
         self.assertEqual(mach_ticks_to_ns(1, 125, 3), 41)
@@ -84,6 +95,13 @@ class PairedTimingSummaryTest(unittest.TestCase):
         self.assertGreater(measured / elapsed, 0.8)
         self.assertLess(measured / elapsed, 1.2)
         self.assertGreater(checksum, 0)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS process gauges are Darwin-specific")
+    def test_reads_process_memory_gauges_separately(self) -> None:
+        counters, memory = DarwinProcessCounters().snapshot_with_memory(os.getpid())
+        self.assertEqual(set(counters), {"instructions_retired", "cycles_elapsed", "cpu_time_ns"})
+        self.assertGreater(memory["physical_footprint_bytes"], 0)
+        self.assertGreater(memory["lifetime_max_physical_footprint_bytes"], 0)
 
 
 if __name__ == "__main__":

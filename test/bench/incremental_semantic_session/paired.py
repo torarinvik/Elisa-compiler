@@ -164,6 +164,8 @@ class DarwinProcessCounters:
 
     INSTRUCTIONS_INDEX = 29
     CYCLES_INDEX = 30
+    PHYSICAL_FOOTPRINT_INDEX = 7
+    LIFETIME_MAX_FOOTPRINT_INDEX = 28
 
     def __init__(self) -> None:
         self.libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -180,19 +182,37 @@ class DarwinProcessCounters:
         self.timebase_numer = int(info.numer)
         self.timebase_denom = int(info.denom)
 
-    def snapshot(self, pid: int) -> dict[str, int]:
+    def snapshot_with_memory(self, pid: int) -> tuple[dict[str, int], dict[str, int]]:
         info = DarwinRusageInfoV4()
         buffer = ctypes.cast(ctypes.byref(info), ctypes.POINTER(ctypes.c_void_p))
         if self.proc_pid_rusage(pid, 4, buffer) != 0:
             error = ctypes.get_errno()
             raise OSError(error, f"proc_pid_rusage({pid}) failed")
-        return {
+        counters = {
             "instructions_retired": int(info.values[self.INSTRUCTIONS_INDEX]),
             "cycles_elapsed": int(info.values[self.CYCLES_INDEX]),
             "cpu_time_ns": mach_ticks_to_ns(
                 int(info.values[0] + info.values[1]), self.timebase_numer, self.timebase_denom
             ),
         }
+        memory = {
+            "physical_footprint_bytes": int(info.values[self.PHYSICAL_FOOTPRINT_INDEX]),
+            "lifetime_max_physical_footprint_bytes": int(info.values[self.LIFETIME_MAX_FOOTPRINT_INDEX]),
+        }
+        return counters, memory
+
+    def snapshot(self, pid: int) -> dict[str, int]:
+        counters, _ = self.snapshot_with_memory(pid)
+        return counters
+
+
+def memory_observation(before: dict[str, int], after: dict[str, int]) -> dict[str, Any]:
+    """Footprint is a gauge: decreases are valid, unlike cumulative counters."""
+    return {
+        "before": dict(before),
+        "after": dict(after),
+        "physical_footprint_change_bytes": after["physical_footprint_bytes"] - before["physical_footprint_bytes"],
+    }
 
 
 def find_stage1_pid(launcher_pid: int, stage1: Path, timeout_seconds: float) -> int:
@@ -401,13 +421,14 @@ def run_arm(
             for request_index, (label, next_source) in enumerate(request_specs):
                 if next_source is not None:
                     source.write_text(next_source, encoding="utf-8")
-                counters_before = process_counters.snapshot(compiler_pid)
+                counters_before, memory_before = process_counters.snapshot_with_memory(compiler_pid)
                 before = time.perf_counter_ns()
                 proc.stdin.write(b"check\n")
                 proc.stdin.flush()
                 status, lines = read_response(reader, time.monotonic() + timeout_seconds)
                 request_wall_ms = (time.perf_counter_ns() - before) / 1_000_000
-                request_counters = counter_delta(counters_before, process_counters.snapshot(compiler_pid))
+                counters_after, memory_after = process_counters.snapshot_with_memory(compiler_pid)
+                request_counters = counter_delta(counters_before, counters_after)
                 for key, value in request_counters.items():
                     counter_totals[key] += value
                 raw_log.write(f"=== request={request_index} label={label} status={status} ===\n")
@@ -423,6 +444,7 @@ def run_arm(
                     "status": int(status),
                     "request_wall_ms": request_wall_ms,
                     **request_counters,
+                    "memory": memory_observation(memory_before, memory_after),
                     "timings": timing_rows(lines),
                     "cache": fields,
                     "diagnostic_sha256": digest_bytes("\n".join(normalized_transcript(lines)).encode()),
@@ -457,6 +479,7 @@ def run_arm(
             **counter_totals,
             "pid": compiler_pid,
             "scope": "exact Stage1 child process; per-request deltas cover each check response",
+            "memory_scope": "point-in-time footprint gauges; lifetime peak covers the whole process, not an individual request",
         },
         "source_path": str(source),
         "initial_source_sha256": digest_bytes(source_versions[0].encode()),

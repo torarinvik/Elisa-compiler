@@ -93,6 +93,12 @@ process, so shell-launcher work is excluded from compiler instruction counts.
 These are Stage1-process counters, not process-tree totals: child tools such as
 Z3 are excluded. If a workload invokes a solver, report its cost separately or
 aggregate child-process counters before making a total-work claim.
+Each counter sample also records physical footprint and lifetime peak physical
+footprint in bytes. Requests retain both snapshots and a signed footprint change;
+these gauges are separate from cumulative instruction/CPU counters. Physical
+footprint is not RSS, and the lifetime peak covers the entire process rather than
+an individual request. These observations expose retained-memory growth but do
+not establish a memory bound or attribute allocations to a compiler phase.
 The normal host load gate still applies to keep cache and scheduling conditions
 comparable; instruction counts are the primary comparison because they are less
 sensitive to scheduling delay than wall time.
