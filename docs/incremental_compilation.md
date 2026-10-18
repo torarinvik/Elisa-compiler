@@ -471,6 +471,17 @@ Start codegen reuse with `-O0`, without debug/profiling/coverage metadata, and w
 1. **Instrument the baseline.** On the exact local compiler seed and host in a quiet window, record phase wall/CPU time for `check_ungranted_panic`, `check_mutable_global_authority`, their combined interval, number of function bodies visited, number of resolved calls/edges, and current diagnostics/effect-row report. Do not infer the 993-second cost from unrelated historical self-host timings.
 2. **Collect and bind facts.** The opt-in driver path now passes the exact analyzed source and tokens alongside the AST, while policy options still come from the original source. Ordinary, expanded `static generate`, and early `pymodule` gates use the paired frontend inputs. The collector remains deliberately narrow; unsupported bodies stay cold. The separate shadow observer remains observational and must not be confused with checker reuse.
 3. **Persist and consume one proven case.** An opt-in sidecar uses bounded no-follow, nonblocking reads, schema/semantic/options validation, recollection against current source, exclusive temporary-file creation, and atomic rename publication. A symlink or FIFO at the cache-file path is a miss; a stale or pre-existing temporary path fails publication closed instead of being followed. These flags protect the final path component only; the configured cache directory is not pinned against symlink substitution. Every candidate body is rescanned before its current facts can authorize a skip; prior record flags and counts are only hints for body matching. The checker uses current-source-verified, uniquely anchored, cacheable zero-direct-fact top-level bodies to skip Global-authority inference/report walks, repeated effect-source scans, and two panic-coverage body scans. It also replays direct-call-only records into Global-authority inference after resolving targets against the fresh function index, and projects current direct facts into Global-permission Read/Write axes for flat bodies without local bindings. Both retain function slots and closure/row work. The direct control compares diagnostics and canonical rows with Global-permission enforcement enabled, and asserts effect-source, panic-coverage, and Global-permission axis counters. The CLI control covers cold/warm/body/option invalidation, a valid-checksum forged sidecar, corrupt-cache fallback, and asserts GA plus effect-source, panic-coverage, and Global-permission axis counters. These expanded controls have not been run against a fresh Stage1 product. Both available products checked—the default `bin/elisac-stage1` and `build/goal-compiler-latest-b11e/bin/elisac-stage1`—report provenance schema `elisa-stage1-provenance-v1`, while the current checker requires v5. A fresh seed attempt using a Stage0 binary rebuilt from the current dirty Go tree (SHA-256 `83d2e903…91bb2`) with a 12 GiB guard exited 1 during semantic analysis; its log contains 97 located non-warning diagnostics and 32,078 warning rows (`/tmp/elisa-incremental-current-seed.log`). It did not produce a current Stage1 binary. This narrow checker-work reduction is not an end-to-end performance result.
+
+Gate W later seeded the frozen compiler source at HEAD `423420b143cb59babaff6659b5d178470c34eaf9`
+with clean Core HEAD `cbaa661924bc481c8769c9cdd1d6906e9819d87e` and Stage0 binary SHA-256
+`de9801afab1c61a487fdd44aa13ef9565d3581b0ac6ccb212bb97166a63fb068`. Its snapshot manifest
+records 6,413 tracked paths and a source-tree match at freeze. Stage0 exited 1 before creating
+`elisac_stage1.o`; the log has 25,398 warnings and 113 non-warning diagnostics
+(`/private/tmp/elisa-stage1-source-snapshot-20261018-gate-W.log`). The machine-parser borrow
+diagnostics present in Gate V are absent in W, but V used a different Stage0 revision, so the
+count change is not a controlled source-only comparison. Gate W produces no Stage1 runtime or
+incremental-reuse qualification.
+
 3a. **Replay one dependency fact.** Current-source-only direct-call records may replace a supported caller's Global-authority inference walk after ordinary global lookup misses and every target resolves uniquely against the fresh function index. Keep report walks and cold fallback. Add warm/cold controls for callee `Global.Read`/`Global.Write` changes, body relocation, and ambiguous target invalidation before widening eligibility.
 3b. **Use a trusted process-local semantic session.** The driver’s
 `run_semantic_gate_incremental_with_session` accepts an opaque
@@ -487,16 +498,19 @@ format. The report uses `prior=session` and `session=edit` when this path reuses
 body, while exact-input hits report `session=hit`.
 
 The opt-in `elisac-stage1 semantic-session SOURCE` host retains one session across
-`check` requests and reparses each saved source version in a request-scoped region.
-Each process is tied to one source path and fixed environment options; callers
-start another host when either changes. The opaque session and one reusable
-process-owned line-map buffer outlive a request; parsed source, tokens, and AST
-remain request-local.
+`check` requests and reparses the source on each request. Each process is tied to
+one source path and fixed environment options; callers start another host when
+either changes. The opaque session and one reusable process-owned line-map buffer
+outlive a request. The current server also allocates source buffers, parser AST
+and source-view storage, and parser/semantic name stores in program `@source`, so
+these parse-generation allocations remain live for the process lifetime; only
+diagnostics and other scratch are bounded by `request_scratch`.
 `test/parity/incremental_semantic_session_control.sh` exercises the protocol through
 the Stage1 wrapper, including repeated requests and an edit that introduces then
-removes a semantic error. A fresh Stage1 run is still needed to qualify session reuse
-and request-region reclamation. The ordinary compiler entry continues to call the
-session-disabled wrapper. Persisted sidecars still take
+removes a semantic error. A fresh Stage1 run is still needed to qualify session
+reuse; this control has no RSS or allocator-growth bound, and request-region
+reclamation is not yet implemented. The ordinary compiler entry continues to call
+the session-disabled wrapper. Persisted sidecars still take
 the current-source collector path because they are untrusted. Keep diagnostics on
 the normal current-source path until a separate location-rebinding result format is
 proven. The session stores only owned portable facts and grants, never AST,
@@ -510,11 +524,16 @@ low-cost unchanged checks or edit-to-executable speedups.
 
 The ordinary `main` path consumes one request and returns. It allocates
 `source_bytes` in the program-lived `@source` region because the AST borrows those
-bytes. The separate semantic-session command gives each request a temporary region
-and publishes the new map into a reusable process-owned lexer buffer. The host
-calls `PhaseTimer::request_start` and marks each completed check so
-semantic timing rows exclude idle time between edits. Other process globals still
-need lifecycle review.
+bytes. The semantic-session command's `request_scratch` bounds diagnostics and
+other scratch, but its source, parser AST/source-view storage, and parser/semantic
+name stores remain in `@source`; that server has no request/epoch cap. Compile-
+session processing uses a `request_source` scope for local work and starts a fresh
+session region after 32 requests, but `source_bytes` and generated `expanded`
+text, AST/source views, and name stores also remain in `@source`. Neither host
+currently reclaims the full parse generation. Both publish the new map into a
+reusable process-owned lexer buffer. The semantic host calls
+`PhaseTimer::request_start` and marks each completed check so semantic timing rows
+exclude idle time between edits. Other process globals still need lifecycle review.
 
 4. **Prove invalidation.** Compare warm incremental output byte-for-byte with cold output for: unchanged build; a body-only edit with unchanged API; a callee body edit that adds/removes `Global.Read` or `Global.Write`; a callee effect-contract change; adding an overload after a previous lookup; changing an import or alias that resolves a previous miss; changing a global from immutable to mutable or changing its type/layout; changing a protocol method contract/conformance; changing strict/global options; and corrupting or versioning out the cache.
 5. **Add body codegen fragments.** Cache and restore eligible `-O0` LLVM function bodies in a newly created module, then test link validity, object/executable parity, and invalidation for function API, type/global layout, callee ABI, target, and codegen flags.
@@ -917,9 +936,14 @@ Stage1 semantic session. Send one `check` line for each saved edit and `quit` to
 stop it. Each check rereads the same source path, rebuilds the include graph,
 line map, tokens, and AST, and returns `0` for accepted, `1` for rejected, or
 `2` for an invalid protocol command on stdout; compiler diagnostics remain on
-stderr. The parsed tree and its source live in a request region. The host keeps
-one reusable line-map buffer, and an identical map preserves the lexer's parsed
-lookup tables. Only the opaque semantic session survives between requests.
+stderr. The current server puts root, expanded, and generated source buffers,
+parser AST nodes and source views, parser name storage, and synthesized semantic
+names in the program `@source` region. That region persists for the server
+lifetime; `request_scratch` bounds diagnostics and other request scratch but does
+not reclaim those per-check allocations. The host keeps one reusable line-map
+buffer, and an identical map preserves the lexer's parsed lookup tables. The
+opaque semantic session is intended to survive between requests, but
+source-backed parse and name storage currently survives too.
 
 This first host reuses the existing validated function-fact path for an exact
 repeat or a source edit. In the trusted in-process session only, it also reuses
@@ -948,10 +972,16 @@ each compile writes `0` or `1` to stdout, and compiler diagnostics stay on stder
 The root path, command-line options, and inherited environment are fixed for the
 process. Every request rereads that source and rebuilds its include identity and
 line map, so an include or root edit changes the session key and current diagnostics
-are rendered against the current source. The source, expanded text, tokens, AST,
-generated text, and other request buffers live in a request region. A single
-semantic session survives up to 32 compile requests; the host then ends that
-session region and starts a cold session to release retained arena storage.
+are rendered against the current source. Request processing is enclosed in
+`request_source`, but the parser API ties AST data and source views to program
+`@source`; the driver also stores `source_bytes` and generated `expanded` text
+there. Parser name storage and synthesized semantic names also use `@source`.
+Those parse and name allocations outlive each request, so ending the compile
+session region after 32 requests does not reclaim them. The semantic-session
+server has no equivalent cap. Reclaiming each parse generation remains an open
+lifetime/API change. The compile-session control sends fewer than 32 requests and
+has no RSS or allocator-growth assertion, so it does not exercise epoch memory
+reclamation.
 
 The shared request routine is also used by one-shot `main`; its three normal
 semantic-gate callsites receive an explicit session reference. One-shot compilation
