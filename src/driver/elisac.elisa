@@ -137,6 +137,9 @@ extern close(fd: i32) -> i32
 extern setenv(name: cstr, value: cstr, overwrite: i32) -> i32
 
 
+extern unsetenv(name: cstr) -> i32
+
+
 extern mkdir(path: cstr, mode: u16) -> i32
 
 
@@ -181,7 +184,7 @@ def collect_incremental_shadow(file: Ast::File&, analyzed_source: u8&, analyzed_
         source_path: sview = bytes_view_range_ref(identity.bytes, root.start, root.length)
         # This cold shadow has no prior snapshot, so the zero fingerprints are intentionally
         # non-persistent markers rather than claims of a complete cache identity.
-        previous: mutable Semantic::IncrementalSemanticSnapshot = Semantic::IncrementalSemanticSnapshot{schema_version: Semantic::INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: 0, options_fingerprint: 0, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: Semantic::INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], current_self_assignment_anchors: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, surface_compatible: false}
+        previous: mutable Semantic::IncrementalSemanticSnapshot = Semantic::IncrementalSemanticSnapshot{schema_version: Semantic::INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: 0, options_fingerprint: 0, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: Semantic::INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], current_self_assignment_anchors: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, declaration_surface_valid: false, surface_compatible: false}
         shadow: Semantic::IncrementalSemanticSnapshot = Semantic::incremental_collect_function_facts(file, analyzed_source, analyzed_length, analyzed_tokens, source_path, 0, 0, shadow_options_key, previous, false)
         if report_enabled:
             report: mutable darray[u8] = []
@@ -243,6 +246,8 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Blocking.IO, Memory.Allocate
                 return run_project(argc, argv)
             "semantic-session":
                 return run_incremental_semantic_server(argc, argv) can Global{Read,Write}
+            "compile-session":
+                return run_incremental_compile_server(argc, argv) can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
             _:
                 pass
         # `build|run|test|bench` are stage0 subcommands stage1 does not implement yet. They
@@ -284,257 +289,286 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Blocking.IO, Memory.Allocate
             raw <- project_compile_request(argc, argv, &project_status)
     elif argc > 1:
         if source_identity_enabled:
-            raw <- cli_request_with_source_context(argc, argv, &incremental_context) can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]
+            raw <- cli_request_with_source_context(argc, argv, &incremental_context) can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]
         else:
-            raw <- cli_request(argc, argv)
+            raw <- cli_request(argc, argv) can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]
     else:
         raw <- read_all()
-    return project_status if project_compile and project_status != 0
-    # `-emit deps`/`deps-json` answer from the include graph alone — no parse, no analysis.
-    # Placed after cli_request so the CLI has recorded the source path it walks from.
-    return emit_deps_report(false) if emit_mode_is("deps")
-    return emit_deps_report(true) if emit_mode_is("deps-json")
-    return 1 if raw.count <= 1
-    # docs/128: the AST borrows its text from these bytes for the whole compile, so they live
-    # in the program-lived `source` region.
-    source_bytes: mutable darray[u8] @source = []
-    source_bytes.extend(raw)
+    region one_shot_session:
+        session: mutable Semantic::IncrementalSemanticSession[one_shot_session] @one_shot_session = Semantic::incremental_semantic_session_new(false) can Memory.Allocate
+        return run_compile_request_with_session(raw, project_compile, project_status, incremental_context, incremental_cache_directory, incremental_cache_report_enabled, incremental_shadow_enabled, incremental_shadow_report_enabled, &session) can[Blocking.IO, Abort.Panic, Memory.Allocate, Memory.Release, Unsafe{PointerArithmetic,PointerCast,RawExtern}, Global{Read,Write}, Console]
 
-    out_path: mutable darray[u8] = []
-    i: mutable usize = 0
-    while i < raw.count - 1 |i, out_path|:
-        b: u8 = raw[i]
-        break if b == 10
-        out_path.push(b)
-        i <- i + 1
-    return 1 if out_path.count == 0
-    # Match stage0's output contract: object, bitcode, IR, and native executable writes
-    # create the parent directory before handing the path to LLVM or the linker. Project
-    # builds commonly name a fresh `build/bin/app`, and relying on the caller to pre-create
-    # that directory turns a valid target into a silent object-write failure.
-    output_directory: darray[u8] = path_directory(out_path)
-    make_directory(output_directory) if output_directory.count > 0.usize()
-    path_len: i64 = out_path.count.i64()
-    out_path.push(0)
-    i <- i + 1 if i < raw.count - 1 and raw[i] == 10
-    source_start: usize = i
-    source_len: usize = raw.count - 1 - source_start
-    return 1 if source_len == 0
 
-    # A REPORT mode's output path is TRUNCATED before any work: the host wrapper used to do
-    # this with `exec > "$out"`, and callers depend on it — a report that fails writes its
-    # diagnosis to stderr and must leave an EMPTY file behind, not the previous run's answer.
-    # (emit_c_bind_parity compares `-o` output and falls back to stderr only when the file is
-    # empty; a stale success from an earlier case read as a divergence.)
-    if emit_mode_is("edir"):
-        return 1 if ElisaEDIR::prepare_output(out_path) != 0
-    elif emit_mode_reports_to_output():
-        truncate_report_output()
 
-    src_ptr: u8& @source = &source_bytes[source_start]
-    PhaseTimer::mark("read-and-expand-includes") can Global{Read,Write}
-    tokens: darray[Lexer::Token] = frontend_tokenize_expanded_unit(src_ptr, src_ptr, source_len)
-    PhaseTimer::mark("lex") can Global{Read,Write}
-    # `-emit tokens` is the LEXER oracle: report and stop before parsing, as stage0 does.
-    if emit_mode_is("tokens"):
-        return emit_tokens_report(tokens)
-    # Formatting modes need stage0's grouping nodes; ordinary compilation erases them.
-    if emit_mode_is("pymodule-pyi"):
-        clear_requested_pyi_status: i64 = emit_pymodule_pyi_clear_requested_output()
-        return clear_requested_pyi_status if clear_requested_pyi_status != 0
-    file: mutable Ast::File = frontend_parser_parse_file_with_length(src_ptr, source_len, tokens, emit_mode_is("fmt") or emit_mode_is("lowered")) can Global{Read,Write}
-    PhaseTimer::mark("parse") can Global{Read,Write}
-    if file.errors.count != 0:
-        for parse_error_index in 0..<file.errors.count |file|:
-            report_parse_error(file.errors[parse_error_index])
-        return 1
-    # Wildcard pymodule rows must be expanded before ordinary object codegen as well as the
-    # manifest/C emitters: the backend emits the stable native wrapper symbols from this table.
-    pymodule_expand_wildcard_exports(file)
-    if emit_mode_is("pymodule-pyi"):
-        clear_default_pyi_status: i64 = emit_pymodule_pyi_clear_default_output(file)
-        return clear_default_pyi_status if clear_default_pyi_status != 0
+def run_compile_request_with_session[@session](raw: darray[u8]&, project_compile: bool, project_status: i64, incremental_context: mutable SourceIdentity::InvocationContext&, incremental_cache_directory: darray[u8]&, incremental_cache_report_enabled: bool, incremental_shadow_enabled: bool, incremental_shadow_report_enabled: bool, session: mutable Semantic::IncrementalSemanticSession[session]& @session) -> i64 can[Blocking.IO, Abort.Panic, Memory.Allocate, Memory.Release, Unsafe{PointerArithmetic,PointerCast,RawExtern}, Global{Read,Write}, Console]:
+    region request:
+        return project_status if project_compile and project_status != 0
+        # `-emit deps`/`deps-json` answer from the include graph alone — no parse, no analysis.
+        # Placed after cli_request so the CLI has recorded the source path it walks from.
+        return emit_deps_report(false) if emit_mode_is("deps")
+        return emit_deps_report(true) if emit_mode_is("deps-json")
+        return 1 if raw.count <= 1
+        # The AST borrows these bytes until the request finishes. Keeping them in this
+        # routine's request region bounds source, tokens, AST, and generated-source storage.
+        source_bytes: mutable darray[u8] @request = []
+        source_bytes.extend(raw)
 
-    # `-emit ast` prints the parse-tree summary and stops, as stage0 does.
-    if emit_mode_is("ast"):
-        return emit_ast_report(file, tokens, src_ptr) can Global{Read,Write}
-    # `-emit doc` renders the AST as markdown and stops, as stage0 does. Placed beside the
-    # source projections so the page describes what was WRITTEN rather than what was generated.
-    if emit_mode_is("doc"):
-        return emit_doc_report(file, tokens, src_ptr) can Global{Read,Write}
+        out_path: mutable darray[u8] = []
+        i: mutable usize = 0
+        while i < raw.count - 1 |i, out_path|:
+            b: u8 = raw[i]
+            break if b == 10
+            out_path.push(b)
+            i <- i + 1
+        return 1 if out_path.count == 0
+        # Match stage0's output contract: object, bitcode, IR, and native executable writes
+        # create the parent directory before handing the path to LLVM or the linker. Project
+        # builds commonly name a fresh `build/bin/app`, and relying on the caller to pre-create
+        # that directory turns a valid target into a silent object-write failure.
+        output_directory: darray[u8] = path_directory(out_path)
+        make_directory(output_directory) if output_directory.count > 0.usize()
+        path_len: i64 = out_path.count.i64()
+        out_path.push(0)
+        i <- i + 1 if i < raw.count - 1 and raw[i] == 10
+        source_start: usize = i
+        source_len: usize = raw.count - 1 - source_start
+        return 1 if source_len == 0
 
-    # `-emit fmt` runs the unparser; every unported shape prints a loud <fmt-*-todo>
-    # marker, so partial coverage can never read as byte parity in the smoke.
-    # `-emit lowered` is stage0's fmt of the ANALYSED AST. stage1's semantic layer does not
-    # desugar the tree in place (stage0's does: UFCS, overload mangling, address-of), so this
-    # emits the UNLOWERED rendering — which is EXACTLY right for the 41 of 56 corpus fixtures
-    # where stage0's own fmt and lowered outputs are identical, i.e. where no lowering
-    # applies. The gate ratchets that count rather than claiming parity it does not have.
-    if emit_mode_is("fmt") or emit_mode_is("lowered"):
-        fmt_buffer: mutable darray[u8] = []
-        FmtUnparse::fmt_file(fmt_buffer, file, tokens, src_ptr) can Global{Read,Write}
-        return 0 if fmt_buffer.count == 0 else emit_tokens_flush(fmt_buffer)
+        # A REPORT mode's output path is TRUNCATED before any work: the host wrapper used to do
+        # this with `exec > "$out"`, and callers depend on it — a report that fails writes its
+        # diagnosis to stderr and must leave an EMPTY file behind, not the previous run's answer.
+        # (emit_c_bind_parity compares `-o` output and falls back to stderr only when the file is
+        # empty; a stale success from an earlier case read as a divergence.)
+        if emit_mode_is("edir"):
+            return 1 if ElisaEDIR::prepare_output(out_path) != 0
+        elif emit_mode_reports_to_output():
+            truncate_report_output()
 
-    # `static generate` expansion. The pass has existed since task #35 but was wired ONLY into
-    # test/breadth/parse_report.elisa — never into this driver — so every `static generate:`
-    # block was silently skipped and its generated names came back as "undefined identifier".
-    #
-    # Placed AFTER the `-emit fmt` return on purpose: the unparser must see the ORIGINAL source
-    # (it round-trips what was written, not what was generated), and `-emit tokens`/`ast`/`doc`
-    # /fmt/lowered have already returned above for the same reason.
-    #
-    # Recognized blocks are spliced into an expanded source and re-parsed ONCE, so generated
-    # declarations flow through the semantic gate and codegen exactly like hand-written ones.
-    # `expanded` is declared here so the generated declarations' source spans outlive the parse;
-    # unrecognized blocks copy through and the pass answers false, leaving everything untouched.
-    compile_file: mutable Ast::File = file
-    expanded: mutable darray[u8] @source = []
-    expanded_tokens: mutable darray[Lexer::Token] = []
-    expanded_src_ptr: mutable u8& @source = src_ptr
-    static_generation_expanded: mutable bool = false
-    semantic_gate_already_run: mutable bool = false
-    static_generation_expanded <- frontend_preprocess_static_generate(src_ptr, source_len, tokens, file, expanded)
-    if static_generation_expanded:
-        expanded_src_ptr <- &expanded[0]
-        expanded_tokens <- frontend_tokenize_expanded_unit(expanded_src_ptr, expanded_src_ptr, expanded.count)
-        expanded_file: mutable Ast::File = frontend_parser_parse_file_with_length(expanded_src_ptr, expanded.count, expanded_tokens) can Global{Read,Write}
-        if expanded_file.errors.count != 0:
-            for parse_error_index in 0..<expanded_file.errors.count |expanded_file|:
-                report_parse_error(expanded_file.errors[parse_error_index])
-            return 1
-        # Mutate wildcard export rows while the expanded parse still has one unambiguous
-        # region; after the branch merge `compile_file` is intentionally read-only.
-        pymodule_expand_wildcard_exports(expanded_file)
+        src_ptr: u8& @request = &source_bytes[source_start]
+        PhaseTimer::mark("read-and-expand-includes") can Global{Read,Write}
+        tokens: darray[Lexer::Token] = frontend_tokenize_expanded_unit(src_ptr, src_ptr, source_len)
+        PhaseTimer::mark("lex") can Global{Read,Write}
+        # `-emit tokens` is the LEXER oracle: report and stop before parsing, as stage0 does.
+        if emit_mode_is("tokens"):
+            return emit_tokens_report(tokens)
+        # Formatting modes need stage0's grouping nodes; ordinary compilation erases them.
         if emit_mode_is("pymodule-pyi"):
-            clear_expanded_pyi_status: i64 = emit_pymodule_pyi_clear_default_output(expanded_file)
-            return clear_expanded_pyi_status if clear_expanded_pyi_status != 0
-        if emit_mode_is("pymodule") or emit_mode_is("pymodule-c") or emit_mode_is("pymodule-pyi") or emit_mode_is("pymodule-so"):
-            expanded_semantic_errors: i64 = run_semantic_gate_incremental(expanded_file, src_ptr, source_len, expanded_src_ptr, expanded.count, expanded_tokens, incremental_context.identity, incremental_cache_directory, incremental_cache_report_enabled, true) can Global{Read,Write}
-            return 1 if expanded_semantic_errors > 0
-            collect_incremental_shadow(expanded_file, expanded_src_ptr, expanded.count, expanded_tokens, incremental_context.identity, incremental_shadow_enabled, incremental_shadow_report_enabled, true) can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
-            semantic_gate_already_run <- true
-            if emit_mode_is("pymodule"):
-                return emit_pymodule_report(expanded_file)
-            if emit_mode_is("pymodule-c"):
-                return emit_pymodule_c_report(expanded_file) can Global{Read,Write}
-            if emit_mode_is("pymodule-pyi"):
-                return emit_pymodule_pyi_report(expanded_file) can Global{Read,Write}
-            if emit_mode_is("pymodule-so"):
-                prepare_status: i64 = emit_pymodule_so_prepare(expanded_file) can Global{Read,Write}
-                return prepare_status if prepare_status != 0
-        compile_file <- expanded_file
-    else:
-        if emit_mode_is("pymodule") or emit_mode_is("pymodule-c") or emit_mode_is("pymodule-pyi") or emit_mode_is("pymodule-so"):
-            pymodule_semantic_errors: i64 = run_semantic_gate_incremental(file, src_ptr, source_len, src_ptr, source_len, tokens, incremental_context.identity, incremental_cache_directory, incremental_cache_report_enabled, false) can Global{Read,Write}
-            return 1 if pymodule_semantic_errors > 0
-            collect_incremental_shadow(file, src_ptr, source_len, tokens, incremental_context.identity, incremental_shadow_enabled, incremental_shadow_report_enabled, false) can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
-            semantic_gate_already_run <- true
-            if emit_mode_is("pymodule"):
-                return emit_pymodule_report(file)
-            if emit_mode_is("pymodule-c"):
-                return emit_pymodule_c_report(file) can Global{Read,Write}
-            if emit_mode_is("pymodule-pyi"):
-                return emit_pymodule_pyi_report(file) can Global{Read,Write}
-            if emit_mode_is("pymodule-so"):
-                prepare_status: i64 = emit_pymodule_so_prepare(file) can Global{Read,Write}
-                return prepare_status if prepare_status != 0
-        compile_file <- file
-
-    # Semantic reports and secondary compilers must see the same expanded unit as ordinary
-    # code generation. Re-parsing static-generation output creates a new AST, so re-apply the
-    # wildcard export expansion and keep the matching source/token buffers together.
-    report_tokens: mutable darray[Lexer::Token] = tokens
-    report_src_ptr: mutable u8& = src_ptr
-    report_source_len: mutable usize = source_len
-    if static_generation_expanded:
-        report_tokens <- expanded_tokens
-        report_src_ptr <- expanded_src_ptr
-        report_source_len <- expanded.count
-
-    # ELISA_DEBUG_NODE_COUNT: report how many store rows (AST nodes, dominated by
-    # this parse) exist right now, for node-density measurement (u16-handle budget
-    # arithmetic, SoA dial planning). Runs before semantic/codegen create stores of
-    # their own, so the count is ~pure parser output.
-    node_count_flag_storage: mutable darray[u8] = []
-    for node_flag_index in 0..<("ELISA_DEBUG_NODE_COUNT").len |node_count_flag_storage|:
-        node_count_flag_storage.push(("ELISA_DEBUG_NODE_COUNT")[node_flag_index])
-    node_count_flag_storage.push(0)
-    node_count_flag: cstr = (&node_count_flag_storage[0]).cast[cstr] can Unsafe.PointerCast
-    if getenv(node_count_flag) is node_count_requested:
-        node_count_buffer: mutable darray[u8] = []
-        for node_label_index in 0..<("node-count: ").len |node_count_buffer|:
-            node_count_buffer.push(("node-count: ")[node_label_index])
-        append_decimal(node_count_buffer, (ctx_store_rows_observed() can Global.Read).u32())
-        node_count_buffer.push(10)
-        write_stderr(node_count_buffer)
-
-    # This is the single mandatory gate for every semantic report, secondary compiler,
-    # interpreter/test execution, and backend artifact. It runs after static generation so
-    # generated declarations cannot bypass validation.
-    PhaseTimer::mark("static-generate") can Global{Read,Write}
-    if not semantic_gate_already_run:
-        semantic_errors: i64 = run_semantic_gate_incremental(compile_file, src_ptr, source_len, report_src_ptr, report_source_len, report_tokens, incremental_context.identity, incremental_cache_directory, incremental_cache_report_enabled, static_generation_expanded) can Global{Read,Write}
-        return 1 if semantic_errors > 0
-        collect_incremental_shadow(compile_file, report_src_ptr, report_source_len, report_tokens, incremental_context.identity, incremental_shadow_enabled, incremental_shadow_report_enabled, static_generation_expanded) can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
-    PhaseTimer::mark("semantic") can Global{Read,Write}
-    # `-emit check`: lex, parse and the full semantic gate, then stop (no IR, no codegen).
-    if emit_mode_is("check"):
-        return 0
-
-    # Semantic projections and secondary compilers operate only on the validated expanded
-    # unit. Pure source views (tokens, AST, docs, formatting) returned before expansion.
-    if emit_mode_is("iface"):
-        return emit_iface_report(compile_file, report_tokens, report_src_ptr) can Global{Read,Write}
-    if emit_mode_is("header"):
-        return emit_header_report(compile_file)
-    if emit_mode_is("test-runner"):
-        return emit_test_runner_report(compile_file, report_src_ptr, report_source_len)
-    if emit_mode_is("tests"):
-        return emit_annotated_report(compile_file, "test", report_tokens, report_src_ptr) can Global{Read,Write}
-    if emit_mode_is("benches"):
-        return emit_annotated_report(compile_file, "bench", report_tokens, report_src_ptr) can Global{Read,Write}
-    if emit_mode_is("fixtures"):
-        return emit_annotated_report(compile_file, "fixture", report_tokens, report_src_ptr) can Global{Read,Write}
-    if emit_mode_is("test"):
-        return emit_test_run(compile_file) can Global{Read,Write}
-    if emit_mode_is("c-bind-check"):
-        return emit_c_bind_report(compile_file, report_tokens, report_src_ptr, false) can Global.Write
-    if emit_mode_is("c-bind-check-json"):
-        return emit_c_bind_report(compile_file, report_tokens, report_src_ptr, true) can Global.Write
-    if emit_mode_is("c-archive"):
-        return emit_c_archive(compile_file, report_tokens, report_src_ptr, report_source_len, out_path) can Global{Read,Write}
-    if emit_mode_is("interpret"):
-        return emit_interpret(compile_file, out_path) can Global{Read,Write}
-    if emit_mode_is("ir"):
-        ir_refusal: mutable darray[u8] = []
-        ir_source: cstr = report_src_ptr.cast[cstr] can Unsafe.PointerCast
-        ir_image: darray[u8] = IrWrite::ir_write_bundle(compile_file, "", sview(ir_source, 0, report_source_len.i64()), &ir_refusal)
-        if ir_refusal.count != 0:
-            report_ir_refusal(ir_refusal)
+            clear_requested_pyi_status: i64 = emit_pymodule_pyi_clear_requested_output()
+            return clear_requested_pyi_status if clear_requested_pyi_status != 0
+        file: mutable Ast::File = frontend_parser_parse_file_with_length(src_ptr, source_len, tokens, emit_mode_is("fmt") or emit_mode_is("lowered")) can Global{Read,Write}
+        PhaseTimer::mark("parse") can Global{Read,Write}
+        if file.errors.count != 0:
+            for parse_error_index in 0..<file.errors.count |file|:
+                report_parse_error(file.errors[parse_error_index])
             return 1
-        return emit_tokens_flush(ir_image)
-    if emit_mode_is("progress"):
-        return emit_progress_report(compile_file)
-    if emit_mode_is("unsafe"):
-        return emit_unsafe_report(compile_file, report_tokens, report_src_ptr, report_source_len) can Global{Read,Write}
-    if emit_mode_is("packed"):
-        packed_ctx: LLVMContextRef = LLVMContextCreate()
-        packed_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_packed", packed_ctx)
-        packed_triple_storage: mutable darray[u8] = []
-        packed_machine: void& = Backend::configure_module_target_for(packed_module, requested_target_triple(&packed_triple_storage))
-        packed_target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(packed_machine)
-        packed_report: darray[u8] = Backend::generate_packed_report(compile_file, packed_module, packed_ctx, packed_target_data)
-        packed_body: mutable darray[u8] = []
-        for packed_index in 0..<packed_report.count |packed_body, packed_report|:
-            packed_body.push(packed_report[packed_index]) if packed_report[packed_index] != 0
-        return emit_tokens_flush(packed_body)
+        # Wildcard pymodule rows must be expanded before ordinary object codegen as well as the
+        # manifest/C emitters: the backend emits the stable native wrapper symbols from this table.
+        pymodule_expand_wildcard_exports(file)
+        if emit_mode_is("pymodule-pyi"):
+            clear_default_pyi_status: i64 = emit_pymodule_pyi_clear_default_output(file)
+            return clear_default_pyi_status if clear_default_pyi_status != 0
 
-    # EDIR is a separate backend over the already parsed and validated tree. It
-    # deliberately runs after static-generate expansion so it never serializes
-    # the pre-expansion program by mistake.
-    if emit_mode_is("edir"):
-        return ElisaEDIR::emit(compile_file, out_path, static_generation_expanded, src_ptr, source_len)
+        # `-emit ast` prints the parse-tree summary and stops, as stage0 does.
+        if emit_mode_is("ast"):
+            return emit_ast_report(file, tokens, src_ptr) can Global{Read,Write}
+        # `-emit doc` renders the AST as markdown and stops, as stage0 does. Placed beside the
+        # source projections so the page describes what was WRITTEN rather than what was generated.
+        if emit_mode_is("doc"):
+            return emit_doc_report(file, tokens, src_ptr) can Global{Read,Write}
 
+        # `-emit fmt` runs the unparser; every unported shape prints a loud <fmt-*-todo>
+        # marker, so partial coverage can never read as byte parity in the smoke.
+        # `-emit lowered` is stage0's fmt of the ANALYSED AST. stage1's semantic layer does not
+        # desugar the tree in place (stage0's does: UFCS, overload mangling, address-of), so this
+        # emits the UNLOWERED rendering — which is EXACTLY right for the 41 of 56 corpus fixtures
+        # where stage0's own fmt and lowered outputs are identical, i.e. where no lowering
+        # applies. The gate ratchets that count rather than claiming parity it does not have.
+        if emit_mode_is("fmt") or emit_mode_is("lowered"):
+            fmt_buffer: mutable darray[u8] = []
+            FmtUnparse::fmt_file(fmt_buffer, file, tokens, src_ptr) can Global{Read,Write}
+            return 0 if fmt_buffer.count == 0 else emit_tokens_flush(fmt_buffer)
+
+        # `static generate` expansion. The pass has existed since task #35 but was wired ONLY into
+        # test/breadth/parse_report.elisa — never into this driver — so every `static generate:`
+        # block was silently skipped and its generated names came back as "undefined identifier".
+        #
+        # Placed AFTER the `-emit fmt` return on purpose: the unparser must see the ORIGINAL source
+        # (it round-trips what was written, not what was generated), and `-emit tokens`/`ast`/`doc`
+        # /fmt/lowered have already returned above for the same reason.
+        #
+        # Recognized blocks are spliced into an expanded source and re-parsed ONCE, so generated
+        # declarations flow through the semantic gate and codegen exactly like hand-written ones.
+        # `expanded` is declared here so the generated declarations' source spans outlive the parse;
+        # unrecognized blocks copy through and the pass answers false, leaving everything untouched.
+        compile_file: mutable Ast::File = file
+        expanded: mutable darray[u8] @request = []
+        expanded_tokens: mutable darray[Lexer::Token] = []
+        expanded_src_ptr: mutable u8& @request = src_ptr
+        generated_line_runs: mutable darray[u32] = []
+        generated_line_count: mutable u32 = 0
+        static_generation_expanded: mutable bool = false
+        semantic_gate_already_run: mutable bool = false
+        static_generation_expanded <- frontend_preprocess_static_generate_with_line_map(src_ptr, source_len, tokens, file, expanded, generated_line_runs, &generated_line_count)
+        if static_generation_expanded:
+            original_line_map: mutable darray[u8] = []
+            _ = driver_line_map_value(&original_line_map)
+            generated_line_map: mutable darray[u8] = driver_compose_generated_line_map(original_line_map, generated_line_runs, generated_line_count)
+            if original_line_map.count > 0.usize() and generated_line_map.count == 0.usize():
+                line_map_error: mutable darray[u8] = []
+                line_map_error.extend("error: could not map generated source to original locations\n")
+                write_stderr(line_map_error)
+                return 1
+            elif generated_line_map.count > 0.usize():
+                can Global{Read,Write}:
+                    Lexer::line_map_publish(generated_line_map)
+            expanded_src_ptr <- &expanded[0]
+            expanded_tokens <- frontend_tokenize_expanded_unit(expanded_src_ptr, expanded_src_ptr, expanded.count)
+            expanded_file: mutable Ast::File = frontend_parser_parse_file_with_length(expanded_src_ptr, expanded.count, expanded_tokens) can Global{Read,Write}
+            if expanded_file.errors.count != 0:
+                for parse_error_index in 0..<expanded_file.errors.count |expanded_file|:
+                    report_parse_error(expanded_file.errors[parse_error_index])
+                return 1
+            # Mutate wildcard export rows while the expanded parse still has one unambiguous
+            # region; after the branch merge `compile_file` is intentionally read-only.
+            pymodule_expand_wildcard_exports(expanded_file)
+            if emit_mode_is("pymodule-pyi"):
+                clear_expanded_pyi_status: i64 = emit_pymodule_pyi_clear_default_output(expanded_file)
+                return clear_expanded_pyi_status if clear_expanded_pyi_status != 0
+            if emit_mode_is("pymodule") or emit_mode_is("pymodule-c") or emit_mode_is("pymodule-pyi") or emit_mode_is("pymodule-so"):
+                expanded_semantic_errors: i64 = run_semantic_gate_incremental_with_session(expanded_file, src_ptr, source_len, expanded_src_ptr, expanded.count, expanded_tokens, incremental_context.identity, incremental_cache_directory, incremental_cache_report_enabled, true, session) can Global{Read,Write}
+                return 1 if expanded_semantic_errors > 0
+                collect_incremental_shadow(expanded_file, expanded_src_ptr, expanded.count, expanded_tokens, incremental_context.identity, incremental_shadow_enabled, incremental_shadow_report_enabled, true) can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
+                semantic_gate_already_run <- true
+                if emit_mode_is("pymodule"):
+                    return emit_pymodule_report(expanded_file)
+                if emit_mode_is("pymodule-c"):
+                    return emit_pymodule_c_report(expanded_file) can Global{Read,Write}
+                if emit_mode_is("pymodule-pyi"):
+                    return emit_pymodule_pyi_report(expanded_file) can Global{Read,Write}
+                if emit_mode_is("pymodule-so"):
+                    prepare_status: i64 = emit_pymodule_so_prepare(expanded_file) can Global{Read,Write}
+                    return prepare_status if prepare_status != 0
+            compile_file <- expanded_file
+        else:
+            if emit_mode_is("pymodule") or emit_mode_is("pymodule-c") or emit_mode_is("pymodule-pyi") or emit_mode_is("pymodule-so"):
+                pymodule_semantic_errors: i64 = run_semantic_gate_incremental_with_session(file, src_ptr, source_len, src_ptr, source_len, tokens, incremental_context.identity, incremental_cache_directory, incremental_cache_report_enabled, false, session) can Global{Read,Write}
+                return 1 if pymodule_semantic_errors > 0
+                collect_incremental_shadow(file, src_ptr, source_len, tokens, incremental_context.identity, incremental_shadow_enabled, incremental_shadow_report_enabled, false) can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
+                semantic_gate_already_run <- true
+                if emit_mode_is("pymodule"):
+                    return emit_pymodule_report(file)
+                if emit_mode_is("pymodule-c"):
+                    return emit_pymodule_c_report(file) can Global{Read,Write}
+                if emit_mode_is("pymodule-pyi"):
+                    return emit_pymodule_pyi_report(file) can Global{Read,Write}
+                if emit_mode_is("pymodule-so"):
+                    prepare_status: i64 = emit_pymodule_so_prepare(file) can Global{Read,Write}
+                    return prepare_status if prepare_status != 0
+            compile_file <- file
+
+        # Semantic reports and secondary compilers must see the same expanded unit as ordinary
+        # code generation. Re-parsing static-generation output creates a new AST, so re-apply the
+        # wildcard export expansion and keep the matching source/token buffers together.
+        report_tokens: mutable darray[Lexer::Token] = tokens
+        report_src_ptr: mutable u8& = src_ptr
+        report_source_len: mutable usize = source_len
+        if static_generation_expanded:
+            report_tokens <- expanded_tokens
+            report_src_ptr <- expanded_src_ptr
+            report_source_len <- expanded.count
+
+        # ELISA_DEBUG_NODE_COUNT: report how many store rows (AST nodes, dominated by
+        # this parse) exist right now, for node-density measurement (u16-handle budget
+        # arithmetic, SoA dial planning). Runs before semantic/codegen create stores of
+        # their own, so the count is ~pure parser output.
+        node_count_flag_storage: mutable darray[u8] = []
+        for node_flag_index in 0..<("ELISA_DEBUG_NODE_COUNT").len |node_count_flag_storage|:
+            node_count_flag_storage.push(("ELISA_DEBUG_NODE_COUNT")[node_flag_index])
+        node_count_flag_storage.push(0)
+        node_count_flag: cstr = (&node_count_flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+        if getenv(node_count_flag) is node_count_requested:
+            node_count_buffer: mutable darray[u8] = []
+            for node_label_index in 0..<("node-count: ").len |node_count_buffer|:
+                node_count_buffer.push(("node-count: ")[node_label_index])
+            append_decimal(node_count_buffer, (ctx_store_rows_observed() can Global.Read).u32())
+            node_count_buffer.push(10)
+            write_stderr(node_count_buffer)
+
+        # This is the single mandatory gate for every semantic report, secondary compiler,
+        # interpreter/test execution, and backend artifact. It runs after static generation so
+        # generated declarations cannot bypass validation.
+        PhaseTimer::mark("static-generate") can Global{Read,Write}
+        if not semantic_gate_already_run:
+            semantic_errors: i64 = run_semantic_gate_incremental_with_session(compile_file, src_ptr, source_len, report_src_ptr, report_source_len, report_tokens, incremental_context.identity, incremental_cache_directory, incremental_cache_report_enabled, static_generation_expanded, session) can Global{Read,Write}
+            return 1 if semantic_errors > 0
+            collect_incremental_shadow(compile_file, report_src_ptr, report_source_len, report_tokens, incremental_context.identity, incremental_shadow_enabled, incremental_shadow_report_enabled, static_generation_expanded) can[Abort.Panic, Console, Memory.Allocate, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
+        PhaseTimer::mark("semantic") can Global{Read,Write}
+        # `-emit check`: lex, parse and the full semantic gate, then stop (no IR, no codegen).
+        if emit_mode_is("check"):
+            return 0
+
+        # Semantic projections and secondary compilers operate only on the validated expanded
+        # unit. Pure source views (tokens, AST, docs, formatting) returned before expansion.
+        if emit_mode_is("iface"):
+            return emit_iface_report(compile_file, report_tokens, report_src_ptr) can Global{Read,Write}
+        if emit_mode_is("header"):
+            return emit_header_report(compile_file)
+        if emit_mode_is("test-runner"):
+            return emit_test_runner_report(compile_file, report_src_ptr, report_source_len)
+        if emit_mode_is("tests"):
+            return emit_annotated_report(compile_file, "test", report_tokens, report_src_ptr) can Global{Read,Write}
+        if emit_mode_is("benches"):
+            return emit_annotated_report(compile_file, "bench", report_tokens, report_src_ptr) can Global{Read,Write}
+        if emit_mode_is("fixtures"):
+            return emit_annotated_report(compile_file, "fixture", report_tokens, report_src_ptr) can Global{Read,Write}
+        if emit_mode_is("test"):
+            return emit_test_run(compile_file) can Global{Read,Write}
+        if emit_mode_is("c-bind-check"):
+            return emit_c_bind_report(compile_file, report_tokens, report_src_ptr, false) can Global.Write
+        if emit_mode_is("c-bind-check-json"):
+            return emit_c_bind_report(compile_file, report_tokens, report_src_ptr, true) can Global.Write
+        if emit_mode_is("c-archive"):
+            return emit_c_archive(compile_file, report_tokens, report_src_ptr, report_source_len, out_path) can Global{Read,Write}
+        if emit_mode_is("interpret"):
+            return emit_interpret(compile_file, out_path) can Global{Read,Write}
+        if emit_mode_is("ir"):
+            ir_refusal: mutable darray[u8] = []
+            ir_source: cstr = report_src_ptr.cast[cstr] can Unsafe.PointerCast
+            ir_image: darray[u8] = IrWrite::ir_write_bundle(compile_file, "", sview(ir_source, 0, report_source_len.i64()), &ir_refusal)
+            if ir_refusal.count != 0:
+                report_ir_refusal(ir_refusal)
+                return 1
+            return emit_tokens_flush(ir_image)
+        if emit_mode_is("progress"):
+            return emit_progress_report(compile_file)
+        if emit_mode_is("unsafe"):
+            return emit_unsafe_report(compile_file, report_tokens, report_src_ptr, report_source_len) can Global{Read,Write}
+        if emit_mode_is("packed"):
+            packed_ctx: LLVMContextRef = LLVMContextCreate()
+            packed_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_packed", packed_ctx)
+            packed_triple_storage: mutable darray[u8] = []
+            packed_machine: void& = Backend::configure_module_target_for(packed_module, requested_target_triple(&packed_triple_storage))
+            packed_target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(packed_machine)
+            packed_report: darray[u8] = Backend::generate_packed_report(compile_file, packed_module, packed_ctx, packed_target_data)
+            packed_body: mutable darray[u8] = []
+            for packed_index in 0..<packed_report.count |packed_body, packed_report|:
+                packed_body.push(packed_report[packed_index]) if packed_report[packed_index] != 0
+            LLVMDisposeTargetData(packed_target_data)
+            LLVMDisposeModule(packed_module)
+            LLVMDisposeTargetMachine(packed_machine)
+            LLVMContextDispose(packed_ctx)
+            return emit_tokens_flush(packed_body)
+
+        # EDIR is a separate backend over the already parsed and validated tree. It
+        # deliberately runs after static-generate expansion so it never serializes
+        # the pre-expansion program by mistake.
+        if emit_mode_is("edir"):
+            return ElisaEDIR::emit(compile_file, out_path, static_generation_expanded, src_ptr, source_len)
+
+        return run_llvm_compile_request_with_cleanup(compile_file, out_path, static_generation_expanded, tokens, src_ptr, source_len, expanded_tokens, expanded_src_ptr) can[Blocking.IO, Abort.Panic, Memory.Allocate, Memory.Release, Unsafe{PointerArithmetic,PointerCast,RawExtern}, Global{Read,Write}, Console]
+
+
+def run_llvm_compile_request_with_cleanup(compile_file: Ast::File&, out_path: darray[u8]&, static_generation_expanded: bool, tokens: darray[Lexer::Token]&, src_ptr: u8&, source_len: usize, expanded_tokens: darray[Lexer::Token]&, expanded_src_ptr: u8&) -> i64 can[Blocking.IO, Abort.Panic, Memory.Allocate, Memory.Release, Unsafe{PointerArithmetic,PointerCast,RawExtern}, Global{Read,Write}, Console]:
     ctx: LLVMContextRef = LLVMContextCreate()
     # Local value and block names never reach an object or executable, and naming ~4M
     # values was ~8% of IR generation for the self-host unit. Kept for every textual or
@@ -551,6 +585,17 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Blocking.IO, Memory.Allocate
     machine: void& = Backend::configure_module_target_for_level(module_handle, requested_target_triple(&triple_storage), opt_level)
     target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(machine)
     builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+    status: i64 = run_llvm_compile_request_body(compile_file, out_path, static_generation_expanded, tokens, src_ptr, source_len, expanded_tokens, expanded_src_ptr, ctx, module_handle, machine, target_data, builder, opt_level) can[Blocking.IO, Abort.Panic, Memory.Allocate, Memory.Release, Unsafe{PointerArithmetic,PointerCast,RawExtern}, Global{Read,Write}, Console]
+    # Destroy request-local LLVM handles on every ordinary return from the emitter.
+    LLVMDisposeBuilder(builder)
+    LLVMDisposeModule(module_handle)
+    LLVMDisposeTargetData(target_data)
+    LLVMDisposeTargetMachine(machine)
+    LLVMContextDispose(ctx)
+    return status
+
+
+def run_llvm_compile_request_body(compile_file: Ast::File&, out_path: darray[u8]&, static_generation_expanded: bool, tokens: darray[Lexer::Token]&, src_ptr: u8&, source_len: usize, expanded_tokens: darray[Lexer::Token]&, expanded_src_ptr: u8&, ctx: LLVMContextRef, module_handle: LLVMModuleRef, machine: void&, target_data: LLVMTargetDataRef, builder: LLVMBuilderRef, opt_level: i64) -> i64 can[Blocking.IO, Abort.Panic, Memory.Allocate, Memory.Release, Unsafe{PointerArithmetic,PointerCast,RawExtern}, Global{Read,Write}, Console]:
     source_name_storage: mutable darray[u8] = []
     source_name: mutable sview = sview("", 0, 0)
     if env_value("ELISA_STAGE1_SRC", &source_name_storage):
@@ -741,7 +786,108 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Blocking.IO, Memory.Allocate
             return 4 if not (Backend::emit_object_parallel(machine, module_handle, path_cstr, Backend::parallel_emit_jobs(), opt_level > 0) can Global.Write)
         PhaseTimer::mark("emit-object") can Global{Read,Write}
 
-    # The module and context are NOT disposed: the process exits next, and tearing down the
-    # self-host module object by object cost ~1 s of wall time after the object was written.
-    LLVMDisposeBuilder(builder)
     return 0
+
+
+const ELISAC_INCREMENTAL_COMPILE_SESSION_EPOCH_REQUEST_LIMIT: usize = 32
+
+struct IncrementalCompileServerEpochResult:
+    stopped: bool
+    status: i64
+
+
+def incremental_compile_server_mode_supported() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    mode: mutable darray[u8] = []
+    return true if not env_value("ELISA_STAGE1_EMIT", &mode)
+    return true if mode.count == 0.usize()
+    return emit_mode_is("check") or emit_mode_is("obj") or emit_llvm_requested() or emit_mode_is("bc") or emit_mode_is("exe") or emit_mode_is("wasm") or emit_mode_is("pymodule-so") or emit_mode_is("edir")
+
+
+def incremental_compile_server_epoch(argc: i64, argv: mutable void&, command: mutable darray[u8]&, cache_directory: darray[u8]&, report_cache: bool, shadow_enabled: bool, shadow_report: bool, baseline_smt_enabled: bool) -> IncrementalCompileServerEpochResult can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+    region compile_session:
+        session: mutable Semantic::IncrementalSemanticSession[compile_session] @compile_session = Semantic::incremental_semantic_session_new(true) can Memory.Allocate
+        completed_requests: mutable usize = 0.usize()
+        while completed_requests < ELISAC_INCREMENTAL_COMPILE_SESSION_EPOCH_REQUEST_LIMIT |completed_requests, command, session|:
+            command.truncate(0.usize())
+            command_too_long: mutable bool = false
+            input_eof: mutable bool = false
+            saw_input: mutable bool = false
+            line_terminated: mutable bool = false
+            while true |command, command_too_long, input_eof, saw_input, line_terminated|:
+                byte: mutable u8 = 0
+                amount: isize = read(0, &byte, 1)
+                if amount == 0:
+                    input_eof <- true
+                    break
+                if amount < 0:
+                    continue if incremental_server_io_interrupted()
+                    message: mutable darray[u8] = []
+                    message.extend("error: could not read compile-session command\n")
+                    write_stderr(message)
+                    return IncrementalCompileServerEpochResult{stopped: true, status: 1}
+                saw_input <- true
+                if byte == 10:
+                    line_terminated <- true
+                    break
+                if command.count < ELISAC_INCREMENTAL_SERVER_COMMAND_LIMIT:
+                    command.push(byte)
+                else:
+                    command_too_long <- true
+            if input_eof and not saw_input:
+                return IncrementalCompileServerEpochResult{stopped: true, status: 0}
+            if line_terminated and command.count > 0 and command[command.count - 1] == 13:
+                command.truncate(command.count - 1)
+            if command_too_long:
+                incremental_server_write_invalid_command()
+                continue
+            if command.count == 4 and command[0] == 113 and command[1] == 117 and command[2] == 105 and command[3] == 116:
+                return IncrementalCompileServerEpochResult{stopped: true, status: 0}
+            if command.count == 7 and command[0] == 99 and command[1] == 111 and command[2] == 109 and command[3] == 112 and command[4] == 105 and command[5] == 108 and command[6] == 101:
+                completed_requests <- completed_requests + 1.usize()
+                request_status: mutable i64 = 1
+                PhaseTimer::request_start() can Global{Read,Write}
+                can Global.Write:
+                    Lexer::line_map_clear()
+                # The root header can change while the host is alive. Restore the
+                # launch-time option first, then the CLI request may set it for this root.
+                _ = unsetenv("ELISA_STAGE1_SMT")
+                _ = setenv("ELISA_STAGE1_SMT", "1", SETENV_OVERWRITE_EXISTING) if baseline_smt_enabled
+                region request:
+                    context: mutable SourceIdentity::InvocationContext @request = SourceIdentity::empty_identity_context(true) can Memory.Allocate
+                    raw: mutable darray[u8] @request = cli_request_with_source_context_from(argc, argv, 2, &context) can[Abort.Panic, Global{Read,Write}, Memory.Allocate, Unsafe.PointerCast]
+                    if raw.count > 1:
+                        if incremental_compile_server_mode_supported():
+                            request_status <- run_compile_request_with_session(raw, false, 0, context, cache_directory, report_cache, shadow_enabled, shadow_report, &session) can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
+                        else:
+                            message: mutable darray[u8] = []
+                            message.extend("error: compile-session supports -emit check, obj, llvm, bc, exe, wasm, pymodule-so, and edir\n")
+                            write_stderr(message)
+                incremental_server_write_status(request_status)
+            else:
+                incremental_server_write_invalid_command()
+        return IncrementalCompileServerEpochResult{stopped: false, status: 0}
+
+
+def run_incremental_compile_server(argc: i64, argv: mutable void&) -> i64 can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+    if argc < 3:
+        usage: mutable darray[u8] = []
+        usage.extend("usage: elisac-stage1 compile-session [-emit check|obj|llvm|bc|exe|wasm|pymodule-so|edir] [-o OUT] SOURCE\nprotocol: write `compile` or `quit` on stdin; each compile prints 0 (accepted) or 1 (rejected) on stdout\n")
+        write_stderr(usage)
+        return 2
+    incremental_shadow_enabled: bool = env_flag_is_one("ELISA_INCREMENTAL_SHADOW") can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    incremental_shadow_report_enabled: mutable bool = false
+    if incremental_shadow_enabled:
+        incremental_shadow_report_enabled <- env_flag_is_one("ELISA_INCREMENTAL_SHADOW_REPORT") can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    incremental_cache_directory: mutable darray[u8] = []
+    _ = env_value("ELISA_STAGE1_INCREMENTAL_CACHE_DIR", &incremental_cache_directory)
+    incremental_cache_report_enabled: bool = env_flag_is_one("ELISA_STAGE1_INCREMENTAL_CACHE_REPORT") can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    baseline_smt_enabled: bool = env_flag_enabled("ELISA_STAGE1_SMT") can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    region server_state:
+        command: mutable darray[u8] @server_state = []
+        stopped: mutable bool = false
+        server_status: mutable i64 = 0
+        while not stopped |stopped, server_status, command|:
+            epoch: IncrementalCompileServerEpochResult = incremental_compile_server_epoch(argc, argv, command, incremental_cache_directory, incremental_cache_report_enabled, incremental_shadow_enabled, incremental_shadow_report_enabled, baseline_smt_enabled) can[Blocking.IO, Abort.Panic, Console, Memory.Allocate, Memory.Release, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]
+            stopped <- epoch.stopped
+            server_status <- epoch.status
+        return server_status

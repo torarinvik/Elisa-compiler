@@ -11,11 +11,15 @@ The current Zig checkout represents analysis units with compact typed handles (`
 
 Dependency edges are indexed in both directions. A depender owns a compact linked edge chain; reanalysis can remove and replace all of its old outgoing edges. Edge slots are recycled. The update path marks transitive dependents as potentially outdated, waits until their dependencies have been checked, then prioritizes ready functions so useful code generation can proceed early. The frontend snapshots file state before scheduling work and avoids applying dependency invalidations when a failed frontend update makes the new analysis unreliable.
 
-This is the most relevant data-oriented transfer: stable integer handles, pooled edges, dense tables, and only the hot fields in hot data structures. Zig uses columnar list storage where it helps. These choices reduce pointer chasing and make graph updates predictable, but they do not replace correct dependency semantics. A large storage rewrite should follow profiling; Elisa can first prototype typed IDs and pooled reverse edges around its existing facts.
+The concrete data layout is worth comparing with Elisa. Zig's `AnalUnit` is a packed 64-bit value containing a 32-bit kind and 32-bit ID. `TrackedInst` uses stable 32-bit IDs across an update and maps them to current ZIR locations; a lost mapping has an explicit sentinel. A `DepEntry` stores a depender handle and three 32-bit adjacency links. Its dependency key is implicit in the per-kind dependee-head maps, so it does not duplicate that endpoint in every edge. See [`AnalUnit` and tracked instruction IDs](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L137), [`AnalUnit`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L422), and [`DepEntry` plus edge insertion/removal](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L925).
+
+Elisa's current edge has two 32-bit endpoints and three 32-bit adjacency links, 20 bytes by source layout. Its outgoing chain is singly linked because replacement removes the whole chain; its reverse depender chain is doubly linked for O(1) unlink. Zig's edge omits the dependee endpoint through a typed head map and uses its own dummy-head/reuse behavior. Zig's layout remains a design option if Elisa introduces typed dependency tables, not an automatic size win. Its `potentially_outdated` and `outdated` work maps track outstanding dependencies, and ready-function units are prioritized for analysis once upstream dependencies settle, which can queue code generation sooner. This avoids treating every transitive depender as immediately ready for reanalysis.
+
+The useful data-oriented transfer is stable integer handles, typed dependency identities, dense pooled records, and hot fields placed for the traversal that consumes them. Zig also uses maps where dynamic dependency keys and scheduling need them; its source does not imply that every compiler table should become structure-of-arrays. Elisa should keep the current representation until real graph callers exist, then compare per-query/per-edge allocation and capacity, dependency replacement cost, and reverse-walk cost. Invalidation now reuses a session worklist and per-node generation stamps instead of allocating and clearing a full visited array per edit; measure sparse and dense closures before changing that design. A structure-of-arrays or implicit-endpoint experiment should be judged on that workload, not on the Zig source layout in isolation.
 
 Zig's incremental persistence is not a complete template to copy. The current source still has save-state TODOs for errors, namespaces, declarations, and linker state. The source study supports borrowing its in-memory dependency model and compact data layout selectively, not adopting its whole cache format.
 
-Sources: [Zig `InternPool.zig` at the inspected commit](https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/src/InternPool.zig), [Zig `Zcu.zig`](https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/src/Zcu.zig), [frontend update path in `PerThread.zig`](https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/src/Zcu/PerThread.zig), [cache save-state path](https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/src/Compilation.zig).
+Sources: [Zig `InternPool.zig` at the inspected commit](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig), [Zig `Zcu.zig`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Zcu.zig), [frontend update path in `PerThread.zig`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Zcu/PerThread.zig), [cache save-state path](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Compilation.zig).
 
 ### Rust: red-green query evaluation
 
@@ -74,10 +78,11 @@ The installed rustc target used macOS deployment version 11.0 while Zig and Clan
 The current worktree now has the first data-oriented query-graph foundation in
 `src/semantic/incremental_function_facts.elisa`: session-scoped 32-bit query and
 edge handles, exact owned query-key bytes, contiguous query/edge arrays, a free
-list, and forward plus reverse adjacency. Reanalysis can replace one query's
-dependencies, and a changed query can mark its reverse dependers dirty. The
-edge pool retains both endpoints and four adjacency links to support constant-
-time unlinking in either direction; the live/freed state uses endpoint
+list, forward plus reverse adjacency, and reusable invalidation scratch. Reanalysis
+can replace one query's dependencies, and a changed query can mark its reverse
+dependers dirty using a retained worklist and per-node generation stamps. The
+edge pool retains both endpoints, a singly linked outgoing dependency chain, and
+a doubly linked incoming depender chain; the live/freed state uses endpoint
 sentinels instead of a separate boolean. Dependency deduplication currently
 uses a nested scan; optimize it only if recorded fan-in shows the update path
 matters. These APIs are not yet called by the
@@ -88,8 +93,8 @@ add result fingerprints and red-green reuse. Do not persist `DeclId`,
 
 A follow-up layout pass groups query status and adjacency handles before the
 wide key spans and fingerprints. Under conventional 64-bit struct alignment,
-this field order is expected to use 56 bytes per query node, compared with 72
-bytes for the earlier order. That is a source-level layout estimate, not a
+this field order, including the u64 invalidation stamp, is expected to use 64
+bytes per query node, compared with 72 bytes for the earlier order. That is a source-level layout estimate, not a
 measured Elisa object layout or a compile-time speedup. Zig's packed `AnalUnit`
 and pooled `DepEntry` show the same general payoff from compact handles and
 keeping dependency traversal data in dense arrays; Elisa should measure the
@@ -114,7 +119,7 @@ All checkouts are shallow and sparse to keep the local source study bounded. Rev
 
 | Project | Checkout | Revision |
 | --- | --- | --- |
-| Zig | `zig`, `src/` and `test/standalone/` | `738d2be9d6b6ef3ff3559130c05159ef53336224` |
+| Zig | `zig`, `src/` and `test/standalone/` | `4812a98ce535e5c3f27c081b94153612cd4817ac` |
 | Rust | `rust`, selected compiler crates | `33295d734447c7a2c22c44190f11bce6164a035a` |
 | LLVM/Clang | `llvm-project`, Clang/LLVM/LTO/LLD paths | `70a4494e073f57eebb77931a5a2e59f6b5e9e13a` |
 | GCC | `gcc`, `gcc/` | `9a00f0797c90485cd70ac86a8751c9565c3979dd` |

@@ -215,9 +215,9 @@ run_stage1_driver_guarded() {
   local driver_poll_us=2000 driver_poll_cap_us
   process_seconds_to_us "$driver_rss_poll_seconds"
   driver_poll_cap_us="$PROCESS_US"
-  # Ordinary CLI requests never consume stdin. The persistent semantic-session subcommand
-  # owns a line protocol, so preserve the caller's stream only for that explicit mode.
-  if [[ "${driver_args[0]:-}" == "semantic-session" ]]; then
+  # Ordinary CLI requests never consume stdin. Persistent session subcommands own line
+  # protocols, so preserve the caller's stream only for those explicit modes.
+  if [[ "${driver_args[0]:-}" == "semantic-session" || "${driver_args[0]:-}" == "compile-session" ]]; then
     "$BIN" "${driver_args[@]+${driver_args[@]}}" <&0 &
   else
     "$BIN" "${driver_args[@]+${driver_args[@]}}" </dev/null &

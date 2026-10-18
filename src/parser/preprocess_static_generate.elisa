@@ -38,13 +38,64 @@ def sg_enum_variant_names(file: Ast::File&, enum_name: sview) -> darray[sview]:
         return result
 
 
-# Append source[from ..< to) to out.
-def sg_append_range(out: mutable darray[u8]&, source: u8&, from_at: usize, end_at: usize) -> void:
+# Sparse `OUTPUT_LINE, INPUT_LINE` runs. Within a run, line origins advance by one.
+def sg_line_map_set_run(line_map: mutable darray[u32]&, output_line: u32, input_line: u32) -> void:
     can Memory.Allocate, Abort.Panic:
+        if line_map.count >= 2.usize() and line_map[line_map.count - 2.usize()] == output_line:
+            line_map[line_map.count - 1.usize()] <- input_line
+        else:
+            line_map.push(output_line)
+            line_map.push(input_line)
+
+
+def sg_advance_source_line(source: u8&, from_at: usize, end_at: usize, input_line: mutable u32&) -> void:
+    can Abort.Panic:
         cursor: mutable usize = from_at
-        while cursor < end_at |cursor, out|:
-            out.push(source[cursor])
+        while cursor < end_at |cursor, input_line, source|:
+            input_line <- input_line + 1 if source[cursor] == 10
             cursor <- cursor + 1
+
+
+def sg_append_mapped_range(out: mutable darray[u8]&, line_map: mutable darray[u32]&, source: u8&, from_at: usize, end_at: usize, input_line: mutable u32&, output_line: mutable u32&) -> void:
+    can Memory.Allocate, Abort.Panic:
+        return if from_at >= end_at
+        sg_line_map_set_run(line_map, output_line, input_line)
+        cursor: mutable usize = from_at
+        while cursor < end_at |cursor, input_line, output_line, out, source|:
+            byte: u8 = source[cursor]
+            out.push(byte)
+            if byte == 10:
+                input_line <- input_line + 1
+                output_line <- output_line + 1
+            cursor <- cursor + 1
+
+
+def sg_append_mapped_template(out: mutable darray[u8]&, line_map: mutable darray[u32]&, source: u8&, slen: usize, tstart: usize, tend: usize, var_name: sview, variant_name: sview, template_input_line: u32, output_line: mutable u32&, template_last_line: mutable u32&) -> void:
+    can Memory.Allocate, Abort.Panic:
+        sg_line_map_set_run(line_map, output_line, template_input_line)
+        var_length: usize = var_name.len
+        cursor: mutable usize = tstart
+        while cursor < tend |cursor, output_line, template_last_line, out|:
+            if cursor + 1 < tend and source[cursor] == 36 and source[cursor + 1] == 123 and sg_interp_is_var_name(source, slen, cursor, var_name):
+                sg_append_sview(out, variant_name)
+                cursor <- cursor + 2 + var_length + 6
+            else:
+                byte: u8 = source[cursor]
+                out.push(byte)
+                if byte == 10:
+                    output_line <- output_line + 1
+                    template_last_line <- template_last_line + 1
+                cursor <- cursor + 1
+
+
+def sg_append_mapped_template_separator(out: mutable darray[u8]&, line_map: mutable darray[u32]&, output_line: mutable u32&, template_last_line: u32) -> void:
+    can Memory.Allocate, Abort.Panic:
+        out.push(10)
+        output_line <- output_line + 1
+        sg_line_map_set_run(line_map, output_line, template_last_line)
+        out.push(10)
+        output_line <- output_line + 1
+        sg_line_map_set_run(line_map, output_line, template_last_line)
 
 
 # Append the bytes of an sview to out.
@@ -129,15 +180,22 @@ def sg_token_end(tokens: darray[Lexer::Token]&, index: usize) -> usize:
     return token.start.usize() + token.length.usize()
 
 
-# Expand recognized `static generate` blocks in `source` into `out`. Returns true iff at least
-# one block was expanded (callers can then re-lex+parse `out` instead of the original source).
-def frontend_preprocess_static_generate(source: u8&, slen: usize, tokens: darray[Lexer::Token]&, file: Ast::File&, out: mutable darray[u8]&) -> bool:
+# Expand recognized `static generate` blocks and return sparse output-line to input-line runs.
+# Each pair is `OUTPUT_LINE, INPUT_EXPANDED_LINE`; a run advances both lines by one until the
+# next pair. Repeated templates start new runs at the original `emit def` line. If no block is
+# expanded, the output is left untouched and the line map stays empty; callers should retain the
+# input source and map for that case.
+def frontend_preprocess_static_generate_with_line_map(source: u8&, slen: usize, tokens: darray[Lexer::Token]&, file: Ast::File&, out: mutable darray[u8]&, out_line_map: mutable darray[u32]&, out_line_count: mutable u32&) -> bool:
     can Memory.Allocate, Abort.Panic:
         copied: mutable usize = 0
         changed: mutable bool = false
+        source_line: mutable u32 = 1
+        output_line: mutable u32 = 1
+        out_line_map.truncate(0)
+        out_line_count <- 0
         count: usize = tokens.count
         i: mutable usize = 0
-        while i < count |i, copied, changed, out|:
+        while i < count |i, copied, changed, source_line, output_line, out, out_line_map|:
             recognized: mutable bool = false
             # `static generate :`
             if sg_token_kind(tokens, i) == Lexer::TokenKind.Static and i + 3 < count and sg_token_text(tokens, source, slen, i + 1) == "generate" and sg_token_kind(tokens, i + 2) == Lexer::TokenKind.Colon:
@@ -188,16 +246,30 @@ def frontend_preprocess_static_generate(source: u8&, slen: usize, tokens: darray
                             if variant_names.count > 0 and interps_ok:
                                 # Copy everything up to the `static` keyword, then splice one concrete
                                 # declaration per variant, then resume after the block.
-                                sg_append_range(out, source, copied, sg_token_start(tokens, i))
-                                for variant_name in variant_names |out|:
-                                    sg_append_template(out, source, slen, template_start, template_end, var_name, variant_name)
-                                    out.push(10)
-                                    out.push(10)
+                                static_start: usize = sg_token_start(tokens, i)
+                                sg_append_mapped_range(out, out_line_map, source, copied, static_start, &source_line, &output_line)
+                                sg_advance_source_line(source, static_start, template_start, &source_line)
+                                template_input_line: u32 = source_line
+                                for variant_name in variant_names |out, out_line_map, output_line|:
+                                    template_last_line: mutable u32 = template_input_line
+                                    sg_append_mapped_template(out, out_line_map, source, slen, template_start, template_end, var_name, variant_name, template_input_line, &output_line, &template_last_line)
+                                    sg_append_mapped_template_separator(out, out_line_map, &output_line, template_last_line)
                                 resume_byte: usize = sg_token_start(tokens, resume) if resume < count else slen
+                                sg_advance_source_line(source, template_start, resume_byte, &source_line)
                                 copied <- resume_byte
                                 changed <- true
                                 recognized <- true
                                 i <- resume
             i <- i + 1 if not recognized
-        sg_append_range(out, source, copied, slen)
-        return changed
+        return false if not changed
+        sg_append_mapped_range(out, out_line_map, source, copied, slen, &source_line, &output_line)
+        out_line_count <- output_line
+        return true
+
+
+# Existing parser/report callers that do not publish diagnostics can keep the bytes-only API.
+def frontend_preprocess_static_generate(source: u8&, slen: usize, tokens: darray[Lexer::Token]&, file: Ast::File&, out: mutable darray[u8]&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        line_map: mutable darray[u32] = []
+        line_count: mutable u32 = 0
+        return frontend_preprocess_static_generate_with_line_map(source, slen, tokens, file, out, line_map, &line_count)

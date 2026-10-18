@@ -281,8 +281,11 @@ rebuilt in the new snapshot, and current parse anchors are regenerated. Changed 
 unsupported bodies take the collector walk. Disk sidecars never authorize this
 cross-edit fact reuse. Ordinary one-shot CLI compilation still uses the
 session-disabled wrapper. The opt-in `semantic-session` host retains one session
-across requests and calls the session-aware entry point; its protocol has not yet
-been qualified by an end-to-end control.
+across requests and calls the session-aware entry point. The new
+`test/parity/incremental_semantic_session_control.sh` control drives cold, exact,
+edited, invalid, and restored requests through the normal Stage1 wrapper. It checks
+the status protocol and the reported session hit/edit decisions; it still needs to
+run against a fresh Stage1 product before qualifying the host's runtime behavior.
 
 The long-lived session also retains bounded self-assignment linter facts per
 function. When the function key and body tokens match exactly, it rebinds saved
@@ -290,9 +293,11 @@ target and statement token ordinals to the current source, then replays those
 diagnostics. Bodies without complete, valid anchors use the original streaming
 checker. These linter facts are process-local and omitted from disk sidecars.
 `self_assignment_bodies_scanned` and `self_assignment_bodies_reused` report this
-path separately from direct-fact matching. The session linter path has not yet
-had an end-to-end parity or performance control, so it does not establish a
-compiler speedup.
+path separately from direct-fact matching. The session control also checks that
+warning locations move with an inserted source line, that a captured-loop
+self-assignment stays on the checker fallback and is still reported, and that the
+report records replay for supported straight-line bodies. It is a correctness control,
+not a performance measurement, so it does not establish a compiler speedup.
 
 The existing narrow parity controls previously covered cold, first-cache, warm,
 body-edited, option-changed, structurally valid forged-sidecar, and corrupted-cache
@@ -479,9 +484,11 @@ Each process is tied to one source path and fixed environment options; callers
 start another host when either changes. The opaque session and one reusable
 process-owned line-map buffer outlive a request; parsed source, tokens, and AST
 remain request-local.
-This protocol currently has no end-to-end test control, so session reuse behavior
-and request-region reclamation still need qualification. The ordinary compiler
-entry continues to call the session-disabled wrapper. Persisted sidecars still take
+`test/parity/incremental_semantic_session_control.sh` exercises the protocol through
+the Stage1 wrapper, including repeated requests and an edit that introduces then
+removes a semantic error. A fresh Stage1 run is still needed to qualify session reuse
+and request-region reclamation. The ordinary compiler entry continues to call the
+session-disabled wrapper. Persisted sidecars still take
 the current-source collector path because they are untrusted. Keep diagnostics on
 the normal current-source path until a separate location-rebinding result format is
 proven. The session stores only owned portable facts and grants, never AST,
@@ -577,20 +584,66 @@ commit input/result fingerprints or mark a recomputed query Green, so the scaffo
 cannot authorize semantic reuse. Its invalidation operation marks the full reverse
 closure Dirty and cannot stop propagation when an intermediate result is unchanged.
 
-The dense query-node record now keeps status and adjacency handles ahead of the
-wide key spans and fingerprints. Under conventional 64-bit struct alignment,
-the new field order is estimated at 56 bytes per node versus 72 bytes before;
-this is not a measured Elisa layout or speedup. The graph still has no semantic
-callers, so profiling it should wait until an evaluate/commit path exists.
+Graph admission now caps owned key bytes at 8 MiB, query nodes and their possible
+hash-index entries at 65,536, edge slots and free-list entries at 262,144 each,
+and one replacement input at 4,096 dependency IDs. A conservative logical-storage
+estimate also caps retained graph data at 32 MiB, including estimated index,
+edge, and free-list overhead. New-query admission returns the sentinel and
+dependency replacement returns `false` before changing graph contents when a cap
+would be exceeded; replacement includes the temporary free-list peak in its check.
+The estimate uses logical counts for the graph pools and the retained capacity for
+the reusable worklist. `darray` and dictionary allocators can round other capacities
+above those counts. In the long-lived session region, non-tail `darray` growth can
+also leave old backing buffers allocated until region teardown, so the 32 MiB value
+does not bound total retained region bytes across growth generations. This is an
+admission bound on estimated payload, not a hard process-RSS limit. Before adding a
+production caller, measure/account the graph region's retained bytes or use fixed-size
+chunks with a hard capacity.
+Each query node carries a u64 invalidation-generation stamp, and the session reuses
+a worklist whose retained capacity is included at 8 estimated bytes per slot. The
+worklist grows with the reached reverse closure and is reused by later edits; only
+generation wrap clears all node stamps. This avoids per-edit O(V) visited-array
+initialization and full worklist reservation.
+
+The dense query-node record now keeps status, adjacency handles, and its invalidation
+stamp ahead of the wide key spans and fingerprints. Under conventional 64-bit struct
+alignment, the current field sequence is estimated at 64 bytes per node; the committed
+pre-generation layout is estimated at 56 bytes, so the generation stamp adds 8 bytes.
+These are source-level estimates, not a measured Elisa layout or speedup. The graph
+still has no semantic callers, so profiling it should wait until an evaluate/commit
+path exists.
+
+The checked Zig revision's `AnalUnit` is a packed 64-bit kind/ID handle. Its
+`DepEntry` uses a 64-bit depender handle and three 32-bit links; the dependee
+identity is implicit in the typed dependency-head map. Elisa stores two 32-bit
+query endpoints and three 32-bit links per edge (20 bytes by source layout). The
+outgoing dependency chain is singly linked because replacement removes the whole
+chain; the incoming depender chain stays doubly linked for O(1) unlink. Admission
+estimates 48 bytes per edge slot for alignment headroom. Zig's layout remains a
+useful alternative if Elisa introduces a typed dependency table. When callers
+exist, measure edge and index capacity plus replacement and invalidation costs
+before changing the representation. The source-level comparison and references are in
+[`compiler_incrementality_reference_study.md`](compiler_incrementality_reference_study.md).
 
 Before using this graph for reuse, add a session-owned evaluate/commit boundary
 that validates exact inputs and dependencies, records the canonical result, and
-marks a query Green only after a successful commit. Dependency-set changes must
-invalidate the query and its dependers. Query handles also need session/generation
-validation, since the current bare indices can alias across sessions or after reset.
-Bound retained nodes, key bytes, edges, and update work; any overflow or graph
-corruption must discard the graph and take the cold path. Until these boundaries
-have semantic callers and parity controls, describe this as scaffolding only.
+marks a query Green only after a successful commit. A dependency-set change dirties
+that query for reevaluation. After commit, propagate dirtiness to reverse dependers
+only if the canonical result fingerprint changed; an unchanged result should stop
+propagation. Query handles also need session/generation validation, since the current
+bare indices can alias across sessions or after reset.
+Dependency deduplication still uses nested scans; the 4,096-ID per-query admission
+cap bounds that work, but a future real caller should measure it. Any overflow or
+graph corruption must discard the graph and take the cold path. Until these
+boundaries have semantic callers and parity controls, describe this as scaffolding only.
+Graph reuse must also be tied to a successfully committed semantic context. A failed
+snapshot store can leave the prior query graph allocated, and key lookup currently
+checks only whether the session is enabled. A future request must stage graph changes
+under its new source generation and publish them only after snapshot commit, or poison
+the prior graph before any lookup and cold-rebuild it on failure. Checking only the
+snapshot's current valid bit is insufficient if graph updates begin before commit.
+Sparse and dense invalidation closure costs remain unmeasured, as do
+dependency-deduplication alternatives.
 
 The report counts `eligible_bodies` and `matched_eligible_bodies` by unique
 cacheable function record, so a body with multiple facts cannot inflate
@@ -737,4 +790,38 @@ yet retain parse trees, skip parsing, record/replay tracked semantic query
 results, or reuse LLVM/native artifacts.
 It is intentionally tied to one source path and fixed process environment for
 its lifetime; launch a fresh host to change compiler options or source identity.
-Ordinary CLI compilation remains one-shot.
+Ordinary CLI compilation remains one-shot. The host control is wired into
+`test/parity/incremental_prior_key_index_gate.sh` and runs through the Stage1 wrapper.
+It checks exact repeats, body edits, error invalidation, self-assignment replay and
+fallback, and shifted diagnostic locations. Bash syntax and ShellCheck pass, but the
+control still needs a fresh Stage1 run before its runtime assertions qualify the host.
+
+## Stage1 compile-session host (2026-10-18)
+
+`elisac-stage1 compile-session [-emit MODE] [-o OUT] SOURCE` is an opt-in repeated
+ordinary source compile host. Send `compile` for each saved edit and `quit` to stop;
+each compile writes `0` or `1` to stdout, and compiler diagnostics stay on stderr.
+The root path, command-line options, and inherited environment are fixed for the
+process. Every request rereads that source and rebuilds its include identity and
+line map, so an include or root edit changes the session key and current diagnostics
+are rendered against the current source. The source, expanded text, tokens, AST,
+generated text, and other request buffers live in a request region. A single
+semantic session survives up to 32 compile requests; the host then ends that
+session region and starts a cold session to release retained arena storage.
+
+The shared request routine is also used by one-shot `main`; its three normal
+semantic-gate callsites receive an explicit session reference. One-shot compilation
+uses a disabled session, preserving disk-sidecar behavior. Repeated compilation
+uses the retained in-process session for validated function facts and self-assignment
+findings, then still runs current semantic checking, LLVM IR generation, optimization,
+and artifact emission. It does not reuse parse trees, semantic query results, LLVM
+modules, or native objects. LLVM object, IR, bitcode, executable, wasm, and Python
+extension requests dispose their builder, module, target data, target machine, and
+context before the next request. `check` and `edir` return before creating LLVM state.
+
+The first host supports `check`, `obj`, `llvm`, `bc`, `exe`, `wasm`, `pymodule-so`,
+and `edir`. It rejects stdout report modes so the status protocol stays readable;
+project-target subcommands and `c-archive` are not wired into this session boundary.
+The wrapper preserves stdin for this mode and applies its usual process memory guard.
+This source change has only had static review so far; no build or runtime control has
+qualified it, so it makes no performance claim.

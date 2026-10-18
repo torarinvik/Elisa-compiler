@@ -35,11 +35,20 @@ extend Semantic:
             InvalidTokenSpan
             UnsupportedSignature
 
-        # These IDs belong to one IncrementalSemanticSession. They are deliberately
-        # distinct from DeclId/BindingId, which are rebuilt with each SymbolTable.
+        # These graph-local IDs are deliberately distinct from DeclId/BindingId,
+        # which are rebuilt with each SymbolTable. They never leave the private graph.
         const INCREMENTAL_SEMANTIC_QUERY_NONE: u32 = 4294967295
+        # Admission caps for the session query graph. The node cap also bounds the
+        # number of possible hash-index entries; the byte estimate includes conservative
+        # map/index overhead but does not account for allocator capacity rounding.
+        const INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT: usize = 8388608
+        const INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT: usize = 16777216
+        const INCREMENTAL_SEMANTIC_QUERY_NODE_LIMIT: usize = 65536
+        const INCREMENTAL_SEMANTIC_QUERY_EDGE_LIMIT: usize = 262144
+        const INCREMENTAL_SEMANTIC_QUERY_PER_DEPENDENCY_LIMIT: usize = 4096
+        const INCREMENTAL_SEMANTIC_QUERY_RETAINED_BYTES_LIMIT: usize = 33554432
 
-        const enum IncrementalSemanticQueryKind of u8:
+        private const enum IncrementalSemanticQueryKind of u8:
             SourceInput
             FunctionBodyFacts
             FunctionSummary
@@ -48,17 +57,45 @@ extend Semantic:
             TypeOf
             ConstantValue
 
-        const enum IncrementalSemanticQueryStatus of u8:
+        private const enum IncrementalSemanticQueryStatus of u8:
             Dirty
+            PotentiallyDirty
             Green
 
-        struct IncrementalSemanticQueryId:
+        private struct IncrementalSemanticQueryId:
             value: u32
 
-        struct IncrementalSemanticDependencyEdgeId:
+        private struct IncrementalSemanticDependencyEdgeId:
             value: u32
 
-        struct IncrementalSemanticQueryNode:
+        private struct IncrementalSemanticQueryHandle[@r]:
+            private:
+                node: IncrementalSemanticQueryId
+                session_cookie: uintptr
+                graph_generation: u64
+                request_generation: u64
+                context_generation: u64
+
+        private struct IncrementalSemanticQueryEvaluation:
+            hit: bool
+            canonical_result: darray[u8]
+
+        private struct IncrementalSemanticQueryDependencyCheck:
+            valid: bool
+            structural: bool
+            equal: bool
+            results_current: bool
+            all_dependencies_green: bool
+            unique_count: usize
+            old_count: usize
+            dependency_ids: darray[IncrementalSemanticQueryId]
+
+        private struct IncrementalSemanticQueryWalkResult:
+            valid: bool
+            budget_ok: bool
+            reaches_target: bool
+
+        private struct IncrementalSemanticQueryNode:
             # Keep status and adjacency links together at the front: invalidation walks
             # this state before it needs the colder key spans or fingerprints. Grouping
             # fields by alignment also avoids padding between every 32-bit handle and
@@ -70,20 +107,28 @@ extend Semantic:
             # Outgoing edges are this query's dependencies; incoming edges are its dependers.
             first_dependency: IncrementalSemanticDependencyEdgeId
             first_depender: IncrementalSemanticDependencyEdgeId
+            # Session generation of the last bounded graph walk.
+            last_invalidation_generation: u64
             key_hash: u64
             key_start: usize
             key_length: usize
+            has_committed_value: bool
+            input_start: usize
+            input_length: usize
+            result_start: usize
+            result_length: usize
             input_fingerprint: u64
             result_fingerprint: u64
+            result_generation: u64
 
-        struct IncrementalSemanticDependencyEdge:
+        private struct IncrementalSemanticDependencyEdge:
             # A NONE endpoint marks a reusable free-list slot.
             depender: IncrementalSemanticQueryId
             dependee: IncrementalSemanticQueryId
-            previous_dependency: IncrementalSemanticDependencyEdgeId
             next_dependency: IncrementalSemanticDependencyEdgeId
             previous_depender: IncrementalSemanticDependencyEdgeId
             next_depender: IncrementalSemanticDependencyEdgeId
+            observed_result_generation: u64
 
         # These spans address the snapshot-owned byte pool, not source buffers or intern tables.
         struct IncrementalFunctionFactRecord:
@@ -171,27 +216,65 @@ extend Semantic:
             bodies_rejected: mutable u32
             self_assignment_bodies_scanned: mutable u32
             self_assignment_bodies_reused: mutable u32
+            # Invocation/session-only proof that the exact declaration surface was
+            # completely encoded. Omitted from the sidecar codec.
+            declaration_surface_valid: mutable bool
+            surface_compatible: mutable bool
+
+        # A session retains only portable scalar/byte facts. Invocation anchors,
+        # including source-borrowing self-assignment names, are rebuilt per request.
+        private struct IncrementalSemanticSessionSnapshot[@r]:
+            schema_version: mutable u32
+            semantic_fingerprint: mutable u64
+            options_fingerprint: mutable u64
+            options_key: mutable darray[u8] @r
+            bytes: mutable darray[u8] @r
+            source_path_start: mutable usize
+            source_path_length: mutable usize
+            declaration_surface_start: mutable usize
+            declaration_surface_length: mutable usize
+            declaration_surface_hash: mutable u64
+            functions: mutable darray[IncrementalFunctionFactRecord] @r
+            direct_facts: mutable darray[IncrementalDirectFact] @r
+            active_grants: mutable darray[IncrementalActiveGrant] @r
+            self_assignment_ranges: mutable darray[IncrementalSelfAssignmentFactRange] @r
+            self_assignment_facts: mutable darray[IncrementalSelfAssignmentFact] @r
+            bodies_visited: mutable u32
+            bodies_matched: mutable u32
+            bodies_rejected: mutable u32
+            self_assignment_bodies_scanned: mutable u32
+            self_assignment_bodies_reused: mutable u32
+            declaration_surface_valid: mutable bool
             surface_compatible: mutable bool
 
         # Callers retain this object, but only Semantic can access or replace its
         # previous facts. No public API accepts a raw snapshot as a trusted prior.
-        struct IncrementalSemanticSession:
+        struct IncrementalSemanticSession[@r]:
             private:
                 enabled: bool
                 valid: mutable bool
-                analyzed_source: mutable darray[u8]
-                identity_key: mutable darray[u8]
-                options_key: mutable darray[u8]
+                analyzed_source: mutable darray[u8] @r
+                identity_key: mutable darray[u8] @r
+                options_key: mutable darray[u8] @r
                 generated_input: mutable bool
                 semantic_fingerprint: mutable u64
-                snapshot: mutable IncrementalSemanticSnapshot
+                snapshot: mutable IncrementalSemanticSessionSnapshot[r]
                 # Query keys stay owned for the lifetime of this session. Edges refer only
                 # to compact IDs, never to keys or current SymbolTable rows.
-                query_key_bytes: mutable darray[u8]
-                query_key_heads: mutable dict[u64, IncrementalSemanticQueryId]
-                query_nodes: mutable darray[IncrementalSemanticQueryNode]
-                query_edges: mutable darray[IncrementalSemanticDependencyEdge]
-                free_query_edges: mutable darray[IncrementalSemanticDependencyEdgeId]
+                query_key_bytes: mutable darray[u8] @r
+                query_key_heads: mutable dict[u64, IncrementalSemanticQueryId] @r
+                query_nodes: mutable darray[IncrementalSemanticQueryNode] @r
+                query_edges: mutable darray[IncrementalSemanticDependencyEdge] @r
+                free_query_edges: mutable darray[IncrementalSemanticDependencyEdgeId] @r
+                # Canonical inputs and result payloads are retained exactly. Fingerprints
+                # are only prefilters and never authorize a hit or red-to-green stop.
+                query_value_bytes: mutable darray[u8] @r
+                query_graph_generation: mutable u64
+                query_request_generation: mutable u64
+                query_context_generation: mutable u64
+                query_graph_poisoned: mutable bool
+                query_invalidation_generation: mutable u64
+                query_invalidation_worklist: mutable darray[IncrementalSemanticQueryId] @r
 
         struct IncrementalSessionCollectionResult:
             snapshot: IncrementalSemanticSnapshot
@@ -201,7 +284,7 @@ extend Semantic:
 
         def incremental_empty_snapshot() -> IncrementalSemanticSnapshot:
             can Memory.Allocate:
-                return IncrementalSemanticSnapshot{schema_version: 0, semantic_fingerprint: 0, options_fingerprint: 0, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: 0, functions: [], current_anchors: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], current_self_assignment_anchors: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, surface_compatible: false}
+                return IncrementalSemanticSnapshot{schema_version: 0, semantic_fingerprint: 0, options_fingerprint: 0, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: 0, functions: [], current_anchors: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], current_self_assignment_anchors: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, declaration_surface_valid: false, surface_compatible: false}
 
         private struct IncrementalFactCandidate:
             name: sview
@@ -548,30 +631,6 @@ extend Semantic:
                 anchor: IncrementalSelfAssignmentAnchor = IncrementalSelfAssignmentAnchor{name: Lexer::text_or_empty(target_token, source, source_length), target_position: position, statement_line: statement_token.line}
                 return (true, anchor)
 
-        # The semantic checker receives `semantic_loop_view(file)`, where a statement
-        # Expr.Block with Invalid yield is rewritten into Stmt.Block. Keep these bodies
-        # cold because the raw fact traversal intentionally leaves Stmt.Expr opaque.
-        def ifc_has_self_assignment_loop_view_block(statements: darray[Ast::Stmt]) -> bool:
-            can Abort.Panic:
-                for statement in statements:
-                    match statement:
-                        Stmt.Expr(expression, _):
-                            match expression:
-                                Expr.Block(_, value, _, _):
-                                    return true if value is Ast::Expr.Invalid
-                                _:
-                                    pass
-                        Stmt.If(_, then_body, else_body, _):
-                            return true if ifc_has_self_assignment_loop_view_block(then_body) or ifc_has_self_assignment_loop_view_block(else_body)
-                        Stmt.While(_, body, _) | Stmt.For(_, _, _, body, _) | Stmt.Block(_, _, _, body, _):
-                            return true if ifc_has_self_assignment_loop_view_block(body)
-                        Stmt.Match(_, arms, _):
-                            for arm in arms:
-                                return true if ifc_has_self_assignment_loop_view_block(arm.body)
-                        _:
-                            pass
-                return false
-
         def ifc_self_assignment_fact_capacity(snapshot: IncrementalSemanticSnapshot&) -> usize:
             can Abort.Panic:
                 return 0 if snapshot.self_assignment_facts.count >= 1000000 or snapshot.self_assignment_ranges.count > 1000000 or snapshot.bytes.count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT
@@ -603,7 +662,7 @@ extend Semantic:
                 return if index >= candidates.count
                 candidate: IncrementalFactCandidate = candidates[index]
                 start: usize = snapshot.self_assignment_facts.count
-                if not candidate.header_supported or candidate.body_token_start >= candidate.body_token_end or candidate.body_token_end > tokens.count or ifc_has_self_assignment_loop_view_block(candidate.body):
+                if not candidate.header_supported or candidate.body_token_start >= candidate.body_token_end or candidate.body_token_end > tokens.count:
                     snapshot.self_assignment_ranges[candidate.owner] <- IncrementalSelfAssignmentFactRange{start: start, count: 0, complete: false, reused_previous: false}
                     return
                 findings: mutable darray[SelfAssignmentFinding] = []
@@ -885,6 +944,7 @@ extend Semantic:
                 ordered.declaration_surface_start <- ordered.bytes.count
                 if ifc_byte_span(snapshot.bytes, snapshot.declaration_surface_start, snapshot.declaration_surface_length) is declaration_surface:
                     ordered.bytes.extend(declaration_surface)
+                ordered.declaration_surface_valid <- snapshot.declaration_surface_valid
                 return ordered
 
         def ifc_surface_equal(previous: IncrementalSemanticSnapshot&, current: IncrementalSemanticSnapshot) -> bool:
@@ -1063,7 +1123,7 @@ extend Semantic:
         # fact reuse after exact surface and body checks.
         def ifc_collect_function_facts(file: Ast::File&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, options_key: darray[u8]&, previous: IncrementalSemanticSnapshot&, has_previous: bool, allow_session_reuse: bool) -> IncrementalSemanticSnapshot:
             can Memory.Allocate, Abort.Panic:
-                snapshot: mutable IncrementalSemanticSnapshot = IncrementalSemanticSnapshot{schema_version: INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: semantic_fingerprint, options_fingerprint: options_fingerprint, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], current_self_assignment_anchors: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, surface_compatible: false}
+                snapshot: mutable IncrementalSemanticSnapshot = IncrementalSemanticSnapshot{schema_version: INCREMENTAL_FUNCTION_FACTS_SCHEMA, semantic_fingerprint: semantic_fingerprint, options_fingerprint: options_fingerprint, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: INCREMENTAL_FACT_HASH_OFFSET, functions: [], current_anchors: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], current_self_assignment_anchors: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, declaration_surface_valid: false, surface_compatible: false}
                 snapshot.options_key.extend(options_key)
                 snapshot.source_path_start <- snapshot.bytes.count
                 snapshot.source_path_length <- source_path.len
@@ -1156,11 +1216,11 @@ extend Semantic:
                             candidates[index].prior_body_matches <- same_body
 
                 trusted_surface_admitted: mutable bool = false
+                proposed_surface: mutable darray[u8] = []
+                proposed_surface_valid: mutable bool = false
                 if allow_session_reuse and has_previous and all_spans_ordered:
-                    proposed_surface: mutable darray[u8] = []
-                    proposed_surface_valid: bool = ifc_append_declaration_surface(proposed_surface, tokens, source, source_length, candidates, snapshot, true)
+                    proposed_surface_valid <- ifc_append_declaration_surface(proposed_surface, tokens, source, source_length, candidates, snapshot, true)
                     trusted_surface_admitted <- proposed_surface_valid and ifc_surface_matches_bytes(previous, snapshot.schema_version, snapshot.semantic_fingerprint, snapshot.options_fingerprint, snapshot.options_key, source_path, proposed_surface)
-
                 for index in 0..<candidates.count |candidates, snapshot|:
                     if allow_session_reuse and trusted_surface_admitted and candidates[index].header_supported and candidates[index].prior_record_cacheable and candidates[index].prior_body_matches:
                         if ifc_reuse_previous_candidate_facts(index, candidates, previous, snapshot):
@@ -1177,6 +1237,7 @@ extend Semantic:
                 snapshot.bytes.extend(declaration_surface)
                 snapshot.declaration_surface_length <- snapshot.bytes.count - snapshot.declaration_surface_start
                 snapshot.declaration_surface_hash <- ifc_hash(snapshot.bytes, snapshot.declaration_surface_start, snapshot.declaration_surface_length)
+                snapshot.declaration_surface_valid <- surface_valid
                 snapshot.surface_compatible <- has_previous and surface_valid and all_spans_ordered and ifc_surface_equal(previous, snapshot)
                 if not surface_valid:
                     snapshot.direct_facts.truncate(0)
@@ -1312,136 +1373,68 @@ extend Semantic:
                 return true
 
     public:
-        def incremental_semantic_session_new(enabled: bool) -> IncrementalSemanticSession can[Memory.Allocate]:
-            return IncrementalSemanticSession{enabled: enabled, valid: false, analyzed_source: [], identity_key: [], options_key: [], generated_input: false, semantic_fingerprint: 0, snapshot: incremental_empty_snapshot(), query_key_bytes: [], query_key_heads: {}, query_nodes: [], query_edges: [], free_query_edges: []}
+        def incremental_semantic_session_new[@r](enabled: bool) -> IncrementalSemanticSession[r] @r can[Memory.Allocate]:
+            return IncrementalSemanticSession{enabled: enabled, valid: false, analyzed_source: [], identity_key: [], options_key: [], generated_input: false, semantic_fingerprint: 0, snapshot: IncrementalSemanticSessionSnapshot{schema_version: 0, semantic_fingerprint: 0, options_fingerprint: 0, options_key: [], bytes: [], source_path_start: 0, source_path_length: 0, declaration_surface_start: 0, declaration_surface_length: 0, declaration_surface_hash: 0, functions: [], direct_facts: [], active_grants: [], self_assignment_ranges: [], self_assignment_facts: [], bodies_visited: 0, bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_scanned: 0, self_assignment_bodies_reused: 0, declaration_surface_valid: false, surface_compatible: false}, query_key_bytes: [], query_key_heads: {}, query_nodes: [], query_edges: [], free_query_edges: [], query_value_bytes: [], query_graph_generation: 1, query_request_generation: 0, query_context_generation: 0, query_graph_poisoned: false, query_invalidation_generation: 0, query_invalidation_worklist: []}
 
-        def incremental_semantic_session_is_enabled(session: IncrementalSemanticSession&) -> bool:
+        def incremental_semantic_session_is_enabled[@r](session: IncrementalSemanticSession[r]& @r) -> bool:
             return session.enabled
 
-        def incremental_semantic_session_reset[@session](session: mutable IncrementalSemanticSession& @session) -> void:
+        def incremental_semantic_session_reset[@session](session: mutable IncrementalSemanticSession[session]& @session) -> void:
             can Abort.Panic, Memory.Allocate:
                 ifc_session_clear_prior(session)
                 ifq_clear_session_graph(session)
 
     private:
-        # Find or create a node by the exact query key. The hash selects a collision
-        # chain only; it never authorizes identity. New key bytes are copied into the
-        # session before the node is published.
-        def incremental_semantic_query_for_key[@session](session: mutable IncrementalSemanticSession& @session, kind: IncrementalSemanticQueryKind, key: darray[u8]&) -> IncrementalSemanticQueryId:
-            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
-                missing: IncrementalSemanticQueryId = IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
-                return missing if not session.enabled
-                key_hash: u64 = ifq_query_key_hash(kind, key)
-                if session.query_key_heads.get(key_hash) is head:
-                    cursor: mutable IncrementalSemanticQueryId = head
-                    while cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |cursor, session, kind, key|:
-                        return cursor if ifq_query_key_matches(session, cursor, kind, key)
-                        return missing if cursor.value.usize() >= session.query_nodes.count
-                        cursor <- session.query_nodes[cursor.value.usize()].next_same_hash
-                return missing if session.query_nodes.count >= INCREMENTAL_SEMANTIC_QUERY_NONE.usize()
-                key_start: usize = session.query_key_bytes.count
-                previous_head: IncrementalSemanticQueryId = head if session.query_key_heads.get(key_hash) is head else missing
-                session.query_key_bytes.extend(key)
-                query_id: IncrementalSemanticQueryId = IncrementalSemanticQueryId{value: session.query_nodes.count.u32()}
-                session.query_nodes.push(IncrementalSemanticQueryNode{kind: kind, key_hash: key_hash, key_start: key_start, key_length: key.count, next_same_hash: previous_head, first_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, first_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, input_fingerprint: 0, result_fingerprint: 0, status: IncrementalSemanticQueryStatus.Dirty})
-                session.query_key_heads <- session.query_key_heads.put(key_hash, query_id) can Global{Read,Write}
-                return query_id
+        # Graph admission is a logical payload bound. Arena capacity can remain above
+        # these counts after growth; callers must keep the graph disconnected until a
+        # resettable store or measured-capacity budget is available.
+        def ifq_graph_within_limit[@r](session: IncrementalSemanticSession[r]& @r, additional_key_bytes: usize, additional_value_bytes: usize, additional_nodes: usize, additional_edges: usize, additional_free_edges: usize, required_worklist_slots: usize) -> bool:
+            can Abort.Panic:
+                return false if session.query_key_bytes.count > INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT
+                return false if additional_key_bytes > INCREMENTAL_SEMANTIC_QUERY_KEY_BYTES_LIMIT - session.query_key_bytes.count
+                return false if session.query_value_bytes.count > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT
+                return false if additional_value_bytes > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT - session.query_value_bytes.count
+                return false if session.query_nodes.count > INCREMENTAL_SEMANTIC_QUERY_NODE_LIMIT
+                return false if additional_nodes > INCREMENTAL_SEMANTIC_QUERY_NODE_LIMIT - session.query_nodes.count
+                return false if session.query_edges.count > INCREMENTAL_SEMANTIC_QUERY_EDGE_LIMIT
+                return false if additional_edges > INCREMENTAL_SEMANTIC_QUERY_EDGE_LIMIT - session.query_edges.count
+                return false if session.free_query_edges.count > INCREMENTAL_SEMANTIC_QUERY_EDGE_LIMIT
+                return false if additional_free_edges > INCREMENTAL_SEMANTIC_QUERY_EDGE_LIMIT - session.free_query_edges.count
+                worklist_slots: usize = session.query_invalidation_worklist.capacity
+                worklist_slots <- required_worklist_slots if required_worklist_slots > worklist_slots
+                return false if worklist_slots > INCREMENTAL_SEMANTIC_QUERY_NODE_LIMIT
+                key_bytes: u64 = (session.query_key_bytes.count + additional_key_bytes).u64()
+                value_bytes: u64 = (session.query_value_bytes.count + additional_value_bytes).u64()
+                # 128 bytes includes the query record and a conservative index share.
+                node_and_index_bytes: u64 = (session.query_nodes.count + additional_nodes).u64() * 128
+                # The edge record is five u32s (20 bytes); retain alignment headroom.
+                edge_bytes: u64 = (session.query_edges.count + additional_edges).u64() * 48
+                free_bytes: u64 = (session.free_query_edges.count + additional_free_edges).u64() * 8
+                worklist_bytes: u64 = worklist_slots.u64() * 8
+                total: u64 = key_bytes + value_bytes + node_and_index_bytes + edge_bytes + free_bytes + worklist_bytes + 32
+                return total <= INCREMENTAL_SEMANTIC_QUERY_RETAINED_BYTES_LIMIT.u64()
 
-        # Replace the full outgoing dependency set. The old forward and reverse links
-        # are removed together, then the new edges are installed in both adjacency lists.
-        # Duplicate dependency IDs are ignored so one query contributes one invalidation edge.
-        def incremental_semantic_query_replace_dependencies[@session](session: mutable IncrementalSemanticSession& @session, depender: IncrementalSemanticQueryId, dependencies: darray[IncrementalSemanticQueryId]&) -> bool:
+        def ifq_invalidation_worklist_push[@session](session: mutable IncrementalSemanticSession[session]& @session, query_id: IncrementalSemanticQueryId) -> bool:
             can Memory.Allocate, Abort.Panic:
-                return false if not session.enabled or not ifq_query_id_is_valid(session, depender)
-                unique_count: mutable usize = 0
-                for index in 0..<dependencies.count |session, depender, dependencies, unique_count|:
-                    dependency: IncrementalSemanticQueryId = dependencies[index]
-                    return false if not ifq_query_id_is_valid(session, dependency)
-                    duplicate: mutable bool = false
-                    for previous in 0..<index |duplicate, dependency, dependencies|:
-                        duplicate <- true if dependencies[previous].value == dependency.value
-                    unique_count <- unique_count + 1 if not duplicate
-
-                old_count: mutable usize = 0
-                edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[depender.value.usize()].first_dependency
-                while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |edge_cursor, old_count, session|:
-                    return false if not ifq_edge_id_is_valid(session, edge_cursor)
-                    old_count <- old_count + 1
-                    return false if old_count > session.query_edges.count
-                    edge_cursor <- session.query_edges[edge_cursor.value.usize()].next_dependency
-
-                reusable_count: usize = session.free_query_edges.count + old_count
-                append_count: usize = unique_count - reusable_count if unique_count > reusable_count else 0
-                return false if append_count > INCREMENTAL_SEMANTIC_QUERY_NONE.usize() - session.query_edges.count
-                session.query_edges.reserve(session.query_edges.count + append_count)
-                session.free_query_edges.reserve(session.free_query_edges.count + old_count)
-
-                edge_cursor <- session.query_nodes[depender.value.usize()].first_dependency
-                while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |edge_cursor, session, depender|:
-                    edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
-                    next_edge: IncrementalSemanticDependencyEdgeId = edge.next_dependency
-                    if edge.previous_depender.value == INCREMENTAL_SEMANTIC_QUERY_NONE:
-                        session.query_nodes[edge.dependee.value.usize()].first_depender <- edge.next_depender
-                    else:
-                        session.query_edges[edge.previous_depender.value.usize()].next_depender <- edge.next_depender
-                    if edge.next_depender.value != INCREMENTAL_SEMANTIC_QUERY_NONE:
-                        session.query_edges[edge.next_depender.value.usize()].previous_depender <- edge.previous_depender
-                    session.query_edges[edge_cursor.value.usize()].depender <- IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
-                    session.query_edges[edge_cursor.value.usize()].dependee <- IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
-                    session.free_query_edges.push(edge_cursor)
-                    edge_cursor <- next_edge
-                session.query_nodes[depender.value.usize()].first_dependency <- IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
-
-                for index in 0..<dependencies.count |session, depender, dependencies|:
-                    dependee: IncrementalSemanticQueryId = dependencies[index]
-                    duplicate: mutable bool = false
-                    for previous in 0..<index |duplicate, dependee, dependencies|:
-                        duplicate <- true if dependencies[previous].value == dependee.value
-                    continue if duplicate
-                    edge_id: IncrementalSemanticDependencyEdgeId
-                    if session.free_query_edges.count > 0:
-                        edge_id <- session.free_query_edges.pop()
-                    else:
-                        edge_id <- IncrementalSemanticDependencyEdgeId{value: session.query_edges.count.u32()}
-                        session.query_edges.push(IncrementalSemanticDependencyEdge{depender: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, dependee: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, previous_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, previous_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE})
-                    outgoing_head: IncrementalSemanticDependencyEdgeId = session.query_nodes[depender.value.usize()].first_dependency
-                    incoming_head: IncrementalSemanticDependencyEdgeId = session.query_nodes[dependee.value.usize()].first_depender
-                    session.query_edges[edge_id.value.usize()] <- IncrementalSemanticDependencyEdge{depender: depender, dependee: dependee, previous_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_dependency: outgoing_head, previous_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_depender: incoming_head}
-                    if outgoing_head.value != INCREMENTAL_SEMANTIC_QUERY_NONE:
-                        session.query_edges[outgoing_head.value.usize()].previous_dependency <- edge_id
-                    if incoming_head.value != INCREMENTAL_SEMANTIC_QUERY_NONE:
-                        session.query_edges[incoming_head.value.usize()].previous_depender <- edge_id
-                    session.query_nodes[depender.value.usize()].first_dependency <- edge_id
-                    session.query_nodes[dependee.value.usize()].first_depender <- edge_id
+                return false if session.query_invalidation_worklist.count >= session.query_nodes.count
+                if session.query_invalidation_worklist.count >= session.query_invalidation_worklist.capacity:
+                    old_capacity: usize = session.query_invalidation_worklist.capacity
+                    next_capacity: usize = 8 if old_capacity == 0 else old_capacity * 2
+                    return false if next_capacity < old_capacity
+                    next_capacity <- session.query_nodes.count if next_capacity > session.query_nodes.count
+                    return false if next_capacity <= old_capacity
+                    return false if not ifq_graph_within_limit(session, 0, 0, 0, 0, 0, next_capacity)
+                    session.query_invalidation_worklist.reserve(next_capacity)
+                session.query_invalidation_worklist.push(query_id)
                 return true
 
-        # Mark a query and every reverse depender dirty. The explicit worklist and
-        # visited bitmap handle dependency cycles without recursion or repeated work.
-        def incremental_semantic_query_invalidate_dependers[@session](session: mutable IncrementalSemanticSession& @session, changed: IncrementalSemanticQueryId) -> bool:
-            can Memory.Allocate, Abort.Panic:
-                return false if not session.enabled or not ifq_query_id_is_valid(session, changed)
-                work: mutable darray[IncrementalSemanticQueryId] = []
-                work.reserve(session.query_nodes.count)
-                visited: mutable darray[bool] = [false for _ in 0..<session.query_nodes.count]
-                visited[changed.value.usize()] <- true
-                work.push(changed)
-                while work.count > 0 |session, work, visited|:
-                    current: IncrementalSemanticQueryId = work.pop()
-                    session.query_nodes[current.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
-                    edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[current.value.usize()].first_depender
-                    steps: mutable usize = 0
-                    while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |edge_cursor, steps, session, work, visited|:
-                        return false if not ifq_edge_id_is_valid(session, edge_cursor)
-                        edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
-                        dependent: IncrementalSemanticQueryId = edge.depender
-                        return false if not ifq_query_id_is_valid(session, dependent)
-                        if not visited[dependent.value.usize()]:
-                            visited[dependent.value.usize()] <- true
-                            work.push(dependent)
-                        steps <- steps + 1
-                        return false if steps > session.query_edges.count
-                        edge_cursor <- edge.next_depender
-                return true
+        def ifq_query_id_is_valid[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId) -> bool:
+            can Abort.Panic:
+                return query_id.value != INCREMENTAL_SEMANTIC_QUERY_NONE and query_id.value.usize() < session.query_nodes.count
+
+        def ifq_edge_id_is_valid[@r](session: IncrementalSemanticSession[r]& @r, edge_id: IncrementalSemanticDependencyEdgeId) -> bool:
+            can Abort.Panic:
+                return edge_id.value != INCREMENTAL_SEMANTIC_QUERY_NONE and edge_id.value.usize() < session.query_edges.count and session.query_edges[edge_id.value.usize()].depender.value != INCREMENTAL_SEMANTIC_QUERY_NONE and session.query_edges[edge_id.value.usize()].dependee.value != INCREMENTAL_SEMANTIC_QUERY_NONE
 
         def ifq_query_key_hash(kind: IncrementalSemanticQueryKind, key: darray[u8]&) -> u64:
             can Abort.Panic:
@@ -1451,32 +1444,543 @@ extend Semantic:
                     hash <- (hash ^ byte.u64()) * 1099511628211
                 return hash
 
-        def ifq_query_id_is_valid(session: IncrementalSemanticSession&, query_id: IncrementalSemanticQueryId) -> bool:
+        def ifq_query_value_hash(bytes: darray[u8]&) -> u64:
             can Abort.Panic:
-                return query_id.value != INCREMENTAL_SEMANTIC_QUERY_NONE and query_id.value.usize() < session.query_nodes.count
+                hash: mutable u64 = 14695981039346656037
+                for byte in bytes |hash|:
+                    hash <- (hash ^ byte.u64()) * 1099511628211
+                return hash
 
-        def ifq_edge_id_is_valid(session: IncrementalSemanticSession&, edge_id: IncrementalSemanticDependencyEdgeId) -> bool:
+        def ifq_query_session_cookie[@r](session: IncrementalSemanticSession[r]& @r) -> uintptr:
+            can Unsafe.PointerCast:
+                return (&session).cast[void&].uintptr()
+
+        def ifq_query_handle_invalid[@r]() -> IncrementalSemanticQueryHandle[r]:
+            return IncrementalSemanticQueryHandle{node: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, session_cookie: 0, graph_generation: 0, request_generation: 0, context_generation: 0}
+
+        def ifq_query_handle_for_id[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId) -> IncrementalSemanticQueryHandle[r]:
+            can Unsafe.PointerCast:
+                return IncrementalSemanticQueryHandle{node: query_id, session_cookie: ifq_query_session_cookie(session), graph_generation: session.query_graph_generation, request_generation: session.query_request_generation, context_generation: session.query_context_generation}
+
+        def ifq_query_handle_is_valid[@r](session: IncrementalSemanticSession[r]& @r, handle: IncrementalSemanticQueryHandle[r]) -> bool:
+            can Abort.Panic, Unsafe.PointerCast:
+                return false if not session.enabled or not session.valid or session.query_graph_poisoned
+                return false if session.query_graph_generation == 0 or handle.graph_generation != session.query_graph_generation
+                return false if session.query_request_generation == 0 or handle.request_generation != session.query_request_generation
+                return false if session.query_context_generation == 0 or handle.context_generation != session.query_context_generation
+                return false if handle.session_cookie != ifq_query_session_cookie(session)
+                return ifq_query_id_is_valid(session, handle.node)
+
+        # Advance once after a semantic snapshot has been successfully committed. Handles
+        # from an earlier request can no longer be used to stage or publish query results.
+        def incremental_semantic_query_begin_request[@session](session: mutable IncrementalSemanticSession[session]& @session) -> bool:
             can Abort.Panic:
-                return edge_id.value != INCREMENTAL_SEMANTIC_QUERY_NONE and edge_id.value.usize() < session.query_edges.count and session.query_edges[edge_id.value.usize()].depender.value != INCREMENTAL_SEMANTIC_QUERY_NONE and session.query_edges[edge_id.value.usize()].dependee.value != INCREMENTAL_SEMANTIC_QUERY_NONE
+                return false if not session.enabled or not session.valid or session.query_graph_poisoned or session.query_context_generation == 0 or session.query_graph_generation == 0
+                if session.query_request_generation == 18446744073709551615:
+                    session.query_graph_poisoned <- true
+                    return false
+                session.query_request_generation <- session.query_request_generation + 1
+                return true
 
-        def ifq_query_key_matches(session: IncrementalSemanticSession&, query_id: IncrementalSemanticQueryId, kind: IncrementalSemanticQueryKind, key: darray[u8]&) -> bool:
+        def ifq_query_key_span_is_valid[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId) -> bool:
             can Abort.Panic:
                 return false if not ifq_query_id_is_valid(session, query_id)
                 node: IncrementalSemanticQueryNode = session.query_nodes[query_id.value.usize()]
+                return node.key_start <= session.query_key_bytes.count and node.key_length <= session.query_key_bytes.count - node.key_start
+
+        def ifq_query_key_matches[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId, kind: IncrementalSemanticQueryKind, key: darray[u8]&) -> bool:
+            can Abort.Panic:
+                return false if not ifq_query_key_span_is_valid(session, query_id)
+                node: IncrementalSemanticQueryNode = session.query_nodes[query_id.value.usize()]
                 return false if node.kind != kind or node.key_hash != ifq_query_key_hash(kind, key) or node.key_length != key.count
-                return false if node.key_start > session.query_key_bytes.count or node.key_length > session.query_key_bytes.count - node.key_start
                 for offset in 0..<key.count |session, node, key|:
                     return false if session.query_key_bytes[node.key_start + offset] != key[offset]
                 return true
 
-        def ifq_clear_session_graph[@session](session: mutable IncrementalSemanticSession& @session) -> void can[Memory.Allocate]:
+        # The hash selects a collision chain only. Exact key bytes decide identity, and
+        # chain traversal is bounded so malformed/cyclic chains fail closed.
+        def ifq_query_for_key_impl[@session](session: mutable IncrementalSemanticSession[session]& @session, kind: IncrementalSemanticQueryKind, key: darray[u8]&) -> IncrementalSemanticQueryId:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                missing: IncrementalSemanticQueryId = IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
+                return missing if not session.enabled or not session.valid or session.query_graph_poisoned
+                key_hash: u64 = ifq_query_key_hash(kind, key)
+                if session.query_key_heads.get(key_hash) is head:
+                    cursor: IncrementalSemanticQueryId = head
+                    steps: mutable usize = 0
+                    while cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |cursor, steps, session, kind, key|:
+                        if cursor.value.usize() >= session.query_nodes.count:
+                            session.query_graph_poisoned <- true
+                            return missing
+                        steps <- steps + 1
+                        if steps > session.query_nodes.count:
+                            session.query_graph_poisoned <- true
+                            return missing
+                        if not ifq_query_key_span_is_valid(session, cursor):
+                            session.query_graph_poisoned <- true
+                            return missing
+                        return cursor if ifq_query_key_matches(session, cursor, kind, key)
+                        cursor <- session.query_nodes[cursor.value.usize()].next_same_hash
+                return missing if session.query_nodes.count >= INCREMENTAL_SEMANTIC_QUERY_NONE.usize()
+                return missing if not ifq_graph_within_limit(session, key.count, 0, 1, 0, 0, 0)
+                key_start: usize = session.query_key_bytes.count
+                previous_head: IncrementalSemanticQueryId = IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
+                if session.query_key_heads.get(key_hash) is head:
+                    previous_head <- head
+                session.query_key_bytes.reserve(key_start + key.count)
+                session.query_nodes.reserve(session.query_nodes.count + 1)
+                session.query_key_heads.reserve(session.query_key_heads.count + 1)
+                session.query_key_bytes.extend(key)
+                query_id: IncrementalSemanticQueryId = IncrementalSemanticQueryId{value: session.query_nodes.count.u32()}
+                session.query_nodes.push(IncrementalSemanticQueryNode{kind: kind, status: IncrementalSemanticQueryStatus.Dirty, next_same_hash: previous_head, first_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, first_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, last_invalidation_generation: 0, key_hash: key_hash, key_start: key_start, key_length: key.count, has_committed_value: false, input_start: 0, input_length: 0, result_start: 0, result_length: 0, input_fingerprint: 0, result_fingerprint: 0, result_generation: 0})
+                session.query_key_heads <- session.query_key_heads.put(key_hash, query_id) can Global{Read,Write}
+                return query_id
+
+        def incremental_semantic_query_for_key[@session](session: mutable IncrementalSemanticSession[session]& @session, kind: IncrementalSemanticQueryKind, key: darray[u8]&) -> IncrementalSemanticQueryHandle[session]:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast:
+                invalid: IncrementalSemanticQueryHandle[session] = ifq_query_handle_invalid()
+                return invalid if not session.enabled or not session.valid or session.query_graph_poisoned or session.query_request_generation == 0
+                query_id: IncrementalSemanticQueryId = ifq_query_for_key_impl(session, kind, key)
+                return invalid if query_id.value == INCREMENTAL_SEMANTIC_QUERY_NONE or session.query_graph_poisoned
+                return ifq_query_handle_for_id(session, query_id)
+
+        def ifq_query_value_span_is_valid[@r](session: IncrementalSemanticSession[r]& @r, start: usize, length: usize) -> bool:
+            can Abort.Panic:
+                return start <= session.query_value_bytes.count and length <= session.query_value_bytes.count - start
+
+        def ifq_query_value_equals[@r](session: IncrementalSemanticSession[r]& @r, start: usize, length: usize, bytes: darray[u8]&) -> bool:
+            can Abort.Panic:
+                return false if length != bytes.count or not ifq_query_value_span_is_valid(session, start, length)
+                for offset in 0..<length |session, start, bytes|:
+                    return false if session.query_value_bytes[start + offset] != bytes[offset]
+                return true
+
+        def ifq_query_result_copy[@r](session: IncrementalSemanticSession[r]& @r, node: IncrementalSemanticQueryNode) -> darray[u8]:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable darray[u8] = []
+                result.reserve(node.result_length)
+                for offset in 0..<node.result_length |session, node, result|:
+                    result.push(session.query_value_bytes[node.result_start + offset])
+                return result
+
+        def ifq_edge_links_are_valid[@r](session: IncrementalSemanticSession[r]& @r, edge_id: IncrementalSemanticDependencyEdgeId) -> bool:
+            can Abort.Panic:
+                return false if not ifq_edge_id_is_valid(session, edge_id)
+                edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_id.value.usize()]
+                return false if not ifq_query_id_is_valid(session, edge.depender) or not ifq_query_id_is_valid(session, edge.dependee)
+                if edge.previous_depender.value == INCREMENTAL_SEMANTIC_QUERY_NONE:
+                    return false if session.query_nodes[edge.dependee.value.usize()].first_depender.value != edge_id.value
+                else:
+                    return false if not ifq_edge_id_is_valid(session, edge.previous_depender)
+                    previous: IncrementalSemanticDependencyEdge = session.query_edges[edge.previous_depender.value.usize()]
+                    return false if previous.dependee.value != edge.dependee.value or previous.next_depender.value != edge_id.value
+                if edge.next_depender.value != INCREMENTAL_SEMANTIC_QUERY_NONE:
+                    return false if not ifq_edge_id_is_valid(session, edge.next_depender)
+                    next: IncrementalSemanticDependencyEdge = session.query_edges[edge.next_depender.value.usize()]
+                    return false if next.dependee.value != edge.dependee.value or next.previous_depender.value != edge_id.value
+                return true
+
+        def ifq_query_dependencies_check[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId, dependencies: darray[IncrementalSemanticQueryHandle[r]]&) -> IncrementalSemanticQueryDependencyCheck:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                check: mutable IncrementalSemanticQueryDependencyCheck = IncrementalSemanticQueryDependencyCheck{valid: true, structural: false, equal: true, results_current: true, all_dependencies_green: true, unique_count: 0, old_count: 0, dependency_ids: []}
+                return IncrementalSemanticQueryDependencyCheck{valid: false, structural: false, equal: false, results_current: false, all_dependencies_green: false, unique_count: 0, old_count: 0, dependency_ids: []} if dependencies.count > INCREMENTAL_SEMANTIC_QUERY_PER_DEPENDENCY_LIMIT
+                for index in 0..<dependencies.count |session, query_id, dependencies, check|:
+                    handle: IncrementalSemanticQueryHandle[r] = dependencies[index]
+                    if not ifq_query_handle_is_valid(session, handle):
+                        check.valid <- false
+                        return check
+                    dependency: IncrementalSemanticQueryId = handle.node
+                    if dependency.value == query_id.value:
+                        check.valid <- false
+                        return check
+                    duplicate: mutable bool = false
+                    for previous in 0..<check.dependency_ids.count |check, dependency|:
+                        duplicate <- true if check.dependency_ids[previous].value == dependency.value
+                    continue if duplicate
+                    dependency_node: IncrementalSemanticQueryNode = session.query_nodes[dependency.value.usize()]
+                    if not dependency_node.has_committed_value:
+                        check.valid <- false
+                        return check
+                    check.all_dependencies_green <- false if dependency_node.status != IncrementalSemanticQueryStatus.Green
+                    if not ifq_query_value_span_is_valid(session, dependency_node.input_start, dependency_node.input_length) or not ifq_query_value_span_is_valid(session, dependency_node.result_start, dependency_node.result_length):
+                        check.valid <- false
+                        check.structural <- true
+                        return check
+                    if not ifq_incoming_head_is_valid(session, dependency):
+                        check.valid <- false
+                        check.structural <- true
+                        return check
+                    check.dependency_ids.push(dependency)
+                    check.unique_count <- check.unique_count + 1
+
+                old_ids: mutable darray[IncrementalSemanticQueryId] = []
+                edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[query_id.value.usize()].first_dependency
+                steps: mutable usize = 0
+                while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |session, query_id, edge_cursor, steps, old_ids, check|:
+                    if not ifq_edge_links_are_valid(session, edge_cursor):
+                        check.valid <- false
+                        check.structural <- true
+                        return check
+                    edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
+                    if edge.depender.value != query_id.value or edge.dependee.value == query_id.value:
+                        check.valid <- false
+                        check.structural <- true
+                        return check
+                    duplicate_old: mutable bool = false
+                    for previous in 0..<old_ids.count |old_ids, edge|:
+                        duplicate_old <- true if old_ids[previous].value == edge.dependee.value
+                    if duplicate_old:
+                        check.valid <- false
+                        check.structural <- true
+                        return check
+                    old_ids.push(edge.dependee)
+                    found: mutable bool = false
+                    for candidate in 0..<check.dependency_ids.count |check, edge, found|:
+                        if check.dependency_ids[candidate].value == edge.dependee.value:
+                            found <- true
+                            dependency_node: IncrementalSemanticQueryNode = session.query_nodes[edge.dependee.value.usize()]
+                            check.results_current <- false if edge.observed_result_generation != dependency_node.result_generation
+                    check.equal <- false if not found
+                    check.old_count <- check.old_count + 1
+                    steps <- steps + 1
+                    if steps > session.query_edges.count:
+                        check.valid <- false
+                        check.structural <- true
+                        return check
+                    edge_cursor <- edge.next_dependency
+                check.equal <- false if check.old_count != check.unique_count
+                return check
+
+        def ifq_incoming_head_is_valid[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId) -> bool:
+            can Abort.Panic:
+                return false if not ifq_query_id_is_valid(session, query_id)
+                head: IncrementalSemanticDependencyEdgeId = session.query_nodes[query_id.value.usize()].first_depender
+                return true if head.value == INCREMENTAL_SEMANTIC_QUERY_NONE
+                return false if not ifq_edge_links_are_valid(session, head)
+                edge: IncrementalSemanticDependencyEdge = session.query_edges[head.value.usize()]
+                return edge.dependee.value == query_id.value and edge.previous_depender.value == INCREMENTAL_SEMANTIC_QUERY_NONE
+
+        def ifq_query_incoming_chain_is_valid[@r](session: IncrementalSemanticSession[r]& @r, query_id: IncrementalSemanticQueryId) -> bool:
+            can Abort.Panic:
+                return false if not ifq_query_id_is_valid(session, query_id)
+                edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[query_id.value.usize()].first_depender
+                steps: mutable usize = 0
+                while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |session, query_id, edge_cursor, steps|:
+                    return false if not ifq_edge_links_are_valid(session, edge_cursor)
+                    edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
+                    return false if edge.dependee.value != query_id.value
+                    steps <- steps + 1
+                    return false if steps > session.query_edges.count
+                    edge_cursor <- edge.next_depender
+                return true
+
+        def ifq_query_walk_path[@session](session: mutable IncrementalSemanticSession[session]& @session, start: IncrementalSemanticQueryId, target: IncrementalSemanticQueryId) -> IncrementalSemanticQueryWalkResult:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable IncrementalSemanticQueryWalkResult = IncrementalSemanticQueryWalkResult{valid: true, budget_ok: true, reaches_target: false}
+                return IncrementalSemanticQueryWalkResult{valid: false, budget_ok: true, reaches_target: false} if not ifq_query_id_is_valid(session, start) or not ifq_query_id_is_valid(session, target)
+                return IncrementalSemanticQueryWalkResult{valid: true, budget_ok: true, reaches_target: true} if start.value == target.value
+                session.query_invalidation_worklist.truncate(0)
+                if session.query_invalidation_generation == 18446744073709551615:
+                    for index in 0..<session.query_nodes.count |session|:
+                        session.query_nodes[index].last_invalidation_generation <- 0
+                    session.query_invalidation_generation <- 0
+                session.query_invalidation_generation <- session.query_invalidation_generation + 1
+                generation: u64 = session.query_invalidation_generation
+                if not ifq_invalidation_worklist_push(session, start):
+                    result.budget_ok <- false
+                    session.query_invalidation_worklist.truncate(0)
+                    return result
+                session.query_nodes[start.value.usize()].last_invalidation_generation <- generation
+                cursor: mutable usize = 0
+                while cursor < session.query_invalidation_worklist.count |session, cursor, result|:
+                    current: IncrementalSemanticQueryId = session.query_invalidation_worklist[cursor]
+                    cursor <- cursor + 1
+                    edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[current.value.usize()].first_dependency
+                    steps: mutable usize = 0
+                    while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |edge_cursor, steps, session, current, target, result|:
+                        if not ifq_edge_links_are_valid(session, edge_cursor):
+                            result.valid <- false
+                            session.query_invalidation_worklist.truncate(0)
+                            return result
+                        edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
+                        if edge.depender.value != current.value:
+                            result.valid <- false
+                            session.query_invalidation_worklist.truncate(0)
+                            return result
+                        dependency: IncrementalSemanticQueryId = edge.dependee
+                        if dependency.value == target.value:
+                            result.reaches_target <- true
+                            session.query_invalidation_worklist.truncate(0)
+                            return result
+                        if session.query_nodes[dependency.value.usize()].last_invalidation_generation != generation:
+                            if not ifq_invalidation_worklist_push(session, dependency):
+                                result.budget_ok <- false
+                                session.query_invalidation_worklist.truncate(0)
+                                return result
+                            session.query_nodes[dependency.value.usize()].last_invalidation_generation <- generation
+                        steps <- steps + 1
+                        if steps > session.query_edges.count:
+                            result.valid <- false
+                            session.query_invalidation_worklist.truncate(0)
+                            return result
+                        edge_cursor <- edge.next_dependency
+                session.query_invalidation_worklist.truncate(0)
+                return result
+
+        # Mark the reverse closure PotentiallyDirty only after the whole closure and
+        # its links have been checked. A later query can become Green without walking
+        # its body when its direct dependencies stabilize at the same result generations.
+        def ifq_mark_reverse_closure[@session](session: mutable IncrementalSemanticSession[session]& @session, root: IncrementalSemanticQueryId, root_status: IncrementalSemanticQueryStatus) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                walk: IncrementalSemanticQueryWalkResult = IncrementalSemanticQueryWalkResult{valid: true, budget_ok: true, reaches_target: false}
+                if not ifq_query_id_is_valid(session, root):
+                    session.query_graph_poisoned <- true
+                    return false
+                session.query_invalidation_worklist.truncate(0)
+                if session.query_invalidation_generation == 18446744073709551615:
+                    for index in 0..<session.query_nodes.count |session|:
+                        session.query_nodes[index].last_invalidation_generation <- 0
+                    session.query_invalidation_generation <- 0
+                session.query_invalidation_generation <- session.query_invalidation_generation + 1
+                generation: u64 = session.query_invalidation_generation
+                if not ifq_invalidation_worklist_push(session, root):
+                    session.query_invalidation_worklist.truncate(0)
+                    session.query_graph_poisoned <- true
+                    return false
+                session.query_nodes[root.value.usize()].last_invalidation_generation <- generation
+                cursor: mutable usize = 0
+                while cursor < session.query_invalidation_worklist.count |session, cursor, walk|:
+                    current: IncrementalSemanticQueryId = session.query_invalidation_worklist[cursor]
+                    cursor <- cursor + 1
+                    edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[current.value.usize()].first_depender
+                    steps: mutable usize = 0
+                    while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |session, edge_cursor, current, steps, walk|:
+                        if not ifq_edge_links_are_valid(session, edge_cursor):
+                            walk.valid <- false
+                            break
+                        edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
+                        if edge.dependee.value != current.value:
+                            walk.valid <- false
+                            break
+                        dependent: IncrementalSemanticQueryId = edge.depender
+                        if session.query_nodes[dependent.value.usize()].last_invalidation_generation != generation:
+                            if not ifq_invalidation_worklist_push(session, dependent):
+                                walk.budget_ok <- false
+                                break
+                            session.query_nodes[dependent.value.usize()].last_invalidation_generation <- generation
+                        steps <- steps + 1
+                        if steps > session.query_edges.count:
+                            walk.valid <- false
+                            break
+                        edge_cursor <- edge.next_depender
+                    if not walk.valid or not walk.budget_ok:
+                        break
+                if not walk.valid or not walk.budget_ok:
+                    session.query_invalidation_worklist.truncate(0)
+                    session.query_graph_poisoned <- true
+                    return false
+                for index in 0..<session.query_invalidation_worklist.count |session, root, root_status|:
+                    query_id: IncrementalSemanticQueryId = session.query_invalidation_worklist[index]
+                    if query_id.value == root.value:
+                        if root_status != IncrementalSemanticQueryStatus.PotentiallyDirty or session.query_nodes[query_id.value.usize()].status != IncrementalSemanticQueryStatus.Dirty:
+                            session.query_nodes[query_id.value.usize()].status <- root_status
+                    elif session.query_nodes[query_id.value.usize()].status != IncrementalSemanticQueryStatus.Dirty:
+                        session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.PotentiallyDirty
+                session.query_invalidation_worklist.truncate(0)
+                return true
+
+        def ifq_query_mark_stale[@session](session: mutable IncrementalSemanticSession[session]& @session, query_id: IncrementalSemanticQueryId) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return ifq_mark_reverse_closure(session, query_id, IncrementalSemanticQueryStatus.Dirty)
+
+        def ifq_query_mark_potentially_stale[@session](session: mutable IncrementalSemanticSession[session]& @session, query_id: IncrementalSemanticQueryId) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return ifq_mark_reverse_closure(session, query_id, IncrementalSemanticQueryStatus.PotentiallyDirty)
+
+        def ifq_query_evaluate[@session](session: mutable IncrementalSemanticSession[session]& @session, handle: IncrementalSemanticQueryHandle[session], input: darray[u8]&, dependencies: darray[IncrementalSemanticQueryHandle[session]]&) -> IncrementalSemanticQueryEvaluation:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                miss: IncrementalSemanticQueryEvaluation = IncrementalSemanticQueryEvaluation{hit: false, canonical_result: []}
+                return miss if not ifq_query_handle_is_valid(session, handle)
+                query_id: IncrementalSemanticQueryId = handle.node
+                node: IncrementalSemanticQueryNode = session.query_nodes[query_id.value.usize()]
+                if node.has_committed_value and (not ifq_query_value_span_is_valid(session, node.input_start, node.input_length) or not ifq_query_value_span_is_valid(session, node.result_start, node.result_length)):
+                    session.query_graph_poisoned <- true
+                    return miss
+                check: IncrementalSemanticQueryDependencyCheck = ifq_query_dependencies_check(session, query_id, dependencies)
+                if not check.valid:
+                    if check.structural:
+                        session.query_graph_poisoned <- true
+                    else:
+                        _ = ifq_query_mark_stale(session, query_id)
+                    return miss
+                same_input: bool = node.has_committed_value and node.input_fingerprint == ifq_query_value_hash(input) and ifq_query_value_equals(session, node.input_start, node.input_length, input)
+                if not check.all_dependencies_green:
+                    _ = ifq_query_mark_potentially_stale(session, query_id)
+                    return miss
+                if not node.has_committed_value:
+                    return miss
+                if not same_input or not check.equal or not check.results_current:
+                    _ = ifq_query_mark_stale(session, query_id)
+                    return miss
+                return miss if node.status == IncrementalSemanticQueryStatus.Dirty
+                session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Green if node.status == IncrementalSemanticQueryStatus.PotentiallyDirty
+                result: darray[u8] = ifq_query_result_copy(session, node)
+                return IncrementalSemanticQueryEvaluation{hit: true, canonical_result: result}
+
+        def ifq_free_query_edges_valid_for_replacement[@r](session: IncrementalSemanticSession[r]& @r, unique_count: usize, old_count: usize) -> bool:
+            can Abort.Panic:
+                selected_existing: usize = unique_count - old_count if unique_count > old_count else 0
+                selected_existing <- session.free_query_edges.count if selected_existing > session.free_query_edges.count
+                return false if session.free_query_edges.count > session.query_edges.count
+                for relative in 0..<selected_existing |session, relative, old_count|:
+                    free_index: usize = session.free_query_edges.count - 1 - relative
+                    edge_id: IncrementalSemanticDependencyEdgeId = session.free_query_edges[free_index]
+                    return false if edge_id.value == INCREMENTAL_SEMANTIC_QUERY_NONE or edge_id.value.usize() >= session.query_edges.count
+                    edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_id.value.usize()]
+                    return false if edge.depender.value != INCREMENTAL_SEMANTIC_QUERY_NONE or edge.dependee.value != INCREMENTAL_SEMANTIC_QUERY_NONE
+                    for previous in 0..<relative |session, free_index, edge_id|:
+                        previous_id: IncrementalSemanticDependencyEdgeId = session.free_query_edges[session.free_query_edges.count - 1 - previous]
+                        return false if previous_id.value == edge_id.value
+                return true
+
+        def ifq_apply_dependency_set[@session](session: mutable IncrementalSemanticSession[session]& @session, depender: IncrementalSemanticQueryId, dependencies: darray[IncrementalSemanticQueryId]&) -> void:
+            can Abort.Panic:
+                edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[depender.value.usize()].first_dependency
+                while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |session, depender, edge_cursor|:
+                    edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
+                    next_edge: IncrementalSemanticDependencyEdgeId = edge.next_dependency
+                    if edge.previous_depender.value == INCREMENTAL_SEMANTIC_QUERY_NONE:
+                        session.query_nodes[edge.dependee.value.usize()].first_depender <- edge.next_depender
+                    else:
+                        session.query_edges[edge.previous_depender.value.usize()].next_depender <- edge.next_depender
+                    if edge.next_depender.value != INCREMENTAL_SEMANTIC_QUERY_NONE:
+                        session.query_edges[edge.next_depender.value.usize()].previous_depender <- edge.previous_depender
+                    session.query_edges[edge_cursor.value.usize()] <- IncrementalSemanticDependencyEdge{depender: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, dependee: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, previous_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, observed_result_generation: 0}
+                    session.free_query_edges.push(edge_cursor)
+                    edge_cursor <- next_edge
+                session.query_nodes[depender.value.usize()].first_dependency <- IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}
+                for index in 0..<dependencies.count |session, depender, dependencies|:
+                    dependency: IncrementalSemanticQueryId = dependencies[index]
+                    duplicate: mutable bool = false
+                    for previous in 0..<index |duplicate, dependency, dependencies|:
+                        duplicate <- true if dependencies[previous].value == dependency.value
+                    continue if duplicate
+                    edge_id: IncrementalSemanticDependencyEdgeId
+                    if session.free_query_edges.count > 0:
+                        edge_id <- session.free_query_edges.pop()
+                    else:
+                        edge_id <- IncrementalSemanticDependencyEdgeId{value: session.query_edges.count.u32()}
+                        session.query_edges.push(IncrementalSemanticDependencyEdge{depender: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, dependee: IncrementalSemanticQueryId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_dependency: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, previous_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, observed_result_generation: 0})
+                    outgoing_head: IncrementalSemanticDependencyEdgeId = session.query_nodes[depender.value.usize()].first_dependency
+                    incoming_head: IncrementalSemanticDependencyEdgeId = session.query_nodes[dependency.value.usize()].first_depender
+                    session.query_edges[edge_id.value.usize()] <- IncrementalSemanticDependencyEdge{depender: depender, dependee: dependency, next_dependency: outgoing_head, previous_depender: IncrementalSemanticDependencyEdgeId{value: INCREMENTAL_SEMANTIC_QUERY_NONE}, next_depender: incoming_head, observed_result_generation: session.query_nodes[dependency.value.usize()].result_generation}
+                    if incoming_head.value != INCREMENTAL_SEMANTIC_QUERY_NONE:
+                        session.query_edges[incoming_head.value.usize()].previous_depender <- edge_id
+                    session.query_nodes[depender.value.usize()].first_dependency <- edge_id
+                    session.query_nodes[dependency.value.usize()].first_depender <- edge_id
+
+        def ifq_query_commit[@session](session: mutable IncrementalSemanticSession[session]& @session, handle: IncrementalSemanticQueryHandle[session], input: darray[u8]&, dependencies: darray[IncrementalSemanticQueryHandle[session]]&, canonical_result: darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                return false if not ifq_query_handle_is_valid(session, handle)
+                query_id: IncrementalSemanticQueryId = handle.node
+                node: IncrementalSemanticQueryNode = session.query_nodes[query_id.value.usize()]
+                check: IncrementalSemanticQueryDependencyCheck = ifq_query_dependencies_check(session, query_id, dependencies)
+                if not check.valid:
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    session.query_graph_poisoned <- true if check.structural
+                    return false
+                dependency_update_required: bool = not check.equal or not check.results_current
+                if dependency_update_required and not check.equal:
+                    for index in 0..<check.unique_count |session, check, query_id|:
+                        walk: IncrementalSemanticQueryWalkResult = ifq_query_walk_path(session, check.dependency_ids[index], query_id)
+                        if not walk.valid:
+                            session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                            session.query_graph_poisoned <- true
+                            return false
+                        if not walk.budget_ok or walk.reaches_target:
+                            session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                            return false
+                if node.has_committed_value and (not ifq_query_value_span_is_valid(session, node.input_start, node.input_length) or not ifq_query_value_span_is_valid(session, node.result_start, node.result_length)):
+                    session.query_graph_poisoned <- true
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                result_changed: bool = not node.has_committed_value
+                candidate_result_fingerprint: u64 = ifq_query_value_hash(canonical_result)
+                if node.has_committed_value:
+                    result_changed <- true if node.result_fingerprint != candidate_result_fingerprint
+                    result_changed <- true if node.result_fingerprint == candidate_result_fingerprint and not ifq_query_value_equals(session, node.result_start, node.result_length, canonical_result)
+                if result_changed and node.result_generation == 18446744073709551615:
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                if result_changed and not ifq_query_incoming_chain_is_valid(session, query_id):
+                    session.query_graph_poisoned <- true
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                if dependency_update_required and not ifq_free_query_edges_valid_for_replacement(session, check.unique_count, check.old_count):
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    session.query_graph_poisoned <- true
+                    return false
+                additional_value_bytes: usize = session.query_value_bytes.count
+                if additional_value_bytes > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT:
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                if input.count > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT - additional_value_bytes:
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                additional_value_bytes <- additional_value_bytes + input.count
+                if canonical_result.count > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT - additional_value_bytes:
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                new_value_bytes: usize = input.count + canonical_result.count
+                append_edges: usize = check.unique_count - (session.free_query_edges.count + check.old_count) if check.unique_count > session.free_query_edges.count + check.old_count else 0
+                extra_free_edges: usize = check.old_count if dependency_update_required else 0
+                extra_edges: usize = append_edges if dependency_update_required else 0
+                if not ifq_graph_within_limit(session, 0, new_value_bytes, 0, extra_edges, extra_free_edges, 0):
+                    session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                    return false
+                session.query_value_bytes.reserve(session.query_value_bytes.count + new_value_bytes)
+                if dependency_update_required:
+                    session.query_edges.reserve(session.query_edges.count + append_edges)
+                    session.free_query_edges.reserve(session.free_query_edges.count + check.old_count)
+                    ifq_apply_dependency_set(session, query_id, check.dependency_ids)
+                input_start: usize = session.query_value_bytes.count
+                session.query_value_bytes.extend(input)
+                result_start: usize = session.query_value_bytes.count
+                session.query_value_bytes.extend(canonical_result)
+                session.query_nodes[query_id.value.usize()].has_committed_value <- true
+                session.query_nodes[query_id.value.usize()].input_start <- input_start
+                session.query_nodes[query_id.value.usize()].input_length <- input.count
+                session.query_nodes[query_id.value.usize()].result_start <- result_start
+                session.query_nodes[query_id.value.usize()].result_length <- canonical_result.count
+                session.query_nodes[query_id.value.usize()].input_fingerprint <- ifq_query_value_hash(input)
+                session.query_nodes[query_id.value.usize()].result_fingerprint <- candidate_result_fingerprint
+                session.query_nodes[query_id.value.usize()].result_generation <- session.query_nodes[query_id.value.usize()].result_generation + 1 if result_changed
+                session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Green
+                if result_changed:
+                    edge_cursor: IncrementalSemanticDependencyEdgeId = session.query_nodes[query_id.value.usize()].first_depender
+                    while edge_cursor.value != INCREMENTAL_SEMANTIC_QUERY_NONE |session, query_id, edge_cursor|:
+                        edge: IncrementalSemanticDependencyEdge = session.query_edges[edge_cursor.value.usize()]
+                        session.query_nodes[edge.depender.value.usize()].status <- IncrementalSemanticQueryStatus.Dirty
+                        edge_cursor <- edge.next_depender
+                return true
+
+        def ifq_clear_session_graph[@session](session: mutable IncrementalSemanticSession[session]& @session) -> void can[Memory.Allocate]:
             session.query_key_bytes.truncate(0)
-            session.query_key_heads <- {}
+            session.query_key_heads.clear()
             session.query_nodes.truncate(0)
             session.query_edges.truncate(0)
             session.free_query_edges.truncate(0)
+            session.query_value_bytes.truncate(0)
+            session.query_request_generation <- 0
+            session.query_invalidation_generation <- 0
+            session.query_invalidation_worklist.truncate(0)
+            if session.query_graph_generation == 18446744073709551615:
+                session.query_graph_generation <- 0
+                session.query_graph_poisoned <- true
+            else:
+                session.query_graph_generation <- session.query_graph_generation + 1
+                session.query_graph_poisoned <- false
 
-        def ifc_session_clear_prior[@session](session: mutable IncrementalSemanticSession& @session) -> void:
+        def ifc_session_clear_prior[@session](session: mutable IncrementalSemanticSession[session]& @session) -> void:
             can Memory.Allocate:
                 session.valid <- false
                 session.analyzed_source.truncate(0)
@@ -1495,20 +1999,19 @@ extend Semantic:
                 session.snapshot.declaration_surface_length <- 0
                 session.snapshot.declaration_surface_hash <- 0
                 session.snapshot.functions.truncate(0)
-                session.snapshot.current_anchors.truncate(0)
                 session.snapshot.direct_facts.truncate(0)
                 session.snapshot.active_grants.truncate(0)
                 session.snapshot.self_assignment_ranges.truncate(0)
                 session.snapshot.self_assignment_facts.truncate(0)
-                session.snapshot.current_self_assignment_anchors.truncate(0)
                 session.snapshot.bodies_visited <- 0
                 session.snapshot.bodies_matched <- 0
                 session.snapshot.bodies_rejected <- 0
                 session.snapshot.self_assignment_bodies_scanned <- 0
                 session.snapshot.self_assignment_bodies_reused <- 0
+                session.snapshot.declaration_surface_valid <- false
                 session.snapshot.surface_compatible <- false
 
-        def ifc_session_source_matches[@session](session: IncrementalSemanticSession& @session, source: u8&, source_length: usize) -> bool:
+        def ifc_session_source_matches[@session](session: IncrementalSemanticSession[session]& @session, source: u8&, source_length: usize) -> bool:
             can Abort.Panic, Unsafe.PointerArithmetic:
                 return false if source_length != session.analyzed_source.count
                 for index in 0..<source_length |session, source|:
@@ -1524,10 +2027,9 @@ extend Semantic:
                     return false if stored[index] != current[index]
                 return true
 
-        # The session is the sole owner of these arrays. Return a deep copy for the
-        # caller so rebinding anchors or checker updates cannot mutate trusted prior facts.
-        # Source anchors and collection counters are invocation-local and are rebuilt.
-        def ifc_clone_session_snapshot(source: IncrementalSemanticSnapshot&) -> IncrementalSemanticSnapshot:
+        # Copy from the session-owned region into a fresh request snapshot. Rebinding
+        # anchors and checker updates then cannot mutate trusted retained facts.
+        def ifc_clone_session_snapshot[@r](source: IncrementalSemanticSessionSnapshot[r]& @r) -> IncrementalSemanticSnapshot:
             can Memory.Allocate, Abort.Panic:
                 cloned: mutable IncrementalSemanticSnapshot = incremental_empty_snapshot()
                 cloned.schema_version <- source.schema_version
@@ -1538,6 +2040,7 @@ extend Semantic:
                 cloned.declaration_surface_start <- source.declaration_surface_start
                 cloned.declaration_surface_length <- source.declaration_surface_length
                 cloned.declaration_surface_hash <- source.declaration_surface_hash
+                cloned.declaration_surface_valid <- source.declaration_surface_valid
                 cloned.options_key.reserve(source.options_key.count)
                 cloned.options_key.extend(source.options_key)
                 cloned.bytes.reserve(source.bytes.count)
@@ -1559,10 +2062,9 @@ extend Semantic:
                     cloned.self_assignment_facts.push(fact)
                 return cloned
 
-        # Copy portable prior facts into the destination's region. Unlike the invocation
-        # clone above, this must never inherit the request region of `source`: the destination
-        # belongs to the longer-lived semantic session and survives the current parse.
-        def ifc_clone_session_snapshot_into[@session](source: IncrementalSemanticSnapshot&, destination: mutable IncrementalSemanticSnapshot& @session) -> void:
+        # Copy portable facts into storage whose element buffers are statically tied to the
+        # session region. No request-local source anchors or sview names enter durable state.
+        def ifc_clone_session_snapshot_into[@session](source: IncrementalSemanticSnapshot&, destination: mutable IncrementalSemanticSessionSnapshot[session]& @session) -> void:
             can Memory.Allocate, Abort.Panic:
                 destination.schema_version <- source.schema_version
                 destination.semantic_fingerprint <- source.semantic_fingerprint
@@ -1572,6 +2074,7 @@ extend Semantic:
                 destination.declaration_surface_start <- source.declaration_surface_start
                 destination.declaration_surface_length <- source.declaration_surface_length
                 destination.declaration_surface_hash <- source.declaration_surface_hash
+                destination.declaration_surface_valid <- source.declaration_surface_valid
                 destination.options_key.truncate(0)
                 destination.options_key.reserve(source.options_key.count)
                 destination.options_key.extend(source.options_key)
@@ -1582,7 +2085,6 @@ extend Semantic:
                 destination.functions.reserve(source.functions.count)
                 for record in source.functions |destination|:
                     destination.functions.push(record)
-                destination.current_anchors.truncate(0)
                 destination.direct_facts.truncate(0)
                 destination.direct_facts.reserve(source.direct_facts.count)
                 for fact in source.direct_facts |destination|:
@@ -1599,7 +2101,6 @@ extend Semantic:
                 destination.self_assignment_facts.reserve(source.self_assignment_facts.count)
                 for fact in source.self_assignment_facts |destination|:
                     destination.self_assignment_facts.push(fact)
-                destination.current_self_assignment_anchors.truncate(0)
                 destination.bodies_visited <- 0
                 destination.bodies_matched <- 0
                 destination.bodies_rejected <- 0
@@ -1607,15 +2108,11 @@ extend Semantic:
                 destination.self_assignment_bodies_reused <- 0
                 destination.surface_compatible <- source.surface_compatible
 
-        def ifc_session_store[@session](session: mutable IncrementalSemanticSession& @session, source: u8&, source_length: usize, identity_key: darray[u8]&, options_key: darray[u8]&, generated_input: bool, semantic_fingerprint: u64, snapshot: IncrementalSemanticSnapshot&) -> bool:
+        def ifc_session_store[@session](session: mutable IncrementalSemanticSession[session]& @session, source: u8&, source_length: usize, identity_key: darray[u8]&, options_key: darray[u8]&, generated_input: bool, semantic_fingerprint: u64, snapshot: IncrementalSemanticSnapshot&) -> bool:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerArithmetic:
                 if not session.enabled:
                     incremental_semantic_session_reset(session)
                     return false
-                # Advancing the source snapshot must keep the session-owned query graph:
-                # stable query keys and edge IDs are what make cross-edit invalidation
-                # possible once semantic callers start recording dependencies.
-                ifc_session_clear_prior(session)
                 encoded_size: IncrementalSnapshotSizeResult = incremental_snapshot_encoded_size(snapshot)
                 return false if not encoded_size.valid
                 size: usize = source_length
@@ -1628,9 +2125,20 @@ extend Semantic:
                 return false if linter_extra > (INCREMENTAL_SNAPSHOT_CODEC_LIMIT - size).u64()
                 size <- size + linter_extra.usize()
                 return false if encoded_size.byte_count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT - size
+                # Reserve every retained destination before invalidating the prior
+                # snapshot. A rejected size leaves the prior snapshot authoritative;
+                # its query graph is poisoned by the caller until another commit.
                 session.analyzed_source.reserve(source_length)
                 session.identity_key.reserve(identity_key.count)
                 session.options_key.reserve(options_key.count)
+                session.snapshot.options_key.reserve(options_key.count)
+                session.snapshot.bytes.reserve(snapshot.bytes.count)
+                session.snapshot.functions.reserve(snapshot.functions.count)
+                session.snapshot.direct_facts.reserve(snapshot.direct_facts.count)
+                session.snapshot.active_grants.reserve(snapshot.active_grants.count)
+                session.snapshot.self_assignment_ranges.reserve(snapshot.self_assignment_ranges.count)
+                session.snapshot.self_assignment_facts.reserve(snapshot.self_assignment_facts.count)
+                ifc_session_clear_prior(session)
                 for index in 0..<source_length |session, source|:
                     current_byte: u8& = source + index
                     current_value: u8 = current_byte
@@ -1644,6 +2152,13 @@ extend Semantic:
                 ifc_clone_session_snapshot_into(snapshot, &session.snapshot)
                 session.generated_input <- generated_input
                 session.semantic_fingerprint <- semantic_fingerprint
+                if session.query_graph_poisoned:
+                    ifq_clear_session_graph(session)
+                if session.query_context_generation == 18446744073709551615:
+                    session.query_context_generation <- 0
+                    session.query_graph_poisoned <- true
+                else:
+                    session.query_context_generation <- session.query_context_generation + 1
                 session.valid <- true
                 return true
 
@@ -1651,7 +2166,7 @@ extend Semantic:
         # This is the only API that can advance trusted process-local provenance. The prior
         # snapshot is private and reaches allow_session_reuse only after its exact context
         # has matched. Sidecar snapshots continue through the rescan-only API.
-        def incremental_collect_function_facts_with_session[@session](file: Ast::File&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, options_key: darray[u8]&, identity_key: darray[u8]&, generated_input: bool, session: mutable IncrementalSemanticSession& @session) -> IncrementalSessionCollectionResult:
+        def incremental_collect_function_facts_with_session[@session](file: Ast::File&, source: u8&, source_length: usize, tokens: darray[Lexer::Token]&, source_path: sview, semantic_fingerprint: u64, options_fingerprint: u64, options_key: darray[u8]&, identity_key: darray[u8]&, generated_input: bool, session: mutable IncrementalSemanticSession[session]& @session) -> IncrementalSessionCollectionResult:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerArithmetic:
                 empty: IncrementalSessionCollectionResult = IncrementalSessionCollectionResult{snapshot: incremental_empty_snapshot(), prior_valid: false, exact_hit: false, body_facts_reused: false}
                 return empty if not session.enabled
@@ -1665,20 +2180,23 @@ extend Semantic:
                 if not context_matches:
                     incremental_semantic_session_reset(session)
                 else:
+                    prior: mutable IncrementalSemanticSnapshot = ifc_clone_session_snapshot(session.snapshot)
                     if ifc_session_source_matches(session, source, source_length):
-                        current: mutable IncrementalSemanticSnapshot = ifc_clone_session_snapshot(session.snapshot)
+                        current: mutable IncrementalSemanticSnapshot = prior
                         if ifc_equal_view(current.bytes, current.source_path_start, current.source_path_length, source_path) and incremental_reanchor_exact_snapshot(file, tokens, source, source_length, &current):
                             return IncrementalSessionCollectionResult{snapshot: current, prior_valid: true, exact_hit: true, body_facts_reused: false}
                     else:
-                        current: mutable IncrementalSemanticSnapshot = ifc_collect_function_facts(file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, session.snapshot, true, true)
+                        current: mutable IncrementalSemanticSnapshot = ifc_collect_function_facts(file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, prior, true, true)
                         reused: bool = current.bodies_matched > 0 and current.bodies_visited < current.functions.count
                         stored: bool = ifc_session_store(session, source, source_length, identity_key, options_key, generated_input, semantic_fingerprint, current)
                         if not stored:
+                            session.query_graph_poisoned <- true
                             ifc_self_assignment_forget(&current)
                         return IncrementalSessionCollectionResult{snapshot: current, prior_valid: true, exact_hit: false, body_facts_reused: reused}
                     incremental_semantic_session_reset(session)
                 cold: IncrementalSemanticSnapshot = ifc_collect_function_facts(file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, empty.snapshot, false, true)
                 stored: bool = ifc_session_store(session, source, source_length, identity_key, options_key, generated_input, semantic_fingerprint, cold)
                 if not stored:
+                    session.query_graph_poisoned <- true
                     ifc_self_assignment_forget(&cold)
                 return IncrementalSessionCollectionResult{snapshot: cold, prior_valid: false, exact_hit: false, body_facts_reused: false}
