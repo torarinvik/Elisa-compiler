@@ -48,8 +48,14 @@ python3 test/bench/incremental_semantic_session/paired.py \
   --pairs 5 --functions 128 --body-edits 3
 ```
 
-The runner checks exact Stage1 provenance before and after the run, holds the shared compiler-benchmark lock,
-and uses the same load gate as the other paired benchmarks. It alternates
+By default, the runner checks exact Stage1 provenance before and after the run,
+holds the shared compiler-benchmark lock, and uses the same load gate as the
+other paired benchmarks. Pass `--concurrent-instruction-counts` to skip that
+lock and load gate when several compiler agents need to measure at once. That
+mode still compares exact Stage1 process instruction counts and runs the same
+status/diagnostic checks; its host qualification stays false, and wall-time and
+cycle measurements are exploratory because concurrent work affects them. Each
+invocation needs its own empty `--output` directory. The runner alternates
 graph-off/graph-on order across pairs. Each mode starts a fresh persistent
 semantic host and uses the same absolute source path within a workload; each
 workload uses a separate path. The sequence includes a

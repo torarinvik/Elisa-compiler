@@ -569,6 +569,11 @@ def main() -> int:
     parser.add_argument("--functions", type=int, default=128)
     parser.add_argument("--body-edits", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=120)
+    parser.add_argument(
+        "--concurrent-instruction-counts",
+        action="store_true",
+        help="skip the host lock/load gate; use process counters while treating wall time as unqualified",
+    )
     args = parser.parse_args()
     if args.pairs < 1 or args.functions < 4 or args.body_edits < 1 or args.timeout_seconds <= 0:
         parser.error("pairs/body-edits/timeout must be positive and functions must be at least 4")
@@ -597,12 +602,14 @@ def main() -> int:
         parser.error("this exploratory paired runner is macOS-only; use the qualified cross-language runner on Linux")
 
     host_lock_path = Path(os.environ.get("ELISA_BENCH_LOCK_PATH") or "/tmp/elisa-cross-language-benchmark.lock")
-    host_lock_fd = os.open(host_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(host_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(host_lock_fd)
-        parser.error(f"another compiler benchmark holds the host lock at {host_lock_path}")
+    host_lock_fd: int | None = None
+    if not args.concurrent_instruction_counts:
+        host_lock_fd = os.open(host_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(host_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(host_lock_fd)
+            parser.error(f"another compiler benchmark holds the host lock at {host_lock_path}")
 
     if not stage1.is_file():
         parser.error(f"Stage1 product does not exist: {stage1}")
@@ -619,7 +626,11 @@ def main() -> int:
                 "system": system,
                 "machine": platform.machine(),
                 "qualified": False,
-                "reason": "retained semantic graph paired timings are exploratory",
+                "reason": (
+                    "concurrent instruction-count mode; wall-time comparisons are unqualified"
+                    if args.concurrent_instruction_counts
+                    else "retained semantic graph paired timings are exploratory"
+                ),
             },
             indent=2,
             sort_keys=True,
@@ -627,12 +638,15 @@ def main() -> int:
         + "\n",
         encoding="utf-8",
     )
-    try:
-        check_load_gate(load_average(), "before retained-session graph benchmark", output, system, host_qualification, preflight=True)
-        print("Waiting for the load gate to hold for 60 seconds before paired samples.", flush=True)
-        wait_for_sustained_load_gate(output, system, host_qualification, stage="before first retained-session pair")
-    except LoadGateError as error:
-        raise SystemExit(str(error)) from error
+    if args.concurrent_instruction_counts:
+        print("Concurrent instruction-count mode: host load and wall time are unqualified.", flush=True)
+    else:
+        try:
+            check_load_gate(load_average(), "before retained-session graph benchmark", output, system, host_qualification, preflight=True)
+            print("Waiting for the load gate to hold for 60 seconds before paired samples.", flush=True)
+            wait_for_sustained_load_gate(output, system, host_qualification, stage="before first retained-session pair")
+        except LoadGateError as error:
+            raise SystemExit(str(error)) from error
 
     pinned_paths = [
         stage1,
@@ -668,10 +682,14 @@ def main() -> int:
         "timing_instrumentation": "separate routing arms enable cache reports and assert reuse; timing arms disable cache reports and chain-visit counting, retain phase timing, collect exact Stage1 process counters, and must match routing-arm diagnostics; summaries contain timing arms only",
         "arm_kind_ordering": "routing-first on even pairs and timing-first on odd pairs to counterbalance run-order drift",
         "diagnostic_parity": "all per-request compiler transcript lines after timing/cache instrumentation removal",
-        "benchmark_host_lock": str(host_lock_path),
+        "benchmark_host_lock": None if args.concurrent_instruction_counts else str(host_lock_path),
         "host_qualification": str(host_qualification),
         "host_qualification_sha256": digest_file(host_qualification),
-        "load_gate": "load1 / logical_cpu <= 0.20; 60 second stable admission",
+        "load_gate": (
+            "disabled by --concurrent-instruction-counts; wall-time comparisons are unqualified"
+            if args.concurrent_instruction_counts
+            else "load1 / logical_cpu <= 0.20; 60 second stable admission"
+        ),
         "pinned_inputs": pins,
     }
     temp = tempfile.TemporaryDirectory(prefix="elisa-retained-graph-")
@@ -734,16 +752,17 @@ def main() -> int:
                 for collect_cache_report in timing_arm_kinds(pair_index):
                     pair_arms: dict[str, dict[str, Any]] = {}
                     for order_index, mode in enumerate(order):
-                        try:
-                            check_load_gate(
-                                load_average(),
-                                f"before pair {pair_index} {workload} {mode}",
-                                output,
-                                system,
-                                host_qualification,
-                            )
-                        except LoadGateError as error:
-                            raise SystemExit(str(error)) from error
+                        if not args.concurrent_instruction_counts:
+                            try:
+                                check_load_gate(
+                                    load_average(),
+                                    f"before pair {pair_index} {workload} {mode}",
+                                    output,
+                                    system,
+                                    host_qualification,
+                                )
+                            except LoadGateError as error:
+                                raise SystemExit(str(error)) from error
                         arm = run_arm(
                             root=root,
                             stage1=stage1,
@@ -761,16 +780,17 @@ def main() -> int:
                         )
                         pair_arms[mode] = arm
                         (routing_arms if collect_cache_report else arms).append(arm)
-                        try:
-                            check_load_gate(
-                                load_average(),
-                                f"after pair {pair_index} {workload} {mode}",
-                                output,
-                                system,
-                                host_qualification,
-                            )
-                        except LoadGateError as error:
-                            raise SystemExit(str(error)) from error
+                        if not args.concurrent_instruction_counts:
+                            try:
+                                check_load_gate(
+                                    load_average(),
+                                    f"after pair {pair_index} {workload} {mode}",
+                                    output,
+                                    system,
+                                    host_qualification,
+                                )
+                            except LoadGateError as error:
+                                raise SystemExit(str(error)) from error
                         for pinned_path, expected_hash in pins.items():
                             if digest_file(Path(pinned_path)) != expected_hash:
                                 raise SystemExit(f"pinned benchmark input changed during run: {pinned_path}")
@@ -921,7 +941,8 @@ def main() -> int:
     (output / "paired.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "COMPLETE").write_text("Paired retained-session graph measurement finished.\n", encoding="utf-8")
     run_state["complete"] = True
-    os.close(host_lock_fd)
+    if host_lock_fd is not None:
+        os.close(host_lock_fd)
     print(json.dumps({"output": str(output), "summary": summary}, sort_keys=True))
     return 0
 
