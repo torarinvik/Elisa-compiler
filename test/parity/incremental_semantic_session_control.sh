@@ -184,8 +184,23 @@ def captured_lint() -> i64:
 def main() -> i64:
     return unknown_name
 EOF
+invalid_cold_status=0
+"$STAGE1" -emit check "$SOURCE" >"$WORK/invalid-cold.stdout" 2>"$WORK/invalid-cold.stderr" || invalid_cold_status=$?
+[[ "$invalid_cold_status" -ne 0 ]] || fail "cold check unexpectedly accepted the unresolved-name source"
+cold_unknown_diagnostic="$(grep -F 'error:' "$WORK/invalid-cold.stderr" | grep -F 'unknown_name' || true)"
+[[ -n "$cold_unknown_diagnostic" ]] || fail "cold check did not report the unresolved name: $(tail -n 8 "$WORK/invalid-cold.stderr")"
+cold_unknown_count="$(grep -F 'error:' "$WORK/invalid-cold.stderr" | grep -Fc 'unknown_name' || true)"
+[[ "$cold_unknown_count" -eq 1 ]] || fail "expected one cold unresolved-name diagnostic, got $cold_unknown_count"
 send_check 1
+first_warm_unknown_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'unknown_name' | tail -n 1 || true)"
+first_warm_unknown_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'unknown_name' || true)"
+[[ "$first_warm_unknown_count" -eq 1 && "$first_warm_unknown_diagnostic" == "$cold_unknown_diagnostic" ]] \
+    || fail "first warm diagnostic differs from cold or has wrong multiplicity: cold=[$cold_unknown_diagnostic] warm_count=$first_warm_unknown_count warm=[$first_warm_unknown_diagnostic]"
 send_check 1
+second_warm_unknown_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'unknown_name' | tail -n 1 || true)"
+second_warm_unknown_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'unknown_name' || true)"
+[[ "$second_warm_unknown_count" -eq 2 && "$second_warm_unknown_diagnostic" == "$cold_unknown_diagnostic" ]] \
+    || fail "repeated warm diagnostic differs from cold or has wrong multiplicity: cold=[$cold_unknown_diagnostic] warm_count=$second_warm_unknown_count warm=[$second_warm_unknown_diagnostic]"
 
 write_valid_source 2 1
 send_check 0
@@ -223,6 +238,21 @@ state_line13_count="$(count_warning_at state 13)"
 shifted_report="$(sed -n '3p' "$REPORTS")"
 [[ "$shifted_report" =~ session=edit([[:space:]]|$) ]] || fail "expected the inserted-line request to reuse the prior semantic snapshot: $shifted_report"
 [[ "$shifted_report" =~ self_assignment_bodies_reused=2([[:space:]]|$) ]] || fail "expected exactly two complete self-assignment body ranges to reuse on the inserted-line request: $shifted_report"
+[[ "$shifted_report" =~ function_body_facts_restored=[1-9][0-9]*([[:space:]]|$) ]] || fail "expected a query-graph body-fact restore on the inserted-line request: $shifted_report"
+[[ "$shifted_report" =~ source_input_admitted=yes([[:space:]]|$) ]] || fail "expected the unchanged declaration surface to be admitted by the query graph: $shifted_report"
+cold_report="$(sed -n '1p' "$REPORTS")"
+if [[ "$cold_report" =~ visited=([0-9]+) ]]; then
+    cold_visited="${BASH_REMATCH[1]}"
+else
+    fail "expected body-walk accounting on the cold request: $cold_report"
+fi
+if [[ "$shifted_report" =~ visited=([0-9]+) ]]; then
+    shifted_visited="${BASH_REMATCH[1]}"
+else
+    fail "expected body-walk accounting on the edited request: $shifted_report"
+fi
+[[ "$shifted_visited" -lt "$cold_visited" ]] \
+    || fail "expected graph hits to skip at least one unchanged eligible body walk: cold=$cold_visited edited=$shifted_visited"
 hit_count="$(grep -Ec 'session=hit([[:space:]]|$)' "$WORK/server.stderr" || true)"
 edit_count="$(grep -Ec 'session=edit([[:space:]]|$)' "$WORK/server.stderr" || true)"
 lint_reuse_count="$(grep -Ec 'self_assignment_bodies_reused=[1-9][0-9]*' "$WORK/server.stderr" || true)"

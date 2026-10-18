@@ -355,7 +355,7 @@ Cache reuse is valid only when it produces the same diagnostics, inferred effect
 
 ## Current seams and limits
 
-`src/driver/elisac_includes.elisa` expands includes into one flat source buffer and carries an original-file line map. `src/driver/elisac.elisa` tokenizes and parses that buffer into one `Ast::File`, then calls `run_semantic_gate` before creating one LLVM module. This means the first implementation should cache function bodies inside the translation unit; treating include files as independent compilation units would change name lookup and module semantics.
+`src/driver/elisac_includes.elisa` expands includes into one flat source buffer and carries an original-file line map. Generated-source diagnostics compose that map to preserve original file and line locations; when no include map exists, the driver composes an identity map. Columns still refer to the generated buffer. `src/driver/elisac.elisa` tokenizes and parses that buffer into one `Ast::File`, then calls `run_semantic_gate` before creating one LLVM module. This means the first implementation should cache function bodies inside the translation unit; treating include files as independent compilation units would change name lookup and module semantics.
 
 In `src/semantic/semantic_api.elisa`, `collect_effect_sources` runs before `check_ungranted_panic`, and `check_mutable_global_authority` follows it. The body passes still compute from current AST facts: zero-fact records bypass supported body walks, direct-call-only records can seed Global-authority inference after current target resolution, and Global-permission axes project current direct facts for flat bodies without local bindings. Both call-based projections fall back to the AST when ordinary global lookup resolves the callee spelling, preserving the cold walk's callee-identifier read. `check_mutable_global_authority` still creates a fresh `GlobalAuthority`, collects declarations and lexical indexes, closes call/effect rows, publishes rows to `SymbolTable`, and walks unsupported or fact-bearing bodies outside the direct-call-only case. Its numeric function slots, lexical scope numbers, AST nodes, offsets, and interned references are invocation-local and cannot be written to disk as identities.
 
@@ -574,76 +574,125 @@ structural validation alone as a substitute for session provenance.
 
 ### Typed semantic query graph status
 
-`IncrementalSemanticSession` now contains a typed query-node and bidirectional-edge
-scaffold, but it is not a production dependency graph yet. The only current
-`incremental_semantic_query_*` definitions are in
-`src/semantic/incremental_function_facts.elisa`; semantic collection and checking
-have no call sites that record dependencies or consume graph results. These
-operations are private while their lifecycle is incomplete. They cannot read or
-commit input/result fingerprints or mark a recomputed query Green, so the scaffold
-cannot authorize semantic reuse. Its invalidation operation marks the full reverse
-closure Dirty and cannot stop propagation when an intermediate result is unchanged.
+`IncrementalSemanticSession` now contains a typed query graph with private key
+lookup, exact-byte evaluate/commit, dependency replacement, and invalidation
+operations in `src/semantic/incremental_function_facts.elisa`. Handles carry a
+session cookie plus graph, request, and committed-context generations, so a handle
+cannot be reused across a reset, graph clear, graph-using request, session, or
+committed-context change. The exact-source collector fast path currently returns
+before `begin_request` and does not touch the graph; any graph use on that path must
+advance the request generation first. Evaluation
+checks exact input bytes, the dependency set, dependency result generations, and
+Green status; commit requires Green dependencies and publishes a query as Green
+only after the canonical result and dependency edges are stored. A changed result
+marks its reverse dependers potentially dirty, which can return to Green when their
+dependency results are unchanged.
 
-Graph admission now caps owned key bytes at 8 MiB, query nodes and their possible
-hash-index entries at 65,536, edge slots and free-list entries at 262,144 each,
-and one replacement input at 4,096 dependency IDs. A conservative logical-storage
-estimate also caps retained graph data at 32 MiB, including estimated index,
-edge, and free-list overhead. New-query admission returns the sentinel and
-dependency replacement returns `false` before changing graph contents when a cap
-would be exceeded; replacement includes the temporary free-list peak in its check.
-The estimate uses logical counts for the graph pools and the retained capacity for
-the reusable worklist. `darray` and dictionary allocators can round other capacities
-above those counts. In the long-lived session region, non-tail `darray` growth can
-also leave old backing buffers allocated until region teardown, so the 32 MiB value
-does not bound total retained region bytes across growth generations. This is an
-admission bound on estimated payload, not a hard process-RSS limit. Before adding a
-production caller, measure/account the graph region's retained bytes or use fixed-size
-chunks with a hard capacity.
+Evaluation checks only direct dependencies and requires them to be Green already.
+Callers for a deeper graph must evaluate dependencies bottom-up; there is no recursive
+try-mark-Green operation. Query keys, inputs, results, and dependency sets also need
+complete, versioned serialization from any future semantic caller. The graph API does
+not infer missing context from the current AST or symbol table.
+
+This remains an unqualified private prototype, not a production query engine. The
+session collector checks cached `SourceInput` and `FunctionBodyFacts` results. A body
+query is attempted only after the trusted prior snapshot proves an exact declaration
+surface, cacheable prior record, and exact body match. A body hit decodes canonical
+query bytes into the current request snapshot, validating each fact against the
+previous snapshot's typed facts before it bypasses the body walker.
+If graph lookup, admission, evaluation, or result restoration misses, the collector
+falls back to copying prior typed facts when the current declaration surface and
+body exactly match; malformed or incompatible prior facts fall through to the AST
+body scan. This preserves the existing safe reuse path when graph limits reject a
+query. After a successful snapshot store, the private publisher seeds or updates
+source and cacheable body nodes, which can repopulate a cleared graph; generation
+exhaustion permanently disables graph use for that session. Publication rebuilds
+each cacheable body's query key and copies its body input for evaluation on every
+stored edit; it serializes and commits the direct-fact result only on a query miss.
+No source-matched retained-edit benchmark of this graph path is
+available, and the implementation was not built or runtime-qualified in this slice.
+The 16 MiB value cap is enforced at graph admission/commit after some source-value,
+body-input, and canonical-result temporaries may already have been assembled; add
+length-only preflights before expanding graph use to large inputs.
+The opt-in `incremental-ga-cache` report now separates request-local
+`function_body_facts_restored`, `prior_snapshot_fact_fallbacks`, and
+`cold_body_scans` counts. They are mutually exclusive per collector candidate and
+bounded by the candidate count. A restore means the graph result decoded and
+validated against the trusted prior typed facts; a fallback means the graph path
+did not restore and exact prior typed facts were copied; a cold scan counts a call
+to `ifc_scan_candidate`, including candidates that the scan later rejects. The
+`source_input_admitted` flag means both the exact SourceInput query hit and the
+trusted prior declaration surface admitted the graph body path. It is false on an
+exact-source session return because that path bypasses the graph. These counters
+describe routing only; do not claim a production query engine or speedup until
+parity controls and measured results show the graph improves the retained-edit
+path.
+
+Graph admission caps owned key bytes at 8 MiB, canonical input/result bytes at 16
+MiB, query nodes and their possible hash-index entries at 65,536, edge slots and
+free-list entries at 262,144 each, and one dependency set at 4,096 IDs. The
+`SourceInput` key is preflighted from identity/path lengths and rejected before copying
+or hashing when it exceeds 8 MiB; the generic key API also rejects oversized keys
+before hashing. These rejections preserve the collector's typed-fact fallback. A
+conservative logical-storage estimate also caps retained graph data at 32 MiB, including estimated
+node/index, edge, free-list, and worklist overhead. Commit checks replacement's
+temporary free-list peak before changing graph contents. The estimate uses logical
+counts for graph pools and retained capacity for the reusable worklist. `darray` and
+dictionary allocators can round other capacities above those counts. In the long-lived
+session region, non-tail `darray` growth can also leave old backing buffers allocated
+until region teardown, so the 32 MiB value does not bound total retained region bytes
+across growth generations. This is an admission bound on estimated payload, not a hard
+process-RSS limit. Before qualifying or expanding the current collector caller,
+measure/account the graph region's retained bytes or use fixed-size chunks with a
+hard capacity.
 Each query node carries a u64 invalidation-generation stamp, and the session reuses
 a worklist whose retained capacity is included at 8 estimated bytes per slot. The
 worklist grows with the reached reverse closure and is reused by later edits; only
 generation wrap clears all node stamps. This avoids per-edit O(V) visited-array
 initialization and full worklist reservation.
+Each node also tracks its incoming-edge count and adjacency validation generation.
+Dependency preflight fully checks a chain when its validation generation is stale;
+checked local edge splices advance the count and generation together, so the shared
+`SourceInput` chain is not rescanned for every body commit. Reverse-closure invalidation
+still walks each reached chain and requires the traversed edge count to match before it
+changes query statuses, catching a cleanly truncated tail without a per-body O(N²) scan.
 
-The dense query-node record now keeps status, adjacency handles, and its invalidation
-stamp ahead of the wide key spans and fingerprints. Under conventional 64-bit struct
-alignment, the current field sequence is estimated at 64 bytes per node; the committed
-pre-generation layout is estimated at 56 bytes, so the generation stamp adds 8 bytes.
-These are source-level estimates, not a measured Elisa layout or speedup. The graph
-still has no semantic callers, so profiling it should wait until an evaluate/commit
-path exists.
+The dense query-node record keeps status, adjacency handles, and its invalidation
+stamp ahead of the key spans and fingerprints. Its six key/input/result span fields
+are checked `u32` values under the 8/16 MiB pool caps. With the current incoming-chain
+validation fields, the sequence is estimated at 112 bytes under conventional 64-bit
+alignment, versus 136 bytes with `usize` spans; admission budgets 128 bytes per node
+to include index overhead. The edge record is 28 bytes by field width and about
+32 bytes with conventional alignment; admission budgets 48 bytes. These are
+source-level estimates, not measured Elisa layouts or speedups. The graph has one
+unqualified semantic caller; profile it after parity and retained-edit controls are
+in place.
 
 The checked Zig revision's `AnalUnit` is a packed 64-bit kind/ID handle. Its
 `DepEntry` uses a 64-bit depender handle and three 32-bit links; the dependee
 identity is implicit in the typed dependency-head map. Elisa stores two 32-bit
-query endpoints and three 32-bit links per edge (20 bytes by source layout). The
-outgoing dependency chain is singly linked because replacement removes the whole
-chain; the incoming depender chain stays doubly linked for O(1) unlink. Admission
-estimates 48 bytes per edge slot for alignment headroom. Zig's layout remains a
-useful alternative if Elisa introduces a typed dependency table. When callers
-exist, measure edge and index capacity plus replacement and invalidation costs
-before changing the representation. The source-level comparison and references are in
+query endpoints, three 32-bit links, and a 64-bit observed result generation per
+edge (28 bytes before alignment). The outgoing dependency chain is singly linked
+because replacement removes the whole chain; the incoming depender chain stays
+doubly linked for O(1) unlink. Admission estimates 48 bytes per edge slot for
+alignment headroom. Zig's layout remains a useful alternative if Elisa introduces a
+typed dependency table. As additional callers are added, measure edge and index
+capacity plus replacement and invalidation costs before changing the representation. The
+source-level comparison and references are in
 [`compiler_incrementality_reference_study.md`](compiler_incrementality_reference_study.md).
 
-Before using this graph for reuse, add a session-owned evaluate/commit boundary
-that validates exact inputs and dependencies, records the canonical result, and
-marks a query Green only after a successful commit. A dependency-set change dirties
-that query for reevaluation. After commit, propagate dirtiness to reverse dependers
-only if the canonical result fingerprint changed; an unchanged result should stop
-propagation. Query handles also need session/generation validation, since the current
-bare indices can alias across sessions or after reset.
 Dependency deduplication still uses nested scans; the 4,096-ID per-query admission
-cap bounds that work, but a future real caller should measure it. Any overflow or
-graph corruption must discard the graph and take the cold path. Until these
-boundaries have semantic callers and parity controls, describe this as scaffolding only.
-Graph reuse must also be tied to a successfully committed semantic context. A failed
-snapshot store can leave the prior query graph allocated, and key lookup currently
-checks only whether the session is enabled. A future request must stage graph changes
-under its new source generation and publish them only after snapshot commit, or poison
-the prior graph before any lookup and cold-rebuild it on failure. Checking only the
-snapshot's current valid bit is insufficient if graph updates begin before commit.
-Sparse and dense invalidation closure costs remain unmeasured, as do
-dependency-deduplication alternatives.
+cap bounds that work, but a future caller should measure it. The value pool is
+append-only between graph clears. After each successful session snapshot store, the
+publisher records the current source and cacheable function results; on failure it
+clears and retries once, then leaves the committed semantic snapshot available to
+the cold-safe path. Region allocator growth can retain prior backing buffers until
+teardown, so the logical limit is not a hard RSS bound. Before treating graph hits as
+a performance feature, qualify failure behavior across context-store failure, graph
+overflow, and cold fallback; then measure the full publisher cost as well as sparse
+and dense invalidation and dependency-deduplication costs. Graph-generation
+exhaustion is fail-closed and permanently poisons that session's graph rather than
+wrapping a handle generation back to an earlier value.
 
 The report counts `eligible_bodies` and `matched_eligible_bodies` by unique
 cacheable function record, so a body with multiple facts cannot inflate
@@ -785,9 +834,9 @@ rebinds their target and statement locations against the fresh token stream.
 Unsupported bodies and decoded disk snapshots keep the ordinary checker path;
 the portable sidecar codec does not serialize these lint facts. The report's
 `self_assignment_bodies_scanned` and `self_assignment_bodies_reused` fields count
-those per-body scans and reuses separately from authority facts. This does not
-yet retain parse trees, skip parsing, record/replay tracked semantic query
-results, or reuse LLVM/native artifacts.
+those per-body scans and reuses separately from authority facts. It still rebuilds
+the parse tree for every request; the query graph only backs this narrow body-fact
+path and does not replay full checker results or reuse LLVM/native artifacts.
 It is intentionally tied to one source path and fixed process environment for
 its lifetime; launch a fresh host to change compiler options or source identity.
 Ordinary CLI compilation remains one-shot. The host control is wired into
@@ -814,8 +863,11 @@ semantic-gate callsites receive an explicit session reference. One-shot compilat
 uses a disabled session, preserving disk-sidecar behavior. Repeated compilation
 uses the retained in-process session for validated function facts and self-assignment
 findings, then still runs current semantic checking, LLVM IR generation, optimization,
-and artifact emission. It does not reuse parse trees, semantic query results, LLVM
-modules, or native objects. LLVM object, IR, bitcode, executable, wasm, and Python
+and artifact emission. The query graph reuses only `SourceInput` and
+`FunctionBodyFacts` results; a body hit restores canonical facts into the current
+snapshot. No source-matched retained-edit benchmark qualifies this graph path yet.
+The host does not reuse parse trees, other semantic query kinds, LLVM modules, or
+native objects. LLVM object, IR, bitcode, executable, wasm, and Python
 extension requests dispose their builder, module, target data, target machine, and
 context before the next request. `check` and `edir` return before creating LLVM state.
 

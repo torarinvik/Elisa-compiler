@@ -11,11 +11,11 @@ The current Zig checkout represents analysis units with compact typed handles (`
 
 Dependency edges are indexed in both directions. A depender owns a compact linked edge chain; reanalysis can remove and replace all of its old outgoing edges. Edge slots are recycled. The update path marks transitive dependents as potentially outdated, waits until their dependencies have been checked, then prioritizes ready functions so useful code generation can proceed early. The frontend snapshots file state before scheduling work and avoids applying dependency invalidations when a failed frontend update makes the new analysis unreliable.
 
-The concrete data layout is worth comparing with Elisa. Zig's `AnalUnit` is a packed 64-bit value containing a 32-bit kind and 32-bit ID. `TrackedInst` uses stable 32-bit IDs across an update and maps them to current ZIR locations; a lost mapping has an explicit sentinel. A `DepEntry` stores a depender handle and three 32-bit adjacency links. Its dependency key is implicit in the per-kind dependee-head maps, so it does not duplicate that endpoint in every edge. See [`AnalUnit` and tracked instruction IDs](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L137), [`AnalUnit`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L422), and [`DepEntry` plus edge insertion/removal](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L925).
+The concrete data layout is worth comparing with Elisa. Zig's `AnalUnit` is a packed 64-bit value containing a 32-bit kind and 32-bit ID. `TrackedInst` uses stable 32-bit IDs across an update and maps them to current ZIR locations; a lost mapping has an explicit sentinel. A `DepEntry` stores a depender handle and three 32-bit adjacency links. Its dependency key is implicit in the per-kind dependee-head maps, so it does not duplicate that endpoint in every edge. Zig also gives namespace-name existence its own dependency key, so an earlier missing-name result can be invalidated when that name is added. See [`AnalUnit` and tracked instruction IDs](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L137), [`AnalUnit`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L422), [`namespace_name` dependency heads](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L75), [`Dependee.namespace_name`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L746), [`NamespaceNameKey`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L918), Zig's [namespace name lookup dependency](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Sema.zig#L6026-L6045), [`DepEntry` plus edge insertion/removal](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig#L925), and [name-change invalidation](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Zcu/PerThread.zig#L978-L992).
 
-Elisa's current edge has two 32-bit endpoints and three 32-bit adjacency links, 20 bytes by source layout. Its outgoing chain is singly linked because replacement removes the whole chain; its reverse depender chain is doubly linked for O(1) unlink. Zig's edge omits the dependee endpoint through a typed head map and uses its own dummy-head/reuse behavior. Zig's layout remains a design option if Elisa introduces typed dependency tables, not an automatic size win. Its `potentially_outdated` and `outdated` work maps track outstanding dependencies, and ready-function units are prioritized for analysis once upstream dependencies settle, which can queue code generation sooner. This avoids treating every transitive depender as immediately ready for reanalysis.
+Elisa already uses compact 32-bit query and edge IDs, dense node/edge pools, recycled edge slots, forward and reverse adjacency, and a reusable invalidation worklist. Its current edge has two 32-bit endpoints, three 32-bit links, and a 64-bit observed result generation: 28 bytes of fields, likely 32 bytes with conventional 8-byte alignment. Zig's `DepEntry` omits the dependee endpoint because typed dependee-head maps retain that identity, and uses dummy heads when removing a list head. That pattern could reduce Elisa's edge payload, but it would need to preserve the current result-generation check and be evaluated against additional indexing and update costs. Zig's `potentially_outdated` and `outdated` maps also track unresolved dependency counts and prioritize ready functions after upstream dependencies settle; Elisa has `PotentiallyDirty` status but no ready-unit queue.
 
-The useful data-oriented transfer is stable integer handles, typed dependency identities, dense pooled records, and hot fields placed for the traversal that consumes them. Zig also uses maps where dynamic dependency keys and scheduling need them; its source does not imply that every compiler table should become structure-of-arrays. Elisa should keep the current representation until real graph callers exist, then compare per-query/per-edge allocation and capacity, dependency replacement cost, and reverse-walk cost. Invalidation now reuses a session worklist and per-node generation stamps instead of allocating and clearing a full visited array per edit; measure sparse and dense closures before changing that design. A structure-of-arrays or implicit-endpoint experiment should be judged on that workload, not on the Zig source layout in isolation.
+The useful data-oriented transfer is stable integer handles, typed dependency identities, dense pooled records, and hot fields placed for the traversal that consumes them. Zig also uses maps where dynamic dependency keys and scheduling need them; its source does not imply that every compiler table should become structure-of-arrays. Elisa's graph now has a private `SourceInput`/`FunctionBodyFacts` evaluate-and-commit caller, but the body-query hit overlaps the prior exact-body/surface reuse path and still validates the canonical payload against the previous typed facts. Its graph integration is experimental groundwork, not measured acceleration. The query node now stores its six key/input/result byte-span fields as checked `u32` values. With the current incoming-edge validation fields, the source-level estimate is 112 bytes per node instead of 136 bytes with `usize` spans on a conventional 64-bit layout. That saves 24 bytes (about 1.5 MiB at the 65,536-node cap) before allocator and index effects. This remains an unmeasured layout estimate; measure query-node allocation and retained-edit traversal before attributing a memory or speed improvement.
 
 Zig's incremental persistence is not a complete template to copy. The current source still has save-state TODOs for errors, namespaces, declarations, and linker state. The source study supports borrowing its in-memory dependency model and compact data layout selectively, not adopting its whole cache format.
 
@@ -67,39 +67,46 @@ The installed rustc target used macOS deployment version 11.0 while Zig and Clan
 
 2. **Give semantic sessions a real owner across requests.** The private session API can retain safe, supported function facts, but the ordinary driver currently constructs a disabled session and the disk sidecar recollects facts from current source. A long-lived compile server can own one session per translation unit. Keep current diagnostics/checker behavior authoritative and measure overhead against fresh analysis; recent synthetic results do not establish a reliable full-pipeline win.
 
-3. **Build the semantic dependency model before broadening result reuse.** Introduce stable typed analysis-unit handles and dependencies for body, callable surface/contracts, inferred effects, constants, layouts, namespace membership, overload candidate sets, failed name lookups, includes/generated inputs, and configuration. Store both forward and reverse edges, replace outgoing edges after reanalysis, and propagate invalidation using canonical result fingerprints (a red-green rule). Keep source locations and diagnostics rebound to the current source revision.
+3. **Add a real dependency at a semantic read site.** A narrow first slice is the translation-unit global suffix of `name_known` for `Expr.Ident`: keep special-name, local-binding, and region-name checks ahead of it, then cache only the exact global membership result, including both `Known` and `Missing`. Key by source identity, current module, and exact name, and depend on the current `SourceInput` so declaration and import edits reconsider prior results. Never retain `DeclId`, `BindingId`, or symbol-table rows. The current global lookup already uses an expected-O(1) name index, so this is a dependency-correctness prototype until counters and retained-edit timings show that graph overhead is repaid. For broader body reuse, add typed dependencies only for the external facts that the body collector actually reads.
 
-4. **Use Zig-style data layout where measurements justify it.** A practical graph prototype is an `AnalysisUnitID` table, an interned typed `DependencyID` table, and one contiguous `DepEdge` pool. Each edge stores its unit and dependency IDs plus links in both adjacency directions; head arrays make it cheap to visit all dependents of a changed fact or remove all old dependencies after reanalysis. Recycle removed edge slots with a free list. Keep unit state and hot counters in dense indexed arrays; split frequently scanned fields into columnar arrays only when allocation and cache profiles show the layout helps. This avoids one heap object or map entry per dependency while retaining precise graph semantics. Keep persistence schemas versioned and avoid storing mutable AST, symbol-table, or LLVM objects.
+4. **Make one bounded data-layout change at a time.** Elisa already has dense query and edge pools, compact IDs, a free list, and forward/reverse links, so a second analysis-unit table would mostly duplicate existing structure. The current prototype stores the query node's six key/input/result byte-span fields as checked `u32` values. The 8 MiB and 16 MiB pool caps bound every admitted span; with current incoming-edge validation fields, the estimated node record is 112 bytes instead of 136 bytes with `usize` spans on a conventional 64-bit layout. This saves 24 bytes (about 1.5 MiB at the 65,536-node cap) before allocator and hash-index effects. Compare actual allocated bytes and graph traversal timings before keeping or crediting the change. Treat Zig's implicit-dependee edge and reusable dummy-head scheme as a separate, higher-invariant experiment; its storage savings do not justify changing Elisa's simpler explicit endpoints without measurements.
 
 5. **Treat code generation as a later, separate cache layer.** A codegen key must include exact LLVM snapshot contents, target machine, LLVM/compiler/runtime identities, optimization and emission options, shard ownership/restriction versions, and relevant profile inputs. Shard bridge names are module-local ordinals and the caller must localize them after each translation unit's complete hit/miss merge before linking it with other units. Any localization or ticket/attestation failure should discard staged hits and use the clean path.
 
 ## Elisa prototype from this study
 
-The current worktree now has the first data-oriented query-graph foundation in
+The current worktree has a private query graph in
 `src/semantic/incremental_function_facts.elisa`: session-scoped 32-bit query and
-edge handles, exact owned query-key bytes, contiguous query/edge arrays, a free
-list, forward plus reverse adjacency, and reusable invalidation scratch. Reanalysis
-can replace one query's dependencies, and a changed query can mark its reverse
-dependers dirty using a retained worklist and per-node generation stamps. The
-edge pool retains both endpoints, a singly linked outgoing dependency chain, and
-a doubly linked incoming depender chain; the live/freed state uses endpoint
-sentinels instead of a separate boolean. Dependency deduplication currently
-uses a nested scan; optimize it only if recorded fan-in shows the update path
-matters. These APIs are not yet called by the
-semantic checker, so current checker behavior and performance are unchanged.
-The next step is to record dependencies at real semantic read sites and then
-add result fingerprints and red-green reuse. Do not persist `DeclId`,
-`BindingId`, AST pointers, or `SymbolTable` rows as query identity.
+edge handles, exact owned keys and values, contiguous query/edge arrays, a free
+list, forward plus reverse adjacency, and reusable invalidation scratch. Opaque
+handles carry session and graph/request/context generations. Query evaluation
+checks exact inputs, dependency identity, dependency result generations, and
+Green status; commit replaces dependencies and propagates `PotentiallyDirty` only
+when a canonical result changes. The session collector consults `SourceInput`
+and `FunctionBodyFacts` nodes and publishes after the authoritative snapshot is
+stored. A body hit still requires the old exact declaration-surface and body
+proof, restores bytes from the graph after comparing them with the prior typed
+facts, and falls back to the existing typed-fact copy on a graph miss. This is
+not yet a net performance result; graph publication, validation, and payload
+decoding add work, and no parity or retained-edit benchmark qualifies the path.
+Other declared query kinds, including `FunctionSummary`, `VisibleNameSet`,
+`NameLookup`, `TypeOf`, and `ConstantValue`, have no callers. The next semantic step is a real typed
+dependency at a read site, such as a complete scope/name lookup that records
+both found and missing outcomes. Do not persist `DeclId`, `BindingId`, AST
+pointers, or `SymbolTable` rows as query identity.
 
-A follow-up layout pass groups query status and adjacency handles before the
-wide key spans and fingerprints. Under conventional 64-bit struct alignment,
-this field order, including the u64 invalidation stamp, is expected to use 64
-bytes per query node, compared with 72 bytes for the earlier order. That is a source-level layout estimate, not a
-measured Elisa object layout or a compile-time speedup. Zig's packed `AnalUnit`
-and pooled `DepEntry` show the same general payoff from compact handles and
-keeping dependency traversal data in dense arrays; Elisa should measure the
-graph once it has real callers before considering a broader structure-of-arrays
-rewrite.
+The dense query-node field sequence is estimated at about 112 bytes with
+conventional 64-bit alignment after narrowing its six pool spans to `u32` and
+including incoming-chain validation fields; the corresponding `usize`-span
+sequence would be about 136 bytes. Admission still budgets 128 bytes per node to
+include index overhead. The edge
+fields total 28 bytes and likely occupy 32 bytes with
+8-byte alignment; admission budgets 48 bytes. These are source-level estimates,
+not measured object layouts or speedups. The graph already uses compact handles
+and pooled records, so measure the checked-u32 span change and evaluate an
+implicit dependee only as separate experiments. Zig's packed `AnalUnit`, stable
+tracked instruction IDs, and pooled `DepEntry` provide design references, not
+proof that a wider structure-of-arrays rewrite would help Elisa.
 
 The backend also exposes an owned configured-target descriptor in
 `src/backend/codegen_target_machine.elisa`. It captures machine and module
