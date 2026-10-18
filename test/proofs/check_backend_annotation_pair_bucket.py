@@ -216,6 +216,7 @@ module_text = MODULE_SOURCE.read_text()
 module_lines = function_section(module_text, "emit_module_core").splitlines()
 expected_module_entry = compact_code("""
     can Global.Write:
+        lifted_lambda_counter <- 0
         annotation_pair_cache_invalidate()
     structs: mutable StructTable = new_struct_table(ctx, target_data, checked_contracts)
 """)
