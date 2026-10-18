@@ -172,6 +172,44 @@ cold_object cold-recovered
 send_compile 0 edit
 compare_object cold-recovered
 
+# The root is byte-identical throughout this sequence. An include-only edit
+# must invalidate the retained source identity and produce the current object.
+INCLUDED_SOURCE="$WORK/included-helper.elisa"
+write_included_helper() {
+    local value="$1"
+    cat >"$INCLUDED_SOURCE" <<EOF
+def helper() -> i64:
+    return $value
+EOF
+}
+cat >"$SOURCE" <<'EOF'
+include "included-helper.elisa"
+
+def main() -> i64:
+    return helper()
+EOF
+cp "$SOURCE" "$WORK/root-before-include-edits.elisa"
+write_included_helper 43
+cold_object cold-include-first
+send_compile 0 edit
+compare_object cold-include-first
+send_compile 0 hit
+compare_object cold-include-first
+
+write_included_helper 44
+cmp -s "$SOURCE" "$WORK/root-before-include-edits.elisa" || fail "include edit changed the root fixture"
+cold_object cold-include-edited
+send_compile 0 edit
+compare_object cold-include-edited
+send_compile 0 hit
+compare_object cold-include-edited
+
+# Returning to an earlier include revision must also yield that revision's bytes.
+write_included_helper 43
+cmp -s "$SOURCE" "$WORK/root-before-include-edits.elisa" || fail "include restoration changed the root fixture"
+send_compile 0 edit
+compare_object cold-include-first
+
 printf 'quit\n' >&3 || fail "could not send quit command"
 exec 3>&-
 if ! wait "$SERVER_PID"; then
@@ -181,4 +219,4 @@ fi
 SERVER_PID=""
 exec 4<&-
 
-echo "incremental compile-session control passed: object parity, exact hit, body edit, error diagnostic replay, and recovery"
+echo "incremental compile-session control passed: object parity, exact hit, body edit, include-only edit/restoration, error diagnostic replay, and recovery"
