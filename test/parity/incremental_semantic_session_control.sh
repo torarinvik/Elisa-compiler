@@ -298,12 +298,44 @@ cat >"$SOURCE" <<'EOF'
 def main() -> i64:
     return newly_added_name + 0
 EOF
+# A body-only edit first recomputes a lookup that the preceding source-surface
+# miss could not cache; its next edit must reuse that result without chain work.
 name_lookup_hits_from_report() {
     local report="$1"
     if [[ "$report" =~ name_lookup_hits=([0-9]+)([[:space:]]|$) ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
     else
         fail "cache report omitted name-lookup hit accounting: $report"
+    fi
+}
+assert_name_lookup_body_edit() {
+    local report="$1"
+    local context="$2"
+    local expected_hits="$3"
+    local expected_chain_work="${4:-positive}"
+    local chain_visits
+    [[ ! "$report" =~ session=hit([[:space:]]|$) ]] \
+        || fail "$context unexpectedly hit the complete-file snapshot: $report"
+    [[ "$report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
+        || fail "$context failed to retain its unchanged declaration surface: $report"
+    [[ "$(name_lookup_hits_from_report "$report")" -eq "$expected_hits" ]] \
+        || fail "$context expected $expected_hits retained NameLookup hits: $report"
+    if [[ "$report" =~ name_lookup_classification_chain_visits=([0-9]+)([[:space:]]|$) ]]; then
+        chain_visits="${BASH_REMATCH[1]}"
+    else
+        fail "$context report omitted classification-chain accounting: $report"
+    fi
+    if [[ "$expected_hits" -eq 0 ]]; then
+        if [[ "$expected_chain_work" == positive ]]; then
+            [[ "$chain_visits" -gt 0 ]] \
+                || fail "$context recomputed without recording resolver-chain work: $report"
+        else
+            [[ "$chain_visits" -eq 0 ]] \
+                || fail "$context should not need resolver-chain work: $report"
+        fi
+    else
+        [[ "$chain_visits" -eq 0 ]] \
+            || fail "$context walked resolver chains despite a retained NameLookup hit: $report"
     fi
 }
 absent_cold_status=0
@@ -339,6 +371,25 @@ declared_warm_missing_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc
 [[ "$declared_warm_missing_count" -eq 0 ]] \
     || fail "the declared name retained a stale negative diagnostic: $declared_warm_missing_count"
 
+for edit_value in 1 2; do
+    cat >"$SOURCE" <<EOF
+const newly_added_name: i64 = 7
+
+def main() -> i64:
+    return newly_added_name + $edit_value
+EOF
+    send_check 0
+    declared_body_report="$(tail -n 1 "$REPORTS")"
+    expected_declared_body_hits=0
+    if [[ "$edit_value" -eq 2 ]]; then
+        expected_declared_body_hits=1
+    fi
+    assert_name_lookup_body_edit "$declared_body_report" "body edit after declaration addition $edit_value" "$expected_declared_body_hits"
+    declared_body_error_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+    [[ "$declared_body_error_count" -eq 0 ]] \
+        || fail "body edit after declaration addition retained a stale diagnostic: $declared_body_error_count"
+done
+
 cat >"$SOURCE" <<'EOF'
 def main() -> i64:
     return newly_added_name + 0
@@ -364,6 +415,24 @@ removed_repeat_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'n
 removed_repeat_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
 [[ "$removed_repeat_count" -eq "$((removed_warm_count + 1))" && "$removed_repeat_diagnostic" == "$removed_cold_diagnostic" ]] \
     || fail "repeated negative lookup differs from cold or has wrong multiplicity: cold=[$removed_cold_diagnostic] warm_count=$removed_repeat_count warm=[$removed_repeat_diagnostic]"
+
+for edit_value in 1 2; do
+    cat >"$SOURCE" <<EOF
+def main() -> i64:
+    return newly_added_name + $edit_value
+EOF
+    send_check 1
+    removed_body_report="$(tail -n 1 "$REPORTS")"
+    expected_removed_body_hits=0
+    if [[ "$edit_value" -eq 2 ]]; then
+        expected_removed_body_hits=1
+    fi
+    assert_name_lookup_body_edit "$removed_body_report" "negative body edit after declaration removal $edit_value" "$expected_removed_body_hits" zero
+    removed_body_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'newly_added_name' | tail -n 1 || true)"
+    removed_body_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'newly_added_name' || true)"
+    [[ "$removed_body_count" -eq "$((removed_repeat_count + edit_value))" && "$removed_body_diagnostic" == "$removed_cold_diagnostic" ]] \
+        || fail "negative body edit after declaration removal differs from cold or has wrong multiplicity: cold=[$removed_cold_diagnostic] warm_count=$removed_body_count warm=[$removed_body_diagnostic]"
+done
 
 # A nested module function is indexed under its short name as well as recorded
 # as a module member. With no root declaration or import, that one-to-one pair
@@ -403,19 +472,11 @@ def main() -> i64:
 EOF
     send_check 1
     indexed_edit_report="$(tail -n 1 "$REPORTS")"
-    [[ ! "$indexed_edit_report" =~ session=hit([[:space:]]|$) ]] \
-        || fail "indexed negative body edit unexpectedly hit the complete-file snapshot: $indexed_edit_report"
-    [[ "$indexed_edit_report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
-        || fail "indexed negative body edit failed to retain its unchanged declaration surface: $indexed_edit_report"
-    [[ "$(name_lookup_hits_from_report "$indexed_edit_report")" -eq 1 ]] \
-        || fail "indexed negative body edit expected exactly one retained NameLookup hit: $indexed_edit_report"
-    if [[ "$indexed_edit_report" =~ name_lookup_classification_chain_visits=([0-9]+)([[:space:]]|$) ]]; then
-        indexed_edit_chain_visits="${BASH_REMATCH[1]}"
-    else
-        fail "cache report omitted indexed-negative chain accounting: $indexed_edit_report"
+    expected_indexed_edit_hits=0
+    if [[ "$edit_value" -eq 2 ]]; then
+        expected_indexed_edit_hits=1
     fi
-    [[ "$indexed_edit_chain_visits" -eq 0 ]] \
-        || fail "indexed negative body edit still walked resolver chains: $indexed_edit_report"
+    assert_name_lookup_body_edit "$indexed_edit_report" "indexed negative body edit $edit_value" "$expected_indexed_edit_hits"
     indexed_edit_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
     indexed_edit_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
     [[ "$indexed_edit_count" -eq "$((indexed_negative_seed_count + edit_value))" && "$indexed_edit_diagnostic" == "$indexed_negative_cold_diagnostic" ]] \
@@ -446,6 +507,29 @@ indexed_visible_server_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -F
 [[ "$indexed_visible_server_count" -eq "$((indexed_negative_seed_count + 2))" ]] \
     || fail "adding the root declaration retained an indexed-name diagnostic: seed=$indexed_negative_seed_count after=$indexed_visible_server_count"
 
+for edit_value in 1 2; do
+    cat >"$SOURCE" <<EOF
+const indexed_name: i64 = 7
+
+module Foreign:
+    def indexed_name() -> i64:
+        return 8
+
+def main() -> i64:
+    return indexed_name + $edit_value
+EOF
+    send_check 0
+    indexed_visible_edit_report="$(tail -n 1 "$REPORTS")"
+    expected_indexed_visible_hits=0
+    if [[ "$edit_value" -eq 2 ]]; then
+        expected_indexed_visible_hits=1
+    fi
+    assert_name_lookup_body_edit "$indexed_visible_edit_report" "indexed-name body edit after declaration addition $edit_value" "$expected_indexed_visible_hits"
+    indexed_visible_edit_error_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+    [[ "$indexed_visible_edit_error_count" -eq "$indexed_visible_server_count" ]] \
+        || fail "indexed-name body edit after declaration addition retained a stale diagnostic: before=$indexed_visible_server_count after=$indexed_visible_edit_error_count"
+done
+
 cat >"$SOURCE" <<'EOF'
 module Foreign:
     def indexed_name() -> i64:
@@ -470,6 +554,28 @@ indexed_negative_remove_server_count="$(grep -F 'error:' "$WORK/server.stderr" |
 indexed_negative_remove_warm="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
 [[ "$indexed_negative_remove_server_count" -eq "$((indexed_negative_server_count_before_remove + 1))" && "$indexed_negative_remove_warm" == "$indexed_negative_remove_diagnostic" ]] \
     || fail "root declaration removal differs from cold or has wrong multiplicity: cold=[$indexed_negative_remove_diagnostic] warm_count=$indexed_negative_remove_server_count warm=[$indexed_negative_remove_warm]"
+
+for edit_value in 1 2; do
+    cat >"$SOURCE" <<EOF
+module Foreign:
+    def indexed_name() -> i64:
+        return 8
+
+def main() -> i64:
+    return indexed_name + $edit_value
+EOF
+    send_check 1
+    indexed_removed_body_report="$(tail -n 1 "$REPORTS")"
+    expected_indexed_removed_hits=0
+    if [[ "$edit_value" -eq 2 ]]; then
+        expected_indexed_removed_hits=1
+    fi
+    assert_name_lookup_body_edit "$indexed_removed_body_report" "indexed-name body edit after declaration removal $edit_value" "$expected_indexed_removed_hits"
+    indexed_removed_body_diagnostic="$(grep -F 'error:' "$WORK/server.stderr" | grep -F 'indexed_name' | tail -n 1 || true)"
+    indexed_removed_body_count="$(grep -F 'error:' "$WORK/server.stderr" | grep -Fc 'indexed_name' || true)"
+    [[ "$indexed_removed_body_count" -eq "$((indexed_negative_remove_server_count + edit_value))" && "$indexed_removed_body_diagnostic" == "$indexed_negative_remove_diagnostic" ]] \
+        || fail "indexed-name body edit after declaration removal differs from cold or has wrong multiplicity: cold=[$indexed_negative_remove_diagnostic] warm_count=$indexed_removed_body_count warm=[$indexed_removed_body_diagnostic]"
+done
 
 write_valid_source 41 1
 send_check 0

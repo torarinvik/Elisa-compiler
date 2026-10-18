@@ -21,6 +21,12 @@ The useful data-oriented transfer is stable integer handles, typed dependency id
 
 Zig's data-oriented choices extend beyond the dependency graph. `InternPool.Local` partitions mutable interned storage by thread, and its `List(Elem)` wrapper uses `std.MultiArrayList(Elem)` so each field occupies a contiguous array; typed integer handles keep references stable as those arrays grow. Mutation metadata is separate from the reader-visible state, cache-line aligned, and growth publishes the new backing storage atomically. The compact `Nav.Repr` is documented as 30 bytes, with flags packed into 16 bits; its representation is deliberately optimized for the common analysis-backed case, which the source reports as about 74% of navs. These choices support parallel access and selective field scans in large compiler tables. Elisa's current invalidation walk reads query status plus reverse-edge endpoints/links, while dependency validation reads edge endpoints and observed generations together, so a blanket SoA rewrite has no established advantage. Prefer measuring bytes and field-access patterns first; a narrower, bounded field such as the edge's observed result generation is a simpler experiment than splitting the whole graph.
 
+The safest data-oriented transfer currently visible in Elisa is to remove a temporary copy, not redesign the graph. The body-query path copies `snapshot.bytes` into a temporary `darray` through `ifq_snapshot_span_copy` before both evaluation and publication ([query evaluation](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/semantic/incremental_function_facts.elisa:1338>), [publication](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/semantic/incremental_function_facts.elisa:2949>), [copy helper](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/semantic/incremental_function_facts.elisa:1844>)). The snapshot bytes already have request lifetime, and evaluate/commit are synchronous. A checked borrowed view can therefore supply the input to hashing and equality checks; commit must still copy the accepted bytes into the session-owned pool and must never retain the view. This would remove one body-sized allocation and copy per evaluation/publication path, not the required session copy or byte comparisons. Revalidate the span and recreate the view after any snapshot mutation. This is a source-level candidate from review, not a measured win.
+
+One smaller payload candidate is to pack the six NameLookup input booleans into one flags byte. The current projection is 22 logical bytes: a 32-bit schema, three 32-bit counts, and six single-byte flags ([encoder](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/semantic/incremental_function_facts.elisa:1791>)). Packing those flags would reduce it to 17 bytes and save at most 327,680 logical bytes at the 65,536-node cap. This is bounded but likely modest; bump the input schema and preserve exact byte equality, then measure actual NameLookup node count, value-pool capacity, bytes hashed/compared, graph-clear frequency, and retained-edit time before keeping it.
+
+Zig's `InternPool.Local` does use arenas to preserve old backing buffers while concurrent readers may still hold their addresses; Elisa's synchronous query path does not need that lifetime extension. Likewise, omitting `dependee` from Zig's `DepEntry` is coupled to per-kind dependency-head maps and its potentially-outdated dependency-count protocol. Elisa currently reads each edge's `dependee` and `observed_result_generation` to validate query results, so dropping that endpoint alone would break the current check. Keep the present hot-first query-node layout and explicit edges until profiling identifies a measurable bandwidth or memory limit; any alternative should be benchmarked with graph build, lookup, invalidation, and dependency replacement workloads together.
+
 Zig's incremental persistence is not a complete template to copy. The current source still has save-state TODOs for errors, namespaces, declarations, and linker state. The source study supports borrowing its in-memory dependency model and compact data layout selectively, not adopting its whole cache format.
 
 Sources: [Zig `InternPool.zig` at the inspected commit](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/InternPool.zig), [Zig `Zcu.zig`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Zcu.zig), [frontend update path in `PerThread.zig`](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Zcu/PerThread.zig), [cache save-state path](https://codeberg.org/ziglang/zig/src/commit/4812a98ce535e5c3f27c081b94153612cd4817ac/src/Compilation.zig).
@@ -30,6 +36,8 @@ Sources: [Zig `InternPool.zig` at the inspected commit](https://codeberg.org/zig
 rustc records query dependencies and fingerprints. When an input changes, dependent queries are reconsidered. A recomputed query can still be marked green if its result fingerprint matches the prior result, preventing unchanged downstream work from being invalidated. At the inspected revision, `try_mark_green` recursively checks an old node's dependencies; if a dependency is still unknown, it tries to force that query from its stable dep-node key. If the key cannot be forced, rustc returns `None` so the caller recomputes. The recorded dependency order matters because control flow can change which queries are read. Persistent data is selected by query/result policy rather than serializing every in-memory compiler object indiscriminately. Code-generation work products are tracked as a separate artifact layer.
 
 The serialized graph stores node keys, value fingerprints, and dependency edges, then builds its node-to-index reverse map lazily per query kind on the first lookup. A successful green check promotes the old node and its edges into the current graph; disk-backed query values needed in the new cache can be loaded in a later promotion pass. These steps trade eager indexing and eager value loading for incremental maintenance, but they still have a cost on no-change builds. Measure reverse-index construction, green-node promotion, and cache promotion alongside queries skipped before treating a high green count as a speedup. See [`LazyNodeIndex` and its profiled per-kind map](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/serialized.rs#L115-L185), [serialized graph lookup](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/serialized.rs#L234-L248), [`try_mark_previous_green` edge promotion](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/graph.rs#L947-L1034), and [cache promotions](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_middle/src/dep_graph/graph.rs#L1065-L1089).
+
+rustc applies the same red-green decision to codegen units before compiling each unit's LLVM module. `determine_cgu_reuse` requires a prior work product and a green `CompileCodegenUnit` dep-node; the codegen loop then submits the cached pre- or post-LTO module instead of calling `backend.compile_codegen_unit`. This can skip per-unit IR generation, lowering, optimization, and object emission, subject to the complete CGU dependency fingerprint. Elisa Core's current `IncrementalObjectSession` operates later: it lowers and optimizes the full module, maps owners, clones and serializes every partition, then looks up exact bitcode plus target settings and skips only native emission on a hit. The rustc boundary is a longer-term target for Elisa, but requires stable codegen-unit identity and dependencies that include declarations, ABI, globals, and optimization inputs; current partition ownership can shift when functions are inserted. See [`determine_cgu_reuse` and reuse dispatch](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_codegen_ssa/src/base.rs#L853-L895) and [CGU reuse checks](https://github.com/rust-lang/rust/blob/33295d734447c7a2c22c44190f11bce6164a035a/compiler/rustc_codegen_ssa/src/base.rs#L1255-L1297).
 
 For Elisa, the useful rule is: propagate change from semantic result fingerprints, not merely from changed source text or a changed dependency. Recompute at the right boundary, compare the canonical result, and stop invalidation when that result is unchanged. Query dependencies must capture the reads that determined the result, including resolution candidate sets and failed lookups. Elisa now has a request-scoped `NameLookup` query at the serial `Expr.Ident` read site, alongside collector `SourceInput` and `FunctionBodyFacts` queries. It caches only `(known, module_only)` from exact surface facts rebuilt from the current symbol table; it does not skip body checking or derive persistent per-name inputs from declaration deltas. Elisa also lacks rustc's generalized force-from-dep-node scheduling path, so this resolver query remains a narrow read-site prototype rather than reuse of semantic analysis units.
 
@@ -150,7 +158,11 @@ Sources, object files, IR, assembly, and the exact build commands are under `bui
 
    `resolver_name_classification` stores the composite `(known, module_only)` result for a graph hit, and its fused cold classifier walks the global symbol and member chains once on a miss. The opt-in full-check path lazily builds an exact per-spelling surface over symbols, members, imports, and regions at the first eligible unbound read; requests with no such read skip the pass, while any request that reaches one pays O(symbols + members + regions) to build both the spelling and `(module, member)` indexes. That setup is included in whole-request timing but not the chain counter. Valid finalized facts provide region membership before the query, so hits no longer scan `region_names`; invalid or missing facts skip the query and use the cold classifier's region scan. Lexical `bound` scans still run before every lookup, including hits. `value_chain_is_module` routes bare identifiers used as field or namespace-call objects through that same classifier. The `classification_chain_visits` counter counts only symbol/member rows visited by the fused NameLookup cold classifier; direct `name_known` callers such as `Expr.RegionNew`, value-block captures, and flow checks, plus qualified `Expr.Scope` probes through `name_is_module`, `ancestor_names_module`, `two_part_names_module`, and `module_declares_member`, are outside it. Thus the metric does not represent all resolver name-chain work. Metrics-enabled chain walks still test the tracking flag per row. The current source replaces the prior full-identity/path NameLookup key with a versioned `(module,name)` key, removing the former O(unique names × identity/path bytes) duplication. Every active lookup encodes its exact key and input into request-scoped scratch buffers for evaluation; a miss reuses those bytes at commit rather than rebuilding them. The graph copies committed bytes into session-owned storage, so it does not retain request-buffer references. Encoding, hashing, graph probes, and scratch-buffer growth are outside the chain-visit counter and may outweigh saved chain walks for short names. This key reduction has no build or performance qualification. It is safe only while the graph remains session-local and the collision-safe surface input captures every changing resolver fact; identity/options mismatches currently clear the graph. The request context now attempts surface construction once at the first eligible global lookup; it memoizes failed construction so unsupported surfaces do not trigger a repeated prepass. Lexical `bound` scans and surface construction need separate workloads because neither is represented by the chain counter. The surface-index changes have no build, parity, or retained-edit timing qualification, so treat the current counters as path-specific evidence rather than a compile-time result. Keep `bound_last_index`, `record_reference`, and unique-function reference selection on the current table.
 
+   A source review found that a valid finalized surface can classify `(known, module_only)` directly: `forced = builtin(name) || region_name_present`; if not forced and `name_indexed` is false, return `(false,false)`; otherwise `known = forced || imported_visible_member || current_module_member || nonmodule_symbol_count > member_count || nonmodule_symbol_count == 0`, and `module_only = known && module_present && nonmodule_symbol_count == 0`. The current persistent NameLookup stores only this cheap pair, has no dependers, and still builds/hashes the key and exact input; after direct classification replaces chain scans, bypass graph evaluate/commit on valid surfaces unless paired timings show a benefit. A small request-local last-row memo `{module, surface_row, known, module_only}` can catch repeated callee classification after the lexical-binding check; module is required because it changes during one resolver walk. Keep invalid surfaces and no-row names on the cold fallback, and never memoize a lexical binding as a global fact. This is an unmeasured path reduction, not yet a speedup claim. See [`resolve_scope.elisa`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/semantic/resolve_scope.elisa:429>) and [`semantic_types.elisa`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/semantic/semantic_types.elisa:489>).
+
 4. **Make one bounded data-layout change at a time.** Elisa already has dense query and edge pools, compact IDs, a free list, and forward/reverse links, so a second analysis-unit table would mostly duplicate existing structure. The current prototype stores the query node's six key/input/result byte-span fields as checked `u32` values. The 8 MiB and 16 MiB pool caps bound logical payloads; they do not hard-bound retained capacity, because array growth and map overhead are estimated and graph clearing truncates storage without releasing capacity. The session epoch eventually releases its region, but retained high-water memory within that epoch still needs measurement or capacity-aware admission. With current incoming-edge validation fields, the estimated node record is 112 bytes instead of 136 bytes with `usize` spans on a conventional 64-bit layout. This saves 24 bytes (about 1.5 MiB at the 65,536-node cap) before allocator and hash-index effects. Compare actual allocated bytes and graph traversal timings before keeping or crediting the change. Treat Zig's implicit-dependee edge and reusable dummy-head scheme as a separate, higher-invariant experiment; its storage savings do not justify changing Elisa's simpler explicit endpoints without measurements.
+
+   A second bounded candidate is the backend's experimental shard-owner map: the logical shard cap is 16, but function/global owner arrays use `i64` with `-1` for unowned. A `u8` representation with `255` as the sentinel would save seven payload bytes per entry on the repeated bridge-inventory and shard-restriction scans. Preserve LLVM ordinal alignment and sentinel behavior, then compare per-shard snapshot hashes and merged-object parity. The cache seam is not connected to the driver, so this only measures backend preparation locality; it does not establish an end-to-end cache win. See [`codegen_parallel_emit.elisa`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/backend/codegen_parallel_emit.elisa:80>) and [`preoptimization_shard_cache.md`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/docs/preoptimization_shard_cache.md:5>).
 
 5. **Treat code generation as a later, separate cache layer.** A codegen key must include exact LLVM snapshot contents, target machine, LLVM/compiler/runtime identities, optimization and emission options, shard ownership/restriction versions, and relevant profile inputs. Shard bridge names are module-local ordinals and the caller must localize them after each translation unit's complete hit/miss merge before linking it with other units. Any localization or ticket/attestation failure should discard staged hits and use the clean path.
 
@@ -177,6 +189,15 @@ decoding add work. Other declared query kinds, including `FunctionSummary`,
 `VisibleNameSet`, `TypeOf`, and `ConstantValue`, still have no callers. Do not
 persist `DeclId`, `BindingId`, AST pointers, or `SymbolTable` rows as query
 identity.
+
+The current body-fact edge is still coarse: each `FunctionBodyFacts` query depends
+on the request's `SourceInput`, and body reuse requires the entire declaration
+surface to match. A change to an unrelated declaration therefore cold-scans
+otherwise unchanged bodies. Reaching finer-grained invalidation needs a stable
+owner manifest with add/update/remove handling, then body queries that record the
+name, type, visibility, and other semantic reads that determined each result.
+Dropping `SourceInput` without proving those reads would risk stale facts; first
+separate body-local syntax fingerprints from declaration-surface dependencies.
 
 The resolver context is explicitly reacquired for each semantic request because
 query handles are session/request/context-generation bound; handles stay out of
@@ -312,6 +333,98 @@ reuse or end-to-end speedup is established by these foundations.
 
 The working repository's current status and measured baselines remain in [incremental compilation design](incremental_compilation.md) and [pre-optimization shard cache design](preoptimization_shard_cache.md). This reference study does not qualify the full incremental-compilation objective and did not run the test suite.
 
+## Follow-up findings (2026-10-18)
+
+Elisa Core's native object cache assigns incremental shards by a stable hash of
+each function name in [incremental_clone.cpp](</Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/compiler/src/backend/incremental_clone.cpp>);
+the instruction-weight prefix partitioner in
+[parallel_emit.c](</Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/compiler/src/backend/parallel_emit.c>)
+is used by ordinary one-shot emission. Therefore a body edit does not move unchanged functions
+between incremental shards. A request-local clone-plan prototype was measured
+with three alternating before/after pairs. It preserved the expected cache
+behavior (8 reused / 0 emitted for unchanged input; 7 reused / 1 emitted after a
+body edit). The unchanged median rose from 117.08 ms to 140.61 ms, with noisy
+three-pair timing. The previously reported body-edit medians (157.85 ms to
+136.75 ms) are withdrawn as performance evidence: the edit fixture grew
+`work0` by 16 terms per timed iteration, and separately calibrated runs could
+therefore average different module sizes. The raw values remain in the archive
+only. Plan preparation itself was about 0.2 ms. The runtime prototype was
+discarded; a fixed-size, same-length body-edit rerun is still needed before
+comparing edit timings. The
+raw [summary](/Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/build/verification/incremental-native-clone-plan-20261018/summary.json)
+and archived harness remain available. This does not establish a native-cache
+speedup from hoisting the repeated clone preflight.
+
+The persistent semantic server has a separate unmeasured memory concern in
+[elisac_incremental_server.elisa](</Users/torarinvikbjarko/Documents/Coding%20Projects/Elisa%20Projects/Elisa-compiler/src/driver/elisac_incremental_server.elisa:73>).
+`incremental_server_check` scopes diagnostics under `request_scratch`, but source
+buffers, generated input, and parser AST/source views use `@source`, which its
+comment says remains allocated for the server lifetime. Repeated checks may
+therefore retain parse/source memory independently of the bounded query graph.
+The follow-up is a request-owned source region, with only copied snapshot/session
+bytes retained, plus an RSS/capacity measurement across many edits.
+
+The Core parser's
+[`functionBodyNeedsAutoRegion`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/compiler/src/parser/parser_statements_parseforheaderexpr_to_parsebracematchstructpatternarg.go:525>)
+has a parent/current synthetic A/B using five 100 ms samples per case. For nested
+`ExprBlock`s at depth 12, median time fell from 3.31 ms to 36.2 us, with
+allocations from 294,912 B / 12,288 allocs to 1,456 B / 44. Mixed nested blocks
+at depth 12 fell from 665 ms to 130 us, with approximate allocations from 51.0
+MB / 2,125,765 allocs to 2,320 B / 80. Statement-only depths 16/32/64 instead
+became about 2.0x / 1.9x / 1.9x slower, with identical allocation counts and
+bytes. The result supports the `ExprBlock` memoization for those synthetic
+shapes and exposes a separate statement-only cost; it does not establish a
+whole-parser speedup. The current source still repeats full reflective scans
+for auto allocations and constructed-struct forwarding on recursive statement
+lists, before consulting its `ExprBlock` memo. A postorder list summary or
+predicate visit counters are the next useful steps, preserving `RegionStmt` and
+`InStoreStmt` boundaries.
+
+These measurements used parent parser source at
+`39c7f806f58f2b5a3ba2abd46b59c5b74312f1be` (SHA-256
+`b22967b5fd2e102038f91982677b9b2521e507ed77fc01eff6d0d3ddd1c66e67`), current
+dirty parser SHA-256
+`551ab16b9bb63030eccd7fcb2074bebf88b15c3e272ff3c826512a93ff77f3b9`, and
+fixture SHA-256
+`0d577dd441fdfd50a2064d9794886eb82efaacf2b84468c1eb5d6961f1138ea9`. The
+benchmark command was `go test -run='^$' -bench='^BenchmarkAutoRegion'
+-benchmem -benchtime=100ms -count=5 ./src/parser`. Its transcript was
+reconstructed from captured command output without a rerun; the approximate
+parent allocation figures remain explicitly approximate. See the
+[transcript](/tmp/auto_region_parser_ab_20261018.log), SHA-256
+`7480ec5d7af186153aac12b8ee9e5037893784851edcebf6510bd0dd12bb5be9`.
+
+The Core parameter-store visitor at
+[analyzer_param_store_targets.go](</Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/compiler/src/semantic/analyzer_param_store_targets.go>)
+also needs binding-scoped source and target backing-store provenance; its current
+same-spelling shadow fixture can pass without proving renamed-local provenance.
+Add renamed-source, global-backed-local-container, and simple-rebind controls
+before trusting those summaries.
+
+Gate L's Stage1 seed used the current-Core bootstrap binary but failed before
+producing an object. Its complete path/message diagnostic multiset matches Gate
+H exactly (25,541 diagnostics: 25,400 warnings and 141 nonwarnings); Gates I and
+K each had 25,540, with one fewer `scan_instruction` postcondition failure.
+The `easm_compose_span` proof failures remained in L. After the L log completed
+at 17:50:25, the live `easm_compose_text.elisa` changed at 17:50:49 from local
+`ComposeSpan` temporaries to inline struct literals, so Gate L does not qualify
+that newer edit. A fresh gate must use the current frozen source and should
+compare full diagnostic multisets, not only the touched function's error count.
+
+Gate N isolated a nullable disabled session in
+`incremental_function_facts.elisa` but also failed before producing Stage1. Its
+normalized diagnostics improve over K by exactly one nonwarning: the inferred
+region store into the disabled session's `output` container disappears. The
+arg-14 inferred-region store and aggregate-return-local-reference diagnostics
+remain. This is a partial diagnostic improvement, not a lifetime fix or source
+qualification. A separate review correction confirmed `anchor.name` is consumed
+when replaying self-assignment diagnostics; the collector's `source` input and
+returned snapshot are both `@output`. Therefore an unannotated helper parameter
+alone does not prove a dangling reference. Any next lifetime change should
+establish whether the snapshot can outlive `source` at its callers or give the
+anchor owned spelling storage. Gate N log SHA-256:
+`f8d407ee99da4ed87958018de9d6d289b0ac3e9084bf1e7732c10d60aad17c30`.
+
 ## Source checkout manifest
 
 All checkouts are shallow and sparse to keep the local source study bounded. Revisions were read on 2026-10-18.
@@ -322,3 +435,46 @@ All checkouts are shallow and sparse to keep the local source study bounded. Rev
 | Rust | `rust`, selected compiler crates | `33295d734447c7a2c22c44190f11bce6164a035a` |
 | LLVM/Clang | `llvm-project`, Clang/LLVM/LTO/LLD paths | `70a4494e073f57eebb77931a5a2e59f6b5e9e13a` |
 | GCC | `gcc`, `gcc/` | `9a00f0797c90485cd70ac86a8751c9565c3979dd` |
+
+## Per-name fact table rollout sketch
+
+A follow-up semantic review proposes indexing exact session-owned spellings as
+`(ResolverEnvId:u32, NameId:u32)`, with a compact row of symbol/nonmodule/member
+counts plus visibility flags. Keep exact spelling bytes behind `NameId`; do not
+use hash-only identity. Keep overload candidates in a separate ordered flat pool
+with start/count ranges, because global name classification and overload
+selection are different facts. Populate rows alongside existing symbol,
+member, alias, region-name, and import registration, then remove the separate
+whole-surface finalization pass. Preserve duplicate-member multiplicity and exact
+`(owner,name)` visibility; import and alias changes need reverse indexes for
+bounded fanout. Missing names need stable empty facts so a later declaration
+invalidates that exact key.
+
+For graph reuse, the existing NameLookup helper must expose its query handle and
+record per-function read edges; its current dependency list is empty. Evaluate
+fact providers before dependers and publish staged rows only with the accepted
+snapshot. The main blocker is stable declaration identity: current snapshots
+carry whole-surface bytes rather than declaration-level contributions. Until a
+safe row-level declaration diff exists, rebuild or fall back on declaration
+surface changes. Measure row/candidate bytes, producer probes, finalization time
+removed, changed-name count, reverse-closure work, and warm body-only and
+unrelated-declaration request time. The current one-pass surface build may still
+win for small translation units, so keep this as a measured rollout hypothesis.
+
+## Core owner census on budget exhaustion
+
+The Core owner preflight returns `complete=false` with a candidate prefix when
+its work-byte budget is exhausted
+([`incremental_owner_candidates.go`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/compiler/src/semantic/incremental_owner_candidates.go:395>)).
+`Analyze` admits only known retained candidates in that partial mode, but its
+later retirement loop removes every prior owner missing from the partial
+`current` set
+([`incremental_analysis_session.go`](</Users/torarinvikbjarko/Documents/Coding%20Projects/Go%20projects/Elisa-core/compiler/src/semantic/incremental_analysis_session.go:549>)).
+The unseen suffix has unknown liveness. The Core owner's current working patch
+preserves every prior key before retirement when `partialCandidates` is true;
+this admits no new suffix owners, and a later complete census can retire keys
+that are truly absent. Exact source validation still gates product reuse. This
+change has not yet been qualified with a targeted partial-census regression or
+build measurement. Add a case with a retained function beyond the budgeted
+prefix, then edit it and check warm reuse against cold diagnostics; also track
+stale-entry retention until a later complete census.
