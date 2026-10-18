@@ -81,14 +81,22 @@ instructions and cycles are marked unavailable because the guarded shell
 launcher owns the timed PID while Stage1 runs as its child; launcher counters
 would not represent compiler work.
 
-Current timed arms set `ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1` to collect path
-counters. That enables per-row name-classification chain counting; graph-off
-traverses more rows and therefore pays more counter work than graph-on hits.
-The reported timing ratios include this asymmetric telemetry overhead and may
-overstate graph-on gains. Treat them as instrumentation-biased, not
-production-equivalent, until a counter-disabled timing arm exists. Performance
-qualification should collect routing counters in separate arms and time with
-reporting disabled.
+Each workload/pair now runs two routing arms first, with
+`ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1`, then two separate timing arms with
+that setting explicitly `0`. Routing arms enforce all reuse, invalidation, and
+NameLookup-counter assertions. Timing arms require no cache report, preserve
+status/diagnostic parity between graph modes and against the corresponding
+routing arm, and retain phase timing. Only timing arms enter performance
+summaries; routing evidence is stored separately in `routing_arms` in
+`paired.json`. Each kind alternates graph-on/off order across pairs. This doubles
+the number of host launches relative to the previous instrumented runner.
+
+Earlier results that enabled chain counting inside timed arms include asymmetric
+telemetry overhead: graph-off traverses and counts more rows. Do not combine
+those results with the separate counter-disabled timing results. The updated
+runner still requires a fresh source-matched Stage1 execution before it can
+establish performance; protocol checks against a fake host are harness validation
+only.
 
 Warm exact-repeat timings are kept separate because SourceInput admission
 currently copies the declaration surface for validation. Compare separate

@@ -174,9 +174,11 @@ def run_arm(
     functions: int,
     edits: int,
     timeout_seconds: float,
+    collect_cache_report: bool = True,
 ) -> dict[str, Any]:
     source.write_text(source_versions[0], encoding="utf-8")
-    mode_dir = output / f"pair-{pair_index:02d}-{workload}-{mode}"
+    arm_kind = "routing" if collect_cache_report else "timing"
+    mode_dir = output / f"pair-{pair_index:02d}-{workload}-{mode}-{arm_kind}"
     mode_dir.mkdir()
     command = ["bash", str(root / "scripts/elisac_stage1.sh"), "semantic-session", str(source)]
     env = os.environ.copy()
@@ -192,7 +194,7 @@ def run_arm(
         {
             "ELISA_STAGE1_BIN": str(stage1),
             "ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH": "1" if mode == "graph-on" else "0",
-            "ELISA_STAGE1_INCREMENTAL_CACHE_REPORT": "1",
+            "ELISA_STAGE1_INCREMENTAL_CACHE_REPORT": "1" if collect_cache_report else "0",
             "ELISA_STAGE1_TIMINGS": "1",
             "ELISA_ALLOW_STALE_STAGE1": "0",
         }
@@ -229,7 +231,9 @@ def run_arm(
                 raw_log.writelines(line + "\n" for line in lines)
                 if status != "0":
                     raise RuntimeError(f"benchmark fixture check {label} was rejected with status {status}")
-                fields = report_fields(lines)
+                fields = report_fields(lines) if collect_cache_report else {}
+                if not collect_cache_report and any(line.startswith("incremental-ga-cache:") for line in lines):
+                    raise RuntimeError("counter-disabled timing arm unexpectedly emitted a cache report")
                 result = {
                     "request_index": request_index,
                     "label": label,
@@ -253,6 +257,8 @@ def run_arm(
         raise
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
     return {
+        "cache_report_enabled": collect_cache_report,
+        "arm_kind": arm_kind,
         "pair": pair_index,
         "workload": workload,
         "mode": mode,
@@ -274,7 +280,7 @@ def run_arm(
     }
 
 
-def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workload: str) -> None:
+def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workload: str, *, require_reports: bool = True) -> None:
     off_requests = off["requests"]
     on_requests = on["requests"]
     if len(off_requests) != len(on_requests):
@@ -284,6 +290,8 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             raise RuntimeError(f"{workload}: graph-on/off request {index} status differs")
         if left["diagnostics"] != right["diagnostics"]:
             raise RuntimeError(f"{workload}: graph-on/off request {index} diagnostics/transcript differ")
+        if not require_reports:
+            continue
         metric_fields = ("name_lookup_hits", "name_lookup_classification_chain_visits")
         if any(field not in left["cache"] or field not in right["cache"] for field in metric_fields):
             raise RuntimeError(f"{workload}: request {index} omitted NameLookup measurement counters")
@@ -329,6 +337,8 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
                 )
     if len(off_requests) < 3:
         raise RuntimeError(f"{workload}: benchmark needs at least one body edit")
+    if not require_reports:
+        return
     for index, (left, right) in enumerate(zip(off_requests, on_requests)):
         if not left["label"].startswith("body-edit-"):
             continue
@@ -469,7 +479,7 @@ def main() -> int:
         "name_lookup_hit_semantics": "call-facts uses one unique callee per body; warm raw hits must exceed the prime same-request duplicate baseline, exposing aggregate prior-request reuse",
         "name_lookup_chain_visit_semantics": "both modes count only symbol/member hash-chain rows visited by the fused NameLookup cold classifier; direct name_known callers (including RegionNew, value-block captures, and flow checks) and qualified Expr.Scope probes are excluded; warm reductions can include same-request duplicate reads and do not represent all resolver name-chain work",
         "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body; zero-fact expects no direct facts",
-        "timing_instrumentation": "ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 enables per-row name-classification chain counters in timed arms; graph-off visits more rows, so ratios include asymmetric telemetry overhead and may overstate graph-on gains; timings are not production-equivalent until a counter-disabled timing arm exists",
+        "timing_instrumentation": "separate routing arms enable cache reports and assert reuse; timing arms disable cache reports and chain-visit counting, retain phase timing, and must match routing-arm diagnostics; summaries contain timing arms only",
         "diagnostic_parity": "all per-request compiler transcript lines after timing/cache instrumentation removal",
         "benchmark_host_lock": str(host_lock_path),
         "host_qualification": str(host_qualification),
@@ -520,6 +530,7 @@ def main() -> int:
     }
     metadata["source_sequence_sha256"] = source_hashes
     arms: list[dict[str, Any]] = []
+    routing_arms: list[dict[str, Any]] = []
     try:
         for pair_index in range(args.pairs):
             ordered_workloads = workload_specs if pair_index % 2 == 0 else tuple(reversed(workload_specs))
@@ -531,53 +542,62 @@ def main() -> int:
                     if (pair_index + workload_index) % 2 == 0
                     else ("graph-on", "graph-off")
                 )
-                pair_arms: dict[str, dict[str, Any]] = {}
-                for order_index, mode in enumerate(order):
-                    try:
-                        check_load_gate(
-                            load_average(),
-                            f"before pair {pair_index} {workload} {mode}",
-                            output,
-                            system,
-                            host_qualification,
+                routing_pair: dict[str, dict[str, Any]] = {}
+                for collect_cache_report in (True, False):
+                    pair_arms: dict[str, dict[str, Any]] = {}
+                    for order_index, mode in enumerate(order):
+                        try:
+                            check_load_gate(
+                                load_average(),
+                                f"before pair {pair_index} {workload} {mode}",
+                                output,
+                                system,
+                                host_qualification,
+                            )
+                        except LoadGateError as error:
+                            raise SystemExit(str(error)) from error
+                        arm = run_arm(
+                            root=root,
+                            stage1=stage1,
+                            source=source,
+                            source_versions=source_versions,
+                            workload=workload,
+                            output=output,
+                            pair_index=pair_index,
+                            mode=mode,
+                            order=order_index,
+                            functions=args.functions,
+                            edits=args.body_edits,
+                            timeout_seconds=args.timeout_seconds,
+                            collect_cache_report=collect_cache_report,
                         )
-                    except LoadGateError as error:
-                        raise SystemExit(str(error)) from error
-                    arm = run_arm(
-                        root=root,
-                        stage1=stage1,
-                        source=source,
-                        source_versions=source_versions,
-                        workload=workload,
-                        output=output,
-                        pair_index=pair_index,
-                        mode=mode,
-                        order=order_index,
-                        functions=args.functions,
-                        edits=args.body_edits,
-                        timeout_seconds=args.timeout_seconds,
+                        pair_arms[mode] = arm
+                        (routing_arms if collect_cache_report else arms).append(arm)
+                        try:
+                            check_load_gate(
+                                load_average(),
+                                f"after pair {pair_index} {workload} {mode}",
+                                output,
+                                system,
+                                host_qualification,
+                            )
+                        except LoadGateError as error:
+                            raise SystemExit(str(error)) from error
+                        for pinned_path, expected_hash in pins.items():
+                            if digest_file(Path(pinned_path)) != expected_hash:
+                                raise SystemExit(f"pinned benchmark input changed during run: {pinned_path}")
+                    validate_pair(
+                        pair_arms["graph-off"],
+                        pair_arms["graph-on"],
+                        args.functions,
+                        workload,
+                        require_reports=collect_cache_report,
                     )
-                    pair_arms[mode] = arm
-                    arms.append(arm)
-                    try:
-                        check_load_gate(
-                            load_average(),
-                            f"after pair {pair_index} {workload} {mode}",
-                            output,
-                            system,
-                            host_qualification,
-                        )
-                    except LoadGateError as error:
-                        raise SystemExit(str(error)) from error
-                    for pinned_path, expected_hash in pins.items():
-                        if digest_file(Path(pinned_path)) != expected_hash:
-                            raise SystemExit(f"pinned benchmark input changed during run: {pinned_path}")
-                validate_pair(
-                    pair_arms["graph-off"],
-                    pair_arms["graph-on"],
-                    args.functions,
-                    workload,
-                )
+                    if collect_cache_report:
+                        routing_pair = pair_arms
+                    else:
+                        for mode in order:
+                            validate_pair(routing_pair[mode], pair_arms[mode], args.functions, workload, require_reports=False)
     finally:
         temp.cleanup()
 
@@ -662,7 +682,7 @@ def main() -> int:
             },
         }
     summary = {"workloads": summaries}
-    result = {"metadata": metadata, "summary": summary, "arms": arms}
+    result = {"metadata": metadata, "summary": summary, "arms": arms, "routing_arms": routing_arms}
     (output / "paired.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "COMPLETE").write_text("Paired retained-session graph measurement finished.\n", encoding="utf-8")
     run_state["complete"] = True
