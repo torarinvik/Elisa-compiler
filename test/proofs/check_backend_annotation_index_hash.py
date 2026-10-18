@@ -80,32 +80,28 @@ facade_text = FACADE.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
-if compact_code(function_section(hash_text, "annotation_index_hash_suffix")) != compact_code('''
-ghost def annotation_index_hash_suffix(text: sview, index: usize, hash: u64) -> u64:
+if compact_code(function_section(hash_text, "annotation_index_hash_prefix")) != compact_code('''
+ghost def annotation_index_hash_prefix(text: sview, index: usize, hash: u64) -> u64:
     requires index <= text.len
-    decreases text.len - index
-    ensure index < text.len implies result == annotation_index_hash_suffix(text, index + 1, (hash ^ text[index].u64()) * ANNOTATION_INDEX_HASH_PRIME)
-    return hash if index == text.len
-    return annotation_index_hash_suffix(text, index + 1, (hash ^ text[index].u64()) * ANNOTATION_INDEX_HASH_PRIME)
+    decreases index
+    ensure index > 0 implies result == (annotation_index_hash_prefix(text, index - 1.usize(), hash) ^ text[index - 1.usize()].u64()) * ANNOTATION_INDEX_HASH_PRIME
+    return hash if index == 0
+    return (annotation_index_hash_prefix(text, index - 1.usize(), hash) ^ text[index - 1.usize()].u64()) * ANNOTATION_INDEX_HASH_PRIME
 '''):
-    raise SystemExit("hash suffix reference no longer defines the recursive FNV-1a byte fold")
+    raise SystemExit("hash prefix reference no longer defines the recursive FNV-1a byte fold")
 
 if compact_code(function_section(hash_text, "annotation_index_hash")) != compact_code('''
 def annotation_index_hash(text: sview) -> u64:
-    ensure result == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
+    ensure result == annotation_index_hash_prefix(text, text.len, ANNOTATION_INDEX_HASH_OFFSET)
     hash: mutable u64 = ANNOTATION_INDEX_HASH_OFFSET
-    offset: mutable usize = 0
-    while offset < text.len |offset, hash, text|:
-        decreases text.len - offset
+    for offset in 0..<text.len |hash, text|:
         invariant offset <= text.len
-        invariant annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
-        assert annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, offset + 1, (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME)
+        invariant hash == annotation_index_hash_prefix(text, offset, ANNOTATION_INDEX_HASH_OFFSET)
+        assert annotation_index_hash_prefix(text, offset + 1.usize(), ANNOTATION_INDEX_HASH_OFFSET) == ((hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME)
         hash <- (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME
-        offset <- offset + 1.usize()
-        assert annotation_index_hash_suffix(text, offset, hash) == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)
+    assert hash == annotation_index_hash_prefix(text, text.len, ANNOTATION_INDEX_HASH_OFFSET)
     return hash
 '''):
-
     raise SystemExit("production owner hash contract or loop invariant changed without updating its proof")
 
 if "const ANNOTATION_INDEX_HASH_OFFSET: u64 = 14695981039346656037" not in hash_text:
@@ -150,7 +146,7 @@ if declarations(positive_text) != POSITIVE_NAMES or declarations(negative_text) 
 proof_shapes = {
     "annotation_hash_matches_recursive_spec": '''ghost def annotation_hash_matches_recursive_spec(text: sview) -> bool:
     ensure result == true
-    return annotation_index_hash(text) == annotation_index_hash_suffix(text, 0, ANNOTATION_INDEX_HASH_OFFSET)''',
+    return annotation_index_hash(text) == annotation_index_hash_prefix(text, text.len, ANNOTATION_INDEX_HASH_OFFSET)''',
     "empty_text_returns_offset_basis": '''def empty_text_returns_offset_basis() -> bool:
     ensure result == true
     return annotation_index_hash("") == ANNOTATION_INDEX_HASH_OFFSET''',

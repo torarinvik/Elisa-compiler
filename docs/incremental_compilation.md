@@ -39,6 +39,165 @@ and reused functions plus phase time; measure with whole-object avoidance
 disabled when testing partial reuse. Keep backend artifact reuse as a subsequent
 boundary with explicit optimizer dependencies and cold/warm parity.
 
+## Bootstrap query publication measurement (2026-10-18)
+
+The Core bootstrap compiler has a separate in-process tracked-query session used
+by its opt-in compile server. Its publication path now consumes the validated,
+deduplicated input inventory directly, avoiding a full map-to-slice-to-map copy.
+Atomic revision updates, missing-versus-empty inputs, and public last-write-wins
+semantics are preserved. A differential edit-history test and race-enabled query
+tests pass, as do the focused incremental semantic, compile-server, and native/LLVM
+parity tests. Consumer tests used read-only Go overlays to exclude concurrent,
+unrelated verifier edits from both baseline and candidate.
+
+Three local runs on an Apple M5 measured median query-session publication falling
+from 2.36 to 2.14 ms for 4,096 input edges, and from 19.40 to 17.56 ms for 32,768
+edges (1,024 queries in each case). Allocated bytes fell about 14% and 16%.
+The synthetic retained local-initializer edit benchmark measured 6.71 versus
+6.51 ms medians, with exactly one initializer checked and 127 reused in both
+versions. These short, sequential samples are exploratory; they do not establish
+a project-wide compile speedup. Raw measurements and source hashes are retained
+under `build/verification/incremental-publication-20261018.*`.
+
+This change reduces cache-maintenance overhead. General semantic-body reuse,
+persistent result replay, backend reuse, and representative edit-to-executable
+qualification remain required for the full incremental-compilation objective.
+
+The Core return-expression cache also now admits canonical `int` parameters and
+returns alongside `i64`. Exact parameter/return types remain part of the source
+identity; current symbol ownership, builtin types, and arithmetic operator-set
+absence are checked before replay. Body/type edits, source relocation, errorful
+fallback, and added/removed `int` operator implementations have cold/warm parity
+controls. Local-initializer replay retains its existing `i64` restrictions.
+LLVM equality and native exit-status checks cover both return types.
+
+A 256-function analysis-only body-edit workload now reuses 255 return bodies and
+checks one changed body. Three short local runs measured approximately 191 ms
+medians both before and after: no reliable timing improvement is established.
+Allocation counts fell from about 1.162 million to 1.016 million per edit, with
+allocated bytes falling from 242.3 to 239.2 MB. Both variants include the same
+alias-identity ownership fix: optimization facts formerly formatted Symbol
+addresses without retaining their owners, allowing GC address reuse to merge
+unrelated identities. The new per-analyzer identity map both retains owners and
+reuses formatted identities. A forced-GC regression fails on the previous
+implementation and passes with ownership retained. These are in-process query
+and typing results, not full-build incremental-compilation qualification.
+
+A subsequent profile of that retained-edit workload identified query publication
+as the largest analyzed CPU contributor. Source-node liveness previously built a
+complete canonical byte buffer and SHA256 digest, then discarded the digest.
+Liveness now uses the same structural visitor with logical byte counting: it
+preserves graph traversal, node identity, rejection rules, and depth/work/byte
+budgets without allocating the serialization buffer or computing a hash. Identity
+creation and exact-tree rebinding still use full fingerprints; liveness only
+checks pointer survival for already indexed source anchors. Per-encoder
+struct field-name caching also avoids repeated reflection metadata construction;
+it retains no cross-invocation schema state. A golden baseline fingerprint guards
+encoding compatibility, and differential tests cover trees, shared nodes, cycles,
+and byte/work/depth rejection.
+
+Three alternating local before/after samples measured the liveness scan at
+222 versus 114 microseconds median, with 191,329 versus 61,600 allocated bytes.
+The 256-function edit workload retained the same 255 reuse / one check counts and
+reduced allocated bytes from about 239.2 to 223.4 MB. Its timing was variable on
+the shared host, so these samples do not establish an overall compiler speedup.
+
+Lexical query keys now use a versioned, length-prefixed encoding with canonical
+ASCII base64 transport instead of repeatedly encoding the dependency spec as
+JSON. Function identity, tree digest, source ordinal/kind, lookup role, domain,
+and requested name all remain exact key fields. A schema gate refuses added
+fields until the encoding is reviewed. Decoding rejects truncation, oversized
+lengths, invalid UTF-8 fields, trailing data, unknown versions, and alternate
+base64 spellings. Existing negative-prefix, nil-blocker, mutation, and binding
+invalidation controls remain applicable; query results and diagnostics keep
+their existing representation. Validation-only call sites avoid constructing
+keys they would immediately discard. This remains a server-local query format,
+not a persistent semantic-result cache.
+
+Three alternating local samples measured key encoding at 670 versus 198 ns and
+decoding at 2,656 versus 355 ns medians. The synthetic retained-edit analysis
+workload measured 177 versus 166 ms medians with the same 255 body reuses and one
+body check. Allocated bytes fell from about 223.4 to 211.8 MB per edit. These short
+analysis-only samples exclude parsing, native emission, and linking; they do not
+establish project-wide edit-to-executable performance.
+
+A final confirmation on the bounded codec used three alternating pairs with
+five timed edits per sample: medians were 211 versus 195 ms, with 223.4 versus
+211.8 MB allocated per edit and unchanged reuse/check counts. The full semantic
+suite, compile-server controls, LLVM/native parity, and 18,934 codec fuzz inputs
+passed. Consumer gates excluded concurrent unrelated verifier edits through
+read-only Go overlays; they do not qualify that separate verifier candidate.
+
+## Native pipeline baseline (2026-10-18)
+
+`BenchmarkIncrementalEditPipeline` in the Core backend now measures fresh parsing,
+analysis, LLVM lowering/verification, and native O0 object emission together. It
+alternates a real single-body edit in 256 integer arithmetic functions. Parsing
+is inside timing; session warmup, linking, and process startup are outside it.
+The fresh control uses ordinary analysis without a retained query session.
+
+Three local samples of three edits each gave these median stage times:
+
+| Mode | Parse | Analysis | LLVM lowering | Native object | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fresh | 14.3 ms | 63.3 ms | 52.7 ms | 275.1 ms | 406.1 ms |
+| Retained | 13.6 ms | 161.4 ms | 51.5 ms | 273.6 ms | 501.1 ms |
+
+Retained analysis checked one body and reused 255 on every edit, yet the complete
+measured pipeline was about 23% slower than fresh. Allocated bytes were 259.7 MB
+versus 108.1 MB. The earlier before/after query optimizations improved the
+retained path, but do not establish that retention is faster than clean analysis.
+Do not enable it by default on that evidence. These are synthetic, short-run
+measurements, not full compiler self-compilation timings.
+
+The next performance gates must compare against fresh compilation, as well as
+the previous retained implementation. Query publication/validation overhead must
+fall below the work it avoids. Native object generation is also a major reuse
+target. Current lowering emits bodies into one shared LLVM module; emitting a
+body can additionally create globals, helpers, and generic specializations.
+Backend reuse therefore needs a dependency-complete artifact boundary, target
+and code-generation option validation, and native parity across edits. Skipping
+an unchanged body without restoring its generated dependencies is insufficient.
+
+### Keep resolver auditing separate from compilation
+
+Profiling the retained pipeline identified a shadow lexical query audit as a
+major cost. It records ordinary resolver reads, builds a separate query world,
+then compares query answers to the ordinary resolver after analysis. That world
+does not authorize the current primitive typing replay: current parameter/local
+binding queries and integer-operator-set checks provide that admission boundary.
+
+The default `NewIncrementalAnalysisSession` now omits this shadow audit.
+`NewIncrementalAnalysisSessionWithOptions` with `AuditLexicalReads: true` retains
+the complete audit for qualification and future query integration. Lexical audit
+tests explicitly select it. This option does not disable any dependency used by
+current reuse. An edit-history test compares fresh, retained, and audited results
+through source relocation, body edits, missing identifiers, and type changes,
+while requiring identical body/initializer replay decisions. LLVM/native parity
+also runs with auditing enabled and disabled.
+
+The pipeline benchmark now has separate `fresh`, `retained`, and `retained-audit`
+modes. Earlier retained measurements in this document included the audit; do not
+compare those timings to default sessions without accounting for this change.
+Three subsequent rounds, each running all three modes for five timed edits,
+measured these medians with no other tests from this task running:
+
+| Mode | Analysis | Parse through object | Allocated bytes/edit | Allocations/edit |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh | 60.79 ms | 421.69 ms | 108.10 MB | 1,053,503 |
+| Retained | 56.87 ms | 408.50 ms | 105.16 MB | 908,851 |
+| Retained with audit | 173.00 ms | 527.43 ms | 259.50 MB | 1,330,367 |
+
+Both retained modes checked one body and reused 255 per edit. Moving the shadow
+audit off the normal path reduced its analysis median by about 67% and allocated
+bytes by about 59%. Retained total samples ranged from 402.7 to 511.7 ms;
+fresh ranged from 409.0 to 433.9 ms. Shared-host timing variation is too large to
+qualify a reliable overall advantage over fresh compilation. These samples
+establish the audit's cost on this synthetic workload, not professional compiler
+iteration latency. Raw logs and source snapshots are retained under
+`build/verification/incremental-audit-options-20261018/`.
+The full general semantic and backend reuse objective remains unfinished.
+
 ## Historical local implementation snapshot (2026-10-11)
 
 Historical VAST timings are motivation, not the current local baseline;
