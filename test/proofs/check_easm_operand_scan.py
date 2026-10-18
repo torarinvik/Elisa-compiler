@@ -319,7 +319,7 @@ for required in (
     "assert many_scan.address_open == open",
     "assert many_scan.address_close == close",
     "assert not many_scan.valid or many_scan.count != TOO_MANY_OPERANDS_SENTINEL or ( many_scan.first_separator < many_scan.last_separator and many_scan.last_separator < text.len",
-    "return many_scan",
+    "return InstructionScanResult{start: start, count: TOO_MANY_OPERANDS_SENTINEL, first_separator: first_separator, last_separator: second_separator, has_address_group: has_address, address_open: open, address_close: close, valid: true}",
     "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
     "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
     "ensure result.valid and result.has_address_group implies ( forall candidate in result.start..<result.address_open: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
