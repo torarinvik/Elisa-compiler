@@ -93,10 +93,17 @@ required_body = (
     "count: usize = instructions.count",
     "count_signed: i64 = count.i64()",
     "return -1 if count_signed < 0 or count_signed.usize() != count",
-    "for index in 0..<count |instructions, target|:",
-    "invariant index <= count",
-    "invariant forall prior in 0..<index: not easm_equal(easm_label_name(instructions[prior]), target)",
-    "if easm_equal(easm_label_name(instructions[index]), target): return index.i64()",
+    "assert count_signed >= 0",
+    "assert count_signed.usize() == count",
+    "assert count_signed == instructions.count.i64()",
+    "for index in 0..<count_signed |instructions, target|:",
+    "invariant index >= 0",
+    "invariant index <= count_signed",
+    "invariant forall prior in 0..<index: prior < count_signed and not easm_equal(easm_label_name(instructions[prior.usize()]), target)",
+    "if easm_equal(easm_label_name(instructions[index.usize()]), target):",
+    "assert index < count_signed",
+    "assert index.usize().i64() == index",
+    "return index",
 )
 positions = [lookup.find(compact(fragment)) for fragment in required_body]
 if any(position < 0 for position in positions) or positions != sorted(positions) or not lookup.endswith("return-1"):

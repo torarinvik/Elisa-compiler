@@ -446,12 +446,15 @@ retain recollection and limit reuse to downstream checker work. Do not treat a
 body hash, schema check, or structural validation as a substitute for that
 decision.
 
-The current report counters also have different units: `visited` counts
-function candidates passed through the collector, including candidates rejected
-before `ifc_walk_body`; `matched` counts cacheable records whose body and
-declaration surface match after current facts were recollected. Neither counter
-means semantic analysis was reused. `ga_walks_skipped` is the current measure of
-checker work avoided and counts only the Global-authority body walks skipped.
+The report counts `eligible_bodies` and `matched_eligible_bodies` by unique
+cacheable function record, so a body with multiple facts cannot inflate
+eligibility. `visited` counts function candidates passed through the collector,
+including candidates rejected before `ifc_walk_body`; `matched` counts records
+whose body and declaration surface match after current facts were recollected.
+A matched body is only a source/cache match; it does not mean its semantic result
+was reused. `ga_walks_skipped` is the current measure of avoided checker work and
+counts only Global-authority body walks skipped. Any future local-initializer
+products must be reported separately from function-body counts.
 
 This experiment does not yet skip `collect_effect_sources`, `check_ungranted_panic`,
 authority indexing/closure, code generation, or linking. LLVM fragment loading

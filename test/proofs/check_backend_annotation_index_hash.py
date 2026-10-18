@@ -84,6 +84,7 @@ if compact_code(function_section(hash_text, "annotation_index_hash_prefix")) != 
 ghost def annotation_index_hash_prefix(text: sview, index: usize, hash: u64) -> u64:
     requires index <= text.len
     decreases index
+    ensure index == 0 implies result == hash
     ensure index > 0 implies result == (annotation_index_hash_prefix(text, index - 1.usize(), hash) ^ text[index - 1.usize()].u64()) * ANNOTATION_INDEX_HASH_PRIME
     return hash if index == 0
     return (annotation_index_hash_prefix(text, index - 1.usize(), hash) ^ text[index - 1.usize()].u64()) * ANNOTATION_INDEX_HASH_PRIME
@@ -97,7 +98,6 @@ def annotation_index_hash(text: sview) -> u64:
     for offset in 0..<text.len |hash, text|:
         invariant offset <= text.len
         invariant hash == annotation_index_hash_prefix(text, offset, ANNOTATION_INDEX_HASH_OFFSET)
-        assert annotation_index_hash_prefix(text, offset + 1.usize(), ANNOTATION_INDEX_HASH_OFFSET) == ((hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME)
         hash <- (hash ^ text[offset].u64()) * ANNOTATION_INDEX_HASH_PRIME
     assert hash == annotation_index_hash_prefix(text, text.len, ANNOTATION_INDEX_HASH_OFFSET)
     return hash

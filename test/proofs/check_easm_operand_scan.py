@@ -461,10 +461,17 @@ if instruction_code.index(compact("target_is_local: bool = easm_label_index(fn.i
 label_index = compact(function_section(MODEL.read_text(), "easm_label_index"))
 required_label_lookup = (
     "return -1 if count_signed < 0 or count_signed.usize() != count",
-    "for index in 0..<count |instructions, target|:",
-    "invariant index <= count",
-    "invariant forall prior in 0..<index: not easm_equal(easm_label_name(instructions[prior]), target)",
-    "if easm_equal(easm_label_name(instructions[index]), target): return index.i64()",
+    "assert count_signed >= 0",
+    "assert count_signed.usize() == count",
+    "assert count_signed == instructions.count.i64()",
+    "for index in 0..<count_signed |instructions, target|:",
+    "invariant index >= 0",
+    "invariant index <= count_signed",
+    "invariant forall prior in 0..<index: prior < count_signed and not easm_equal(easm_label_name(instructions[prior.usize()]), target)",
+    "if easm_equal(easm_label_name(instructions[index.usize()]), target):",
+    "assert index < count_signed",
+    "assert index.usize().i64() == index",
+    "return index",
 )
 if any(compact(fragment) not in label_index for fragment in required_label_lookup) or not label_index.endswith("return-1"):
     raise SystemExit("conditional target lookup lost its bounded first-match or unresolved-label behavior")
