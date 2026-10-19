@@ -77,22 +77,22 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
     def test_parallel_runtime_gate_must_precede_worker_submission(self):
         runtime = (
-            "        def par_pass_run[pool](first: u32, count: u32) -> SymbolTable @destination:\n"
+            "        def par_pass_run[@pool](first: u32, count: u32) -> void:\n"
             "            unsafe_pass: mutable bool = false\n"
             "            for offset in 0..<count:\n"
             "                if not par_pass_is_append_only(first + offset):\n"
             "                    unsafe_pass <- true\n"
             "            if count < 2 or shared_pool.handle == null or unsafe_pass:\n"
             "                for offset in 0..<count:\n"
-            "                    table <- par_pass_call(first + offset, file, scratch.loop_view, flags, table)\n"
-            "                return move table\n"
+            "                    table <- par_pass_call[destination](first + offset, file, &loop_view, flags, table)\n"
+            "                return\n"
             "            region par_pass_jobs_region:\n"
             "                jobs: mutable darray[ParPassJob] @par_pass_jobs_region = []\n"
             "                nursery on(shared_pool):\n"
             "                    submit par_pass_worker(ticket)\n"
         )
         self.assertEqual(audit.parallel_runtime_serial_guard_errors(runtime), [])
-        missing_move_return = runtime.replace("return move table", "return")
+        missing_move_return = runtime.replace("                return\n", "                pass\n")
         self.assertTrue(audit.parallel_runtime_serial_guard_errors(missing_move_return))
         immutable_guard = runtime.replace(
             "unsafe_pass: mutable bool = false",
@@ -137,7 +137,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
         self.assertEqual((calls[0]["start"], calls[0]["count"]), (35, 8))
         self.assertIsNotNone(calls[0]["match"].group(2))
         self.assertIsNotNone(calls[0]["match"].group(3))
-        self.assertEqual(audit.normalized_par_run_line(line, calls[0]["match"]), line)
+        self.assertEqual(audit.normalized_par_run_line(line, calls[0]["match"]), line.replace("&pass_scratch_slots[0]", "loop_view"))
 
     def test_bare_parallel_call_normalizes_to_explicit_lmut_update(self):
         line = (
@@ -153,7 +153,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
         self.assertIsNotNone(calls[0]["match"].group(3))
         self.assertEqual(
             audit.normalized_par_run_line(line, calls[0]["match"]),
-            "        table <- par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], 35, 8) "
+            "        table <- par_pass_run(file, flags, table, shared_pool, loop_view, 35, 8) "
             "can Global{Read,Write}",
         )
 
@@ -186,6 +186,63 @@ class SemanticParallelAuditTest(unittest.TestCase):
             "initialize exactly one" in error
             for error in audit.pipeline_scratch_errors(uninitialized, 0, len(uninitialized), uninitialized_calls)
         ))
+
+    def test_typed_view_calls_require_initialized_view(self):
+        declaration = "        loop_view: Ast::File = semantic_loop_view(file)"
+        call = "        table <- par_pass_run(file, flags, table, shared_pool, loop_view, 0, 2)"
+        lines = [declaration, call]
+        calls, errors = audit.par_run_calls(lines)
+        self.assertEqual(errors, [])
+        self.assertEqual(audit.pipeline_scratch_errors(lines, 0, len(lines), calls), [])
+        for invalid in [[call], [call, declaration], [declaration, declaration, call],
+                        [declaration, call, call.replace("loop_view, 0", "&slots[0], 0")]]:
+            invalid_calls, errors = audit.par_run_calls(invalid)
+            self.assertEqual(errors, [])
+            self.assertTrue(audit.pipeline_scratch_errors(invalid, 0, len(invalid), invalid_calls))
+
+    def test_typed_view_normalization_is_idempotent(self):
+        line = "        table <- par_pass_run(file, flags, table, shared_pool, loop_view, 3, 2)"
+        calls, errors = audit.par_run_calls([line])
+        self.assertEqual(errors, [])
+        self.assertEqual(audit.normalized_par_run_line(line, calls[0]["match"]), line)
+
+    def test_emit_uses_typed_view_without_scratch_and_is_idempotent(self):
+        from unittest.mock import patch
+        lines = ["def check_full_into_pipeline():", "    loop_view: Ast::File = semantic_loop_view(file)",
+                 "    table <- check_one(loop_view.top_decls, table)", "    PhaseTimer::minor(\"sem:check_one\")", "    return"]
+        run = [{"line": 2, "indent": "    ", "name": "check_one", "args": "loop_view.top_decls, table"}]
+        with patch.object(audit, "plan_runs", return_value=(lines, [], [], [run])), patch.object(audit, "pipeline_statements", return_value=(lines, 0, len(lines), [])):
+            output, flags, _, _ = audit.emit({})
+        self.assertFalse(any("ParPassScratch" in line for line in output))
+        self.assertTrue(any("shared_pool, loop_view, 0, 1)" in line for line in output))
+        with patch.object(audit, "plan_runs", return_value=(output, flags, [], [])), patch.object(audit, "pipeline_statements", return_value=(output, 0, len(output), [])):
+            repeated, _, _, _ = audit.emit({})
+        self.assertEqual(repeated, output)
+
+    def test_generated_migration_preserves_other_function_scratch(self):
+        from unittest.mock import patch
+        outside = "    other_slots: mutable darray[ParPassScratch[pool]] @pool = []"
+        inside = "    pass_scratch_slots: mutable darray[ParPassScratch[pool]] @pool = []"
+        outside_flags = "    flags: ParPassFlags = ParPassFlags{other: true}"
+        lines = ["def other():", outside, outside_flags, "    return", "def check_full_into_pipeline():",
+                 "    loop_view: Ast::File = semantic_loop_view(file)", inside,
+                 "    table <- par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], 0, 1)", "    return"]
+        with patch.object(audit, "plan_runs", return_value=(lines, [], [], [])), patch.object(audit, "pipeline_statements", return_value=(lines, 4, len(lines), [])):
+            output, _, _, _ = audit.emit({})
+        self.assertIn(outside, output)
+        self.assertIn(outside_flags, output)
+        self.assertNotIn(inside, output)
+        self.assertTrue(any("shared_pool, loop_view, 0, 1)" in line for line in output))
+
+    def test_typed_job_view_requires_field_initialization_and_worker_borrow(self):
+        source = ("        struct ParPassJob:\n            loop_view: Ast::File\n"
+                  "        def worker():\n            view: Ast::File& = &job.loop_view\n"
+                  "        def run():\n            jobs.push(ParPassJob{loop_view: loop_view})\n")
+        self.assertEqual(audit.parallel_runtime_view_errors(source), [])
+        for broken in [source.replace("loop_view: loop_view", "other: loop_view"),
+                       source.replace("loop_view: Ast::File", "other: Ast::File"),
+                       source.replace("&job.loop_view", "job.view_bits.cast[Ast::File&]")]:
+            self.assertTrue(audit.parallel_runtime_view_errors(broken))
 
     def test_dispatcher_accepts_single_update_inside_effect_scope(self):
         source = (

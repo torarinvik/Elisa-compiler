@@ -90,7 +90,7 @@ ENUM_VARIANT_RE = re.compile(r"^\s+([A-Z]\w*)\b")
 CALL_RE = re.compile(r"\b([A-Za-z_]\w*)[ \t]*(?:\[[^\]\n]*\])?[ \t]*\(")
 PAR_RUN_RE = re.compile(
     r"^([ \t]*)(table <- )?par_pass_run\(file, flags, table, shared_pool, "
-    r"(&[A-Za-z_]\w*\[\d+\]), (\d+), (\d+)\)([ \t]+can[ \t]+[^\n]+)?[ \t]*$"
+    r"(loop_view|&[A-Za-z_]\w*\[\d+\]), (\d+), (\d+)\)([ \t]+can[ \t]+[^\n]+)?[ \t]*$"
 )
 PAR_RUN_ANY_RE = re.compile(r"\bpar_pass_run\s*\(")
 MUTABLE_POINTER_CAST_RE = re.compile(
@@ -381,7 +381,7 @@ def par_run_calls(lines, offset=0):
 
 def normalized_par_run_line(line, match):
     """Emit the lmut call with an explicit table update while preserving effects/indentation."""
-    return (match.group(1) + "table <- par_pass_run(file, flags, table, shared_pool, " + match.group(3) + ", "
+    return (match.group(1) + "table <- par_pass_run(file, flags, table, shared_pool, " + "loop_view" + ", "
             + match.group(4) + ", " + match.group(5) + ")" + (match.group(6) or ""))
 
 
@@ -389,7 +389,7 @@ def parse_parallel_dispatch(source):
     """Return dispatcher arms as (id, pass name, args, condition), plus structural errors."""
     lines = source.splitlines()
     definition = next((i for i, line in enumerate(lines)
-                       if re.match(r"^[ \t]*def par_pass_call\(", line)), None)
+                       if re.match(r"^[ \t]*def par_pass_call(?:\[[^\]\n]+\])?\(", line)), None)
     if definition is None:
         return [], ["semantic_parallel_passes.elisa: missing par_pass_call dispatcher"]
 
@@ -2710,9 +2710,10 @@ def emit(info):
             out[call["line"]] = normalized_par_run_line(out[call["line"]], call["match"])
         initializer = "flags: ParPassFlags = ParPassFlags{%s}" % ", ".join("%s: %s" % (flag, flag) for flag in flags)
         for i, line in enumerate(out):
-            if re.match(r"\s*flags: ParPassFlags\s*=\s*ParPassFlags\{", line):
+            if start <= i < end and re.match(r"\s*flags: ParPassFlags\s*=\s*ParPassFlags\{", line):
                 indent = line[:len(line) - len(line.lstrip())]
                 out[i] = indent + initializer
+        out = [line for i, line in enumerate(out) if not (start <= i < end and re.match(r"\s*\w+:\s*mutable darray\[ParPassScratch\[", line))]
         return out, flags, [], []
     out = list(lines)
     calls = []
@@ -2724,7 +2725,7 @@ def emit(info):
             pass_id += 1
         head = run[0]
         new = [head["indent"] + "# Append-only passes %d..%d, run concurrently (semantic_parallel.elisa)." % (first, pass_id - 1),
-               head["indent"] + "table <- par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], %d, %d)" % (first, len(run)),
+               head["indent"] + "table <- par_pass_run(file, flags, table, shared_pool, loop_view, %d, %d)" % (first, len(run)),
                head["indent"] + 'PhaseTimer::minor("sem:par_run_%d")' % k]
         for s in run:
             out[s["line"]] = None
@@ -2734,16 +2735,10 @@ def emit(info):
     view_line = next(i for i in range(start, end) if re.match(r"\s*loop_view: Ast::File = ", lines[i]))
     view_indent = lines[view_line][:len(lines[view_line]) - len(lines[view_line].lstrip())]
     fields = ", ".join("%s: %s" % (f, f) for f in flags)
-    scratch_line = next((i for i in range(start, end)
-                         if re.match(r"\s*\w+:\s*mutable darray\[ParPassScratch\[", lines[i])), None)
-    if scratch_line is None:
-        scratch_name = "pass_scratch_slots"
-        scratch_init = (view_indent + "pass_scratch_slots: mutable darray[ParPassScratch[pool]] @pool = "
-                        "[ParPassScratch[pool]{loop_view: loop_view}]")
-        out[view_line] = [lines[view_line], scratch_init,
-                          view_indent + "flags: ParPassFlags = ParPassFlags{%s}" % fields]
-    else:
-        out[view_line] = [lines[view_line], view_indent + "flags: ParPassFlags = ParPassFlags{%s}" % fields]
+    out[view_line] = [lines[view_line], view_indent + "flags: ParPassFlags = ParPassFlags{%s}" % fields]
+    for i in range(start, end):
+        if re.match(r"\s*\w+:\s*mutable darray\[ParPassScratch\[", lines[i]):
+            out[i] = None
     flat = []
     for item in out:
         if item is None:
@@ -2843,10 +2838,10 @@ def parallel_runtime_serial_guard_errors(source):
     serial = find_line(r"if count < 2 or shared_pool\.handle == null or unsafe_pass:")
     serial_loop = find_line(r"for offset in 0\.\.<count", serial + 1 if serial is not None else 0)
     call = find_line(
-        r"table <- par_pass_call\(first\s*\+\s*offset, file, scratch\.loop_view, flags, table\)",
+        r"table <- par_pass_call\[destination\]\(first\s*\+\s*offset, file, &loop_view, flags, table\)",
         serial_loop + 1 if serial_loop is not None else 0,
     )
-    return_line = find_line(r"^\s*return\s+move\s+table\s*$", call + 1 if call is not None else 0)
+    return_line = find_line(r"^\s*return\s*$", call + 1 if call is not None else 0)
     worker = find_line(r"nursery on\(shared_pool\):")
     region = find_line(r"region par_pass_jobs_region:")
     jobs = find_line(r"jobs: mutable darray\[ParPassJob\] @par_pass_jobs_region = \[\]")
@@ -2891,6 +2886,33 @@ def parallel_runtime_serial_guard_errors(source):
     return errors
 
 
+def parallel_runtime_lmut_errors(source, passes):
+    """Check parallel dispatch keeps the caller's explicit table region."""
+    line = next((line for line in source.splitlines()
+                 if re.match(r"^[ \t]*def par_pass_run\[", line)), None)
+    if line is None:
+        return ["semantic_parallel.elisa: missing par_pass_run"]
+    errors = []
+    if not re.search(r"\btable:[ \t]*mutable SymbolTable&[ \t]*@\w+,", line):
+        errors.append("semantic_parallel.elisa: par_pass_run must borrow the caller's table descriptor in a named region")
+    if not re.search(
+        r"def par_pass_call\[@table_region\]\(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region\) -> void:",
+        passes,
+    ):
+        errors.append("semantic_parallel_passes.elisa: dispatcher must tie its table borrow to an explicit named region")
+    if not re.search(r"\(&frozen_table\)\.cast\[mutable void&\], table\.cast\[void&\], size_of\(SymbolTable\)", source):
+        errors.append("semantic_parallel.elisa: par_pass_run must copy bytes from the borrowed table descriptor")
+    if not re.search(r"table <- par_pass_call\[destination\]\(first \+ offset, file, &loop_view, flags, table\)", source):
+        errors.append("semantic_parallel.elisa: serial dispatcher must instantiate the caller's table region")
+    if not re.search(r"table <- par_pass_parent_diagnostic\[destination\]\(source_bits, table\)", source):
+        errors.append("semantic_parallel.elisa: parent diagnostic splice must instantiate its explicit table region")
+    if not re.search(r"table <- par_pass_call\(job\.pass_id, file, view, job\.flags, table\)", source):
+        errors.append("semantic_parallel.elisa: worker dispatcher call must explicitly update its local table")
+    if not re.search(r"\) -> void:", line):
+        errors.append("semantic_parallel.elisa: par_pass_run must mutate the borrowed table in place")
+    return errors
+
+
 def passes_source(flags, calls, max_batch):
     head = """# Stage1 semantic layer — the passes semantic_parallel.elisa may run concurrently, by id.
 # GENERATED by scripts/semantic_parallel_gen.py --write from the sequential pipeline in
@@ -2911,7 +2933,7 @@ extend Semantic:
             "        struct ParPassFlags:"]
     body += ["            %s: %s" % (f, types[f]) for f in flags]
     body += ["",
-            "        def par_pass_call(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: lmut SymbolTable) -> void:",
+            "        def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void:",
             "            can Memory.Allocate, Abort.Panic:"]
     for n, (pid, s) in enumerate(calls):
         args = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", s["args"]) if flags else s["args"]
@@ -2958,6 +2980,32 @@ def refresh_pass_flags(source, flags):
     return updated
 
 
+def refresh_dispatch_table_region(source):
+    """Tie the generated dispatcher borrow to an explicit region parameter."""
+    lines = source.splitlines()
+    matches = [index for index, line in enumerate(lines)
+               if re.match(r"^[ \t]*def par_pass_call(?:\[[^\]\n]+\])?\(", line)]
+    if len(matches) != 1:
+        raise ValueError("expected exactly one par_pass_call dispatcher signature")
+    index = matches[0]
+    indent = lines[index][:len(lines[index]) - len(lines[index].lstrip())]
+    expected = (
+        indent + "def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
+        "flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void:"
+    )
+    accepted = {
+        indent + "def par_pass_call(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
+        "flags: ParPassFlags, table: lmut SymbolTable) -> void:",
+        indent + "def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
+        "flags: ParPassFlags, table: lmut SymbolTable& @table_region) -> void:",
+        expected,
+    }
+    if lines[index] not in accepted:
+        raise ValueError("unrecognized par_pass_call dispatcher signature")
+    lines[index] = expected
+    return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+
 def generated_parallel_errors(info):
     """Validate generated pipeline ranges against the dispatcher's ordered pass IDs."""
     api = open(API, encoding="utf-8").read()
@@ -2981,7 +3029,7 @@ def generated_parallel_errors(info):
     if not pipeline_calls:
         errors.append("semantic_api.elisa: no generated par_pass_run calls found")
     if any(call["match"].group(3) is None for call in pipeline_calls):
-        errors.append("semantic_api.elisa: generated par_pass_run call is missing pool-owned scratch storage")
+        errors.append("semantic_api.elisa: generated par_pass_run call is missing its typed loop view")
     if any(call["match"].group(2) is None for call in pipeline_calls):
         errors.append("semantic_api.elisa: par_pass_run calls must explicitly update the lmut table")
     counts = [call["count"] for call in pipeline_calls]
@@ -3021,6 +3069,9 @@ def generated_parallel_errors(info):
     }
     errors.extend(parallel_safety_gate_errors(passes, safe_ids))
     errors.extend(parallel_runtime_serial_guard_errors(parallel))
+    errors.extend(parallel_runtime_lmut_errors(parallel, passes))
+    errors.extend(parallel_runtime_view_errors(parallel))
+
 
     _lines, _start, _end, params = pipeline_statements()
     expected_flags = [p for p in params if p not in PIPELINE_CONTEXT]
@@ -3032,13 +3083,52 @@ def generated_parallel_errors(info):
     initialized_flags = re.findall(r"\b(\w+):", flag_init.group(1)) if flag_init else []
     if initialized_flags != expected_flags:
         errors.append("semantic_api.elisa: ParPassFlags initializer does not match pipeline scalar flags")
-    if not re.search(r"def par_pass_run\[[^\]]*@pool[^\]]*\]\([^\n]*shared_pool: mutable ThreadPool& @pool, scratch: mutable ParPassScratch\[pool\]& @pool", parallel):
+    if not re.search(r"def par_pass_run\[[^\]]*@pool[^\]]*\]\([^\n]*shared_pool: mutable ThreadPool& @pool, loop_view: Ast::File", parallel):
         errors.append("semantic_parallel.elisa: par_pass_run must borrow the shared pool in the caller's region")
     return errors
 
 
+def parallel_runtime_view_errors(source):
+    """Require a typed job copy and a worker borrow, rather than a parameter address."""
+    errors = []
+    lines = source.splitlines()
+    start = next((i for i, line in enumerate(lines) if re.match(r"^[ \t]*struct ParPassJob:", line)), None)
+    block = []
+    if start is not None:
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        for line in lines[start + 1:]:
+            if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= indent:
+                break
+            block.append(line)
+    if not any(re.fullmatch(r"[ \t]+loop_view: Ast::File[ \t]*", line) for line in block):
+        errors.append("semantic_parallel.elisa: ParPassJob must hold a typed loop view")
+    if not re.search(r"jobs\.push\(ParPassJob\{[^\n}]*loop_view:[ \t]*loop_view(?:,|\})", source):
+        errors.append("semantic_parallel.elisa: each job must initialize its typed loop view from the pipeline view")
+    if not re.search(r"view: Ast::File& = &job\.loop_view", source):
+        errors.append("semantic_parallel.elisa: workers must borrow the loop view in their joined job record")
+    if re.search(r"\bview_bits[ \t]*:|\bjob\.view_bits\b", source):
+        errors.append("semantic_parallel.elisa: raw loop-view descriptor addresses must not be retained")
+    return errors
+
+
 def pipeline_scratch_errors(lines, start, end, calls):
-    """Check that every generated worker call uses the initialized pool scratch slot."""
+    """Check typed-view initialization; retain legacy slot checks for migration."""
+    # Historical slot-shaped calls remain parseable for migration and old fixtures.
+    # New calls must use the single typed view initialized before any dispatch.
+    view_calls = [call for call in calls if call["match"].group(3) == "loop_view"]
+    if view_calls:
+        errors = []
+        if len(view_calls) != len(calls):
+            errors.append("semantic_api.elisa: mixed typed-view and scratch-slot calls")
+        declarations = [i for i in range(start, end)
+                        if re.match(r"^[ \t]*loop_view: Ast::File = semantic_loop_view\(file\)[ \t]*$", lines[i])]
+        if len(declarations) != 1:
+            errors.append("semantic_api.elisa: initialize exactly one typed loop_view")
+        elif any(call["line"] <= declarations[0] for call in calls):
+            errors.append("semantic_api.elisa: loop_view must be initialized before par_pass_run")
+        if any(re.match(r"\s*\w+:\s*mutable darray\[ParPassScratch\[", lines[i]) for i in range(start, end)):
+            errors.append("semantic_api.elisa: typed-view calls must not allocate obsolete scratch slots")
+        return errors
     scratch_decl_re = re.compile(
         r"^[ \t]*(\w+):[ \t]*mutable darray\[ParPassScratch\[pool\]\][ \t]*@pool[ \t]*=[ \t]*"
         r"\[[ \t]*ParPassScratch\[pool\]\{[ \t]*loop_view:[ \t]*loop_view[ \t]*\}[ \t]*\][ \t]*$"
@@ -3127,6 +3217,7 @@ def main(argv):
             current = open(PASSES, encoding="utf-8").read()
             current = refresh_max_batch(current, max_batch)
             current = refresh_pass_flags(current, flags)
+            current = refresh_dispatch_table_region(current)
             dispatch, dispatch_errors = parse_parallel_dispatch(current)
             if dispatch_errors:
                 print("semantic_parallel_gen: refusing --write: " + "; ".join(dispatch_errors))

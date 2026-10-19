@@ -33,7 +33,8 @@ extend Semantic:
             # joins; the worker writes only its own diagnostics descriptor.
             frozen_table: SymbolTable
             file_bits: uintptr
-            view_bits: uintptr
+            # Read-only AST backing remains borrowed until the nursery joins.
+            loop_view: Ast::File
             flags: ParPassFlags
             pass_id: u32
             # Owns copied diagnostic payloads until the parent appends them, then is freed.
@@ -49,14 +50,6 @@ extend Semantic:
         struct ParPassTicket:
             job_bits: uintptr
             ast: Ast::Decl?
-
-        # The loop view is reused across the whole pipeline. Per-batch jobs are allocated in
-        # par_pass_run's lexical region instead: they contain borrowed table addresses and must
-        # not persist in this pool-lifetime object. Tickets carry scalar addresses because
-        # pool_submit requires one monomorphic, structurally shareable payload type; the nursery
-        # joins every worker before the per-batch records' region ends.
-        struct ParPassScratch[@pool]:
-            loop_view: Ast::File
 
         # Explicit allocation is essential: an `in` block does not change the inferred
         # owner of writes through a worker-local lmut SymbolTable.
@@ -142,7 +135,7 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
                 job: mutable heap ParPassJob& = ticket.job_bits.cast[mutable heap ParPassJob&]
                 file: heap Ast::File& = job.file_bits.cast[heap Ast::File&]
-                view: heap Ast::File& = job.view_bits.cast[heap Ast::File&]
+                view: Ast::File& = &job.loop_view
                 shared_bits: uintptr = (&job.frozen_table).cast[void&].uintptr()
                 # Every byte is overwritten by the shallow copy before any field is read.
                 # Avoid constructing the normal table, which reserves its full text buffer
@@ -227,12 +220,10 @@ extend Semantic:
         # Run passes [first, first + count) of par_pass_call over `table` and append their
         # diagnostics in id order: concurrently on the shared pool, or in order on this
         # thread when no pool was supplied (serial mode and syntax-error checks).
-        # Pass the table descriptor by value and return its updated descriptor. On the
-        # parallel path, nested arrays remain borrowed from the caller and are read-only
-        # during the nursery; diagnostics are appended after the join. Keeping the mutable
-        # descriptor local avoids exposing the caller's table reference as a possible
-        # store-through target.
-        def par_pass_run[@file, @destination, @pool](file: Ast::File& @file, flags: ParPassFlags, table: mutable SymbolTable @destination, shared_pool: mutable ThreadPool& @pool, scratch: mutable ParPassScratch[pool]& @pool, first: u32, count: u32) -> SymbolTable @destination:
+        # Mutate the caller's descriptor in place. On the parallel path, jobs receive
+        # shallow descriptor copies whose backing arrays are read-only during the nursery;
+        # the caller's descriptor is only used again after every worker has joined.
+        def par_pass_run[@file, @destination, @pool](file: Ast::File& @file, flags: ParPassFlags, table: mutable SymbolTable& @destination, shared_pool: mutable ThreadPool& @pool, loop_view: Ast::File, first: u32, count: u32) -> void:
             can Memory.Allocate, Memory.Release, Abort.Panic, Parallel, Unsafe.PointerCast, Pool.Submit, Pool.WaitAll, Thread.Spawn, Thread.Join, Atomics.Store, Atomics.Load, Atomics.CompareExchange, Sync{Lock,Wait,Unlock,Notify}:
                 unsafe_pass: mutable bool = false
                 for offset in 0..<count:
@@ -240,14 +231,14 @@ extend Semantic:
                         unsafe_pass <- true
                 if count < 2 or shared_pool.handle == null or unsafe_pass:
                     for offset in 0..<count |table, file, flags, first|:
-                        table <- par_pass_call(first + offset, file, scratch.loop_view, flags, table) can Global{Read,Write}
-                    return move table
+                        table <- par_pass_call[destination](first + offset, file, &loop_view, flags, table) can Global{Read,Write}
+                    return
                 # The raw table address in a job is valid only for this synchronous batch.
                 # Keep its storage in a lexical region around submission, join, validation,
                 # splice, and arena release instead of retaining it in pool-lifetime scratch.
                 region par_pass_jobs_region:
                     jobs: mutable darray[ParPassJob] @par_pass_jobs_region = []
-                    for offset in 0..<count |jobs, scratch, table, file, flags, first|:
+                    for offset in 0..<count |jobs, loop_view, table, file, flags, first|:
                         # Copy only the table descriptor into the batch record. The job
                         # borrows the caller-owned backing arrays, which remain frozen until
                         # the nursery joins, without retaining a pointer to the caller's
@@ -256,8 +247,7 @@ extend Semantic:
                         _ = memcpy((&frozen_table).cast[mutable void&], table.cast[void&], size_of(SymbolTable))
                         frozen_table.diagnostics <- []
                         file_bits: uintptr = file.cast[void&].uintptr()
-                        view_bits: uintptr = (&scratch.loop_view).cast[void&].uintptr()
-                        jobs.push(ParPassJob{frozen_table: move frozen_table, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, table_unchanged: false, diagnostics: []})
+                        jobs.push(ParPassJob{frozen_table: move frozen_table, file_bits: file_bits, loop_view: loop_view, flags: flags, pass_id: first + offset, arena: zeroed, table_unchanged: false, diagnostics: []})
                     # Reuse the caller's long-lived pool. The nursery creates only a per-batch
                     # TaskGroup, joins every worker at the block boundary, and leaves pool shutdown
                     # to the caller. The direct counted loop keeps the join proof on the ForStmt path.
@@ -274,7 +264,6 @@ extend Semantic:
                         job: mutable ParPassJob = move job_value
                         for index in 0..<job.diagnostics.count |table, job|:
                             source_bits: uintptr = (&job.diagnostics[index]).cast[void&].uintptr()
-                            table <- par_pass_parent_diagnostic(source_bits, table)
+                            table <- par_pass_parent_diagnostic[destination](source_bits, table)
                         arena_free(&job.arena) can Global{Read,Write}
                         _ = move job.frozen_table
-                return move table
