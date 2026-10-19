@@ -2485,8 +2485,8 @@ def generated_parallel_errors(info):
     initialized_flags = re.findall(r"\b(\w+):", flag_init.group(1)) if flag_init else []
     if initialized_flags != expected_flags:
         errors.append("semantic_api.elisa: ParPassFlags initializer does not match pipeline scalar flags")
-    if not re.search(r"def par_pass_run\([^\n]*shared_pool: mutable ThreadPool&", parallel):
-        errors.append("semantic_parallel.elisa: par_pass_run does not accept the shared pool")
+    if not re.search(r"def par_pass_run\[@pool\]\([^\n]*shared_pool: mutable ThreadPool& @pool", parallel):
+        errors.append("semantic_parallel.elisa: par_pass_run must borrow the shared pool in the caller's region")
     return errors
 
 

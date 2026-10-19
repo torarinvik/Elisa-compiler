@@ -349,12 +349,14 @@ if [[ "${1:-}" == "--profile" ]]; then GATE_PROFILE="$2"; shift 2; fi
 profile_patterns() {
   case "$1" in
     fast)     echo 'emit_*_parity_smoke.sh unreachable_smoke.sh when_smoke.sh
+                    benchmark_expression_loops_smoke.sh
                     match_*_smoke.sh struct_*_smoke.sh namespace_*_smoke.sh
                     slice_*_smoke.sh assign_target_smoke.sh' ;;
     answers)  echo 'behavioural* driver_acceptance_smoke.sh differential*' ;;
     backend)  echo 'backend_*_smoke.sh self_host_gen3_smoke.sh opt_pipeline_smoke.sh
                     array_*_smoke.sh slice_*_smoke.sh struct_*_smoke.sh' ;;
-    parser)   echo 'lexer* parser* emit_tokens_parity_smoke.sh emit_ast_parity_smoke.sh' ;;
+    parser)   echo 'lexer* parser* return_guard_style_smoke.sh
+                    emit_tokens_parity_smoke.sh emit_ast_parity_smoke.sh' ;;
     semantic) echo 'semantic* diagnostics* sema_smoke.sh resolve_smoke.sh internal-suite*
                     diagnostic* unreachable_smoke.sh flow_strict_census_smoke.sh' ;;
     emit)     echo 'emit_*_parity_smoke.sh' ;;

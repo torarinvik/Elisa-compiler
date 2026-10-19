@@ -56,9 +56,15 @@ def fixture(functions: int, edit_version: int, payload_mode: str, add_surface_fu
         for index in range(functions):
             pieces.append(f"def fact_leaf_{index:04d}() -> i64:\n    return {index}\n\n")
         pieces.append("def fact_leaf_alt() -> i64:\n    return 999\n\n")
+    elif payload_mode == "shared-calls":
+        pieces.append("def shared_fact_leaf() -> i64:\n    return 700\n\n")
+        pieces.append("def shared_fact_leaf_alt() -> i64:\n    return 701\n\n")
     for index in range(functions):
         if payload_mode == "call-facts":
             target = "fact_leaf_alt" if index == 0 and edit_version % 2 == 1 else f"fact_leaf_{index:04d}"
+            body = f"    return {target}()\n"
+        elif payload_mode == "shared-calls":
+            target = "shared_fact_leaf_alt" if index == 0 and edit_version % 2 == 1 else "shared_fact_leaf"
             body = f"    return {target}()\n"
         else:
             value = edit_version if index == 0 else index
@@ -141,6 +147,33 @@ def paired_counter_summary(ratios: list[float], label: str) -> dict[str, Any]:
 def timing_arm_kinds(pair_index: int) -> tuple[bool, bool]:
     """Return routing/timing order, counterbalanced across adjacent pairs."""
     return (True, False) if pair_index % 2 == 0 else (False, True)
+
+
+def mode_environment(mode: str) -> dict[str, str]:
+    """Return the explicit resolver/query-graph switches for one benchmark arm."""
+    if mode == "graph-off":
+        return {
+            "ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH": "0",
+            "ELISA_STAGE1_INCREMENTAL_NAME_LOOKUP_DIRECT": "0",
+        }
+    if mode == "graph-on":
+        return {
+            "ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH": "1",
+            "ELISA_STAGE1_INCREMENTAL_NAME_LOOKUP_DIRECT": "0",
+        }
+    if mode == "direct-surface":
+        return {
+            "ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH": "1",
+            "ELISA_STAGE1_INCREMENTAL_NAME_LOOKUP_DIRECT": "1",
+        }
+    raise ValueError(f"unknown semantic-session benchmark mode: {mode}")
+
+
+def three_mode_order(pair_index: int, workload_index: int, *, timing: bool = False) -> tuple[str, ...]:
+    """Rotate the opt-in three-arm order so no resolver mode is always first."""
+    modes = ("graph-off", "graph-on", "direct-surface")
+    offset = (pair_index + workload_index + (1 if timing else 0)) % len(modes)
+    return modes[offset:] + modes[:offset]
 
 
 class DarwinRusageInfoV4(ctypes.Structure):
@@ -299,6 +332,70 @@ def paired_counter_measurements(
     }
 
 
+def paired_mode_measurements(
+    arms: list[dict[str, Any]],
+    pair_count: int,
+    labels: tuple[str, ...] | list[str],
+    field: str,
+    baseline_mode: str,
+    treatment_mode: str,
+    description: str,
+) -> dict[str, Any]:
+    """Compare one opt-in mode with a baseline without changing legacy summaries."""
+    per_label: dict[str, Any] = {}
+    aggregate_ratios: list[float] = []
+    for label in labels:
+        ratios: list[float] = []
+        baseline_samples: list[float] = []
+        treatment_samples: list[float] = []
+        for pair_index in range(pair_count):
+            baseline_arm = next(
+                arm for arm in arms if arm["pair"] == pair_index and arm["mode"] == baseline_mode
+            )
+            treatment_arm = next(
+                arm for arm in arms if arm["pair"] == pair_index and arm["mode"] == treatment_mode
+            )
+            baseline_value = next(
+                request[field] for request in baseline_arm["requests"] if request["label"] == label
+            )
+            treatment_value = next(
+                request[field] for request in treatment_arm["requests"] if request["label"] == label
+            )
+            if baseline_value <= 0 or treatment_value <= 0:
+                raise RuntimeError(f"{description} {label}: paired measurement must be positive")
+            baseline_samples.append(baseline_value)
+            treatment_samples.append(treatment_value)
+            ratio = treatment_value / baseline_value
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise RuntimeError(f"{description} {label}: paired ratio is invalid")
+            ratios.append(ratio)
+        per_label[label] = {
+            f"{baseline_mode}_median": statistics.median(baseline_samples),
+            f"{treatment_mode}_median": statistics.median(treatment_samples),
+            "median_treatment_over_baseline_ratio": statistics.median(ratios),
+            "paired_ratios": ratios,
+        }
+        aggregate_ratios.extend(ratios)
+    if not aggregate_ratios or any(not math.isfinite(ratio) for ratio in aggregate_ratios):
+        raise RuntimeError(f"{description}: paired comparison produced an invalid ratio")
+    aggregate = {
+        "median_treatment_over_baseline_ratio": statistics.median(aggregate_ratios),
+        "geometric_mean_treatment_over_baseline_ratio": math.exp(
+            sum(math.log(ratio) for ratio in aggregate_ratios) / len(aggregate_ratios)
+        ),
+        "treatment_wins": sum(ratio < 1.0 for ratio in aggregate_ratios),
+        "baseline_wins": sum(ratio > 1.0 for ratio in aggregate_ratios),
+        "ties": sum(ratio == 1.0 for ratio in aggregate_ratios),
+        "paired_samples": len(aggregate_ratios),
+    }
+    return {
+        "baseline_mode": baseline_mode,
+        "treatment_mode": treatment_mode,
+        "per_label": per_label,
+        "paired_aggregate": aggregate,
+    }
+
+
 class PipeLineReader:
     """Read bytes directly so select() and Python's text buffer cannot diverge."""
 
@@ -382,13 +479,14 @@ def run_arm(
         "ELISA_SEMANTIC_SERIAL",
     ):
         env.pop(key, None)
+    arm_environment = mode_environment(mode)
     env.update(
         {
             "ELISA_STAGE1_BIN": str(stage1),
-            "ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH": "1" if mode == "graph-on" else "0",
             "ELISA_STAGE1_INCREMENTAL_CACHE_REPORT": "1" if collect_cache_report else "0",
             "ELISA_STAGE1_TIMINGS": "1",
             "ELISA_ALLOW_STALE_STAGE1": "0",
+            **arm_environment,
         }
     )
     started = time.perf_counter_ns()
@@ -413,7 +511,8 @@ def run_arm(
     results: list[dict[str, Any]] = []
     request_specs: list[tuple[str, str | None]] = [("prime", None), ("exact-repeat", None)]
     request_specs.extend((f"body-edit-{index + 1}", source_versions[index + 1]) for index in range(edits))
-    request_specs.append(("declaration-surface-edit", source_versions[-1]))
+    request_specs.append(("declaration-surface-edit", source_versions[-2]))
+    request_specs.append(("post-surface-body-edit", source_versions[-1]))
     transcript_log = mode_dir / "requests.log"
     try:
         assert proc.stdin is not None
@@ -468,6 +567,7 @@ def run_arm(
         "pair": pair_index,
         "workload": workload,
         "mode": mode,
+        "mode_environment": arm_environment,
         "order": order,
         "process_wall_ms": elapsed_ms,
         "process_counters": {
@@ -494,40 +594,139 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
     if len(off_requests) != len(on_requests):
         raise RuntimeError(f"{workload}: graph-on/off request counts differ")
     for index, (left, right) in enumerate(zip(off_requests, on_requests)):
+        if left["label"] != right["label"]:
+            raise RuntimeError(f"{workload}: graph-on/off request {index} labels differ")
         if left["status"] != right["status"]:
             raise RuntimeError(f"{workload}: graph-on/off request {index} status differs")
         if left["diagnostics"] != right["diagnostics"]:
             raise RuntimeError(f"{workload}: graph-on/off request {index} diagnostics/transcript differ")
         if not require_reports:
             continue
+        empty_fact_fields = (
+            "complete_empty_body_eligible",
+            "complete_empty_body_restored",
+            "complete_empty_body_publish_skips",
+            "complete_empty_body_commits",
+        )
+        if any(field not in left["cache"] or field not in right["cache"] for field in empty_fact_fields):
+            raise RuntimeError(f"{workload}: request {index} omitted complete-empty query counters")
+        expected_empty_eligible = {
+            "zero-fact": functions + 1,
+            "call-facts": functions + 2,
+            "shared-calls": 3,
+        }[workload]
+        empty_label = left["label"]
+        if empty_label in {"declaration-surface-edit", "post-surface-body-edit"}:
+            expected_empty_eligible += 1
+        for mode, request in (("graph-off", left), ("graph-on", right)):
+            cache = request["cache"]
+            if empty_label == "exact-repeat":
+                expected_for_request = 0
+            else:
+                expected_for_request = expected_empty_eligible
+            if int(cache["complete_empty_body_eligible"]) != expected_for_request:
+                raise RuntimeError(
+                    f"{workload}: {mode} {empty_label} classified "
+                    f"{cache['complete_empty_body_eligible']} complete-empty bodies; "
+                    f"expected {expected_for_request}"
+                )
+            for field in ("complete_empty_body_restored", "complete_empty_body_publish_skips", "complete_empty_body_commits"):
+                if mode == "graph-off" and int(cache[field]) != 0:
+                    raise RuntimeError(f"{workload}: graph-off {empty_label} unexpectedly reported {field}={cache[field]}")
+        if empty_label == "prime":
+            expected_empty_restored = 0
+            expected_empty_commits = expected_empty_eligible
+        elif empty_label == "exact-repeat":
+            expected_empty_restored = 0
+            expected_empty_commits = 0
+        elif empty_label.startswith("body-edit-") or empty_label == "post-surface-body-edit":
+            expected_empty_restored = expected_empty_eligible - (1 if workload == "zero-fact" else 0)
+            expected_empty_commits = 1 if workload == "zero-fact" else 0
+        elif empty_label == "declaration-surface-edit":
+            # This version repeats the final body-edit value, so all existing
+            # complete-empty bodies remain exact and only the newly added function
+            # needs a query commit.
+            expected_empty_restored = expected_empty_eligible - 1
+            expected_empty_commits = 1
+        else:
+            expected_empty_restored = 0
+            expected_empty_commits = 0
+        graph_on_empty = right["cache"]
+        if int(graph_on_empty["complete_empty_body_restored"]) != expected_empty_restored:
+            raise RuntimeError(
+                f"{workload}: graph-on {empty_label} restored "
+                f"{graph_on_empty['complete_empty_body_restored']} independent empty bodies; "
+                f"expected {expected_empty_restored}"
+            )
+        if int(graph_on_empty["complete_empty_body_publish_skips"]) != expected_empty_restored:
+            raise RuntimeError(
+                f"{workload}: graph-on {empty_label} skipped publication for "
+                f"{graph_on_empty['complete_empty_body_publish_skips']} empty bodies; "
+                f"expected {expected_empty_restored}"
+            )
+        if int(graph_on_empty["complete_empty_body_commits"]) != expected_empty_commits:
+            raise RuntimeError(
+                f"{workload}: graph-on {empty_label} committed "
+                f"{graph_on_empty['complete_empty_body_commits']} empty query values; "
+                f"expected {expected_empty_commits}"
+            )
         metric_fields = ("name_lookup_hits", "name_lookup_classification_chain_visits")
         if any(field not in left["cache"] or field not in right["cache"] for field in metric_fields):
             raise RuntimeError(f"{workload}: request {index} omitted NameLookup measurement counters")
+        reverse_mark_fields = (
+            "reverse_mark_fast_skips",
+            "reverse_mark_full_walks",
+            "reverse_mark_nodes_visited",
+            "reverse_mark_edges_visited",
+        )
+        if any(field not in left["cache"] or field not in right["cache"] for field in reverse_mark_fields):
+            raise RuntimeError(f"{workload}: request {index} omitted reverse-closure measurement counters")
         if int(left["cache"]["name_lookup_hits"]) != 0:
             raise RuntimeError(f"{workload}: graph-off request {index} unexpectedly hit NameLookup")
-        if workload == "call-facts":
+        if any(int(left["cache"][field]) != 0 for field in reverse_mark_fields):
+            raise RuntimeError(f"{workload}: graph-off request {index} unexpectedly marked a reverse closure")
+        if right["label"] == "exact-repeat" and any(
+            int(right["cache"][field]) != 0 for field in reverse_mark_fields
+        ):
+            raise RuntimeError(f"{workload}: graph-on exact-repeat unexpectedly marked a reverse closure")
+        if workload in {"call-facts", "shared-calls"}:
             prime_hits = int(on_requests[0]["cache"]["name_lookup_hits"])
             on_visits = int(right["cache"]["name_lookup_classification_chain_visits"])
             if right["label"] == "prime" and on_visits <= 0:
-                raise RuntimeError("call-facts graph-on prime did not record cold NameLookup chain visits")
-            if right["label"] == "exact-repeat" or right["label"].startswith("body-edit-"):
+                raise RuntimeError(f"{workload} graph-on prime did not record cold NameLookup chain visits")
+            if (
+                right["label"] == "exact-repeat"
+                or right["label"].startswith("body-edit-")
+                or right["label"] == "post-surface-body-edit"
+            ):
                 off_visits = int(left["cache"]["name_lookup_classification_chain_visits"])
                 warm_hits = int(right["cache"]["name_lookup_hits"])
-                if warm_hits <= prime_hits:
+                if workload == "call-facts" and warm_hits <= prime_hits:
                     raise RuntimeError(
                         f"call-facts graph-on {right['label']} did not exceed its prime same-request hit baseline: "
                         f"prime={prime_hits} warm={warm_hits}"
                     )
+                if workload == "shared-calls" and warm_hits <= 0:
+                    raise RuntimeError("shared-calls graph-on warm request had no repeated-name NameLookup hits")
                 if off_visits <= 0 or on_visits >= off_visits:
                     raise RuntimeError(
-                        f"call-facts graph-on {right['label']} did not reduce classification-chain visits: "
+                        f"{workload} graph-on {right['label']} did not reduce classification-chain visits: "
                         f"graph_off={off_visits} graph_on={on_visits} hits={warm_hits} prime_hits={prime_hits}"
                     )
         for field in ("eligible_bodies", "matched_eligible_bodies"):
             if left["cache"].get(field) != right["cache"].get(field):
                 raise RuntimeError(f"{workload}: graph-on/off request {index} has different {field} counts")
-        expected_eligible = functions * 2 + 2 if workload == "call-facts" else functions + 1
-        if left["label"] == "declaration-surface-edit":
+        if (
+            left["cache"].get("name_lookup_direct_surface_classifications") != "0"
+            or right["cache"].get("name_lookup_direct_surface_classifications") != "0"
+        ):
+            raise RuntimeError(f"{workload}: graph-off/on arm unexpectedly used direct-surface classification")
+        expected_eligible = {
+            "call-facts": functions * 2 + 2,
+            "shared-calls": functions + 3,
+            "zero-fact": functions + 1,
+        }[workload]
+        if left["label"] in {"declaration-surface-edit", "post-surface-body-edit"}:
             expected_eligible += 1
         eligible = int(left["cache"].get("eligible_bodies", "-1"))
         if eligible != expected_eligible:
@@ -535,7 +734,20 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
                 f"{workload}: request {left['label']} admitted {eligible} cacheable bodies; "
                 f"fixture expects {expected_eligible}"
             )
-        expected_direct_facts = functions if workload == "call-facts" else 0
+        if left["label"] == "declaration-surface-edit":
+            graph_on = right["cache"]
+            full_walks = int(graph_on["reverse_mark_full_walks"])
+            fast_skips = int(graph_on["reverse_mark_fast_skips"])
+            visited_nodes = int(graph_on["reverse_mark_nodes_visited"])
+            visited_edges = int(graph_on["reverse_mark_edges_visited"])
+            if full_walks <= 0 or visited_nodes <= 0 or visited_edges <= 0:
+                raise RuntimeError(
+                    f"{workload}: declaration-surface edit did not exercise a nonempty reverse closure: "
+                    f"walks={full_walks} nodes={visited_nodes} edges={visited_edges}"
+                )
+            if fast_skips <= 0:
+                raise RuntimeError(f"{workload}: declaration-surface edit did not reuse the repeated-mark shortcut")
+        expected_direct_facts = functions if workload in {"call-facts", "shared-calls"} else 0
         for mode, request in (("graph-off", left), ("graph-on", right)):
             direct_facts = int(request["cache"].get("direct_fact_count", "-1"))
             if direct_facts != expected_direct_facts:
@@ -548,7 +760,7 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
     if not require_reports:
         return
     for index, (left, right) in enumerate(zip(off_requests, on_requests)):
-        if not left["label"].startswith("body-edit-"):
+        if not left["label"].startswith("body-edit-") and left["label"] != "post-surface-body-edit":
             continue
         off_cache = left["cache"]
         on_cache = right["cache"]
@@ -559,19 +771,26 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
         if on_cache.get("source_input_admitted") != "yes":
             raise RuntimeError(f"graph-on edit {index} did not admit unchanged SourceInput")
         expected_restored = int(off_cache.get("eligible_bodies", "0")) - 1
-        restored = int(on_cache.get("function_body_facts_restored", "0"))
+        restored = int(on_cache.get("function_body_facts_restored", "0")) + int(
+            on_cache.get("complete_empty_body_restored", "0")
+        )
         if expected_restored <= 0 or restored != expected_restored:
             raise RuntimeError(
                 f"graph-on edit {index} did not restore every unchanged cacheable body: "
                 f"restored={restored} expected={expected_restored} functions={functions}"
             )
-        publish_skips = int(on_cache.get("body_query_publish_skips", "-1"))
+        publish_skips = int(on_cache.get("body_query_publish_skips", "-1")) + int(
+            on_cache.get("complete_empty_body_publish_skips", "-1")
+        )
         if publish_skips != restored:
             raise RuntimeError(
                 f"graph-on edit {index} did not skip publication evaluation for each restored body: "
                 f"skipped={publish_skips} restored={restored}"
             )
-        if int(off_cache.get("body_query_publish_skips", "-1")) != 0:
+        off_publish_skips = int(off_cache.get("body_query_publish_skips", "-1")) + int(
+            off_cache.get("complete_empty_body_publish_skips", "-1")
+        )
+        if off_publish_skips != 0:
             raise RuntimeError(f"graph-off edit {index} unexpectedly skipped body-query publication")
     surface_index = next(index for index, request in enumerate(off_requests) if request["label"] == "declaration-surface-edit")
     for mode, request in (("graph-off", off_requests[surface_index]), ("graph-on", on_requests[surface_index])):
@@ -584,6 +803,84 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             raise RuntimeError(f"{mode} declaration-surface edit skipped publication after invalidation")
 
 
+def validate_direct_surface_pair(
+    graph_on: dict[str, Any], direct_surface: dict[str, Any], workload: str
+) -> None:
+    """Check semantic parity and prove the opt-in resolver route was selected."""
+    graph_requests = graph_on["requests"]
+    direct_requests = direct_surface["requests"]
+    if len(graph_requests) != len(direct_requests):
+        raise RuntimeError(f"{workload}: graph-on/direct-surface request counts differ")
+    expected_graph_env = mode_environment("graph-on")
+    expected_direct_env = mode_environment("direct-surface")
+    if graph_on.get("mode_environment") != expected_graph_env:
+        raise RuntimeError(f"{workload}: graph-on arm has unexpected environment switches")
+    if direct_surface.get("mode_environment") != expected_direct_env:
+        raise RuntimeError(f"{workload}: direct-surface arm has unexpected environment switches")
+
+    body_cache_fields = (
+        "eligible_bodies",
+        "matched_eligible_bodies",
+        "source_input_admitted",
+        "function_body_facts_restored",
+        "prior_snapshot_fact_fallbacks",
+        "body_query_publish_skips",
+        "complete_empty_body_eligible",
+        "complete_empty_body_restored",
+        "complete_empty_body_publish_skips",
+        "complete_empty_body_commits",
+        "direct_fact_count",
+    )
+    reverse_mark_fields = (
+        "reverse_mark_fast_skips",
+        "reverse_mark_full_walks",
+        "reverse_mark_nodes_visited",
+        "reverse_mark_edges_visited",
+    )
+    for index, (graph_request, direct_request) in enumerate(zip(graph_requests, direct_requests)):
+        if graph_request["label"] != direct_request["label"]:
+            raise RuntimeError(f"{workload}: graph-on/direct-surface request {index} labels differ")
+        if graph_request["status"] != direct_request["status"]:
+            raise RuntimeError(f"{workload}: graph-on/direct-surface request {index} status differs")
+        if graph_request["diagnostics"] != direct_request["diagnostics"]:
+            raise RuntimeError(f"{workload}: graph-on/direct-surface request {index} diagnostics/transcript differ")
+        for mode, request in (("graph-on", graph_request), ("direct-surface", direct_request)):
+            if any(field not in request["cache"] for field in reverse_mark_fields):
+                raise RuntimeError(f"{workload}: {mode} request {index} omitted reverse-closure counters")
+            if request["label"] == "exact-repeat" and any(
+                int(request["cache"][field]) != 0 for field in reverse_mark_fields
+            ):
+                raise RuntimeError(f"{workload}: {mode} exact-repeat unexpectedly marked a reverse closure")
+            if request["label"] == "declaration-surface-edit":
+                values = {field: int(request["cache"][field]) for field in reverse_mark_fields}
+                if any(value <= 0 for value in values.values()):
+                    raise RuntimeError(
+                        f"{workload}: {mode} declaration-surface edit missed reverse-closure work: {values}"
+                    )
+        for field in body_cache_fields:
+            if graph_request["cache"].get(field) != direct_request["cache"].get(field):
+                raise RuntimeError(
+                    f"{workload}: direct-surface request {index} changed body-cache field {field}"
+                )
+        if graph_request["cache"].get("name_lookup_direct_surface_classifications") != "0":
+            raise RuntimeError(f"{workload}: graph-on request {index} unexpectedly used direct surface classification")
+        if direct_request["cache"].get("name_lookup_hits") != "0":
+            raise RuntimeError(f"{workload}: direct-surface request {index} unexpectedly hit NameLookup graph")
+
+    if workload in {"call-facts", "shared-calls"}:
+        for request in direct_requests:
+            direct_count = int(request["cache"].get("name_lookup_direct_surface_classifications", "0"))
+            if direct_count <= 0:
+                raise RuntimeError(
+                    f"{workload} direct-surface {request['label']} did not classify finalized-surface names"
+                )
+            chain_visits = int(request["cache"].get("name_lookup_classification_chain_visits", "-1"))
+            if chain_visits != 0:
+                raise RuntimeError(
+                    f"{workload} direct-surface {request['label']} unexpectedly used cold classifier chains: {chain_visits}"
+                )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1", type=Path, default=ROOT / "bin/elisac-stage1")
@@ -592,6 +889,11 @@ def main() -> int:
     parser.add_argument("--functions", type=int, default=128)
     parser.add_argument("--body-edits", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=120)
+    parser.add_argument(
+        "--include-direct-surface",
+        action="store_true",
+        help="add an opt-in graph-on NameLookup arm that classifies from the finalized resolver surface",
+    )
     parser.add_argument(
         "--concurrent-instruction-counts",
         action="store_true",
@@ -684,27 +986,50 @@ def main() -> int:
     ]
     pins = {str(path.resolve()): digest_file(path.resolve()) for path in pinned_paths}
     metadata: dict[str, Any] = {
-        "status": "exploratory retained semantic-session graph-on/off benchmark; not disk-sidecar timing",
+        "status": (
+            "exploratory retained semantic-session graph-on/off plus direct-surface NameLookup benchmark; not disk-sidecar timing"
+            if args.include_direct_surface
+            else "exploratory retained semantic-session graph-on/off benchmark; not disk-sidecar timing"
+        ),
         "platform": platform.platform(),
         "python": sys.version,
         "stage1_path": str(stage1),
         "stage1_sha256": digest_file(stage1),
         "stage1_provenance_sha256": digest_file(Path(str(stage1) + ".provenance.json")),
         "runner_sha256": digest_file(Path(__file__).resolve()),
+        "direct_surface_arm_enabled": args.include_direct_surface,
+        "mode_environment": {
+            mode: mode_environment(mode)
+            for mode in (
+                ("graph-off", "graph-on", "direct-surface")
+                if args.include_direct_surface
+                else ("graph-off", "graph-on")
+            )
+        },
         "process_counter_method": "macOS proc_pid_rusage(RUSAGE_INFO_V4) sampled on the exact Stage1 compiler child PID; process-level retired instructions, cycles, and CPU time (not LLVM instruction attribution)",
         "pairs": args.pairs,
         "functions": args.functions,
         "body_edits_per_arm": args.body_edits,
         "source_identity": "same absolute temporary source path within each workload across graph modes and pairs",
         "semantic_execution_mode": "default parallel mode; ELISA_SEMANTIC_SERIAL is cleared for each arm",
-        "warm_measurement": "body edits are the primary paired summary; prime, exact-repeat, and declaration-surface controls also receive paired summaries",
+        "warm_measurement": "body edits are the primary paired summary; prime, exact-repeat, declaration-surface, and post-surface body-edit controls also receive paired summaries",
         "name_lookup_hit_semantics": "call-facts uses one unique callee per body; warm raw hits must exceed the prime same-request duplicate baseline, exposing aggregate prior-request reuse",
-        "name_lookup_chain_visit_semantics": "both modes count only symbol/member hash-chain rows visited by the fused NameLookup cold classifier; direct name_known callers (including RegionNew, value-block captures, and flow checks) and qualified Expr.Scope probes are excluded; warm reductions can include same-request duplicate reads and do not represent all resolver name-chain work",
+        "name_lookup_chain_visit_semantics": "graph-off and graph-on count only symbol/member hash-chain rows visited by the fused NameLookup cold classifier; direct-surface counts finalized-surface classifications separately and bypasses per-name graph evaluate/commit; direct name_known callers (including RegionNew, value-block captures, and flow checks) and qualified Expr.Scope probes are excluded",
+        "reverse_mark_counter_semantics": "routing-only request counters cover query-graph reverse invalidation during collection/publication and semantic resolution; exact-repeat expects zero closure work and declaration-surface-edit must exercise a nonempty full walk plus at least one repeated-mark shortcut",
+        "reverse_mark_counter_overhead": "timing arms disable counter increments, but the current graph traversal still checks the runtime metrics flag per visited node and edge; measured graph-on/off ratios include this branch overhead",
         "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body; zero-fact expects no direct facts",
         "primary_performance_metric": "Stage1 process retired instructions from macOS proc_pid_rusage; wall time and cycles are supporting measurements",
         "timing_instrumentation": "separate routing arms enable cache reports and assert reuse; timing arms disable cache reports and chain-visit counting, retain phase timing, collect exact Stage1 process counters, and must match routing-arm diagnostics; summaries contain timing arms only",
-        "arm_kind_ordering": "routing-first on even pairs and timing-first on odd pairs to counterbalance run-order drift",
-        "diagnostic_parity": "all per-request compiler transcript lines after timing/cache instrumentation removal",
+        "arm_kind_ordering": (
+            "with direct-surface enabled, all routing arms run and pass diagnostics parity before timing arms; mode order rotates across pairs"
+            if args.include_direct_surface
+            else "routing-first on even pairs and timing-first on odd pairs to counterbalance run-order drift"
+        ),
+        "diagnostic_parity": (
+            "all routing modes must match per-request compiler transcript lines after timing/cache instrumentation removal before timed arms run; each timed arm must also match its same-mode routing arm"
+            if args.include_direct_surface
+            else "all per-request compiler transcript lines after timing/cache instrumentation removal"
+        ),
         "benchmark_host_lock": None if args.concurrent_instruction_counts else str(host_lock_path),
         "host_qualification": str(host_qualification),
         "host_qualification_sha256": digest_file(host_qualification),
@@ -717,6 +1042,8 @@ def main() -> int:
     }
     temp = tempfile.TemporaryDirectory(prefix="elisa-retained-graph-")
     workload_specs = (("zero-fact", "zero-fact"), ("call-facts", "call-facts"))
+    if args.include_direct_surface:
+        workload_specs += (("shared-calls", "shared-calls"),)
     workloads: dict[str, tuple[Path, list[str]]] = {}
     source_hashes: dict[str, list[str]] = {}
     source_sequence_dir = output / "source-sequence"
@@ -738,6 +1065,19 @@ def main() -> int:
                 add_surface_function=True,
             )
         )
+        source_versions.append(
+            fixture(
+                args.functions,
+                100_001 + args.body_edits,
+                payload_mode,
+                add_surface_function=True,
+            )
+        )
+        if workload == "shared-calls":
+            if source_versions[0].count("return shared_fact_leaf()") != args.functions:
+                raise RuntimeError("shared-calls prime fixture does not route every caller to one global callee")
+            if "return shared_fact_leaf_alt()" not in source_versions[1]:
+                raise RuntimeError("shared-calls first body edit does not change a caller's target")
         workloads[workload] = (source, source_versions)
         workload_sequence_dir = source_sequence_dir / workload
         workload_sequence_dir.mkdir()
@@ -745,8 +1085,10 @@ def main() -> int:
         for index, version in enumerate(source_versions):
             if index == 0:
                 name = "prime.elisa"
-            elif index == len(source_versions) - 1:
+            elif index == len(source_versions) - 2:
                 name = "declaration-surface-edit.elisa"
+            elif index == len(source_versions) - 1:
+                name = "post-surface-body-edit.elisa"
             else:
                 name = f"body-edit-{index}.elisa"
             (workload_sequence_dir / name).write_text(version, encoding="utf-8")
@@ -754,8 +1096,15 @@ def main() -> int:
         source_hashes[workload] = hashes
     metadata["workloads"] = {
         "zero-fact": "cacheable literal-return bodies with zero direct-call facts",
-        "call-facts": "cacheable direct-call bodies with nonempty direct-call facts",
+        "call-facts": "unique-callee workload: cacheable direct-call bodies isolate reuse across distinct global name keys",
     }
+    if args.include_direct_surface:
+        metadata["workloads"]["shared-calls"] = (
+            "shared-callee workload: cacheable callers repeat one global name to expose same-request duplicate lookup plus cross-request reuse; the first caller alternates to a distinct target on edits"
+        )
+    metadata["fixture_scope"] = (
+        "synthetic fixtures contain no imports or import annotations; direct-surface versus graph comparisons do not measure import-heavy resolver-surface setup"
+    )
     metadata["source_sequence_sha256"] = source_hashes
     arms: list[dict[str, Any]] = []
     routing_arms: list[dict[str, Any]] = []
@@ -772,9 +1121,16 @@ def main() -> int:
                 )
                 routing_pair: dict[str, dict[str, Any]] = {}
                 timing_pair: dict[str, dict[str, Any]] = {}
-                for collect_cache_report in timing_arm_kinds(pair_index):
+                collect_sequence = (True, False) if args.include_direct_surface else timing_arm_kinds(pair_index)
+                route_order = three_mode_order(pair_index, workload_index) if args.include_direct_surface else order
+                for collect_cache_report in collect_sequence:
                     pair_arms: dict[str, dict[str, Any]] = {}
-                    for order_index, mode in enumerate(order):
+                    arm_order = (
+                        three_mode_order(pair_index, workload_index, timing=not collect_cache_report)
+                        if args.include_direct_surface
+                        else order
+                    )
+                    for order_index, mode in enumerate(arm_order):
                         if not args.concurrent_instruction_counts:
                             try:
                                 check_load_gate(
@@ -825,11 +1181,19 @@ def main() -> int:
                             workload,
                             require_reports=True,
                         )
+                        if args.include_direct_surface:
+                            validate_direct_surface_pair(
+                                pair_arms["graph-on"], pair_arms["direct-surface"], workload
+                            )
                         routing_pair = pair_arms
                     else:
                         timing_pair = pair_arms
-                for mode in order:
-                    validate_pair(routing_pair[mode], timing_pair[mode], args.functions, workload, require_reports=False)
+                for mode in route_order:
+                    if routing_pair[mode]["mode_environment"] != timing_pair[mode]["mode_environment"]:
+                        raise RuntimeError(f"{workload}: {mode} routing/timing environment differs")
+                    validate_pair(
+                        routing_pair[mode], timing_pair[mode], args.functions, workload, require_reports=False
+                    )
     finally:
         temp.cleanup()
 
@@ -840,6 +1204,11 @@ def main() -> int:
 
     edit_labels = [f"body-edit-{index + 1}" for index in range(args.body_edits)]
     summaries: dict[str, Any] = {}
+    summary_modes = (
+        ("graph-off", "graph-on", "direct-surface")
+        if args.include_direct_surface
+        else ("graph-off", "graph-on")
+    )
     for workload, _payload_mode in workload_specs:
         workload_arms = [arm for arm in arms if arm["workload"] == workload]
         per_edit: dict[str, Any] = {}
@@ -883,7 +1252,7 @@ def main() -> int:
                 )
                 paired_ratios.append(on_value / off_value)
         body_edit_summary = paired_timing_summary(paired_ratios, f"{workload} body edits")
-        control_labels = ("prime", "exact-repeat", "declaration-surface-edit")
+        control_labels = ("prime", "exact-repeat", "declaration-surface-edit", "post-surface-body-edit")
         process_counter_summary = {
             "primary_metric": "instructions_retired",
             "instructions_retired": {
@@ -931,7 +1300,7 @@ def main() -> int:
             control_summary = paired_timing_summary(control_ratios, f"{workload} {label}")
             control_summary["paired_control_samples"] = len(control_ratios)
             paired_controls[label] = control_summary
-        summaries[workload] = {
+        workload_summary = {
             "per_edit": per_edit,
             **body_edit_summary,
             "primary_metric": "instructions_retired",
@@ -950,15 +1319,53 @@ def main() -> int:
                         for request in arm["requests"]
                         if request["label"] == label
                     )
-                    for mode in ("graph-off", "graph-on")
+                    for mode in summary_modes
                 }
-                for label in ("prime", "exact-repeat", "declaration-surface-edit")
+                for label in ("prime", "exact-repeat", "declaration-surface-edit", "post-surface-body-edit")
             },
             "process_wall_medians_ms": {
                 mode: statistics.median(arm["process_wall_ms"] for arm in workload_arms if arm["mode"] == mode)
-                for mode in ("graph-off", "graph-on")
+                for mode in summary_modes
             },
         }
+        if args.include_direct_surface:
+            comparison_labels = (
+                "prime",
+                "exact-repeat",
+                *edit_labels,
+                "declaration-surface-edit",
+                "post-surface-body-edit",
+            )
+            workload_summary["direct_surface_vs_graph_on"] = {
+                "request_wall_ms": paired_mode_measurements(
+                    workload_arms,
+                    args.pairs,
+                    comparison_labels,
+                    "request_wall_ms",
+                    "graph-on",
+                    "direct-surface",
+                    f"{workload} direct-surface wall time",
+                ),
+                "instructions_retired": paired_mode_measurements(
+                    workload_arms,
+                    args.pairs,
+                    comparison_labels,
+                    "instructions_retired",
+                    "graph-on",
+                    "direct-surface",
+                    f"{workload} direct-surface instructions",
+                ),
+                "cycles_elapsed": paired_mode_measurements(
+                    workload_arms,
+                    args.pairs,
+                    comparison_labels,
+                    "cycles_elapsed",
+                    "graph-on",
+                    "direct-surface",
+                    f"{workload} direct-surface cycles",
+                ),
+            }
+        summaries[workload] = workload_summary
     summary = {"workloads": summaries}
     result = {"metadata": metadata, "summary": summary, "arms": arms, "routing_arms": routing_arms}
     (output / "paired.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -638,6 +638,10 @@ while [[ "$index" -lt "$num_diagnostics" ]]; do
     index=$((index + 1))
 done
 
+echo "-- guard_condition_nonbool --"
+run_case guard_condition_nonbool pos "$FIXTURES/guard_condition_nonbool.pos.elisa" "logical operator requires bool operands"
+run_case guard_condition_nonbool neg "$FIXTURES/guard_condition_nonbool.neg.elisa" "logical operator requires bool operands"
+
 require_diagnostic_count iter_mutref_expression_contexts \
     "$FIXTURES/iter_mutref_expression_contexts.pos.elisa" \
     'cannot pass "xs" by mutable reference while it is being iterated: the callee may push/clear/relocate its buffer' 8

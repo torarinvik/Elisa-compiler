@@ -81,4 +81,4 @@ Fixed on branch claude/difffuzz-20261004 (fixtures live with the fix):
 Open (repros here):
 | Repro | stage0 | stage1 | class |
 |---|---|---|---|
-| query_same_line_binder_head_collision | 21 | declines | loud decline, known limit of the line-keyed __query table |
+| query_same_line_binder_head_collision | 21 | declines (last recorded) | query-head lookup now uses token offsets in source; regression and acceptance evidence still pending |

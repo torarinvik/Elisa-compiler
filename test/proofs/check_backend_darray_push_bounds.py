@@ -102,7 +102,7 @@ ordered(container, "emit_darray_push", (
     'range_index_wide <- LLVMBuildSExt(builder, range_index_raw, int64_type, "push.range.index.wide") if direct_range_signed else LLVMBuildZExt(builder, range_index_raw, int64_type, "push.range.index.wide")',
     "elif direct_range_bits > 64:",
     'range_index_wide <- LLVMBuildTrunc(builder, range_index_raw, int64_type, "push.range.index.narrow")',
-    'count <- LLVMBuildAdd(builder, initial_count, range_index_wide, "push.range.offset")',
+    "count <- range_index_wide",
     "elif cursor_slot is push_cursor_slot:",
     'count <- LLVMBuildLoad2(builder, int64_type, push_cursor_slot, "push.cursor")',
     "if not fast_capacity_proven:",
@@ -141,7 +141,7 @@ ordered(container, "emit_darray_grow_body", (
     'new_capacity <- LLVMBuildSelect(builder, too_small, needed, base, "push.cap.new")',
 ))
 ordered(prereserve, "emit_loop_prereserve", (
-    "if bound is Expr.IntLit(limit, _) and limit > 0 and limit.u64() <= PRERESERVE_CAP:",
+    "if bound is Expr.IntLit(limit, _) and limit > 0 and limit.u64() <= trip_cap:",
     "fast_push_slots.push(slot)",
 ))
 size_load = compact(section(size_types, "darray_load_size_i64"))

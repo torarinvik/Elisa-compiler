@@ -32,6 +32,7 @@ POSITIVE = {
     "fast_push_cursor_update_strictly_progresses",
     "fast_push_remaining_work_stays_within_remaining_reservation",
     "fast_push_reserved_extra_fits_u32",
+    "fast_push_two_i64_fill_stays_within_byte_cap",
     "fast_push_cursor_final_count_is_exact",
     "fast_push_biased_index_stays_reserved",
     "fast_push_keeps_public_count_until_exit",
@@ -43,7 +44,8 @@ NEGATIVE = {
     "false_fast_push_final_count_omits_existing_count",
     "false_fast_push_biased_pointer_omits_base",
     "false_fast_push_at_reserved_end_has_room",
-    "false_fast_push_maximum_extra_exceeds_u32",
+    "false_fast_push_byte_budget_allows_one_extra_element",
+    "false_fast_push_old_trip_cap_fits_byte_budget",
 }
 PROOF_SHA256 = {
     "fast_push_cursor_starts_at_existing_count": "4a25575b5e45f0f6c9a7e7449e5c5f7ef74c94bb3833d4c5c9370786c247de54",
@@ -51,8 +53,9 @@ PROOF_SHA256 = {
     "fast_push_cursor_update_stays_within_reserved_end": "9a9c78633a83a222cd35ceaa5954bb95264f98c9c7c09068ce041d8ebb06b8c8",
     "fast_push_cursor_update_strictly_progresses": "3f33448da04b867a79201efc968a0ef8b234ed00dc88d4d4c68ac1f7df1ea4ae",
     "fast_push_remaining_work_stays_within_remaining_reservation": "64e5fff4cd8e9d9463563e37e180befe71329b3b37d2f7db8a6735dd477f2ecd",
-    "fast_push_reserved_extra_fits_u32": "4321bbf0292001b01e7f072156ce49d64b882254d84f8be5e9902697e6b9ec09",
-    "fast_push_cursor_final_count_is_exact": "49deb1732dbefdf7881c371e7484662a896de44591440ef417cd33eabd0067fc",
+    "fast_push_reserved_extra_fits_u32": "3457339ae36abf2682d731289269dde49649703f71363fd3f4bd0e3d9da84c06",
+    "fast_push_two_i64_fill_stays_within_byte_cap": "f9aa03e5112e7b9121071152cd030957bb6d7eaad52fc84b8815effa00b75263",
+    "fast_push_cursor_final_count_is_exact": "351ad318bd5dc22a652af4407904ee0c0fc45355440bfef5a6d915a2a9a5b733",
     "fast_push_biased_index_stays_reserved": "a517ad9dfe1fa1f22c301b9a0fecc8ad5b4b0305cd181f3f0e98719fcfb45b37",
     "fast_push_keeps_public_count_until_exit": "af3446a5632b2191da0b886145b85f65d05362acd9c46cdcbece2866b7a70d29",
     "fast_push_count_observation_disables_cursor": "5989c5f0f79a4663cba270882dd92c032f9b2018f2be04aece50b176f27385af",
@@ -61,7 +64,8 @@ PROOF_SHA256 = {
     "false_fast_push_final_count_omits_existing_count": "9e3e4097ff1227a97712f67761b319a3903b8c7dcf862102beca8739b165ff23",
     "false_fast_push_biased_pointer_omits_base": "5605308d4c316809e113b377a4ed5004b622fc205cb7810bb92f046f7646d468",
     "false_fast_push_at_reserved_end_has_room": "933d377a531e210b5e25a201cd73657e8383b4f1ca6952aee388c8db304fb8cb",
-    "false_fast_push_maximum_extra_exceeds_u32": "db24df8117e999374d703647c3695084c91ba5afaaea725d2c72049eb18ae4fd",
+    "false_fast_push_byte_budget_allows_one_extra_element": "c5380d143473f600206917d9c327762b84346bd23f5700eb1dcf2305d7c60935",
+    "false_fast_push_old_trip_cap_fits_byte_budget": "0e4cdb9cbadc2d2149776b2bef6e49dab6e294b4e986b34c6f836da300732b1f",
 }
 
 
@@ -105,36 +109,41 @@ shapes = SHAPES.read_text()
 reserve_body = compact(section(container, "emit_darray_reserve"))
 if 'LLVMBuildStructGEP2(builder,header,array_slot,1,' in reserve_body or "count_pointer" in reserve_body:
     raise SystemExit("cursor reuse of the pre-reserve count requires reserve to leave DArray count untouched")
-if "constPRERESERVE_CAP:u64=16777216" not in compact(prereserve):
-    raise SystemExit("fast-fill proof cap differs from the compiler's bounded loop trip count")
-if "constPRERESERVE_MAX_PUSHES:i64=64" not in compact(prereserve):
+if "constmoduleLoopPrereserveLimits:MAX_RESERVED_BYTES:u64=67108864" not in compact(prereserve):
+    raise SystemExit("fast-fill proof byte budget differs from the compiler's bounded reservation")
+if "MAX_PUSHES_PER_ITERATION:i64=64" not in compact(prereserve):
     raise SystemExit("fast-fill proof push bound differs from the compiler's admitted body bound")
+if "returnLoopPrereserveLimits::MAX_RESERVED_BYTES/element_stride_bytes/pushes.u64()" not in compact(prereserve):
+    raise SystemExit("fast-fill trip cap no longer divides sequentially by ABI stride and push count")
 if "constDARRAY_U32_MAX:u64=4294967295" not in compact(container):
     raise SystemExit("fast-fill reserve-width proof lost the target 32-bit usize maximum")
-if 16777216 * 64 != 1073741824 or 1073741824 > 4294967295:
-    raise SystemExit("fast-fill trip/push product no longer fits even the 32-bit usize maximum")
+if 67108864 > 4294967295:
+    raise SystemExit("fast-fill byte budget no longer fits the 32-bit usize maximum")
 ordered(prereserve, "emit_loop_prereserve", (
     "pushes: i64 = prereserve_push_count(body, receiver, push_count_budget)",
-    "skip <- true if pushes <= 0 or pushes > PRERESERVE_MAX_PUSHES",
+    "skip <- true if pushes <= 0 or pushes > LoopPrereserveLimits::MAX_PUSHES_PER_ITERATION",
+    "element_stride_bytes: u64 = LLVMABISizeOfType(structs.target.target_data, element_llvm_type)",
+    "trip_cap <- prereserve_trip_cap(pushes, element_stride_bytes)",
+    "skip <- true if trip_cap == 0",
     "direct_index_candidate: mutable bool = false",
     "if pushes == 1 and variables.count == 1.usize():",
     "match iterable:",
     "Expr.Binary(direct_low, direct_operator, direct_high, _):",
     "if direct_operator == TokenKind.RangeLt and direct_low is Expr.IntLit(direct_start, _):",
     "if direct_high is Expr.IntLit(direct_limit, _):",
-    "direct_index_candidate <- direct_start == 0 and direct_limit > 0 and direct_limit.u64() <= PRERESERVE_CAP",
+    "direct_index_candidate <- direct_start == 0 and direct_limit > 0 and direct_limit.u64() <= trip_cap",
     "skip <- true if not skip and not prereserve_body_ok(body, receiver, local_scope, scalar_loop_names, scalar_body_names, fns, structs, generics, runtime.overflow_wrap, proof_budget)",
     "if not skip:",
-    'cap: LLVMValueRef = LLVMConstInt(i64_type, PRERESERVE_CAP, 0)',
+    'cap: LLVMValueRef = LLVMConstInt(i64_type, trip_cap, 0)',
     'capped: LLVMValueRef = LLVMBuildSelect(builder, LLVMBuildICmp(builder, 36, wide, cap, "prereserve.under.cap"), wide, cap, "prereserve.capped")',
     'trips: LLVMValueRef = LLVMBuildSelect(builder, positive, capped, zero, "prereserve.trips")',
     "if emit_checked_reserve_binary(trips, LLVMConstInt(i64_type, pushes.u64(), 0), true, m, ctx, builder, structs.target.target_pointer_bits) is extra:",
     'current: LLVMValueRef = darray_load_size_i64(count_pointer, ctx, builder, "prereserve.count", structs.target.target_pointer_bits)',
     "if emit_checked_reserve_binary(current, extra, false, m, ctx, builder, structs.target.target_pointer_bits) is needed:",
     "if (emit_darray_reserve(slot, receiver_type, needed, structs, growth_runtime, m, ctx, builder, true) can Global{Read,Write}):",
-    "if bound is Expr.IntLit(limit, _) and limit > 0 and limit.u64() <= PRERESERVE_CAP:",
+    "if bound is Expr.IntLit(limit, _) and limit > 0 and limit.u64() <= trip_cap:",
     "fast_push_slots.push(slot)",
-    "cursor_budget: mutable usize = PRERESERVE_MAX_ANALYSIS_NODES",
+    "cursor_budget: mutable usize = LoopPrereserveLimits::MAX_ANALYSIS_NODES",
     "if not prereserve_body_reads_darray_count(body, cursor_budget):",
     'items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "fill.items")',
     "cursor_initial: LLVMValueRef = current",

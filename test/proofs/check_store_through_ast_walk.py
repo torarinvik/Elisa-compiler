@@ -245,9 +245,9 @@ EXPRESSION_EDGES = (
     ("for arm in arms |out|:", "sts_collect_names(arm.guard, out)", 1),
     ("for arm in arms |out|:", "sts_collect_statement_names(arm.body, out)", 0),
     ("for arm in arms |out|:", "sts_collect_statement_names(arm.body, out)", 1),
-    ("Expr.Comprehension(_, iterable, condition, body, _):", "sts_collect_names(iterable, out)"),
-    ("Expr.Comprehension(_, iterable, condition, body, _):", "sts_collect_names(condition, out)"),
-    ("Expr.Comprehension(_, iterable, condition, body, _):", "sts_collect_names(body, out)"),
+    ("Expr.Comprehension(_, iterable, condition, body, _, _):", "sts_collect_names(iterable, out)"),
+    ("Expr.Comprehension(_, iterable, condition, body, _, _):", "sts_collect_names(condition, out)"),
+    ("Expr.Comprehension(_, iterable, condition, body, _, _):", "sts_collect_names(body, out)"),
     ("Expr.Refinement(base, predicate, _):", "sts_collect_names(base, out)"),
     ("Expr.Refinement(base, predicate, _):", "sts_collect_names(predicate, out)"),
     ("Expr.GetElse(guarded, recovery, _):", "sts_collect_names(guarded, out)"),
@@ -382,8 +382,8 @@ HOLDER_SCAN_EXPRESSION_EDGES = (
     ("for arm in arms |binders, owned, view_names, view_values|:", "chv_scan_expression_locals(arm.guard, in_region, binders, owned, view_names, view_values)", 1),
     ("for arm in arms |binders, owned, view_names, view_values|:", "chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)", 0),
     ("for arm in arms |binders, owned, view_names, view_values|:", "chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)", 1),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "chv_scan_expression_locals(iterable, in_region, binders, owned, view_names, view_values)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "comprehension_binders.push(variable)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "chv_scan_expression_locals(iterable, in_region, binders, owned, view_names, view_values)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "comprehension_binders.push(variable)"),
     ("Expr.Refinement(base, predicate, _):", "chv_scan_expression_locals(base, in_region, binders, owned, view_names, view_values)"),
     ("Expr.Refinement(base, predicate, _):", "chv_scan_expression_locals(predicate, in_region, binders, owned, view_names, view_values)"),
     ("Expr.GetElse(guarded, recovery, _):", "chv_scan_expression_locals(guarded, in_region, binders, owned, view_names, view_values)"),
@@ -464,12 +464,12 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 1),
     ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 0),
     ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 1),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),
     ("for outer_ref in ref_params |comprehension_ref_params|:", "comprehension_ref_params.push(outer_ref) if outer_ref != variable"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "comprehension_binders.push(variable)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(condition, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "comprehension_binders.push(variable)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(condition, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
     ("Expr.Refinement(base, predicate, _):", "table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Refinement(base, predicate, _):", "table <- chv_walk_expression(predicate, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.GetElse(guarded, recovery, _):", "table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, guarded_flow, summary, table)"),
@@ -527,18 +527,18 @@ DICT_VIEW_TAINT_EDGES = (
 )
 
 COMPREHENSION_VIEW_TAINT_EDGES = (
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
 )
 
 COMPREHENSION_BINDER_VIEW_TAINT_EDGES = (
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "iterable_may_yield_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "chv_flow_bind(comprehension_flow, variable, false, iterable_may_yield_owned_view, false)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "iterable_may_yield_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "chv_flow_bind(comprehension_flow, variable, false, iterable_may_yield_owned_view, false)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
 )
 
 IDENTIFIER_VIEW_TAINT_EDGES = (
@@ -913,7 +913,7 @@ theorem_routes = {
         "arguments_checked": (("for candidate in candidates |table| -> table:", "candidate_arguments.extend(arguments)"),),
     },
     "proof_chv_comprehension_scope_masks_shadowed_reference": {
-        "reference_parameter": (("Expr.Comprehension(variable, iterable, condition, body, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),),
+        "reference_parameter": (("Expr.Comprehension(variable, iterable, condition, body, _, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),),
         "binder_shadows_reference": (("for outer_ref in ref_params |comprehension_ref_params|:", "comprehension_ref_params.push(outer_ref) if outer_ref != variable"),),
     },
     "proof_chv_view_alias_join_preserves_owned_fact": {

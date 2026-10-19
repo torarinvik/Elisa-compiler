@@ -11,9 +11,9 @@ NameLookup hits separately. Each `call-facts` body calls a distinct leaf, with
 an alternate leaf for the edited body. A call's callee is still classified
 twice within one request, so the runner compares warm hit totals with the prime
 same-request baseline; warm totals must exceed that baseline to show aggregate
-prior-request reuse. Both graph modes report the chain rows visited by the
-NameLookup classification probe. The runner requires cold graph-on visits at
-prime and fewer graph-on visits than
+prior-request reuse. The graph-off and graph-on modes report the chain rows
+visited by the NameLookup classification probe. The runner requires cold
+graph-on visits at prime and fewer graph-on visits than
 graph-off on exact-repeat and body-edit requests. Those reductions can still
 include same-request duplicate checks. The counter covers only global symbol and
 module-member hash-chain rows visited by the fused classifier. An active graph
@@ -39,6 +39,14 @@ The semantic checker still walks function bodies, so these routing checks do not
 establish a compiler speedup. Production use requires a fresh source-matched paired
 run with repeatable end-to-end gains.
 
+The cache report also records reverse-closure fast skips, full walks, visited
+nodes, and visited edges. Routing checks require no closure work on exact-repeat
+and a full walk followed by at least one repeated-mark skip on
+`declaration-surface-edit`. These counters validate that the shortcut is being
+exercised; they are not a speed result. Timed arms disable counter increments,
+but graph traversal still checks the runtime metrics flag per visited node and
+edge, so graph-on/off timings include that small asymmetric branch overhead.
+
 Run on macOS after the source-matched Stage1 product is available:
 
 ```sh
@@ -48,6 +56,67 @@ python3 test/bench/incremental_semantic_session/paired.py \
   --pairs 5 --functions 128 --body-edits 3
 ```
 
+The default run compares two routing modes:
+
+- `graph-off` disables the semantic query graph.
+- `graph-on` enables the graph, including cached `NameLookup` queries.
+
+Add `--include-direct-surface` to include a third routing mode and an additional
+workload:
+
+```sh
+python3 test/bench/incremental_semantic_session/paired.py \
+  --stage1 "$PWD/bin/elisac-stage1" \
+  --output /absolute/path/to/empty/results \
+  --pairs 5 --functions 128 --body-edits 3 --include-direct-surface
+```
+
+`direct-surface` keeps the query graph enabled for body-fact reuse, but bypasses
+the per-name `NameLookup` graph evaluate/commit when the resolver has a valid,
+finalized name surface. It computes the same `(known, module_only)` classification
+from that surface. If the context is inactive or the surface is invalid, the
+resolver uses its cold classifier. The runner records explicit environment
+switches for all three modes so an inherited setting cannot select a different
+route.
+
+With `--include-direct-surface`, each workload first runs three routing arms
+with cache reports, then three counter-disabled timing arms in a rotated order.
+Before timing is summarized, the runner checks graph-on against direct-surface
+for equal request counts, statuses, diagnostic transcripts, and body-cache
+fields. It also checks that graph-on did not use direct classification, that
+direct-surface did not hit the `NameLookup` graph, and that call workloads
+recorded direct-surface classifications. Each timing arm must match the
+corresponding routing arm's environment, status, and diagnostics. The report
+keeps the routing evidence separate from timing summaries.
+
+The extra `shared-calls` workload gives many bodies the same callee spelling,
+then changes one caller to an alternate callee. This complements `call-facts`,
+which gives each body a distinct callee, and exposes repeated-name query costs.
+`zero-fact` remains the literal-return control and does not exercise eligible
+`NameLookup` reads. Direct-surface versus graph-on therefore measures the cost
+of the NameLookup route on these generated sources, not the cost of all semantic
+queries or a whole-compiler speedup.
+
+The direct-surface parity check covers the generated `zero-fact`, `call-facts`,
+and `shared-calls` sequences. Those fixtures contain no imports or import
+annotations, no local or region names, and no qualified `Expr.Scope` paths.
+They do not establish parity for import visibility, region-name classification,
+absent names, or the full range of module/member collisions. The separate
+`test/parity/incremental_semantic_session_control.sh` exercises negative-name
+invalidation on the ordinary graph route; it does not select `direct-surface`.
+Use targeted parity cases before broadening the experiment or making claims about
+those resolver inputs.
+
+A useful next workload is a local-binding sweep: give each call body 0, 32, or
+128 unused scalar parameters while keeping its queried global callee unshadowed.
+`resolver_name_classification` checks every active `bound` name before it reaches
+NameLookup, so this reveals whether the cached global classification still pays
+off after that linear prefix. Include a separate parameter-shadowing control in
+which a local name matches a global identifier and must bypass NameLookup. If
+adding a binding-comparison counter, keep it in routing arms and leave timed arms
+counter-disabled. This coverage is proposed; the current generated workloads do
+not measure local-scope scan cost.
+
 By default, the runner checks exact Stage1 provenance before and after the run,
 holds the shared compiler-benchmark lock, and uses the same load gate as the
 other paired benchmarks. Pass `--concurrent-instruction-counts` to skip that
@@ -56,15 +125,18 @@ mode still compares exact Stage1 process instruction counts and runs the same
 status/diagnostic checks; its host qualification stays false, and wall-time and
 cycle measurements are exploratory because concurrent work affects them. Each
 invocation needs its own empty `--output` directory. The runner alternates
-graph-off/graph-on order across pairs. Each mode starts a fresh persistent
-semantic host and uses the same absolute source path within a workload; each
-workload uses a separate path. The sequence includes a
+graph-off/graph-on order across pairs by default; with the direct-surface option,
+it rotates the three routing modes across pairs. Each mode starts a fresh
+persistent semantic host and uses the same absolute source path within a
+workload; each workload uses a separate path. The sequence includes a
 prime request, an exact-source repeat, several one-body edits with unchanged
-declarations, and a declaration-surface edit.
-The runner clears `ELISA_SEMANTIC_SERIAL` so both arms use the default parallel
+declarations, a declaration-surface edit, and a body-only edit after that
+surface has been published.
+The runner clears `ELISA_SEMANTIC_SERIAL` so all modes use the default parallel
 semantic pass mode regardless of the invoking shell environment.
 
-Each pair runs two workloads. `zero-fact` uses literal-return function bodies,
+The default run includes two workloads. With `--include-direct-surface`, it also
+runs `shared-calls`. `zero-fact` uses literal-return function bodies,
 which exercise body reuse while serializing empty direct-fact payloads.
 `call-facts` uses zero-argument direct calls in the function bodies, so restored
 bodies carry direct-call facts as well as their body records. The edited body
@@ -74,16 +146,38 @@ one direct-call fact per `bench_*` body in `call-facts` and zero in `zero-fact`.
 Results and source hashes are grouped by workload so the empty-payload control
 cannot hide the cost of copying actual facts.
 
+The runner also checks the closed complete-empty query class: exactly one
+`return` of an integer, float, string, character, or boolean literal. Those
+`FunctionBodyFacts` nodes have an empty dependency set because this AST shape
+cannot read declarations. On the declaration-surface edit, graph-on must restore
+the unchanged members of this class and skip their duplicate publication even
+though `SourceInput` changed; graph-off must report no restores or skips. The
+separate `complete_empty_body_*` counters describe only direct-fact query work;
+the compiler still parses the source and runs its full semantic pipeline.
+
+The `post-surface-body-edit` control retains the added declaration and changes
+only `bench_0000`. This checks that the graph warms again after publishing a new
+declaration surface: graph-off must use typed-snapshot fallback, while graph-on
+must admit the now-current `SourceInput` and restore and skip publication for
+every unchanged eligible body. The changed body remains cold. Complete-empty
+restoration follows the same rule: the edited body is excluded for `zero-fact`,
+while all complete-empty bodies are restored for the call workloads. This
+request is reported as its own control and is not folded into the pre-surface
+body-edit aggregate.
+
 For every body edit, graph-off must report typed-snapshot fallback reuse and
 graph-on must report SourceInput admission plus restoration of every unchanged
-cacheable body. The declaration-surface control must invalidate that reuse.
+SourceInput-dependent body. The declaration-surface control must invalidate
+that broad reuse while the separately counted complete-empty queries remain
+reusable.
 The runner compares the complete per-request compiler transcript after removing
 only cache/timing instrumentation, so status and diagnostics must match between
 modes. Prime, exact-repeat, body-edit, and invalidation timings remain separate
 in `paired.json`, with timing summaries grouped by workload. Body edits remain
-the primary paired timing summary; prime, exact-repeat, and declaration-surface
-controls also receive separate paired ratios, geometric means, and win counts.
-Control ratios are descriptive and are not folded into the body-edit aggregate.
+the primary paired timing summary; prime, exact-repeat, declaration-surface,
+and post-surface body-edit controls also receive separate paired ratios,
+geometric means, and win counts. Control ratios are descriptive and are not
+folded into the body-edit aggregate.
 The primary performance measure is the exact Stage1 process's retired
 instructions, sampled with macOS `proc_pid_rusage` immediately around each
 request. Cycles, per-request phase wall/CPU times, request wall times, and outer
@@ -103,17 +197,17 @@ The normal host load gate still applies to keep cache and scheduling conditions
 comparable; instruction counts are the primary comparison because they are less
 sensitive to scheduling delay than wall time.
 
-Each workload/pair runs two routing arms with
+Each workload/pair runs graph-off and graph-on routing arms with
 `ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1` and two separate timing arms with
-that setting explicitly `0`. Routing arms enforce all reuse, invalidation, and
-NameLookup-counter assertions. Timing arms require no cache report, preserve
-status/diagnostic parity between graph modes and against the corresponding
-routing arm, and retain phase timing. Only timing arms enter performance
-summaries; routing evidence is stored separately in `routing_arms` in
-`paired.json`. Arm-kind order is counterbalanced across pairs (routing-first on
-even pairs, timing-first on odd pairs), and graph-on/off order alternates within
-each kind. This doubles the number of host launches relative to the previous
-instrumented runner.
+that setting explicitly `0`. When `--include-direct-surface` is enabled, each
+set also runs a direct-surface arm. Routing arms enforce reuse, invalidation,
+and NameLookup-counter assertions. Timing arms require no cache report, preserve
+status/diagnostic parity with the corresponding routing arm, and retain phase
+timing. Only timing arms enter performance summaries; routing evidence is stored
+separately in `routing_arms` in `paired.json`. The default two-mode runner
+counterbalances routing-first and timing-first pairs and alternates graph-on/off
+order within each kind. The three-mode runner runs all routing arms before all
+timing arms and rotates the mode order across pairs.
 
 Earlier results that enabled chain counting inside timed arms include asymmetric
 telemetry overhead: graph-off traverses and counts more rows. Do not combine

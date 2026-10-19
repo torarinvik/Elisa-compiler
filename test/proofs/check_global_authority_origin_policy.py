@@ -127,8 +127,7 @@ permission_body = compact(function_section(policy_text, "unknown_alias_permissio
 expected_permission = compact('''
 def unknown_alias_permission(write: bool) -> sview:
     ensure result == ("Global.Write" if write else "Global.Read")
-    return "Global.Write" if write
-    return "Global.Read"
+    return "Global.Write" if write else "Global.Read"
 ''')
 if permission_body != expected_permission:
     raise SystemExit("production unknown-alias permission mapping changed from its exact read/write rule")

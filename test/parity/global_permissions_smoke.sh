@@ -89,6 +89,16 @@ expect_stage1_row() {
     fi
 }
 
+expect_no_stage1_row() {
+    local name="$1" file="$2" unexpected="$3" rows
+    rows="$(stage1_globals "$file")"
+    if printf '%s\n' "$rows" | grep -F -x -q "$unexpected"; then
+        printf 'global permissions smoke FAILED: %s unexpectedly has row %s\nRows: %s\n' \
+            "$name" "$unexpected" "${rows//$'\n'/ | }" >&2
+        failed=$((failed + 1))
+    fi
+}
+
 # A reversed 256-function call chain checks that Global rows still propagate through
 # a deep call graph in both compiler implementations.
 printf 'global mutable hot: i32 = 0\n' > "$WORK/deep_global_chain.elisa"
@@ -278,9 +288,99 @@ def main() -> i64:
     return 0
 EOF
 
-for case_file in reads_writes store_and_grant trusted_firewall rooted_store qualified_return; do
+# Module-qualified mutable globals contribute the same read/write rows as unqualified
+# globals. A compound store to the qualified place contributes both axes.
+cat > "$WORK/qualified_globals.elisa" <<'EOF'
+module Counters:
+    public:
+        global mutable hits: i32 = 7
+
+def read_hits() -> i32:
+    can Global.Read:
+        return Counters::hits
+
+def set_hits() -> void:
+    can Global.Write:
+        Counters::hits <- 8
+
+def bump_hits() -> void:
+    can Global{Read, Write}:
+        Counters::hits += 1
+EOF
+
+# Same-spelled functions in different modules must keep distinct effect-graph nodes.
+# The left function writes a mutable global; the right function is pure. In particular,
+# a caller of Right::touch must not inherit Left::touch's Global.Write requirement.
+cat > "$WORK/same_named_module_functions.elisa" <<'EOF'
+module Left:
+    public:
+        global mutable marker: i32 = 0
+        def touch() -> void:
+            can Global.Write:
+                marker <- 1
+
+module Right:
+    public:
+        def touch() -> void:
+            pass
+
+def call_left() -> void:
+    can Global.Write:
+        Left::touch()
+
+def call_right() -> void:
+    Right::touch()
+
+def main() -> i64:
+    can Global.Write:
+        call_left()
+    call_right()
+    return 0
+EOF
+
+# Reversing module declaration order must not change which `touch` effect belongs to
+# each qualified call.
+cat > "$WORK/same_named_module_functions_reversed.elisa" <<'EOF'
+module Right:
+    public:
+        def touch() -> void:
+            pass
+
+module Left:
+    public:
+        global mutable marker: i32 = 0
+        def touch() -> void:
+            can Global.Write:
+                marker <- 1
+
+def call_left() -> void:
+    can Global.Write:
+        Left::touch()
+
+def call_right() -> void:
+    Right::touch()
+
+def main() -> i64:
+    can Global.Write:
+        call_left()
+    call_right()
+    return 0
+EOF
+
+for case_file in reads_writes store_and_grant trusted_firewall rooted_store qualified_return qualified_globals same_named_module_functions same_named_module_functions_reversed; do
     expect_agree "$case_file" "$WORK/$case_file.elisa"
 done
+expect_stage1_row "qualified module read is inferred" "$WORK/qualified_globals.elisa" "read_hits Global.Read"
+expect_stage1_row "qualified simple write is inferred" "$WORK/qualified_globals.elisa" "set_hits Global.Write"
+expect_stage1_row "qualified compound write infers read" "$WORK/qualified_globals.elisa" "bump_hits Global.Read"
+expect_stage1_row "qualified compound write infers write" "$WORK/qualified_globals.elisa" "bump_hits Global.Write"
+printf 'PASS qualified module global reads and writes\n'
+expect_stage1_row "same-named qualified writer propagates" "$WORK/same_named_module_functions.elisa" "call_left Global.Write"
+expect_no_stage1_row "same-named qualified pure function stays pure" "$WORK/same_named_module_functions.elisa" "call_right Global.Write"
+printf 'PASS same-named module function identity\n'
+expect_stage1_row "reversed-order qualified writer propagates" "$WORK/same_named_module_functions_reversed.elisa" "call_left Global.Write"
+expect_no_stage1_row "reversed-order qualified pure function stays pure" "$WORK/same_named_module_functions_reversed.elisa" "call_right Global.Write"
+printf 'PASS reversed same-named module function identity\n'
 
 # Grouped permission clauses retain every member in both signatures and local grants.
 # The separate mutable-global authority smoke rejects a one-member Global{Read} grant

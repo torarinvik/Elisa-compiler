@@ -209,7 +209,7 @@ RecordUpdate(base: Expr, fields: darray[FieldInit], pos: Pos)
 If(condition: Expr, then_expr: Expr, else_expr: Expr, pos: Pos)
 Match(scrutinee: Expr, arms: darray[MatchArm], pos: Pos)
 Catch(guarded: Expr, arms: darray[MatchArm], pos: Pos)
-Comprehension(var: sview, iterable: Expr, condition: Expr, body: Expr, pos: Pos)
+Comprehension(var: sview, iterable: Expr, condition: Expr, body: Expr, pos: Pos, query_scope_id: u32)
 Refinement(base: Expr, predicate: Expr, pos: Pos)
 GetElse(guarded: Expr, recovery: darray[Stmt], pos: Pos)
 Lambda(params: darray[sview], body: darray[Stmt], pos: Pos)
@@ -342,7 +342,7 @@ expression_walk_path = (
     "Expr.Construct(type_expression, fields, line): table <- walk_expression_for_division_by_zero(type_expression, table) for field in fields |table| -> table: table <- walk_expression_for_division_by_zero(field.value, table)",
     "Expr.RecordUpdate(base, fields, line): table <- walk_expression_for_division_by_zero(base, table) for field in fields |table| -> table: table <- walk_expression_for_division_by_zero(field.value, table)",
     "Expr.If(condition, then_expr, else_expr, line): table <- walk_expression_for_division_by_zero(condition, table) table <- walk_expression_for_division_by_zero(then_expr, table) table <- walk_expression_for_division_by_zero(else_expr, table)",
-    "Expr.Comprehension(loop_variable, iterable, condition, body, line): table <- walk_expression_for_division_by_zero(iterable, table) table <- walk_expression_for_division_by_zero(condition, table) table <- walk_expression_for_division_by_zero(body, table)",
+    "Expr.Comprehension(loop_variable, iterable, condition, body, line, _): table <- walk_expression_for_division_by_zero(iterable, table) table <- walk_expression_for_division_by_zero(condition, table) table <- walk_expression_for_division_by_zero(body, table)",
     "Expr.Lambda(parameters, body, line): table <- walk_statements_for_division_by_zero(body, table)",
     "Expr.Block(statements, value, captures, line): table <- walk_statements_for_division_by_zero(statements, table) table <- walk_expression_for_division_by_zero(value, table)",
     "Expr.Match(scrutinee, arms, line): table <- walk_expression_for_division_by_zero(scrutinee, table) for arm in arms |table| -> table: table <- walk_expression_for_division_by_zero(arm.guard, table) table <- walk_statements_for_division_by_zero(arm.body, table)",
@@ -372,7 +372,7 @@ expression_edges = (
     ("match expression:", "Expr.Construct(type_expression, fields, line):"),
     ("match expression:", "Expr.RecordUpdate(base, fields, line):"),
     ("match expression:", "Expr.If(condition, then_expr, else_expr, line):"),
-    ("match expression:", "Expr.Comprehension(loop_variable, iterable, condition, body, line):"),
+    ("match expression:", "Expr.Comprehension(loop_variable, iterable, condition, body, line, _):"),
     ("match expression:", "Expr.Lambda(parameters, body, line):"),
     ("match expression:", "Expr.Block(statements, value, captures, line):"),
     ("match expression:", "Expr.Match(scrutinee, arms, line):"),
@@ -422,9 +422,9 @@ expression_edges = (
     ("Expr.If(condition, then_expr, else_expr, line):", "table <- walk_expression_for_division_by_zero(condition, table)"),
     ("Expr.If(condition, then_expr, else_expr, line):", "table <- walk_expression_for_division_by_zero(then_expr, table)"),
     ("Expr.If(condition, then_expr, else_expr, line):", "table <- walk_expression_for_division_by_zero(else_expr, table)"),
-    ("Expr.Comprehension(loop_variable, iterable, condition, body, line):", "table <- walk_expression_for_division_by_zero(iterable, table)"),
-    ("Expr.Comprehension(loop_variable, iterable, condition, body, line):", "table <- walk_expression_for_division_by_zero(condition, table)"),
-    ("Expr.Comprehension(loop_variable, iterable, condition, body, line):", "table <- walk_expression_for_division_by_zero(body, table)"),
+    ("Expr.Comprehension(loop_variable, iterable, condition, body, line, _):", "table <- walk_expression_for_division_by_zero(iterable, table)"),
+    ("Expr.Comprehension(loop_variable, iterable, condition, body, line, _):", "table <- walk_expression_for_division_by_zero(condition, table)"),
+    ("Expr.Comprehension(loop_variable, iterable, condition, body, line, _):", "table <- walk_expression_for_division_by_zero(body, table)"),
     ("Expr.Lambda(parameters, body, line):", "table <- walk_statements_for_division_by_zero(body, table)"),
     ("Expr.Block(statements, value, captures, line):", "table <- walk_statements_for_division_by_zero(statements, table)"),
     ("Expr.Block(statements, value, captures, line):", "table <- walk_expression_for_division_by_zero(value, table)"),

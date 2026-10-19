@@ -1,4 +1,5 @@
 """Admit direct proofs of the source BindingId fact join and consume operations."""
+import argparse
 import hashlib
 import json
 import os
@@ -7,10 +8,13 @@ import re
 import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = ROOT.parent / "elisa-proof"
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 PROOF_PROCESS_TIMEOUT_SECONDS = 60
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -25,10 +29,11 @@ semantic_sources = [ROOT / "src/semantic/binding_identity_types.elisa",
                     ROOT / "src/semantic/ownership_binding_flow.elisa",
                     CONTROL_FLOW,
                     FACADE]
-inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
-          HERE / "proof_product_gate.py", Path(__file__), proof, rejected, *semantic_sources]
-inputs.extend(source_include_closure([proof, rejected]))
-hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+source_inputs = [HERE / "proof_product_gate.py", Path(__file__), proof, rejected, *semantic_sources]
+source_inputs.extend(source_include_closure([proof, rejected]))
+inputs = source_inputs if args.source_only else [BIN, MANIFEST, MANIFEST_CHECKSUM,
+    PROVER / "ELISA_COMPILER_REV", *source_inputs]
+hashes = {} if args.source_only else {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 def compact(source):
     return "".join("".join(line.split("#", 1)[0].split()) for line in source.splitlines())
@@ -54,16 +59,8 @@ unknown_vector_contract = (
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable)"
     "fact_count:usize=facts.count"
-    "index:mutableusize=0"
     "assertfacts.count==fact_count"
-    "assertindex==0"
-    "assertforallfact_indexin0..<index:notfacts[fact_index].known"
-    "andfacts[fact_index].reachable==reachable"
-    "andfacts[fact_index].may_live==reachable"
-    "andfacts[fact_index].may_consumed==reachable"
-    "whileindex<fact_count|facts,index,fact_count,reachable|:"
-    "decreasesfact_count-index"
-    "invariantindex<=fact_count"
+    "forindexin0..<fact_count|facts,fact_count,reachable|:"
     "invariantfacts.count==fact_count"
     "invariantforallfact_indexin0..<index:notfacts[fact_index].known"
     "andfacts[fact_index].reachable==reachable"
@@ -80,13 +77,6 @@ unknown_vector_contract = (
     "andfacts[fact_index].reachable==reachable"
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
-    "index<-index+1"
-    "assertindex<=fact_count"
-    "assertfacts.count==fact_count"
-    "assertforallfact_indexin0..<index:notfacts[fact_index].known"
-    "andfacts[fact_index].reachable==reachable"
-    "andfacts[fact_index].may_live==reachable"
-    "andfacts[fact_index].may_consumed==reachable"
     "assertfacts.count==fact_count"
     "assertfacts.count==0or(forallfact_indexin0..<facts.count:notfacts[fact_index].known"
     "andfacts[fact_index].reachable==reachable"
@@ -100,6 +90,7 @@ unknown_flow_source = compact(CONTROL_FLOW.read_text())
 unknown_flow_contract = (
     "defownership_flow_unknown(flow:mutableOwnershipFrontier&)->voidcan[Abort.Panic]:"
     "ensurenotflow.coverage_complete"
+    "canAbort.Panic:"
     "ownership_bindings_unknown(&flow.facts,flow.reachable)"
     "flow.coverage_complete<-false"
 )
@@ -142,6 +133,11 @@ if len(positive_names) != len(set(positive_names)) or set(positive_names) != exp
     raise SystemExit("positive ownership proof declaration inventory changed")
 if len(negative_names) != len(set(negative_names)) or set(negative_names) != expected_false:
     raise SystemExit("ownership false-claim declaration inventory changed")
+
+if args.source_only:
+    print(json.dumps({"source_bound": True, "positive": len(expected_positive),
+                      "false_controls": len(expected_false)}))
+    raise SystemExit(0)
 
 try:
     product_manifest = require_current_product(BIN, PROVER)

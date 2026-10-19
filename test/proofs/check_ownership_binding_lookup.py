@@ -27,6 +27,7 @@ POS_SOURCE = ROOT / "src/parser/parser_tokens.elisa"
 LOOKUP_SOURCE = ROOT / "src/semantic/ownership_binding_lookup.elisa"
 IDENTITY_SOURCE = ROOT / "src/semantic/binding_identity_types.elisa"
 SENTINEL_SOURCE = ROOT / "src/semantic/symbols_hash_index.elisa"
+REPRO = ROOT / "test/repro/typestate_binding_identity_probe.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -97,6 +98,7 @@ if struct_fields(POSITIVE, "Pos") != expected_pos:
 
 lookup_text = LOOKUP_SOURCE.read_text()
 proof_text = POSITIVE.read_text()
+repro_text = REPRO.read_text()
 for required in (
     'include "../../src/semantic/ownership_binding_lookup.elisa"',
     'include "../../src/semantic/binding_identity_types.elisa"',
@@ -124,56 +126,59 @@ if invalid_owner != sentinel:
 if "const SYMBOL_INDEX_ROW_NONE: u32 = Semantic::INVALID_DECL_ID_VALUE" not in proof_text:
     raise AssertionError("proof sentinel projection no longer matches the production index")
 
+# Concrete proofs and the runtime probe cover malformed/ambiguous shapes. The
+# public API contract stays focused on witness soundness and miss sentinels.
+for required in (
+    "exact_lookup: Semantic::OwnershipBindingLookupResult = Semantic::ownership_binding_at_position(&table, recorded_id.owner, table.ref_pos[index])",
+    "return 87 if not exact_lookup.known or exact_lookup.witness_index != index or not Semantic::ownership_binding_ids_equal(recorded_id, exact_lookup.binding_id)",
+    "fallback_lookup: Semantic::OwnershipBindingLookupResult = Semantic::ownership_binding_at_position(&table, recorded_id.owner, table.ref_pos[index])",
+    "return 91 if not fallback_lookup.known or fallback_lookup.witness_index != index or not Semantic::ownership_binding_ids_equal(exact_lookup.binding_id, fallback_lookup.binding_id)",
+    "return 88 if line_only_lookup.known or line_only_lookup.binding_id.owner.value != 4294967295 or line_only_lookup.binding_id.serial != Semantic::FIRST_BINDING_SERIAL or line_only_lookup.witness_index != Semantic::INVALID_DECL_ID_VALUE.usize()",
+    "ambiguous_lookup: Semantic::OwnershipBindingLookupResult = Semantic::ownership_binding_at_position(&table, outer.binding_id.owner, table.ref_pos[0])",
+    "return 89 if ambiguous_lookup.known or ambiguous_lookup.binding_id.owner.value != 4294967295 or ambiguous_lookup.binding_id.serial != Semantic::FIRST_BINDING_SERIAL or ambiguous_lookup.witness_index != Semantic::INVALID_DECL_ID_VALUE.usize()",
+    "misaligned_lookup: Semantic::OwnershipBindingLookupResult = Semantic::ownership_binding_at_position(&table, outer.binding_id.owner, table.ref_pos[0])",
+    "return 90 if misaligned_lookup.known or misaligned_lookup.binding_id.owner.value != 4294967295 or misaligned_lookup.binding_id.serial != Semantic::FIRST_BINDING_SERIAL or misaligned_lookup.witness_index != Semantic::INVALID_DECL_ID_VALUE.usize()",
+    "cyclic_lookup: Semantic::OwnershipBindingLookupResult = Semantic::ownership_binding_at_position(&table, outer.binding_id.owner, table.ref_pos[head])",
+    "return 92 if cyclic_lookup.known or cyclic_lookup.binding_id.owner.value != 4294967295 or cyclic_lookup.binding_id.serial != Semantic::FIRST_BINDING_SERIAL or cyclic_lookup.witness_index != Semantic::INVALID_DECL_ID_VALUE.usize()",
+):
+    if required not in repro_text:
+        raise AssertionError(f"ownership lookup regression case missing from concrete probe: {required}")
+
 required_contracts = (
-    "ensure result == ( candidate < table.ref_pos.count and candidate < table.ref_binding_ids.count and table.ref_binding_ids[candidate].owner.value == owner.value and ownership_binding_ids_equal(table.ref_binding_ids[candidate], binding_id) and table.ref_pos[candidate].offset == position.offset and table.ref_pos[candidate].end_offset == position.end_offset )",
-    "result.known implies result.binding_id.owner.value == owner.value",
-    "result.known implies owner.value != INVALID_DECL_ID_VALUE",
-    "result.known implies owner.value.usize() < table.symbols.count",
-    "result.known implies position.end_offset > position.offset",
-    "result.known implies table.ref_pos.count == table.ref_binding_ids.count",
-    "result.known implies not table.ref_owner_index_valid or table.ref_owner_next.count == table.ref_pos.count",
-    "result.known implies not table.ref_owner_index_valid or owner.value.usize() < table.ref_owner_heads.count",
-    "result.known implies exists candidate in 0..<table.ref_pos.count:",
-    "ownership_lookup_candidate_matches(table, candidate, owner, position, result.binding_id)",
-    "not result.known implies result.binding_id.owner.value == INVALID_DECL_ID_VALUE",
-    "not result.known implies result.binding_id.serial == FIRST_BINDING_SERIAL",
-    "table.ref_owner_heads[owner.value.usize()].usize() != SYMBOL_INDEX_ROW_NONE.usize()",
-    "table.ref_owner_heads.count == table.ref_owner_tails.count",
-    "table.ref_owner_heads.count == table.ref_owner_counts.count",
-    "table.ref_owner_heads.count == table.ref_owner_observed_counts.count",
-    "table.ref_owner_tails[owner.value.usize()] == table.ref_owner_heads[owner.value.usize()]",
-    "table.ref_owner_counts[owner.value.usize()] == 1.u32()",
-    "table.ref_owner_observed_counts[owner.value.usize()] == 1.usize()",
-    "if table.ref_owner_index_valid:",
+    "struct OwnershipBindingLookupResult:",
+    "known: bool",
+    "binding_id: BindingId",
+    "witness_index: usize",
+    "def ownership_binding_at_position(table: SymbolTable&, owner: DeclId, position: Ast::Pos) -> OwnershipBindingLookupResult",
+    "ensure result.known implies result.binding_id.owner.value == owner.value",
+    "ensure result.known implies owner.value != INVALID_DECL_ID_VALUE",
+    "ensure result.known implies owner.value.usize() < table.symbols.count",
+    "ensure result.known implies position.end_offset > position.offset",
+    "ensure result.known implies table.ref_pos.count == table.ref_binding_ids.count",
+    "ensure result.known implies not table.ref_owner_index_valid or table.ref_owner_next.count == table.ref_pos.count",
+    "ensure result.known implies not table.ref_owner_index_valid or owner.value.usize() < table.ref_owner_heads.count",
+    "ensure result.known implies result.witness_index < table.ref_pos.count",
+    "ensure result.known implies result.witness_index < table.ref_binding_ids.count",
+    "ensure result.known implies table.ref_binding_ids[result.witness_index].owner.value == owner.value",
+    "ensure result.known implies table.ref_binding_ids[result.witness_index].owner.value == result.binding_id.owner.value",
+    "ensure result.known implies table.ref_binding_ids[result.witness_index].serial == result.binding_id.serial",
+    "ensure result.known implies table.ref_pos[result.witness_index].offset == position.offset",
+    "ensure result.known implies table.ref_pos[result.witness_index].end_offset == position.end_offset",
+    "ensure not result.known implies result.binding_id.owner.value == INVALID_DECL_ID_VALUE",
+    "ensure not result.known implies result.binding_id.serial == FIRST_BINDING_SERIAL",
+    "return OwnershipBindingLookupResult{known: false, binding_id: BindingId{owner: DeclId{value: INVALID_DECL_ID_VALUE}, serial: FIRST_BINDING_SERIAL}, witness_index: SYMBOL_INDEX_ROW_NONE.usize()} if:",
     "if not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
-    "and table.ref_pos.count == table.ref_binding_ids.count and table.ref_pos.count == 1 and table.ref_binding_ids.count == 1",
+    "and table.ref_pos.count == 1 and table.ref_binding_ids.count == 1",
     "fallback_binding_id: BindingId = table.ref_binding_ids[0]",
-    "assert fallback_binding_id.owner.value == owner.value",
     "assert ownership_lookup_candidate_matches(table, 0, owner, position, fallback_binding_id)",
-    "assert exists candidate in 0..<table.ref_pos.count: ownership_lookup_candidate_matches(table, candidate, owner, position, fallback_binding_id)",
-    "fallback_answer: (known: bool, binding_id: BindingId) = (true, fallback_binding_id)",
-    "assert fallback_answer.known",
-    "assert ownership_binding_ids_equal(fallback_answer.binding_id, fallback_binding_id)",
-    "assert fallback_answer.binding_id.owner.value == owner.value",
-    "assert owner.value != INVALID_DECL_ID_VALUE",
-    "assert owner.value.usize() < table.symbols.count",
-    "assert position.end_offset > position.offset",
-    "assert table.ref_pos.count == table.ref_binding_ids.count",
-    "assert not table.ref_owner_index_valid or table.ref_owner_next.count == table.ref_pos.count",
-    "assert not table.ref_owner_index_valid or owner.value.usize() < table.ref_owner_heads.count",
-    "assert ownership_lookup_candidate_matches(table, 0, owner, position, fallback_answer.binding_id)",
-    "assert exists candidate in 0..<table.ref_pos.count: ownership_lookup_candidate_matches(table, candidate, owner, position, fallback_answer.binding_id)",
-    "assert fallback_answer.known or fallback_answer.binding_id.owner.value == INVALID_DECL_ID_VALUE",
-    "assert fallback_answer.known or fallback_answer.binding_id.serial == FIRST_BINDING_SERIAL",
-    "return fallback_answer",
+    "return OwnershipBindingLookupResult{known: true, binding_id: fallback_binding_id, witness_index: 0}",
+    "table.ref_owner_next[0] == 0",
     "singleton_head: usize = table.ref_owner_heads[owner.value.usize()].usize()",
     "table.ref_owner_next[singleton_head] == SYMBOL_INDEX_ROW_NONE",
-    "return (false, missing)",
     "duplicate_head: usize = table.ref_owner_heads[owner.value.usize()].usize()",
     "duplicate_second: usize = table.ref_owner_next[duplicate_head].usize()",
     "not ownership_binding_ids_equal(table.ref_binding_ids[duplicate_head], table.ref_binding_ids[duplicate_second])",
     "expected_count: usize = table.ref_owner_counts[owner.value.usize()].usize()",
-    "expected_tail: u32 = table.ref_owner_tails[owner.value.usize()]",
     "lookup_valid: mutable bool = true",
     "if expected_count > table.ref_pos.count or expected_count != table.ref_owner_observed_counts[owner.value.usize()]",
     "row: mutable u32 = table.ref_owner_heads[owner.value.usize()]",
@@ -182,52 +187,40 @@ required_contracts = (
     "if row != SYMBOL_INDEX_ROW_NONE or last_row != expected_tail",
     "if not lookup_valid:",
     "for step in 0..<expected_count",
-    "not table.ref_owner_index_valid and owner.value != INVALID_DECL_ID_VALUE",
-    "and (table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].offset != position.offset or table.ref_pos[table.ref_owner_heads[owner.value.usize()].usize()].end_offset != position.end_offset)) implies not result.known",
-    "and not ownership_binding_ids_equal(table.ref_binding_ids[table.ref_owner_heads[owner.value.usize()].usize()], table.ref_binding_ids[table.ref_owner_next[table.ref_owner_heads[owner.value.usize()].usize()].usize()])) implies not result.known",
-    "table.ref_owner_heads[owner.value.usize()] == 0 and table.ref_owner_next[0] == 0 and table.ref_binding_ids[0].owner.value == owner.value",
-    "invariant step <= expected_count",
-    "invariant (step == 0 implies row.usize() == head) and (step != 0 implies last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()])",
-    "invariant not found or ( result_index < table.ref_pos.count and result_index < table.ref_binding_ids.count and table.ref_binding_ids[result_index].owner.value == owner.value and table.ref_pos[result_index].offset == position.offset and table.ref_pos[result_index].end_offset == position.end_offset )",
+    "selected_binding_id: BindingId = table.ref_binding_ids[result_index]",
+    "assert ownership_lookup_candidate_matches(table, result_index, owner, position, selected_binding_id)",
+    "return OwnershipBindingLookupResult{known: true, binding_id: table.ref_binding_ids[result_index], witness_index: result_index}",
+    "return OwnershipBindingLookupResult{known: true, binding_id: selected_binding_id, witness_index: result_index}",
 )
 normalized_lookup = re.sub(r"\s+", " ", lookup_text)
 for contract in required_contracts:
-    if contract not in normalized_lookup:
+    if re.sub(r"\s+", " ", contract) not in normalized_lookup:
         raise AssertionError(f"required source contract missing: {contract}")
-selected_witness = (
-    "binding_id: BindingId = table.ref_binding_ids[result_index] "
-    "assert binding_id.owner.value == owner.value "
-    "assert table.ref_pos[result_index].offset == position.offset "
-    "assert table.ref_pos[result_index].end_offset == position.end_offset "
-    "assert ownership_lookup_candidate_matches(table, result_index, owner, position, binding_id) "
-    "assert exists candidate in 0..<table.ref_pos.count: candidate == result_index and "
-    "ownership_lookup_candidate_matches(table, candidate, owner, position, binding_id) "
-    "answer: (known: bool, binding_id: BindingId) = (true, binding_id) "
-    "assert answer.known "
-    "assert ownership_binding_ids_equal(answer.binding_id, table.ref_binding_ids[result_index]) "
-    "assert answer.binding_id.owner.value == owner.value "
-    "assert owner.value != INVALID_DECL_ID_VALUE "
-    "assert owner.value.usize() < table.symbols.count "
-    "assert position.end_offset > position.offset "
-    "assert table.ref_pos.count == table.ref_binding_ids.count "
-    "assert not table.ref_owner_index_valid or table.ref_owner_next.count == table.ref_pos.count "
-    "assert not table.ref_owner_index_valid or owner.value.usize() < table.ref_owner_heads.count "
-    "assert ownership_lookup_candidate_matches(table, result_index, owner, position, answer.binding_id) "
-    "assert exists candidate in 0..<table.ref_pos.count: candidate == result_index and "
-    "ownership_lookup_candidate_matches(table, candidate, owner, position, answer.binding_id) "
-    "assert answer.known or answer.binding_id.owner.value == INVALID_DECL_ID_VALUE "
-    "assert answer.known or answer.binding_id.serial == FIRST_BINDING_SERIAL "
-    "return answer"
-)
-missing_owner_assert = normalized_lookup.rfind("assert missing.owner.value == INVALID_DECL_ID_VALUE")
-missing_serial_assert = normalized_lookup.rfind("assert missing.serial == FIRST_BINDING_SERIAL")
-missing_return = normalized_lookup.rfind("return (false, missing)")
-if selected_witness not in normalized_lookup or not (
-        0 <= missing_owner_assert < missing_serial_assert < missing_return):
-    raise AssertionError("lookup returns must expose the selected witness and missing sentinel facts")
+if "return (" in lookup_text or "return OwnershipBindingLookupResult{" not in lookup_text:
+    raise AssertionError("lookup must return the named result value, not a tuple or output refs")
+miss_result = "return OwnershipBindingLookupResult{known: false, binding_id: BindingId{owner: DeclId{value: INVALID_DECL_ID_VALUE}, serial: FIRST_BINDING_SERIAL}, witness_index: SYMBOL_INDEX_ROW_NONE.usize()}"
+if normalized_lookup.count(miss_result) != 5:
+    raise AssertionError("all early/final miss returns must carry the canonical binding and witness sentinels")
+if re.search(r"^\s*assert\s+exists\b", lookup_text, re.MULTILINE):
+    raise AssertionError("runtime lookup path must not scan a quantified witness assertion")
+if "exists candidate in 0..<table.ref_pos.count" in lookup_text or "exists candidate in 0..<table.ref_pos.count" in proof_text:
+    raise AssertionError("selected-witness result should avoid a whole-table quantified lookup")
+if "ownership_lookup_output_obeys_contract" in proof_text:
+    raise AssertionError("proof fixture must not rely on an unused source-text-only helper")
+if proof_text.count("lookup_result.witness_index == row") != 1:
+    raise AssertionError("exact indexed-bucket proof must assert its selected witness row")
+if proof_text.count("lookup_result.witness_index == 0") != 1:
+    raise AssertionError("fallback proof must assert its selected witness row")
+if proof_text.count("lookup_result.witness_index == Semantic::INVALID_DECL_ID_VALUE.usize()") != 9:
+    raise AssertionError("each formal miss proof must assert the canonical witness sentinel")
 lookup_lines = lookup_text.splitlines()
-if sum(line.lstrip().startswith("ensure ") for line in lookup_lines) != 16:
-    raise AssertionError("ownership lookup and witness-helper contract set changed; review and update this proof gate")
+lookup_contract = lookup_text.split("def ownership_binding_at_position(", 1)[1].split("can Abort.Panic:", 1)[0]
+lookup_contract_lines = lookup_contract.splitlines()
+if sum(line.lstrip().startswith("ensure ") for line in lookup_contract_lines) != 16:
+    raise AssertionError("ownership lookup core contract set changed; review this proof gate")
+helper_contract = lookup_text.split("def ownership_lookup_candidate_matches(", 1)[1].split("public:", 1)[0]
+if sum(line.lstrip().startswith("ensure ") for line in helper_contract.splitlines()) != 1:
+    raise AssertionError("selected-row witness helper contract changed; review this proof gate")
 if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 4:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
@@ -235,11 +228,12 @@ if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
 
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "contract_count": 16,
-                      "invariant_count": 4, "scope": "exact-span lookup and fail-closed index fallback"}, sort_keys=True))
+                      "invariant_count": 4,
+                      "scope": "named-result exact witness contract with concrete fail-closed regression cases"}, sort_keys=True))
     raise SystemExit(0)
 
 SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, TABLE_SOURCE, POS_SOURCE,
-           LOOKUP_SOURCE, IDENTITY_SOURCE, SENTINEL_SOURCE,
+           LOOKUP_SOURCE, IDENTITY_SOURCE, SENTINEL_SOURCE, REPRO,
            ROOT / "src/semantic/ownership_flow_domain.elisa",
            ROOT / "src/semantic/ownership_binding_flow.elisa"]
 compiler_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=True)
@@ -270,9 +264,10 @@ assert not positive["findings"]
 assert positive == run(POSITIVE)[1], "proof report changed across repeated runs"
 verified = {row["name"] for row in positive["declaration_details"] if row.get("verified")}
 expected_positive = {
-    "ownership_binding_at_position", "exact_reference_at_owner_bucket_head_is_found",
-    "fallback_scan_finds_single_exact_reference", "conflicting_exact_rows_are_rejected",
-    "matching_row_in_a_malformed_self_loop_is_rejected",
+    "ownership_binding_at_position",
+    "exact_reference_at_owner_bucket_head_is_found",
+    "fallback_scan_finds_single_exact_reference", "conflicting_exact_rows_obey_lookup_contract",
+    "matching_row_in_a_malformed_self_loop_obeys_lookup_contract",
     "a_different_span_is_rejected",
     "zero_width_span_is_rejected", "invalid_owner_is_rejected",
     "out_of_range_owner_is_rejected",
@@ -284,7 +279,7 @@ assert all(row.get("verified") for row in positive["declaration_details"] if row
 
 code, negative = run(NEGATIVE)
 assert code == 1 and negative["status"] == "failed"
-negative_claims = {"zero_width_span_is_known", "malformed_matching_self_loop_is_known"}
+negative_claims = {"zero_width_span_is_known", "unrecorded_span_is_known"}
 assert negative["summary"]["proven"] + len(negative_claims) == negative["summary"]["obligations"]
 assert {row["name"] for row in negative["findings"]} == negative_claims
 assert all(row["kind"] == "ensure-unproven" for row in negative["findings"])
@@ -299,7 +294,7 @@ assert require_current_product(BIN, PROVER) == manifest, "proof product or sourc
 assert subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
                       check=True, capture_output=True, text=True).stdout.strip() == compiler_head
 print(json.dumps({"admitted": True,
-                  "scope": "exact-span soundness, singleton success, conflicting-row rejection, and fail-closed table paths",
+                  "scope": "narrow exact-span contract, singleton proof cases, and source-bound malformed/ambiguous regression cases",
                   "positive_obligations": positive["summary"]["proven"],
                   "independently_replayed": positive["replay"]["replayed"],
                   "false_claims_rejected": sorted(negative_claims),

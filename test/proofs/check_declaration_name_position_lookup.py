@@ -81,12 +81,17 @@ def declaration_name_position(annotations: darray[Ast::EnumAnnotation]&, name: s
     ensure Ast::pos_equal(result, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
     can Abort.Panic:
         answer: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
-        for reverse in 0..<annotations.count |answer|:
-            invariant reverse <= annotations.count
-            invariant Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, annotations.count - reverse))
-            assert reverse < annotations.count
-            index: usize = annotations.count - reverse - 1
-            assert index + 1 == annotations.count - reverse
+        cursor: mutable usize = annotations.count
+        assert cursor <= annotations.count
+        assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, cursor))
+        while cursor > 0 and cursor <= annotations.count |answer, cursor|:
+            invariant cursor <= annotations.count
+            invariant Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, cursor))
+            index: usize = cursor - 1
+            assert index < cursor
+            assert index + 1 == cursor
+            assert index <= annotations.count
+            assert index + 1 <= annotations.count
             assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1))
             annotation: Ast::EnumAnnotation = annotations[index]
             eligible: bool = annotation.owner == "__lsp_decl_name" and annotation.name == name and annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0)
@@ -96,6 +101,11 @@ def declaration_name_position(annotations: darray[Ast::EnumAnnotation]&, name: s
             else:
                 assert Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1))
             assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index))
+            cursor <- index
+            assert cursor == index
+            assert cursor <= annotations.count
+            assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, cursor))
+        assert cursor == 0
         assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
         return answer
 '''

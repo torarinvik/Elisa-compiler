@@ -4,11 +4,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import argparse
 from pathlib import Path
 import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -69,9 +74,10 @@ def ref_type_can_grow(value_type: ValueType, structs: mutable StructTable&) -> b
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
         return false if value_type.kind != TypeKind.Ref
         target: ValueType = ref_target_of(value_type, structs)
-        true return if target.kind == TypeKind.DArray
-        true return if is_growable_container_struct(target, structs)
-        true return if target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
+        return true if:
+            target.kind == TypeKind.DArray
+            is_growable_container_struct(target, structs)
+            target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
         return false
 """,
     "value_type_carries_caller_region": """
@@ -79,9 +85,10 @@ def value_type_carries_caller_region(value_type: ValueType, structs: mutable Str
     can Abort.Panic:
         return false if value_type.kind != TypeKind.Ref
         target: ValueType = ref_target_of(value_type, structs)
-        true return if target.kind == TypeKind.DArray
-        true return if is_growable_container_struct(target, structs)
-        true return if target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
+        return true if:
+            target.kind == TypeKind.DArray
+            is_growable_container_struct(target, structs)
+            target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
         return ast_value_needs_arena(target, structs)
 """,
     "value_type_returns_caller_region": """
@@ -200,6 +207,10 @@ for path, shapes in ((POSITIVE, proof_shapes), (NEGATIVE, negative_shapes)):
             raise SystemExit(f"{name} no longer proves the source-bound caller-region policy formula")
 if 'include "./backend_caller_region_policy.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the positive caller-region proofs")
+
+if args.source_only:
+    print(f"source_bound=True positive={len(POSITIVE_NAMES)} false_controls={len(NEGATIVE_NAMES)}")
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

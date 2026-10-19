@@ -195,7 +195,10 @@ assert_body_walker_skips() {
 }
 
 write_valid_source 40
-ELISA_STAGE1_BIN="$STAGE1" ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1 ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
+ELISA_STAGE1_BIN="$STAGE1" \
+    ELISA_STAGE1_INCREMENTAL_QUERY_GRAPH=1 \
+    ELISA_STAGE1_INCREMENTAL_NAME_LOOKUP_DIRECT=0 \
+    ELISA_STAGE1_INCREMENTAL_CACHE_REPORT=1 \
     "${PYTHON_BIN:-python3}" -c 'import os, sys; os.setsid(); os.execvp("bash", ["bash", *sys.argv[1:]])' \
     "$ROOT/scripts/elisac_stage1.sh" semantic-session "$SOURCE" \
     <"$REQUESTS" >"$REPLIES" 2>"$WORK/server.stderr" &
@@ -215,6 +218,156 @@ assert_body_walker_skips "$ordinary_repeat_report" "the ordinary repeat" 1
 # so the unchanged main body can restore while lint warning anchors shift by one line.
 write_valid_source 41 1
 send_check 0
+
+# A complete-empty literal body is independent of declaration-surface edits.
+# Keep a second literal body and add one new declaration so the graph can prove
+# that the old helper stays Green while newly introduced bodies are committed.
+write_surface_transition_source() {
+    local helper_mode="$1"
+    local include_post_broad_surface="${2:-0}"
+    : >"$SOURCE"
+    if [[ "$helper_mode" == "literal" ]]; then
+        cat >>"$SOURCE" <<'EOF'
+def helper() -> i64:
+    return 41
+EOF
+    else
+        cat >>"$SOURCE" <<'EOF'
+def helper() -> i64:
+    return source_leaf()
+EOF
+    fi
+    cat >>"$SOURCE" <<'EOF'
+
+def source_leaf() -> i64:
+    return 11
+
+def lint() -> i64:
+    value: mutable i64 = 40
+    value <- value
+    return value
+
+def captured_lint() -> i64:
+    state: mutable i64 = 0
+    while state > 0 |state|:
+        state <- state
+        state <- state - 1
+    return state
+
+def main() -> i64:
+    return helper()
+
+def unrelated_surface() -> i64:
+    return 13
+EOF
+    if [[ "$include_post_broad_surface" == 1 ]]; then
+        cat >>"$SOURCE" <<'EOF'
+
+def post_broad_surface() -> i64:
+    return 19
+EOF
+    fi
+}
+write_surface_transition_source literal
+send_check 0
+empty_surface_report="$(tail -n 1 "$REPORTS")"
+[[ "$empty_surface_report" =~ source_input_admitted=no([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit unexpectedly admitted SourceInput: $empty_surface_report"
+[[ "$empty_surface_report" =~ complete_empty_body_eligible=3([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit classified the wrong bodies: $empty_surface_report"
+[[ "$empty_surface_report" =~ complete_empty_body_restored=1([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit did not restore the unchanged helper: $empty_surface_report"
+[[ "$empty_surface_report" =~ complete_empty_body_publish_skips=1([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit did not skip the restored helper publication: $empty_surface_report"
+[[ "$empty_surface_report" =~ complete_empty_body_commits=2([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit did not commit both new literal bodies: $empty_surface_report"
+[[ "$empty_surface_report" =~ function_body_facts_restored=0([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit restored a SourceInput-dependent body: $empty_surface_report"
+[[ "$empty_surface_report" =~ cold_body_scans=1([[:space:]]|$) ]] \
+    || fail "complete-empty declaration edit did not cold-scan its ordinary call body: $empty_surface_report"
+
+# Exercise both dependency-shape transitions. Literal -> call changes [] to
+# [SourceInput], while call -> literal changes it back. In each direction the
+# edited body must commit once and unchanged empty siblings must remain reusable.
+write_surface_transition_source call
+send_check 0
+empty_to_broad_report="$(tail -n 1 "$REPORTS")"
+[[ "$empty_to_broad_report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
+    || fail "empty-to-broad transition failed to admit unchanged SourceInput: $empty_to_broad_report"
+[[ "$empty_to_broad_report" =~ complete_empty_body_eligible=2([[:space:]]|$) ]] \
+    || fail "empty-to-broad transition classified the wrong bodies: $empty_to_broad_report"
+[[ "$empty_to_broad_report" =~ complete_empty_body_restored=2([[:space:]]|$) ]] \
+    || fail "empty-to-broad transition failed to restore the unchanged empty siblings: $empty_to_broad_report"
+[[ "$empty_to_broad_report" =~ complete_empty_body_publish_skips=2([[:space:]]|$) ]] \
+    || fail "empty-to-broad transition did not skip both restored empty siblings: $empty_to_broad_report"
+[[ "$empty_to_broad_report" =~ complete_empty_body_commits=0([[:space:]]|$) ]] \
+    || fail "empty-to-broad transition unexpectedly committed an empty query: $empty_to_broad_report"
+
+# A surface change while the helper is call-bearing must invalidate both it and
+# main, while the empty siblings stay reusable through their dependency-free nodes.
+cat >>"$SOURCE" <<'EOF'
+
+def post_broad_surface() -> i64:
+    return 19
+EOF
+send_check 0
+post_broad_surface_report="$(tail -n 1 "$REPORTS")"
+[[ "$post_broad_surface_report" =~ source_input_admitted=no([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit unexpectedly admitted SourceInput: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ complete_empty_body_eligible=3([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit classified the wrong empty bodies: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ complete_empty_body_restored=2([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit failed to restore both old empty bodies: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ complete_empty_body_publish_skips=2([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit did not skip both empty-body publications: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ complete_empty_body_commits=1([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit did not commit its new empty body: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ function_body_facts_restored=0([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit restored SourceInput-dependent bodies: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ body_query_publish_skips=0([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit skipped a SourceInput-dependent publication: $post_broad_surface_report"
+[[ "$post_broad_surface_report" =~ cold_body_scans=2([[:space:]]|$) ]] \
+    || fail "post-broad declaration edit did not cold-scan both call bodies: $post_broad_surface_report"
+
+write_surface_transition_source literal 1
+send_check 0
+broad_to_empty_report="$(tail -n 1 "$REPORTS")"
+[[ "$broad_to_empty_report" =~ source_input_admitted=yes([[:space:]]|$) ]] \
+    || fail "broad-to-empty transition failed to admit unchanged SourceInput: $broad_to_empty_report"
+[[ "$broad_to_empty_report" =~ complete_empty_body_eligible=4([[:space:]]|$) ]] \
+    || fail "broad-to-empty transition classified the wrong bodies: $broad_to_empty_report"
+[[ "$broad_to_empty_report" =~ complete_empty_body_restored=3([[:space:]]|$) ]] \
+    || fail "broad-to-empty transition failed to restore the unchanged empty siblings: $broad_to_empty_report"
+[[ "$broad_to_empty_report" =~ complete_empty_body_publish_skips=3([[:space:]]|$) ]] \
+    || fail "broad-to-empty transition did not skip both restored empty siblings: $broad_to_empty_report"
+[[ "$broad_to_empty_report" =~ complete_empty_body_commits=1([[:space:]]|$) ]] \
+    || fail "broad-to-empty transition did not recommit the literal helper: $broad_to_empty_report"
+
+# A second declaration change after the helper returns to the empty dependency
+# shape proves that the previous SourceInput edge was removed when it was recommitted.
+cat >>"$SOURCE" <<'EOF'
+
+def post_transition_surface() -> i64:
+    return 17
+EOF
+send_check 0
+post_transition_surface_report="$(tail -n 1 "$REPORTS")"
+[[ "$post_transition_surface_report" =~ source_input_admitted=no([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit unexpectedly admitted SourceInput: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ complete_empty_body_eligible=5([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit classified the wrong empty bodies: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ complete_empty_body_restored=4([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit did not retain all old empty bodies: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ complete_empty_body_publish_skips=4([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit did not skip all old empty-body publications: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ complete_empty_body_commits=1([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit did not commit its new empty body: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ function_body_facts_restored=0([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit restored a SourceInput-dependent body: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ body_query_publish_skips=0([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit skipped a SourceInput-dependent publication: $post_transition_surface_report"
+[[ "$post_transition_surface_report" =~ cold_body_scans=1([[:space:]]|$) ]] \
+    || fail "post-transition declaration edit did not cold-scan its ordinary call body: $post_transition_surface_report"
 
 # Grow request and retained snapshot vectors, plus the include identity key. Then
 # repeat the large check after the previous request region has ended; it must read
@@ -698,9 +851,9 @@ exec 4<&-
 [[ -s "$WORK/server.stderr" ]] || fail "expected diagnostics and cache reports on stderr"
 grep -Fq 'unknown_name' "$WORK/server.stderr" || fail "missing diagnostic for edited unresolved name"
 lint_warning_count="$(grep -Fc 'assignment to "value" has no effect: target and value are identical' "$WORK/server.stderr" || true)"
-[[ "$lint_warning_count" -eq 6 ]] || fail "expected the current self-assignment warning on all six requests containing that function, got $lint_warning_count"
+[[ "$lint_warning_count" -eq 8 ]] || fail "expected the current self-assignment warning on all eight requests containing that function, got $lint_warning_count"
 captured_lint_warning_count="$(grep -Fc 'assignment to "state" has no effect: target and value are identical' "$WORK/server.stderr" || true)"
-[[ "$captured_lint_warning_count" -eq 6 ]] || fail "expected the captured-loop warning on all six requests containing that function, got $captured_lint_warning_count"
+[[ "$captured_lint_warning_count" -eq 8 ]] || fail "expected the captured-loop warning on all eight requests containing that function, got $captured_lint_warning_count"
 count_warning_at() {
     local name="$1"
     local line="$2"
@@ -713,10 +866,12 @@ count_warning_at() {
 }
 value_line6_count="$(count_warning_at value 6)"
 value_line7_count="$(count_warning_at value 7)"
+value_line9_count="$(count_warning_at value 9)"
 state_line12_count="$(count_warning_at state 12)"
 state_line13_count="$(count_warning_at state 13)"
-[[ "$value_line6_count" -eq 2 && "$value_line7_count" -eq 4 ]] || fail "expected straight-line warning anchors to shift from line 6 to 7, got $value_line6_count/$value_line7_count"
-[[ "$state_line12_count" -eq 2 && "$state_line13_count" -eq 4 ]] || fail "expected captured-loop warning anchors to shift from line 12 to 13, got $state_line12_count/$state_line13_count"
+state_line15_count="$(count_warning_at state 15)"
+[[ "$value_line6_count" -eq 2 && "$value_line7_count" -eq 1 && "$value_line9_count" -eq 5 ]] || fail "unexpected straight-line warning anchors after adding complete-empty surface cases: $value_line6_count/$value_line7_count/$value_line9_count"
+[[ "$state_line12_count" -eq 2 && "$state_line13_count" -eq 1 && "$state_line15_count" -eq 5 ]] || fail "unexpected captured-loop warning anchors after adding complete-empty surface cases: $state_line12_count/$state_line13_count/$state_line15_count"
 shifted_report="$(sed -n '3p' "$REPORTS")"
 [[ "$shifted_report" =~ session=edit([[:space:]]|$) ]] || fail "expected the inserted-line request to reuse the prior semantic snapshot: $shifted_report"
 assert_graph_body_edit "$shifted_report" "the shifted helper edit" 3

@@ -61,6 +61,14 @@ def igc_configure_semantic_query_graph[@session](session: mutable Semantic::Incr
     _ = Semantic::incremental_semantic_session_set_query_graph_enabled(session, graph_enabled)
 
 
+# A separate A/B arm bypasses only NameLookup graph operations after the exact
+# resolver surface is available. It requires query-graph context initialization;
+# if that context is inactive, resolver classification remains cold.
+def igc_direct_surface_name_lookup_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    setting: mutable darray[u8] = []
+    return env_value("ELISA_STAGE1_INCREMENTAL_NAME_LOOKUP_DIRECT", &setting) and setting.count == 1 and setting[0] == 49
+
+
 def igc_cache_path(cache_directory: darray[u8]&, source_path: sview) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
     path: mutable darray[u8] = []
     for index in 0..<cache_directory.count |path, cache_directory|:
@@ -164,6 +172,7 @@ def igc_write_atomic[@output](path: darray[u8]&, bytes: darray[u8]& @output, sem
 
 
 def run_semantic_gate_incremental_with_session[@session, @input_source, @output](file: Ast::File& @input_source, policy_source: u8&, policy_length: usize, analyzed_source: u8& @input_source, analyzed_length: usize, tokens: darray[Lexer::Token]& @input_source, identity: SourceIdentity::Capture&, cache_directory: darray[u8]&, report_cache: bool, generated_input: bool, session: mutable Semantic::IncrementalSemanticSession[session]& @session) -> i64 can[Abort.Panic, Console, Memory.Allocate, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}]:
+    Semantic::incremental_semantic_reverse_mark_metrics_begin_request(session, report_cache)
     options: Semantic::IncrementalSemanticOptions = stage1_semantic_options(policy_source, policy_length)
     semantic_fingerprint: u64 = Semantic::INCREMENTAL_SEMANTIC_ENGINE_VERSION
     session_enabled: bool = Semantic::incremental_semantic_session_is_enabled(session)
@@ -194,6 +203,10 @@ def run_semantic_gate_incremental_with_session[@session, @input_source, @output]
     prior_snapshot_fact_fallbacks: mutable u32 = 0
     cold_body_scans: mutable u32 = 0
     source_input_admitted: mutable bool = false
+    complete_empty_body_eligible: mutable u32 = 0
+    complete_empty_body_restored: mutable u32 = 0
+    complete_empty_body_publish_skips: mutable u32 = 0
+    complete_empty_body_commits: mutable u32 = 0
     if admission_inputs_valid:
         if cache_directory.count > 0:
             igc_mkdir(cache_directory)
@@ -214,6 +227,10 @@ def run_semantic_gate_incremental_with_session[@session, @input_source, @output]
                 prior_snapshot_fact_fallbacks <- session_result.prior_snapshot_fact_fallbacks
                 cold_body_scans <- session_result.cold_body_scans
                 source_input_admitted <- session_result.source_input_admitted
+                complete_empty_body_eligible <- session_result.complete_empty_body_eligible
+                complete_empty_body_restored <- session_result.complete_empty_body_restored
+                complete_empty_body_publish_skips <- session_result.complete_empty_body_publish_skips
+                complete_empty_body_commits <- session_result.complete_empty_body_commits
                 session_attempted <- true
             else:
                 Semantic::incremental_semantic_session_reset(session)
@@ -243,14 +260,19 @@ def run_semantic_gate_incremental_with_session[@session, @input_source, @output]
     effect_source_bodies_skipped: mutable u64 = 0
     ungranted_panic_bodies_skipped: mutable u64 = 0
     global_permission_axis_scans_skipped: mutable u64 = 0
-    name_lookup_stats: mutable Semantic::IncrementalSemanticNameLookupStats = Semantic::IncrementalSemanticNameLookupStats{hits: 0, classification_chain_visits: 0}
+    name_lookup_stats: mutable Semantic::IncrementalSemanticNameLookupStats = Semantic::IncrementalSemanticNameLookupStats{hits: 0, direct_surface_classifications: 0, classification_chain_visits: 0}
     semantic_errors: mutable i64 = 0
     PhaseTimer::mark("incremental-before-semantic") can Global{Read,Write}
     lookup_contexts: mutable darray[Semantic::IncrementalSemanticNameLookupContext[output]] @output = []
-    Semantic::incremental_semantic_name_lookup_context_disabled_push(lookup_contexts)
+    Semantic::incremental_semantic_name_lookup_context_disabled_push(&lookup_contexts)
     Semantic::incremental_semantic_name_lookup_context_begin_request[session, output, output](session, report_cache, &lookup_contexts[0]) can[Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast]
-    semantic_errors <- run_semantic_gate_with_lookup_context[output, session, output](file, policy_source, policy_length, options, &snapshot, &incremental_skip_count, &effect_source_bodies_skipped, &ungranted_panic_bodies_skipped, &global_permission_axis_scans_skipped, session, &lookup_contexts[0]) can Global{Read,Write}
+    Semantic::incremental_semantic_name_lookup_context_set_direct_surface_mode[output, output](&lookup_contexts[0], igc_direct_surface_name_lookup_enabled())
+    region snapshot_borrow:
+        snapshot_slots: mutable darray[Semantic::IncrementalSemanticSnapshot[output]] @snapshot_borrow = [snapshot]
+        semantic_errors <- run_semantic_gate_with_lookup_context[output, snapshot_borrow, session, output](file, policy_source, policy_length, options, &snapshot_slots[0], &incremental_skip_count, &effect_source_bodies_skipped, &ungranted_panic_bodies_skipped, &global_permission_axis_scans_skipped, session, &lookup_contexts[0]) can Global{Read,Write}
     name_lookup_stats <- Semantic::incremental_semantic_name_lookup_stats[output, output](&lookup_contexts[0])
+    reverse_mark_stats: Semantic::IncrementalSemanticReverseMarkStats = Semantic::incremental_semantic_reverse_mark_stats(session)
+    Semantic::incremental_semantic_reverse_mark_metrics_end_request(session)
     # `mark` also flushes buffered short semantic passes; the request end span is independent.
     PhaseTimer::mark("incremental-semantic") can Global{Read,Write}
     cache_published: mutable bool = false
@@ -321,6 +343,14 @@ def run_semantic_gate_incremental_with_session[@session, @input_source, @output]
             report.extend("yes")
         else:
             report.extend("no")
+        report.extend(" complete_empty_body_eligible=")
+        append_decimal(&report, complete_empty_body_eligible)
+        report.extend(" complete_empty_body_restored=")
+        append_decimal(&report, complete_empty_body_restored)
+        report.extend(" complete_empty_body_publish_skips=")
+        append_decimal(&report, complete_empty_body_publish_skips)
+        report.extend(" complete_empty_body_commits=")
+        append_decimal(&report, complete_empty_body_commits)
         report.extend(" direct_fact_count=")
         append_decimal(&report, snapshot.direct_facts.count.u32())
         report.extend(" effect_source_bodies_skipped=")
@@ -331,8 +361,18 @@ def run_semantic_gate_incremental_with_session[@session, @input_source, @output]
         append_decimal(&report, global_permission_axis_scans_skipped.u32())
         report.extend(" name_lookup_hits=")
         append_decimal(&report, name_lookup_stats.hits.u32())
+        report.extend(" name_lookup_direct_surface_classifications=")
+        append_decimal(&report, name_lookup_stats.direct_surface_classifications.u32())
         report.extend(" name_lookup_classification_chain_visits=")
         append_decimal(&report, name_lookup_stats.classification_chain_visits.u32())
+        report.extend(" reverse_mark_fast_skips=")
+        append_decimal_u64(&report, reverse_mark_stats.fast_skips)
+        report.extend(" reverse_mark_full_walks=")
+        append_decimal_u64(&report, reverse_mark_stats.full_walks)
+        report.extend(" reverse_mark_nodes_visited=")
+        append_decimal_u64(&report, reverse_mark_stats.nodes_visited)
+        report.extend(" reverse_mark_edges_visited=")
+        append_decimal_u64(&report, reverse_mark_stats.edges_visited)
         report.extend(" self_assignment_bodies_scanned=")
         append_decimal(&report, snapshot.self_assignment_bodies_scanned)
         report.extend(" self_assignment_bodies_reused=")

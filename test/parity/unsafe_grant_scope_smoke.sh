@@ -952,6 +952,38 @@ cases = {
     ),
 }
 
+# Qualified duplicate leaf names must retain module identity in strict-unsafe effect
+# lookup. Test both declaration orders, and check both that the pure sibling stays
+# callable and that the unsafe target still requires a local grant.
+left_unsafe_module = (
+    "module Left:\n"
+    "    public:\n"
+    "        def touch() -> void can[Unsafe.PointerCast]:\n            pass\n"
+)
+right_pure_module = (
+    "module Right:\n"
+    "    public:\n"
+    "        def touch() -> void:\n            pass\n"
+)
+for order_name, modules in (
+    ("Left before Right", left_unsafe_module + right_pure_module),
+    ("Right before Left", right_pure_module + left_unsafe_module),
+):
+    cases[f"strict unsafe duplicate leaf pure sibling {order_name}"] = (
+        "# strict\n" + modules +
+        "def main() -> i64:\n"
+        "    Right::touch()\n"
+        "    return 0\n",
+        None,
+    )
+    cases[f"strict unsafe duplicate leaf unsafe target {order_name}"] = (
+        "# strict\n" + modules +
+        "def main() -> i64:\n"
+        "    Left::touch()\n"
+        "    return 0\n",
+        "requires can[Unsafe]",
+    )
+
 with tempfile.TemporaryDirectory(prefix="elisa-unsafe-grants-") as temp:
     directory = pathlib.Path(temp)
     for name, (source, expected) in cases.items():

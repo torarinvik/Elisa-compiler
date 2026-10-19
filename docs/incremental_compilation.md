@@ -262,10 +262,20 @@ cold runs. A direct-call-only body can also replace the Global-authority inferen
 walk after its targets are resolved against the current function index; its report
 walk stays cold. When Global permission enforcement is enabled, Read/Write axes
 project freshly collected facts for eligible flat bodies without local bindings,
-while retaining each function slot; zero-fact bodies contribute empty axes. The
-panic pass still builds its wrapper index and annotation views and visits
-declarations; only bound-name collection and its body walkers are skipped. The conservative collector rejects
-local reference writes, nested grant blocks, parenthesized expressions, and
+while retaining each function slot; verified zero-fact bodies contribute empty
+axes. The live collector now leaves every plain `Stmt.Assign(..., Assign, ...)`
+out of the incremental fact lane, regardless of target or RHS; literal
+`Stmt.VarDecl` bindings remain independently eligible. This conservative cache
+boundary avoids relying on incomplete name indexes while the Global-permission
+and Global-authority walkers disagree about fresh identifier targets. It
+preserves cold/warm parity without deciding assignment semantics. The source
+change has not been compiled or tested; the reference study records the
+required Stage0 oracle and cold/warm parity cases.
+
+The panic pass still builds its wrapper index and annotation views and visits
+declarations; only bound-name collection and its body walkers are skipped. The
+conservative collector rejects local reference writes, nested grant blocks,
+parenthesized expressions, and
 unsupported syntax so these skips preserve authority behavior and walker-depth
 diagnostics. Global-authority replay also stays cold for the whole unit when
 inline-grant annotations are present, because their spans are not yet bound to
@@ -931,13 +941,25 @@ not infer missing context from the current AST or symbol table.
 
 This remains an unqualified private prototype, not a production query engine. The
 session collector checks cached `SourceInput` and `FunctionBodyFacts` results. A body
-query is attempted only after the trusted prior snapshot proves an exact declaration
-surface, cacheable prior record, and exact body match. A body hit decodes canonical
+query reuse for an ordinary body is attempted only after the trusted prior snapshot
+proves an exact declaration surface, cacheable prior record, and exact body match.
+The `complete_empty_body` exception can reuse a graph query after the exact prior
+body match without trusted whole-surface admission. A body hit decodes canonical
 query bytes into the current request snapshot, validating each fact against the
-previous snapshot's typed facts before it bypasses the body walker. A resolver
-`NameLookup` query is connected at `Expr.Ident` classification: the driver reacquires a
-request context after collection, and the serial declaration-resolution walk checks the
-cached `(known, module_only)` result before scanning global symbol/member chains. Key
+previous snapshot's typed facts before it bypasses the body walker.
+For ordinary bodies, this query path is an overlay on the existing typed-snapshot
+reuse: the graph lookup requires the same exact prior body/surface admission and
+checks its decoded facts against the prior typed record; a graph miss falls back to
+copying that same record under the same gate. It therefore does not yet demonstrate
+additional body-fact extraction skipped versus graph-off. The `complete_empty_body`
+syntax path skips collector scanning independently of the graph. Treat graph counters
+as routing/revalidation evidence until a graph-only path demonstrates additional
+analysis work avoided.
+
+A resolver `NameLookup` query is connected at `Expr.Ident` classification: the
+driver reacquires a request context after collection, and the serial
+declaration-resolution walk checks the cached `(known, module_only)` result before
+scanning global symbol/member chains. Key
 schema 2 stores only current module and exact name; input schema 3 packs six boolean
 surface facts into one flags byte alongside the exact count fields. The session-local
 graph resets when identity or options change. After declarations, aliases, imports, and region annotations
@@ -970,14 +992,22 @@ only; no build, parity run, or benchmark has verified them.
 This can reuse classification across body-only edits because the declaration surface
 omits function bodies, while every declaration-surface change invalidates all these
 name queries. The resolver still performs the indexed chain walk on misses.
-The current body-fact query has a coarser dependency: each `FunctionBodyFacts`
-node depends on the whole `SourceInput`, whose value includes the declaration
-surface and options. A declaration change can therefore make every body query
-non-green even when an unrelated function body and its facts are unchanged. The
-same broad surface match also gates the current prior-snapshot reuse path; if the
-surface differs, the collector cold-scans candidate bodies. Thus an unrelated
-declaration edit can currently force supported bodies through the scan. The
-next useful graph step is to record the actual name observations used by the fact
+For ordinary cacheable bodies, each `FunctionBodyFacts` node still depends on the
+whole `SourceInput`, whose value includes the declaration surface and options. A
+declaration change can therefore make those body queries non-green even when an
+unrelated function body and its facts are unchanged. The same broad surface match
+also gates prior-snapshot reuse for ordinary bodies; if the surface differs, the
+collector cold-scans those candidates.
+
+There is now one closed-shape exception. A supported body containing exactly one
+`return` of an integer, float, string, character, or boolean literal is marked
+`complete_empty_body`; it has no direct facts and its `FunctionBodyFacts` query
+has no `SourceInput` dependency. The collector can skip its fact scan across a
+declaration-surface edit, with or without the query graph. This skips only direct-
+fact collection: parsing and the normal semantic pipeline still run. The graph
+path has not yet shown additional body-work savings over the typed-snapshot path.
+
+The next useful graph step for non-empty bodies is to record the actual name observations used by the fact
 walker as dependencies, scoped to the canonical direct facts this syntax walk
 emits. For `GlobalRead`/`GlobalWrite`, record mutable-global membership plus the
 owner's local/binder shadowing; this walk does not inspect all-global presence on
@@ -1015,16 +1045,15 @@ the current-AST cold scan so no prior typed facts survive the eligibility
 transition.
 Do not persist request-local declaration IDs or handles in those dependencies.
 
-A conservative rollout can first relax `SourceInput` only for bodies whose prior
-collector explicitly records a complete empty declaration-observation manifest.
-Derive this class from a closed syntax shape, not `direct_fact_count == 0`: for
-example, exactly one bare `return` whose expression is a self-contained integer,
-float, string, character, or boolean literal, with no local bindings, grants,
-calls, identifiers, or additional statements. Zero emitted direct facts alone is
+The current collector implements the first closed-shape exception directly from
+the AST, rather than inferring it from `direct_fact_count == 0`: one bare `return`
+of a self-contained integer, float, string, character, or boolean literal, with
+no local bindings, grants, calls, identifiers, or additional statements. It marks
+that record cacheable with zero facts and omits its `SourceInput` edge. Every other
+body keeps the broad surface dependency until its observed-name and call
+projections, including owner removal, are complete. Zero emitted facts alone is
 not proof of an empty dependency set because body-local forms may be omitted from
-that fact vocabulary. Key the context by exact body bytes and current owner
-eligibility; keep the whole-surface dependency for bodies with observed names or
-calls until their projections and owner-removal publication are complete.
+the current fact vocabulary.
 
 For the current collector, keep the first dependency manifest scoped to observations
 from bodies that are already cacheable. `ifc_walk_expr` rejects absent/readonly
@@ -1097,24 +1126,26 @@ collection and publish only after the replacement snapshot stores successfully.
 A fresh session or sidecar without a complete validated prior manifest must take
 the cold scan; it cannot infer context equality from old fact record offsets alone.
 Collection and publication must use the same dependency set. The current publisher
-rebuilds a shared `[SourceInput]` dependency list for every cacheable body; if
-collection admits an empty-manifest body without that edge but publication
-reattaches it, declaration edits will still invalidate the body. Carry a validated
-dependency classification through the request snapshot or recompute it from the
-same complete manifest at publication, and assert the committed edge set in a
-control. Prefer one deterministic dependency builder for collection-time
-evaluation and post-store publication; retain request-local projection evidence
-separately from handles, then reacquire handles under the committed graph
-generation.
+uses `[SourceInput]` for ordinary cacheable bodies and no dependency for
+`complete_empty_body`; its request-local hit marker records that dependency mode.
+Validation checks the source result generation for ordinary bodies and requires
+zero dependencies for the complete-empty case. Both paths still require a valid,
+bounds-checked declaration-surface snapshot. As additional dependency classes are
+added, carry their validated classification through the request snapshot or
+recompute it from the same complete manifest at publication, and assert the
+committed edge set in a control. Prefer one deterministic dependency builder for
+collection-time evaluation and post-store publication; retain request-local
+projection evidence separately from handles, then reacquire handles under the
+committed graph generation.
 
-This is the target behavior, not the current implementation. Collection attempts
-FunctionBodyFacts only after the complete SourceInput value fits and hits; the
-publisher also returns before visiting body nodes when that value is over cap.
-The outer publisher treats that predictable miss like aggregate exhaustion,
-clears the graph, and retries the same preflight. Thus an oversized SourceInput
-currently prevents context-only body queries and can discard unrelated graph
-state. Keep fixed-cap admission misses local; clear and rebuild only for actual
-aggregate-capacity or structural failures.
+That broader dependency-policy mechanism remains future work. The current
+`complete_empty_body` exception can be collected without an admitted `SourceInput`
+and published without that edge, even when the encoded source value exceeds its
+per-value cap. It still requires valid declaration-surface metadata and spans;
+ordinary bodies remain gated by the `SourceInput` path. A source-value cap miss
+alone no longer prevents complete-empty nodes from publishing or requires a graph
+clear. Keep predictable misses for future context queries local; clear and rebuild
+only for actual aggregate-capacity or structural failures.
 
 Query-value capacity is part of this dependency policy. A valid source surface
 whose `SourceInput` key or value exceeds its cap must still allow a fitting
@@ -1133,11 +1164,12 @@ that owner unpublished when neither dependency fits. Add retained-session
 controls for both a large declaration surface with small context-only bodies and
 a context payload that exceeds its own cap.
 
-The current validated-body-hit marker also records the `SourceInput` result
-generation and publication skip validation reacquires that handle. If an eligible
-body drops the broad source edge, update the marker to validate its exact current
-context dependency set (or disable the publish skip for that case); a source-only
-marker cannot authorize publication under a different dependency policy.
+The validated-body-hit marker now records whether the body requires `SourceInput`.
+Publication validates its source result generation for ordinary bodies and checks
+that the dependency list is empty for `complete_empty_body`; it also checks the
+exact body span, key, graph generation, and result generation. Graph clears still
+invalidate the marker. Any future dependency class must carry equivalent evidence
+for its exact current dependency set before it can skip publication.
 
 The existing `NameLookup` query returns only `(known, module_only)` and omits
 binding types, signatures, attributes, and declaration identities. It can skip
@@ -1206,10 +1238,11 @@ did not restore and exact prior typed facts were copied; a cold scan counts a ca
 to `ifc_scan_candidate`, including candidates that the scan later rejects. The
 `source_input_admitted` flag means both the exact SourceInput query hit and the
 trusted prior declaration surface admitted the graph body path. It is false on an
-exact-source session return because that path bypasses the graph. These counters
-describe routing only; do not claim a production query engine or speedup until
-parity controls and measured results show the graph improves the retained-edit
-path.
+exact-source session return because that path bypasses the graph, and it does not
+describe the `complete_empty_body` path that deliberately has no SourceInput edge.
+These counters describe routing only; do not claim a production query engine or
+speedup until parity controls and measured results show the graph improves the
+retained-edit path.
 
 The paired retained-session harness now has `zero-fact` and `call-facts` workloads.
 The latter uses a distinct leaf callee per body and requires warm `NameLookup` hit
@@ -1277,9 +1310,11 @@ validation fields, the sequence is estimated at 112 bytes under conventional 64-
 alignment, versus 136 bytes with `usize` spans; admission budgets 128 bytes per node
 to include index overhead. The edge record is 28 bytes by field width and about
 32 bytes with conventional alignment; admission budgets 48 bytes. These are
-source-level estimates, not measured Elisa layouts or speedups. The graph has one
-unqualified semantic caller; profile it after parity and retained-edit controls are
-in place.
+source-level estimates, not measured Elisa layouts or speedups. The current graph
+has collector `SourceInput`/`FunctionBodyFacts` callers and a resolver `NameLookup`
+caller. These are distinct query paths; body-fact reuse still overlaps the existing
+snapshot reuse path, and none has source-matched parity plus retained-edit timing
+qualification. Profile each path separately before crediting a speedup.
 
 The checked Zig revision's `AnalUnit` is a packed 64-bit kind/ID handle. Its
 `DepEntry` uses a 64-bit depender handle and three 32-bit links; the dependee
@@ -1318,6 +1353,62 @@ and dense invalidation and dependency-deduplication costs. Graph-generation
 exhaustion is fail-closed and permanently poisons that session's graph rather than
 wrapping a handle generation back to an earlier value.
 
+One graph optimization refreshes stale dependency generations when the
+dependency IDs are unchanged. [`ifq_query_commit`](../src/semantic/incremental_function_facts.elisa#L3071)
+sets `dependency_replacement_required` only when IDs differ and sets
+`dependency_generation_refresh_required` for equal IDs with stale generations
+and Green dependees. Changed IDs still run the cycle check and use
+[`ifq_apply_dependency_set`](../src/semantic/incremental_function_facts.elisa#L2992)
+to replace topology. Equal IDs use
+[`ifq_refresh_dependency_generations`](../src/semantic/incremental_function_facts.elisa#L3038),
+which validates the entire edge chain before updating each edge's
+`observed_result_generation`; adjacency and incoming-chain generations remain
+unchanged. If any validation fails, the graph fails closed. The earlier
+`current-settled` semantic gate started before this helper was added. The later
+source-hashed `frozen-a73ea` gate included it, but still reported compiler errors
+in snapshot reanchoring and the semantic API, so this path has no passing build
+qualification yet. Add separate generation-refresh and topology-rewrite counters, then
+use a declaration-surface edit to verify refreshes without rewrites and measure
+edge work plus full retained-request time. No timing result establishes a
+speedup yet.
+
+A later source-matched Stage1 seed on 2026-10-19 used source hash
+`4109a3adab3cf74376f792a3d01f2f141065488eb7fae2bc3cf1def19b10fac6` and build-recipe
+hash `f4cf2fb863d549b4e5e7d8d0182295b7bf51dca565d284a89550f2836f70a67e`. Its before
+and after source and recipe content hashes and stat fingerprints matched, but the
+Stage0 bootstrap compile exited with status 1. The log is
+`/private/tmp/elisa-goal-rgn-seed.log`. Remaining region diagnostics include an
+`input_source` escape into the exact-reanchor plan and escapes through the semantic
+lookup session/context at `semantic_api.elisa:893` and
+`elisac_source_probes.elisa:285`, plus wrapper lifetime errors in `semantic_api.elisa`.
+The worktree has since changed, so this is a qualified failed attempt for that exact
+source snapshot, not a qualification of the live tree or a Stage1 product. A second
+pinned seed used source hash
+`93ef7df21cf5c72be9e6e610036d0ef91d59c9df9a67b2bbcd49a3fbad73e58f` with the same
+recipe hash; its before/after provenance also matched and it failed with the same
+remaining plan and semantic API lifetime diagnostics. Its log is
+`/private/tmp/elisa-goal-rgn2-seed.log`. The worktree advanced again after this run.
+
+A later shared-tree seed captured source hash
+`7566eae6e51ff8342d4b01846649df55191477e993107e60870a4b19ea0b11d8` and ended with
+status 1; the log is `/private/tmp/elisa-goal-clean-seed.log`. Its post-run source hash
+was `1b52569a1a433f75e141dc064d2cd17d40a5e6ad741645c018efe3a13956a56f`, while recipe
+hash and stat fingerprint matched. The only source file reported as changed during
+the run was `incremental_function_facts.elisa`. The captured revision had no IFC
+plan-region diagnostic, but this does not qualify the later IFC source. Unchanged
+`semantic_api.elisa` and `elisac_source_probes.elisa` still reported eight lifetime
+diagnostics across their lookup-context and local-storage boundaries. This is mixed
+source evidence, not a full-tree qualification.
+
+The next seed captured source hash
+`0084d187fd7441276329a705b3c7d2461e3681017446b5a0296d6001c73d8e94` and was
+terminated with status 143 before producing an after-provenance file. Its log is
+`/private/tmp/elisa-goal-ifc-annotated-seed.log`; the recipe fingerprint matched at
+launch. During the run, live provenance showed source hash
+`b2d193afa0a97cdc5c816874b61d43320c3dceaa9426f65637e2a002bbde404a`, with edits after
+capture to `check_borrow_binders.elisa`, `semantic_api.elisa`, and
+`store_through_summary.elisa`. This interrupted run provides no build qualification.
+
 The report counts `eligible_bodies` and `matched_eligible_bodies` by unique
 cacheable function record, so a body with multiple facts cannot inflate
 eligibility. `visited` counts candidates passed through the collector walk,
@@ -1351,73 +1442,98 @@ edges, then skips that body's inference walk; the report walk remains cold to
 preserve exact diagnostic locations. The same proof skips only the body-bound-name,
 panic statement, and grant-coverage scans in `check_ungranted_panic`; effect-wrapper
 indexing/closure, code generation, and linking remain on the full path. With
-Global-permission enforcement enabled, the same current-source fact pass also
-replaces the local-name, Global.Read/Write, and direct-call collectors for eligible
-top-level functions. Zero-fact records contribute false direct bits; flat
-fact-bearing bodies without local bindings project their direct read/write facts
-and call edges. Their function slots remain so closure and effect-row publication
-still include the complete declaration set. Bodies with local bindings, nested
-control flow, or nested declarations stay cold. The direct checker control enables
-Global-permission enforcement, compares canonical rows, and asserts axis-scan
-counters; the CLI control enables it with `# globals` and asserts the same counter
-alongside the other pass counters. Runtime parity for these updated controls is
-still pending a fresh Stage1 product. LLVM fragment loading remains a separate
-later stage.
+Global-permission enforcement enabled, verified current-source facts can skip
+direct body scans for eligible top-level functions while retaining every function
+slot for closure and row publication. A zero-fact record is usable only after the
+current anchor, cacheability, and complete fact span checks pass; literal
+`Stmt.VarDecl` bindings may occur in that lane. Fact-bearing records use the
+restricted flat-body projection, while `=` assignments, nested control flow,
+comprehensions, nested declarations, and unsupported expressions stay cold. The
+direct checker control enables Global-permission enforcement, compares canonical
+rows, and asserts axis-scan counters; the CLI control enables it with `# globals`
+and asserts the same counter alongside the other pass counters. Runtime parity
+for these updated controls is still pending a fresh Stage1 product. LLVM fragment
+loading remains a separate later stage.
 
-The cold fallback is not yet a trustworthy semantic baseline for all local-name
-shadowing. `collect_local_names` recursively flattens `VarDecl` names from the
-whole function, while the resolver visits each initializer before binding that
-declaration and restores lexical scope across control-flow arms. For example,
-with mutable global `hot`, `prior: i64 = hot; hot: i64 = 1` resolves the first
-`hot` as the global, but the flat local set can hide that `Global.Read` from the
-Global-permission fallback. A declaration in one branch can likewise mask a
-same-named global read outside that branch. The function-value effect pass uses
-the same pre-collected locals. This is a cold-path correctness issue, not stale
-fact reuse; replace flat name collection with source-order lexical environments
-and scope push/pop, then require cold parity for declaration-order, branch,
-loop, block, and pattern-binding cases before widening body-fact reuse.
+The Global-permission fallback has since replaced the old function-wide local
+census with source-order binding stacks and branch/scope copies. Its expression
+and call visitors now cover the previously listed `Expr.If`, match/catch guards,
+call callee and argument, assignment-place, block, comprehension, and recovery
+children. The incremental collector remains narrower: verified zero-fact records
+can skip both Global axes, while fact-bearing records use a flat-body projection
+and unsupported control-flow, contracts, comprehensions, or call shapes stay on
+the cold AST path. Literal `Stmt.VarDecl` bindings can still occur in a verified
+zero-fact body; they are not categorically cold. Keep the current-record,
+cacheability, and fact-span checks ahead of every empty-fact shortcut. These are
+source observations; the latest full Stage1 seed has not qualified them.
 
-The cold write walker has a complementary operator mismatch: it treats every
-assignment rooted in a mutable global as a store, while the resolver treats
-plain `=` as a new local binding and reserves `<-`/compound operators for
-existing places. Thus `global mutable hot: i64 = 0; def f(): hot = 1` can acquire a
-false `Global.Write` requirement. Model binding versus mutation in the same
-source-order environment.
+R69 source review found that a zero-argument `panic()` is recorded as `PanicSite`,
+but the Global-permission projector treated that kind as a no-op even though the
+cold call walker adds a conservative unknown-target edge. The current projector
+now rejects `PanicSite` during its preflight pass, before appending any projected
+edges, so both Global axes fall back to the cold body walkers. This is a
+source-level soundness repair, not yet Stage1- or parity-qualified. The existing
+`panic_only` fixture cannot exercise this projection path because it uses a
+trusted block and does not call the function; a future parity control should use
+a flat cacheable `panic()` body called from an ungranted caller, with both
+Global.Read and Global.Write siblings, and compare cold, first-snapshot, and warm
+diagnostics.
 
-Call-edge discovery also treats a source spelling as callable identity. The
-resolver chooses a local binding before a same-named top-level function, but
-`called_function_name` and `gp_expression_calls` do not consult that binding.
-For example, `def through(bump: fn(i64) -> i64, n: i64) -> i64: return bump(n)`
-can be connected to a top-level effectful `bump` even though the call targets
-the function-value parameter, spuriously propagating its `Global.Write`. Build
-call edges from the current resolved binding and only map confirmed top-level
-callables to the declaration graph.
+One cold-path semantic disagreement remains for plain `=` to an identifier.
+The Global-authority walker treats it as a new local binding, while the separate
+Global-permission write walker can infer `Global.Write` if the unbound spelling
+resolves to a global. The incremental collector now keeps every plain
+`Stmt.Assign(..., Assign, ...)` cold, regardless of target or RHS; this avoids a
+cold/warm difference without deciding which pass matches Stage0. Re-admit this
+shape only after a Stage0 oracle and binding-aware parity establish the intended
+semantics.
 
-Expression coverage in the cold Global walkers is also incomplete. Both
-`gp_expression_reads` and `gp_expression_calls` omit `Expr.If`, so a conditional
-value can hide a global read or a call edge even though the fact collector
-rejects that expression and correctly selects the cold path. For example:
+The scoped Global call graph now tracks declaration slots, routes local or
+computed callees through a conservative unknown edge, and closes effects with a
+worklist. However, effect-row publication still calls `gp_push_source_row` with
+the bare function name; `function_effect_refs` and the ungranted-call path also
+look rows up by the leaf returned from `called_function_name`. Same-named
+functions in separate modules can therefore share inferred Global rows after
+the scoped closure. Preserve a scoped declaration key through publication and
+lookup, and make the existing `Left::touch`/`Right::touch` parity fixture check
+the published rows and caller diagnostics.
 
-```elisa
-global mutable hot: i64 = 0
-def f(flag: bool) -> i64:
-    return if flag:
-        hot
-    else:
-        0
-```
+Two remaining cold precision limits are separate from cacheability. The Global
+walkers traverse every `Stmt.Contract`, including proof/frame-only
+`decreases`, `decreases*`, `invariant`, `changes`, and `preserves` that the
+backend does not lower at runtime; filter those kinds to match runtime behavior.
+They also analyze literal lambda callback arguments as executable even when a
+known callee never invokes them. The incremental collector rejects these shapes,
+so these are cold over-approximations, not warm-cache undercounts.
 
-The cold visitor must recurse through every executable expression child and
-respect branch and pattern scopes. The statement walkers also omit Match guards,
-the call walker skips nested calls in a Call's callee and assignment target, and
-`Stmt.Contract` has no explicit kind-aware handling. The backend checks
-`requires`/`require` and `assert` predicates at runtime, defers `ensure`/`ensures`
-to each later return, and does not lower `decreases`, `invariant`, `changes`, or
-`preserves` as runtime predicates. The canonical visitor must include runtime
-and return-flow expression observations while keeping proof and frame clauses
-separate. These omissions already affect cold inference; complete fact manifests
-cannot make Global-row reuse sound until the canonical visitor covers them or
-rejects those forms.
+The function-value signature checker still collects fn-typed locals from nested
+branches and loops into function-wide name/type arrays, then chooses the first
+same-spelled entry when validating assignments. Shadowed function-typed locals
+can therefore use the wrong declared effect row. Its separate site-check visitor
+also covers only selected expression kinds. The fix belongs in a
+scope-aware local-to-type map and a deliberate expansion of that visitor.
+The AST now carries a `query_scope_id` on comprehension nodes and collection
+comprehensions preserve their original opener `Pos`. The parser derives this
+parse-local `u32` as `for`-token offset plus one, reserving zero for synthetic
+nodes. The backend now derives scope IDs for query annotation rows and uses them for
+comprehension emission, count, and extremum recognition. Semantic annotation
+ingestion retains the raw `for`-token offset, while the resolver, all three
+global-permission walkers, and the global-authority walker convert that offset to
+the same parse-local ID and compare it with the AST scope ID; `Pos` remains for
+diagnostics. This fixes the opener-versus-`for` join and same-line clause identity.
+These semantic consumers still scan every binder row for each query and truncate
+mismatched parallel offset/name arrays, so add a validated per-scope range index
+and fail closed on malformed metadata. If
+annotation tables merge parse units, qualify the identity by parse unit rather
+than using an offset alone. Backend lookup also scans by scope. The leading
+enumerate-query parser accepts a comma list of extra binders; codegen currently
+supports one extra binder for the recognized enumerate form and declines larger
+arities. Nested `for` clauses parse one binder, and nested lowering now declines
+an extra binder on the leading clause before dispatch rather than dropping it.
+Either lower every accepted binder or preserve explicit fail-closed handling for
+unsupported arity and lowering shapes. IFC currently declines comprehension
+bodies, so this is a cold semantic scope issue rather than a demonstrated
+warm-cache undercount.
 
 ### Driver source context boundary
 
@@ -1494,6 +1610,45 @@ repeated work; a native-object cache alone cannot. The Core compile-server cache
 still helps object-heavy requests, as its source-to-object measurements above show,
 but it does not skip frontend analysis or current-module construction.
 
+The older ownership-binding lookup in
+[ownership_binding_lookup.elisa](</Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler/src/semantic/ownership_binding_lookup.elisa:33>)
+had a possible hot-path cost: its successful postcondition contained an
+existential over all `ref_pos` rows, even when the implementation had selected
+a row from the owner bucket. A reduced-shape probe has compiler and source
+provenance: its source
+`/private/tmp/elisa_exists_value_probe_stage0.elisa` (SHA-256
+`893a38fe0418a6d4dd8db0a09386863e75cb8575e02f1d7c6d9aa16da60481ad`) builds
+a runtime byte array and evaluates two identical Boolean `exists` expressions.
+The receipt-backed Core Stage0 compiler (commit
+`294e5f910a27949115af5296e071b57ebdc01659`, binary SHA-256
+`191fc072361b79932e26397354e641270e45cb939aaa74fc64242d030b44343b`) emits
+two separate loops in the `-O3` IR (SHA-256
+`5ed757d3eac5dd2702004101a8f0c3c294accf1db2e5ffe841546abb5ac07b5b`). LLVM
+23.1.3 `llc -O3 -mcpu=apple-m5` emits
+`/private/tmp/elisa_exists_value_probe_stage0_O3.s` (SHA-256
+`cc6ba2f8f10aba9d5dfd800e6fa0e1d20f586fd1b9432767a1668d7215f951c5`) for
+`arm64-apple-darwin27.0.0`, with two loops that each perform one byte load and
+comparison per visited element; the second loop restarts at the array base.
+When a matching byte is at the last position, this reduced positive case reads
+and compares up to `2N` bytes. This confirms that the optimizer does not merge
+these repeated quantifiers in this reduced value-expression shape. It does not
+establish the optimized code shape of the current
+`ownership_binding_at_position`. An earlier `assert exists` probe was removed
+from emitted IR and is not evidence. The current source returns a `witness_index`
+and checks its bounds and exact row with `ownership_lookup_candidate_matches`,
+removing the table-wide quantified ensure. The proof fixture mirrors that
+selected-row contract and the miss sentinel, but R76 still failed to prove some
+lookup postconditions; the fixture and source-bound checker were edited after
+that snapshot, so their updated state has not yet passed a compiler gate.
+
+The current lookup still walks a linked list of references for the owner. A
+multi-row bucket can therefore take O(k) row visits per lookup; repeated lookups
+for k references can remain O(k²) in a large function. This is a source-level
+worst-case, not a measured runtime result. No source-matched Stage1 IR or
+assembly for the exact lookup has been produced, so emitted cost and the net
+effect of the witness result remain unverified. Any future indexing change must
+preserve the ambiguity and malformed-row fail-closed behavior.
+
 The local static artifacts are historical and do not match this checkout. The
 2026-08-05 `build/s1_driver.ll` has 1,079,457 instructions across 5,020 functions;
 `Semantic.check_full` alone contains 492 call sites. The 2026-09-14 Stage1 object
@@ -1567,12 +1722,14 @@ are rendered against the current source. Request processing is enclosed in
 `request_source`, but the parser API ties AST data and source views to program
 `@source`; the driver also stores `source_bytes` and generated `expanded` text
 there. Parser name storage and synthesized semantic names also use `@source`.
-Those parse and name allocations outlive each request, so ending the compile
-session region after 32 requests does not reclaim them. The semantic-session
-server has no equivalent cap. Reclaiming each parse generation remains an open
-lifetime/API change. The compile-session control sends fewer than 32 requests and
-has no RSS or allocator-growth assertion, so it does not exercise epoch memory
-reclamation.
+Because these allocations are attached to `@source` rather than `request_source`,
+the driver does not establish that ending the request region reclaims them. Whether
+the enclosing `@source` region is reclaimed per request or retained by the host
+requires runtime/allocator verification; the current controls do not prove either
+bounded reclamation or unbounded growth. Reclaiming each parse generation remains
+an open lifetime/API question. The compile-session control sends fewer than 32
+requests and has no RSS or allocator-growth assertion, so it does not exercise
+epoch memory reclamation.
 
 The shared request routine is also used by one-shot `main`; its three normal
 semantic-gate callsites receive an explicit session reference. One-shot compilation

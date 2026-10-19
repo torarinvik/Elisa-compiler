@@ -144,8 +144,22 @@ if not range_view_request.startswith("ghostdefbytes_view_range_ref_request_valid
 parse_body = compact(function_section(parser_text, "parse_layout_module"))
 if "defparse_layout_module(source:darray[u8]&,length:usize,path:sview)->Module:requireslength<=source.count" not in parse_body:
     raise SystemExit("layout parser must bind its logical length to the backing darray extent")
+compose_body = compact(function_section(parser_text, "easm_expand_compositions"))
+required_compose_effect_grants = (
+    "canUnsafe.PointerArithmetic,Unsafe.RawExtern:substituted_text<-bytes_view_range_ref(substituted_bytes,0.usize(),substituted_bytes.count)",
+    "canUnsafe.PointerArithmetic,Unsafe.RawExtern:variant.name<-bytes_view_range_ref(name_bytes,0.usize(),name_bytes.count)",
+)
+if any(grant not in compose_body for grant in required_compose_effect_grants):
+    raise SystemExit("composition expansion must locally grant only the bounded-view effects it uses")
+required_parser_effect_grants = (
+    "canUnsafe.PointerArithmetic,Unsafe.RawExtern:line_view<-bytes_view_range_ref(source,line_start,cursor-line_start)",
+    "canUnsafe.PointerArithmetic,Unsafe.RawExtern:easm_expand_compositions(out)",
+    "canAbort.Panic:forissueinverify_module(out):out.issues.push(issue)",
+)
+if any(grant not in parse_body for grant in required_parser_effect_grants):
+    raise SystemExit("line parser lost an explicit local effect grant for its bounded view, expansion, or verification")
 module_wrapper = compact(function_section(parser_text, "parse_module"))
-if "defparse_module(source:darray[u8]&,length:usize,path:sview)->Module:requireslength<=source.countreturnparse_layout_module(source,length,path)" not in module_wrapper:
+if "defparse_module(source:darray[u8]&,length:usize,path:sview)->Module:requireslength<=source.countcanAbort.Panic,Unsafe.PointerArithmetic,Unsafe.RawExtern:returnparse_layout_module(source,length,path)" not in module_wrapper:
     raise SystemExit("public EASM parsing must preserve the bounded darray input contract")
 for source_path in [*ROOT.joinpath("src").rglob("*.elisa"), *ROOT.joinpath("test").rglob("*.elisa")]:
     source_text = source_path.read_text()
@@ -172,7 +186,8 @@ if declaration_invariant < 0 or target_invariant < declaration_invariant \
 project_body = compact(function_section(parser_text, "parse_project"))
 if not all(fragment in project_body for fragment in (
         "bytes:darray[u8]&=&source.bytes",
-        "assertlength<=bytes.count",
+        "assert(length<=bytes.count)",
+        "canAbort.Panic,Unsafe.PointerArithmetic,Unsafe.RawExtern:source:ProjectSource&=&sources[source_index]",
         "parsed:Module=parse_module(bytes,length,source.path)",
 )):
     raise SystemExit("project parser must restate the bounded source extent after trimming the logical length")

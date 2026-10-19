@@ -15,15 +15,20 @@ SOURCE = ROOT / 'src/backend/codegen_loop_prereserve.elisa'
 POSITIVE = HERE / 'backend_prereserve_bound.elisa'
 NEGATIVE = HERE / 'backend_prereserve_bound_rejected.elisa'
 POSITIVE_HASHES = {
-    'prereserve_extra_capacity_is_i64_safe': '667ca3119954e06b5a9d6c8734159258d2584657c1696f6fc0386c6b865c7263',
-    'prereserve_negative_bound_reserves_nothing': '6e4c906e196a21a9483733149b437b965437030d236f7ec92de5de0b17a31616',
-    'prereserve_over_cap_bound_is_clamped': '083063dbe1ba3a9d51b2ba5b7c38a795dc415ba8e9be015104b574b0b3ee2801',
-    'prereserve_in_range_bound_is_preserved': '79867ccb8b79b95f298118cb0618ae3aa72d24dfc6895af2d3acbb54415064b2',
-    'prereserve_zero_bound_reserves_nothing': '5d3bed0e82b7cd688dcca33ad13d043f2032e5a7370389190291aae1b3ed65e6',
+    'prereserve_trip_cap_model': 'afcd4c2f748154956cadf52a9eabc70bc2444d7a2a148f0a0899179a6ff377e2',
+    'prereserve_single_i64_trip_cap': '5960c4ff4be0028bd2a4b56177ac4c2d54d76db9918c17b1d405d6313e0a59e4',
+    'prereserve_two_i64_trip_cap': '4b907ed7ca25b01635f05f3021e3545824dde8818234066852b9e92dcabd4e32',
+    'prereserve_zero_stride_reserves_nothing': '57672b8e9f84f2c94011af4a29b01b80de8f57089d80f72fa2ecab0705a1bd26',
+    'prereserve_too_many_pushes_disable_reservation': 'e08391e6bc916e8b5ff46b9ce80f37df6584843b588f1297134b1ea69033b3a5',
+    'prereserve_extra_capacity_is_i64_safe': '62c3192ef0e1beaa4e6943a9f9e0b4dd21f97ea9ee3810099423048a08ab9d06',
+    'prereserve_negative_bound_reserves_nothing': 'd7a9cd043d645aa0689cc71f95e661171189868f339c479eb3b04b1479839129',
+    'prereserve_over_cap_bound_is_clamped': 'b703f93f541f741cd212510a8ca97f52c83aa164c0f951874f5f3003a15c8d5f',
+    'prereserve_in_range_bound_is_preserved': '89b259582060057985b8f7083fca05e3772251f319696858efc8298f800187b5',
+    'prereserve_zero_bound_reserves_nothing': 'c39a0c706ad4038871ca7f2ebed6677b8ed60dde769a3ffebed487c4071098d0',
 }
 NEGATIVE_HASHES = {
-    'false_prereserve_product_below_actual_maximum': '54034d6e3fc79bc55d113175d713863d614c283a180277870de558600c106114',
-    'false_over_cap_bound_is_not_clamped': 'c6773b5944be7e4183e10f2bea2b2fee510a5067a8a0d81cb319a8863b6b7bd8',
+    'false_old_trip_push_stride_product_exceeds_byte_budget': '7a74a0be937f716a92cec42a0347b55997c6159732c1322cf3206ff768c316f0',
+    'false_over_cap_bound_is_not_clamped': 'efee155fa79671af30c0d0f87661cbda1fe5bc919c1f6cfa61401de2b1960511',
 }
 def compact(text: str) -> str:
     return ''.join(''.join(line.split('#', 1)[0].split()) for line in text.splitlines())
@@ -42,10 +47,15 @@ if not NEGATIVE.read_text().startswith('include "./backend_prereserve_bound.elis
     raise SystemExit('false controls must import the positive reserve model')
 source = compact(SOURCE.read_text())
 for fragment in (
-    'constPRERESERVE_CAP:u64=16777216',
-    'constPRERESERVE_MAX_PUSHES:i64=64',
-    'skip<-trueifpushes<=0orpushes>PRERESERVE_MAX_PUSHES',
+    'constmoduleLoopPrereserveLimits:MAX_RESERVED_BYTES:u64=67108864',
+    'MAX_PUSHES_PER_ITERATION:i64=64',
+    'skip<-trueifpushes<=0orpushes>LoopPrereserveLimits::MAX_PUSHES_PER_ITERATION',
+    'defprereserve_trip_cap(pushes:i64,element_stride_bytes:u64)->u64:',
+    'return0ifpushes<=0orpushes>LoopPrereserveLimits::MAX_PUSHES_PER_ITERATIONorelement_stride_bytes==0',
+    'returnLoopPrereserveLimits::MAX_RESERVED_BYTES/element_stride_bytes/pushes.u64()',
     'pushes:i64=prereserve_push_count(body,receiver,push_count_budget)',
+    'element_stride_bytes:u64=LLVMABISizeOfType(structs.target.target_data,element_llvm_type)',
+    'trip_cap<-prereserve_trip_cap(pushes,element_stride_bytes)',
     'LLVMBuildICmp(builder,38,wide,zero,"prereserve.positive")',
     'LLVMBuildSelect(builder,LLVMBuildICmp(builder,36,wide,cap,"prereserve.under.cap"),wide,cap,"prereserve.capped")',
     'LLVMBuildSelect(builder,positive,capped,zero,"prereserve.trips")',
