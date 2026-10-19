@@ -6,7 +6,7 @@
 # Sourced by elisac_stage1.sh, which owns ROOT/BIN and the toolchain variables this reads.
 
 seed_build() {
-  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind seed_runtime_sha256_expected seed_runtime_sha256_actual
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind seed_runtime_sha256_expected seed_runtime_sha256_actual seed_retained_server
   local seed_hook_mode
   local -a seed_link_flags seed_link_objects
   # A newly-created Git worktree has no ignored build directory yet. Create the
@@ -211,10 +211,19 @@ seed_build() {
   # re-runs them.
   seed_smt_cache_dir="${ELISACORE_SMT_CACHE_DIR-${XDG_CACHE_HOME:-$HOME/.cache}/elisac-smt-proofs}"
   seed_smt_cache_declined="${ELISACORE_SMT_CACHE_DECLINED-1}"
+  # A running scripts/elisac_retained_server.sh re-checks body-only edits in seconds;
+  # set ELISACORE_RETAINED_SERVER= (empty) to always compile locally.
+  # Only this compile uses it, so other bootstrap invocations never replace the
+  # analysis the server keeps.
+  seed_retained_server="${ELISACORE_RETAINED_SERVER-}"
+  if [[ -z "${ELISACORE_RETAINED_SERVER+x}" && -S "$HOME/.elisac/retained.sock" ]]; then
+    seed_retained_server="$HOME/.elisac/retained.sock"
+  fi
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
   ELISACORE_SMT_CACHE_DIR="$seed_smt_cache_dir" \
   ELISACORE_SMT_CACHE_DECLINED="$seed_smt_cache_declined" \
+  ELISACORE_RETAINED_SERVER="$seed_retained_server" \
   ELISACORE_TRUSTED_RUNTIME_SOURCE="$ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" \
     "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
