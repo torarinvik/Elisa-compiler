@@ -203,8 +203,13 @@ seed_build() {
       exit 2
       ;;
   esac
+  # Reuse proven (unsat) SMT verdicts across seeds. The cache is keyed by the exact query text,
+  # the bootstrap compiler and solver binaries, and the solver options, so it only skips
+  # re-proving identical obligations. Set ELISACORE_SMT_CACHE_DIR= (empty) to disable.
+  seed_smt_cache_dir="${ELISACORE_SMT_CACHE_DIR-${XDG_CACHE_HOME:-$HOME/.cache}/elisac-smt-proofs}"
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
+  ELISACORE_SMT_CACHE_DIR="$seed_smt_cache_dir" \
   ELISACORE_TRUSTED_RUNTIME_SOURCE="$ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" \
     "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
