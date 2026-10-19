@@ -39,8 +39,8 @@ extend Backend:
                 if return_type_opt is declared_return:
                     return_value_type <- annotation_value_type(declared_return, structs)
                 return false if return_value_type.kind == TypeKind.Unmodeled
-                old_snapshot_calls: mutable darray[Expr] = []
-                old_snapshot_arguments: mutable darray[Expr] = []
+                old_snapshot_calls: mutable darray[Expr] @source = []
+                old_snapshot_arguments: mutable darray[Expr] @source = []
                 if not codegen_collect_old_postconditions(body, &old_snapshot_calls, &old_snapshot_arguments):
                     structs.diagnostics.decline_line <- line.line if structs.diagnostics.decline_line == 0
                     structs.diagnostics.decline_kind <- "old-value postcondition snapshot"
@@ -392,127 +392,130 @@ extend Backend:
                 # Each parameter gets a slot too, so a parameter reads and assigns exactly
                 # like a local and emit_expression's Ident path needs no param special
                 # case. mem2reg removes the copy.
-                local_scope: mutable Scope = Scope{names: [], slots: [], types: [], pool_names: [], group_names: [], deferred: []}
-                scope_load_aliases(body, structs, local_scope)
-                loops: mutable LoopStack = LoopStack{exits: [], continues: [], defer_marks: []}
-                # The function's auto region is the outermost OWNED region — unless the arena
-                # is threaded in, in which case it is the CALLER's and nothing here frees it,
-                # so the stack stays empty.
-                regions: mutable RegionStack = RegionStack{arenas: []}
-                regions.arenas.push(local_runtime.arena) if local_runtime.owns_arena
-                if local_runtime.rehome_scratch is function_rehome_scratch:
-                    regions.arenas.push(function_rehome_scratch) if function_rehome_scratch != local_runtime.arena
-                parameter_index: mutable u32 = leading_param_offset
-                parameter_arena_index: mutable i64 = 0
-                # An Arena-taking function has no hidden caller slots (params_manage_arena), so a
-                # reference parameter is marked ARENA_MANAGED_PARAMETER instead: inside `in a:`
-                # it grows into the active arena, as stage0 does. Falling through to the scratch
-                # arena grew the caller's darray into memory freed at return.
-                parameters_arena_managed: bool = params_manage_arena(params, structs)
-                for parameter in params |local_scope, parameter_index, fn, ctx, builder|:
-                    parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
-                    if parameter.name == "incoming":
-                        dbg_event_type("EVENT_PARAMETER", structs.visibility.current_owner, parameter_type, structs)
-                    source_parameter_index: u32 = parameter_index - leading_param_offset
-                    name_storage: mutable darray[u8] = []
-                    parameter_value: mutable LLVMValueRef = LLVMGetParam(fn, parameter_index)
-                    parameter_llvm_type: LLVMTypeRef = llvm_type_of(parameter_type, structs, ctx)
-                    slot: LLVMValueRef = build_entry_alloca(builder, parameter_llvm_type, sview_to_cstr(parameter.name, name_storage))
-                    if value_type_uses_indirect_aggregate(parameter_type, structs, ctx):
-                        parameter_alignment: mutable u32 = LLVMABIAlignmentOfType(structs.target.target_data, parameter_llvm_type)
-                        parameter_alignment <- 1 if parameter_alignment == 0
-                        LLVMSetAlignment(slot, parameter_alignment)
-                        _ = LLVMBuildMemCpy(builder, slot, parameter_alignment, parameter_value, parameter_alignment, LLVMConstInt(LLVMInt64TypeInContext(ctx), LLVMABISizeOfType(structs.target.target_data, parameter_llvm_type), 0))
-                    else:
-                        _ = LLVMBuildStore(builder, parameter_value, slot)
-                    declare_local(local_scope, parameter.name, slot, parameter_type)
-                    # A BY-VALUE parameter carries the obligation its caller handed over:
-                    # `consume(move t)` suppresses the caller's drop, so the callee owes the
-                    # one release. Registering only locals leaked every moved-in value.
-                    # register_drop_cleanup is a no-op for anything but a struct with a
-                    # `__drop__` hook, so references and scalars are unaffected. The
-                    # parameter already has its own alloca above, so the drop zeroes this
-                    # frame's slot and never reaches back into the caller's.
-                    #
-                    # EXCEPT inside a destructor: `__drop__` IS its receiver's death, so
-                    # arming a cleanup for `self` there recurses until the stack dies
-                    # (stage0's isOwnDropReceiver guard). A destructor takes only its
-                    # receiver, so skipping the whole body is the same rule.
-                    register_drop_cleanup(parameter.name, parameter_type, slot, line.line, local_scope, structs, ctx, builder) if function_name != "__drop__"
-                    has_parameter_region: bool = function_region_row >= 0 and fns.param_start[function_region_row.usize()] + source_parameter_index.usize() < fns.param_region_slots.count and fns.param_region_slots[fns.param_start[function_region_row.usize()] + source_parameter_index.usize()]
-                    if has_parameter_region:
-                        mark_last_local_parameter_arena(local_scope, parameter_arena_index)
-                        parameter_arena_index <- parameter_arena_index + 1
-                    elif instantiation_row >= 0 and instantiation_row.usize() < generics.inst_arena_param_counts.count and source_parameter_index.usize() < generics.inst_arena_param_counts[instantiation_row.usize()]:
-                        # An instantiation has no fns row; its per-parameter slots were recorded.
-                        instantiation_parameter_slot: i64 = generics.inst_arena_param_slots[generics.inst_arena_param_start[instantiation_row.usize()] + source_parameter_index.usize()]
-                        mark_last_local_parameter_arena(local_scope, instantiation_parameter_slot) if instantiation_parameter_slot >= 0
-                    elif parameters_arena_managed and parameter_type.kind == TypeKind.Ref:
-                        mark_last_local_parameter_arena(local_scope, ARENA_MANAGED_PARAMETER)
-                    if local_runtime.disjoint_function_mask != 0 and source_parameter_index < DISJOINT_SCOPE_COUNT and disjoint_numeric_darray_ref(parameter.type_expression, structs):
-                        bit: mutable u64 = 1
-                        for _ in 0..<source_parameter_index |bit|:
-                            bit <- bit * 2
-                        if (local_runtime.disjoint_function_mask / bit) % 2 == 1:
-                            local_runtime.disjoint_param_slots <- local_runtime.disjoint_param_slots.push(slot)
-                            local_runtime.disjoint_param_indices <- local_runtime.disjoint_param_indices.push(source_parameter_index)
-                    # DWARF argument numbers start at 1, and count DECLARED parameters --
-                    # the error out-param and the threaded arena are ABI additions the
-                    # source never named, so they are not numbered here.
-                    declare_debug_variable(parameter.name, slot, parameter_type, parameter_index + 1 - leading_param_offset, line.line, fn, local_runtime, structs, ctx, builder) can Global{Read,Write}
-                    parameter_index <- parameter_index + 1
+                # Cache-capable emitters may retain metadata in either table.
+                # Program-owned backing outlives both independent caller regions.
+                in source:
+                    local_scope: mutable Scope = Scope{names: [], slots: [], types: [], pool_names: [], group_names: [], deferred: []}
+                    scope_load_aliases(body, structs, &local_scope)
+                    loops: mutable LoopStack = LoopStack{exits: [], continues: [], defer_marks: []}
+                    # The function's auto region is the outermost OWNED region — unless the arena
+                    # is threaded in, in which case it is the CALLER's and nothing here frees it,
+                    # so the stack stays empty.
+                    regions: mutable RegionStack = RegionStack{arenas: []}
+                    regions.arenas.push(local_runtime.arena) if local_runtime.owns_arena
+                    if local_runtime.rehome_scratch is function_rehome_scratch:
+                        regions.arenas.push(function_rehome_scratch) if function_rehome_scratch != local_runtime.arena
+                    parameter_index: mutable u32 = leading_param_offset
+                    parameter_arena_index: mutable i64 = 0
+                    # An Arena-taking function has no hidden caller slots (params_manage_arena), so a
+                    # reference parameter is marked ARENA_MANAGED_PARAMETER instead: inside `in a:`
+                    # it grows into the active arena, as stage0 does. Falling through to the scratch
+                    # arena grew the caller's darray into memory freed at return.
+                    parameters_arena_managed: bool = params_manage_arena(params, structs)
+                    for parameter in params |local_scope, parameter_index, fn, ctx, builder|:
+                        parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                        if parameter.name == "incoming":
+                            dbg_event_type("EVENT_PARAMETER", structs.visibility.current_owner, parameter_type, structs)
+                        source_parameter_index: u32 = parameter_index - leading_param_offset
+                        name_storage: mutable darray[u8] = []
+                        parameter_value: mutable LLVMValueRef = LLVMGetParam(fn, parameter_index)
+                        parameter_llvm_type: LLVMTypeRef = llvm_type_of(parameter_type, structs, ctx)
+                        slot: LLVMValueRef = build_entry_alloca(builder, parameter_llvm_type, sview_to_cstr(parameter.name, name_storage))
+                        if value_type_uses_indirect_aggregate(parameter_type, structs, ctx):
+                            parameter_alignment: mutable u32 = LLVMABIAlignmentOfType(structs.target.target_data, parameter_llvm_type)
+                            parameter_alignment <- 1 if parameter_alignment == 0
+                            LLVMSetAlignment(slot, parameter_alignment)
+                            _ = LLVMBuildMemCpy(builder, slot, parameter_alignment, parameter_value, parameter_alignment, LLVMConstInt(LLVMInt64TypeInContext(ctx), LLVMABISizeOfType(structs.target.target_data, parameter_llvm_type), 0))
+                        else:
+                            _ = LLVMBuildStore(builder, parameter_value, slot)
+                        declare_local(&local_scope, parameter.name, slot, parameter_type)
+                        # A BY-VALUE parameter carries the obligation its caller handed over:
+                        # `consume(move t)` suppresses the caller's drop, so the callee owes the
+                        # one release. Registering only locals leaked every moved-in value.
+                        # register_drop_cleanup is a no-op for anything but a struct with a
+                        # `__drop__` hook, so references and scalars are unaffected. The
+                        # parameter already has its own alloca above, so the drop zeroes this
+                        # frame's slot and never reaches back into the caller's.
+                        #
+                        # EXCEPT inside a destructor: `__drop__` IS its receiver's death, so
+                        # arming a cleanup for `self` there recurses until the stack dies
+                        # (stage0's isOwnDropReceiver guard). A destructor takes only its
+                        # receiver, so skipping the whole body is the same rule.
+                        register_drop_cleanup(parameter.name, parameter_type, slot, line.line, &local_scope, structs, ctx, builder) if function_name != "__drop__"
+                        has_parameter_region: bool = function_region_row >= 0 and fns.param_start[function_region_row.usize()] + source_parameter_index.usize() < fns.param_region_slots.count and fns.param_region_slots[fns.param_start[function_region_row.usize()] + source_parameter_index.usize()]
+                        if has_parameter_region:
+                            mark_last_local_parameter_arena(local_scope, parameter_arena_index)
+                            parameter_arena_index <- parameter_arena_index + 1
+                        elif instantiation_row >= 0 and instantiation_row.usize() < generics.inst_arena_param_counts.count and source_parameter_index.usize() < generics.inst_arena_param_counts[instantiation_row.usize()]:
+                            # An instantiation has no fns row; its per-parameter slots were recorded.
+                            instantiation_parameter_slot: i64 = generics.inst_arena_param_slots[generics.inst_arena_param_start[instantiation_row.usize()] + source_parameter_index.usize()]
+                            mark_last_local_parameter_arena(local_scope, instantiation_parameter_slot) if instantiation_parameter_slot >= 0
+                        elif parameters_arena_managed and parameter_type.kind == TypeKind.Ref:
+                            mark_last_local_parameter_arena(local_scope, ARENA_MANAGED_PARAMETER)
+                        if local_runtime.disjoint_function_mask != 0 and source_parameter_index < DISJOINT_SCOPE_COUNT and disjoint_numeric_darray_ref(parameter.type_expression, structs):
+                            bit: mutable u64 = 1
+                            for _ in 0..<source_parameter_index |bit|:
+                                bit <- bit * 2
+                            if (local_runtime.disjoint_function_mask / bit) % 2 == 1:
+                                local_runtime.disjoint_param_slots <- local_runtime.disjoint_param_slots.push(slot)
+                                local_runtime.disjoint_param_indices <- local_runtime.disjoint_param_indices.push(source_parameter_index)
+                        # DWARF argument numbers start at 1, and count DECLARED parameters --
+                        # the error out-param and the threaded arena are ABI additions the
+                        # source never named, so they are not numbered here.
+                        declare_debug_variable(parameter.name, slot, parameter_type, parameter_index + 1 - leading_param_offset, line.line, fn, local_runtime, structs, ctx, builder) can Global{Read,Write}
+                        parameter_index <- parameter_index + 1
 
-                can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                    local_runtime.disjoint_scope_refs <- build_disjoint_scopes(m, local_runtime.disjoint_param_indices, ctx, builder)
+                    can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                        local_runtime.disjoint_scope_refs <- build_disjoint_scopes(m, local_runtime.disjoint_param_indices, ctx, builder)
 
-                old_snapshot_slots: mutable darray[LLVMValueRef] = []
-                old_snapshot_types: mutable darray[ValueType] = []
-                if not (emit_contract_old_snapshots(local_scope, local_runtime.old_snapshot_calls, local_runtime.old_snapshot_arguments, fns, structs, generics, &old_snapshot_slots, &old_snapshot_types, &local_runtime, m, ctx, builder) can Global{Read,Write}):
-                    structs.diagnostics.decline_line <- line.line if structs.diagnostics.decline_line == 0
-                    structs.diagnostics.decline_kind <- "old-value postcondition snapshot expression"
-                    return false
-                local_runtime.old_snapshot_slots <- old_snapshot_slots
-                local_runtime.old_snapshot_types <- old_snapshot_types
+                    old_snapshot_slots: mutable darray[LLVMValueRef] = []
+                    old_snapshot_types: mutable darray[ValueType] = []
+                    if not (emit_contract_old_snapshots(&local_scope, local_runtime.old_snapshot_calls, local_runtime.old_snapshot_arguments, fns, structs, generics, &old_snapshot_slots, &old_snapshot_types, &local_runtime, m, ctx, builder) can Global{Read,Write}):
+                        structs.diagnostics.decline_line <- line.line if structs.diagnostics.decline_line == 0
+                        structs.diagnostics.decline_kind <- "old-value postcondition snapshot expression"
+                        return false
+                    local_runtime.old_snapshot_slots <- old_snapshot_slots
+                    local_runtime.old_snapshot_types <- old_snapshot_types
 
-                body_status: mutable EmitStatus = EmitStatus.Open
-                body_status <- emit_statements(body, return_value_type, local_scope, loops, regions, fns, structs, generics, &local_runtime, m, ctx, builder) can Global{Read,Write}
-                return false if body_status == EmitStatus.Declined
-                if local_scope.alias_growth_ambiguous:
-                    structs.diagnostics.decline_line <- line.line if structs.diagnostics.decline_line == 0
-                    structs.diagnostics.decline_kind <- "growth through a reference that may alias storage in different caller regions"
-                    return false
-                # A `-> void` function may legitimately run off the end: close it with
-                # `ret void` (and free the region first, like any other return path). A
-                # value-returning function that falls through is NOT modeled — rather than
-                # invent a return value, decline; LLVM would reject the open block anyway.
-                if body_status == EmitStatus.Open:
-                    return false if:
-                        return_value_type.kind != TypeKind.Void
-                        not (emit_void_ensure_checks(local_scope, fns, structs, generics, &local_runtime, m, ctx, builder) can Global{Read,Write})
-                    # `defer` runs on EVERY exit, and falling off the end of a `-> void`
-                    # function is one. Only the explicit-`return` paths unwound them, so a
-                    # void function with no trailing `return` silently dropped every deferred
-                    # block: `defer block: note(1)` … `note(3)` answered 3 where stage0
-                    # answers 31. Found by adversarial differential testing; nothing in the
-                    # compiler's own sources hits it, because they all return explicitly.
-                    return false if not (emit_deferred_actions(local_scope, false, fns, structs, generics, &local_runtime, m, ctx, builder) can Global{Read,Write})
-                    if local_runtime.rehome_scratch is fallthrough_rehome_scratch and fallthrough_rehome_scratch != local_runtime.arena:
-                        emit_global_rehomes(fallthrough_rehome_scratch, local_runtime, builder)
-                        rehome_free_arguments: mutable darray[LLVMValueRef] = [fallthrough_rehome_scratch]
-                        rehome_free_pointer: void& = (&rehome_free_arguments[0]).cast[void&] can Unsafe.PointerCast
-                        _ = LLVMBuildCall2(builder, local_runtime.arena_free_type, (local_runtime.arena_free can Global{Read,Write}), rehome_free_pointer, 1, "")
-                    (emit_region_free(local_runtime, builder) can Global{Read,Write})
-                    # A `void error[E]` fn that runs off the end succeeds — return the 0 code.
-                    if fn_is_error:
-                        _ = LLVMBuildRet(builder, error_success_return_value(structs, local_runtime, ctx))
-                    elif local_runtime.main_returns_status:
-                        _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
-                    else:
-                        _ = LLVMBuildRetVoid(builder)
+                    body_status: mutable EmitStatus = EmitStatus.Open
+                    body_status <- emit_statements(body, return_value_type, &local_scope, &loops, &regions, fns, structs, generics, &local_runtime, m, ctx, builder) can Global{Read,Write}
+                    return false if body_status == EmitStatus.Declined
+                    if local_scope.alias_growth_ambiguous:
+                        structs.diagnostics.decline_line <- line.line if structs.diagnostics.decline_line == 0
+                        structs.diagnostics.decline_kind <- "growth through a reference that may alias storage in different caller regions"
+                        return false
+                    # A `-> void` function may legitimately run off the end: close it with
+                    # `ret void` (and free the region first, like any other return path). A
+                    # value-returning function that falls through is NOT modeled — rather than
+                    # invent a return value, decline; LLVM would reject the open block anyway.
+                    if body_status == EmitStatus.Open:
+                        return false if:
+                            return_value_type.kind != TypeKind.Void
+                            not (emit_void_ensure_checks(&local_scope, fns, structs, generics, &local_runtime, m, ctx, builder) can Global{Read,Write})
+                        # `defer` runs on EVERY exit, and falling off the end of a `-> void`
+                        # function is one. Only the explicit-`return` paths unwound them, so a
+                        # void function with no trailing `return` silently dropped every deferred
+                        # block: `defer block: note(1)` … `note(3)` answered 3 where stage0
+                        # answers 31. Found by adversarial differential testing; nothing in the
+                        # compiler's own sources hits it, because they all return explicitly.
+                        return false if not (emit_deferred_actions(&local_scope, false, fns, structs, generics, &local_runtime, m, ctx, builder) can Global{Read,Write})
+                        if local_runtime.rehome_scratch is fallthrough_rehome_scratch and fallthrough_rehome_scratch != local_runtime.arena:
+                            emit_global_rehomes(fallthrough_rehome_scratch, local_runtime, builder)
+                            rehome_free_arguments: mutable darray[LLVMValueRef] = [fallthrough_rehome_scratch]
+                            rehome_free_pointer: void& = (&rehome_free_arguments[0]).cast[void&] can Unsafe.PointerCast
+                            _ = LLVMBuildCall2(builder, local_runtime.arena_free_type, (local_runtime.arena_free can Global{Read,Write}), rehome_free_pointer, 1, "")
+                        (emit_region_free(local_runtime, builder) can Global{Read,Write})
+                        # A `void error[E]` fn that runs off the end succeeds — return the 0 code.
+                        if fn_is_error:
+                            _ = LLVMBuildRet(builder, error_success_return_value(structs, local_runtime, ctx))
+                        elif local_runtime.main_returns_status:
+                            _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
+                        else:
+                            _ = LLVMBuildRetVoid(builder)
+                        instrument_trace_function_exits(fn, function_name, function_line_of(declaration), local_runtime, m, ctx, builder)
+                        return true
                     instrument_trace_function_exits(fn, function_name, function_line_of(declaration), local_runtime, m, ctx, builder)
                     return true
-                instrument_trace_function_exits(fn, function_name, function_line_of(declaration), local_runtime, m, ctx, builder)
-                return true
             return false
 
 include "./codegen_declare_decorators.elisa"
