@@ -77,7 +77,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
     def test_parallel_runtime_gate_must_precede_worker_submission(self):
         runtime = (
-            "        def par_pass_run[pool](first: u32, count: u32):\n"
+            "        def par_pass_run[pool](first: u32, count: u32) -> SymbolTable @destination:\n"
             "            unsafe_pass: mutable bool = false\n"
             "            for offset in 0..<count:\n"
             "                if not par_pass_is_append_only(first + offset):\n"
@@ -85,13 +85,15 @@ class SemanticParallelAuditTest(unittest.TestCase):
             "            if count < 2 or shared_pool.handle == null or unsafe_pass:\n"
             "                for offset in 0..<count:\n"
             "                    table <- par_pass_call(first + offset, file, scratch.loop_view, flags, table)\n"
-            "                return\n"
+            "                return move table\n"
             "            region par_pass_jobs_region:\n"
             "                jobs: mutable darray[ParPassJob] @par_pass_jobs_region = []\n"
             "                nursery on(shared_pool):\n"
             "                    submit par_pass_worker(ticket)\n"
         )
         self.assertEqual(audit.parallel_runtime_serial_guard_errors(runtime), [])
+        missing_move_return = runtime.replace("return move table", "return")
+        self.assertTrue(audit.parallel_runtime_serial_guard_errors(missing_move_return))
         immutable_guard = runtime.replace(
             "unsafe_pass: mutable bool = false",
             "unsafe_pass: bool = false",

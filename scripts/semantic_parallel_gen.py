@@ -2846,7 +2846,7 @@ def parallel_runtime_serial_guard_errors(source):
         r"table <- par_pass_call\(first\s*\+\s*offset, file, scratch\.loop_view, flags, table\)",
         serial_loop + 1 if serial_loop is not None else 0,
     )
-    return_line = find_line(r"^\s*return\s*$", call + 1 if call is not None else 0)
+    return_line = find_line(r"^\s*return\s+move\s+table\s*$", call + 1 if call is not None else 0)
     worker = find_line(r"nursery on\(shared_pool\):")
     region = find_line(r"region par_pass_jobs_region:")
     jobs = find_line(r"jobs: mutable darray\[ParPassJob\] @par_pass_jobs_region = \[\]")

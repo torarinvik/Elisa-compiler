@@ -13,13 +13,18 @@ layout or reinterpretation of an unrelated carrier type.
 
 After joining, the runner validates **every** worker snapshot against the unchanged
 parent table before copying any result. It then copies results in pass order. Each
-text payload gets a separate caller-region byte buffer, held in the defaulted
-SymbolTable.parallel_diagnostic_text field. An explicit region-polymorphic helper
-allocates those buffers in the caller's region. Their descriptors may move when the
-outer array grows, but their bytes never grow after insertion. The internal pointer
-boundary in par_pass_parent_view relies on precisely that invariant. This avoids
-the existing text_storage buffer's fixed 65536-byte capacity and relocation hazards.
-Each job arena is explicitly freed after its last diagnostic is copied.
+text payload is interned in the append-only `@source` NameStore, and its stable view
+is held in the defaulted `SymbolTable.parallel_diagnostic_text` field. The outer
+array may move its view descriptors; the NameStore retires full byte buffers without
+moving them. This avoids the existing `text_storage` buffer's fixed 65536-byte
+capacity and relocation hazards. Empty fields retain an empty view row so the field
+offsets remain aligned. Each job arena is explicitly freed after its last diagnostic
+is copied. The source store retains its current `@source` lifetime; bounded reclamation
+across persistent host requests remains a separate open question.
+
+The source switch from independent buffers to the `@source` NameStore is newer than
+the production qualification recorded below. That run establishes the earlier worker
+copy/splice design; the current NameStore path still needs a fresh source-matched gate.
 The parent copy receives a scalar address into the still-live job record, reads it
 through an internal heap Diagnostic reference, and finishes cloning before freeing
 the job. This avoids conservatively treating a temporary Diagnostic value as an

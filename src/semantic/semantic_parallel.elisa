@@ -12,8 +12,8 @@
 #   explicitly deep-copies its diagnostics and every text payload into a private job arena;
 # - per-batch job records live in a lexical region that encloses submission, join, validation,
 #   diagnostic splice, and arena release; they never remain in the pool's persistent scratch;
-# - after joining, diagnostics are copied into the caller table's region in pass order,
-#   then each job arena is released;
+# - after joining, diagnostic text is interned in the source-lifetime NameStore and
+#   diagnostics are copied into the parent table in pass order, then each job arena is released;
 # - the worker reads the AST through the submitting scope's store, which `submit` captures
 #   (a worker may only read a captured store; both compilers reject one that builds nodes);
 # - each worker compares its local table's top-level descriptor bytes with the frozen table,
@@ -68,31 +68,22 @@ extend Semantic:
                 _ = memcpy(data.cast[mutable void&], text.data.cast[void&], text.len.usize())
                 return unsafe_sview_bounded_bytes(data, text.len.usize())
 
-        # Copy diagnostic text into an independently owned buffer in the destination
-        # table's region. Returning the buffer separates the byte copy from publishing
-        # that owner into the table, so store-through summaries do not conflate the source
-        # view with the destination merely because both occur in one helper call.
-        def par_pass_parent_text_buffer[@r](text: sview, table: SymbolTable& @r) -> darray[u8] @source:
-            can Memory.Allocate, Abort.Panic:
-                bytes: mutable darray[u8] @source = []
-                bytes.extend(text)
-                return bytes
-
-        # Each view gets an independent buffer. Growing the outer backing array cannot
-        # relocate a view's bytes, unlike growing SymbolTable.text_storage.
+        # Copy diagnostic text into the append-only source NameStore, matching the text type
+        # retained by SymbolTable diagnostics. A temporary byte array keeps the input view
+        # separate from the stable result published in the table.
         def par_pass_parent_text[@r](text: sview, table: mutable SymbolTable& @r) -> void:
             can Memory.Allocate, Abort.Panic:
-                bytes: darray[u8] @source = par_pass_parent_text_buffer(text, table)
-                table.parallel_diagnostic_text.push(bytes)
+                if text.len == 0:
+                    table.parallel_diagnostic_text.push("")
+                    return
+                panic("semantic_parallel: invalid diagnostic text length") if text.len < 0
+                bytes: mutable darray[u8] = []
+                bytes.extend(text)
+                stable_text: sview @source = intern_joined_text(bytes, table)
+                table.parallel_diagnostic_text.push(stable_text)
 
         def par_pass_parent_view[@r](table: SymbolTable& @r, index: usize) -> sview @source:
-            can Unsafe.PointerCast:
-                bytes: darray[u8] @source = table.parallel_diagnostic_text[index]
-                return "" if bytes.count == 0
-                # Individual backing buffers never grow after insertion. Erase the outer
-                # container dependency: its growth moves descriptors, not these byte buffers.
-                bits: uintptr = (&bytes[0]).cast[void&].uintptr()
-                return unsafe_sview_bounded_bytes(bits.cast[u8&], bytes.count)
+            return table.parallel_diagnostic_text[index]
 
         def par_pass_parent_diagnostic[@r](source_bits: uintptr, table: mutable SymbolTable& @r) -> void:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
@@ -236,7 +227,12 @@ extend Semantic:
         # Run passes [first, first + count) of par_pass_call over `table` and append their
         # diagnostics in id order: concurrently on the shared pool, or in order on this
         # thread when no pool was supplied (serial mode and syntax-error checks).
-        def par_pass_run[@file, @destination, @pool](file: Ast::File& @file, flags: ParPassFlags, table: mutable SymbolTable& @destination, shared_pool: mutable ThreadPool& @pool, scratch: mutable ParPassScratch[pool]& @pool, first: u32, count: u32) -> void:
+        # Pass the table descriptor by value and return its updated descriptor. On the
+        # parallel path, nested arrays remain borrowed from the caller and are read-only
+        # during the nursery; diagnostics are appended after the join. Keeping the mutable
+        # descriptor local avoids exposing the caller's table reference as a possible
+        # store-through target.
+        def par_pass_run[@file, @destination, @pool](file: Ast::File& @file, flags: ParPassFlags, table: mutable SymbolTable @destination, shared_pool: mutable ThreadPool& @pool, scratch: mutable ParPassScratch[pool]& @pool, first: u32, count: u32) -> SymbolTable @destination:
             can Memory.Allocate, Memory.Release, Abort.Panic, Parallel, Unsafe.PointerCast, Pool.Submit, Pool.WaitAll, Thread.Spawn, Thread.Join, Atomics.Store, Atomics.Load, Atomics.CompareExchange, Sync{Lock,Wait,Unlock,Notify}:
                 unsafe_pass: mutable bool = false
                 for offset in 0..<count:
@@ -245,7 +241,7 @@ extend Semantic:
                 if count < 2 or shared_pool.handle == null or unsafe_pass:
                     for offset in 0..<count |table, file, flags, first|:
                         table <- par_pass_call(first + offset, file, scratch.loop_view, flags, table) can Global{Read,Write}
-                    return
+                    return move table
                 # The raw table address in a job is valid only for this synchronous batch.
                 # Keep its storage in a lexical region around submission, join, validation,
                 # splice, and arena release instead of retaining it in pool-lifetime scratch.
@@ -281,3 +277,4 @@ extend Semantic:
                             table <- par_pass_parent_diagnostic(source_bits, table)
                         arena_free(&job.arena) can Global{Read,Write}
                         _ = move job.frozen_table
+                return move table
