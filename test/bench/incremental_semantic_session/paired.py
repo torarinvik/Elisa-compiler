@@ -48,7 +48,13 @@ def digest_file(path: Path) -> str:
     return digest_bytes(path.read_bytes())
 
 
-def fixture(functions: int, edit_version: int, payload_mode: str, add_surface_function: bool = False) -> str:
+def fixture(
+    functions: int,
+    edit_version: int,
+    payload_mode: str,
+    add_surface_function: bool = False,
+    post_surface_fact_transition: bool = False,
+) -> str:
     pieces = [
         "# Many cacheable, independent bodies make the collector's reuse path visible.\n\n",
     ]
@@ -60,7 +66,9 @@ def fixture(functions: int, edit_version: int, payload_mode: str, add_surface_fu
         pieces.append("def shared_fact_leaf() -> i64:\n    return 700\n\n")
         pieces.append("def shared_fact_leaf_alt() -> i64:\n    return 701\n\n")
     for index in range(functions):
-        if payload_mode == "call-facts":
+        if post_surface_fact_transition and index == 0 and payload_mode in {"call-facts", "shared-calls"}:
+            body = "    return 42\n"
+        elif payload_mode == "call-facts":
             target = "fact_leaf_alt" if index == 0 and edit_version % 2 == 1 else f"fact_leaf_{index:04d}"
             body = f"    return {target}()\n"
         elif payload_mode == "shared-calls":
@@ -618,6 +626,8 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
         empty_label = left["label"]
         if empty_label in {"declaration-surface-edit", "post-surface-body-edit"}:
             expected_empty_eligible += 1
+        if empty_label == "post-surface-body-edit" and workload in {"call-facts", "shared-calls"}:
+            expected_empty_eligible += 1
         for mode, request in (("graph-off", left), ("graph-on", right)):
             cache = request["cache"]
             if empty_label == "exact-repeat":
@@ -640,8 +650,11 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             expected_empty_restored = 0
             expected_empty_commits = 0
         elif empty_label.startswith("body-edit-") or empty_label == "post-surface-body-edit":
-            expected_empty_restored = expected_empty_eligible - (1 if workload == "zero-fact" else 0)
-            expected_empty_commits = 1 if workload == "zero-fact" else 0
+            changed_body_is_empty = workload == "zero-fact" or (
+                empty_label == "post-surface-body-edit" and workload in {"call-facts", "shared-calls"}
+            )
+            expected_empty_restored = expected_empty_eligible - (1 if changed_body_is_empty else 0)
+            expected_empty_commits = 1 if changed_body_is_empty else 0
         elif empty_label == "declaration-surface-edit":
             # This version repeats the final body-edit value, so all existing
             # complete-empty bodies remain exact and only the newly added function
@@ -697,17 +710,50 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             if (
                 right["label"] == "exact-repeat"
                 or right["label"].startswith("body-edit-")
+                or right["label"] == "declaration-surface-edit"
                 or right["label"] == "post-surface-body-edit"
             ):
                 off_visits = int(left["cache"]["name_lookup_classification_chain_visits"])
                 warm_hits = int(right["cache"]["name_lookup_hits"])
-                if workload == "call-facts" and warm_hits <= prime_hits:
-                    raise RuntimeError(
-                        f"call-facts graph-on {right['label']} did not exceed its prime same-request hit baseline: "
-                        f"prime={prime_hits} warm={warm_hits}"
-                    )
-                if workload == "shared-calls" and warm_hits <= 0:
-                    raise RuntimeError("shared-calls graph-on warm request had no repeated-name NameLookup hits")
+                if workload == "call-facts":
+                    if right["label"] == "post-surface-body-edit":
+                        same_request_baseline = functions - 1
+                        if warm_hits <= same_request_baseline:
+                            raise RuntimeError(
+                                "call-facts graph-on post-surface-body-edit did not exceed its same-request duplicate baseline: "
+                                f"baseline={same_request_baseline} warm={warm_hits}"
+                            )
+                    elif warm_hits <= prime_hits:
+                        raise RuntimeError(
+                            f"call-facts graph-on {right['label']} did not exceed its prime same-request hit baseline: "
+                            f"prime={prime_hits} warm={warm_hits}"
+                        )
+                if workload == "shared-calls":
+                    label = right["label"]
+                    call_sites = functions - 1 if label == "post-surface-body-edit" else functions
+                    if label.startswith("body-edit-"):
+                        edit_index = int(label.rsplit("-", 1)[1])
+                        uses_alternate_callee = edit_index % 2 == 1
+                    elif label == "declaration-surface-edit":
+                        edit_index = sum(
+                            1 for request in on_requests if str(request["label"]).startswith("body-edit-")
+                        )
+                        uses_alternate_callee = edit_index % 2 == 1
+                    else:
+                        edit_index = 0
+                        uses_alternate_callee = False
+                    # Every direct call is classified twice. The cold same-request
+                    # hit floor is total reads minus distinct callee spellings.
+                    # `body-edit-N` labels use one-based N, and fixture() receives
+                    # edit_version 100_000 + N for those requests. Since 100_000 is
+                    # even, odd label suffixes select the alternate callee.
+                    distinct_callees = 1 if label == "post-surface-body-edit" or not uses_alternate_callee else 2
+                    same_request_baseline = 2 * call_sites - distinct_callees
+                    if warm_hits <= same_request_baseline:
+                        raise RuntimeError(
+                            f"shared-calls graph-on {label} did not exceed its same-request duplicate baseline: "
+                            f"baseline={same_request_baseline} warm={warm_hits}"
+                        )
                 if off_visits <= 0 or on_visits >= off_visits:
                     raise RuntimeError(
                         f"{workload} graph-on {right['label']} did not reduce classification-chain visits: "
@@ -748,6 +794,8 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
             if fast_skips <= 0:
                 raise RuntimeError(f"{workload}: declaration-surface edit did not reuse the repeated-mark shortcut")
         expected_direct_facts = functions if workload in {"call-facts", "shared-calls"} else 0
+        if left["label"] == "post-surface-body-edit" and workload in {"call-facts", "shared-calls"}:
+            expected_direct_facts -= 1
         for mode, request in (("graph-off", left), ("graph-on", right)):
             direct_facts = int(request["cache"].get("direct_fact_count", "-1"))
             if direct_facts != expected_direct_facts:
@@ -766,10 +814,21 @@ def validate_pair(off: dict[str, Any], on: dict[str, Any], functions: int, workl
         on_cache = right["cache"]
         if off_cache.get("source_input_admitted") != "no":
             raise RuntimeError(f"graph-off edit {index} unexpectedly admitted SourceInput")
-        if int(off_cache.get("prior_snapshot_fact_fallbacks", "0")) <= 0:
+        snapshot_fallbacks = int(off_cache.get("prior_snapshot_fact_fallbacks", "0"))
+        if workload == "zero-fact":
+            if snapshot_fallbacks != 0:
+                raise RuntimeError(
+                    f"graph-off zero-fact edit {index} unexpectedly used typed-snapshot fallback"
+                )
+        elif snapshot_fallbacks <= 0:
             raise RuntimeError(f"graph-off edit {index} skipped typed-snapshot fact fallback")
-        if on_cache.get("source_input_admitted") != "yes":
-            raise RuntimeError(f"graph-on edit {index} did not admit unchanged SourceInput")
+        expected_source_admission = "no" if workload == "zero-fact" else "yes"
+        actual_source_admission = on_cache.get("source_input_admitted")
+        if actual_source_admission != expected_source_admission:
+            raise RuntimeError(
+                f"graph-on {workload} edit {index} reported SourceInput admission "
+                f"{actual_source_admission!r}; fixture expects {expected_source_admission!r}"
+            )
         expected_restored = int(off_cache.get("eligible_bodies", "0")) - 1
         restored = int(on_cache.get("function_body_facts_restored", "0")) + int(
             on_cache.get("complete_empty_body_restored", "0")
@@ -1013,11 +1072,11 @@ def main() -> int:
         "source_identity": "same absolute temporary source path within each workload across graph modes and pairs",
         "semantic_execution_mode": "default parallel mode; ELISA_SEMANTIC_SERIAL is cleared for each arm",
         "warm_measurement": "body edits are the primary paired summary; prime, exact-repeat, declaration-surface, and post-surface body-edit controls also receive paired summaries",
-        "name_lookup_hit_semantics": "call-facts uses one unique callee per body; warm raw hits must exceed the prime same-request duplicate baseline, exposing aggregate prior-request reuse",
+        "name_lookup_hit_semantics": "call-facts uses one unique callee per body; ordinary warm requests must exceed the prime same-request hit baseline and post-surface must exceed N-1. Every shared-calls warm request must exceed its fixture-specific same-request duplicate baseline: 2N-2 when an alternate callee is present, 2N-1 for one shared callee, and 2N-3 after the post-surface literal transition. These aggregate thresholds prove at least one prior-request NameLookup hit, not reuse of every unchanged spelling.",
         "name_lookup_chain_visit_semantics": "graph-off and graph-on count only symbol/member hash-chain rows visited by the fused NameLookup cold classifier; direct-surface counts finalized-surface classifications separately and bypasses per-name graph evaluate/commit; direct name_known callers (including RegionNew, value-block captures, and flow checks) and qualified Expr.Scope probes are excluded",
         "reverse_mark_counter_semantics": "routing-only request counters cover query-graph reverse invalidation during collection/publication and semantic resolution; exact-repeat expects zero closure work and declaration-surface-edit must exercise a nonempty full walk plus at least one repeated-mark shortcut",
         "reverse_mark_counter_overhead": "timing arms disable counter increments, but the current graph traversal still checks the runtime metrics flag per visited node and edge; measured graph-on/off ratios include this branch overhead",
-        "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body; zero-fact expects no direct facts",
+        "direct_fact_payload_semantics": "call-facts expects one direct-call fact per bench body before the post-surface transition, then one fewer; zero-fact expects no direct facts",
         "primary_performance_metric": "Stage1 process retired instructions from macOS proc_pid_rusage; wall time and cycles are supporting measurements",
         "timing_instrumentation": "separate routing arms enable cache reports and assert reuse; timing arms disable cache reports and chain-visit counting, retain phase timing, collect exact Stage1 process counters, and must match routing-arm diagnostics; summaries contain timing arms only",
         "arm_kind_ordering": (
@@ -1071,6 +1130,7 @@ def main() -> int:
                 100_001 + args.body_edits,
                 payload_mode,
                 add_surface_function=True,
+                post_surface_fact_transition=True,
             )
         )
         if workload == "shared-calls":
@@ -1078,6 +1138,20 @@ def main() -> int:
                 raise RuntimeError("shared-calls prime fixture does not route every caller to one global callee")
             if "return shared_fact_leaf_alt()" not in source_versions[1]:
                 raise RuntimeError("shared-calls first body edit does not change a caller's target")
+        if workload in {"call-facts", "shared-calls"}:
+            transitioned_body = "def bench_0000() -> i64:\n    return 42\n\n"
+            if transitioned_body not in source_versions[-1]:
+                raise RuntimeError(f"{workload} post-surface edit does not transition bench_0000 to a literal")
+            previous = source_versions[-2]
+            function_header = "def bench_0000() -> i64:\n"
+            if previous.count(function_header) != 1:
+                raise RuntimeError(f"{workload} declaration-surface fixture has no unique bench_0000 body")
+            previous_return = previous.split(function_header, 1)[1].splitlines()[0]
+            if not previous_return.startswith("    return ") or not previous_return.endswith("()"):
+                raise RuntimeError(f"{workload} declaration-surface bench_0000 body is not a direct call")
+            previous_body = f"{function_header}{previous_return}\n\n"
+            if previous.count(previous_body) != 1 or previous.replace(previous_body, transitioned_body, 1) != source_versions[-1]:
+                raise RuntimeError(f"{workload} post-surface edit changed source outside bench_0000's body")
         workloads[workload] = (source, source_versions)
         workload_sequence_dir = source_sequence_dir / workload
         workload_sequence_dir.mkdir()

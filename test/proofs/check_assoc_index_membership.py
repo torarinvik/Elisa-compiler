@@ -1,6 +1,7 @@
 """Source-bind the associated-index refinement membership scan and controls."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -10,11 +11,15 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check production and proof bindings without running Elisa-Proof")
+ARGS = argument_parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not ARGS.source_only)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 SOURCE = ROOT / "src/semantic/assoc_index_membership.elisa"
 CONSUMER = ROOT / "src/semantic/check_assoc_index_bounds.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
@@ -62,6 +67,12 @@ negative_text = NEGATIVE.read_text()
 expected_model = '''
 ghost def method_unproven_from(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview, remaining: usize) -> bool:
     decreases remaining
+    ensure remaining == 0 or remaining > method_names.count implies result == false
+    ensure remaining > 0 and remaining <= method_names.count implies result == (
+        (method_names[method_names.count - remaining] == method
+            and not (method_names.count - remaining < method_refined.count and method_refined[method_names.count - remaining]))
+        or method_unproven_from(method_names, method_refined, method, remaining - 1)
+    )
     return false if:
         remaining == 0
         remaining > method_names.count
@@ -74,7 +85,10 @@ expected_scan = '''
 def method_unproven(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview) -> bool:
     ensure result == method_unproven_from(method_names, method_refined, method, method_names.count)
     found: mutable bool = false
-    for index in 0 ..< method_names.count |found, method_names, method_refined, method|:
+    index: mutable usize = 0
+    assert index <= method_names.count
+    assert method_unproven_from(method_names, method_refined, method, method_names.count) == (found or method_unproven_from(method_names, method_refined, method, method_names.count - index))
+    while index < method_names.count |found, index, method_names, method_refined, method|:
         invariant index <= method_names.count
         invariant method_unproven_from(method_names, method_refined, method, method_names.count) == (found or method_unproven_from(method_names, method_refined, method, method_names.count - index))
         remaining: usize = method_names.count - index
@@ -95,6 +109,13 @@ def method_unproven(method_names: darray[sview]&, method_refined: darray[bool]&,
         assert method_unproven_from(method_names, method_refined, method, method_names.count) == (
             found or method_unproven_from(method_names, method_refined, method, method_names.count - next_index)
         )
+        index <- next_index
+        assert index == next_index
+        assert index <= method_names.count
+        assert method_unproven_from(method_names, method_refined, method, method_names.count) == (
+            found or method_unproven_from(method_names, method_refined, method, method_names.count - index)
+        )
+    assert index == method_names.count
     assert method_unproven_from(method_names, method_refined, method, 0) == false
     assert method_unproven_from(method_names, method_refined, method, method_names.count) == found
     return found
@@ -114,15 +135,18 @@ if production_call not in function_section(consumer_text, "aib_index_is_unproven
     raise SystemExit("the generic associated-index decision must call the proved membership scan")
 collector = compact(function_section(consumer_text, "aib_collect_impl_methods"))
 collector_invariants = "invariantmethod_names.count==method_refined.count"
-if ("requiresmethod_names.count==method_refined.count" not in collector or
-        "ensuremethod_names.count==method_refined.count" not in collector or
+if ("ensuremethod_names.count==method_refined.count" not in collector or
         collector.count(collector_invariants) != 2 or
         collector.count("assertmethod_names.count==method_refined.count") < 7):
     raise SystemExit("impl-method collection must establish parallel table parity at each loop and recursion boundary")
-name_push = collector.find("method_names.push(name)")
-refinement_push = collector.find("method_refined.push(refined)")
-if name_push < 0 or refinement_push <= name_push:
-    raise SystemExit("each impl method must append its name and refinement together in aligned order")
+append = compact(function_section(consumer_text, "aib_append_impl_method"))
+name_push = append.find("method_names.push(method_name)")
+refinement_push = append.find("method_refined.push(refined)")
+if ("requiresmethod_names.count==method_refined.count" not in append or
+        "ensuremethod_names.count==method_refined.count" not in append or
+        name_push < 0 or refinement_push <= name_push or
+        "aib_append_impl_method(name,refined,method_names,method_refined)" not in collector):
+    raise SystemExit("each impl method must append its name and refinement together through the parity-preserving helper")
 if (collector.count("aib_collect_impl_methods(body,annotations,method_names,method_refined)") != 1 or
         collector.count("aib_collect_impl_methods(module_body,annotations,method_names,method_refined)") != 1):
     raise SystemExit("recursive impl collectors must preserve the same paired side tables")
@@ -198,6 +222,12 @@ if compact(function_section(negative_text, "missing_refinement_row_is_considered
     raise SystemExit("rejected control must assert the opposite missing-refinement behavior")
 
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
+if ARGS.source_only:
+    print(json.dumps({"source_bound": True, "positive_theorems": len(POSITIVE_NAMES),
+                      "false_controls": len(NEGATIVE_NAMES),
+                      "proof_closure_files": len(source_closure)}, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

@@ -66,12 +66,6 @@ required_source = (
     "return VRO_COMPARE_GREATER if left[position] > right[position]",
     "ensure result == vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION)",
     "ensure result >= VRO_COMPARE_LESS and result <= VRO_COMPARE_GREATER",
-    "ghost def vro_text_compare_reference_swap(",
-    "ensure vro_text_compare_reference_from(left, right, position) == -vro_text_compare_reference_from(right, left, position)",
-    "return true if position == left.len or position == right.len",
-    "return true if left[position] < right[position]",
-    "return true if left[position] > right[position]",
-    "return vro_text_compare_reference_swap(left, right, position + VRO_BYTE_STEP)",
     "invariant position <= shared",
     "while position < shared |position, left, right, shared|:",
     "invariant vro_text_compare_reference_from(left, right, position) == vro_text_compare_reference_from(left, right, VRO_FIRST_BYTE_POSITION)",
@@ -132,6 +126,19 @@ for name in positive_names:
         raise SystemExit(f"positive comparator theorem missing: {name}")
 if "vro_text_compare_reference_swap(left, right, VRO_FIRST_BYTE_POSITION)" not in positive:
     raise SystemExit("antisymmetry theorem no longer composes the production comparator with its reference-order lemma")
+reference_swap = (
+    "ghost def vro_text_compare_reference_swap(",
+    "requires position <= left.len and position <= right.len",
+    "decreases (left.len if left.len < right.len else right.len) - position",
+    "ensure result == true",
+    "ensure vro_text_compare_reference_from(left, right, position) == -vro_text_compare_reference_from(right, left, position)",
+    "return true if position == left.len or position == right.len",
+    "return true if left[position] < right[position]",
+    "return true if left[position] > right[position]",
+    "return vro_text_compare_reference_swap(left, right, position + VRO_BYTE_STEP)",
+)
+if not all(fragment in positive for fragment in reference_swap):
+    raise SystemExit("antisymmetry proof must carry its recursive lemma over the production comparator specification")
 if "VRO_COMPARE_LESS" not in positive or "VRO_COMPARE_EQUAL" not in positive:
     raise SystemExit("comparator theorems no longer use the production result constants")
 for name in negative_names:

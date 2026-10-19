@@ -313,7 +313,7 @@ for fragment in (
     "forbidden:bool=SemanticIteratorMutationPolicy::forbidden_during_iteration(method_name)",
     "receiver_name:sview=ident_name_of(receiver)",
     "ifreceiver_name!=\"\":resolved_receiver:sview=SemanticIteratorAliasResolution::resolve(alias_names,alias_targets,receiver_name)receiver_is_place<-SemanticIteratorAliasResolution::may_name(resolved_receiver,container)",
-    "method_namereturnifforbiddenandreceiver_is_place",
+    "returnmethod_nameifforbiddenandreceiver_is_place",
 ):
     if fragment not in mutation:
         raise SystemExit(f"production iterator check lost the proved alias-mutator path: {fragment}")

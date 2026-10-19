@@ -9,21 +9,29 @@ The graph remains opt-in and is not qualified for production use by this
 benchmark alone. The runner measures function-body fact reuse and resolver
 NameLookup hits separately. Each `call-facts` body calls a distinct leaf, with
 an alternate leaf for the edited body. A call's callee is still classified
-twice within one request, so the runner compares warm hit totals with the prime
-same-request baseline; warm totals must exceed that baseline to show aggregate
-prior-request reuse. The graph-off and graph-on modes report the chain rows
-visited by the NameLookup classification probe. The runner requires cold
-graph-on visits at prime and fewer graph-on visits than
-graph-off on exact-repeat and body-edit requests. Those reductions can still
+twice within one request, so the runner compares warm hit totals with the
+same-request duplicate baseline. Ordinary `call-facts` warm totals must exceed
+the prime baseline. For the post-surface edit, which turns one caller into a
+literal, the runner requires more than `N-1` hits for `call-facts` and more than
+`2N-3` for `shared-calls`; remaining duplicate reads alone can produce those
+baseline counts. Other pre-transition `shared-calls` warm requests must exceed
+their duplicate-only baseline: `2N-2` with both callees or `2N-1` when all N
+callers use the shared callee. The graph-off and graph-on modes report the chain
+rows visited by the NameLookup classification probe. The runner requires cold
+graph-on visits at prime and fewer graph-on visits than graph-off on exact-repeat,
+body-edit, declaration-surface, and post-surface requests. Those reductions can still
 include same-request duplicate checks. The counter covers only global symbol and
 module-member hash-chain rows visited by the fused classifier. An active graph
 request builds its exact resolver surface lazily when it reaches its first
 unbound name; requests with no eligible NameLookup reads skip that build. The
 first eligible read still pays the full surface scan, and every query scans lexical
-bindings before checking the cache. The cold fallback scans `region_names`, while
-active queries read the precomputed region bit. Surface construction and local
-scans are outside the chain counter, though surface construction is included in
-graph-on whole-request timing. This fixture
+bindings before checking the cache. Each active read also probes the per-name resolver
+surface and the `(current_module, name)` member-pair index, including warm cache hits;
+those probes are not represented in the chain counter. The cold fallback scans
+`region_names`, while active queries read the precomputed region bit. Surface
+construction, per-read surface probes, and local scans are outside the chain counter,
+though surface construction and probes are included in graph-on whole-request timing.
+This fixture
 has no local or region names, so it does not measure those costs. Bare module
 identifiers used as `Expr.Field` or namespace-call objects now also use
 NameLookup; qualified `Expr.Scope` module-prefix and member
@@ -141,10 +149,11 @@ which exercise body reuse while serializing empty direct-fact payloads.
 `call-facts` uses zero-argument direct calls in the function bodies, so restored
 bodies carry direct-call facts as well as their body records. The edited body
 calls a distinct leaf per function; the edited body switches to a separate
-alternate leaf. The report exposes `direct_fact_count`, and the runner asserts
-one direct-call fact per `bench_*` body in `call-facts` and zero in `zero-fact`.
-Results and source hashes are grouped by workload so the empty-payload control
-cannot hide the cost of copying actual facts.
+alternate leaf. Before the post-surface transition, the report exposes
+`direct_fact_count` and the runner asserts one direct-call fact per `bench_*`
+body in `call-facts`; the post-surface transition removes one. `zero-fact`
+expects no direct facts. Results and source hashes are grouped by workload so
+the empty-payload control cannot hide the cost of copying actual facts.
 
 The runner also checks the closed complete-empty query class: exactly one
 `return` of an integer, float, string, character, or boolean literal. Those
@@ -156,20 +165,37 @@ separate `complete_empty_body_*` counters describe only direct-fact query work;
 the compiler still parses the source and runs its full semantic pipeline.
 
 The `post-surface-body-edit` control retains the added declaration and changes
-only `bench_0000`. This checks that the graph warms again after publishing a new
-declaration surface: graph-off must use typed-snapshot fallback, while graph-on
-must admit the now-current `SourceInput` and restore and skip publication for
-every unchanged eligible body. The changed body remains cold. Complete-empty
-restoration follows the same rule: the edited body is excluded for `zero-fact`,
-while all complete-empty bodies are restored for the call workloads. This
-request is reported as its own control and is not folded into the pre-surface
-body-edit aggregate.
+only `bench_0000`, after first confirming that its prior body is a direct call.
+For the call workloads, that edit changes its body to a literal, so the report
+must show one fewer direct fact and one new complete-empty query commit. These
+body-query assertions check reuse after publishing a new declaration surface:
+for `call-facts` and `shared-calls`, graph-off must use typed-snapshot fallback
+while graph-on admits the now-current `SourceInput`. The separate NameLookup
+assertion requires post-surface hit counts above the same-request duplicate
+baselines described above. The all-complete-empty
+`zero-fact` workload expects neither admission nor typed-snapshot fallback; its
+closed body shape proves the empty fact result directly. Every workload must
+restore and skip publication for each unchanged eligible body. The changed body
+remains cold, while unchanged complete-empty bodies are restored. This request
+is reported as its own control and is not folded into the pre-surface body-edit
+aggregate.
 
-For every body edit, graph-off must report typed-snapshot fallback reuse and
-graph-on must report SourceInput admission plus restoration of every unchanged
-SourceInput-dependent body. The declaration-surface control must invalidate
-that broad reuse while the separately counted complete-empty queries remain
-reusable.
+These NameLookup thresholds prove that a warm request gets at least one hit
+from an earlier request after subtracting hits from duplicate spellings within
+the same request. They do not prove reuse for every unchanged spelling; the
+counters are aggregate rather than per-key.
+
+For `call-facts` and `shared-calls` body edits, graph-off must report
+typed-snapshot fallback reuse and graph-on must report collector-side
+`source_input_admitted`. For `zero-fact`, both paths skip these broad body-fact
+reuse paths because every body is complete-empty. That report field covers
+collector/body-fact admission only: graph publication has a separate
+`SourceInput` phase when it has cacheable nonempty bodies, and the graph-on
+driver refreshes the resolver `SourceInput` context before semantic resolution.
+Neither phase is represented by `source_input_admitted`. Graph-on must still
+restore every unchanged eligible body in all workloads. The declaration-surface
+control must invalidate `SourceInput`-dependent body-fact reuse while the
+separately counted complete-empty queries remain reusable.
 The runner compares the complete per-request compiler transcript after removing
 only cache/timing instrumentation, so status and diagnostics must match between
 modes. Prime, exact-repeat, body-edit, and invalidation timings remain separate

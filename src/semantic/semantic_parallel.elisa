@@ -25,10 +25,10 @@
 
 extend Semantic:
     private:
-        struct ParPassJob:
-            shared_bits: uintptr
-            file_bits: uintptr
-            view_bits: uintptr
+        struct ParPassJob[@file, @destination, @pool]:
+            shared_table: SymbolTable& @destination
+            file: Ast::File& @file
+            view: Ast::File& @pool
             flags: ParPassFlags
             pass_id: u32
             # Owns copied diagnostic payloads until the parent appends them, then is freed.
@@ -41,9 +41,15 @@ extend Semantic:
         # What a worker receives. `ast` is always null: its type is what makes the worker an
         # AST reader, so both compilers thread the AST store into it and `submit` captures the
         # submitting scope's store for it.
-        struct ParPassTicket:
-            job_bits: uintptr
+        struct ParPassTicket[@file, @destination, @pool]:
+            job: mutable ParPassJob[file, destination, pool]& @pool
             ast: Ast::Decl?
+
+        # Storage lives for the pool's lifetime, so worker tickets can carry typed borrows
+        # through the nursery join instead of uintptr values that erase their provenance.
+        struct ParPassScratch[@file, @destination, @pool]:
+            loop_view: Ast::File
+            jobs: mutable darray[ParPassJob[file, destination, pool]] @pool
 
         # Explicit allocation is essential: an `in` block does not change the inferred
         # owner of writes through a worker-local lmut SymbolTable.
@@ -134,11 +140,12 @@ extend Semantic:
                     effect_ref_count: source.effect_ref_count
                 })
 
-        def par_pass_worker(ticket: ParPassTicket) -> u32:
+        def par_pass_worker[@file, @destination, @pool](ticket: ParPassTicket[file, destination, pool]) -> u32:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-                job: mutable heap ParPassJob& = ticket.job_bits.cast[mutable heap ParPassJob&]
-                file: heap Ast::File& = job.file_bits.cast[heap Ast::File&]
-                view: heap Ast::File& = job.view_bits.cast[heap Ast::File&]
+                job: mutable ParPassJob[file, destination, pool]& = ticket.job
+                file: Ast::File& = job.file
+                view: Ast::File& = job.view
+                shared_bits: uintptr = job.shared_table.cast[void&].uintptr()
                 # Every byte is overwritten by the shallow copy before any field is read.
                 # Avoid constructing the normal table, which reserves its full text buffer
                 # only to discard that allocation immediately.
@@ -146,7 +153,7 @@ extend Semantic:
                 # lmut pass dispatcher. The caller-table copy below replaces every field;
                 # skip the normal text buffer reserve because append-only passes never need it.
                 table: mutable SymbolTable = SymbolTable(false)
-                _ = memcpy((&table).cast[mutable void&], job.shared_bits.cast[void&], size_of(SymbolTable))
+                _ = memcpy((&table).cast[mutable void&], job.shared_table.cast[void&], size_of(SymbolTable))
                 table.diagnostics <- []
                 table <- par_pass_call(job.pass_id, file, view, job.flags, table) can Global{Read,Write}
                 # Check while the worker-local table still exists. Keeping only the bool in the
@@ -155,8 +162,8 @@ extend Semantic:
                 diagnostics_offset: usize = ((&table.diagnostics).cast[void&].uintptr() - local_bits).usize()
                 diagnostics_end: usize = diagnostics_offset + size_of(darray[Diagnostic])
                 table_size: usize = size_of(SymbolTable)
-                head_same: bool = memcmp(local_bits.cast[void&], job.shared_bits.cast[void&], diagnostics_offset) == 0
-                tail_same: bool = memcmp((local_bits + diagnostics_end.uintptr()).cast[void&], (job.shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
+                head_same: bool = memcmp(local_bits.cast[void&], shared_bits.cast[void&], diagnostics_offset) == 0
+                tail_same: bool = memcmp((local_bits + diagnostics_end.uintptr()).cast[void&], (shared_bits + diagnostics_end.uintptr()).cast[void&], table_size - diagnostics_end) == 0
                 job.table_unchanged <- head_same and tail_same
                 # Clone the records before this frame releases its inferred arena. All
                 # textual fields must also be cloned, even source views and empty defaults.
@@ -222,36 +229,32 @@ extend Semantic:
         # Run passes [first, first + count) of par_pass_call over `table` and append their
         # diagnostics in id order: concurrently on the shared pool, or in order on this
         # thread when no pool was supplied (serial mode and syntax-error checks).
-        def par_pass_run[@pool](file: Ast::File&, view: Ast::File&, flags: ParPassFlags, table: lmut SymbolTable, shared_pool: mutable ThreadPool& @pool, first: u32, count: u32) -> void:
+        def par_pass_run[@file, @destination, @pool](file: Ast::File& @file, flags: ParPassFlags, table: mutable SymbolTable& @destination, shared_pool: mutable ThreadPool& @pool, scratch: mutable ParPassScratch[file, destination, pool]& @pool, first: u32, count: u32) -> void:
             can Memory.Allocate, Memory.Release, Abort.Panic, Parallel, Unsafe.PointerCast, Pool.Submit, Pool.WaitAll, Thread.Spawn, Thread.Join, Atomics.Store, Atomics.Load, Atomics.CompareExchange, Sync{Lock,Wait,Unlock,Notify}:
                 if count < 2 or shared_pool.handle == null:
-                    for offset in 0..<count |table, file, view, flags, first|:
-                        table <- par_pass_call(first + offset, file, view, flags, table) can Global{Read,Write}
+                    for offset in 0..<count |table, file, flags, first|:
+                        table <- par_pass_call(first + offset, file, scratch.loop_view, flags, table) can Global{Read,Write}
                     return
-                jobs: mutable darray[ParPassJob] = []
-                shared_bits: uintptr = (&table).cast[void&].uintptr()
-                file_bits: uintptr = file.cast[void&].uintptr()
-                view_bits: uintptr = view.cast[void&].uintptr()
-                for offset in 0..<count |jobs, shared_bits, file_bits, view_bits, flags, first|:
-                    jobs.push(ParPassJob{shared_bits: shared_bits, file_bits: file_bits, view_bits: view_bits, flags: flags, pass_id: first + offset, arena: zeroed, diagnostics: []})
-                # Each job's address, taken from the buffer itself (not base + i * size_of).
-                job_addresses: mutable darray[uintptr] = []
-                for offset in 0..<count |job_addresses, jobs|:
-                    job_addresses.push((&jobs[offset.usize()]).cast[void&].uintptr())
+                # Keep the view descriptor and job records in the pool region. Worker borrows
+                # point into this stable scratch and remain valid until the nursery joins.
+                while scratch.jobs.count < count.usize():
+                    scratch.jobs.push(ParPassJob[file, destination, pool]{shared_table: table, file: file, view: &scratch.loop_view, flags: flags, pass_id: 0, arena: zeroed, diagnostics: []})
+                for offset in 0..<count |scratch, table, file, flags, first|:
+                    scratch.jobs[offset.usize()] <- ParPassJob[file, destination, pool]{shared_table: table, file: file, view: &scratch.loop_view, flags: flags, pass_id: first + offset, arena: zeroed, table_unchanged: false, diagnostics: []}
                 # Reuse the caller's long-lived pool. The nursery creates only a per-batch
                 # TaskGroup, joins every worker at the block boundary, and leaves pool shutdown
                 # to the caller. The direct counted loop keeps the join proof on the ForStmt path.
                 nursery on(shared_pool):
-                    for job_index in 0..<job_addresses.count:
+                    for job_index in 0..<count.usize():
                         can Global{Read,Write}:
-                            submit par_pass_worker(ParPassTicket{job_bits: job_addresses[job_index], ast: null})
+                            submit par_pass_worker(ParPassTicket[file, destination, pool]{job: &scratch.jobs[job_index], ast: null})
                 # Validate every job before the splice mutates parent backing storage.
-                for job_bits in job_addresses |table|:
-                    job: heap ParPassJob& = job_bits.cast[heap ParPassJob&]
+                for job_index in 0..<count.usize() |table, scratch|:
+                    job: ParPassJob[file, destination, pool] = scratch.jobs[job_index]
                     panic("semantic_parallel: a pass run concurrently wrote a SymbolTable field other than diagnostics") if not job.table_unchanged
-                for job_bits in job_addresses |table|:
-                    job: mutable heap ParPassJob& = job_bits.cast[mutable heap ParPassJob&]
+                for job_index in 0..<count.usize() |table, scratch|:
+                    job: ParPassJob[file, destination, pool] = scratch.jobs[job_index]
                     for index in 0..<job.diagnostics.count |table, job|:
                         source_bits: uintptr = (&job.diagnostics[index]).cast[void&].uintptr()
                         table <- par_pass_parent_diagnostic(source_bits, table)
-                    arena_free(&job.arena) can Global{Read,Write}
+                    arena_free(&scratch.jobs[job_index].arena) can Global{Read,Write}

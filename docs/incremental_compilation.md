@@ -960,8 +960,12 @@ A resolver `NameLookup` query is connected at `Expr.Ident` classification: the
 driver reacquires a request context after collection, and the serial
 declaration-resolution walk checks the cached `(known, module_only)` result before
 scanning global symbol/member chains. Key
-schema 2 stores only current module and exact name; input schema 3 packs six boolean
-surface facts into one flags byte alongside the exact count fields. The session-local
+schema 2 stores only current module and exact name; input schema 4 packs six boolean
+surface facts into one flags byte and stores only the two result-relevant counts:
+non-module symbol count and member-row count. The total same-name symbol count is
+omitted because the resolver classification does not read it. The logical input is
+13 bytes (schema, flags, and two 32-bit counts); this source change still needs a
+source-pinned build and parity validation. The session-local
 graph resets when identity or options change. After declarations, aliases, imports, and region annotations
 are collected, the first eligible unbound name-classification read lazily builds a
 collision-safe exact-spelling surface index. Requests with no eligible reads skip the
@@ -970,8 +974,9 @@ still pays that setup because the builder first reconstructs imported-module and
 imported-member sets from the import annotations, then indexes the declaration surface.
 The request context memoizes the build attempt, including failure, so unsupported
 surfaces use the cold classifier without repeating the prepass. The input
-records total and non-module
-symbol counts, module presence, module-member row multiplicity, imported visibility,
+records non-module symbol count and module-member row multiplicity; total same-name
+`symbol_count` is omitted because neither classification formula reads it. It also
+records module presence, imported visibility,
 current-module membership, region-name presence, the `name_indexed` gate bit, and the
 forced-builtin class. This preserves the existing visibility/count rule while giving
 negative names stable all-zero surface facts. NameLookup has no `SourceInput` edge; the

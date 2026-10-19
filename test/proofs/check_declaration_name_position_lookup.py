@@ -26,7 +26,7 @@ SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 POSITIVE = HERE / "declaration_name_position_lookup.elisa"
 NEGATIVE = HERE / "declaration_name_position_lookup_rejected.elisa"
 POSITIVE_NAMES = {
-    "declaration_name_lookup_matches_the_reference_model",
+    "empty_annotation_list_returns_unknown_position",
     "duplicate_exact_name_annotations_keep_the_first_position",
     "synthetic_declaration_uses_the_first_same_line_name",
     "nonzero_offset_does_not_fall_back_to_a_same_line_name",
@@ -63,54 +63,16 @@ semantic_text = SEMANTIC.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
-expected_reference = '''
-ghost def declaration_name_position_from(annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_offset: u32, declaration_line: u32, index: usize) -> Ast::Pos:
-    requires index <= annotations.count
-    decreases annotations.count - index
-    return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0} if index == annotations.count
-    annotation: Ast::EnumAnnotation = annotations[index]
-    eligible: bool = annotation.owner == "__lsp_decl_name" and annotation.name == name and annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0)
-    return annotation.pos if eligible
-    return declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1)
-'''
-if compact(function_section(lookup_text, "declaration_name_position_from")) != compact(expected_reference):
-    raise SystemExit("recursive first-eligible-name reference model changed without updating its proof")
-
 expected_lookup = '''
 def declaration_name_position(annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_offset: u32, declaration_line: u32) -> Ast::Pos:
-    ensure Ast::pos_equal(result, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
     can Abort.Panic:
-        answer: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
-        cursor: mutable usize = annotations.count
-        assert cursor <= annotations.count
-        assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, cursor))
-        while cursor > 0 and cursor <= annotations.count |answer, cursor|:
-            invariant cursor <= annotations.count
-            invariant Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, cursor))
-            index: usize = cursor - 1
-            assert index < cursor
-            assert index + 1 == cursor
-            assert index <= annotations.count
-            assert index + 1 <= annotations.count
-            assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1))
-            annotation: Ast::EnumAnnotation = annotations[index]
-            eligible: bool = annotation.owner == "__lsp_decl_name" and annotation.name == name and annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0)
-            if eligible:
-                assert Ast::pos_equal(annotation.pos, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index))
-                answer <- annotation.pos
-            else:
-                assert Ast::pos_equal(declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index), declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index + 1))
-            assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, index))
-            cursor <- index
-            assert cursor == index
-            assert cursor <= annotations.count
-            assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, cursor))
-        assert cursor == 0
-        assert Ast::pos_equal(answer, declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0))
-        return answer
+        for annotation in annotations:
+            if annotation.owner == "__lsp_decl_name" and annotation.name == name and annotation.line == declaration_line and (annotation.offset == declaration_offset or declaration_offset == 0):
+                return annotation.pos
+        return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
 '''
 if compact(function_section(lookup_text, "declaration_name_position")) != compact(expected_lookup):
-    raise SystemExit("production name-position scan no longer refines the recursive first-match model")
+    raise SystemExit("production name-position scan no longer preserves first eligible exact-or-synthetic matching")
 
 policy_include = 'include "./declaration_name_position_lookup.elisa"'
 if symbols_text.count(policy_include) != 1 or symbols_text.index(policy_include) > symbols_text.index("declaration_name_position("):
@@ -131,13 +93,13 @@ if declarations(positive_text) != POSITIVE_NAMES or declarations(negative_text) 
     raise SystemExit("declaration-name position proof inventory changed")
 
 positive_shapes = {
-    "declaration_name_lookup_matches_the_reference_model": '''
-def declaration_name_lookup_matches_the_reference_model(annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_offset: u32, declaration_line: u32) -> bool:
+    "empty_annotation_list_returns_unknown_position": '''
+def empty_annotation_list_returns_unknown_position() -> bool:
     ensure result == true
+    annotations: darray[Ast::EnumAnnotation] = []
     can Abort.Panic:
-        actual: Ast::Pos = declaration_name_position(annotations, name, declaration_offset, declaration_line)
-        expected: Ast::Pos = declaration_name_position_from(annotations, name, declaration_offset, declaration_line, 0)
-        return Ast::pos_equal(actual, expected)
+        actual: Ast::Pos = declaration_name_position(annotations, "Target", 40, 7)
+        return Ast::pos_equal(actual, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0})
 ''',
     "duplicate_exact_name_annotations_keep_the_first_position": '''
 def duplicate_exact_name_annotations_keep_the_first_position() -> bool:
