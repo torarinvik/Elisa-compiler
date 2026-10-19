@@ -49,14 +49,43 @@ def normalized_expression(expression: str) -> str:
     return value
 
 
+def diagnostic_payload_base_type(type_expression: str) -> str:
+    """Ignore a field's region annotation when classifying its payload ownership."""
+    value = re.sub(r"^mutable\s+", "", type_expression.strip())
+    return re.sub(r"\s+@[A-Za-z_]\w*$", "", value)
+
+
+def diagnostic_payload_region(type_expression: str) -> str:
+    match = re.search(r"\s+(@[A-Za-z_]\w*)$", type_expression.strip())
+    return match.group(1) if match else ""
+
+
+def function_section(source: str, name: str) -> str:
+    """Extract one source function without relying on an adjacent comment heading."""
+    lines = source.splitlines()
+    start = next((index for index, line in enumerate(lines)
+                  if re.match(r"^[ \t]*def " + re.escape(name) + r"(?:\[[^\]]*\])?\(", line)), None)
+    assert start is not None, f"missing {name} function"
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= indent:
+            break
+        end += 1
+    return "\n".join(lines[start:end])
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     types = (root / "src/semantic/semantic_types.elisa").read_text()
     runner = (root / "src/semantic/semantic_parallel.elisa").read_text()
     body = types.split("        struct Diagnostic:\n", 1)[1].split("        # Fresh, empty table.", 1)[0]
     fields = dict(re.findall(r"^            (\w+): (?:mutable )?([^=\n]+)", body, re.M))
-    assert all(kind.strip() in {"sview", "u32", "Ast::Pos", "DiagnosticKind"} for kind in fields.values()), "new Diagnostic payload type requires ownership review"
-    texts = [name for name, kind in fields.items() if kind.strip() == "sview"]
+    field_types = {name: diagnostic_payload_base_type(kind) for name, kind in fields.items()}
+    assert all(kind in {"sview", "u32", "Ast::Pos", "DiagnosticKind"} for kind in field_types.values()), "new Diagnostic payload type requires ownership review"
+    texts = [name for name, kind in field_types.items() if kind == "sview"]
+    export_texts = [name for name in texts if diagnostic_payload_region(fields[name]) != "@source"]
     parent = runner.split("        def par_pass_parent_diagnostic", 1)[1].split("        def par_pass_worker", 1)[0]
     worker = runner.split("        def par_pass_worker", 1)[1].split("        # True when", 1)[0]
     copies = re.findall(r"table <- par_pass_parent_text\(source\.(\w+), table\)", parent)
@@ -77,18 +106,18 @@ def main() -> None:
                 expected = f"par_pass_parent_view(table, first + {copies.index(name)})"
             assert normalized_expression(values[name]) == expected, f"{label}: incorrect copy of {name}"
     api = (root / "src/semantic/semantic_api.elisa").read_text()
-    exported = api.split("        def diagnostic_export[@r]", 1)[1].split("        # Driver-facing", 1)[0]
-    export_copies = re.findall(r"(\w+)_bits: uintptr = diagnostic_export_text\(source\.(\w+), diagnostics\)", exported)
-    assert len(export_copies) == len(texts), "export text copies changed"
-    assert dict(export_copies) == {name: name for name in texts}, "export text mapping changed"
+    exported = function_section(api, "diagnostic_export")
+    export_copies = re.findall(r"(\w+): diagnostic_output_text\(source\.(\w+), text_buffers\)", exported)
+    assert len(export_copies) == len(export_texts), "export text copies changed"
+    assert dict(export_copies) == {name: name for name in export_texts}, "export text mapping changed"
     literal = diagnostic_literal(exported)
     assignments = re.findall(r"^\s*(\w+): ([^\n]+?)(?:,)?$", literal, re.M)
     assert len(assignments) == len(fields), "export Diagnostic field coverage changed"
     values = dict(assignments)
     assert set(values) == set(fields), "export Diagnostic fields changed"
     for name in fields:
-        expected = (f"unsafe_sview_bounded_bytes({name}_bits.cast[u8&], source.{name}.len.usize())"
-                    if name in texts else f"source.{name}")
+        expected = (f"diagnostic_output_text(source.{name}, text_buffers)"
+                    if name in export_texts else f"source.{name}")
         assert normalized_expression(values[name]) == expected, f"export: incorrect copy of {name}"
     print(f"parallel Diagnostic ownership audit: {len(fields)} fields, {len(texts)} text payloads covered")
 

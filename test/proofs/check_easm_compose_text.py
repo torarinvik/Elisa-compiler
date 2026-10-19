@@ -82,6 +82,7 @@ helper_names = {
     "easm_compose_span_reference_at_bounds",
     "easm_compose_span_reference_from_open", "easm_compose_span_reference",
     "easm_compose_span_matches_reference", "easm_compose_span_state_matches_reference",
+    "easm_compose_span_record",
 }
 if not helper_names <= declarations(text_source):
     raise SystemExit("compose-text module is missing an extracted production helper")
@@ -103,6 +104,15 @@ required_state_match_fragments = (
 )
 if any(compact(fragment) not in state_matches_reference_body for fragment in required_state_match_fragments):
     raise SystemExit("compose-span loop state predicate no longer compares the complete reference span")
+span_record_body = compact(function_section(text_source, "easm_compose_span_record"))
+required_span_record_fragments = (
+    "ensure result.start == start",
+    "ensure result.end == end",
+    "ensure result.valid == valid",
+    "return ComposeSpan{start: start, end: end, valid: valid}",
+)
+if any(compact(fragment) not in span_record_body for fragment in required_span_record_fragments):
+    raise SystemExit("compose-span return helper lost its exact field projection contract")
 state_wrapper_body = compact(function_section(text_source, "easm_compose_span_reference_from_state"))
 if any(compact(fragment) not in state_wrapper_body for fragment in (
     "and wanted >= 0 and wanted < easm_compose_argument_count_spec(values)) implies (",
@@ -192,6 +202,9 @@ required_span_fragments = (
     "assert answer.valid or (answer.start == 0 and answer.end == 0)",
     "assert not answer.valid or answer.start <= answer.end",
     "assert not answer.valid or answer.end <= text.len",
+    "assert easm_compose_span_record(answer.start, answer.end, answer.valid).valid == easm_compose_span_reference(text, wanted).valid",
+    "assert easm_compose_span_record(answer.start, answer.end, answer.valid).start == easm_compose_span_reference(text, wanted).start",
+    "assert easm_compose_span_record(answer.start, answer.end, answer.valid).end == easm_compose_span_reference(text, wanted).end",
     "return answer",
 )
 if any(compact(fragment) not in span_body for fragment in required_span_fragments):

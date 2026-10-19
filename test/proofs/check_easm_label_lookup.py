@@ -83,8 +83,8 @@ required_contracts = (
     "ensure result >= 0 implies result < instructions.count.i64()",
     "ensure result >= 0 implies result.usize().i64() == result",
     "ensure result >= 0 implies easm_equal(easm_label_name(instructions[result.usize()]), target)",
-    "ensure result >= 0 implies (forall prior in 0..<result: not easm_equal(easm_label_name(instructions[prior.usize()]), target))",
-    "ensure (instructions.count.i64() >= 0 and instructions.count.i64().usize() == instructions.count and result == -1) implies (forall candidate in 0..<instructions.count.i64(): not easm_equal(easm_label_name(instructions[candidate.usize()]), target))",
+    "ensure result >= 0 implies (forall prior in 0..<result.usize(): not easm_equal(easm_label_name(instructions[prior]), target))",
+    "ensure (instructions.count.i64() >= 0 and instructions.count.i64().usize() == instructions.count and result == -1) implies (forall candidate in 0..<instructions.count: not easm_equal(easm_label_name(instructions[candidate]), target))",
 )
 if any(compact(contract) not in lookup for contract in required_contracts):
     raise SystemExit("EASM label lookup lost its sentinel, count, first-match, or miss contract")
@@ -96,14 +96,19 @@ required_body = (
     "assert count_signed >= 0",
     "assert count_signed.usize() == count",
     "assert count_signed == instructions.count.i64()",
-    "for index in 0..<count_signed |instructions, target|:",
+    "for index in 0..<count |count, instructions, target|:",
     "invariant index >= 0",
-    "invariant index <= count_signed",
-    "invariant forall prior in 0..<index: prior < count_signed and not easm_equal(easm_label_name(instructions[prior.usize()]), target)",
-    "if easm_equal(easm_label_name(instructions[index.usize()]), target):",
-    "assert index < count_signed",
-    "assert index.usize().i64() == index",
-    "return index",
+    "invariant index <= count",
+    "invariant forall prior in 0..<index: not easm_equal(easm_label_name(instructions[prior]), target)",
+    "if easm_equal(easm_label_name(instructions[index]), target):",
+    "assert index < count",
+    "assert index.i64() < count_signed",
+    "assert index.i64().usize() == index",
+    "assert forall prior in 0..<index: not easm_equal(easm_label_name(instructions[prior]), target)",
+    "return index.i64()",
+    "assert not easm_equal(easm_label_name(instructions[index]), target)",
+    "assert forall prior in 0..<(index + 1): not easm_equal(easm_label_name(instructions[prior]), target)",
+    "assert forall candidate in 0..<count: not easm_equal(easm_label_name(instructions[candidate]), target)",
 )
 positions = [lookup.find(compact(fragment)) for fragment in required_body]
 if any(position < 0 for position in positions) or positions != sorted(positions) or not lookup.endswith("return-1"):

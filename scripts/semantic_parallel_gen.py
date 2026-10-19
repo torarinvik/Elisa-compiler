@@ -45,7 +45,12 @@ SRC = os.path.join(ROOT, "src")
 API = os.path.join(SRC, "semantic", "semantic_api.elisa")
 PASSES = os.path.join(SRC, "semantic", "semantic_parallel_passes.elisa")
 PIPELINE = "check_full_into_pipeline"
-PIPELINE_CONTEXT = {"file", "table", "shared_pool", "snapshot", "incremental_skip_count", "enforce_mutable_global_grants"}
+PIPELINE_CONTEXT = {
+    "file", "table", "shared_pool", "snapshot", "incremental_skip_count",
+    "effect_source_bodies_skipped", "ungranted_panic_bodies_skipped",
+    "global_permission_axis_scans_skipped", "lookup_session", "lookup_context",
+    "enforce_mutable_global_grants",
+}
 MIN_RUN = 2
 MUTATORS = (
     r"push|push_back|extend|pop|clear|insert|remove|remove_at|put|put_checked|put_or_panic|add|set|swap|sort"
@@ -84,10 +89,15 @@ ENUM_RE = re.compile(r"^(\s*)(?:const\s+)?enum\s+(\w+)\b.*:\s*$")
 ENUM_VARIANT_RE = re.compile(r"^\s+([A-Z]\w*)\b")
 CALL_RE = re.compile(r"\b([A-Za-z_]\w*)[ \t]*(?:\[[^\]\n]*\])?[ \t]*\(")
 PAR_RUN_RE = re.compile(
-    r"^([ \t]*)(table <- )?par_pass_run\(file, &loop_view, flags, table, "
-    r"(shared_pool, )?(\d+), (\d+)\)([ \t]+can[ \t]+[^\n]+)?[ \t]*$"
+    r"^([ \t]*)(table <- )?par_pass_run\(file, flags, table, shared_pool, "
+    r"(&[A-Za-z_]\w*\[\d+\]), (\d+), (\d+)\)([ \t]+can[ \t]+[^\n]+)?[ \t]*$"
 )
 PAR_RUN_ANY_RE = re.compile(r"\bpar_pass_run\s*\(")
+MUTABLE_POINTER_CAST_RE = re.compile(
+    r"(?:\(\s*&?\s*)*\b(?P<root>\w+)\b"
+    r"(?:(?:\s*\.\s*\w+)|(?:\s*\[[^\]\n]*\]))*\s*\)*"
+    r"\s*\.\s*cast\s*\[(?P<target>[^\]\n]+)\]"
+)
 PAR_PASS_ARM_RE = re.compile(r"^([ \t]*)(if|elif) pass_id == (\d+):[ \t]*$")
 PAR_PASS_ARM_ANY_RE = re.compile(r"\bpass_id\s*==")
 
@@ -101,7 +111,7 @@ def elisa_files():
 
 def type_expression_is_mutable_ref(type_expression, aliases, alias_cache=None):
     """Resolve source type aliases enough to detect a mutable reference spelling."""
-    if re.search(r"\bmutable\b[^&]*&", type_expression):
+    if re.search(r"\b(?:mutable|lmut)\b", type_expression):
         return True
     if alias_cache is None:
         alias_cache = {}
@@ -116,7 +126,7 @@ def type_expression_is_mutable_ref(type_expression, aliases, alias_cache=None):
         visiting.add(alias)
         result = False
         for aliased_type in aliases.get(alias, ()):
-            if re.search(r"\bmutable\b[^&]*&", aliased_type):
+            if re.search(r"\b(?:mutable|lmut)\b", aliased_type):
                 result = True
                 break
             if any(
@@ -371,7 +381,7 @@ def par_run_calls(lines, offset=0):
 
 def normalized_par_run_line(line, match):
     """Emit the lmut call with an explicit table update while preserving effects/indentation."""
-    return (match.group(1) + "table <- par_pass_run(file, &loop_view, flags, table, shared_pool, "
+    return (match.group(1) + "table <- par_pass_run(file, flags, table, shared_pool, " + match.group(3) + ", "
             + match.group(4) + ", " + match.group(5) + ")" + (match.group(6) or ""))
 
 
@@ -473,6 +483,31 @@ def match_arm_body(line):
         if rest.startswith("|"):
             rest = rest[1:].lstrip()
             continue
+        if rest.startswith("if "):
+            # A guarded pattern still ends with the match-arm colon. Find that
+            # colon outside nested expressions so constructors in the pattern or
+            # guard are not mistaken for AST values built by the worker.
+            depth = 0
+            quote = None
+            escaped = False
+            for j, char in enumerate(rest):
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = None
+                    continue
+                if char in "\"'":
+                    quote = char
+                elif char in "([{":
+                    depth += 1
+                elif char in ")]}":
+                    depth -= 1
+                elif char == ":" and depth == 0:
+                    return rest[j + 1:]
+            return None
         return rest[1:] if rest.startswith(":") else None
 
 
@@ -965,6 +1000,175 @@ def type_may_contain_reference(type_expression, aliases, structs):
     return False
 
 
+def type_may_contain_mutable_alias(type_expression, aliases, structs):
+    """Whether a copied value can retain mutable owned storage or a mutable borrow.
+
+    Immutable views are allowed here: parallel semantic workers can read table-owned
+    text for the duration of the synchronous join, while mutable containers and mutable
+    references could expose writes or outlive a reallocated owner.
+    """
+    def classify(expression):
+        expression = expression.strip()
+        while expression.startswith("(") and matching_delimiter(expression, 0) == len(expression) - 1:
+            expression = expression[1:-1].strip()
+        while expression.endswith("?"):
+            expression = expression[:-1].rstrip()
+        if re.search(r"\blmut\b", expression):
+            return "value", True
+        if "&" in expression:
+            return "value", type_expression_is_mutable_ref(expression, aliases)
+        expression = re.sub(r"^(?:(?:mutable|lmut|static|heap|stack)\s+)+", "", expression)
+        if "[" in expression or "{" in expression or "," in expression:
+            return "invalid", True
+        if not re.fullmatch(r"(?:\w+::)*\w+", expression):
+            return "invalid", True
+        name = expression.rsplit("::", 1)[-1]
+        if name == "sview" or name in COPY_VALUE_TYPE_NAMES:
+            return "value", False
+        return "name", name
+
+    kind, root = classify(type_expression)
+    if kind == "value":
+        return root
+    if kind == "invalid":
+        return True
+
+    # A type is safe only after every alias/record edge has completed without
+    # finding a mutable owner. An edge back to an active node is an unresolved
+    # recursive cycle, so fail closed instead of treating it as an already-seen
+    # safe type.
+    state = {}
+    memo = {}
+    frames = []
+
+    def push(name):
+        candidates = list(aliases.get(name, ()))
+        schemas = structs.get(name, ())
+        children = candidates + [
+            field_type
+            for fields in schemas
+            for field_type in (fields.values() if isinstance(fields, dict) else fields)
+        ]
+        if not candidates and not schemas:
+            state[name] = 2
+            memo[name] = True
+            return
+        state[name] = 1
+        frames.append([name, children, 0, False])
+
+    push(root)
+    while frames:
+        name, children, index, unsafe = frames[-1]
+        if unsafe:
+            memo[name] = True
+            state[name] = 2
+            frames.pop()
+            if frames:
+                frames[-1][3] = True
+            continue
+        if index >= len(children):
+            memo[name] = False
+            state[name] = 2
+            frames.pop()
+            continue
+
+        child_kind, child = classify(children[index])
+        frames[-1][2] += 1
+        if child_kind == "value":
+            if child:
+                frames[-1][3] = True
+        elif child_kind == "invalid":
+            frames[-1][3] = True
+        elif state.get(child) == 1:
+            frames[-1][3] = True
+        elif state.get(child) == 2:
+            if memo[child]:
+                frames[-1][3] = True
+        else:
+            parent = frames[-1]
+            push(child)
+            if state.get(child) == 2 and memo[child]:
+                parent[3] = True
+
+    return memo[root]
+
+
+def type_is_top_level_reference(type_expression, aliases):
+    """Whether this value is itself a reference, including through simple aliases."""
+    pending = [type_expression]
+    visited = set()
+    while pending:
+        expression = pending.pop().strip()
+        while expression.startswith("(") and matching_delimiter(expression, 0) == len(expression) - 1:
+            expression = expression[1:-1].strip()
+        while expression.endswith("?"):
+            expression = expression[:-1].rstrip()
+        if "&" in expression or re.search(r"\blmut\b", expression):
+            return True
+        expression = re.sub(r"^(?:(?:mutable|static|heap|stack)\s+)+", "", expression)
+        if not re.fullmatch(r"(?:\w+::)*\w+", expression):
+            continue
+        name = expression.rsplit("::", 1)[-1]
+        if name in visited:
+            return True
+        visited.add(name)
+        pending.extend(aliases.get(name, ()))
+    return False
+
+
+def is_detached_copy_value(type_expression, aliases, structs):
+    """A by-value copy with no mutable owner alias and no top-level borrow."""
+    return bool(
+        type_expression
+        and type_is_copy_value(type_expression, aliases, structs)
+        and not type_may_contain_mutable_alias(type_expression, aliases, structs)
+        and not type_is_top_level_reference(type_expression, aliases)
+    )
+
+
+def mutable_cast_source_names(parameters, text, aliases, structs, additional_sources=()):
+    """Names whose reference/view-derived storage may reach a mutable pointer cast."""
+    names = {
+        name for name in additional_sources
+        if re.search(r"\b" + re.escape(name) + r"\b", text)
+    }
+    for formal in split_top_level_arguments(parameters):
+        match = re.match(r"\s*(\w+)\s*:\s*(.+?)\s*(?:=(?!=).*)?$", formal)
+        if match:
+            formal_type = match.group(2)
+            if (
+                re.search(r"\b(?:mutable|lmut)\b|&", formal_type)
+                or type_may_contain_reference(formal_type, aliases, structs)
+            ):
+                names.add(match.group(1))
+    typed_local = re.compile(
+        r"^[ \t]*(\w+)[ \t]*:[ \t]*(.+?)[ \t]*(?:<-|=(?!=))",
+        re.MULTILINE,
+    )
+    for match in typed_local.finditer(text):
+        local_type = match.group(2).strip()
+        if (
+            re.search(r"\b(?:mutable|lmut)\b|&", local_type)
+            or type_may_contain_reference(local_type, aliases, structs)
+        ):
+            names.add(match.group(1))
+    assignment = re.compile(
+        r"^[ \t]*(\w+)[ \t]*(?::[^=\n]+)?[ \t]*(?:<-|=(?!=))[ \t]*(.*?)[ \t]*$",
+        re.MULTILINE,
+    )
+    changed = True
+    while changed:
+        changed = False
+        for match in assignment.finditer(text):
+            target, value = match.groups()
+            if target not in names and any(
+                re.search(r"\b" + re.escape(source) + r"\b", value) for source in names
+            ):
+                names.add(target)
+                changed = True
+    return names
+
+
 def local_table_field_aliases(text, tables, table_field_types, type_aliases, struct_field_types):
     """Track simple local aliases of SymbolTable fields for mutation checks at callsites."""
     if not tables:
@@ -1324,6 +1528,91 @@ def type_equivalents(type_expression, aliases):
     return found
 
 
+def receiver_dispatch_type_key(type_expression):
+    """Normalize the outer borrow/region spelling for receiver dispatch matching."""
+    expression = type_expression.strip()
+    while expression.startswith("(") and matching_delimiter(expression, 0) == len(expression) - 1:
+        expression = expression[1:-1].strip()
+    expression = re.sub(
+        r"^(?:(?:mutable|lmut|static|heap|stack)\s+)+", "", expression
+    )
+    # Regions affect the lifetime of a borrow, not the receiver's nominal type.
+    expression = re.sub(r"\s+@[A-Za-z_]\w*", "", expression)
+    expression = re.sub(r"\s+", "", expression)
+    while expression.endswith("&"):
+        expression = expression[:-1]
+    return expression
+
+
+def receiver_dispatch_type_equivalents(type_expression, aliases):
+    """Resolve only unambiguous aliases while retaining generic receiver spellings."""
+    first = receiver_dispatch_type_key(type_expression)
+    if not first:
+        return set()
+    found, pending = set(), [first]
+    while pending:
+        spelling = pending.pop()
+        if not spelling:
+            continue
+        is_simple_name = re.fullmatch(r"(?:\w+::)*\w+", spelling)
+        if not is_simple_name:
+            found.add(spelling)
+            continue
+        alias_name = spelling.rsplit("::", 1)[-1]
+        targets = {
+            receiver_dispatch_type_key(candidate)
+            for candidate in aliases.get(alias_name, ())
+        }
+        targets.discard("")
+        # An ambiguous unqualified alias is not enough evidence to identify the
+        # receiver type. Do not retain its spelling as a match either: the same
+        # ambiguous alias on both sides does not prove a source dispatch.
+        if len(targets) == 1:
+            found.add(spelling)
+            pending.extend(targets - found)
+        elif len(targets) > 1 and "::" not in spelling:
+            continue
+        else:
+            found.add(spelling)
+    return found
+
+
+def receiver_method_has_source_dispatch(
+    receiver, callee, text, tables, table_field_types, aliases, structs, definitions,
+):
+    """Whether a parsed source function's first formal matches this receiver type.
+
+    A name-only match is insufficient: a method from elisacore_std may share its
+    name with an unrelated free function in src.  Source methods use their
+    receiver as the first formal, so require a statically known matching type.
+    """
+    receiver_type = receiver_expression_type(
+        receiver, text, tables, table_field_types, aliases, structs, definitions
+    )
+    receiver_types = receiver_dispatch_type_equivalents(receiver_type, aliases)
+    if not receiver_types:
+        return False
+    for candidate in definitions.get(callee, ()):
+        if candidate.get("external"):
+            continue
+        formals = split_top_level_arguments(candidate.get("params", ""))
+        if not formals:
+            continue
+        formal = formals[0].split(":", 1)
+        if len(formal) != 2:
+            continue
+        formal_type = re.split(r"\s*=(?!=)", formal[1], maxsplit=1)[0].strip()
+        formal_types = receiver_dispatch_type_equivalents(formal_type, aliases)
+        if receiver_types & formal_types:
+            return True
+    return False
+
+
+def receiver_is_static_owner(receiver):
+    """Recognize the type-style `Type.method(...)` qualifier used for static calls."""
+    return bool(re.fullmatch(r"[A-Z]\w*(?:\.[A-Z]\w*)*", receiver.strip()))
+
+
 def matching_cast_candidate_indexes(candidates, source_type, target_type, aliases):
     """Match scalar cast hooks by source and target type; unknown signatures fail closed."""
     source_names = type_equivalents(source_type, aliases)
@@ -1668,7 +1957,7 @@ def argument_global_names(argument, globals_, aliases):
 
 def call_may_mutate_table_field(
     arguments, candidates, tables, aliases, table_field_types=None, type_aliases=None,
-    struct_field_types=None, allow_copied_values=False, builtin_value_push=False,
+    struct_field_types=None, allow_copied_values=False, builtin_value_push=False, text="",
 ):
     """Conservatively match tainted actuals to mutable formals across overloads."""
     table_field_types = table_field_types or {}
@@ -1678,12 +1967,34 @@ def call_may_mutate_table_field(
     tainted = []
     for index, argument in enumerate(arguments):
         is_tainted = argument_is_table_field_or_alias(argument, tables, aliases)
+        if is_tainted:
+            table_names = "(?:" + "|".join(sorted(map(re.escape, tables))) + ")" if tables else r"(?!)"
+            direct_table_path = bool(re.search(
+                r"\b" + table_names + r"\s*(?:\.\s*\w+|\[[^\]\n]*\])", argument
+            ))
+            if not direct_table_path:
+                local_expression = argument.strip()
+                while True:
+                    if local_expression.startswith("&"):
+                        local_expression = local_expression[1:].strip()
+                    elif local_expression.startswith("(") and matching_delimiter(local_expression, 0) == len(local_expression) - 1:
+                        local_expression = local_expression[1:-1].strip()
+                    else:
+                        break
+                value_type = local_path_expression_type(
+                    local_expression, text, struct_field_types
+                ) if text else ""
+                if is_detached_copy_value(value_type, type_aliases, struct_field_types):
+                    # The local owns this Copy value. Immutable views inside it may
+                    # still alias table text, but a mutable formal can only modify
+                    # the local descriptor; mutable owner containers remain tainted.
+                    is_tainted = False
         if is_tainted and allow_copied_values:
             value_type = table_field_expression_type(
                 argument, tables, table_field_types, type_aliases, struct_field_types
             )
             formal_is_by_value = bool(candidates) and index not in possibly_mutable
-            if value_type and type_is_copy_value(value_type, type_aliases, struct_field_types) and (
+            if is_detached_copy_value(value_type, type_aliases, struct_field_types) and (
                 formal_is_by_value or builtin_value_push
             ):
                 is_tainted = False
@@ -1726,6 +2037,11 @@ def analyze(
                     if m.group(1) != "diagnostics":
                         writes.add(m.group(1))
                 for m in re.finditer(r"\bin\s+" + te + r"\.(\w+)(?:(?:\.\w+)|(?:\[[^\]\n]*\]))*\s*:", text):
+                    line_start = text.rfind("\n", 0, m.start()) + 1
+                    # Iterating over a table field is read-only. The assignment
+                    # form guarded here is a region entry, not `for x in field:`.
+                    if re.search(r"\bfor\b[^:\n]*$", text[line_start:m.start()]):
+                        continue
                     if m.group(1) != "diagnostics":
                         writes.add("in:" + m.group(1))
                 if re.search(r"&\s*(?:\(\s*)*" + te + r"\b(?!\s*\.)", code_text):
@@ -1854,6 +2170,45 @@ def analyze(
                     writes.add("global-alias:" + alias)
             for site in ast_constructions(text):
                 writes.add("ast:" + site)
+            # A mutable-reference cast can turn an otherwise immutable view into
+            # a write-capable pointer. Keep it out of the append-only closure even
+            # when the view arrives inside a copied record from a caller.
+            mutable_cast_sources = mutable_cast_source_names(
+                d["params"], code_text, type_aliases, struct_field_types, globals_
+            )
+            cast_targets = re.compile(r"\.\s*cast\s*\[(?P<target>[^\]\n]+)\]")
+            parsed_casts = {
+                cast.start("target"): cast
+                for cast in MUTABLE_POINTER_CAST_RE.finditer(code_text)
+            }
+            for cast in cast_targets.finditer(code_text):
+                target_type = cast.group("target").strip()
+                if type_expression_is_mutable_ref(target_type, type_aliases):
+                    # The target alone proves the cast creates write capability. Do not
+                    # depend on recognizing a field, index, or method-call receiver.
+                    writes.add("mutable-view-pointer-cast")
+                    break
+                if is_builtin_scalar_type(target_type, type_aliases):
+                    continue
+                parsed = parsed_casts.get(cast.start("target"))
+                if parsed is not None and parsed.group("root") in mutable_cast_sources:
+                    writes.add("mutable-view-pointer-cast")
+                    break
+                line_start = code_text.rfind("\n", 0, cast.start()) + 1
+                receiver_text = code_text[line_start:cast.start()]
+                assignment = re.search(r"(?:<-|(?<![=!<>])=(?!=))", receiver_text)
+                if assignment is not None:
+                    receiver_text = receiver_text[assignment.end():]
+                if any(
+                    re.search(r"\b" + re.escape(source) + r"\b", receiver_text)
+                    for source in mutable_cast_sources
+                ) or (parsed is None and mutable_cast_sources):
+                    # Complex call/index receivers are intentionally not parsed here.
+                    # If one contains a known shared or reference-bearing source, or
+                    # cannot be parsed at all in a function with such a source, fail
+                    # closed instead of missing an alias hidden behind the call.
+                    writes.add("mutable-view-pointer-cast")
+                    break
             # A local diagnostics alias can be inspected or can replace/clear diagnostics
             # from earlier sequential passes. Treat any such alias as a dependency on the
             # accumulated diagnostics stream instead of trying to infer its use mode.
@@ -1879,6 +2234,11 @@ def analyze(
                 # can be cast and escape even though the local itself was not borrowed with `&`.
                 if re.search(cast_source + r"\s*\.\s*cast\s*\[", code_text):
                     writes.add("table-backed-address-cast")
+                alias_type = local_path_expression_type(alias, text, struct_field_types)
+                if is_detached_copy_value(alias_type, type_aliases, struct_field_types):
+                    # Keep the address-escape check above, but mutations and borrows
+                    # of a detached local copy cannot write through to its table source.
+                    continue
                 alias_path = r"\b" + ae + alias_part + r"*"
                 if alias in borrowed_field_aliases and re.search(r"\b" + ae + r"\s*<-", text):
                     writes.add("alias:" + alias)
@@ -1890,7 +2250,26 @@ def analyze(
                     writes.add("alias:" + alias)
             for m in CALL_RE.finditer(code_text):
                 callee = m.group(1)
-                if callee in defs and callee != name:
+                receiver = receiver_before_call(code_text, m.start())
+                source_receiver_dispatch = bool(
+                    receiver
+                    and not receiver_is_static_owner(receiver)
+                    and receiver_method_has_source_dispatch(
+                        receiver,
+                        callee,
+                        text,
+                        tables,
+                        table_field_types,
+                        type_aliases,
+                        struct_field_types,
+                        defs,
+                    )
+                )
+                if (
+                    callee in defs
+                    and callee != name
+                    and (receiver is None or receiver_is_static_owner(receiver) or source_receiver_dispatch)
+                ):
                     callees.add(callee)
                 if any(candidate.get("external") for candidate in defs.get(callee, ())):
                     writes.add("external-call:" + callee)
@@ -1966,13 +2345,24 @@ def analyze(
                         # cannot expose a mutable table alias. Exact __cast__ overloads
                         # were handled above using their selected-effect summaries.
                         handled_cast_sites.add((callee, receiver))
-                elif (
+                if (
                     receiver is not None
+                    and (callee, receiver) not in handled_cast_sites
                     and callee not in NON_CALL_KEYWORDS
-                    and not defs.get(callee)
                     and not (
                         callee == "push"
                         and is_diagnostics_receiver(receiver, tables, diagnostic_aliases)
+                    )
+                    and not (receiver_is_static_owner(receiver) and defs.get(callee))
+                    and not receiver_method_has_source_dispatch(
+                        receiver,
+                        callee,
+                        text,
+                        tables,
+                        table_field_types,
+                        type_aliases,
+                        struct_field_types,
+                        defs,
                     )
                     and not receiver_method_is_known_intrinsic(
                         receiver,
@@ -2080,6 +2470,7 @@ def analyze(
                         table_field_types,
                         type_aliases,
                         struct_field_types,
+                        text=text,
                         allow_copied_values=bool(
                             receiver and not table_receiver and callee == "push"
                         ),
@@ -2153,7 +2544,7 @@ def pipeline_statements():
     """(line index, indent, pass name, args, cond) for each `table <- pass(...)` statement in
     check_full_into_pipeline, plus the function's parameter names."""
     lines = open(API, encoding="utf-8").read().split("\n")
-    start = next(i for i, l in enumerate(lines) if re.match(r"\s*def " + PIPELINE + r"\(", l))
+    start = next(i for i, l in enumerate(lines) if re.match(r"\s*def " + PIPELINE + r"(?:\[[^\]]*\])?\(", l))
     params = [p.split(":")[0].strip() for p in DEF_RE.match(lines[start]).group(3).split(",")]
     indent = len(lines[start]) - len(lines[start].lstrip())
     end = start + 1
@@ -2333,7 +2724,7 @@ def emit(info):
             pass_id += 1
         head = run[0]
         new = [head["indent"] + "# Append-only passes %d..%d, run concurrently (semantic_parallel.elisa)." % (first, pass_id - 1),
-               head["indent"] + "table <- par_pass_run(file, &loop_view, flags, table, shared_pool, %d, %d)" % (first, len(run)),
+               head["indent"] + "table <- par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], %d, %d)" % (first, len(run)),
                head["indent"] + 'PhaseTimer::minor("sem:par_run_%d")' % k]
         for s in run:
             out[s["line"]] = None
@@ -2343,13 +2734,161 @@ def emit(info):
     view_line = next(i for i in range(start, end) if re.match(r"\s*loop_view: Ast::File = ", lines[i]))
     view_indent = lines[view_line][:len(lines[view_line]) - len(lines[view_line].lstrip())]
     fields = ", ".join("%s: %s" % (f, f) for f in flags)
-    out[view_line] = [lines[view_line], view_indent + "flags: ParPassFlags = ParPassFlags{%s}" % fields]
+    scratch_line = next((i for i in range(start, end)
+                         if re.match(r"\s*\w+:\s*mutable darray\[ParPassScratch\[", lines[i])), None)
+    if scratch_line is None:
+        scratch_name = "pass_scratch_slots"
+        scratch_init = (view_indent + "pass_scratch_slots: mutable darray[ParPassScratch[pool]] @pool = "
+                        "[ParPassScratch[pool]{loop_view: loop_view}]")
+        out[view_line] = [lines[view_line], scratch_init,
+                          view_indent + "flags: ParPassFlags = ParPassFlags{%s}" % fields]
+    else:
+        out[view_line] = [lines[view_line], view_indent + "flags: ParPassFlags = ParPassFlags{%s}" % fields]
     flat = []
     for item in out:
         if item is None:
             continue
         flat.extend(item if isinstance(item, list) else [item])
     return flat, flags, calls, runs
+
+
+PARALLEL_GATE_BEGIN = "        # BEGIN GENERATED APPEND-ONLY GATE"
+PARALLEL_GATE_END = "        # END GENERATED APPEND-ONLY GATE"
+
+
+def parallel_safety_gate_source(safe_ids):
+    """Emit a fail-closed whitelist for pass IDs proven safe by the source audit."""
+    ids = sorted(set(safe_ids))
+    lines = [PARALLEL_GATE_BEGIN,
+             "        def par_pass_is_append_only(pass_id: u32) -> bool:"]
+    ranges = []
+    for pass_id in ids:
+        if ranges and pass_id == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], pass_id)
+        else:
+            ranges.append((pass_id, pass_id))
+    for first, last in ranges:
+        if first == last:
+            condition = "pass_id == %d" % first
+        elif first == 0:
+            condition = "pass_id <= %d" % last
+        else:
+            condition = "pass_id >= %d and pass_id <= %d" % (first, last)
+        lines.append("            return true if " + condition)
+    lines.append("            return false")
+    lines.append(PARALLEL_GATE_END)
+    return "\n".join(lines)
+
+
+def refresh_parallel_safety_gate(source, safe_ids):
+    """Replace or append the audit-generated pass-ID whitelist in the dispatcher."""
+    start = source.find(PARALLEL_GATE_BEGIN)
+    end = source.find(PARALLEL_GATE_END)
+    generated = parallel_safety_gate_source(safe_ids)
+    if start < 0 and end < 0:
+        return source.rstrip() + "\n\n" + generated + "\n"
+    if start < 0 or end < start or source.find(PARALLEL_GATE_BEGIN, start + 1) >= 0:
+        raise ValueError("malformed generated append-only gate markers")
+    end += len(PARALLEL_GATE_END)
+    return source[:start] + generated + source[end:]
+
+
+def parallel_safety_gate_errors(source, safe_ids):
+    """Require the generated whitelist to exactly match the append-only audit."""
+    start = source.find(PARALLEL_GATE_BEGIN)
+    end = source.find(PARALLEL_GATE_END)
+    if start < 0 or end < start or source.find(PARALLEL_GATE_BEGIN, start + 1) >= 0:
+        return ["semantic_parallel_passes.elisa: missing or malformed generated append-only gate"]
+    actual = source[start:end + len(PARALLEL_GATE_END)].strip()
+    expected = parallel_safety_gate_source(safe_ids).strip()
+    if actual != expected:
+        return ["semantic_parallel_passes.elisa: append-only ID gate does not exactly match the audited dispatcher"]
+    return []
+
+
+def parallel_runtime_serial_guard_errors(source):
+    """Check unsafe pass IDs take the ordered dispatcher path before any worker submits."""
+    lines = source.splitlines()
+    start = next((index for index, line in enumerate(lines)
+                  if re.match(r"^[ \t]*def par_pass_run\[", line)), None)
+    if start is None:
+        return ["semantic_parallel.elisa: missing par_pass_run"]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= indent:
+            break
+        end += 1
+    body_lines = lines[start:end]
+    body = "\n".join(body_lines)
+    errors = []
+    def find_line(pattern, after=0):
+        return next((index for index in range(after, len(body_lines))
+                     if re.search(pattern, body_lines[index])), None)
+
+    def line_indent(index):
+        line = body_lines[index]
+        return len(line) - len(line.lstrip())
+
+    def next_code_line(index):
+        return next((candidate for candidate in range(index + 1, len(body_lines))
+                     if body_lines[candidate].strip()
+                     and not body_lines[candidate].lstrip().startswith("#")), None)
+
+    gate = find_line(r"if not par_pass_is_append_only\(first\s*\+\s*offset\):")
+    gate_assignment = find_line(r"unsafe_pass\s*<-\s*true", gate + 1 if gate is not None else 0)
+    gate_loop = next((index for index in range(gate - 1, -1, -1)
+                      if re.search(r"for offset in 0\.\.<count:", body_lines[index])), None) if gate is not None else None
+    serial = find_line(r"if count < 2 or shared_pool\.handle == null or unsafe_pass:")
+    serial_loop = find_line(r"for offset in 0\.\.<count", serial + 1 if serial is not None else 0)
+    call = find_line(
+        r"table <- par_pass_call\(first\s*\+\s*offset, file, scratch\.loop_view, flags, table\)",
+        serial_loop + 1 if serial_loop is not None else 0,
+    )
+    return_line = find_line(r"^\s*return\s*$", call + 1 if call is not None else 0)
+    worker = find_line(r"nursery on\(shared_pool\):")
+    region = find_line(r"region par_pass_jobs_region:")
+    jobs = find_line(r"jobs: mutable darray\[ParPassJob\] @par_pass_jobs_region = \[\]")
+    initialization = find_line(r"^\s*unsafe_pass: mutable\s+bool = false\s*$")
+    if None in (
+        gate, gate_assignment, gate_loop, serial, serial_loop, call, return_line,
+        worker, region, jobs, initialization,
+    ):
+        errors.append("semantic_parallel.elisa: unsafe pass IDs or batch-local job storage are not guarded by the serial dispatcher path")
+    else:
+        base_indent = line_indent(initialization)
+        ordered = initialization < gate_loop < gate < gate_assignment < serial < serial_loop < call < return_line < region < jobs < worker
+        expected_indents = {
+            initialization: base_indent,
+            gate_loop: base_indent,
+            gate: base_indent + 4,
+            gate_assignment: base_indent + 8,
+            serial: base_indent,
+            serial_loop: base_indent + 4,
+            call: base_indent + 8,
+            return_line: base_indent + 4,
+            region: base_indent,
+            jobs: base_indent + 4,
+            worker: base_indent + 4,
+        }
+        if not ordered:
+            errors.append("semantic_parallel.elisa: serial dispatcher must return before worker submission")
+        elif any(line_indent(index) != expected for index, expected in expected_indents.items()):
+            errors.append("semantic_parallel.elisa: serial gate, loop, and return indentation bypasses the unsafe-pass branch")
+        elif any(next_code_line(parent) != child for parent, child in (
+            (initialization, gate_loop),
+            (gate_loop, gate),
+            (gate, gate_assignment),
+            (gate_assignment, serial),
+            (serial, serial_loop),
+            (serial_loop, call),
+            (call, return_line),
+            (return_line, region),
+            (region, jobs),
+        )):
+            errors.append("semantic_parallel.elisa: serial guard statements are not nested under their required parent branches")
+    return errors
 
 
 def passes_source(flags, calls, max_batch):
@@ -2382,6 +2921,7 @@ extend Semantic:
         kw = "if" if n == 0 else "elif"
         body.append("                %s pass_id == %d:" % (kw, pid))
         body.append("                    table <- %s(%s)%s" % (s["name"], args, (" " + suffix) if suffix else ""))
+    body.extend(["", parallel_safety_gate_source(pid for pid, _statement in calls)])
     return head + "\n".join(body) + "\n"
 
 
@@ -2431,6 +2971,7 @@ def generated_parallel_errors(info):
     lines, start, end, _params = pipeline_statements()
     _lines, _flags, _stmts, sequential_runs = plan_runs(info)
     pipeline_calls, _pipeline_malformed = par_run_calls(lines[start:end], start)
+    errors.extend(pipeline_scratch_errors(lines, start, end, pipeline_calls))
     if has_mixed_generated_and_sequential_runs(lines, start, end, sequential_runs):
         errors.append("semantic_api.elisa: mixed generated batches and sequential eligible runs; regenerate from a fully sequential pipeline")
     pipeline_line_numbers = set(range(start, end))
@@ -2440,7 +2981,7 @@ def generated_parallel_errors(info):
     if not pipeline_calls:
         errors.append("semantic_api.elisa: no generated par_pass_run calls found")
     if any(call["match"].group(3) is None for call in pipeline_calls):
-        errors.append("semantic_api.elisa: generated par_pass_run call is missing shared_pool")
+        errors.append("semantic_api.elisa: generated par_pass_run call is missing pool-owned scratch storage")
     if any(call["match"].group(2) is None for call in pipeline_calls):
         errors.append("semantic_api.elisa: par_pass_run calls must explicitly update the lmut table")
     counts = [call["count"] for call in pipeline_calls]
@@ -2474,6 +3015,12 @@ def generated_parallel_errors(info):
     for record in dispatch:
         if not record["name"] or not record["args"].strip():
             errors.append("semantic_parallel_passes.elisa: incomplete dispatcher mapping for pass_id %d" % record["id"])
+    safe_ids = {
+        record["id"] for record in dispatch
+        if append_only(info, record["name"])[0]
+    }
+    errors.extend(parallel_safety_gate_errors(passes, safe_ids))
+    errors.extend(parallel_runtime_serial_guard_errors(parallel))
 
     _lines, _start, _end, params = pipeline_statements()
     expected_flags = [p for p in params if p not in PIPELINE_CONTEXT]
@@ -2485,8 +3032,36 @@ def generated_parallel_errors(info):
     initialized_flags = re.findall(r"\b(\w+):", flag_init.group(1)) if flag_init else []
     if initialized_flags != expected_flags:
         errors.append("semantic_api.elisa: ParPassFlags initializer does not match pipeline scalar flags")
-    if not re.search(r"def par_pass_run\[@pool\]\([^\n]*shared_pool: mutable ThreadPool& @pool", parallel):
+    if not re.search(r"def par_pass_run\[[^\]]*@pool[^\]]*\]\([^\n]*shared_pool: mutable ThreadPool& @pool, scratch: mutable ParPassScratch\[pool\]& @pool", parallel):
         errors.append("semantic_parallel.elisa: par_pass_run must borrow the shared pool in the caller's region")
+    return errors
+
+
+def pipeline_scratch_errors(lines, start, end, calls):
+    """Check that every generated worker call uses the initialized pool scratch slot."""
+    scratch_decl_re = re.compile(
+        r"^[ \t]*(\w+):[ \t]*mutable darray\[ParPassScratch\[pool\]\][ \t]*@pool[ \t]*=[ \t]*"
+        r"\[[ \t]*ParPassScratch\[pool\]\{[ \t]*loop_view:[ \t]*loop_view[ \t]*\}[ \t]*\][ \t]*$"
+    )
+    declarations = []
+    for line_number in range(start, end):
+        match = scratch_decl_re.fullmatch(lines[line_number])
+        if match:
+            declarations.append((line_number, match.group(1)))
+    if len(declarations) != 1:
+        return ["semantic_api.elisa: check_full_into_pipeline must initialize exactly one pool-owned ParPassScratch slot"]
+
+    declaration_line, slot_name = declarations[0]
+    errors = []
+    for call in calls:
+        expression = call["match"].group(3) or ""
+        slot = re.fullmatch(r"&([A-Za-z_]\w*)\[0\]", expression)
+        if slot is None:
+            errors.append("semantic_api.elisa:%d: par_pass_run must borrow the initialized scratch slot at index 0" % (call["line"] + 1))
+        elif slot.group(1) != slot_name:
+            errors.append("semantic_api.elisa:%d: par_pass_run references a different scratch slot than the initialized one" % (call["line"] + 1))
+        elif call["line"] <= declaration_line:
+            errors.append("semantic_api.elisa:%d: scratch slot must be initialized before par_pass_run" % (call["line"] + 1))
     return errors
 
 
@@ -2509,10 +3084,6 @@ def main(argv):
     if mode == "--check":
         bad = []
         bad.extend(generated_parallel_errors(info))
-        for name in listed_passes():
-            ok, writes, reads = append_only(info, name)
-            if not ok:
-                bad.append("%s: writes %s%s" % (name, sorted(writes), " reads diagnostics" if reads else ""))
         if bad:
             print("semantic_parallel_gen: passes run concurrently that are NOT append-only:")
             for b in bad:
@@ -2524,7 +3095,11 @@ def main(argv):
         except AssertionError as error:
             print("semantic_parallel_gen: " + str(error))
             return 1
-        print("semantic_parallel_gen: %d concurrent passes, all append-only" % len(listed_passes()))
+        dispatch, _errors = parse_parallel_dispatch(open(PASSES, encoding="utf-8").read())
+        safe_count = sum(append_only(info, record["name"])[0] for record in dispatch)
+        print("semantic_parallel_gen: %d passes audited; %d parallel-eligible, %d serialized" % (
+            len(dispatch), safe_count, len(dispatch) - safe_count
+        ))
         return 0
     if mode == "--report":
         _lines, _flags, stmts, runs = plan_runs(info)
@@ -2545,12 +3120,23 @@ def main(argv):
         generated_counts = [int(m.group(5)) for line in flat for m in [PAR_RUN_RE.search(line)] if m]
         if calls or not generated_counts:
             max_batch = max((len(run) for run in runs), default=1)
-            open(PASSES, "w", encoding="utf-8").write(passes_source(flags, calls, max_batch))
+            pass_source = passes_source(flags, calls, max_batch)
+            open(PASSES, "w", encoding="utf-8").write(pass_source)
         else:
             max_batch = max(generated_counts)
             current = open(PASSES, encoding="utf-8").read()
             current = refresh_max_batch(current, max_batch)
-            open(PASSES, "w", encoding="utf-8").write(refresh_pass_flags(current, flags))
+            current = refresh_pass_flags(current, flags)
+            dispatch, dispatch_errors = parse_parallel_dispatch(current)
+            if dispatch_errors:
+                print("semantic_parallel_gen: refusing --write: " + "; ".join(dispatch_errors))
+                return 1
+            safe_ids = {
+                record["id"] for record in dispatch
+                if append_only(info, record["name"])[0]
+            }
+            current = refresh_parallel_safety_gate(current, safe_ids)
+            open(PASSES, "w", encoding="utf-8").write(current)
         print("semantic_parallel_gen: %d runs, %d passes; flags %s" % (len(runs), len(calls), flags))
         return 0
     print(__doc__)

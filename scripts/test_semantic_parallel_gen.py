@@ -8,6 +8,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import semantic_parallel_gen as audit
+import semantic_parallel_diagnostic_audit as diagnostic_audit
 
 
 TABLE_FIELD_TYPES = {
@@ -46,9 +47,85 @@ def analyze(
 
 
 class SemanticParallelAuditTest(unittest.TestCase):
+    def test_diagnostic_ownership_audit_normalizes_region_annotated_views(self):
+        self.assertEqual(
+            diagnostic_audit.diagnostic_payload_base_type("sview @source"), "sview"
+        )
+        self.assertEqual(
+            diagnostic_audit.diagnostic_payload_base_type("mutable sview @source"),
+            "sview",
+        )
+
+    def test_parallel_gate_requires_exact_safe_id_mapping(self):
+        gate = audit.parallel_safety_gate_source({1, 4, 9})
+        self.assertEqual(audit.parallel_safety_gate_errors(gate, {1, 4, 9}), [])
+        self.assertTrue(audit.parallel_safety_gate_errors(gate, {1, 4, 8}))
+
+    def test_parallel_gate_compacts_ranges_without_admitting_gaps(self):
+        ids = {0, 1, 2, 4, 6, 7, 8}
+        gate = audit.parallel_safety_gate_source(ids)
+        self.assertIn("return true if pass_id <= 2", gate)
+        self.assertIn("return true if pass_id == 4", gate)
+        self.assertIn("return true if pass_id >= 6 and pass_id <= 8", gate)
+        conditions = re.findall(r"return true if (.+)", gate)
+        for pass_id in [*range(12), 255, 2**32 - 1]:
+            admitted = any(eval(condition, {"__builtins__": {}}, {"pass_id": pass_id})
+                           for condition in conditions)
+            self.assertEqual(admitted, pass_id in ids)
+        empty = audit.parallel_safety_gate_source(set())
+        self.assertNotIn("return true", empty)
+
+    def test_parallel_runtime_gate_must_precede_worker_submission(self):
+        runtime = (
+            "        def par_pass_run[pool](first: u32, count: u32):\n"
+            "            unsafe_pass: mutable bool = false\n"
+            "            for offset in 0..<count:\n"
+            "                if not par_pass_is_append_only(first + offset):\n"
+            "                    unsafe_pass <- true\n"
+            "            if count < 2 or shared_pool.handle == null or unsafe_pass:\n"
+            "                for offset in 0..<count:\n"
+            "                    table <- par_pass_call(first + offset, file, scratch.loop_view, flags, table)\n"
+            "                return\n"
+            "            region par_pass_jobs_region:\n"
+            "                jobs: mutable darray[ParPassJob] @par_pass_jobs_region = []\n"
+            "                nursery on(shared_pool):\n"
+            "                    submit par_pass_worker(ticket)\n"
+        )
+        self.assertEqual(audit.parallel_runtime_serial_guard_errors(runtime), [])
+        immutable_guard = runtime.replace(
+            "unsafe_pass: mutable bool = false",
+            "unsafe_pass: bool = false",
+        )
+        self.assertTrue(audit.parallel_runtime_serial_guard_errors(immutable_guard))
+        bypassed = runtime.replace("or unsafe_pass:", "or false:")
+        self.assertTrue(audit.parallel_runtime_serial_guard_errors(bypassed))
+        late_gate = runtime.replace(
+            "                if not par_pass_is_append_only(first + offset):\n"
+            "                    unsafe_pass <- true\n",
+            "",
+        ).replace(
+            "                nursery on(shared_pool):\n",
+            "                nursery on(shared_pool):\n"
+            "                    if not par_pass_is_append_only(first + offset):\n"
+            "                        unsafe_pass <- true\n",
+        )
+        self.assertTrue(audit.parallel_runtime_serial_guard_errors(late_gate))
+        dedented_fallback = runtime.replace(
+            "                for offset in 0..<count:\n",
+            "            for offset in 0..<count:\n",
+        )
+        self.assertTrue(audit.parallel_runtime_serial_guard_errors(dedented_fallback))
+        sibling_mutation = runtime.replace(
+            "                    unsafe_pass <- true\n",
+            "                        pass\n"
+            "                if unrelated_condition:\n"
+            "                    unsafe_pass <- true\n",
+        )
+        self.assertTrue(audit.parallel_runtime_serial_guard_errors(sibling_mutation))
+
     def test_generated_parallel_call_uses_explicit_lmut_update(self):
         line = (
-            "        table <- par_pass_run(file, &loop_view, flags, table, shared_pool, 35, 8) "
+            "        table <- par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], 35, 8) "
             "can Global{Read,Write}"
         )
         calls, errors = audit.par_run_calls([line])
@@ -62,7 +139,7 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
     def test_bare_parallel_call_normalizes_to_explicit_lmut_update(self):
         line = (
-            "        par_pass_run(file, &loop_view, flags, table, shared_pool, 35, 8) "
+            "        par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], 35, 8) "
             "can Global{Read,Write}"
         )
         calls, errors = audit.par_run_calls([line])
@@ -74,9 +151,39 @@ class SemanticParallelAuditTest(unittest.TestCase):
         self.assertIsNotNone(calls[0]["match"].group(3))
         self.assertEqual(
             audit.normalized_par_run_line(line, calls[0]["match"]),
-            "        table <- par_pass_run(file, &loop_view, flags, table, shared_pool, 35, 8) "
+            "        table <- par_pass_run(file, flags, table, shared_pool, &pass_scratch_slots[0], 35, 8) "
             "can Global{Read,Write}",
         )
+
+    def test_generated_parallel_call_requires_initialized_matching_scratch_slot(self):
+        declaration = (
+            "        pass_scratch_slots: mutable darray[ParPassScratch[pool]] @pool = "
+            "[ParPassScratch[pool]{loop_view: loop_view}]"
+        )
+        call = (
+            "        table <- par_pass_run(file, flags, table, shared_pool, "
+            "&pass_scratch_slots[0], 0, 2) can Global{Read,Write}"
+        )
+        lines = [declaration, call]
+        calls, malformed = audit.par_run_calls(lines)
+        self.assertEqual(malformed, [])
+        self.assertEqual(audit.pipeline_scratch_errors(lines, 0, len(lines), calls), [])
+
+        mismatched = [declaration, call.replace("pass_scratch_slots", "other_slots")]
+        mismatched_calls, malformed = audit.par_run_calls(mismatched)
+        self.assertEqual(malformed, [])
+        self.assertTrue(any(
+            "different scratch slot" in error
+            for error in audit.pipeline_scratch_errors(mismatched, 0, len(mismatched), mismatched_calls)
+        ))
+
+        uninitialized = [call]
+        uninitialized_calls, malformed = audit.par_run_calls(uninitialized)
+        self.assertEqual(malformed, [])
+        self.assertTrue(any(
+            "initialize exactly one" in error
+            for error in audit.pipeline_scratch_errors(uninitialized, 0, len(uninitialized), uninitialized_calls)
+        ))
 
     def test_dispatcher_accepts_single_update_inside_effect_scope(self):
         source = (
@@ -261,6 +368,88 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
         self.assertFalse(audit.append_only(info, "root")[0])
 
+    def test_unknown_receiver_method_name_collision_fails_closed(self):
+        info = analyze({
+            # This free function is unrelated to ExternalObject.inspect.  Its
+            # name alone must not make the receiver call look source-resolved.
+            "inspect": [definition(
+                "value: i32",
+                "def inspect(value: i32):\n"
+                "    return\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable, object: ExternalObject",
+                "def root(table: lmut SymbolTable, object: ExternalObject):\n"
+                "    object.inspect()\n",
+            )],
+        })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+        self.assertNotIn("inspect", info["root"][2])
+
+    def test_receiver_method_with_matching_source_first_formal_is_resolved(self):
+        info = analyze({
+            "inspect": [definition(
+                "object: LocalObject&",
+                "def inspect(object: LocalObject&):\n"
+                "    return\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable, object: LocalObject",
+                "def root(table: lmut SymbolTable, object: LocalObject):\n"
+                "    object.inspect()\n",
+            )],
+        })
+
+        self.assertTrue(audit.append_only(info, "root")[0])
+
+    def test_ambiguous_receiver_alias_does_not_prove_source_dispatch(self):
+        info = analyze({
+            "inspect": [definition(
+                "object: Twin",
+                "def inspect(object: Twin):\n"
+                "    return\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable, object: Twin",
+                "def root(table: lmut SymbolTable, object: Twin):\n"
+                "    object.inspect()\n",
+            )],
+        }, type_aliases={"Twin": ["LocalObject", "OtherObject"]})
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertIn("unknown-receiver-call:inspect", writes)
+        self.assertNotIn("inspect", info["root"][2])
+
+    def test_static_type_qualified_source_call_stays_in_call_graph(self):
+        info = analyze({
+            "inspect": [definition(
+                "value: i32",
+                "def inspect(value: i32):\n"
+                "    return\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable, value: i32",
+                "def root(table: lmut SymbolTable, value: i32):\n"
+                "    Owner.inspect(value)\n",
+            )],
+        })
+
+        self.assertTrue(audit.append_only(info, "root")[0])
+        self.assertIn("inspect", info["root"][2])
+
+    def test_unknown_numeric_receiver_conversion_fails_closed(self):
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable, object: ExternalObject",
+                "def root(table: lmut SymbolTable, object: ExternalObject):\n"
+                "    object.i64()\n",
+            )],
+        })
+
+        self.assertFalse(audit.append_only(info, "root")[0])
+
     def test_nested_enum_pattern_is_not_an_unknown_receiver_method(self):
         info = analyze(
             {
@@ -273,6 +462,18 @@ class SemanticParallelAuditTest(unittest.TestCase):
             },
             enum_variants={"Stmt": {"Assign"}, "Expr": {"Ident"}},
         )
+
+        self.assertTrue(audit.append_only(info, "root")[0])
+
+    def test_guarded_match_variant_is_not_an_ast_construction(self):
+        info = analyze({
+            "root": [definition(
+                "",
+                "def root():\n"
+                "    match expression:\n"
+                "        Expr.Field(object, field, _) if field == \"count\": pass\n",
+            )],
+        }, enum_variants={"Expr": {"Field"}})
 
         self.assertTrue(audit.append_only(info, "root")[0])
 
@@ -312,6 +513,107 @@ class SemanticParallelAuditTest(unittest.TestCase):
             {"StructRoot": [{"field": "UnknownType"}]},
         ))
 
+    def test_mutable_alias_type_analysis_allows_views_but_fails_closed_on_storage_and_cycles(self):
+        self.assertFalse(audit.type_may_contain_mutable_alias("sview", {}, {}))
+        self.assertFalse(audit.type_may_contain_mutable_alias(
+            "ViewRecord", {}, {"ViewRecord": [{"name": "sview", "ordinal": "usize"}]}
+        ))
+        self.assertTrue(audit.type_may_contain_mutable_alias("darray[sview]", {}, {}))
+        self.assertTrue(audit.type_may_contain_mutable_alias(
+            "AliasA", {"AliasA": ["AliasB"], "AliasB": ["AliasA"]}, {}
+        ))
+        self.assertTrue(audit.type_may_contain_mutable_alias(
+            "RecordA", {}, {"RecordA": [{"next": "RecordB"}], "RecordB": [{"next": "RecordA"}]}
+        ))
+        # The parser indexes by terminal name across module scopes. A safe alias
+        # must not hide a same-named record that owns mutable storage.
+        aliases = {"Twin": ["i64"]}
+        structs = {"Twin": [{"buffer": "darray[u8]"}]}
+        self.assertFalse(audit.is_detached_copy_value("Twin", aliases, structs))
+
+    def test_mutable_call_on_local_copy_of_view_record_does_not_mutate_table_alias(self):
+        info = analyze({
+            "mutate_record": [definition(
+                "record: mutable ViewRecord&",
+                "def mutate_record(record: mutable ViewRecord&):\n"
+                "    pass\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    record: ViewRecord = table.view_record\n"
+                "    mutate_record(&record)\n",
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, view_record="ViewRecord"), struct_field_types={
+            "ViewRecord": [{"name": "sview", "ordinal": "usize"}],
+            "SymbolKind": [[]],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertTrue(append_only, writes)
+
+    def test_mutable_helper_raw_cast_from_copied_view_record_stays_rejected(self):
+        info = analyze({
+            "mutate_record": [definition(
+                "record: ViewRecord",
+                "def mutate_record(record: ViewRecord):\n"
+                "    name: sview = record.name\n"
+                "    raw: MutableBytes = name.data.cast[MutableBytes]\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    record: ViewRecord = table.view_record\n"
+                "    mutate_record(record)\n",
+            )],
+        }, table_field_types=dict(TABLE_FIELD_TYPES, view_record="ViewRecord"), struct_field_types={
+            "ViewRecord": [{"name": "sview", "ordinal": "usize"}],
+            "SymbolKind": [[]],
+        }, type_aliases={"MutableBytes": ["MutableByteAlias"], "MutableByteAlias": ["mutable u8&"]})
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertTrue(any("cast" in write for write in writes), writes)
+
+    def test_unresolved_cast_from_global_view_is_rejected(self):
+        info = analyze({
+            "root": [definition(
+                "",
+                "def root():\n"
+                "    raw: UnknownTarget = global_view.data.cast[UnknownTarget]\n",
+            )],
+        }, globals_={"global_view"})
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertTrue(any("cast" in write for write in writes), writes)
+
+    def test_mutable_cast_through_table_getter_receiver_is_rejected(self):
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    raw: UnknownTarget = table.get_view(key).data.cast[UnknownTarget]\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertFalse(append_only)
+        self.assertTrue(any("cast" in write for write in writes), writes)
+
+    def test_unrelated_unresolved_cast_is_not_attributed_to_reference_parameter(self):
+        info = analyze({
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    scratch: usize = 0\n"
+                "    raw: UnknownTarget = scratch.cast[UnknownTarget]\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertTrue(append_only, writes)
+
     def test_known_source_helper_mutating_table_field_is_rejected(self):
         info = analyze({
             "mutate_table": [definition(
@@ -327,6 +629,19 @@ class SemanticParallelAuditTest(unittest.TestCase):
         })
 
         self.assertFalse(audit.append_only(info, "root")[0])
+
+    def test_read_only_table_field_iteration_is_not_a_region_write(self):
+        info = analyze({
+            "root": [definition(
+                "table: SymbolTable&",
+                "def root(table: SymbolTable&):\n"
+                "    for symbol in table.symbols:\n"
+                "        pass\n",
+            )],
+        })
+
+        append_only, writes, _ = audit.append_only(info, "root")
+        self.assertTrue(append_only, writes)
 
     def test_explicit_table_field_reference_to_mutable_helper_is_rejected(self):
         info = analyze({
