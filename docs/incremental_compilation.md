@@ -943,18 +943,19 @@ This remains an unqualified private prototype, not a production query engine. Th
 session collector checks cached `SourceInput` and `FunctionBodyFacts` results. A body
 query reuse for an ordinary body is attempted only after the trusted prior snapshot
 proves an exact declaration surface, cacheable prior record, and exact body match.
-The `complete_empty_body` exception can reuse a graph query after the exact prior
-body match without trusted whole-surface admission. A body hit decodes canonical
-query bytes into the current request snapshot, validating each fact against the
+The `complete_empty_body` exception and a successfully scanned prior zero-fact
+record can reuse a graph query after the exact body match without trusted
+whole-surface admission. A body hit decodes canonical query bytes into the current request snapshot, validating each fact against the
 previous snapshot's typed facts before it bypasses the body walker.
 For ordinary bodies, this query path is an overlay on the existing typed-snapshot
 reuse: the graph lookup requires the same exact prior body/surface admission and
 checks its decoded facts against the prior typed record; a graph miss falls back to
 copying that same record under the same gate. It therefore does not yet demonstrate
 additional body-fact extraction skipped versus graph-off. The `complete_empty_body`
-syntax path skips collector scanning independently of the graph. Treat graph counters
-as routing/revalidation evidence until a graph-only path demonstrates additional
-analysis work avoided.
+syntax path skips collector scanning independently of the graph; the prior
+zero-fact path also skips a scan using the successful typed record even when the
+graph misses. Treat graph counters as routing/revalidation evidence until a
+graph-only path demonstrates additional analysis work avoided.
 
 A resolver `NameLookup` query is connected at `Expr.Ident` classification: the
 driver reacquires a request context after collection, and the serial
@@ -1004,13 +1005,25 @@ unrelated function body and its facts are unchanged. The same broad surface matc
 also gates prior-snapshot reuse for ordinary bodies; if the surface differs, the
 collector cold-scans those candidates.
 
-There is now one closed-shape exception. A supported body containing exactly one
-`return` of an integer, float, string, character, or boolean literal is marked
-`complete_empty_body`; it has no direct facts and its `FunctionBodyFacts` query
-has no `SourceInput` dependency. The collector can skip its fact scan across a
-declaration-surface edit, with or without the query graph. This skips only direct-
-fact collection: parsing and the normal semantic pipeline still run. The graph
-path has not yet shown additional body-work savings over the typed-snapshot path.
+There are two source-independent body-fact cases, with different proofs. A
+supported body containing exactly one `return` of an integer, float, string,
+character, or boolean literal is marked `complete_empty_body` directly from its
+AST shape, before the fact walker runs. Separately, a retained-session record may
+be classified as a source-independent zero-fact body after a successful completed
+fact scan has proved it cacheable with zero direct facts. Reusing that record requires the
+current header to remain supported, the body bytes to match exactly, and the
+prior fact span to be valid. This can cover a multi-statement literal-only body
+or literal local declarations that do not have the closed `complete_empty_body`
+shape. A zero fact count by itself is not the proof; an incomplete or rejected
+walk cannot enter this class.
+
+Both cases can reuse direct-fact results without a `SourceInput` dependency.
+Only the prior `zero_fact_body` proof skips the broad declaration-surface gate
+for a non-`complete_empty_body` body; a new body with no prior proof is scanned
+on the ordinary path before its result can be published without that edge.
+These shortcuts cover direct-fact collection only. Parsing, type checking,
+diagnostics, and the normal semantic pipeline still run. The query graph has not
+yet shown additional end-to-end body-work savings over the typed-snapshot path.
 
 The next useful graph step for non-empty bodies is to record the actual name observations used by the fact
 walker as dependencies, scoped to the canonical direct facts this syntax walk
@@ -1050,15 +1063,31 @@ the current-AST cold scan so no prior typed facts survive the eligibility
 transition.
 Do not persist request-local declaration IDs or handles in those dependencies.
 
-The current collector implements the first closed-shape exception directly from
-the AST, rather than inferring it from `direct_fact_count == 0`: one bare `return`
-of a self-contained integer, float, string, character, or boolean literal, with
-no local bindings, grants, calls, identifiers, or additional statements. It marks
-that record cacheable with zero facts and omits its `SourceInput` edge. Every other
-body keeps the broad surface dependency until its observed-name and call
-projections, including owner removal, are complete. Zero emitted facts alone is
-not proof of an empty dependency set because body-local forms may be omitted from
-the current fact vocabulary.
+`complete_empty_body` remains the first, closed AST-shape exception: one bare
+`return` of a self-contained integer, float, string, character, or boolean
+literal, with no local bindings, grants, calls, identifiers, or additional
+statements. It is recognized before scanning. A separate retained-session path
+uses the current scanner's successful prior result: the prior record must be
+cacheable, its body must match byte-for-byte, its direct-fact count must be zero,
+and its fact range must be in bounds. The current header must remain supported,
+and the active session's semantic fingerprint, generated-input mode, options,
+and identity must still match. This completed scan is the proof that the body
+emitted no declaration-sensitive direct facts. It can include additional
+literal-only statements or accepted literal local declarations. A current cold
+scan can publish a cacheable zero-fact body without a `SourceInput` edge, but it
+cannot authorize prior-record reuse until a later exact-body request. A bare zero
+count without a successful cacheable scan and valid span never authorizes
+an empty dependency set.
+
+The scanner remains fail-closed: local/parameter identifier reads, declaration
+lookups that are not represented by direct facts, unsupported syntax, and
+incomplete scans stay non-cacheable and use the ordinary `SourceInput` path or
+cold semantic fallback. Neither source-independent class caches type checking
+or diagnostics. The `zero_fact_body_*` report counters describe collector-side
+proof, restore, and publication routing separately from `complete_empty_body_*`;
+if final declaration-surface projection fails, the collector invalidates all
+body records and suppresses graph publication even if an earlier scan or restore
+count was recorded.
 
 For the current collector, keep the first dependency manifest scoped to observations
 from bodies that are already cacheable. `ifc_walk_expr` rejects absent/readonly
@@ -1132,10 +1161,11 @@ A fresh session or sidecar without a complete validated prior manifest must take
 the cold scan; it cannot infer context equality from old fact record offsets alone.
 Collection and publication must use the same dependency set. The current publisher
 uses `[SourceInput]` for ordinary cacheable bodies and no dependency for
-`complete_empty_body`; its request-local hit marker records that dependency mode.
-Validation checks the source result generation for ordinary bodies and requires
-zero dependencies for the complete-empty case. Both paths still require a valid,
-bounds-checked declaration-surface snapshot. As additional dependency classes are
+`complete_empty_body` or a successfully scanned zero-fact body; its request-local
+hit marker records that dependency mode. Validation checks the source result
+generation for ordinary bodies and requires zero dependencies for either
+source-independent case. All currently publishable records still require valid,
+bounds-checked declaration-surface metadata. As additional dependency classes are
 added, carry their validated classification through the request snapshot or
 recompute it from the same complete manifest at publication, and assert the
 committed edge set in a control. Prefer one deterministic dependency builder for
@@ -1143,14 +1173,15 @@ collection-time evaluation and post-store publication; retain request-local
 projection evidence separately from handles, then reacquire handles under the
 committed graph generation.
 
-That broader dependency-policy mechanism remains future work. The current
-`complete_empty_body` exception can be collected without an admitted `SourceInput`
-and published without that edge, even when the encoded source value exceeds its
-per-value cap. It still requires valid declaration-surface metadata and spans;
-ordinary bodies remain gated by the `SourceInput` path. A source-value cap miss
-alone no longer prevents complete-empty nodes from publishing or requires a graph
-clear. Keep predictable misses for future context queries local; clear and rebuild
-only for actual aggregate-capacity or structural failures.
+That broader dependency-policy mechanism remains future work. The
+`complete_empty_body` and scanner-proven zero-fact exceptions can be collected
+without an admitted `SourceInput` and published without that edge, even when the
+encoded source value exceeds its per-value cap. They still require valid
+declaration-surface metadata and spans; ordinary bodies remain gated by the
+`SourceInput` path. A source-value cap miss alone no longer prevents these
+source-independent nodes from publishing or requires a graph clear. Keep
+predictable misses for future context queries local; clear and rebuild only for
+actual aggregate-capacity or structural failures.
 
 Query-value capacity is part of this dependency policy. A valid source surface
 whose `SourceInput` key or value exceeds its cap must still allow a fitting
@@ -1171,10 +1202,11 @@ a context payload that exceeds its own cap.
 
 The validated-body-hit marker now records whether the body requires `SourceInput`.
 Publication validates its source result generation for ordinary bodies and checks
-that the dependency list is empty for `complete_empty_body`; it also checks the
-exact body span, key, graph generation, and result generation. Graph clears still
-invalidate the marker. Any future dependency class must carry equivalent evidence
-for its exact current dependency set before it can skip publication.
+that the dependency list is empty for `complete_empty_body` and scanner-proven
+zero-fact bodies; it also checks the exact body span, key, graph generation, and
+result generation. Graph clears still invalidate the marker. Any future dependency
+class must carry equivalent evidence for its exact current dependency set before
+it can skip publication.
 
 The existing `NameLookup` query returns only `(known, module_only)` and omits
 binding types, signatures, attributes, and declaration identities. It can skip
@@ -1229,7 +1261,7 @@ snapshot remains the fallback for values rejected by these checks. The collector
 still assembles the proposed declaration surface needed for exact snapshot
 comparison. These checks do not preflight remaining aggregate graph capacity: a
 permitted body copy or canonical result can still be materialized before commit
-discovers that the 32 MiB value pool has insufficient room. The aggregate logical
+discovers that the 16 MiB value pool or 32 MiB aggregate estimate has insufficient room. The aggregate logical
 cap also excludes these pre-admission temporaries. A remaining-capacity preflight or
 span-based evaluation path could reduce that transient peak; keep the graph opt-in.
 These guards have source review only and still need parity and retained-session
@@ -1244,13 +1276,25 @@ to `ifc_scan_candidate`, including candidates that the scan later rejects. The
 `source_input_admitted` flag means both the exact SourceInput query hit and the
 trusted prior declaration surface admitted the graph body path. It is false on an
 exact-source session return because that path bypasses the graph, and it does not
-describe the `complete_empty_body` path that deliberately has no SourceInput edge.
+describe either source-independent body-fact path that deliberately has no
+SourceInput edge. The separate `zero_fact_body_eligible` and
+`zero_fact_body_restored` counts describe scanner-proof/restore attempts before
+final declaration-surface validation; if that projection fails, the collector
+clears all cacheable body records and publication does not proceed. The
+`zero_fact_body_publish_skips` and `zero_fact_body_commits` counts apply only to
+successfully published graph records. These class counters supplement, rather
+than replace, the general restore/fallback/scan counters.
 These counters describe routing only; do not claim a production query engine or
 speedup until parity controls and measured results show the graph improves the
 retained-edit path.
 
 The paired retained-session harness now has `zero-fact` and `call-facts` workloads.
-The latter uses a distinct leaf callee per body and requires warm `NameLookup` hit
+Its `zero-fact` fixture is the literal-return `complete_empty_body` control; it does
+not cover the broader scanner-proven zero-fact class described above. A future
+control should use a multi-statement literal-only body, change an unrelated
+declaration, and then mutate the body to read a local/parameter identifier to
+prove that the zero-fact cache path is dropped. The `call-facts` workload uses a
+distinct leaf callee per body and requires warm `NameLookup` hit
 totals to exceed the prime request's same-request duplicate baseline, exposing
 aggregate prior-request reuse. It also asserts `direct_fact_count` is one per
 `bench_*` body, while the `zero-fact` workload asserts there are no direct facts.

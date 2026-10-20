@@ -271,14 +271,16 @@ driver_args=("$@")
 
 # Opt-in content-addressed object cache (ELISA_STAGE1_CACHE=1, directory
 # ELISA_STAGE1_CACHE_DIR, default ~/.cache/elisac-stage1). Only a plain object compile
-# (`-o OUT` with no `-emit` other than obj) is cached. The key covers everything the
-# object is a function of: the product binary, the argument vector with OUT
+# (`-o OUT` with no `-emit` other than obj) is cached. The key covers these inputs:
+# the product binary, the argument vector with OUT
 # normalised, every ELISA_* variable, every file of the source's include graph
 # (`-emit deps`), and the standard library tree the driver may pull in implicitly.
 # A hit restores the object and replays both diagnostic streams; a miss compiles
 # and stores the object plus diagnostics. The product provenance manifest is
-# part of the key because it attests the exact LLVM toolchain artifacts; a
+# part of the key because it records selected LLVM toolchain artifacts; a
 # reseed after an in-place LLVM update must not reuse objects from the old ABI.
+# Loader-variable overrides decline admission. Selected artifact provenance does
+# not prove actual mapped-image identity or close ambient loader configuration.
 # Products outside this tree and explicit stale-product runs skip the cache because
 # assert_stage1_fresh.sh cannot attest their manifest.
 # Integrity metadata is mandatory;
@@ -297,6 +299,13 @@ stage1_cache_environment() {
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
   [[ "${ELISA_ALLOW_STALE_STAGE1:-0}" != 1 ]] || return 1
+  # Selected provenance does not attest loader overrides or their referenced bytes.
+  # Inspect shell variable names without invoking another dynamically loaded tool.
+  # Conservatively include unexported and empty-valued variables too.
+  local loader_override
+  for loader_override in "${!LD_@}" "${!DYLD_@}"; do
+    [[ -z "$loader_override" ]] || return 1
+  done
   [[ ! -L "$BIN" ]] || return 1
   local normalized_bin normalized_root
   normalized_bin="$(cd -- "$(dirname -- "$BIN")" 2>/dev/null && pwd -P)/$(basename -- "$BIN")" || return 1

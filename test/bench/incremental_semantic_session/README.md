@@ -100,10 +100,15 @@ keeps the routing evidence separate from timing summaries.
 The extra `shared-calls` workload gives many bodies the same callee spelling,
 then changes one caller to an alternate callee. This complements `call-facts`,
 which gives each body a distinct callee, and exposes repeated-name query costs.
-`zero-fact` remains the literal-return control and does not exercise eligible
+`zero-fact` remains the literal-return/`complete_empty_body` control and does
+not exercise the scanner-proven zero-fact path for other body shapes or eligible
 `NameLookup` reads. Direct-surface versus graph-on therefore measures the cost
 of the NameLookup route on these generated sources, not the cost of all semantic
-queries or a whole-compiler speedup.
+queries or a whole-compiler speedup. A future control for the broader zero-fact
+class should use a multi-statement literal-only body (so it is outside the closed
+single-return shape), prove reuse across an unrelated declaration edit, and then
+change that body to a local/parameter identifier read to prove the cacheable
+zero-fact classification is dropped and cold scanning resumes.
 
 The direct-surface parity check covers the generated `zero-fact`, `call-facts`,
 and `shared-calls` sequences. Those fixtures contain no imports or import
@@ -155,10 +160,12 @@ body in `call-facts`; the post-surface transition removes one. `zero-fact`
 expects no direct facts. Results and source hashes are grouped by workload so
 the empty-payload control cannot hide the cost of copying actual facts.
 
-The runner also checks the closed complete-empty query class: exactly one
+The runner also checks only the closed complete-empty query class: exactly one
 `return` of an integer, float, string, character, or boolean literal. Those
 `FunctionBodyFacts` nodes have an empty dependency set because this AST shape
-cannot read declarations. On the declaration-surface edit, graph-on must restore
+cannot read declarations. The current fixture does not cover a prior successful
+scanner result with zero facts and a multi-statement body. On the
+declaration-surface edit, graph-on must restore
 the unchanged members of this class and skip their duplicate publication even
 though `SourceInput` changed; graph-off must report no restores or skips. The
 separate `complete_empty_body_*` counters describe only direct-fact query work;
@@ -187,8 +194,10 @@ counters are aggregate rather than per-key.
 
 For `call-facts` and `shared-calls` body edits, graph-off must report
 typed-snapshot fallback reuse and graph-on must report collector-side
-`source_input_admitted`. For `zero-fact`, both paths skip these broad body-fact
-reuse paths because every body is complete-empty. That report field covers
+`source_input_admitted`. For this `zero-fact` fixture, both paths skip these
+broad body-fact reuse paths because every body is complete-empty; it does not
+validate the newer
+scanner-proven zero-fact class. That report field covers
 collector/body-fact admission only: graph publication has a separate
 `SourceInput` phase when it has cacheable nonempty bodies, and the graph-on
 driver refreshes the resolver `SourceInput` context before semantic resolution.

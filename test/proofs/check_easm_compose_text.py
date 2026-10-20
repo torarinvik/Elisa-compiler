@@ -139,7 +139,7 @@ required_span_fragments = (
     "assert easm_compose_span_reference(text, wanted).end == 0",
     "no_open_span: ComposeSpan = ComposeSpan{start: 0, end: 0, valid: false}",
     "assert easm_compose_span_matches_reference(no_open_span, text, wanted)",
-    "answer <- no_open_span",
+    "return no_open_span",
     "close_offset: usize = EasmTextScan::find_byte(text[open:text.len], 41)",
     "assert close_offset > 0.usize()",
     "close: usize = close_offset + open",
@@ -154,15 +154,14 @@ required_span_fragments = (
     "if wanted < 0 or wanted >= argument_count:",
     "no_argument_span: ComposeSpan = ComposeSpan{start: 0, end: 0, valid: false}",
     "assert easm_compose_span_matches_reference(no_argument_span, text, wanted)",
-    "answer <- no_argument_span",
+    "return no_argument_span",
     "easm_compose_span_reference_from_state(values, base, close, start, 0.usize(), current, wanted).valid == easm_compose_span_reference(text, wanted).valid",
     "easm_compose_span_reference_from_state(values, base, close, start, 0.usize(), current, wanted).start == easm_compose_span_reference(text, wanted).start",
     "easm_compose_span_reference_from_state(values, base, close, start, 0.usize(), current, wanted).end == easm_compose_span_reference(text, wanted).end",
     "assert easm_compose_span_state_matches_reference(values, base, close, start, 0.usize(), current, wanted, text)",
     "assert current <= wanted",
-    "cursor: mutable usize = 0",
-    "while cursor < value_length",
-    "invariant cursor <= value_length",
+    "cursor: usize = 0",
+    "for cursor in 0..<value_length |value_length, start, current, values, base, close, wanted, text|:",
     "invariant base <= close",
     "invariant values.len == close - base",
     "invariant value_length == values.len",
@@ -170,12 +169,9 @@ required_span_fragments = (
     "invariant start <= cursor",
     "invariant current >= 0",
     "invariant current <= wanted",
-    "invariant current.usize() <= cursor",
     "invariant easm_compose_span_state_matches_reference(values, base, close, start, cursor, current, wanted, text)",
-    "decreases value_length - cursor",
     "if values[cursor] == 44:",
     "assert current < wanted",
-    "break",
     "EasmTextScan::trim_bounds(values[start:cursor])",
     "assert span_end <= close",
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid",
@@ -183,9 +179,7 @@ required_span_fragments = (
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == span_end",
     "selected_span: ComposeSpan = ComposeSpan{start: span_start, end: span_end, valid: true}",
     "assert easm_compose_span_matches_reference(selected_span, text, wanted)",
-    "answer <- selected_span",
-    "selected_found <- true",
-    "if not selected_found:",
+    "return selected_span",
     "if current == wanted:",
     "EasmTextScan::trim_bounds(values[start:value_length])",
     "assert wanted - current > easm_compose_comma_count_from(values, value_length)",
@@ -194,7 +188,7 @@ required_span_fragments = (
     "assert easm_compose_span_reference_from_state(values, base, close, start, value_length, current, wanted).end == 0",
     "no_match_span: ComposeSpan = ComposeSpan{start: 0, end: 0, valid: false}",
     "assert easm_compose_span_matches_reference(no_match_span, text, wanted)",
-    "answer <- no_match_span",
+    "return no_match_span",
     "assert answer.valid == easm_compose_span_reference(text, wanted).valid",
     "assert answer.start == easm_compose_span_reference(text, wanted).start",
     "assert answer.end == easm_compose_span_reference(text, wanted).end",
@@ -445,6 +439,8 @@ if "forissueinmodule.issues:" not in emit_body or \
     raise SystemExit("EASM code generation no longer fails closed on composition-span issues")
 
 positive_names = {
+    "a_bare_colon_line_is_not_a_label",
+    "a_whitespace_only_colon_line_is_not_a_label",
     "compose_argument_count_matches_the_recursive_comma_model",
     "compose_parser_count_matches_the_span_argument_count",
     "implementation_matches_the_recursive_span_spec",
@@ -458,6 +454,8 @@ positive_names = {
     "missing_open_paren_uses_the_invalid_sentinel",
 }
 negative_names = {
+    "a_bare_colon_line_can_become_a_label",
+    "a_whitespace_only_colon_line_can_become_a_label",
     "comma_separated_arguments_can_be_counted_as_empty",
     "in_range_argument_index_can_have_an_invalid_span",
     "valid_span_can_end_past_its_source",
@@ -465,6 +463,8 @@ negative_names = {
     "invalid_span_can_return_nonzero_bounds",
 }
 negative_claims = {
+    "a_bare_colon_line_can_become_a_label": 'instruction.op == "label"',
+    "a_whitespace_only_colon_line_can_become_a_label": 'instruction.op == "label"',
     "comma_separated_arguments_can_be_counted_as_empty": 'Easm::easm_compose_argument_count("dst, src") == 0',
     "in_range_argument_index_can_have_an_invalid_span": "not span.valid",
     "valid_span_can_end_past_its_source": "span.valid implies span.end > text.len",
@@ -484,6 +484,15 @@ for source_text, name_set, path_label in (
     ):
         if module_path not in source_text:
             raise SystemExit(f"{path_label} proof no longer imports production source: {module_path}")
+
+parse_instruction_body = compact(function_section(text_source, "easm_parse_instruction"))
+if compact("if line_view.len > 0 and line_view[line_view.len - 1.usize()] == 58 and easm_trim(line_view[0:line_view.len - 1.usize()]).len > 0:") not in parse_instruction_body:
+    raise SystemExit("EASM text parser no longer rejects bare or whitespace-only colon labels")
+
+for name in ("a_bare_colon_line_is_not_a_label", "a_whitespace_only_colon_line_is_not_a_label"):
+    section = compact(function_section(positive_text, name))
+    if compact("ensure result == true") not in section or compact('instruction.op != "label"') not in section:
+        raise SystemExit(f"positive parser behavior theorem {name} lost its checked proposition")
 
 for name in positive_names:
     if compact("ensure result == true") not in compact(function_section(positive_text, name)):
