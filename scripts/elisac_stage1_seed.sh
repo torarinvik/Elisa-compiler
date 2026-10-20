@@ -219,8 +219,14 @@ seed_build() {
   if [[ -z "${ELISACORE_RETAINED_SERVER+x}" && -S "$HOME/.elisac/retained.sock" ]]; then
     seed_retained_server="$HOME/.elisac/retained.sock"
   fi
+  # With the server, code generation uses the incrementally updated analysis
+  # instead of re-analyzing a clean edit from scratch (its IR matched a fresh
+  # analysis byte for byte on this tree); ELISACORE_RETAINED_SPLICED_CODEGEN=0
+  # restores the fresh analysis.
+  seed_spliced_codegen="${ELISACORE_RETAINED_SPLICED_CODEGEN-1}"
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
+  ELISACORE_RETAINED_SPLICED_CODEGEN="$seed_spliced_codegen" \
   ELISACORE_SMT_CACHE_DIR="$seed_smt_cache_dir" \
   ELISACORE_SMT_CACHE_DECLINED="$seed_smt_cache_declined" \
   ELISACORE_RETAINED_SERVER="$seed_retained_server" \
