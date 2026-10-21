@@ -11,6 +11,9 @@ extend Semantic:
         const GLOBAL_AUTHORITY_LOCAL_ALIAS: usize = 4294967293
         const GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS: u8 = 2
         const GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT: u32 = 128
+        # Return-origin summary value meaning "the join of the call's arguments". Only
+        # stored in return_origins; never used as an origin itself.
+        const GLOBAL_AUTHORITY_ARGUMENT_RESULT: usize = 4294967292
 
         struct GlobalAuthority:
             parents: mutable darray[usize] = []
@@ -149,6 +152,16 @@ extend Semantic:
             # Stable-within-analysis identities prevent a captured local-root origin
             # from silently naming a different binding after lexical slots are reused.
             local_origin_ids: mutable darray[usize] = []
+            # Locals below this index are the current top-level function's parameters.
+            parameter_limit: mutable usize = 0
+            # Per-function summary of what a returned reference may alias: NONE, one
+            # global slot, ARGUMENT_RESULT, or UNKNOWN_ALIAS (the default; also every
+            # function without a walked body). A quiet pre-walk computes them from
+            # all-unknown inputs, so every summary over-approximates its function.
+            return_origins: mutable darray[usize] = []
+            return_origin_acc: mutable darray[usize] = []
+            summary_walk: mutable bool = false
+            summary_function: mutable usize = GLOBAL_AUTHORITY_NONE
             next_local_origin_id: mutable usize = 0
             return_type: mutable Ast::Expr? = null
             lambda_depth: mutable u32 = 0
@@ -447,9 +460,26 @@ extend Semantic:
                     _:
                         return state.globals.count
 
+        # `x.cast[T]` reinterprets x: its storage root and reference origin are x's, as
+        # stage0 roots a cast at its operand. Read as a projection, `cast` is no field of
+        # x's referent and every cast of a reference took an unknown alias origin.
+        def ga_cast_operand(expression: Ast::Expr) -> Ast::Expr?:
+            match expression:
+                Expr.Index(cast_callee, _, _):
+                    if cast_callee is Expr.Field(cast_operand, cast_member, _) and cast_member == "cast":
+                        return cast_operand
+                    return null
+                _:
+                    return null
+
         def ga_place_global(expression: Ast::Expr, state: mutable GlobalAuthority&) -> usize:
             can Memory.Allocate, Abort.Panic:
                 current: mutable Ast::Expr = expression
+                while true |current|:
+                    if ga_cast_operand(current) is place_cast_operand:
+                        current <- place_cast_operand
+                    else:
+                        break
                 while true |current, state|:
                     match current:
                         Expr.Field(base, _, _) | Expr.Index(base, _, _) | Expr.IndexN(base, _, _) | Expr.Slice(base, _, _, _) | Expr.Paren(base, _) | Expr.Move(base, _) | Expr.Unary(_, base, _):
@@ -554,6 +584,8 @@ extend Semantic:
         def ga_reference_path_origin(expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> usize:
             can Memory.Allocate, Abort.Panic:
                 return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
+                if ga_cast_operand(expression) is cast_operand:
+                    return ga_reference_path_origin(cast_operand, state, depth + 1)
                 match expression:
                     Expr.Field(base, _, _) | Expr.Index(base, _, _) | Expr.IndexN(base, _, _) | Expr.Slice(base, _, _, _):
                         if ga_expression_is_reference(base, state, depth + 1):
@@ -845,8 +877,12 @@ extend Semantic:
         def ga_local_reference_origin(expression: Ast::Expr, state: GlobalAuthority&, depth: u32) -> usize:
             can Memory.Allocate, Abort.Panic:
                 return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
+                if ga_cast_operand(expression) is cast_operand:
+                    return ga_local_reference_origin(cast_operand, state, depth + 1)
                 match expression:
                     Expr.Ident(name, _):
+                        # `null` parses as a keyword identifier and names no storage.
+                        return GLOBAL_AUTHORITY_NONE if name == "null"
                         local_index: usize = ga_local_slot(name, state)
                         return ga_validate_local_origin(state.local_global_origins[local_index], state) if local_index < state.local_global_origins.count
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index < state.locals.count
@@ -863,6 +899,11 @@ extend Semantic:
                                 if root_index >= state.locals.count:
                                     return ga_projected_reference_origin(expression, GLOBAL_AUTHORITY_NONE, state)
                             if root_index < state.locals.count:
+                                # Whatever is reachable through a parameter is caller storage,
+                                # covered by the caller's grant (stage0's parameter rule), even
+                                # when the projection's type (a generic T) gives no evidence.
+                                if root_index < state.parameter_limit and root_index < state.local_global_origins.count:
+                                    return state.local_global_origins[root_index]
                                 if root_index < state.local_global_origins.count:
                                     return ga_projected_reference_origin(expression, state.local_global_origins[root_index], state)
                             return ga_projected_reference_origin(expression, GLOBAL_AUTHORITY_NONE, state)
@@ -892,6 +933,11 @@ extend Semantic:
                     Expr.Ident(name, _):
                         local_index: usize = ga_local_slot(name, state)
                         if local_index < state.locals.count:
+                            # A declared by-value local is not a reference, whatever
+                            # references its contents carry: those are reached through
+                            # projections, each judged by its own type.
+                            if local_index < state.local_types.count and state.local_types[local_index] is declared_local_type:
+                                return ga_reference_type(declared_local_type, state, depth + 1, state.local_type_scopes[local_index] if local_index < state.local_type_scopes.count else GLOBAL_AUTHORITY_NONE)
                             return true if local_index >= state.local_global_origins.count
                             origin: usize = ga_validate_local_origin(state.local_global_origins[local_index], state)
                             return true if SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin)
@@ -1002,9 +1048,92 @@ extend Semantic:
                     origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, argument_origin)
                 return SemanticGlobalAuthorityOrigin::constructor_origin(origin, true)
 
+        # An operand that can only be an integer: literals, the layout builtins, integer
+        # arithmetic over such operands, proven-scalar locals and non-reference types.
+        def ga_integer_valued(expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if depth > 32
+                match expression:
+                    Expr.IntLit(_, _):
+                        return true
+                    Expr.Paren(inner, _):
+                        return ga_integer_valued(inner, state, depth + 1)
+                    Expr.Call(callee, _, _, _):
+                        if callee is Expr.Ident(builtin_name, _):
+                            if builtin_name == "size_of" or builtin_name == "align_of" or builtin_name == "offset_of":
+                                return ga_named_callee_slot(callee, state) >= state.functions.count
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.Star or operator == TokenKind.Slash or operator == TokenKind.Percent or operator == TokenKind.LShift or operator == TokenKind.RShift or operator == TokenKind.Plus or operator == TokenKind.Minus:
+                            return true if ga_integer_valued(left, state, depth + 1) and ga_integer_valued(right, state, depth + 1)
+                    _:
+                        pass
+                if ga_annotation(expression, state, depth + 1) is annotation:
+                    return not ga_type_expression_contains_reference(annotation, state, depth + 1) and ga_expression_type_scope(expression, state, depth + 1) != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return false
+
+        # A call result aliases what its callee's summary says it may return. Every
+        # selected overload contributes; an argument-derived summary joins the origins
+        # of all actual arguments (the receiver included), which covers any parameter.
+        def ga_call_result_origin(callee: Ast::Expr, arguments: darray[Ast::Expr], labels: darray[sview], state: mutable GlobalAuthority&, depth: u32) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32
+                slot: mutable usize = ga_named_callee_slot(callee, state)
+                method: mutable bool = false
+                actuals: mutable darray[Ast::Expr] = arguments
+                actual_labels: mutable darray[sview] = labels
+                match ga_callable_core(callee):
+                    Expr.Field(receiver, method_name, _):
+                        method <- true
+                        if ga_annotation(receiver, state, depth + 1) is receiver_type:
+                            slot <- ga_resolve_function(method_name, ga_receiver_scope(receiver_type, state), false, state)
+                        actuals <- [receiver]
+                        actual_labels <- [""]
+                        actuals.extend(arguments)
+                        actual_labels.extend(labels)
+                        slot <- ga_select_function(slot, actuals, actual_labels, state, true)
+                    _:
+                        slot <- ga_select_function(slot, actuals, actual_labels, state)
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if slot >= state.functions.count or state.functions[slot] == ""
+                result: mutable usize = GLOBAL_AUTHORITY_NONE
+                found: mutable bool = false
+                while next_candidate < state.functions.count |next_candidate: usize = ga_candidate_head(slot, state), result, found, state|:
+                    candidate: usize = next_candidate
+                    next_candidate <- state.function_next[candidate]
+                    continue if not ga_candidate_selected(candidate, slot, actuals, actual_labels, state, method)
+                    found <- true
+                    # Slots registered after the summary walk (lambdas) have no summary.
+                    summary: usize = state.return_origins[candidate] if candidate < state.return_origins.count else GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    if summary == GLOBAL_AUTHORITY_ARGUMENT_RESULT:
+                        for actual in actuals |result, state| -> result:
+                            result <- SemanticGlobalAuthorityOrigin::join_reference_origins(result, ga_reference_origin(actual, state, depth + 1))
+                    else:
+                        result <- SemanticGlobalAuthorityOrigin::join_reference_origins(result, summary)
+                    return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if result == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return result if found
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+
+        # Fold one `return` into the current function's summary, in callee terms.
+        def ga_record_return_origin(returned: Ast::Expr, state: mutable GlobalAuthority&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                slot: usize = state.summary_function
+                return if slot >= state.return_origin_acc.count or state.lambda_depth != 0
+                origin: usize = ga_reference_origin(returned, state, 0)
+                summary: mutable usize = GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                if origin == GLOBAL_AUTHORITY_NONE or origin < state.globals.count:
+                    summary <- origin
+                elif origin < GLOBAL_AUTHORITY_LOCAL_ALIAS and ga_local_origin_index(origin, state) < state.parameter_limit:
+                    summary <- GLOBAL_AUTHORITY_ARGUMENT_RESULT
+                previous: usize = state.return_origin_acc[slot]
+                if previous == GLOBAL_AUTHORITY_NONE:
+                    state.return_origin_acc[slot] <- summary
+                elif previous != summary and summary != GLOBAL_AUTHORITY_NONE:
+                    state.return_origin_acc[slot] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+
         def ga_reference_origin(expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> usize:
             can Memory.Allocate, Abort.Panic:
                 return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32
+                if ga_cast_operand(expression) is cast_operand:
+                    return ga_reference_origin(cast_operand, state, depth + 1)
                 match expression:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         return ga_reference_origin(inner, state, depth + 1)
@@ -1034,7 +1163,9 @@ extend Semantic:
                     Expr.Call(callee, arguments, labels, _):
                         variant_slot: usize = ga_enum_variant_slot(callee, state)
                         return ga_enum_constructor_origin(variant_slot, arguments, labels, state, depth + 1) if variant_slot < state.enum_variant_names.count
-                        return ga_expression_reference_origin(expression, state, depth + 1)
+                        opaque_origin: usize = ga_expression_reference_origin(expression, state, depth + 1)
+                        return opaque_origin if opaque_origin != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                        return ga_call_result_origin(callee, arguments, labels, state, depth + 1)
                     Expr.If(_, _, _, _) | Expr.Match(_, _, _):
                         return ga_expression_reference_origin(expression, state, depth + 1)
                     Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
@@ -1068,6 +1199,17 @@ extend Semantic:
                     Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _):
                         origin: usize = ga_local_reference_origin(expression, state, depth + 1)
                         return origin if origin != GLOBAL_AUTHORITY_NONE
+                        return ga_expression_reference_origin(expression, state, depth + 1)
+                    Expr.Binary(left, operator, right, _):
+                        # Pointer arithmetic stays inside the storage its reference operand
+                        # names; the integer operand contributes no origin of its own.
+                        if operator == TokenKind.Plus or operator == TokenKind.Minus:
+                            return ga_reference_origin(left, state, depth + 1) if ga_integer_valued(right, state, depth + 1)
+                            return ga_reference_origin(right, state, depth + 1) if ga_integer_valued(left, state, depth + 1)
+                            left_origin: usize = ga_reference_origin(left, state, depth + 1)
+                            right_origin: usize = ga_reference_origin(right, state, depth + 1)
+                            return SemanticGlobalAuthorityOrigin::join_reference_origins(left_origin, right_origin)
+                        return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_expression_is_reference(expression, state, depth + 1)
                         return ga_expression_reference_origin(expression, state, depth + 1)
                     _:
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_expression_is_reference(expression, state, depth + 1)
@@ -1146,6 +1288,8 @@ extend Semantic:
         def ga_reference_rebind_origin(expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> usize:
             can Memory.Allocate, Abort.Panic:
                 return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32
+                if ga_cast_operand(expression) is cast_operand:
+                    return ga_reference_rebind_origin(cast_operand, state, depth + 1)
                 match expression:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         return ga_reference_rebind_origin(inner, state, depth + 1)
@@ -1162,11 +1306,21 @@ extend Semantic:
                         return ga_reference_rebind_origin(operand, state, depth + 1) if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                     Expr.Ident(name, _):
+                        # `null` parses as a keyword identifier and names no storage.
+                        return GLOBAL_AUTHORITY_NONE if name == "null"
                         local_index: usize = ga_local_slot(name, state)
                         return ga_validate_local_origin(state.local_global_origins[local_index], state) if local_index < state.local_global_origins.count
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index < state.locals.count
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
-                    Expr.Call(_, _, _, _) | Expr.If(_, _, _, _) | Expr.Match(_, _, _):
+                    Expr.Call(_, _, _, _) | Expr.If(_, _, _, _) | Expr.Match(_, _, _) | Expr.Binary(_, _, _, _):
+                        # Same opaque-result rule as ga_reference_origin: only a result whose
+                        # type may carry a reference (or is unknown) stays an unknown alias.
+                        return ga_reference_origin(expression, state, depth + 1)
+                    Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _):
+                        # A projection names storage reached through its root, exactly as
+                        # ga_reference_origin resolves it; unknown roots stay unknown.
+                        projected_origin: usize = ga_local_reference_origin(expression, state, depth + 1)
+                        return projected_origin if projected_origin != GLOBAL_AUTHORITY_NONE
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                     _:
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
@@ -1265,6 +1419,32 @@ extend Semantic:
                 if ga_annotation(target, state, 0) is type_expression:
                     return if not ga_mutation_can_change_reference_contents(type_expression, state, 0)
                 state.local_global_origins[local_index] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+
+        # `return r` from a reference-returning function hands the reference itself
+        # back without touching its referent. The caller sees an opaque call result,
+        # so an unknown alias stays fail-closed at the caller's first access.
+        def ga_returns_reference_local(returned: Ast::Expr, state: mutable GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if state.lambda_depth != 0
+                declared_return: Ast::Expr = get state.return_type else return false
+                return false if not ga_reference_type(declared_return, state, 0)
+                current: mutable Ast::Expr = returned
+                while true |current|:
+                    match current:
+                        Expr.Paren(inner, _) | Expr.Move(inner, _):
+                            current <- inner
+                        Expr.Ident(name, _):
+                            local_index: usize = ga_local_slot(name, state)
+                            return false if local_index >= state.locals.count or local_index >= state.local_types.count or local_index >= state.local_global_origins.count
+                            if state.local_types[local_index] is local_type:
+                                return false if not ga_reference_type(local_type, state, 0)
+                            else:
+                                return false
+                            origin: usize = ga_validate_local_origin(state.local_global_origins[local_index], state)
+                            return origin >= state.globals.count
+                        _:
+                            return false
+                return false
 
         def ga_access(expression: Ast::Expr, write: bool, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -1733,7 +1913,9 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 need_read <- need_read or state.reads[candidate]
                 need_write <- need_write or state.writes[candidate]
-                if state.report:
+                if state.summary_walk:
+                    pass
+                elif state.report:
                     table <- ga_generic_call_rows_at(candidate, at, state, table) can Global{Read,Write}
                 else:
                     ga_edge_rows(state.function, candidate, state) can Global{Read,Write}
@@ -1966,6 +2148,10 @@ extend Semantic:
 
         def ga_iteration_binding_type_expression(iterable: Ast::Expr, binding_type_id: u32, binding_count: usize, binding_index: usize, at: Ast::Pos, state: GlobalAuthority&, table: SymbolTable&) -> Ast::Expr?:
             can Memory.Allocate, Abort.Panic:
+                # A range counter is an integer whatever width the range has; the type
+                # tables record no item type for it, and only reference-ness matters here.
+                if binding_count == 1 and iterable is Expr.Binary and pag_iteration_binding_kind(iterable, 0, table) == 2:
+                    return Ast::Expr.Ident("usize", at)
                 if ga_annotation(iterable, state, 0) is iterable_annotation:
                     iterable_type: mutable Ast::Expr = ga_type_alias_result(iterable_annotation, state.module_scope, state, 0)
                     while true |iterable_type|:
@@ -2210,8 +2396,12 @@ extend Semantic:
                             state.local_callees.truncate(mark)
                             state.local_global_origins.truncate(mark)
                     Expr.Index(left, right, _) | Expr.Refinement(left, right, _):
-                        table <- ga_expression(left, state, table) can Global{Read,Write}
-                        table <- ga_expression(right, state, table) can Global{Read,Write}
+                        # `x.cast[T]` reads x and names a type (see ga_cast_operand).
+                        if ga_cast_operand(expression) is cast_operand:
+                            table <- ga_expression(cast_operand, state, table) can Global{Read,Write}
+                        else:
+                            table <- ga_expression(left, state, table) can Global{Read,Write}
+                            table <- ga_expression(right, state, table) can Global{Read,Write}
                     Expr.Slice(base, low, high, _):
                         table <- ga_expression(base, state, table) can Global{Read,Write}
                         table <- ga_expression(low, state, table) can Global{Read,Write}
@@ -2676,7 +2866,8 @@ extend Semantic:
                                             break
                         Stmt.Return(value, _):
                             if value is returned:
-                                table <- ga_expression(returned, state, table) can Global{Read,Write}
+                                ga_record_return_origin(returned, state) if state.summary_walk
+                                table <- ga_expression(returned, state, table) can Global{Read,Write} if not ga_returns_reference_local(returned, state)
                                 if not state.report and state.function < state.returned_callees.count:
                                     returned_slot: usize = state.returned_callees[state.function]
                                     callback_slot: usize = ga_callee_slot(returned, state) can Global{Read,Write}
@@ -2919,6 +3110,10 @@ extend Semantic:
                                 state.function <- slot
                                 break
                             state.return_type <- return_type
+                            state.summary_function <- state.function if state.function < state.functions.count and state.functions[state.function] == name and state.function_scopes[state.function] == module_scope and state.function_offsets[state.function] == at.offset else GLOBAL_AUTHORITY_NONE
+                            # A bodiless declaration (extern, protocol requirement) keeps the
+                            # unknown summary: its returns are not visible to this walk.
+                            state.return_origin_acc[state.summary_function] <- GLOBAL_AUTHORITY_NONE if state.summary_walk and state.summary_function < state.return_origin_acc.count and body.count > 0
                             for parameter in parameters:
                                 state.locals.push(parameter.name)
                                 _ = ga_push_local_origin_id(state) can Global{Read,Write}
@@ -2928,6 +3123,7 @@ extend Semantic:
                                 # A parameter holds caller storage, never a global root: the
                                 # caller's grant covers what it passes (stage0's rule).
                                 state.local_global_origins.push(ga_local_origin(state.locals.count - 1, state))
+                            state.parameter_limit <- state.locals.count
                             # Signature effects declare the exported row, not local authority.
                             # The current collector has already rescanned this body. Only
                             # direct top-level declarations have snapshot anchors; nested
@@ -2951,6 +3147,7 @@ extend Semantic:
                                 if state.progress_functions % 1024 == 0:
                                     PhaseTimer::counter("authority:report_functions_progress" if state.report else "authority:inference_functions_progress", state.progress_functions) can Global{Read,Write}
                             state.locals.clear()
+                            state.parameter_limit <- 0
                             state.local_origin_ids.clear()
                             state.local_types.clear()
                             state.local_type_scopes.clear()
@@ -3054,6 +3251,41 @@ extend Semantic:
                         elif ga_incremental_record_is_direct_call_only(record_index, snapshot):
                             replay_call_records <- replay_call_records.put(offset, record_index) can Global{Read,Write}
                 PhaseTimer::end_span("authority:collect_setup", setup_span)
+                summary_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
+                # Return-origin summaries: quiet report-mode walks (they mutate no rows).
+                # The first walk sees every call result as unknown; each later walk reads
+                # the previous walk's summaries. Summaries only narrow from unknown, and
+                # each walk's inputs over-approximate, so any round's result is sound.
+                summary_diagnostic_mark: usize = table.diagnostics.count
+                state.return_origins.clear()
+                state.return_origin_acc.clear()
+                for _ in 0..<state.functions.count |state|:
+                    state.return_origins.push(GLOBAL_AUTHORITY_UNKNOWN_ALIAS)
+                    state.return_origin_acc.push(GLOBAL_AUTHORITY_UNKNOWN_ALIAS)
+                summary_overflow: bool = state.walk_overflow
+                state.report <- true
+                state.summary_walk <- true
+                summary_changed: mutable bool = true
+                summary_rounds: mutable u32 = 0
+                while summary_changed and summary_rounds < 4 |summary_changed, summary_rounds, state, table, reusable_empty_offsets, replay_call_records, incremental_skip_count|:
+                    summary_rounds <- summary_rounds + 1
+                    table <- ga_functions(file.top_decls, 0, &state, table, snapshot, &reusable_empty_offsets, &replay_call_records, incremental_skip_count, false, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
+                    table.diagnostics <- table.diagnostics.truncate(summary_diagnostic_mark)
+                    state.progress_functions <- 0
+                    summary_changed <- false
+                    break if state.walk_overflow and not summary_overflow
+                    for slot in 0..<min(state.return_origins.count, state.return_origin_acc.count) |summary_changed, state|:
+                        if state.return_origins[slot] != state.return_origin_acc[slot]:
+                            state.return_origins[slot] <- state.return_origin_acc[slot]
+                            summary_changed <- true
+                        state.return_origin_acc[slot] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                if state.walk_overflow and not summary_overflow:
+                    for slot in 0..<state.return_origins.count |state|:
+                        state.return_origins[slot] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                state.summary_walk <- false
+                state.report <- false
+                state.summary_function <- GLOBAL_AUTHORITY_NONE
+                PhaseTimer::end_span("authority:return_summaries", summary_span)
                 inference_span: PhaseTimer::Span = PhaseTimer::begin_span() can Global{Read,Write}
                 table <- ga_functions(file.top_decls, 0, &state, table, snapshot, &reusable_empty_offsets, &replay_call_records, incremental_skip_count, use_current_snapshot_facts, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
                 if state.walk_overflow:
