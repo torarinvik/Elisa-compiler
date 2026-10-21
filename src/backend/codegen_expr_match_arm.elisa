@@ -154,14 +154,23 @@ extend Backend:
                                 payload_binding <- packed_bound
                             elif variant_fields[0] is Pattern.Wildcard:
                                 payload_binding <- ""
+                            elif variant_fields[0] is Pattern.Literal(packed_sole_literal):
+                                payload_binding <- ""
+                                literal_indexes.push(0)
+                                literal_texts.push(packed_sole_literal)
                             else:
                                 payload_declined <- true
                         if variant_fields.count > 1:
-                            for packed_multi_field in variant_fields |payload_multi_bindings, payload_declined|:
+                            for packed_multi_at in 0..<variant_fields.count |variant_fields, payload_multi_bindings, payload_declined, literal_indexes, literal_texts|:
+                                packed_multi_field: Pattern = variant_fields[packed_multi_at]
                                 if packed_multi_field is Pattern.Binding(packed_multi_bound):
                                     payload_multi_bindings.push(packed_multi_bound)
                                 elif packed_multi_field is Pattern.Wildcard:
                                     payload_multi_bindings.push("")
+                                elif packed_multi_field is Pattern.Literal(packed_multi_literal):
+                                    payload_multi_bindings.push("")
+                                    literal_indexes.push(packed_multi_at)
+                                    literal_texts.push(packed_multi_literal)
                                 # A NESTED variant sub-pattern occupies its slot but
                                 # binds no name here — it is tested and bound after the
                                 # plain fields, below. "" keeps the positions aligned.
@@ -213,7 +222,7 @@ extend Backend:
                     hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, variant_ordinal.u64(), 0), "match.cmp")
                     _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
                     LLVMPositionBuilderAtEnd(builder, arm_block)
-                    if penum_scrutinee and literal_indexes.count > 0:
+                    if penum_scrutinee and not packed_scrutinee and literal_indexes.count > 0:
                         if not emit_penum_literal_tests(payload_path, literal_indexes, literal_texts, scrutinee_type, penum_slot, next_block, function, structs, runtime, ctx, builder):
                             declined <- true
                             return
@@ -227,7 +236,7 @@ extend Backend:
                             return
                     # Bind the payload INSIDE the arm: `getelementptr %Shape, ptr
                     # %tmp, i32 0, i32 1` then load at the variant's own type.
-                    if packed_scrutinee and payload_binding != "":
+                    if packed_scrutinee and (payload_binding != "" or (literal_indexes.count > 0 and payload_multi_bindings.count == 0)):
                         # `call i64 @ctx_packed_store_read_variant_sparse_word(i32 %n, ptr %state, i64 1)`
                         # -- word 0 is the tag, so the first payload field is word 1.
                         packed_arm_payload: ValueType = packed_payload_of_path(payload_path, structs)
@@ -281,10 +290,20 @@ extend Backend:
                         packed_word_type: mutable ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
                         packed_word_type <- packed_arm_payload if runtime.packed_mode == 2 and (packed_is_dynamic_aos_enum(structs, scrutinee_type.bits.i64()) or packed_is_ast_root_row(structs, packed_root_index_of(structs, scrutinee_type.bits.i64())))
                         if emit_conversion(packed_word, packed_word_type, packed_arm_payload, structs, ctx, builder) is packed_arm_value:
-                            packed_arm_storage: mutable darray[u8] = []
-                            packed_arm_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(packed_arm_payload, structs, ctx), sview_to_cstr(payload_binding, packed_arm_storage))
-                            _ = LLVMBuildStore(builder, packed_arm_value, packed_arm_slot)
-                            declare_local(local_scope, payload_binding, packed_arm_slot, packed_arm_payload)
+                            if literal_indexes.count > 0:
+                                # `Expr.IntLit(0)` -- the single payload IS the field.
+                                if payload_literal_hit(literal_texts[0], packed_arm_value, packed_arm_payload, structs, runtime, ctx, builder) is packed_sole_hit:
+                                    packed_sole_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "packed.lit.ok")
+                                    _ = LLVMBuildCondBr(builder, packed_sole_hit, packed_sole_cont, next_block)
+                                    LLVMPositionBuilderAtEnd(builder, packed_sole_cont)
+                                else:
+                                    declined <- true
+                                    return
+                            if payload_binding != "":
+                                packed_arm_storage: mutable darray[u8] = []
+                                packed_arm_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(packed_arm_payload, structs, ctx), sview_to_cstr(payload_binding, packed_arm_storage))
+                                _ = LLVMBuildStore(builder, packed_arm_value, packed_arm_slot)
+                                declare_local(local_scope, payload_binding, packed_arm_slot, packed_arm_payload)
                         else:
                             declined <- true
                             return
@@ -327,6 +346,22 @@ extend Backend:
                                 packed_multi_slot_ptr: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(packed_multi_type, structs, ctx), sview_to_cstr(payload_multi_bindings[packed_multi_index], packed_multi_storage))
                                 _ = LLVMBuildStore(builder, packed_multi_field, packed_multi_slot_ptr)
                                 declare_local(local_scope, payload_multi_bindings[packed_multi_index], packed_multi_slot_ptr, packed_multi_type)
+                        # LITERAL fields (`Expr.Bin('+', l, r)`): compare, falling through on a miss.
+                        packed_lit_failed: mutable bool = false
+                        for packed_lit_at in 0..<literal_indexes.count |literal_indexes, literal_texts, packed_multi_start, packed_multi_value, packed_lit_failed, function, next_block, structs, runtime, ctx, builder|:
+                            continue if packed_lit_failed
+                            packed_lit_index: usize = literal_indexes[packed_lit_at]
+                            packed_lit_type: ValueType = copied_type(structs.packed_enums.packed_field_types[packed_multi_start + packed_lit_index])
+                            packed_lit_field: LLVMValueRef = LLVMBuildExtractValue(builder, packed_multi_value, packed_lit_index.u32(), "packed.lit.field")
+                            if payload_literal_hit(literal_texts[packed_lit_at], packed_lit_field, packed_lit_type, structs, runtime, ctx, builder) is packed_lit_hit:
+                                packed_lit_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "packed.lit.ok")
+                                _ = LLVMBuildCondBr(builder, packed_lit_hit, packed_lit_cont, next_block)
+                                LLVMPositionBuilderAtEnd(builder, packed_lit_cont)
+                            else:
+                                packed_lit_failed <- true
+                        if packed_lit_failed:
+                            declined <- true
+                            return
                         # NESTED sub-patterns: read each sub-node's record, test its
                         # tag, and fall through to next_block on a mismatch so the arm
                         # only matches when every nested test holds, then bind that

@@ -15,7 +15,8 @@ trap 'rm -rf "$WORK"' EXIT
 failures=0
 fail() { echo "named-variant-pattern smoke FAIL: $1" >&2; failures=$((failures + 1)); }
 
-for src in "$DIR"/*.elisa; do
+# loop_captures rides along: same two-compiler exit-code check.
+for src in "$DIR"/*.elisa "$REPO_ROOT/test/fixtures/loop_captures"/*.elisa; do
 	name="$(basename "$src" .elisa)"
 	if [[ "$name" == *.neg ]]; then
 		s0_out="$("$ELISACORE_BIN" "$src" -emit obj -o "$WORK/s0.o" 2>&1)" && fail "$name: stage0 accepted"
@@ -26,7 +27,7 @@ for src in "$DIR"/*.elisa; do
 		grep -qF "$message" <<< "$s1_out" || fail "$name: stage1 lacks \"$message\": $s1_out"
 		continue
 	fi
-	"$ELISACORE_BIN" "$src" -emit obj -o "$WORK/s0.o" && clang -o "$WORK/s0" "$WORK/s0.o" || { fail "$name: stage0 build"; continue; }
+	"$ELISACORE_BIN" "$src" -emit obj -o "$WORK/s0.o" && clang -o "$WORK/s0" "$WORK/s0.o" "$RUNTIME_OBJ" || { fail "$name: stage0 build"; continue; }
 	ELISA_ALLOW_STALE_STAGE1=1 "$STAGE1" "$src" -o "$WORK/s1.o" && clang -o "$WORK/s1" "$WORK/s1.o" "$RUNTIME_OBJ" || { fail "$name: stage1 build"; continue; }
 	"$WORK/s0"; s0_rc=$?
 	"$WORK/s1"; s1_rc=$?
