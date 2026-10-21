@@ -886,13 +886,18 @@ extend Semantic:
                         local_index: usize = ga_local_slot(name, state)
                         return ga_validate_local_origin(state.local_global_origins[local_index], state) if local_index < state.local_global_origins.count
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index < state.locals.count
-                        return GLOBAL_AUTHORITY_NONE
+                        # A global root is resolved by the place walk; any other name
+                        # (`result` in a contract) names detached storage.
+                        return GLOBAL_AUTHORITY_NONE if ga_global(expression, state) < state.globals.count
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS
                     Expr.Field(base, _, _) | Expr.Index(base, _, _) | Expr.IndexN(base, _, _) | Expr.Slice(base, _, _, _):
                         base_origin: usize = ga_local_reference_origin(base, state, depth + 1)
                         # A projection through a reference reads a nested value from the
                         # referenced local aggregate. A projection through a by-value
                         # aggregate instead selects one of its contained references, so
                         # preserve that content summary unchanged.
+                        # Whatever is reached through detached storage is detached too.
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if base_origin == GLOBAL_AUTHORITY_LOCAL_ALIAS
                         if base_origin != GLOBAL_AUTHORITY_NONE and ga_expression_is_reference(base, state, 0):
                             root_index: usize = ga_local_origin_index(base_origin, state)
                             if base_origin >= state.globals.count and base_origin < GLOBAL_AUTHORITY_LOCAL_ALIAS:
@@ -908,14 +913,14 @@ extend Semantic:
                                     return ga_projected_reference_origin(expression, state.local_global_origins[root_index], state)
                             return ga_projected_reference_origin(expression, GLOBAL_AUTHORITY_NONE, state)
                         return base_origin if base_origin != GLOBAL_AUTHORITY_NONE
-                        return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_expression_is_reference(expression, state, 0)
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_expression_is_reference(expression, state, 0)
                         return base_origin
                     Expr.Unary(operator, base, _) if operator == TokenKind.Ampersand:
                         return ga_local_address_origin(base, state)
                     Expr.Paren(base, _) | Expr.Move(base, _) | Expr.Unary(_, base, _):
                         base_origin: usize = ga_local_reference_origin(base, state, depth + 1)
                         return base_origin if base_origin != GLOBAL_AUTHORITY_NONE
-                        return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_expression_is_reference(expression, state, 0)
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_expression_is_reference(expression, state, 0)
                         return base_origin
                     _:
                         return GLOBAL_AUTHORITY_NONE
@@ -1045,7 +1050,7 @@ extend Semantic:
                 origin: mutable usize = GLOBAL_AUTHORITY_NONE
                 for argument in arguments |origin, state| -> origin:
                     argument_origin: usize = ga_reference_origin(argument, state, depth + 1)
-                    origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, argument_origin)
+                    origin <- ga_join_origins(state, origin, argument_origin)
                 return SemanticGlobalAuthorityOrigin::constructor_origin(origin, true)
 
         # An operand that can only be an integer: literals, the layout builtins, integer
@@ -1093,7 +1098,9 @@ extend Semantic:
                         slot <- ga_select_function(slot, actuals, actual_labels, state, true)
                     _:
                         slot <- ga_select_function(slot, actuals, actual_labels, state)
-                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if slot >= state.functions.count or state.functions[slot] == ""
+                # stage0's rule: a returned reference was charged where the callee created
+                # it, so an opaque call result names detached storage, never a global.
+                return GLOBAL_AUTHORITY_LOCAL_ALIAS if slot >= state.functions.count or state.functions[slot] == ""
                 result: mutable usize = GLOBAL_AUTHORITY_NONE
                 found: mutable bool = false
                 while next_candidate < state.functions.count |next_candidate: usize = ga_candidate_head(slot, state), result, found, state|:
@@ -1102,15 +1109,16 @@ extend Semantic:
                     continue if not ga_candidate_selected(candidate, slot, actuals, actual_labels, state, method)
                     found <- true
                     # Slots registered after the summary walk (lambdas) have no summary.
-                    summary: usize = state.return_origins[candidate] if candidate < state.return_origins.count else GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    summary: mutable usize = state.return_origins[candidate] if candidate < state.return_origins.count else GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    summary <- GLOBAL_AUTHORITY_LOCAL_ALIAS if summary == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                     if summary == GLOBAL_AUTHORITY_ARGUMENT_RESULT:
                         for actual in actuals |result, state| -> result:
-                            result <- SemanticGlobalAuthorityOrigin::join_reference_origins(result, ga_reference_origin(actual, state, depth + 1))
+                            result <- ga_join_origins(state, result, ga_reference_origin(actual, state, depth + 1))
                     else:
-                        result <- SemanticGlobalAuthorityOrigin::join_reference_origins(result, summary)
+                        result <- ga_join_origins(state, result, summary)
                     return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if result == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                 return result if found
-                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return GLOBAL_AUTHORITY_LOCAL_ALIAS
 
         # Fold one `return` into the current function's summary, in callee terms.
         def ga_record_return_origin(returned: Ast::Expr, state: mutable GlobalAuthority&) -> void:
@@ -1119,7 +1127,7 @@ extend Semantic:
                 return if slot >= state.return_origin_acc.count or state.lambda_depth != 0
                 origin: usize = ga_reference_origin(returned, state, 0)
                 summary: mutable usize = GLOBAL_AUTHORITY_UNKNOWN_ALIAS
-                if origin == GLOBAL_AUTHORITY_NONE or origin < state.globals.count:
+                if origin == GLOBAL_AUTHORITY_NONE or origin < state.globals.count or origin == GLOBAL_AUTHORITY_LOCAL_ALIAS:
                     summary <- origin
                 elif origin < GLOBAL_AUTHORITY_LOCAL_ALIAS and ga_local_origin_index(origin, state) < state.parameter_limit:
                     summary <- GLOBAL_AUTHORITY_ARGUMENT_RESULT
@@ -1129,11 +1137,40 @@ extend Semantic:
                 elif previous != summary and summary != GLOBAL_AUTHORITY_NONE:
                     state.return_origin_acc[slot] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
 
+        # stage0's rule: following a reference stored in a field or element reaches
+        # storage of its own, not the global that held the pointer. Authority is charged
+        # where an alias to a global is created (borrow, store, escape) and where the
+        # holding global itself is read, never again where the stored pointer is followed.
+        def ga_loaded_reference(expression: Ast::Expr, state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _):
+                        type_expression: Ast::Expr = get ga_annotation(expression, state, 0) else return false
+                        loaded_scope: usize = ga_expression_type_scope(expression, state, 0)
+                        return false if loaded_scope == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                        return ga_reference_type(type_expression, state, 0, loaded_scope)
+                    _:
+                        return false
+
+        # The proved policy join, refined for authority: two different origins that are
+        # each known not to be a global (local roots, detached storage) still name no
+        # global, so the join is detached rather than an unknown alias.
+        def ga_join_origins(state: GlobalAuthority&, left: usize, right: usize) -> usize:
+            joined: usize = SemanticGlobalAuthorityOrigin::join_reference_origins(left, right)
+            return joined if joined != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+            return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if left == GLOBAL_AUTHORITY_UNKNOWN_ALIAS or right == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+            return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if left < state.globals.count or right < state.globals.count
+            return GLOBAL_AUTHORITY_LOCAL_ALIAS
+
         def ga_reference_origin(expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> usize:
             can Memory.Allocate, Abort.Panic:
                 return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32
                 if ga_cast_operand(expression) is cast_operand:
-                    return ga_reference_origin(cast_operand, state, depth + 1)
+                    # A cast from a value with no origin (an integer address) names no
+                    # global binding: the result is detached storage.
+                    cast_origin: usize = ga_reference_origin(cast_operand, state, depth + 1)
+                    return GLOBAL_AUTHORITY_LOCAL_ALIAS if cast_origin == GLOBAL_AUTHORITY_NONE
+                    return cast_origin
                 match expression:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         return ga_reference_origin(inner, state, depth + 1)
@@ -1153,40 +1190,53 @@ extend Semantic:
                         if local_index < state.local_global_origins.count:
                             origin: usize = ga_validate_local_origin(state.local_global_origins[local_index], state)
                             return origin if origin != GLOBAL_AUTHORITY_NONE
+                            # Every alias to a global records its exact origin where it is
+                            # created; a local with none holds detached storage (stage0).
+                            return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_expression_is_reference(expression, state, depth + 1)
                             return ga_expression_reference_origin(expression, state, depth + 1)
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index < state.locals.count
                         global_slot: usize = ga_global(expression, state)
                         if global_slot < state.globals.count and ga_expression_is_reference(state.global_types[global_slot], state, depth + 1):
                             return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                         return SemanticGlobalAuthorityOrigin::opaque_expression_origin(true, ga_type_expression_contains_reference(state.global_types[global_slot], state, depth + 1)) if global_slot < state.globals.count
-                        return GLOBAL_AUTHORITY_NONE
+                        # Neither a local nor a global (`result` in a contract, a function
+                        # name): no global binding is named, so its storage is detached.
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS
                     Expr.Call(callee, arguments, labels, _):
                         variant_slot: usize = ga_enum_variant_slot(callee, state)
                         return ga_enum_constructor_origin(variant_slot, arguments, labels, state, depth + 1) if variant_slot < state.enum_variant_names.count
                         opaque_origin: usize = ga_expression_reference_origin(expression, state, depth + 1)
                         return opaque_origin if opaque_origin != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                         return ga_call_result_origin(callee, arguments, labels, state, depth + 1)
-                    Expr.If(_, _, _, _) | Expr.Match(_, _, _):
+                    Expr.If(_, then_value, else_value, _):
+                        then_origin: usize = ga_reference_origin(then_value, state, depth + 1)
+                        # `return X if c` has no else value: only X can be produced.
+                        return then_origin if else_value is Expr.Absent
+                        return ga_join_origins(state, then_origin, ga_reference_origin(else_value, state, depth + 1))
+                    Expr.Match(_, _, _):
                         return ga_expression_reference_origin(expression, state, depth + 1)
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
+                        # Literal storage is static and immutable, never a mutable global.
+                        return GLOBAL_AUTHORITY_NONE
                     Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
                         origin: mutable usize = GLOBAL_AUTHORITY_NONE
                         for element in elements |origin, state| -> origin:
                             element_origin: usize = ga_reference_origin(element, state, depth + 1)
-                            origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, element_origin)
+                            origin <- ga_join_origins(state, origin, element_origin)
                         return origin
                     Expr.DictLit(entries, _):
                         origin: mutable usize = GLOBAL_AUTHORITY_NONE
                         for entry in entries |origin, state| -> origin:
                             key_origin: usize = ga_reference_origin(entry.key, state, depth + 1)
                             value_origin: usize = ga_reference_origin(entry.value, state, depth + 1)
-                            origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, key_origin)
-                            origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, value_origin)
+                            origin <- ga_join_origins(state, origin, key_origin)
+                            origin <- ga_join_origins(state, origin, value_origin)
                         return origin
                     Expr.Construct(type_expression, fields, _):
                         origin: mutable usize = GLOBAL_AUTHORITY_NONE
                         for field in fields |origin, state| -> origin:
                             field_origin: usize = ga_reference_origin(field.value, state, depth + 1)
-                            origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, field_origin)
+                            origin <- ga_join_origins(state, origin, field_origin)
                         if ga_type_expression_contains_reference(type_expression, state, depth + 1) and ga_construct_omits_reference_field(type_expression, fields, state):
                             return SemanticGlobalAuthorityOrigin::constructor_origin(origin, false)
                         return SemanticGlobalAuthorityOrigin::constructor_origin(origin, true)
@@ -1194,11 +1244,16 @@ extend Semantic:
                         origin: mutable usize = ga_reference_origin(base, state, depth + 1)
                         for field in fields |origin, state| -> origin:
                             field_origin: usize = ga_reference_origin(field.value, state, depth + 1)
-                            origin <- SemanticGlobalAuthorityOrigin::join_reference_origins(origin, field_origin)
+                            origin <- ga_join_origins(state, origin, field_origin)
                         return origin
                     Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _):
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_loaded_reference(expression, state)
                         origin: usize = ga_local_reference_origin(expression, state, depth + 1)
                         return origin if origin != GLOBAL_AUTHORITY_NONE
+                        # A projection rooted in neither a global place nor a recorded alias
+                        # cannot reach a global: every global alias records its origin.
+                        return ga_expression_reference_origin(expression, state, depth + 1) if ga_place_global(expression, state) < state.globals.count
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_local_storage_slot(expression, state) < state.locals.count
                         return ga_expression_reference_origin(expression, state, depth + 1)
                     Expr.Binary(left, operator, right, _):
                         # Pointer arithmetic stays inside the storage its reference operand
@@ -1208,7 +1263,7 @@ extend Semantic:
                             return ga_reference_origin(right, state, depth + 1) if ga_integer_valued(left, state, depth + 1)
                             left_origin: usize = ga_reference_origin(left, state, depth + 1)
                             right_origin: usize = ga_reference_origin(right, state, depth + 1)
-                            return SemanticGlobalAuthorityOrigin::join_reference_origins(left_origin, right_origin)
+                            return ga_join_origins(state, left_origin, right_origin)
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_expression_is_reference(expression, state, depth + 1)
                         return ga_expression_reference_origin(expression, state, depth + 1)
                     _:
@@ -1289,7 +1344,11 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32
                 if ga_cast_operand(expression) is cast_operand:
-                    return ga_reference_rebind_origin(cast_operand, state, depth + 1)
+                    # A cast from a value with no origin (an integer address) names no
+                    # global binding: the result is detached storage.
+                    cast_origin: usize = ga_reference_rebind_origin(cast_operand, state, depth + 1)
+                    return GLOBAL_AUTHORITY_LOCAL_ALIAS if cast_origin == GLOBAL_AUTHORITY_NONE
+                    return cast_origin
                 match expression:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         return ga_reference_rebind_origin(inner, state, depth + 1)
@@ -1312,6 +1371,8 @@ extend Semantic:
                         return ga_validate_local_origin(state.local_global_origins[local_index], state) if local_index < state.local_global_origins.count
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index < state.locals.count
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
+                        return GLOBAL_AUTHORITY_NONE
                     Expr.Call(_, _, _, _) | Expr.If(_, _, _, _) | Expr.Match(_, _, _) | Expr.Binary(_, _, _, _):
                         # Same opaque-result rule as ga_reference_origin: only a result whose
                         # type may carry a reference (or is unknown) stays an unknown alias.
@@ -1319,9 +1380,10 @@ extend Semantic:
                     Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _):
                         # A projection names storage reached through its root, exactly as
                         # ga_reference_origin resolves it; unknown roots stay unknown.
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_loaded_reference(expression, state)
                         projected_origin: usize = ga_local_reference_origin(expression, state, depth + 1)
                         return projected_origin if projected_origin != GLOBAL_AUTHORITY_NONE
-                        return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                        return ga_reference_origin(expression, state, depth + 1)
                     _:
                         return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
 
@@ -1331,9 +1393,13 @@ extend Semantic:
                     # A reference stored in a global aggregate may use an unqualified
                     # alias from that aggregate's module. Keep the root as its scope
                     # provenance so later projections resolve the same field types.
+                    return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_loaded_reference(value, state)
                     global_slot: usize = ga_place_global(value, state)
                     return global_slot if global_slot < state.globals.count
                     return ga_reference_rebind_origin(value, state, 0)
+                # A binding whose declared type holds no reference cannot carry an alias.
+                if type_expression is scalar_type:
+                    return GLOBAL_AUTHORITY_NONE if not ga_type_expression_contains_reference(scalar_type, state, 0) and ga_expression_type_scope(value, state, 0) != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
                 return ga_reference_origin(value, state, 0)
 
         def ga_access_unknown_alias(at: Ast::Pos, write: bool, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
@@ -1400,7 +1466,7 @@ extend Semantic:
                     return previous_origin if not ga_type_expression_contains_reference(value_type, state, 0)
                 source_origin: usize = ga_reference_origin(value, state, 0)
                 return previous_origin if source_origin == GLOBAL_AUTHORITY_NONE
-                joined_origin: usize = SemanticGlobalAuthorityOrigin::join_reference_origins(previous_origin, source_origin)
+                joined_origin: usize = ga_join_origins(state, previous_origin, source_origin)
                 state.local_global_origins[local_index] <- joined_origin
                 return joined_origin
 
@@ -1418,7 +1484,9 @@ extend Semantic:
                     return if ga_reference_type(root_type, state, 0)
                 if ga_annotation(target, state, 0) is type_expression:
                     return if not ga_mutation_can_change_reference_contents(type_expression, state, 0)
-                state.local_global_origins[local_index] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                # A global alias the callee stores here is charged at that store (stage0's
+                # creation rule), so the contents become detached storage, not unknown.
+                state.local_global_origins[local_index] <- ga_join_origins(state, state.local_global_origins[local_index], GLOBAL_AUTHORITY_LOCAL_ALIAS)
 
         # `return r` from a reference-returning function hands the reference itself
         # back without touching its referent. The caller sees an opaque call result,
@@ -1483,12 +1551,29 @@ extend Semantic:
                     type_scope: usize = ga_expression_type_scope(value, state, 0)
                     return if ga_reference_type(type_expression, state, 0, type_scope)
                     return if not ga_value_contains_mutable_reference(value, type_expression, state, 0)
-                    origin: usize = ga_reference_origin(value, state, 0)
-                    if origin < state.globals.count:
-                        mutable_path: bool = state.writable[origin] or ga_global_path_mutable(value, state, 0)
-                        table <- ga_access_slot(origin, Ast::expr_pos(value), true, mutable_path, state, table) can Global{Read,Write} if mutable_path
-                    elif SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin):
-                        table <- ga_access_unknown_alias(Ast::expr_pos(value), true, state, table) can Global{Read,Write}
+                    table <- ga_charge_global_alias_components(value, state, table, 0) can Global{Read,Write}
+
+        # Each global alias placed into an aggregate is created at that site, so charge
+        # every component whose origin is an exact global, not only a uniform summary.
+        def ga_charge_global_alias_components(value: Ast::Expr, state: mutable GlobalAuthority&, table: lmut SymbolTable, depth: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if depth > 32
+                origin: usize = ga_reference_origin(value, state, 0)
+                if origin < state.globals.count:
+                    mutable_path: bool = state.writable[origin] or ga_global_path_mutable(value, state, 0)
+                    table <- ga_access_slot(origin, Ast::expr_pos(value), true, mutable_path, state, table) can Global{Read,Write} if mutable_path
+                    return
+                match value:
+                    Expr.Paren(inner, _):
+                        table <- ga_charge_global_alias_components(inner, state, table, depth + 1) can Global{Read,Write}
+                    Expr.Call(_, arguments, _, _) | Expr.Array(arguments, _) | Expr.Tuple(arguments, _) | Expr.SetLit(arguments, _):
+                        for argument in arguments |state, table| -> table:
+                            table <- ga_charge_global_alias_components(argument, state, table, depth + 1) can Global{Read,Write}
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        for field in fields |state, table| -> table:
+                            table <- ga_charge_global_alias_components(field.value, state, table, depth + 1) can Global{Read,Write}
+                    _:
+                        pass
 
         # A store evaluates all subscripts, but does not read the storage root. A
         # compound store reads that root separately before writing it.
@@ -2185,10 +2270,13 @@ extend Semantic:
                 if type_expression is binding_type_expression:
                     contains_reference <- contains_reference or ga_type_expression_contains_reference(binding_type_expression, state, 0)
                 source_origin: usize = ga_reference_origin(subject, state, 0) if contains_reference else GLOBAL_AUTHORITY_NONE
-                global_origin: usize = SemanticGlobalAuthorityOrigin::pattern_binding_origin(
+                global_origin: mutable usize = SemanticGlobalAuthorityOrigin::pattern_binding_origin(
                     contains_reference,
                     source_origin
                 )
+                # A subject with no origin is not a global place and no recorded alias, so
+                # what its binders reach is detached storage (stage0's creation rule).
+                global_origin <- GLOBAL_AUTHORITY_LOCAL_ALIAS if contains_reference and source_origin == GLOBAL_AUTHORITY_NONE
                 type_scope: usize = ga_expression_type_scope(subject, state, 0)
                 return (type_expression, global_origin, type_scope)
 
@@ -2821,6 +2909,8 @@ extend Semantic:
                             binding_origin: usize = ga_local_reference_binding_origin(inferred_type, value, state)
                             binding_type_scope: usize = ga_type_scope(type_expression, state) if type_expression is not Expr.Absent and type_expression is not Expr.Invalid else ga_expression_type_scope(value, state, 0)
                             ga_record_mutable_global_borrow(value, inferred_type, state, table) can Global{Read,Write}
+                            # Storing a mutable global alias inside an aggregate creates it here.
+                            ga_record_mutable_global_escape(value, inferred_type, state, table) can Global{Read,Write}
                             state.locals.push(name)
                             _ = ga_push_local_origin_id(state) can Global{Read,Write}
                             state.local_types.push(inferred_type)
@@ -2836,6 +2926,8 @@ extend Semantic:
                                 binding_type_scope: usize = ga_expression_type_scope(value, state, 0)
                                 table <- ga_write_place(value, state, table) can Global{Read,Write} if ga_inferred_writable(value, state)
                                 ga_record_mutable_global_borrow(value, inferred_type, state, table) can Global{Read,Write}
+                                # Storing a mutable global alias inside an aggregate creates it here.
+                                ga_record_mutable_global_escape(value, inferred_type, state, table) can Global{Read,Write}
                                 state.locals.push(binding_name)
                                 _ = ga_push_local_origin_id(state) can Global{Read,Write}
                                 state.local_types.push(inferred_type)
@@ -2849,11 +2941,13 @@ extend Semantic:
                                     if ga_annotation(target, state, 0) is target_type and ga_mutable_parameter(target_type, state, 0):
                                         if origin < state.globals.count:
                                             table <- ga_access_slot(origin, Ast::expr_pos(value), true, false, state, table) can Global{Read,Write}
-                                        elif SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin):
-                                            table <- ga_access_unknown_alias(Ast::expr_pos(value), true, state, table) can Global{Read,Write}
                                 else:
                                     table <- ga_target(target, gp_is_compound_assign(operator), state, table) can Global{Read,Write}
                                     _ = ga_join_aggregate_reference_origin(target, value, state) can Global{Read,Write}
+                                    # Storing a mutable global alias into memory creates it here.
+                                    if ga_annotation(target, state, 0) is stored_type:
+                                        if ga_mutable_parameter(stored_type, state, 0) or ga_value_contains_mutable_reference(value, stored_type, state, 0):
+                                            table <- ga_charge_global_alias_components(value, state, table, 0) can Global{Read,Write}
                                 if target is Expr.Ident(binding_name, _):
                                     callback: usize = ga_callee_slot(value, state) can Global{Read,Write}
                                     local_index: mutable usize = state.locals.count
