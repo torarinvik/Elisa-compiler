@@ -161,3 +161,23 @@ In Stage1 Global-authority closure, `ga_close_rows` scans all call edges for up 
 The checked Stage1 compiler IR and Go assembly are diagnostic evidence, not a correctness or speedup qualification. The Core encoder change preserves the fingerprint's field order and names, but still needs a focused parity check and matched retained-edit benchmark before claiming a semantic or performance result.
 
 The mapped static-generation preprocessor leaves its output and line runs empty when it finds no expandable block, so ordinary driver calls keep the original source and avoid per-byte newline accounting. The separate bytes-only compatibility wrapper copies source bytes only for callers that need an output buffer. This is a source-level fast-path change, not a measured speedup; it still needs parity coverage and a representative preprocessing measurement.
+
+## Driver diagnostic line-map cache (2026-10-21)
+
+The diagnostic batch now refreshes a parsed driver line map once, then uses read-only
+lookups for primary and secondary positions. A stale cache falls back to the original
+parser. The identity includes the lexer publication generation and environment pointer,
+so persistent hosts pick up republished maps even when their backing storage is reused.
+
+`ELISACORE_BIN=/path/to/elisac python3 test/parity/driver_line_map_cache_smoke.py`
+compiles the production location functions separately from the full driver and checks
+cached/uncached parity, unsorted entries, duplicate starts, empty paths, republishing,
+empty overrides, and suspend/resume. Add `--benchmark` for a focused comparison.
+With the recovered stage0 bootstrap (SHA-256
+`7f7d3a96eee8cc63b171184f488dfa1bce0531daf8ac49966e3ab05f21d5f46a`),
+the medians of three runs were 57.4 ms uncached and 3.0 ms cached for 500 locations
+through 2,000 map entries. Each run includes process startup; this measures location
+rendering and cache construction, not whole compiler or retained-edit latency.
+The rebuilt stage1 compiler also passes the regression; its separately compiled benchmark
+measured 205.0 ms uncached and 4.8 ms cached (three-run medians). These are distinct
+code-generation paths and should not be combined into one compiler speedup claim.

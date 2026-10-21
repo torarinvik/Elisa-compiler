@@ -36,6 +36,7 @@ semantic_parallel_passes.elisa by id, in pipeline order (the splice order).
   semantic_parallel_gen.py --report     list every pipeline pass and its classification
 """
 import collections
+from functools import lru_cache
 import os
 import re
 import sys
@@ -414,7 +415,9 @@ def parse_parallel_dispatch(source):
 
     records = []
     for arm_index, (line_index, arm_indent, arm_kind, pass_id) in enumerate(arms):
-        expected_kind = "if" if arm_index == 0 else "elif"
+        # Accept the legacy chain and the shallow independent-if dispatcher.
+        # All later arms must use the same form; mixed shapes remain an error.
+        expected_kind = "if" if arm_index == 0 or len(arms) < 2 else arms[1][2]
         if arm_kind != expected_kind:
             errors.append("semantic_parallel_passes.elisa:%d: expected %s for pass_id %d" %
                           (line_index + 1, expected_kind, pass_id))
@@ -857,6 +860,15 @@ COPY_VALUE_TYPE_NAMES = {
 }
 
 
+def copy_alias_view_base_type(expression):
+    """A view lifetime does not change its copyability or backing mutability."""
+    if expression.startswith("sview") and re.fullmatch(
+        r"sview\s*@(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*", expression
+    ):
+        return "sview"
+    return expression
+
+
 def type_is_copy_value(type_expression, aliases, structs, seen=frozenset()):
     """Whether a type is safely copied, using an iterative alias/struct walk.
 
@@ -875,6 +887,7 @@ def type_is_copy_value(type_expression, aliases, structs, seen=frozenset()):
             return ("value", expression.endswith("&") and not
                     type_expression_is_mutable_ref(expression, aliases))
         expression = re.sub(r"^(?:(?:mutable|static|heap|stack)\s+)+", "", expression)
+        expression = copy_alias_view_base_type(expression)
         if "[" in expression or "{" in expression or "," in expression:
             return "invalid", None
         if not re.fullmatch(r"(?:\w+::)*\w+", expression):
@@ -969,6 +982,7 @@ def type_may_contain_reference(type_expression, aliases, structs):
         if "&" in expression:
             return True
         expression = re.sub(r"^(?:(?:mutable|lmut|static|heap|stack)\s+)+", "", expression)
+        expression = copy_alias_view_base_type(expression)
         if "[" in expression or "{" in expression or "," in expression:
             # Generic containers and compound types are not needed to prove the
             # copy-only return case; fail closed if the copy checker admits one.
@@ -1018,6 +1032,7 @@ def type_may_contain_mutable_alias(type_expression, aliases, structs):
         if "&" in expression:
             return "value", type_expression_is_mutable_ref(expression, aliases)
         expression = re.sub(r"^(?:(?:mutable|lmut|static|heap|stack)\s+)+", "", expression)
+        expression = copy_alias_view_base_type(expression)
         if "[" in expression or "{" in expression or "," in expression:
             return "invalid", True
         if not re.fullmatch(r"(?:\w+::)*\w+", expression):
@@ -1128,9 +1143,15 @@ def is_detached_copy_value(type_expression, aliases, structs):
 
 def mutable_cast_source_names(parameters, text, aliases, structs, additional_sources=()):
     """Names whose reference/view-derived storage may reach a mutable pointer cast."""
+    # Globals are identifiers: tokenize the body once instead of searching it
+    # once per global. Keep the original matching rule for compound spellings.
+    words = set(re.findall(r"\w+", text))
     names = {
         name for name in additional_sources
-        if re.search(r"\b" + re.escape(name) + r"\b", text)
+        if name in words or (
+            not re.fullmatch(r"\w+", name)
+            and re.search(r"\b" + re.escape(name) + r"\b", text)
+        )
     }
     for formal in split_top_level_arguments(parameters):
         match = re.match(r"\s*(\w+)\s*:\s*(.+?)\s*(?:=(?!=).*)?$", formal)
@@ -1156,13 +1177,20 @@ def mutable_cast_source_names(parameters, text, aliases, structs, additional_sou
         r"^[ \t]*(\w+)[ \t]*(?::[^=\n]+)?[ \t]*(?:<-|=(?!=))[ \t]*(.*?)[ \t]*$",
         re.MULTILINE,
     )
+    assignments = [
+        (match.group(1), match.group(2), set(re.findall(r"\w+", match.group(2))))
+        for match in assignment.finditer(text)
+    ]
+    compound_names = {name for name in names if not re.fullmatch(r"\w+", name)}
     changed = True
     while changed:
         changed = False
-        for match in assignment.finditer(text):
-            target, value = match.groups()
-            if target not in names and any(
-                re.search(r"\b" + re.escape(source) + r"\b", value) for source in names
+        for target, value, value_words in assignments:
+            if target not in names and (
+                not names.isdisjoint(value_words) or any(
+                    re.search(r"\b" + re.escape(source) + r"\b", value)
+                    for source in compound_names
+                )
             ):
                 names.add(target)
                 changed = True
@@ -1379,11 +1407,9 @@ def table_field_expression_type(argument, tables, table_field_types, type_aliase
     return current_type
 
 
-def local_path_expression_type(expression, text, struct_field_types):
-    """Resolve a simple local or local-struct-field type from its declaration."""
-    path = re.fullmatch(r"\s*(\w+)((?:\s*\.\s*\w+)*)\s*", expression)
-    if path is None:
-        return ""
+@lru_cache(maxsize=128)
+def local_declaration_types(text):
+    """Parse each body once across its many receiver and field-path queries."""
     local_types = {
         match.group(1): match.group(2).strip()
         for match in re.finditer(
@@ -1396,6 +1422,15 @@ def local_path_expression_type(expression, text, struct_field_types):
             match = re.match(r"\s*(\w+)\s*:\s*(.+?)\s*(?:=(?!=).*)?$", formal)
             if match:
                 local_types[match.group(1)] = match.group(2).strip()
+    return local_types
+
+
+def local_path_expression_type(expression, text, struct_field_types):
+    """Resolve a simple local or local-struct-field type from its declaration."""
+    path = re.fullmatch(r"\s*(\w+)((?:\s*\.\s*\w+)*)\s*", expression)
+    if path is None:
+        return ""
+    local_types = local_declaration_types(text)
     current_type = local_types.get(path.group(1), "")
     for member in re.findall(r"\.\s*(\w+)", path.group(2)):
         owner = re.sub(r"^(?:(?:mutable|static|heap|stack)\s+)+", "", current_type.strip())
@@ -2940,8 +2975,9 @@ extend Semantic:
         suffix = s.get("suffix", "")
         if suffix and flags:
             suffix = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", suffix)
-        kw = "if" if n == 0 else "elif"
-        body.append("                %s pass_id == %d:" % (kw, pid))
+        # pass_id is immutable and IDs are unique. Independent branches preserve
+        # dispatch while avoiding a nested AST proportional to the pass count.
+        body.append("                if pass_id == %d:" % pid)
         body.append("                    table <- %s(%s)%s" % (s["name"], args, (" " + suffix) if suffix else ""))
     body.extend(["", parallel_safety_gate_source(pid for pid, _statement in calls)])
     return head + "\n".join(body) + "\n"

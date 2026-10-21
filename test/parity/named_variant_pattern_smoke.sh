@@ -15,8 +15,8 @@ trap 'rm -rf "$WORK"' EXIT
 failures=0
 fail() { echo "named-variant-pattern smoke FAIL: $1" >&2; failures=$((failures + 1)); }
 
-# loop_captures rides along: same two-compiler exit-code check.
-for src in "$DIR"/*.elisa "$REPO_ROOT/test/fixtures/loop_captures"/*.elisa; do
+# loop_captures and self_parse_syntax ride along: same two-compiler exit-code check.
+for src in "$DIR"/*.elisa "$REPO_ROOT/test/fixtures/loop_captures"/*.elisa "$REPO_ROOT/test/fixtures/self_parse_syntax"/*.elisa; do
 	name="$(basename "$src" .elisa)"
 	if [[ "$name" == *.neg ]]; then
 		s0_out="$("$ELISACORE_BIN" "$src" -emit obj -o "$WORK/s0.o" 2>&1)" && fail "$name: stage0 accepted"

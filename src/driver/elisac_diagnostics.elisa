@@ -181,6 +181,14 @@ def flat_line_to_original(flat_line: u32) -> u32 can[Abort.Panic, Memory.Allocat
 # include expansion the parser's token lines are buffer lines, so a raw one reads one or more
 # lines off the file the reader is looking at.
 def source_line_of(flat_line: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    if driver_line_map_cached() can Global.Read:
+        best: usize = driver_line_map_best(flat_line) can Global.Read
+        can Global.Read:
+            return driver_line_map_orig[best] + (flat_line - driver_line_map_flat[best]) if best < driver_line_map_flat.count
+        return flat_line
+    return source_line_of_uncached(flat_line) can Global.Read
+
+def source_line_of_uncached(flat_line: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     map_storage: mutable darray[u8] = []
     return flat_line if not (driver_line_map_value(&map_storage) can Global.Read)
     best_flat: mutable u32 = 0
@@ -210,8 +218,117 @@ def source_line_of(flat_line: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsa
     return best_orig + (flat_line - best_flat) if best_flat > 0
     return flat_line
 
+# ELISA_STAGE1_LINE_MAP parsed once per publication/environment string. The per-call
+# parse copied the whole map (>128 KB for the compiler itself) out of the environment for
+# EVERY diagnostic; a unit with tens of thousands of findings spent longer printing them
+# than analysing it. Entries keep the per-call parse's exact arithmetic and tie rule.
+global mutable driver_line_map_bytes: darray[u8] @source
+global mutable driver_line_map_flat: darray[u32] @source
+global mutable driver_line_map_orig: darray[u32] @source
+global mutable driver_line_map_path_start: darray[usize] @source
+global mutable driver_line_map_path_stop: darray[usize] @source
+# 0 = not built, 1 = built from a map, 2 = no map. Keyed by override generation or getenv pointer.
+global mutable driver_line_map_state: u8
+global mutable driver_line_map_override: bool
+global mutable driver_line_map_generation: u64
+global mutable driver_line_map_key: uintptr
+
+# Identity of the map currently visible: the override generation, or the getenv pointer.
+def driver_line_map_current_key() -> uintptr can[Abort.Panic, Unsafe.PointerCast]:
+    override_active: bool = lexer_line_map_override_active can Global.Read
+    return 0 if override_active
+    if getenv("ELISA_STAGE1_LINE_MAP") is value_bytes:
+        return value_bytes.cast[uintptr]
+    return 0
+
+# Whether the cached entries describe the visible map. Read-only: a stale or missing cache
+# makes the printers take the per-call parse instead of rebuilding here.
+def driver_line_map_cached() -> bool can[Abort.Panic, Unsafe.PointerCast]:
+    can Global.Read:
+        return false if driver_line_map_state != 1
+        return driver_line_map_override == lexer_line_map_override_active and driver_line_map_generation == lexer_line_map_generation and driver_line_map_key == driver_line_map_current_key()
+
+# Build the cache for the visible map; called where the caller already holds Global{Read,Write}.
+def driver_line_map_refresh() -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    key: uintptr = driver_line_map_current_key() can Global.Read
+    can Global{Read,Write}:
+        override_active: bool = lexer_line_map_override_active
+        generation: u64 = lexer_line_map_generation
+        return if driver_line_map_state != 0 and driver_line_map_override == override_active and driver_line_map_generation == generation and driver_line_map_key == key
+        driver_line_map_bytes.truncate(0)
+        driver_line_map_flat.truncate(0)
+        driver_line_map_orig.truncate(0)
+        driver_line_map_path_start.truncate(0)
+        driver_line_map_path_stop.truncate(0)
+        driver_line_map_override <- override_active
+        driver_line_map_generation <- generation
+        driver_line_map_key <- key
+        driver_line_map_state <- 2
+        map_storage: mutable darray[u8] = []
+        return if not driver_line_map_value(&map_storage)
+        driver_line_map_bytes.extend(map_storage)
+        cursor: mutable usize = 0.usize()
+        while cursor < map_storage.count |cursor, map_storage|:
+            entry_stop: mutable usize = cursor
+            while entry_stop < map_storage.count |entry_stop, map_storage|:
+                break if map_storage[entry_stop] == 10
+                entry_stop <- entry_stop + 1.usize()
+            # FLAT ':' ORIG ':' PATH
+            scan: mutable usize = cursor
+            entry_flat: mutable u32 = 0
+            while scan < entry_stop |scan, entry_flat, map_storage|:
+                break if map_storage[scan] == 58
+                entry_flat <- entry_flat * 10 + (map_storage[scan] - 48).u32()
+                scan <- scan + 1.usize()
+            scan <- scan + 1.usize()
+            entry_orig: mutable u32 = 0
+            while scan < entry_stop |scan, entry_orig, map_storage|:
+                break if map_storage[scan] == 58
+                entry_orig <- entry_orig * 10 + (map_storage[scan] - 48).u32()
+                scan <- scan + 1.usize()
+            scan <- scan + 1.usize()
+            driver_line_map_flat.push(entry_flat)
+            driver_line_map_orig.push(entry_orig)
+            driver_line_map_path_start.push(scan)
+            driver_line_map_path_stop.push(entry_stop)
+            cursor <- entry_stop + 1.usize()
+        driver_line_map_state <- 1
+
+# The entry a flat line maps through: the LAST entry with the largest FLAT <= flat_line,
+# or the entry count when none has FLAT > 0 at or below it.
+def driver_line_map_best(flat_line: u32) -> usize can[Abort.Panic]:
+    can Global.Read:
+        best: mutable usize = driver_line_map_flat.count
+        best_flat: mutable u32 = 0
+        for index in 0..<driver_line_map_flat.count |best, best_flat, flat_line|:
+            entry_flat: u32 = driver_line_map_flat[index]
+            if entry_flat <= flat_line and entry_flat >= best_flat:
+                best_flat <- entry_flat
+                best <- index
+        return best if best_flat > 0 else driver_line_map_flat.count
 
 def push_diagnostic_location(buffer: mutable darray[u8]&, flat_line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    if driver_line_map_cached() can Global.Read:
+        best: usize = driver_line_map_best(flat_line) can Global.Read
+        can Global.Read:
+            if best < driver_line_map_flat.count:
+                best_start: usize = driver_line_map_path_start[best]
+                best_stop: usize = driver_line_map_path_stop[best]
+                if best_start < best_stop:
+                    for path_index in best_start..<best_stop |buffer|:
+                        buffer.push(driver_line_map_bytes[path_index])
+                    buffer.push(58)
+                elif push_source_path(buffer):
+                    buffer.push(58)
+                append_decimal(buffer, driver_line_map_orig[best] + (flat_line - driver_line_map_flat[best]))
+                return
+        if push_source_path(buffer):
+            buffer.push(58)
+        append_decimal(buffer, flat_line)
+        return
+    push_diagnostic_location_uncached(buffer, flat_line) can Global.Read
+
+def push_diagnostic_location_uncached(buffer: mutable darray[u8]&, flat_line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     map_storage: mutable darray[u8] = []
     if driver_line_map_value(&map_storage) can Global.Read:
         best_flat: mutable u32 = 0
@@ -256,8 +373,6 @@ def push_diagnostic_location(buffer: mutable darray[u8]&, flat_line: u32) -> voi
     if push_source_path(buffer):
         buffer.push(58)
     append_decimal(buffer, flat_line)
-
-
 
 
 def report_diagnostic(diagnostic: Semantic::Diagnostic) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:

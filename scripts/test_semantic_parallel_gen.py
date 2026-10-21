@@ -47,6 +47,84 @@ def analyze(
 
 
 class SemanticParallelAuditTest(unittest.TestCase):
+    def test_mutable_cast_sources_preserve_boundaries_and_alias_closure(self):
+        sources = audit.mutable_cast_source_names("", """
+one = shared
+two = one
+three = Namespace::state
+four = π
+lookalike = sharedness
+""", {}, {}, ("shared", "unused", "Namespace::state", "π"))
+        self.assertEqual(sources, {
+            "shared", "Namespace::state", "π", "one", "two", "three", "four",
+        })
+
+    def test_local_type_cache_keeps_source_and_schema_changes_separate(self):
+        source = "def probe(value: Record):\n    local: Other = value\n"
+        self.assertEqual(audit.local_path_expression_type("value.field", source, {
+            "Record": [{"field": "sview"}],
+        }), "sview")
+        self.assertEqual(audit.local_path_expression_type("value.field", source, {
+            "Record": [{"field": "mutable darray[sview]"}],
+        }), "mutable darray[sview]")
+        changed = source.replace("value: Record", "value: Changed")
+        self.assertEqual(audit.local_path_expression_type("value.field", changed, {
+            "Changed": [{"field": "u32"}],
+        }), "u32")
+        self.assertEqual(audit.local_path_expression_type("local", source, {}), "Other")
+
+    def test_copy_alias_classification_preserves_qualified_view_lifetimes(self):
+        for spelling in ("sview @source", "sview@source", "mutable sview @source"):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(audit.type_is_copy_value(spelling, {}, {}))
+                self.assertTrue(audit.type_may_contain_reference(spelling, {}, {}))
+                self.assertFalse(audit.type_may_contain_mutable_alias(spelling, {}, {}))
+        aliases = {"Text": ["sview @source"]}
+        structs = {"Record": [{"text": "Text", "count": "u32"}]}
+        self.assertTrue(audit.type_is_copy_value("Record", aliases, structs))
+        self.assertTrue(audit.type_may_contain_reference("Record", aliases, structs))
+        self.assertFalse(audit.type_may_contain_mutable_alias("Record", aliases, structs))
+        self.assertEqual(
+            audit.is_detached_copy_value("Record", aliases, structs),
+            audit.is_detached_copy_value("Record", {}, {"Record": [{"text": "sview", "count": "u32"}]}),
+        )
+        for spelling in ("mutable darray[sview @source]", "mutable sview& @source",
+                         "sview @source extra", "sview @source @other", "cstr @source"):
+            with self.subTest(unsafe=spelling):
+                self.assertFalse(audit.type_is_copy_value(spelling, {}, {}))
+                self.assertTrue(audit.type_may_contain_mutable_alias(spelling, {}, {}))
+
+    def test_qualified_view_records_keep_escape_and_mutable_cast_checks(self):
+        fields = dict(TABLE_FIELD_TYPES, view_record="ViewRecord")
+        structs = {"ViewRecord": [{"name": "sview @source", "ordinal": "usize"}],
+                   "SymbolKind": [[]]}
+        returned = analyze({"view_record": [definition(
+            "table: SymbolTable&",
+            "def view_record(table: SymbolTable&) -> ViewRecord:\n"
+            "    return table.view_record\n",
+        )]}, table_field_types=fields, struct_field_types=structs)
+        safe, writes, _ = audit.append_only(returned, "view_record")
+        self.assertFalse(safe)
+        self.assertTrue(any("returned-table-field-alias" in write for write in writes), writes)
+        cast = analyze({
+            "mutate_record": [definition(
+                "record: ViewRecord",
+                "def mutate_record(record: ViewRecord):\n"
+                "    name: sview @source = record.name\n"
+                "    raw: MutableBytes = name.data.cast[MutableBytes]\n",
+            )],
+            "root": [definition(
+                "table: lmut SymbolTable",
+                "def root(table: lmut SymbolTable):\n"
+                "    record: ViewRecord = table.view_record\n"
+                "    mutate_record(record)\n",
+            )],
+        }, table_field_types=fields, struct_field_types=structs,
+           type_aliases={"MutableBytes": ["mutable u8&"]})
+        safe, writes, _ = audit.append_only(cast, "root")
+        self.assertFalse(safe)
+        self.assertTrue(any("cast" in write for write in writes), writes)
+
     def test_diagnostic_ownership_audit_normalizes_region_annotated_views(self):
         self.assertEqual(
             diagnostic_audit.diagnostic_payload_base_type("sview @source"), "sview"
@@ -278,6 +356,17 @@ class SemanticParallelAuditTest(unittest.TestCase):
 
         self.assertEqual(records, [])
         self.assertTrue(any("exactly one body statement" in error for error in errors))
+
+    def test_flat_dispatcher_preserves_all_passes_and_rejects_mixed_shapes(self):
+        source = "def par_pass_call(pass_id: u32):\n" + ''.join(
+            f"    if pass_id == {pid}:\n        table <- check_{pid}(file, table)\n"
+            for pid in range(221))
+        records, errors = audit.parse_parallel_dispatch(source)
+        self.assertEqual(errors, [])
+        self.assertEqual([record['id'] for record in records], list(range(221)))
+        self.assertEqual([record['name'] for record in records], [f'check_{pid}' for pid in range(221)])
+        _records, errors = audit.parse_parallel_dispatch(source.replace('if pass_id == 123:', 'elif pass_id == 123:'))
+        self.assertTrue(any('expected if' in error for error in errors))
 
     def test_method_receiver_stops_at_nested_index_boundary(self):
         self.assertEqual(

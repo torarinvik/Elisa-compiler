@@ -397,6 +397,10 @@ extend Semantic:
             keys: mutable dict[u64, u32] @source
             local_callables: mutable darray[BorrowLocalCallable] @source
             initialized: mutable bool = false
+            # Every indexed row chained by key (newest first), so an ambiguous key is
+            # resolved over the rows that share it instead of over every reference row.
+            site_heads: mutable dict[u64, u32] @source = {}
+            site_next: mutable darray[u32] @source = []
             # BindingDeclaredType rows are queried by exact BindingId while building
             # closure alias facts. Cache their chains once per reference-site index so
             # repeated aliases and loop binders do not rescan the whole type table.
@@ -416,6 +420,8 @@ extend Semantic:
             enum_payload_owner_heads: mutable dict[u64, u32] @source = {}
             enum_payload_owner_next: mutable darray[u32] @source = []
             enum_payload_owner_indexed_count: mutable usize = 0
+
+        const BORROW_REFERENCE_SITE_ABSENT: usize = 18446744073709551615
 
         def borrow_reference_site_key(owner: DeclId, position: Ast::Pos) -> u64:
             can Abort.Panic:
@@ -569,8 +575,12 @@ extend Semantic:
                 if not sites.initialized:
                     if table.ref_pos.count == table.ref_binding_ids.count and table.ref_kind.count == table.ref_binding_ids.count:
                         for row in 0..<table.ref_binding_ids.count |sites, table|:
-                            if table.ref_pos[row].end_offset > table.ref_pos[row].offset:
+                            sites.site_next.push(SYMBOL_INDEX_ROW_NONE)
+                            if table.ref_pos[row].end_offset > table.ref_pos[row].offset and row < SYMBOL_INDEX_ROW_NONE.usize():
                                 key: u64 = borrow_reference_site_key(table.ref_binding_ids[row].owner, table.ref_pos[row])
+                                if sites.site_heads.get(key) is chained_head:
+                                    sites.site_next[row] <- chained_head
+                                sites.site_heads <- sites.site_heads.put(key, row.u32()) can Global{Read,Write}
                                 if sites.keys.get(key) is previous:
                                     previous_row: usize = previous.usize()
                                     if previous == SYMBOL_INDEX_ROW_NONE or previous_row >= table.ref_pos.count or previous_row >= table.ref_kind.count or previous_row >= table.ref_binding_ids.count:
@@ -586,13 +596,17 @@ extend Semantic:
                                     row_value: u32 = row.u32() if row < SYMBOL_INDEX_ROW_NONE.usize() else SYMBOL_INDEX_ROW_NONE
                                     sites.keys <- sites.keys.put(key, row_value) can Global{Read,Write}
                     sites.initialized <- true
-                if sites.keys.get(borrow_reference_site_key(owner, position)) is indexed_row and indexed_row != SYMBOL_INDEX_ROW_NONE:
-                    row: usize = indexed_row.usize()
-                    if row < table.ref_pos.count and row < table.ref_binding_ids.count and row < table.ref_kind.count:
-                        recorded: Ast::Pos = table.ref_pos[row]
-                        if table.ref_binding_ids[row].owner.value == owner.value and recorded.offset == position.offset and recorded.end_offset == position.end_offset:
-                            return (true, row)
-                return (false, 0)
+                if sites.keys.get(borrow_reference_site_key(owner, position)) is indexed_row:
+                    if indexed_row != SYMBOL_INDEX_ROW_NONE:
+                        row: usize = indexed_row.usize()
+                        if row < table.ref_pos.count and row < table.ref_binding_ids.count and row < table.ref_kind.count:
+                            recorded: Ast::Pos = table.ref_pos[row]
+                            if table.ref_binding_ids[row].owner.value == owner.value and recorded.offset == position.offset and recorded.end_offset == position.end_offset:
+                                return (true, row)
+                    return (false, 0)
+                # The key is exactly (owner, start offset) and every row that could match is
+                # indexed, so an absent key proves there is no site: skip the exact scan.
+                return (false, BORROW_REFERENCE_SITE_ABSENT)
 
         # Return both properties together so indirect-call handling performs one cache
         # probe on its common path. Ambiguous cache entries fall back to an exact scan.
@@ -610,22 +624,31 @@ extend Semantic:
                 if row_known:
                     kind: u8 = table.ref_kind[row]
                     return (kind, kind != 0, table.ref_binding_ids[row])
+                # Without this the miss path scanned every reference in the program per query,
+                # quadratic on large units (the driver's own analysis spent 99% here).
+                return (0, false, missing) if row == BORROW_REFERENCE_SITE_ABSENT
                 found: mutable bool = false
                 binding_ambiguous: mutable bool = false
                 kind_ambiguous: mutable bool = false
                 result_kind: mutable u8 = 0
                 result_binding: mutable BindingId = missing
-                for candidate in 0..<table.ref_binding_ids.count |candidate, found, binding_ambiguous, kind_ambiguous, result_kind, result_binding, table, owner, position|:
-                    id: BindingId = table.ref_binding_ids[candidate]
-                    recorded: Ast::Pos = table.ref_pos[candidate]
+                # Only rows with this exact (owner, start offset) key can match; walk their chain.
+                candidate: mutable usize = SYMBOL_INDEX_ROW_NONE.usize()
+                if sites.site_heads.get(borrow_reference_site_key(owner, position)) is chain_head:
+                    candidate <- chain_head.usize()
+                while candidate < table.ref_binding_ids.count and candidate < sites.site_next.count |candidate, found, binding_ambiguous, kind_ambiguous, result_kind, result_binding, table, owner, position, sites|:
+                    current: usize = candidate
+                    candidate <- sites.site_next[current].usize()
+                    id: BindingId = table.ref_binding_ids[current]
+                    recorded: Ast::Pos = table.ref_pos[current]
                     continue if id.owner.value != owner.value or recorded.offset != position.offset or recorded.end_offset != position.end_offset
                     if not found:
                         found <- true
-                        result_kind <- table.ref_kind[candidate]
+                        result_kind <- table.ref_kind[current]
                         result_binding <- id
                     else:
                         binding_ambiguous <- true if not ownership_binding_ids_equal(result_binding, id)
-                        kind_ambiguous <- true if result_kind != table.ref_kind[candidate]
+                        kind_ambiguous <- true if result_kind != table.ref_kind[current]
                 return (0, false, missing) if not found
                 return (3, false, missing) if kind_ambiguous
                 return (result_kind, not binding_ambiguous and result_kind != 0, result_binding if not binding_ambiguous else missing)

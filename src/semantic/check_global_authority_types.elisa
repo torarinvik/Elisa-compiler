@@ -3,8 +3,36 @@ include "./global_authority_postfix_cast_name.elisa"
 
 extend Semantic:
     private:
+        def ga_module_child_key(parent: usize, segment: sview) -> u64:
+            can Abort.Panic:
+                return name_hash(segment) ^ (parent.u64() * 11400714819323198485)
+
+        # Record module row `index` (just pushed) in the child index.
+        def ga_index_module_child(state: mutable GlobalAuthority&, index: usize) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Backfill rows a constructor seeded without indexing (e.g. the root module).
+                while state.module_child_next.count <= index and state.module_child_next.count < state.modules.count and state.module_child_next.count < state.parents.count |state, index|:
+                    row: usize = state.module_child_next.count
+                    segment: sview = (state.modules[row])[state.module_starts[row]:state.module_starts[row] + state.module_lengths[row]]
+                    key: u64 = ga_module_child_key(state.parents[row], segment)
+                    state.module_child_next.push(head if state.module_child_heads.get(key) is head else GLOBAL_AUTHORITY_NONE)
+                    state.module_child_heads <- state.module_child_heads.put(key, row) can Global{Read,Write}
+
         def ga_child_part(state: GlobalAuthority&, parent: usize, path: sview, start: usize, length: usize) -> usize:
             can Abort.Panic:
+                if state.module_child_next.count == state.modules.count:
+                    # Indexed: walk rows whose (parent, segment) hash matches; lowest index wins,
+                    # as in the scan below.
+                    best: mutable usize = state.modules.count
+                    row: mutable usize = head if state.module_child_heads.get(ga_module_child_key(parent, path[start:start + length])) is head else GLOBAL_AUTHORITY_NONE
+                    while row < state.modules.count |row, best, parent, path, start, length, state|:
+                        if row > 0 and row < best and state.parents[row] == parent and state.module_lengths[row] == length:
+                            same: mutable bool = true
+                            for byte_index in 0..<length |same|:
+                                same <- false if (state.modules[row])[state.module_starts[row] + byte_index] != path[start + byte_index]
+                            best <- row if same
+                        row <- state.module_child_next[row]
+                    return best
                 for index in 1..<state.modules.count:
                     continue if state.parents[index] != parent or state.module_lengths[index] != length
                     equal: mutable bool = true
@@ -55,6 +83,7 @@ extend Semantic:
                         state.modules.push(path)
                         state.module_starts.push(start)
                         state.module_lengths.push(end - start)
+                        ga_index_module_child(state, state.modules.count - 1) can Global{Read,Write}
                     parent <- child
                     start <- end + 2
                 return parent
@@ -95,9 +124,9 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match type_expression:
                     Expr.Ident(name, _):
-                        return ga_resolve(name, state.module_scope, false, state.alias_names, state.alias_scopes, state)
+                        return ga_resolve_indexed(name, state.module_scope, false, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                     Expr.Scope(base, name, _):
-                        return ga_resolve(name, ga_module_readonly(base, state), true, state.alias_names, state.alias_scopes, state)
+                        return ga_resolve_indexed(name, ga_module_readonly(base, state), true, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                     _:
                         return state.alias_names.count
 
@@ -106,8 +135,8 @@ extend Semantic:
                 return true if depth > 32
                 lexical_scope: usize = state.module_scope if origin == GLOBAL_AUTHORITY_NONE else origin
                 alias: usize = match type_expression:
-                    Expr.Ident(name, _): ga_resolve(name, lexical_scope, false, state.alias_names, state.alias_scopes, state)
-                    Expr.Scope(base, name, _): ga_resolve(name, ga_module_readonly(base, state, lexical_scope), true, state.alias_names, state.alias_scopes, state)
+                    Expr.Ident(name, _): ga_resolve_indexed(name, lexical_scope, false, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
+                    Expr.Scope(base, name, _): ga_resolve_indexed(name, ga_module_readonly(base, state, lexical_scope), true, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                     _: state.alias_names.count
                 return ga_mutable_parameter(state.alias_types[alias], state, depth + 1, state.alias_scopes[alias]) if alias < state.alias_names.count
                 match type_expression:
@@ -126,11 +155,11 @@ extend Semantic:
                 return expression if depth > 32
                 match expression:
                     Expr.Ident(name, _):
-                        slot: usize = ga_resolve(name, module_scope, false, state.alias_names, state.alias_scopes, state)
+                        slot: usize = ga_resolve_indexed(name, module_scope, false, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                         return ga_type_alias_result(state.alias_types[slot], state.alias_scopes[slot], state, depth + 1) if slot < state.alias_names.count
                     Expr.Scope(base, name, _):
                         owner: usize = ga_module_readonly(base, state, module_scope)
-                        slot: usize = ga_resolve(name, owner, true, state.alias_names, state.alias_scopes, state)
+                        slot: usize = ga_resolve_indexed(name, owner, true, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                         return ga_type_alias_result(state.alias_types[slot], state.alias_scopes[slot], state, depth + 1) if slot < state.alias_names.count
                     _:
                         pass
@@ -145,14 +174,15 @@ extend Semantic:
                     Expr.Unary(_, inner, _) | Expr.Paren(inner, _) | Expr.Index(inner, _, _) | Expr.IndexN(inner, _, _):
                         return ga_known_struct(inner, lexical_scope, state, depth + 1)
                     Expr.Ident(name, _):
-                        alias: usize = ga_resolve(name, lexical_scope, false, state.alias_names, state.alias_scopes, state)
+                        hash: u64 = name_hash(name)
+                        alias: usize = ga_resolve_hashed(name, hash, lexical_scope, false, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                         return ga_known_struct(state.alias_types[alias], state.alias_scopes[alias], state, depth + 1) if alias < state.alias_names.count
-                        return ga_resolve(name, lexical_scope, false, state.struct_names, state.struct_scopes, state)
+                        return ga_resolve_hashed(name, hash, lexical_scope, false, state.struct_names, state.struct_scopes, state.struct_heads, state.struct_next, state)
                     Expr.Scope(base, name, _):
                         module_scope: usize = ga_module_readonly(base, state, lexical_scope)
-                        alias: usize = ga_resolve(name, module_scope, true, state.alias_names, state.alias_scopes, state)
+                        alias: usize = ga_resolve_indexed(name, module_scope, true, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                         return ga_known_struct(state.alias_types[alias], state.alias_scopes[alias], state, depth + 1) if alias < state.alias_names.count
-                        return ga_resolve(name, module_scope, true, state.struct_names, state.struct_scopes, state)
+                        return ga_resolve_indexed(name, module_scope, true, state.struct_names, state.struct_scopes, state.struct_heads, state.struct_next, state)
                     _:
                         return state.struct_names.count
 
@@ -259,7 +289,7 @@ extend Semantic:
 
         def ga_builtin_head(head: sview) -> bool:
             return when head:
-                "bool" | "char" | "cstr" | "sview" | "dstr" | "usize" | "isize" | "uintptr" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" -> true
+                "bool" | "char" | "cstr" | "sview" | "dstr" | "usize" | "isize" | "uintptr" | "int" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" -> true
                 _ -> false
 
         def ga_closed_builtin(expression: Ast::Expr, origin: usize, state: GlobalAuthority&, depth: u32) -> bool:
@@ -270,14 +300,14 @@ extend Semantic:
                 owner: usize = match expression:
                     Expr.Scope(base, _, _): ga_module_readonly(base, state, origin)
                     _: origin
-                alias: usize = ga_resolve(head, owner, expression is Expr.Scope, state.alias_names, state.alias_scopes, state)
+                alias: usize = ga_resolve_indexed(head, owner, expression is Expr.Scope, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                 if (expression is Expr.Ident or expression is Expr.Scope) and alias < state.alias_names.count:
                     return ga_closed_builtin(state.alias_types[alias], state.alias_scopes[alias], state, depth + 1)
                 match expression:
                     Expr.Ident(name, _):
                         return false if:
                             not ga_builtin_head(name) or ga_generic_head(name, state)
-                            ga_resolve(name, origin, false, state.enum_names, state.enum_scopes, state) < state.enum_names.count
+                            ga_resolve_indexed(name, origin, false, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state) < state.enum_names.count
                         return ga_known_struct(expression, origin, state, 0) == state.struct_names.count
                     _:
                         return false
@@ -320,7 +350,7 @@ extend Semantic:
                 alias_owner: usize = match expression:
                     Expr.Scope(base, _, _): ga_module_readonly(base, state, origin)
                     _: origin
-                alias: usize = ga_resolve(head, alias_owner, qualified, state.alias_names, state.alias_scopes, state)
+                alias: usize = ga_resolve_indexed(head, alias_owner, qualified, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                 if (expression is Expr.Ident or expression is Expr.Scope) and alias < state.alias_names.count:
                     declared_alias: usize = ga_known_struct(expression, origin, state, depth)
                     caller_alias: usize = ga_known_struct(expression, state.module_scope, state, depth)
@@ -453,7 +483,7 @@ extend Semantic:
                 return false if not (expression is Expr.Ident)
                 name: sview = ga_type_head(expression)
                 return false if name != "int" and name != "void"
-                return not ga_generic_head(name, state) and ga_known_struct(expression, origin, state, 0) == state.struct_names.count and ga_resolve(name, origin, false, state.enum_names, state.enum_scopes, state) == state.enum_names.count and ga_resolve(name, origin, false, state.alias_names, state.alias_scopes, state) == state.alias_names.count
+                return not ga_generic_head(name, state) and ga_known_struct(expression, origin, state, 0) == state.struct_names.count and ga_resolve_indexed(name, origin, false, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state) == state.enum_names.count and ga_resolve_indexed(name, origin, false, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state) == state.alias_names.count
 
         # A handle application is definitely not a plain builtin result. Follow
         # aliases in their defining namespace; do not compare unknown type args.
@@ -467,16 +497,16 @@ extend Semantic:
                             Expr.Scope(base, _, _): ga_module_readonly(base, state, origin)
                             _: origin
                         qualified: bool = expression is Expr.Scope
-                        alias: usize = ga_resolve(name, owner, qualified, state.alias_names, state.alias_scopes, state)
+                        alias: usize = ga_resolve_indexed(name, owner, qualified, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state)
                         return ga_nonbuiltin_cast_target(state.alias_types[alias], state.alias_scopes[alias], state, depth + 1) if alias < state.alias_names.count
-                        return true if ga_resolve(name, owner, qualified, state.struct_names, state.struct_scopes, state) < state.struct_names.count
-                        return ga_resolve(name, owner, qualified, state.enum_names, state.enum_scopes, state) < state.enum_names.count
+                        return true if ga_resolve_indexed(name, owner, qualified, state.struct_names, state.struct_scopes, state.struct_heads, state.struct_next, state) < state.struct_names.count
+                        return ga_resolve_indexed(name, owner, qualified, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state) < state.enum_names.count
                     Expr.Index(Expr.Ident(head, _), _, _):
                         return false if:
                             head != "id" or ga_generic_head(head, state)
-                            ga_resolve(head, origin, false, state.alias_names, state.alias_scopes, state) < state.alias_names.count
-                            ga_resolve(head, origin, false, state.struct_names, state.struct_scopes, state) < state.struct_names.count
-                        return ga_resolve(head, origin, false, state.enum_names, state.enum_scopes, state) == state.enum_names.count
+                            ga_resolve_indexed(head, origin, false, state.alias_names, state.alias_scopes, state.alias_heads, state.alias_next, state) < state.alias_names.count
+                            ga_resolve_indexed(head, origin, false, state.struct_names, state.struct_scopes, state.struct_heads, state.struct_next, state) < state.struct_names.count
+                        return ga_resolve_indexed(head, origin, false, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state) == state.enum_names.count
                     _:
                         return false
 
@@ -507,7 +537,7 @@ extend Semantic:
                     Expr.Field(_, target, at):
                         return false if not ga_postfix_cast_name(target)
                         raw: Ast::Expr = Ast::Expr.Ident(target, at)
-                        return ga_builtin_head(target) or target == "void" or target == "int" or target == "s8" or target == "s16" or target == "s32" or target == "s64" or ga_generic_head(target, state) or ga_known_struct(raw, state.module_scope, state, 0) < state.struct_names.count or ga_resolve(target, state.module_scope, false, state.enum_names, state.enum_scopes, state) < state.enum_names.count or ga_alias(raw, state) < state.alias_names.count
+                        return ga_builtin_head(target) or target == "void" or target == "int" or target == "s8" or target == "s16" or target == "s32" or target == "s64" or ga_generic_head(target, state) or ga_known_struct(raw, state.module_scope, state, 0) < state.struct_names.count or ga_resolve_indexed(target, state.module_scope, false, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state) < state.enum_names.count or ga_alias(raw, state) < state.alias_names.count
                     _:
                         return false
 
@@ -518,6 +548,21 @@ extend Semantic:
                         previous_end: mutable u32 = tuple_pos.offset
                         for element in elements |previous_end, field, state|:
                             element_pos: Ast::Pos = Ast::expr_pos(element)
+                            if state.tuple_labels_ready:
+                                # Binary search the first label at or after previous_end.
+                                low: mutable usize = 0
+                                high: mutable usize = state.tuple_label_offsets.count
+                                while low < high |low, high, previous_end, state|:
+                                    middle: usize = low + (high - low) / 2
+                                    if state.tuple_label_offsets[middle] < previous_end:
+                                        low <- middle + 1
+                                    else:
+                                        high <- middle
+                                while low < state.tuple_label_offsets.count and state.tuple_label_offsets[low] < element_pos.offset |low, field, element_pos, state|:
+                                    return element if state.tuple_label_names[low] == field
+                                    low <- low + 1
+                                previous_end <- element_pos.end_offset
+                                continue
                             for annotation in state.annotations:
                                 if annotation.owner == "__tuple_label" and annotation.name == field and annotation.offset >= previous_end and annotation.offset < element_pos.offset:
                                     return element
@@ -557,16 +602,22 @@ extend Semantic:
                     Expr.Ident(_, _) | Expr.Scope(_, _, _):
                         owner: usize = ga_known_struct(resolved, state.module_scope, state, depth + 1)
                         if owner < state.struct_names.count:
-                            for index in 0..<state.field_owners.count:
+                            index_cursor: mutable usize = ga_field_first(owner, state)
+                            while index_cursor < state.field_owners.count |index_cursor|:
+                                index: usize = index_cursor
+                                index_cursor <- ga_field_after(index, state)
                                 continue if state.field_owners[index] != state.struct_names[owner] or state.field_scopes[index] != state.struct_scopes[owner]
                                 return true if:
                                     state.field_scopes[index] != state.module_scope
                                     ga_type_expression_contains_reference(state.field_types[index], state, depth + 1)
                             return false
-                        enum_owner: usize = ga_resolve(ga_type_head(resolved), state.module_scope, resolved is Expr.Scope, state.enum_names, state.enum_scopes, state)
+                        enum_owner: usize = ga_resolve_indexed(ga_type_head(resolved), state.module_scope, resolved is Expr.Scope, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state)
                         if enum_owner < state.enum_names.count:
                             return true if state.enum_variant_scopes.count < state.enum_variant_names.count or state.enum_variant_owners.count < state.enum_variant_names.count or state.enum_variant_payload_starts.count < state.enum_variant_names.count or state.enum_variant_payload_counts.count < state.enum_variant_names.count
-                            for variant_index in 0..<state.enum_variant_names.count:
+                            variant_index_cursor: mutable usize = ga_variant_first(enum_owner, state)
+                            while variant_index_cursor < state.enum_variant_names.count |variant_index_cursor|:
+                                variant_index: usize = variant_index_cursor
+                                variant_index_cursor <- ga_variant_after(variant_index, state)
                                 continue if state.enum_variant_owners[variant_index] != state.enum_names[enum_owner] or state.enum_variant_scopes[variant_index] != state.enum_scopes[enum_owner]
                                 return true if state.enum_variant_scopes[variant_index] != state.module_scope
                                 payload_start: usize = state.enum_variant_payload_starts[variant_index]
@@ -615,14 +666,20 @@ extend Semantic:
                     Expr.Ident(_, _) | Expr.Scope(_, _, _):
                         owner: usize = ga_known_struct(resolved, lexical_scope, state, depth + 1)
                         if owner < state.struct_names.count:
-                            for index in 0..<state.field_owners.count:
+                            index_cursor: mutable usize = ga_field_first(owner, state)
+                            while index_cursor < state.field_owners.count |index_cursor|:
+                                index: usize = index_cursor
+                                index_cursor <- ga_field_after(index, state)
                                 continue if state.field_owners[index] != state.struct_names[owner] or state.field_scopes[index] != state.struct_scopes[owner]
                                 return true if ga_type_expression_contains_mutable_reference(state.field_types[index], state, depth + 1, state.field_scopes[index])
                             return false
-                        enum_owner: usize = ga_resolve(ga_type_head(resolved), lexical_scope, resolved is Expr.Scope, state.enum_names, state.enum_scopes, state)
+                        enum_owner: usize = ga_resolve_indexed(ga_type_head(resolved), lexical_scope, resolved is Expr.Scope, state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state)
                         if enum_owner < state.enum_names.count:
                             return true if state.enum_variant_scopes.count < state.enum_variant_names.count or state.enum_variant_owners.count < state.enum_variant_names.count or state.enum_variant_payload_starts.count < state.enum_variant_names.count or state.enum_variant_payload_counts.count < state.enum_variant_names.count
-                            for variant_index in 0..<state.enum_variant_names.count:
+                            variant_index_cursor: mutable usize = ga_variant_first(enum_owner, state)
+                            while variant_index_cursor < state.enum_variant_names.count |variant_index_cursor|:
+                                variant_index: usize = variant_index_cursor
+                                variant_index_cursor <- ga_variant_after(variant_index, state)
                                 continue if state.enum_variant_owners[variant_index] != state.enum_names[enum_owner] or state.enum_variant_scopes[variant_index] != state.enum_scopes[enum_owner]
                                 payload_start: usize = state.enum_variant_payload_starts[variant_index]
                                 payload_count: usize = state.enum_variant_payload_counts[variant_index]
@@ -655,7 +712,10 @@ extend Semantic:
                             return tuple_field_type
                         owner: usize = ga_known_struct(base_type, lexical_scope, state, depth + 1)
                         return null if owner == state.struct_names.count
-                        for index in 0..<state.field_owners.count:
+                        index_cursor: mutable usize = ga_field_first(owner, state)
+                        while index_cursor < state.field_owners.count |index_cursor|:
+                            index: usize = index_cursor
+                            index_cursor <- ga_field_after(index, state)
                             if state.field_owners[index] == state.struct_names[owner] and state.field_scopes[index] == state.struct_scopes[owner] and state.field_names[index] == field:
                                 return null if not ga_return_portable(state.field_types[index], state.field_scopes[index], state, depth + 1)
                                 return state.field_types[index]
@@ -897,6 +957,8 @@ extend Semantic:
                 return false if state.functions[candidate] != state.functions[selected] or state.function_scopes[candidate] != state.function_scopes[selected]
                 score: i64 = ga_candidate_score(candidate, arguments, labels, state, method)
                 return false if score < 0
+                # The selected row trivially ties with itself; skip rescoring it.
+                return true if candidate == selected
                 if method:
                     return score == ga_candidate_score(selected, arguments, labels, state, true) if ga_method_candidates_known(selected, arguments, state) else true
                 return true if ga_has_variadic_candidate(selected, state)
