@@ -13,6 +13,24 @@ grep -q 'try without else requires an error union' <<< "$optional"
 scalar=$(printf 'def bad() -> int:\n    value: int = try 7\n    return value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$scalar"
 
+unary_numeric_parameter=$(printf 'def bad(value: i64) -> i64:\n    return try +value\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$unary_numeric_parameter"
+
+nested_numeric_expression=$(printf 'def bad(left: i64, right: i64) -> i64:\n    return try (left + right) * 2\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nested_numeric_expression"
+
+typed_local_chained_numeric=$(printf 'def bad() -> i64:\n    value: i64 = 2\n    return try (value + 3) * 7\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$typed_local_chained_numeric"
+
+nonfallible_int_binary=$(printf 'def bad(value: int) -> int:\n    return try value + 1\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nonfallible_int_binary"
+
+nonfallible_uintptr_binary=$(printf 'def bad(value: uintptr) -> uintptr:\n    return try value + 1\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nonfallible_uintptr_binary"
+
+unary_numeric_alias=$(printf 'def bad(value: i64) -> i64:\n    result = -(value + 1)\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$unary_numeric_alias"
+
 first_class=$(printf 'error E:\n    Bad\n\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$first_class"
 
@@ -46,14 +64,23 @@ grep -q '^D 0$' <<< "$local_error_union_alias"
 fallible_call_alias=$(printf 'error E:\n    Bad\n\ndef load() -> i64 error[E]:\n    return 1\n\ndef forward() -> i64 error[E]:\n    copied = load()\n    return try copied\n' | "$RPT")
 grep -q '^D 0$' <<< "$fallible_call_alias"
 
+conditional_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = load() if flag else load()\n    return try value\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_alias"
+
 parameter_rebinding=$(printf 'error E:\n    Bad\n\ndef forward(mutable value: i64 error[E]) -> i64 error[E]:\n    rebind value = value\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$parameter_rebinding"
 
 parameter_scalar_rebinding=$(printf 'error E:\n    Bad\n\ndef bad(mutable value: i64 error[E]) -> i64 error[E]:\n    rebind value = 7\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$parameter_scalar_rebinding"
 
+branch_parameter_scalar_rebinding=$(printf 'error E:\n    Bad\ndef forward(flag: bool, mutable value: i64 error[E]) -> i64 error[E]:\n    if flag:\n        rebind value = 7\n    return try value\n' | "$RPT")
+grep -q '^D 0$' <<< "$branch_parameter_scalar_rebinding"
+
 multi_target_rebinding=$(printf 'error E:\n    Bad\n\ndef forward(mutable other: i64, mutable value: i64 error[E]) -> i64 error[E]:\n    rebind other, value = 1, value\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$multi_target_rebinding"
+
+same_line_parameter_families=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(left: i64 error[E], right: i64 error[F]) -> i64 error[E]:\n    return try right\n' | "$RPT")
+grep -q 'cannot propagate F from a function returning E' <<< "$same_line_parameter_families"
 
 multi_target_fresh_family=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load_f() -> i64 error[F]:\n    return 1\ndef mismatch() -> i64 error[E]:\n    rebind first: i64, value: i64 = 1, load_f()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate F from a function returning E' <<< "$multi_target_fresh_family"
@@ -73,11 +100,17 @@ grep -q 'try without else requires an error union' <<< "$lambda_without_error_de
 lambda_call_mismatch=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef maybe() -> i64 error[E]:\n    return 1\ndef build() -> i64 error[E]:\n    callback = fn() -> i64 error[F] => try maybe()\n    return 0\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$lambda_call_mismatch"
 
+reserved_lambda_context_name=$(printf 'error E:\n    Bad\ndef forward(__try_inside_lambda: i64 error[E]) -> i64 error[E]:\n    return try __try_inside_lambda\n' | "$RPT")
+grep -q '^D 0$' <<< "$reserved_lambda_context_name"
+
 scalar_local=$(printf 'def bad() -> i64:\n    value: i64 = 7\n    return try value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$scalar_local"
 
 shadow_after_try=$(printf 'error E:\n    Bad\n\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    result: i64 = try value\n    if true:\n        value: i64 = 7\n    return result\n' | "$RPT")
 grep -q '^D 0$' <<< "$shadow_after_try"
+
+branch_shadow_does_not_escape=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(flag: bool, value: i64 error[E]) -> i64 error[F]:\n    if flag:\n        value = 7\n    return try value\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$branch_shadow_does_not_escape"
 
 pattern_shadow_does_not_escape_branch=$(printf 'def bad(subject: darray[i64]) -> i64:\n    value: i64 = 7\n    if subject is [value]:\n        pass\n    return try value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$pattern_shadow_does_not_escape_branch"
@@ -112,8 +145,20 @@ grep -q '^D 0$' <<< "$pattern_shadow_does_not_escape"
 nonfallible_unary=$(printf 'def bad() -> i64:\n    return try -7\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$nonfallible_unary"
 
+nonfallible_unary_plus=$(printf 'def bad() -> i64:\n    return try +7\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nonfallible_unary_plus"
+
 nonfallible_binary=$(printf 'error E:\n    Bad\n\ndef bad(value: i64 error[E]) -> i64 error[E]:\n    return try value + 1\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$nonfallible_binary"
+
+nonfallible_usize_binary=$(printf 'def bad(value: usize) -> usize:\n    return try value + 1\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nonfallible_usize_binary"
+
+nonfallible_isize_binary=$(printf 'def bad(value: isize) -> isize:\n    return try value + 1\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nonfallible_isize_binary"
+
+nonfallible_conditional=$(printf 'def bad(flag: bool) -> i64:\n    return try (7 if flag else 8)\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nonfallible_conditional"
 
 recovered=$(printf 'def maybe(flag: bool) -> int?:\n    return 7 if flag else null\ndef ok(flag: bool) -> int:\n    return try maybe(flag) else 0\n' | "$RPT")
 grep -q '^D 0$' <<< "$recovered"

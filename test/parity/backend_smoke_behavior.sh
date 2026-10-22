@@ -290,6 +290,10 @@ run_case clone_error_union_success 'error E:\n    X\n\ndef make() -> i64 error[E
 run_case clone_error_union_failure 'error E:\n    X\n\ndef fail() -> i64 error[E]:\n    raise E.X\n\ndef main() -> i64:\n    source: i64 error[E] = fail()\n    copy: i64 error[E] = clone[i64 error[E]](source)\n    return 42\n' 42
 run_case clone_error_union_struct_field 'error E:\n    X\n\nstruct Box:\n    value: i64 error[E]\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef main() -> i64:\n    source: Box = Box{value: make()}\n    copy: Box = clone[Box](source)\n    return 42\n' 42
 run_case error_union_parameter 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef take(value: i64 error[E]) -> i64:\n    return 42\n\ndef main() -> i64:\n    source: i64 error[E] = make()\n    return take(source)\n' 42
+# Same-line parameter error sets must stay attached to their own parameter in backend type
+# resolution. The fieldless E and payload-bearing F also make the catch arm exercise F's
+# family-specific payload layout, not just the shared error-union descriptor.
+run_case error_union_parameters_same_line_distinct 'error E:\n    Bad\n\nerror F:\n    Other(code: i64)\n\ndef make_e() -> i64 error[E]:\n    return 7\n\ndef fail_f() -> i64 error[F]:\n    raise F.Other(41)\n\ndef inspect(left: i64 error[E], right: i64 error[F]) -> i64:\n    return catch right:\n        ok:\n            ok\n        F.Other(code):\n            code + 1\n\ndef main() -> i64:\n    left: i64 error[E] = make_e()\n    right: i64 error[F] = fail_f()\n    return inspect(left, right)\n' 42
 # Forwarding a first-class error-union value from an error-returning function must split the
 # descriptor back into its status and payload. A plain `return value` used to store the whole
 # `{code, payload_ptr}` descriptor through the i64 out-slot and return success, losing the 7.

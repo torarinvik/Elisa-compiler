@@ -200,6 +200,10 @@ extend Semantic:
                         Stmt.Assign(target, _, assigned_value, _):
                             if target is Expr.Ident(assigned_name, _):
                                 binders.push(assigned_name)
+                            if target is Expr.Array(target_elements, _):
+                                for target_element in target_elements |binders|:
+                                    if target_element is Expr.Ident(assigned_name, _):
+                                        binders.push(assigned_name)
                             chv_scan_expression_locals(target, in_region, binders, owned, view_names, view_values)
                             chv_scan_expression_locals(assigned_value, in_region, binders, owned, view_names, view_values)
                             expression_binders: mutable darray[sview @source] = []
@@ -353,30 +357,45 @@ extend Semantic:
                         chv_scan_locals(statements, in_region, binders, owned, view_names, view_values)
                         chv_scan_expression_locals(value, in_region, binders, owned, view_names, view_values)
 
-        # `darray[T]`, `dict[K, V]`, `set[T]` or `dstr`, under any `mutable`.
-        # A by-value opaque extern handle cannot carry Elisa arena storage. Keep
-        # ambiguous names and type-parameter shadows conservative; references to
-        # a local handle slot are a separate, potentially short-lived value.
+        # An opaque extern type names foreign-managed storage, but may still hold a
+        # pointer into Elisa storage. Keep this classification separate from the value's
+        # borrow provenance; it must never clear that provenance.
+        def chv_type_name_is_foreign_handle(name: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if not table.symbol_name_index_valid or table.symbol_name_indexed_rows != table.symbols.count or table.symbol_name_next.count != table.symbols.count
+                matches: mutable usize = 0
+                opaque: mutable bool = false
+                row: mutable u32 = symbol_chain_head(table, name)
+                while row != SYMBOL_INDEX_ROW_NONE |row, matches, opaque, table, name|:
+                    symbol: Symbol = table.symbols[row.usize()]
+                    if symbol.name == name:
+                        matches <- matches + 1
+                        opaque <- symbol.kind == SymbolKind.Extern and symbol.opaque_extern_type
+                    row <- table.symbol_name_next[row.usize()]
+                return false if matches != 1 or not opaque
+                return not any parameter in table.generic_param_names where parameter == name
+
         def chv_type_is_foreign_handle(type_expression: Ast::Expr, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 match type_expression:
                     Expr.Paren(inner, _) | Expr.Unary(TokenKind.Mutable, inner, _):
                         return chv_type_is_foreign_handle(inner, table)
-                    Expr.Ident(name, _):
-                        return false if not table.symbol_name_index_valid or table.symbol_name_indexed_rows != table.symbols.count or table.symbol_name_next.count != table.symbols.count
-                        matches: mutable usize = 0
-                        opaque: mutable bool = false
-                        row: mutable u32 = symbol_chain_head(table, name)
-                        while row != SYMBOL_INDEX_ROW_NONE |row, matches, opaque, table, name|:
-                            symbol: Symbol = table.symbols[row.usize()]
-                            if symbol.name == name:
-                                matches <- matches + 1
-                                opaque <- symbol.kind == SymbolKind.Extern and symbol.opaque_extern_type
-                            row <- table.symbol_name_next[row.usize()]
-                        return false if matches != 1 or not opaque
-                        return not any parameter in table.generic_param_names where parameter == name
+                    Expr.Ident(name, _) | Expr.Scope(_, name, _):
+                        return chv_type_name_is_foreign_handle(name, table)
                     _:
                         return false
+
+        # Parallel assignment evaluates one tuple/array value once, then lands its
+        # elements in corresponding targets. Parentheses do not change that shape.
+        def chv_parallel_value_elements(value: Ast::Expr) -> (found: bool, elements: darray[Ast::Expr]):
+            can Abort.Panic:
+                match value:
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _):
+                        return (true, elements)
+                    Expr.Paren(inner, _):
+                        return chv_parallel_value_elements(inner)
+                    _:
+                        return (false, [])
 
         def chv_type_is_owned_container(type_expression: Ast::Expr) -> bool:
             can Memory.Allocate, Abort.Panic:
@@ -736,6 +755,17 @@ extend Semantic:
                     # this analysis cannot recover, preserve soundness without erasing taint.
                     chv_flow_bind(flow, name, false, facts.may_owned_view or not facts.found, facts.may_alias_reference or not facts.found)
 
+        def chv_join_expression_binding_facts(left: (found: bool, may_owned_view: bool, may_alias_reference: bool), right: (found: bool, may_owned_view: bool, may_alias_reference: bool)) -> (found: bool, may_owned_view: bool, may_alias_reference: bool):
+            can Abort.Panic:
+                return (left.found or right.found, left.may_owned_view or right.may_owned_view, left.may_alias_reference or right.may_alias_reference)
+
+        # Ordered expression children can introduce the same binder more than once.
+        # The later occurrence shadows the earlier one in the surrounding flow.
+        def chv_last_expression_binding_facts(left: (found: bool, may_owned_view: bool, may_alias_reference: bool), right: (found: bool, may_owned_view: bool, may_alias_reference: bool)) -> (found: bool, may_owned_view: bool, may_alias_reference: bool):
+            can Abort.Panic:
+                return right if right.found
+                return left
+
         def chv_expression_binding_facts(expression: Ast::Expr, binder: sview, ref_params: darray[sview]&, flow: CHVViewFlow&, table: SymbolTable&) -> (found: bool, may_owned_view: bool, may_alias_reference: bool):
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -753,74 +783,82 @@ extend Semantic:
                             return right_facts if right_facts.found
                             return left_facts
                         right_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(right, binder, ref_params, flow, table)
-                        return (left_facts.found or right_facts.found, left_facts.may_owned_view or right_facts.may_owned_view, left_facts.may_alias_reference or right_facts.may_alias_reference)
+                        if operator == TokenKind.Or:
+                            # A disjunction only introduces a pattern name when both
+                            # alternatives bind it. If the syntax collector still reports
+                            # a one-sided binder, the caller fails closed and keeps it tainted.
+                            return (left_facts.found and right_facts.found, left_facts.may_owned_view or right_facts.may_owned_view, left_facts.may_alias_reference or right_facts.may_alias_reference)
+                        return chv_last_expression_binding_facts(left_facts, right_facts)
                     Expr.Call(callee, arguments, _, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(callee, binder, ref_params, flow, table)
                         for argument in arguments |facts, flow, table|:
                             next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(argument, binder, ref_params, flow, table)
-                            facts.found <- facts.found or next_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or next_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or next_facts.may_alias_reference
+                            facts <- chv_last_expression_binding_facts(facts, next_facts)
                         return facts
                     Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = (false, false, false)
                         for child in Ast::effect_runtime_children(candidates, arguments) |facts, flow, table|:
                             next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(child, binder, ref_params, flow, table)
-                            facts.found <- facts.found or next_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or next_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or next_facts.may_alias_reference
+                            facts <- chv_last_expression_binding_facts(facts, next_facts)
                         return facts
                     Expr.Field(receiver, _, _) | Expr.Scope(receiver, _, _) | Expr.Unary(_, receiver, _) | Expr.Move(receiver, _) | Expr.RegionNew(receiver, _, _) | Expr.Paren(receiver, _):
                         return chv_expression_binding_facts(receiver, binder, ref_params, flow, table)
                     Expr.Index(receiver, index, _) | Expr.Refinement(receiver, index, _):
                         left_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(receiver, binder, ref_params, flow, table)
                         right_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(index, binder, ref_params, flow, table)
-                        return (left_facts.found or right_facts.found, left_facts.may_owned_view or right_facts.may_owned_view, left_facts.may_alias_reference or right_facts.may_alias_reference)
+                        # The selector/predicate evaluates after the receiver/base and
+                        # can shadow a same-named pattern binder from it.
+                        return right_facts if right_facts.found
+                        return left_facts
                     Expr.Slice(receiver, low, high, _):
                         receiver_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(receiver, binder, ref_params, flow, table)
                         low_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(low, binder, ref_params, flow, table)
                         high_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(high, binder, ref_params, flow, table)
-                        return (receiver_facts.found or low_facts.found or high_facts.found, receiver_facts.may_owned_view or low_facts.may_owned_view or high_facts.may_owned_view, receiver_facts.may_alias_reference or low_facts.may_alias_reference or high_facts.may_alias_reference)
+                        # Slice operands are visited receiver, low bound, high bound;
+                        # the last matching binder is the one visible after evaluation.
+                        return high_facts if high_facts.found
+                        return low_facts if low_facts.found
+                        return receiver_facts
                     Expr.IndexN(receiver, arguments, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(receiver, binder, ref_params, flow, table)
                         for argument in arguments |facts, flow, table|:
                             next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(argument, binder, ref_params, flow, table)
-                            facts.found <- facts.found or next_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or next_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or next_facts.may_alias_reference
+                            facts <- chv_last_expression_binding_facts(facts, next_facts)
                         return facts
-                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                    Expr.Tuple(elements, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = (false, false, false)
                         for element in elements |facts, flow, table|:
                             next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(element, binder, ref_params, flow, table)
-                            facts.found <- facts.found or next_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or next_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or next_facts.may_alias_reference
+                            # Tuple elements are resolved in source order and append their
+                            # binders to the enclosing scope. A later same-name element
+                            # shadows an earlier one, so retain the last matching fact.
+                            facts <- next_facts if next_facts.found
+                        return facts
+                    Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = (false, false, false)
+                        for element in elements |facts, flow, table|:
+                            next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(element, binder, ref_params, flow, table)
+                            facts <- chv_last_expression_binding_facts(facts, next_facts)
                         return facts
                     Expr.DictLit(entries, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = (false, false, false)
                         for entry in entries |facts, flow, table|:
                             key_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(entry.key, binder, ref_params, flow, table)
                             value_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(entry.value, binder, ref_params, flow, table)
-                            facts.found <- facts.found or key_facts.found or value_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or key_facts.may_owned_view or value_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or key_facts.may_alias_reference or value_facts.may_alias_reference
+                            facts <- chv_last_expression_binding_facts(facts, key_facts)
+                            facts <- chv_last_expression_binding_facts(facts, value_facts)
                         return facts
                     Expr.Construct(_, fields, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = (false, false, false)
                         for field in fields |facts, flow, table|:
                             next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(field.value, binder, ref_params, flow, table)
-                            facts.found <- facts.found or next_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or next_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or next_facts.may_alias_reference
+                            facts <- chv_last_expression_binding_facts(facts, next_facts)
                         return facts
                     Expr.RecordUpdate(base, fields, _):
                         facts: mutable (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(base, binder, ref_params, flow, table)
                         for field in fields |facts, flow, table|:
                             next_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(field.value, binder, ref_params, flow, table)
-                            facts.found <- facts.found or next_facts.found
-                            facts.may_owned_view <- facts.may_owned_view or next_facts.may_owned_view
-                            facts.may_alias_reference <- facts.may_alias_reference or next_facts.may_alias_reference
+                            facts <- chv_last_expression_binding_facts(facts, next_facts)
                         return facts
                     Expr.If(condition, then_value, else_value, _):
                         condition_facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_expression_binding_facts(condition, binder, ref_params, flow, table)
@@ -1120,6 +1158,9 @@ extend Semantic:
                             arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
                             chv_flow_merge(&arm_flow, &guarded_flow, branch_mark)
                             is_success_arm: bool = arm_index == 0
+                            # Catch arm zero binds the guarded success value. Later arms
+                            # bind error variants and cannot reuse success provenance; with
+                            # no error payload types, keep their roots conservatively tainted.
                             chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_alias_reference if is_success_arm else true, &arm_flow)
                             table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                             table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
@@ -1210,11 +1251,11 @@ extend Semantic:
                             chv_flow_bind_expression_binders(declared_value, ref_params, flow, table)
                             typed_owned: bool = chv_type_is_owned_container(type_expression) and not type_marker_present_here(type_expression, TokenKind.Ampersand)
                             literal_owned: bool = (type_expression is Expr.Absent) and (declared_value is Expr.Array(_, _))
+                            foreign_handle: bool = chv_type_is_foreign_handle(type_expression, table)
                             declared_alias_ref: bool = chv_expression_may_alias_ref(declared_value, ref_params, flow, 0)
-                            # Call argument/store checks above still run. Only the value
-                            # assigned to this foreign handle loses temporary view taint.
-                            flow.last_value_may_be_owned_view <- false if chv_type_is_foreign_handle(type_expression, table)
-                            chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)
+                            # Opaque extern values may retain borrowed Elisa pointers, so
+                            # their type does not erase initializer provenance.
+                            chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref, foreign_handle)
                         Stmt.Assign(target, operator, assigned_value, _):
                             assigned_name: sview = ident_name_of(target)
                             assigned_root: sview = chv_place_root(target)
@@ -1224,20 +1265,69 @@ extend Semantic:
                             previous_index: usize = chv_flow_latest(flow, assigned_root) if assigned_root != "" else flow.names.count
                             previous_may_owned_view <- flow.may_owned_view[previous_index] if previous_index < flow.names.count
                             previous_may_alias_reference <- flow.may_alias_reference[previous_index] if previous_index < flow.names.count
-                            table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
-                            assigned_value_may_be_owned_view: bool = flow.last_value_may_be_owned_view
-                            assigned_value_may_alias_reference: bool = chv_expression_may_alias_ref(assigned_value, ref_params, flow, 0)
+                            parallel_targets: mutable darray[Ast::Expr] = []
+                            if target is Expr.Array(target_elements, _):
+                                parallel_targets.extend(target_elements)
+                            parallel_values_found, parallel_values = chv_parallel_value_elements(assigned_value)
+                            parallel_shape: bool = parallel_values_found and parallel_targets.count > 0 and parallel_targets.count == parallel_values.count
+                            parallel_owned_views: mutable darray[bool] = []
+                            parallel_alias_refs: mutable darray[bool] = []
+                            assigned_value_may_be_owned_view: mutable bool = false
+                            assigned_value_may_alias_reference: mutable bool = false
+                            if parallel_shape:
+                                # Walk each value exactly once, left to right. Preserve its
+                                # own facts for the matching synthetic rebind temporary.
+                                for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:
+                                    table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                                    value_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                                    value_may_alias_reference: bool = chv_expression_may_alias_ref(parallel_value, ref_params, flow, 0)
+                                    parallel_owned_views.push(value_may_be_owned_view)
+                                    parallel_alias_refs.push(value_may_alias_reference)
+                                    assigned_value_may_be_owned_view <- assigned_value_may_be_owned_view or value_may_be_owned_view
+                                    assigned_value_may_alias_reference <- assigned_value_may_alias_reference or value_may_alias_reference
+                                flow.last_value_may_be_owned_view <- assigned_value_may_be_owned_view
+                            else:
+                                table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                                assigned_value_may_be_owned_view <- flow.last_value_may_be_owned_view
+                                assigned_value_may_alias_reference <- chv_expression_may_alias_ref(assigned_value, ref_params, flow, 0)
                             chv_flow_bind_expression_binders(assigned_value, ref_params, flow, table)
                             table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
-                            assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)
-                            assigned_alias_ref: bool = assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)
+                            assigned_fresh_binding: bool = operator == TokenKind.Assign and assigned_name != ""
+                            assigned_foreign_handle: bool = not assigned_fresh_binding and previous_index < flow.foreign_handle.count and flow.foreign_handle[previous_index]
+                            assigned_alias: bool = (assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)) and not assigned_foreign_handle
+                            assigned_alias_ref: bool = (assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)) and not assigned_foreign_handle
                             if assigned_root != "":
                                 assigned_index: usize = chv_flow_latest(flow, assigned_root)
-                                if assigned_index < flow.names.count:
-                                    flow.may_owned_view[assigned_index] <- assigned_alias
-                                    flow.may_alias_reference[assigned_index] <- assigned_alias_ref
+                                if operator == TokenKind.Assign and assigned_name != "":
+                                    # `=` introduces a new binding; it must not inherit an
+                                    # older same-named local's type classification.
+                                    chv_flow_bind(flow, assigned_root, false, assigned_alias, assigned_alias_ref)
+                                elif assigned_index < flow.names.count:
+                                    foreign_handle: bool = not projection_assignment and assigned_index < flow.foreign_handle.count and flow.foreign_handle[assigned_index]
+                                    flow.may_owned_view[assigned_index] <- assigned_alias and not foreign_handle
+                                    flow.may_alias_reference[assigned_index] <- assigned_alias_ref and not foreign_handle
                                 else:
                                     chv_flow_bind(flow, assigned_root, false, assigned_alias, assigned_alias_ref)
+                            elif target is Expr.Array(target_elements, _):
+                                for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, parallel_shape, parallel_owned_views, parallel_alias_refs, target_elements|:
+                                    if target_elements[target_index] is Expr.Ident(target_name, _):
+                                        target_flow_index: usize = chv_flow_latest(flow, target_name)
+                                        previous_target_may_be_owned_view: bool = target_flow_index < flow.names.count and flow.may_owned_view[target_flow_index]
+                                        previous_target_may_alias_reference: bool = target_flow_index < flow.names.count and flow.may_alias_reference[target_flow_index]
+                                        target_fresh_binding: bool = operator == TokenKind.Assign
+                                        target_foreign_handle: bool = not target_fresh_binding and target_flow_index < flow.foreign_handle.count and flow.foreign_handle[target_flow_index]
+                                        element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view
+                                        element_may_alias_reference: bool = parallel_alias_refs[target_index] if parallel_shape else assigned_value_may_alias_reference
+                                        target_alias: bool = (element_may_be_owned_view or (operator != TokenKind.Assign and previous_target_may_be_owned_view)) and not target_foreign_handle
+                                        target_alias_ref: bool = (element_may_alias_reference or (operator != TokenKind.Assign and previous_target_may_alias_reference)) and not target_foreign_handle
+                                        if operator == TokenKind.Assign:
+                                            chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)
+                                        elif target_flow_index < flow.names.count:
+                                            foreign_handle: bool = target_flow_index < flow.foreign_handle.count and flow.foreign_handle[target_flow_index]
+                                            flow.may_owned_view[target_flow_index] <- target_alias and not foreign_handle
+                                            flow.may_alias_reference[target_flow_index] <- target_alias_ref and not foreign_handle
+                                        else:
+                                            chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)
                         Stmt.Return(value, _):
                             table <- chv_walk_expression(return_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if value is return_value
                         Stmt.If(condition, then_body, else_body, _):
@@ -1308,7 +1398,7 @@ extend Semantic:
                                 ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
                                 parameter_owned: bool = chv_type_is_owned_container(parameter.type_expression) and not type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
                                 parameter_may_alias_reference: bool = type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
-                                chv_flow_bind(flow, parameter.name, parameter_owned, false, parameter_may_alias_reference)
+                                chv_flow_bind(flow, parameter.name, parameter_owned, false, parameter_may_alias_reference, chv_type_is_foreign_handle(parameter.type_expression, table))
                             if ref_params.count > 0:
                                 owned: mutable darray[sview] = []
                                 view_names: mutable darray[sview] = []

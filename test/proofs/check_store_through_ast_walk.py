@@ -416,7 +416,7 @@ HOLDER_WALK_STATEMENT_EDGES = (
     ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("Stmt.Contract(_, expression, _):", "table <- chv_walk_expression(expression, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)"),
+    ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref, foreign_handle)"),
 )
 
 HOLDER_WALK_EXPRESSION_EDGES = (
@@ -465,11 +465,11 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.If(condition, then_value, else_value, _):", "table <- chv_walk_expression(else_value, in_region, ref_params, binders, owned, view_names, view_values, else_flow, summary, table)"),
     ("Expr.Match(scrutinee, arms, _):", "for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:"),
     ("Expr.Catch(guarded, arms, _):", "table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, guarded_flow, summary, table)"),
-    ("Expr.Catch(guarded, arms, _):", "for arm in arms |table, branch_value_may_be_owned, merged_flow| -> table:"),
+    ("Expr.Catch(guarded, arms, _):", "for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:"),
     ("for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
-    ("for arm in arms |table, branch_value_may_be_owned, merged_flow| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
-    ("for arm in arms |table, branch_value_may_be_owned, merged_flow| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),
     ("for outer_ref in ref_params |comprehension_ref_params|:", "comprehension_ref_params.push(outer_ref) if outer_ref != variable"),
@@ -484,6 +484,27 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Lambda(parameters, body, _):", "table <- chv_walk_statements(body, in_region, lambda_ref_params, lambda_binders, lambda_owned, lambda_view_names, lambda_view_values, lambda_flow, summary, table)"),
     ("Expr.Block(block_statements, block_value, _, _):", "table <- chv_walk_statements(block_statements, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Block(block_statements, block_value, _, _):", "table <- chv_walk_expression(block_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+)
+
+CATCH_ARM_PROVENANCE_EDGES = (
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:",
+     "is_success_arm: bool = arm_index == 0"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:",
+     "chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_alias_reference if is_success_arm else true, arm_flow)"),
+)
+
+EXPRESSION_BINDING_FACTS_OR_EDGES = (
+    ("Expr.Binary(left, operator, right, _):", "if operator == TokenKind.Or:"),
+    ("if operator == TokenKind.Or:",
+     "return (left_facts.found and right_facts.found, left_facts.may_owned_view or right_facts.may_owned_view, left_facts.may_alias_reference or right_facts.may_alias_reference)"),
+)
+
+PARALLEL_ASSIGNMENT_FLOW_EDGES = (
+    ("Stmt.Assign(target, operator, assigned_value, _):", "parallel_values_found, parallel_values = chv_parallel_value_elements(assigned_value)"),
+    ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "parallel_owned_views.push(value_may_be_owned_view)"),
+    ("elif target is Expr.Array(target_elements, _):", "element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view"),
+    ("elif target is Expr.Array(target_elements, _):", "chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)"),
 )
 
 BINARY_AND_RIGHT_WALK_EDGE = (
@@ -631,10 +652,13 @@ ASSIGN_VIEW_TAINT_EDGES = (
     ("Stmt.Assign(target, operator, assigned_value, _):", "projection_assignment: bool = assigned_name == \"\" and assigned_root != \"\""),
     ("Stmt.Assign(target, operator, assigned_value, _):", "previous_index: usize = chv_flow_latest(flow, assigned_root) if assigned_root != \"\" else flow.names.count"),
     ("Stmt.Assign(target, operator, assigned_value, _):", "previous_may_owned_view <- flow.may_owned_view[previous_index] if previous_index < flow.names.count"),
-    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias: bool = flow.last_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)"),
+    ("else:", "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("else:", "assigned_value_may_be_owned_view <- flow.last_value_may_be_owned_view"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)"),
     ("Stmt.Assign(target, operator, assigned_value, _):", "if assigned_root != \"\":"),
-    ("if assigned_root != \"\":", "if assigned_index < flow.names.count:"),
-    ("if assigned_index < flow.names.count:", "flow.may_owned_view[assigned_index] <- assigned_alias"),
+    ("if assigned_root != \"\":", "elif assigned_index < flow.names.count:"),
+    ("elif assigned_index < flow.names.count:", "flow.may_owned_view[assigned_index] <- assigned_alias"),
 )
 
 PLACE_ROOT_PROJECTION_EDGES = (
@@ -651,11 +675,23 @@ EFFECT_CANDIDATE_EDGES = (
 )
 
 VIEW_FLOW_MERGE_EDGES = (
-    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_owned_view[index] <- left.may_owned_view[index] or right.may_owned_view[index]"),
+    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "foreign_handle: bool = index < target.foreign_handle.count and target.foreign_handle[index]"),
+    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_owned_view[index] <- (left.may_owned_view[index] or right.may_owned_view[index]) and not foreign_handle"),
 )
 
 REF_ALIAS_FLOW_MERGE_EDGES = (
-    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_alias_reference[index] <- left.may_alias_reference[index] or right.may_alias_reference[index]"),
+    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "foreign_handle: bool = index < target.foreign_handle.count and target.foreign_handle[index]"),
+    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_alias_reference[index] <- (left.may_alias_reference[index] or right.may_alias_reference[index]) and not foreign_handle"),
+)
+
+FOREIGN_HANDLE_ASSIGNMENT_EDGES = (
+    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_fresh_binding: bool = operator == TokenKind.Assign and assigned_name != \"\""),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_foreign_handle: bool = not assigned_fresh_binding and previous_index < flow.foreign_handle.count and flow.foreign_handle[previous_index]"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias: bool = (assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)) and not assigned_foreign_handle"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias_ref: bool = (assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)) and not assigned_foreign_handle"),
+    ("elif assigned_index < flow.names.count:", "foreign_handle: bool = not projection_assignment and assigned_index < flow.foreign_handle.count and flow.foreign_handle[assigned_index]"),
+    ("elif assigned_index < flow.names.count:", "flow.may_owned_view[assigned_index] <- assigned_alias and not foreign_handle"),
+    ("elif assigned_index < flow.names.count:", "flow.may_alias_reference[assigned_index] <- assigned_alias_ref and not foreign_handle"),
 )
 
 REF_ALIAS_HELPER_EDGES = (
@@ -1040,6 +1076,7 @@ theorem_routes = {
     "proof_chv_view_alias_join_preserves_owned_fact": {
         "left_branch_may_own": VIEW_FLOW_MERGE_EDGES,
         "right_branch_may_own": VIEW_FLOW_MERGE_EDGES,
+        "foreign_handle_guard": (VIEW_FLOW_MERGE_EDGES[0],),
     },
     "proof_chv_aggregate_construct_keeps_field_view_taint": {
         "field_walked": (CONSTRUCT_VIEW_TAINT_EDGES[0], CONSTRUCT_VIEW_TAINT_EDGES[1]),
@@ -1053,10 +1090,11 @@ theorem_routes = {
         "aggregate_taint_set": (RECORD_UPDATE_VIEW_TAINT_EDGES[5],),
     },
     "proof_chv_projection_assignment_preserves_aggregate_taint": {
-        "rhs_may_be_view": (ASSIGN_VIEW_TAINT_EDGES[4],),
+        "rhs_may_be_view": (ASSIGN_VIEW_TAINT_EDGES[5],),
         "previous_root_may_be_view": (ASSIGN_VIEW_TAINT_EDGES[3],),
-        "compound_assignment": (ASSIGN_VIEW_TAINT_EDGES[4],),
+        "compound_assignment": (ASSIGN_VIEW_TAINT_EDGES[7],),
         "target_is_projection": (ASSIGN_VIEW_TAINT_EDGES[1],),
+        "foreign_handle_guard": FOREIGN_HANDLE_ASSIGNMENT_EDGES,
     },
     "proof_chv_comprehension_result_tracks_yielded_view": {
         "body_may_be_owned_view": COMPREHENSION_VIEW_TAINT_EDGES,
@@ -1087,6 +1125,7 @@ theorem_routes = {
     "proof_chv_reference_alias_join_preserves_either_path": {
         "left_path_may_alias": REF_ALIAS_FLOW_MERGE_EDGES,
         "right_path_may_alias": REF_ALIAS_FLOW_MERGE_EDGES,
+        "foreign_handle_guard": (REF_ALIAS_FLOW_MERGE_EDGES[0],),
     },
     "proof_chv_reference_targets_cover_alias_routes": {
         "direct_parameter": (REF_ALIAS_HELPER_EDGES[0],),
@@ -1410,13 +1449,13 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_indirect_calls_fail_closed":
         validate_exact_boolean_theorem(positive_text, name, routes, "reference_target_checked and owned_view_checked", proof_source, proof_edges)
     elif name == "proof_chv_view_alias_join_preserves_owned_fact":
-        validate_exact_boolean_theorem(positive_text, name, routes, "left_branch_may_own or right_branch_may_own", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "(left_branch_may_own or right_branch_may_own) and not foreign_handle_guard", proof_source, proof_edges)
     elif name == "proof_chv_aggregate_construct_keeps_field_view_taint":
         validate_exact_boolean_theorem(positive_text, name, routes, "field_walked and field_taint_joined and aggregate_taint_set", proof_source, proof_edges)
     elif name == "proof_chv_record_update_keeps_base_and_field_view_taint":
         validate_exact_boolean_theorem(positive_text, name, routes, "base_taint_kept and field_walked and field_taint_joined and aggregate_taint_set", proof_source, proof_edges)
     elif name == "proof_chv_projection_assignment_preserves_aggregate_taint":
-        validate_exact_boolean_theorem(positive_text, name, routes, "rhs_may_be_view or ((compound_assignment or target_is_projection) and previous_root_may_be_view)", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "(rhs_may_be_view or ((compound_assignment or target_is_projection) and previous_root_may_be_view)) and not foreign_handle_guard", proof_source, proof_edges)
     elif name == "proof_chv_comprehension_result_tracks_yielded_view":
         validate_exact_boolean_theorem(positive_text, name, routes, "body_may_be_owned_view", proof_source, proof_edges)
     elif name == "proof_chv_comprehension_element_view_reaches_yielded_result":
@@ -1432,7 +1471,7 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_aggregate_field_projection_requires_tainted_root":
         validate_exact_boolean_theorem(positive_text, name, routes, "root_is_known and aggregate_may_contain_view", proof_source, proof_edges)
     elif name == "proof_chv_reference_alias_join_preserves_either_path":
-        validate_exact_boolean_theorem(positive_text, name, routes, "left_path_may_alias or right_path_may_alias", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "(left_path_may_alias or right_path_may_alias) and not foreign_handle_guard", proof_source, proof_edges)
     elif name == "proof_chv_reference_targets_cover_alias_routes":
         validate_exact_boolean_theorem(positive_text, name, routes, "direct_parameter and local_alias and call_result and projection_fallback", proof_source, proof_edges)
     elif name == "proof_chv_binary_operator_checks_both_operands":
@@ -1477,6 +1516,10 @@ for source, edges, label in (
     (holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES, "holder-view expression walk"),
 ):
     validate_edge_set(source, edges, label)
+validate_edge_set(holder_walk_expressions, CATCH_ARM_PROVENANCE_EDGES, "holder-view catch-arm provenance")
+validate_edge_set(function_section(holder_text, "chv_expression_binding_facts"), EXPRESSION_BINDING_FACTS_OR_EDGES, "holder-view disjunction binder provenance")
+validate_edge_set(holder_walk_statements, PARALLEL_ASSIGNMENT_FLOW_EDGES, "holder-view parallel-assignment provenance")
+validate_edge_set(holder_walk_statements, FOREIGN_HANDLE_ASSIGNMENT_EDGES, "holder-view foreign-handle assignment")
 validate_edge_set(holder_walk_expressions, BINARY_OPERATOR_FALLBACK_EDGES, "holder-view binary operator fallback")
 validate_edge_set(function_section(holder_text, "chv_binary_operator_has_non_runtime_target"), (BINARY_NON_RUNTIME_TARGET_EDGES[0],), "holder-view non-runtime binary target classification")
 validate_edge_set(holder_walk_expressions, ARRAY_VIEW_TAINT_EDGES, "holder-view array and tuple taint")
