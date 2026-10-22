@@ -1,0 +1,89 @@
+extend Semantic:
+    private:
+        def constructor_argument_never_fits(value: Ast::Expr, type_name: sview @source, names: darray[sview]&, types: darray[sview @source]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if type_name == ""
+                literal: sview = literal_kind_of(value)
+                return literal_never_fits(literal, type_name) if literal != ""
+                family: sview = infer_family(value, names, types, table)
+                return firm_never_fits(family, type_name) if family != ""
+                # A cast to a structural/ref type cannot inhabit a primitive payload.
+                match value:
+                    Expr.Index(cast_member, cast_target, cast_line):
+                        match cast_member:
+                            Expr.Field(cast_receiver, cast_name, member_line):
+                                return cast_name == "cast" and bare_type_name(cast_target) == "" and family_of_type_name(type_name) != ""
+                            _:
+                                pass
+                    _:
+                        pass
+                return false
+
+
+        def expression_is_fstring(value: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return expression_is_fstring(inner)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        match callee:
+                            Expr.Ident(callee_name, callee_pos):
+                                return callee_name == "__fstr"
+                            _:
+                                return false
+                    _:
+                        return false
+
+
+        # Flag a value (literal OR firm expression) against a declared primitive.
+        def check_value_against(value: Ast::Expr, type_name: sview @source, declared_name: sview @source, report_pos: Ast::Pos, names: darray[sview]&, types: darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                literal_kind: sview = literal_kind_of(value)
+                if literal_kind != "":
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: type_name, actual: stage0_literal_spelling(literal_kind)}) if literal_never_fits(literal_kind, type_name)
+                else:
+                    value_type: InferType = infer_expression_type(value, names, types, table)
+                    value_family: sview = family_of_kind(value_type)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: type_name, actual: stage0_value_spelling(value_type)}) if value_family != "" and firm_never_fits(value_family, type_name)
+                    # An enum value never inhabits a different, unrelated enum (check_enum_value_wall).
+                    value_enum: sview = enum_value_never_fits(value, type_name, names, types, table)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: type_name, actual: value_enum}) if value_enum != ""
+                    # A raw reference is not a C string. Its pointee may be a single byte
+                    # with no terminator, so converting it implicitly would make later
+                    # strlen-based reads cross the referent's extent.
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: type_name, actual: "reference"}) if expression_is_raw_reference(value, names, types, table) and is_string_type_name(type_name)
+                    # An f-string builds a FRESH `darray[u8]` temporary. Binding it to an
+                    # `sview` keeps a view of storage that is freed at the end of the
+                    # statement (the fuzz-found segfault, F7); stage0 reports the
+                    # mismatch. Keep the owner instead: declare the local `darray[u8]`.
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: type_name, actual: "darray[u8]"}) if type_name == "sview" and expression_is_fstring(value)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: diagnostic_type_spelling(type_name), actual: stage0_index_spelling(value_type)}) if string_member_never_fits(value_type, type_name)
+                    # A dictionary subscript is a fallible lookup, not a direct VALUE
+                    # projection: `d[k]` has type `V&?` (mutable when the dictionary
+                    # is mutable).  Keep the structural inference of its payload for
+                    # consumers that need it, but never let that payload masquerade as
+                    # a scalar initializer/assignment.  `get d[k] else ...` is a
+                    # separate AST form and is intentionally not rejected here.
+                    match value:
+                        Expr.Index(indexed_object, index_expression, index_line):
+                            receiver_id: mutable u32 = structural_type_id_of(indexed_object, names, types, table)
+                            while interned_kind(receiver_id, table) == SemTypeKind.Ref:
+                                receiver_id <- interned_elem(receiver_id, 0, table)
+                            if interned_kind(receiver_id, table) == SemTypeKind.Container and interned_name(receiver_id, table) == "dict" and family_of_type_name(type_name) != "" and not (value_family != "" and firm_never_fits(value_family, type_name)) and not string_member_never_fits(value_type, type_name):
+                                value_id: u32 = interned_elem(receiver_id, 1, table)
+                                value_spelling: sview = type_name_of_row(value_id, table)
+                                if value_spelling != "":
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: declared_name, pos: report_pos, line: report_pos.line, expected: type_name, actual: "optional reference to dictionary value"})
+                        _:
+                            pass
+
+
+extend Semantic:
+    public:
+        # Read-only adapter for trusted clients that need the frontend's inferred sort while
+        # constructing a source-bound proof environment. The caller supplies the exact lexical
+        # name/type context; this does not certify that context or replace semantic diagnostics.
+        # In particular, callers must bind the context to the same source declarations before
+        # treating a returned Bool as evidence about an imported obligation.
+        def infer_expression_type_for_proof(expression: Ast::Expr, names: darray[sview]&, types: darray[sview @source]&, table: SymbolTable&) -> InferType:
+            return infer_expression_type(expression, names, types, table)

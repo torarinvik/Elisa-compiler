@@ -1,0 +1,427 @@
+extend Backend:
+    private:
+        def emit_statement_assign_flow[@scope_region, @loops_region, @regions_region, @fns_region, @structs_region, @generics_region](statement: Stmt, return_type: ValueType, local_scope: mutable Scope& @scope_region, loops: mutable LoopStack& @loops_region, regions: mutable RegionStack& @regions_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            # `x <- value`. `<-` is Elisa's ASSIGNMENT operator; `=` is DECLARATION
+            # (`x: T = v`, or bare `x = v` which stage0 lowers to a fresh VarDeclStmt —
+            # `x = 42` after `x: i64 = 1` is "duplicate local", not a store). stage1's
+            # parser currently folds BOTH `<-` and `=` into Stmt.Assign, so the operator
+            # must be checked here: modeling `=` as a store would silently contradict
+            # stage0, where `i = i + 1` in a loop body declares a fresh shadow and the
+            # outer `i` never moves (an infinite loop, no diagnostic — observed).
+            # Compound assignment (`+=`) and non-ident targets also decline.
+            if statement is Stmt.Assign(assign_target, assign_operator, assign_value, assign_line):
+                # `x = get xs[i] else return -1` / `x <- get f() else return -1` /
+                # `b.v <- get xs[i] else return` — a GetElse that CARRIES A RECOVERY is control
+                # flow, and emit_expression has no case for it, so every assignment form below
+                # declined the enclosing function while stage0 compiled it. Route it the way
+                # `return <GetElse>` already does: declare a synthetic local through the
+                # VarDecl emitter, which lowers every GetElse shape (optional unwrap AND the
+                # checked index whose guarded type is the ELEMENT type), then assign THAT.
+                # One rewrite covers every target shape and both operators.
+                #
+                # `_ = <GetElse>` is excluded: the discard path below hands it to the statement
+                # emitter, which runs the guarded expression for its effects and binds nothing.
+                # An EMPTY recovery is excluded too — that is the bare `get` propagation form,
+                # whose own paths (the rebind one here, the VarDecl one) type it from the
+                # function's optional return.
+                ag_is_discard: mutable bool = false
+                if assign_target is Expr.Ident(ag_discard_name, ag_discard_line):
+                    _ = ag_discard_line
+                    ag_is_discard <- ag_discard_name == "_"
+                if (local_scope.pool_names.count > 0 or local_scope.group_names.count > 0) and not ag_is_discard and backend_expression_may_contain_pool_lifetime_handle(assign_value, expression_type(assign_value, local_scope, fns, structs, generics), local_scope, fns, structs, generics):
+                    structs.diagnostics.decline_line <- assign_line.line if structs.diagnostics.decline_line == 0
+                    structs.diagnostics.decline_kind <- "Pool-lifetime handle assignment inside a lexical pool needs ownership tracking"
+                    return EmitStatus.Declined
+                if assign_value is Expr.GetElse(ag_guarded, ag_recovery, ag_get_pos):
+                    if ag_recovery.count != 0 and not ag_is_discard:
+                        _ = ag_guarded
+                        ag_status: EmitStatus = emit_statement((Stmt.VarDecl("__assign_get", Expr.Invalid, assign_value, ag_get_pos)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                        return EmitStatus.Declined if ag_status != EmitStatus.Open
+                        return emit_statement((Stmt.Assign(assign_target, assign_operator, Expr.Ident("__assign_get", ag_get_pos), assign_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                if assign_target is Expr.Ident(soa_view_name, soa_view_name_line):
+                    if assign_operator == TokenKind.Assign and not (lookup_slot(local_scope, soa_view_name) is soa_view_existing):
+                        if assign_value is Expr.Index(soa_view_object, soa_view_index, soa_view_index_line):
+                            soa_view_type: mutable ValueType = expression_type(soa_view_object, local_scope, fns, structs, generics)
+                            match soa_view_object:
+                                Expr.Ident(soa_view_source, soa_view_source_line):
+                                    soa_view_type <- struct_type_of_name(soa_view_source, local_scope, structs) if soa_view_type.kind != TypeKind.Struct
+                                _:
+                                    pass
+                            if soa_view_type.kind == TypeKind.Struct and struct_declares_soa_layout(structs, structs.records.names[soa_view_type.bits.usize()]):
+                                if (struct_chain_address(soa_view_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is soa_view_base:
+                                    if (emit_expression(soa_view_index, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is soa_view_at:
+                                        soa_view_slot: LLVMValueRef = build_entry_alloca(builder, LLVMInt64TypeInContext(ctx), "soa.view.i")
+                                        _ = LLVMBuildStore(builder, soa_row_index_as_i64(soa_view_at, ctx, builder), soa_view_slot)
+                                        structs.loops.soa_row_binder_names <- structs.loops.soa_row_binder_names.push(soa_view_name)
+                                        structs.loops.soa_row_binder_slots <- structs.loops.soa_row_binder_slots.push(soa_view_type.bits)
+                                        structs.loops.soa_row_binder_bases <- structs.loops.soa_row_binder_bases.push(soa_view_base)
+                                        structs.loops.soa_row_binder_indexes <- structs.loops.soa_row_binder_indexes.push(soa_view_slot)
+                                        return EmitStatus.Open
+                                return EmitStatus.Declined
+                # `_ = EXPR` — an explicit DISCARD (both `=` and `<-` fold to Stmt.Assign).
+                # Emit the value for its side effects and drop the result; bind nothing. A
+                # discarded call (`_ = helper(5)`, `_ = fetch_add(&a, 2)`) otherwise fell to the
+                # non-ident/`=`-target declines below.
+                if assign_target is Expr.Ident(assign_discard_name, assign_discard_line):
+                    if assign_discard_name == "_":
+                        # `_ = try f(x) else return N` — see the matching note in the VarDecl
+                        # discard path: a GetElse carrying a recovery is control flow, so the
+                        # statement emitter owns it rather than emit_expression.
+                        if assign_value is Expr.GetElse(ad_get_guarded, ad_get_recovery, ad_get_pos):
+                            if ad_get_recovery.count != 0:
+                                _ = ad_get_guarded
+                                return emit_statement((Stmt.Expr(assign_value, ad_get_pos)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                        discard_try_status: i64 = emit_discarded_propagating_try(assign_value, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                        return EmitStatus.Open if discard_try_status > 0
+                        return EmitStatus.Declined if discard_try_status < 0
+                        dr_assign_status: i64 = try_discarded_darray_reserve(assign_value, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                        return EmitStatus.Open if dr_assign_status == 1
+                        return EmitStatus.Declined if dr_assign_status < 0
+                        # `_ = xs.resize(n)` / `.truncate(n)` / `.clear()` / `.push(v)` /
+                        # `.extend(other)` — these return the receiver for chaining, so they are
+                        # DISCARDED rather than written as bare statements. The STATEMENT emitter
+                        # already lowers all five; emit_expression models none of them, so each
+                        # declined here while the bare-statement spelling compiled. `reserve` was
+                        # the only one with a dedicated discard path (above).
+                        #
+                        # push/extend were the expensive omission. `_ = out.push(byte)` is how
+                        # elisacore_std's own Std::Path::join is written, so a single discarded
+                        # push declined that function -- and because one decline drops the whole
+                        # unit, it took every other function down with it. That is what stopped
+                        # the namespaced std from self-hosting: 467 declined functions reported,
+                        # one construct at fault. stage0 compiles the same line.
+                        #
+                        # A discarded call IS a statement expression, so delegate rather than
+                        # duplicate the lowering. Restricted to these darray methods: the general
+                        # discard path below is the tested route for everything else.
+                        if assign_value is Expr.Call(da_callee, da_arguments, da_argument_names, da_call_line):
+                            match da_callee:
+                                Expr.Field(da_object, da_method, da_method_line):
+                                    if da_method == "resize" or da_method == "truncate" or da_method == "clear" or da_method == "push" or da_method == "extend":
+                                        da_receiver_type: ValueType = darray_type_behind_expr(da_object, local_scope, structs)
+                                        if da_receiver_type.kind == TypeKind.DArray:
+                                            da_handled: mutable bool = false
+                                            da_status: EmitStatus = emit_statement_blocks_exprs((Stmt.Expr(assign_value, assign_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, &da_handled) can Global{Read,Write}
+                                            return da_status if da_handled
+                                _:
+                                    pass
+                        discard_assign_type: ValueType = expression_type(assign_value, local_scope, fns, structs, generics)
+                        discard_assign_expected: ValueType = discard_assign_type if discard_assign_type.kind != TypeKind.Unmodeled else ValueType{kind: TypeKind.Signed, bits: 64}
+                        if (emit_expression(assign_value, discard_assign_expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is discarded_assign_value:
+                            _ = discarded_assign_value
+                            return EmitStatus.Open
+                        return EmitStatus.Declined
+                # `rebind a: T, lexer = call(...)` / `rebind a, b <- call(...)` — parser lowers
+                # rebind to Assign(Array([targets…]), op, value). Stage0: emit the call once,
+                # bind the primary result to the first target, and treat trailing targets that
+                # name existing lmut/locals as claims (no extra IR — lmut mutation is by ptr).
+                # Without this, every lexer/parser `rebind token, lexer = lexer.next_token()`
+                # declines and gen2 cannot compile the product frontend.
+                if assign_target is Expr.Array(rebind_targets, rebind_array_line):
+                    return EmitStatus.Declined if rebind_targets.count == 0
+                    # `xs, last <- xs.pop()`, `xs, item <- xs.remove_at(i)`, `d, found <- d.remove(k)`
+                    # — the value-threading spellings (STYLE_GUIDE.md section 6) of
+                    # `last <- xs.pop()` and friends: the container goes in and comes back, the
+                    # method's own result is the second element. Each method already updates its
+                    # receiver in place, so the form IS the single-target assignment and is
+                    # emitted as exactly that statement.
+                    if rebind_targets.count == 2 and assign_operator == TokenKind.LArrow and assign_value is Expr.Call(claim_callee, _, _, _):
+                        if claim_callee is Expr.Field(claim_receiver, claim_method, _):
+                            claim_darray: bool = (claim_method == "pop" or claim_method == "remove_at") and darray_type_behind_expr(claim_receiver, local_scope, structs).kind == TypeKind.DArray
+                            claim_dict: bool = claim_method == "remove" and dict_type_args_of(claim_receiver, local_scope, fns, structs, generics).count != 0
+                            if (claim_darray or claim_dict) and same_assign_place(rebind_targets[0], claim_receiver):
+                                return emit_statement((Stmt.Assign(rebind_targets[1], assign_operator, assign_value, assign_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                    # `first, second <- second, first` — POSITIONAL parallel assignment, the
+                    # shape check_raise_destination uses to order an error-family pair.
+                    #
+                    # Every RHS value is emitted BEFORE any store. Interleaving them would make
+                    # the swap read `first` on the right AFTER it had already been overwritten —
+                    # a wrong answer, and avoiding it is the whole point of the form existing.
+                    #
+                    # Only `<-` (rebind) and only targets that are EXISTING locals: a `=` form
+                    # would be declaring new names, and lookup_slot failing leaves that
+                    # declining rather than storing into something that is not there.
+                    # `lo, hi = (n, n + 1)` (a parenthesized tuple) and `lo, hi = n, n + 1` (a
+                    # bare comma list binding FRESH names): the tuple-block emitter's contract with
+                    # no leading statements — every component is evaluated before any target is
+                    # bound. Both declined, though the block form `lo, hi =` NEWLINE `n, n + 1`
+                    # already compiled through the same emitter.
+                    if assign_value is Expr.Tuple(tuple_rhs_elements, tuple_rhs_line):
+                        return emit_tuple_block_assignment(rebind_targets, assign_operator, assign_value, assign_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                    if assign_operator == TokenKind.Assign and assign_value is Expr.Array(fresh_values, fresh_values_line):
+                        return emit_tuple_block_assignment(rebind_targets, assign_operator, (Expr.Tuple(fresh_values, fresh_values_line)), assign_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                    if assign_value is Expr.Array(par_values, par_array_line):
+                        return EmitStatus.Declined if:
+                            assign_operator != TokenKind.LArrow
+                            par_values.count != rebind_targets.count
+                        par_temps: mutable darray[LLVMValueRef] = []
+                        par_slots: mutable darray[LLVMValueRef] = []
+                        par_declined: mutable bool = false
+                        for par_index in 0..<par_values.count |par_temps, par_slots, par_declined, rebind_targets, par_values, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                            continue if par_declined
+                            if rebind_targets[par_index] is Expr.Ident(par_name, par_name_line):
+                                par_type: ValueType = lookup_type(local_scope, par_name)
+                                # Two element shapes MUTATE THE TARGET IN PLACE and store nothing; the
+                                # manifest desugar (parser_stmt.elisa) now routes every `<-` branch
+                                # here, so both must be handled where the single-target path handled
+                                # them, or the compiler's own `parser, out <- if …: parser, out.push(d)
+                                # else: parser.advance(), out` declines (44 corpus programs, every one
+                                # embedding the parser):
+                                #   * an `lmut` PARAMETER's slot holds a POINTER (TypeKind.Ref); a
+                                #     threading call on it mutates through that pointer, and the value
+                                #     emit_expression's threading rule would hand back (the loaded
+                                #     struct) does not fit a pointer slot — emit the call for effect;
+                                #   * `out.push(d)` and the other four receiver-returning darray methods
+                                #     are STATEMENTS the block emitter lowers and emit_expression does
+                                #     not model — delegate exactly as the `_ = out.push(byte)` discard
+                                #     path above does.
+                                # A bare `parser` re-stated only to hold its column is a no-op store on a
+                                # pointer slot, skipped the same way.
+                                par_in_place: mutable bool = false
+                                if par_type.kind == TypeKind.Ref:
+                                    if par_values[par_index] is Expr.Ident(par_self_name, par_self_line):
+                                        par_in_place <- par_self_name == par_name
+                                if par_values[par_index] is Expr.Call(par_call_callee, par_call_args, par_call_arg_names, par_call_line):
+                                    if par_call_callee is Expr.Field(par_call_receiver, par_call_method, par_call_method_line):
+                                        if par_call_receiver is Expr.Ident(par_receiver_name, par_receiver_line):
+                                            if par_receiver_name == par_name:
+                                                par_is_darray_op: bool = (par_call_method == "resize" or par_call_method == "truncate" or par_call_method == "clear" or par_call_method == "push" or par_call_method == "extend") and darray_type_behind_expr(par_call_receiver, local_scope, structs).kind == TypeKind.DArray
+                                                if par_is_darray_op:
+                                                    par_handled: mutable bool = false
+                                                    par_status: EmitStatus = emit_statement_blocks_exprs((Stmt.Expr(par_values[par_index], par_call_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, &par_handled) can Global{Read,Write}
+                                                    par_in_place <- par_handled and par_status != EmitStatus.Declined
+                                                    par_declined <- true if not par_in_place
+                                                elif par_type.kind == TypeKind.Ref:
+                                                    if (emit_call(par_call_callee, par_call_args, par_call_arg_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is par_call_effect:
+                                                        _ = par_call_effect
+                                                        par_in_place <- true
+                                                    else:
+                                                        par_declined <- true
+                                continue if par_in_place or par_declined
+                                if par_type.kind == TypeKind.Unmodeled:
+                                    par_declined <- true
+                                elif lookup_slot(local_scope, par_name) is par_slot:
+                                    if (emit_expression(par_values[par_index], par_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is par_value:
+                                        par_temps.push(par_value)
+                                        par_slots.push(par_slot)
+                                    else:
+                                        par_declined <- true
+                                else:
+                                    par_declined <- true
+                            else:
+                                par_declined <- true
+                        return EmitStatus.Declined if par_declined
+                        for par_store in 0..<par_temps.count |par_temps, par_slots, builder|:
+                            _ = LLVMBuildStore(builder, par_temps[par_store], par_slots[par_store])
+                            if rebind_targets[par_store] is Expr.Ident(par_stored_name, _):
+                                clear_local_callable_aliases(local_scope, par_stored_name)
+                        return EmitStatus.Open
+                    if assign_value is Expr.Block(bv_statements, bv_value, bv_captures, bv_block_line):
+                        return emit_tuple_block_assignment(rebind_targets, assign_operator, assign_value, assign_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                    # `a, b, c = match SCRUT:` where every ARM YIELDS A TUPLE — one dispatch,
+                    # several outputs (resolve_enums.elisa's check_unreachable_arms is the shape
+                    # this exists for). Element types come from the FIRST arm's tuple, which is
+                    # also what the match-into-slot emitter stores through for every other arm,
+                    # so a later arm whose element does not emit at that type declines rather
+                    # than storing a mismatched value.
+                    if assign_value is Expr.Match(dm_scrutinee, dm_arms, dm_match_line):
+                        return EmitStatus.Declined if rebind_targets.count < 2 or dm_arms.count == 0
+                        dm_names: mutable darray[sview @source] = []
+                        dm_target_ok: mutable bool = true
+                        for dm_target in rebind_targets |dm_names, dm_target_ok|:
+                            if dm_target is Expr.Ident(dm_target_name, dm_target_line):
+                                dm_names.push(dm_target_name)
+                            else:
+                                dm_target_ok <- false
+                        return EmitStatus.Declined if not dm_target_ok
+                        dm_types: mutable darray[ValueType] = []
+                        if arm_value_expression(dm_arms[0].body) is dm_first_value:
+                            match dm_first_value:
+                                Expr.Tuple(dm_first_elements, dm_first_line):
+                                    return EmitStatus.Declined if dm_first_elements.count != rebind_targets.count
+                                    # A bare integer literal has no intrinsic type, so expression_type
+                                    # answers Unmodeled for `true, 1, 7`; resolve_type applies stage0's
+                                    # i64 default the same way the scrutinee dispatch does.
+                                    dm_types.extend([resolve_type(dm_element, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics) for dm_element in dm_first_elements])
+                                _:
+                                    pass
+                        return EmitStatus.Declined if dm_types.count != rebind_targets.count
+                        match_status: EmitStatus = emit_match_into_slot(dm_scrutinee, dm_arms, dm_types, dm_names, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                        if match_status == EmitStatus.Open:
+                            for dm_target_name in dm_names:
+                                clear_local_callable_aliases(local_scope, dm_target_name)
+                        return match_status
+                    # Named tuple results are positional values, not lmut thread claims.
+                    tuple_result_type: ValueType = expression_type(assign_value, local_scope, fns, structs, generics)
+                    if tuple_result_type.kind == TypeKind.Struct:
+                        if structs.records.names[tuple_result_type.bits.usize()] == "":
+                            return emit_tuple_block_assignment(rebind_targets, assign_operator, assign_value, assign_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                    if rebind_targets[0] is Expr.Ident(rb_name, rb_line):
+                        # `rebind X: T, parser = get parser.method()` — value-position BARE `get`:
+                        # the guarded method returns an optional (its receiver `parser` is mutated
+                        # in place, the trailing target); PROPAGATE None on absent (this fn returns
+                        # an optional), bind X's payload on present. emit_expression has no GetElse
+                        # value case and the parser does NOT strip a rebind's `get`, so without this
+                        # every `rebind X: Ast::Expr = get parser.…()` (pervasive in the parser
+                        # dispatchers) declined. Mirrors the VarDecl bare-get path.
+                        if assign_value is Expr.GetElse(rb_get_guarded, rb_get_recovery, rb_get_gline):
+                            if rb_get_recovery.count == 0 and return_type.kind == TypeKind.Optional:
+                                rb_get_opt_type: mutable ValueType = expression_type(rb_get_guarded, local_scope, fns, structs, generics)
+                                # Two-level match (NOT a single nested `is Expr.Call(Expr.Field(_,n,_),…)`):
+                                # the backend's packed-is binds only TOP-LEVEL fields, so a nested pattern
+                                # that binds an inner name would itself decline during self-host.
+                                if rb_get_opt_type.kind != TypeKind.Optional and rb_get_guarded is Expr.Call(rb_get_callee, rb_gm_args, _, _):
+                                    match rb_get_callee:
+                                        Expr.Field(_, rb_gm_name, _):
+                                            rb_gm_ret: mutable ValueType = lookup_return_type(fns, "Parser", rb_gm_name)
+                                            rb_gm_ret <- lookup_return_type(fns, "", rb_gm_name) if rb_gm_ret.kind == TypeKind.Unmodeled
+                                            rb_gm_idx: mutable i64 = function_index_of_arity(fns, "Parser", rb_gm_name, rb_gm_args.count + 1)
+                                            rb_gm_idx <- function_index_of(fns, "Parser", rb_gm_name) if rb_gm_idx < 0
+                                            rb_gm_ret <- copied_type(fns.returns[rb_gm_idx.usize()]) if rb_gm_idx >= 0
+                                            rb_get_opt_type <- rb_gm_ret
+                                        _:
+                                            pass
+                                return EmitStatus.Declined if rb_get_opt_type.kind != TypeKind.Optional
+                                rb_get_payload: ValueType = optional_payload_of(rb_get_opt_type, structs)
+                                return EmitStatus.Declined if rb_get_payload.kind == TypeKind.Unmodeled
+                                if (emit_expression(rb_get_guarded, rb_get_opt_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is rb_get_optional:
+                                    rb_get_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                    rb_get_present: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, rb_get_fn, "rb.get.present")
+                                    rb_get_absent: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, rb_get_fn, "rb.get.absent")
+                                    rb_get_tag: LLVMValueRef = optional_tag_of(rb_get_optional, rb_get_opt_type, structs, ctx, builder)
+                                    _ = LLVMBuildCondBr(builder, rb_get_tag, rb_get_present, rb_get_absent)
+                                    LLVMPositionBuilderAtEnd(builder, rb_get_absent)
+                                    (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
+                                    _ = LLVMBuildRet(builder, LLVMConstNull(llvm_type_of(return_type, structs, ctx)))
+                                    LLVMPositionBuilderAtEnd(builder, rb_get_present)
+                                    rb_get_value: LLVMValueRef = optional_payload_value_of(rb_get_optional, rb_get_opt_type, structs, ctx, builder)
+                                    rb_get_storage: mutable darray[u8] = []
+                                    rb_get_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(rb_get_payload, structs, ctx), sview_to_cstr(rb_name, rb_get_storage))
+                                    _ = LLVMBuildStore(builder, rb_get_value, rb_get_slot)
+                                    declare_local(local_scope, rb_name, rb_get_slot, rb_get_payload)
+                                    return EmitStatus.Open
+                                return EmitStatus.Declined
+                        # `parser, _ <- parser.advance()` is the lmut thread-claim form:
+                        # `parser` names the receiver being mutated and `_` discards the
+                        # returned Token. It must not bind that Token over the Parser& slot.
+                        # The same shape occurs throughout the self-hosting parser/lexer.
+                        if lookup_type(local_scope, rb_name).kind == TypeKind.Ref and assign_value is Expr.Call(rb_claim_callee, rb_claim_args, rb_claim_arg_names, rb_claim_line):
+                            match rb_claim_callee:
+                                Expr.Field(rb_claim_recv, rb_method_name, rb_method_line):
+                                    match rb_claim_recv:
+                                        Expr.Ident(rb_receiver_name, rb_receiver_line):
+                                            if rb_receiver_name == rb_name:
+                                                rb_claim_type: mutable ValueType = expression_type(assign_value, local_scope, fns, structs, generics)
+                                                if rb_claim_type.kind == TypeKind.Unmodeled:
+                                                    rb_claim_ret: mutable ValueType = lookup_return_type(fns, "Parser", rb_method_name)
+                                                    rb_claim_ret <- lookup_return_type(fns, "", rb_method_name) if rb_claim_ret.kind == TypeKind.Unmodeled
+                                                    rb_claim_index: mutable i64 = function_index_of_arity(fns, "Parser", rb_method_name, rb_claim_args.count + 1)
+                                                    rb_claim_index <- function_index_of(fns, "Parser", rb_method_name) if rb_claim_index < 0
+                                                    rb_claim_ret <- copied_type(fns.returns[rb_claim_index.usize()]) if rb_claim_index >= 0
+                                                    rb_claim_type <- rb_claim_ret if rb_claim_ret.kind != TypeKind.Unmodeled
+                                                if (emit_expression(assign_value, rb_claim_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is rb_claim_value:
+                                                    # `parser, value <- parser.expression()` — the RECEIVER is
+                                                    # target 0 (mutated through its pointer, no store needed)
+                                                    # and the returned value belongs to target 1. Dropping it
+                                                    # left the second name at its previous value: every
+                                                    # `Stmt.Return(value, …)` in the self-hosted parser was
+                                                    # built with `value` still null, so gen2 emitted nothing.
+                                                    # `parser, _ <- parser.advance()` still discards.
+                                                    if rebind_targets.count > 1 and rb_claim_type.kind != TypeKind.Void and rb_claim_type.kind != TypeKind.Unmodeled:
+                                                        match rebind_targets[1]:
+                                                            Expr.Ident(rb_claim_second, rb_claim_second_line):
+                                                                if rb_claim_second != "_":
+                                                                    rb_claim_existing: LLVMValueRef? = lookup_slot(local_scope, rb_claim_second)
+                                                                    rb_claim_bound: mutable bool = false
+                                                                    if rb_claim_existing is rb_claim_slot:
+                                                                        rb_claim_here: LLVMBasicBlockRef = LLVMGetInsertBlock(builder)
+                                                                        rb_claim_decl_block: LLVMBasicBlockRef = LLVMGetInstructionParent(rb_claim_slot)
+                                                                        rb_claim_fn: LLVMValueRef = LLVMGetBasicBlockParent(rb_claim_here)
+                                                                        rb_claim_entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(rb_claim_fn)
+                                                                        rb_claim_prior: ValueType = lookup_type(local_scope, rb_claim_second)
+                                                                        if (rb_claim_decl_block == rb_claim_here or rb_claim_decl_block == rb_claim_entry) and rb_claim_prior.kind == rb_claim_type.kind and rb_claim_prior.bits == rb_claim_type.bits:
+                                                                            _ = LLVMBuildStore(builder, rb_claim_value, rb_claim_slot)
+                                                                            clear_local_callable_aliases(local_scope, rb_claim_second)
+                                                                            rb_claim_bound <- true
+                                                                    if not rb_claim_bound:
+                                                                        rb_claim_alloca: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(rb_claim_type, structs, ctx), "rebind.claim")
+                                                                        _ = LLVMBuildStore(builder, rb_claim_value, rb_claim_alloca)
+                                                                        declare_local(local_scope, rb_claim_second, rb_claim_alloca, rb_claim_type)
+                                                            _:
+                                                                pass
+                                                    return EmitStatus.Open
+                                                return EmitStatus.Declined
+                                        _:
+                                            pass
+                                _:
+                                    pass
+                        rb_type: mutable ValueType = expression_type(assign_value, local_scope, fns, structs, generics)
+                        if rb_type.kind == TypeKind.Unmodeled and assign_value is Expr.Call(rb_method_callee, rb_method_args, _, _):
+                            match rb_method_callee:
+                                Expr.Field(_, rb_method_name, _):
+                                    parser_method_type: mutable ValueType = lookup_return_type(fns, "Parser", rb_method_name)
+                                    parser_method_type <- lookup_return_type(fns, "", rb_method_name) if parser_method_type.kind == TypeKind.Unmodeled
+                                    parser_method_index: mutable i64 = function_index_of_arity(fns, "Parser", rb_method_name, rb_method_args.count + 1)
+                                    parser_method_index <- function_index_of(fns, "Parser", rb_method_name) if parser_method_index < 0
+                                    parser_method_type <- copied_type(fns.returns[parser_method_index.usize()]) if parser_method_index >= 0
+                                    parser_method_type <- ValueType{kind: TypeKind.Void, bits: 0} if rb_method_name == "skip_newlines"
+                                    rb_type <- parser_method_type if parser_method_type.kind != TypeKind.Unmodeled
+                                _:
+                                    pass
+                        rb_type <- lookup_type(local_scope, rb_name) if rb_type.kind == TypeKind.Unmodeled else rb_type
+                        return EmitStatus.Declined if rb_type.kind == TypeKind.Unmodeled
+                        if rb_type.kind == TypeKind.Void:
+                            if (emit_expression(assign_value, rb_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is rb_void_value:
+                                _ = rb_void_value
+                                return EmitStatus.Open
+                            return EmitStatus.Declined
+                        if (emit_expression(assign_value, rb_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is rb_value:
+                            # Reuse a slot only when its alloca dominates this block (the
+                            # usual loop-carried scalar rebind). A same-named declaration from
+                            # a sibling arm does not dominate here, so shadow it with a fresh
+                            # arm-local slot instead.
+                            rb_existing: LLVMValueRef? = lookup_slot(local_scope, rb_name)
+                            if rb_existing is rb_slot_value:
+                                rb_current_block: LLVMBasicBlockRef = LLVMGetInsertBlock(builder)
+                                rb_existing_block: LLVMBasicBlockRef = LLVMGetInstructionParent(rb_slot_value)
+                                rb_function: LLVMValueRef = LLVMGetBasicBlockParent(rb_current_block)
+                                rb_entry_block: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(rb_function)
+                                if rb_existing_block == rb_current_block or rb_existing_block == rb_entry_block:
+                                    _ = LLVMBuildStore(builder, rb_value, rb_slot_value)
+                                    clear_local_callable_aliases(local_scope, rb_name)
+                                else:
+                                    rb_alloca: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(rb_type, structs, ctx), "rebind")
+                                    _ = LLVMBuildStore(builder, rb_value, rb_alloca)
+                                    declare_local(local_scope, rb_name, rb_alloca, rb_type)
+                            else:
+                                rb_alloca: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(rb_type, structs, ctx), "rebind")
+                                _ = LLVMBuildStore(builder, rb_value, rb_alloca)
+                                declare_local(local_scope, rb_name, rb_alloca, rb_type)
+                            # Trailing targets: lmut claims / existing names — stage0 emits no
+                            # extra stores (pointer receivers already mutated in the call).
+                            return EmitStatus.Open
+                        return EmitStatus.Declined
+                    return EmitStatus.Declined
+                # Any assignment kills a narrowing proof about the target: the value the
+                # `assert PATH != null` was about is gone, and a stale proof would unwrap a
+                # fresh null. Done BEFORE the store so no path below can miss it.
+                invalidate_narrowing(assign_target, structs)
+                # `xs <- xs.push(v)` / `obj.field <- obj.field.push(v)` — stage0's darray push
+                # mutates in place and returns the same container. Lower as in-place push on
+                # the receiver address (same as the statement form `xs.push(v)`), not as a
+                # full value rebuild. Lexer `pending_tokens <- pending_tokens.push(token)`.
+                assign_container_matched: mutable bool = false
+                assign_container_value: EmitStatus = emit_assign_container_and_compound(assign_target, assign_operator, assign_value, assign_line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, &assign_container_matched) can Global{Read,Write}
+                return assign_container_value if assign_container_matched
+                assign_place_matched: mutable bool = false
+                assign_place_value: EmitStatus = emit_assign_to_place(assign_target, assign_operator, assign_value, assign_line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, &assign_place_matched) can Global{Read,Write}
+                return assign_place_value if assign_place_matched
+                return EmitStatus.Declined
+            return emit_statement_branching(statement, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, handled) can Global{Read,Write}
+include "./codegen_stmt_assign_place.elisa"
+include "./codegen_stmt_assign_place_rebind.elisa"
+
+include "./codegen_stmt_assign_container.elisa"
+
+include "./codegen_stmt_branching.elisa"

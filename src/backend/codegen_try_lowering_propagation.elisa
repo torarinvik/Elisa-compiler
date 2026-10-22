@@ -1,0 +1,292 @@
+extend Backend:
+    private:
+        # The EXPLICIT type-argument list of a generic callee — `f[T]` (Index) or `f[K, V]`
+        # (IndexN) — plus its base name. `ok` is false when the callee is not that shape or a
+        # type argument does not resolve. Written as one out-param helper so the three `try`
+        # dispatch sites do not each re-open the Index/IndexN pair.
+        def generic_callee_type_args(callee: Expr, base: mutable sview&, ok: mutable bool&, structs: mutable StructTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            resolved: mutable darray[ValueType] = []
+            ok <- false
+            match callee:
+                Expr.Index(single_callee, single_arg, single_line):
+                    match single_callee:
+                        Expr.Ident(single_name, single_name_line):
+                            single_type: ValueType = annotation_value_type(single_arg, structs)
+                            if single_type.kind != TypeKind.Unmodeled:
+                                resolved.push(single_type)
+                                base <- single_name
+                                ok <- true
+                        _:
+                            pass
+                Expr.IndexN(multi_callee, multi_args, multi_line):
+                    match multi_callee:
+                        Expr.Ident(multi_name, multi_name_line):
+                            multi_declined: mutable bool = false
+                            for multi_arg in multi_args |resolved, multi_declined, structs|:
+                                multi_type: ValueType = annotation_value_type(multi_arg, structs)
+                                multi_declined <- true if multi_type.kind == TypeKind.Unmodeled
+                                resolved.push(multi_type)
+                            if not multi_declined:
+                                base <- multi_name
+                                ok <- true
+                        _:
+                            pass
+                _:
+                    pass
+            return resolved
+
+
+
+
+        # `try f[K, V](args)` with NO `else`, in an error-returning function — the PROPAGATING
+        # form of a generic error call with EXPLICIT type arguments. The plain propagating
+        # helpers take a bare name and recover the type args by INFERENCE from argument 0,
+        # which the std's `arena_dict_put[cstr[key_shape], i64](a, m, key, value)` cannot
+        # supply; without this the call fell through to the plain generic lowering, which
+        # declines every error-returning instantiation outright. `wants_value` selects whether
+        # the out-slot's success value is loaded (`return try …`) or discarded (statement form).
+        def emit_propagating_generic_try_value(base: sview @source, type_args: darray[ValueType]&, arguments: darray[Expr]&, wants_value: bool, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            gtry_slot: i64 = generic_index_of(generics, base)
+            return null if:
+                gtry_slot < 0
+                not generics.is_error[gtry_slot.usize()]
+            gtry_type: ValueType = generic_return_type(base, type_args, generics, structs)
+            return null if:
+                gtry_type.kind == TypeKind.Unmodeled
+                wants_value and gtry_type.kind == TypeKind.Void
+            explicit_error_family: sview @source = resolved_error_family(infer_generic_error_family(gtry_slot.usize(), arguments, local_scope, fns, structs, generics), structs)
+            return null if generic_error_param_at(generics, gtry_slot.usize()) != "" and explicit_error_family == ""
+            gtry_return_family: sview = current_error_return_family(runtime, structs)
+            return null if not error_status_remap_supported(explicit_error_family, gtry_return_family, structs)
+            if instantiate_generic_with_error_family(base, type_args, explicit_error_family, generics, structs, m, ctx) is gtry_target:
+                # A VOID-success instantiation still writes an i64 0 on `raise`, so the
+                # out-slot needs a real allocation even when nothing reads it.
+                gtry_out_llvm: LLVMTypeRef = LLVMInt64TypeInContext(ctx) if gtry_type.kind == TypeKind.Void else llvm_type_of(gtry_type, structs, ctx)
+                gtry_out_slot: LLVMValueRef = build_entry_alloca(builder, gtry_out_llvm, "try.out")
+                gtry_args: mutable darray[LLVMValueRef] = [gtry_out_slot]
+                gtry_declined: mutable bool = false
+                gtry_index: mutable usize = 0
+                for gtry_arg in arguments |gtry_args, gtry_declined, gtry_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    gtry_wanted: ValueType = instantiation_param_type(base, type_args, gtry_index, generics, structs)
+                    if (emit_expression(gtry_arg, gtry_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is gtry_arg_value:
+                        gtry_args.push(gtry_arg_value)
+                    else:
+                        gtry_declined <- true
+                    gtry_index <- gtry_index + 1
+                return null if gtry_declined
+                if instantiation_wants_store(base, type_args, generics):
+                    if call_site_store(runtime) is gtry_store:
+                        gtry_args.push(gtry_store)
+                    else:
+                        return null
+                return null if not push_named_instantiation_arenas(gtry_args, base, type_args, arguments, local_scope, runtime, generics, structs)
+                gtry_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(gtry_target)
+                gtry_args_pointer: void& = (&gtry_args[0]).cast[void&] can Unsafe.PointerCast
+                gtry_status: LLVMValueRef = LLVMBuildCall2(builder, gtry_fn_type, gtry_target, gtry_args_pointer, gtry_args.count.u32(), "try.code")
+                clear_all_local_callable_aliases(local_scope)
+                # Payload-carrying error sets return an aggregate descriptor; inspect its
+                # status field before the propagation branch. Returning or comparing the
+                # whole descriptor as i32 produces verifier-invalid IR.
+                gtry_code: LLVMValueRef = error_status_code(gtry_status, ctx, builder)
+                gtry_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, gtry_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                gtry_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                gtry_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gtry_function, "try.cont")
+                gtry_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gtry_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, gtry_ok, gtry_cont_block, gtry_fail_block)
+                LLVMPositionBuilderAtEnd(builder, gtry_fail_block)
+                # A `try` PROPAGATE is a function EXIT, so it unwinds `defer` exactly as
+                # `return` and `raise` do. It did not: `defer function:` + `try g(x)`
+                # ran the deferred body on the success exit and DROPPED it on the
+                # failure exit -- stage0 ran it on both (measured 2 vs stage1's 1).
+                # Deferred actions run BEFORE the region unwind, the order every other
+                # exit path uses: a deferred body may still read region-backed memory.
+                return null if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
+                mutable gtry_return_status: LLVMValueRef = gtry_status
+                if explicit_error_family != gtry_return_family:
+                    if remap_error_status(gtry_status, explicit_error_family, gtry_return_family, structs, ctx, builder) is remapped_gtry_status:
+                        gtry_return_status <- remapped_gtry_status
+                    else:
+                        return null
+                _ = LLVMBuildRet(builder, gtry_return_status)
+                LLVMPositionBuilderAtEnd(builder, gtry_cont_block)
+                return LLVMBuildLoad2(builder, gtry_out_llvm, gtry_out_slot, "try.value") if wants_value else gtry_out_slot
+            return null
+
+
+
+
+        # `_ = try f(args)` — the explicit discard keeps the call's success value unused,
+        # but `try` still propagates its error. The ordinary discard expression path only
+        # emits the error-union value and drops it, silently turning a failing call into
+        # success. Return 1 when this emitted the propagation, -1 when it recognized a
+        # fallible call but could not lower it, and 0 when the expression is not a fallible
+        # call so the caller can continue with its ordinary discard handling.
+        def emit_discarded_propagating_try[@scope_region, @loops_region, @regions_region, @fns_region, @structs_region, @generics_region](expression: Expr, return_type: ValueType, local_scope: mutable Scope& @scope_region, loops: mutable LoopStack& @loops_region, regions: mutable RegionStack& @regions_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Paren(paren_expression, paren_line):
+                    return emit_discarded_propagating_try(paren_expression, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                Expr.Call(callee, arguments, argument_names, call_line):
+                    _ = argument_names
+                    match try_callee_as_ident_with_generics(callee, fns, structs, generics):
+                        Expr.Ident(name, name_line):
+                            owner: sview = try_callee_owner_with_generics(callee, fns, structs, generics)
+                            if error_callee_is(fns, structs, generics, name, owner):
+                                no_recovery: darray[Stmt] = []
+                                status: EmitStatus = emit_propagating_try(name, arguments, no_recovery, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, owner) can Global{Read,Write}
+                                return 1 if status == EmitStatus.Open else -1
+                        _:
+                            pass
+                    generic_base: mutable sview = ""
+                    generic_args_ok: mutable bool = false
+                    generic_types: darray[ValueType] = generic_callee_type_args(callee, &generic_base, &generic_args_ok, structs)
+                    if generic_args_ok:
+                        generic_index: i64 = generic_index_of(generics, generic_base)
+                        if generic_index >= 0 and generics.is_error[generic_index.usize()]:
+                            if (emit_propagating_generic_try_value(generic_base, generic_types, arguments, false, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is generic_status:
+                                _ = generic_status
+                                return 1
+                            return -1
+                    return 0
+                _:
+                    return 0
+
+
+
+
+        struct PropagatingTryCall:
+            payload_type: ValueType
+            payload_llvm: LLVMTypeRef
+            out_slot: LLVMValueRef
+            status: LLVMValueRef
+
+
+        # Shared hidden-ABI setup for value-form `try`. This helper deliberately has no
+        # recovery-body or LoopStack parameter; the two finalizers own their separate error
+        # paths while sharing callee resolution, argument emission, arena arguments and status.
+        def prepare_propagating_try_call[@scope_region, @fns_region, @structs_region, @generics_region](name: sview, arguments: darray[Expr], local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, allow_unmapped_error: bool, owner_hint: sview = "") -> PropagatingTryCall? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            value_try_type: ValueType = error_callee_value_type(name, arguments, local_scope, fns, structs, generics, owner_hint)
+            return null if value_try_type.kind == TypeKind.Unmodeled or value_try_type.kind == TypeKind.Void
+            if error_callee_target(name, arguments, local_scope, fns, structs, generics, m, ctx, owner_hint) is value_try_target:
+                value_try_out_llvm: LLVMTypeRef = llvm_type_of(value_try_type, structs, ctx)
+                value_try_out_slot: LLVMValueRef = build_entry_alloca(builder, value_try_out_llvm, "try.out")
+                value_try_args: mutable darray[LLVMValueRef] = [value_try_out_slot]
+                value_try_declined: mutable bool = false
+                value_try_index: mutable usize = 0
+                for value_try_arg in arguments |value_try_args, value_try_declined, value_try_index, name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    value_try_wanted: ValueType = error_callee_param_type(name, arguments, value_try_index, local_scope, fns, structs, generics, owner_hint)
+                    if (emit_expression(value_try_arg, value_try_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is value_try_arg_value:
+                        value_try_args.push(value_try_arg_value)
+                    else:
+                        value_try_declined <- true
+                    value_try_index <- value_try_index + 1
+                return null if:
+                    value_try_declined
+                    not (emit_error_call_defaults(name, owner_hint, arguments.count, value_try_args, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                value_try_arena_count: usize = error_callee_arena_count(name, arguments, local_scope, fns, structs, generics, owner_hint)
+                for _ in 0..<value_try_arena_count |value_try_args, arguments, local_scope, runtime, structs|:
+                    value_try_args.push(call_site_arena(arguments, local_scope, runtime, structs))
+                value_try_fn_index: i64 = function_index_of(fns, error_callee_owner(fns, structs, name, owner_hint), name)
+                mutable value_try_family: sview = resolved_error_family(line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_set_names, fns.lines[value_try_fn_index.usize()]), structs) if value_try_fn_index >= 0 else ""
+                if value_try_fn_index < 0:
+                    value_try_generic_index: i64 = error_callee_generic_index(generics, name, owner_hint)
+                    if value_try_generic_index >= 0:
+                        value_try_family <- resolved_error_family(infer_generic_error_family(value_try_generic_index.usize(), arguments, local_scope, fns, structs, generics), structs)
+                value_try_return_family: sview = current_error_return_family(runtime, structs)
+                return null if not allow_unmapped_error and not error_status_remap_supported(value_try_family, value_try_return_family, structs)
+                value_try_extern: bool = value_try_fn_index >= 0 and fns.is_extern[value_try_fn_index.usize()]
+                value_try_status: mutable LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
+                if emit_error_status_call(value_try_target, value_try_args, value_try_family, value_try_extern, structs, ctx, builder) is value_try_status_value:
+                    value_try_status <- value_try_status_value
+                else:
+                    return null
+                clear_all_local_callable_aliases(local_scope)
+                return PropagatingTryCall{payload_type: value_try_type, payload_llvm: value_try_out_llvm, out_slot: value_try_out_slot, status: value_try_status}
+            return null
+
+
+
+
+        # Deferred-action emission can grow StructTable after the hidden-status call was
+        # prepared. Re-resolve family names from stable declaration rows at the point of use;
+        # never carry a borrowed family-name view across that mutation.
+        def remap_propagating_try_status_after_deferred[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](status: LLVMValueRef, name: sview, arguments: darray[Expr], local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, ctx: LLVMContextRef, builder: LLVMBuilderRef, owner_hint: sview = "") -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            function_index: i64 = function_index_of(fns, error_callee_owner(fns, structs, name, owner_hint), name)
+            source_family: mutable sview = resolved_error_family(line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_set_names, fns.lines[function_index.usize()]), structs) if function_index >= 0 else ""
+            if function_index < 0:
+                generic_index: i64 = error_callee_generic_index(generics, name, owner_hint)
+                if generic_index >= 0:
+                    source_family <- resolved_error_family(infer_generic_error_family(generic_index.usize(), arguments, local_scope, fns, structs, generics), structs)
+            target_family: sview = current_error_return_family(runtime, structs)
+            return status if source_family == target_family
+            return null if source_family == ""
+            remap_error_status(status, source_family, target_family, structs, ctx, builder)
+
+
+        struct PropagatingTryValue:
+            value: LLVMValueRef
+            payload_type: ValueType
+
+        # Plain `try f(args)` propagates on error. This has no recovery-body or LoopStack path.
+        def emit_propagating_try_value_no_recovery[@scope_region, @regions_region, @fns_region, @structs_region, @generics_region](name: sview, arguments: darray[Expr], local_scope: mutable Scope& @scope_region, regions: mutable RegionStack& @regions_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, owner_hint: sview = "") -> PropagatingTryValue? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if (prepare_propagating_try_call(name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder, false, owner_hint) can Global{Read,Write}) is prepared:
+                value_try_code: LLVMValueRef = error_status_code(prepared.status, ctx, builder)
+                value_try_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, value_try_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                value_try_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                value_try_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, value_try_function, "try.cont")
+                value_try_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, value_try_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, value_try_ok, value_try_cont_block, value_try_fail_block)
+                LLVMPositionBuilderAtEnd(builder, value_try_fail_block)
+                # Deferred bodies may read region-backed memory, so run them before unwind.
+                return null if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
+                mutable value_try_return_status: LLVMValueRef = prepared.status
+                if remap_propagating_try_status_after_deferred(prepared.status, name, arguments, local_scope, fns, structs, generics, runtime, ctx, builder, owner_hint) is remapped_value_try_status:
+                    value_try_return_status <- remapped_value_try_status
+                else:
+                    return null
+                _ = LLVMBuildRet(builder, value_try_return_status)
+                LLVMPositionBuilderAtEnd(builder, value_try_cont_block)
+                return PropagatingTryValue{value: LLVMBuildLoad2(builder, prepared.payload_llvm, prepared.out_slot, "try.value"), payload_type: prepared.payload_type}
+            return null
+
+        def emit_propagating_try_value_no_recovery_from_callee[@scope_region, @regions_region, @fns_region, @structs_region, @generics_region, @runtime_region](callee: Expr, arguments: darray[Expr], local_scope: mutable Scope& @scope_region, regions: mutable RegionStack& @regions_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> PropagatingTryValue? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match try_callee_as_ident_with_generics(callee, fns, structs, generics):
+                Expr.Ident(name, _):
+                    return emit_propagating_try_value_no_recovery(name, arguments, local_scope, regions, fns, structs, generics, runtime, m, ctx, builder, try_callee_owner_with_generics(callee, fns, structs, generics)) can Global{Read,Write}
+                _:
+                    return null
+
+
+        # `try f(args) else err: BODY` uses the same hidden ABI and runs BODY on failure. BODY
+        # must terminate because the success path supplies the value.
+        def emit_propagating_try_value_with_recovery[@scope_region, @loops_region, @regions_region, @fns_region, @structs_region, @generics_region](name: sview, arguments: darray[Expr], recovery_body: darray[Stmt], recovery_return_type: ValueType, local_scope: mutable Scope& @scope_region, loops: mutable LoopStack& @loops_region, regions: mutable RegionStack& @regions_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, owner_hint: sview = "") -> PropagatingTryValue? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if (prepare_propagating_try_call(name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder, true, owner_hint) can Global{Read,Write}) is prepared:
+                value_try_code: LLVMValueRef = error_status_code(prepared.status, ctx, builder)
+                value_try_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, value_try_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                value_try_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                value_try_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, value_try_function, "try.cont")
+                value_try_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, value_try_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, value_try_ok, value_try_cont_block, value_try_fail_block)
+                LLVMPositionBuilderAtEnd(builder, value_try_fail_block)
+                value_try_recovery_status: EmitStatus = emit_statements(&recovery_body, recovery_return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                return null if value_try_recovery_status != EmitStatus.Terminated
+                LLVMPositionBuilderAtEnd(builder, value_try_cont_block)
+                return PropagatingTryValue{value: LLVMBuildLoad2(builder, prepared.payload_llvm, prepared.out_slot, "try.value"), payload_type: prepared.payload_type}
+            return null
+
+
+        # Optional-body compatibility entry. Null-recovery callers should use the dedicated
+        # no-recovery entry so their summary cannot include the recovery-body path.
+        def emit_propagating_try_value[@scope_region, @loops_region, @regions_region, @fns_region, @structs_region, @generics_region](name: sview, arguments: darray[Expr], recovery: darray[Stmt]?, recovery_return_type: ValueType, local_scope: mutable Scope& @scope_region, loops: mutable LoopStack& @loops_region, regions: mutable RegionStack& @regions_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, owner_hint: sview = "") -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if recovery is recovery_body:
+                if recovery_body.count == 0:
+                    if (emit_propagating_try_value_no_recovery(name, arguments, local_scope, regions, fns, structs, generics, runtime, m, ctx, builder, owner_hint) can Global{Read,Write}) is no_recovery_result:
+                        return no_recovery_result.value
+                    return null
+                if (emit_propagating_try_value_with_recovery(name, arguments, recovery_body, recovery_return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, owner_hint) can Global{Read,Write}) is recovery_result:
+                    return recovery_result.value
+                return null
+            if (emit_propagating_try_value_no_recovery(name, arguments, local_scope, regions, fns, structs, generics, runtime, m, ctx, builder, owner_hint) can Global{Read,Write}) is no_recovery_result:
+                return no_recovery_result.value
+            return null

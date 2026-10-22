@@ -1,0 +1,353 @@
+extend Semantic:
+    private:
+        def check_variable_initializers(statements: darray[Ast::Stmt], return_type_name: sview @source, return_type_id: u32, names: mutable darray[sview]&, types: mutable darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, names, types| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            type_name: sview = bare_type_name(type_expression)
+                            # Resolve and validate the initializer in the enclosing scope:
+                            # when a declaration shadows an outer name, references in its
+                            # initializer still refer to that outer binding (`value: i64& =
+                            # &value`). Installing the new name first made this resolve
+                            # against itself and rejected a shadowing form stage0 accepts.
+                            # Use the declaration's canonical row directly for the
+                            # initializer. Block-valued RHS traversal can temporarily
+                            # alter the local channel; contextual checking must not lose
+                            # the VarDecl's own expected type at that boundary.
+                            declared_type_id: u32 = annotation_type_id(type_expression, table) can Global{Read,Write}
+                            table <- check_stored_value(value, declared_type_id, name, Ast::expr_pos(value), false, names, types, table) if declared_type_id != 0
+                            table <- check_container_mutation_stored_value(value, names, types, table)
+                            # A reference annotation is not represented by the legacy bare
+                            # type-name channel, so it used to skip `check_value_against`.
+                            # Still reject a firmly inferred non-reference value in that
+                            # slot. String literals are storage references in stage0, and
+                            # an optional reference may already be refined non-null by the
+                            # surrounding flow check, so both remain conservative escapes.
+                            # This is the stage1 parity wall for cases such as
+                            # `raw: u8& = get state.rows[i].raw[j] else return 0`: stage0
+                            # reports the reference/array mismatch before code generation.
+                            reference_value_type: InferType = infer_expression_type(value, names, types, table) if interned_kind(declared_type_id, table) == SemTypeKind.Ref else primitive_type(SemTypeKind.Unknown)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: "non-null reference", actual: stage0_value_spelling(reference_value_type)}) if interned_kind(declared_type_id, table) == SemTypeKind.Ref and reference_value_type.kind != SemTypeKind.Unknown and reference_value_type.kind != SemTypeKind.Ref and reference_value_type.kind != SemTypeKind.Optional and reference_value_type.kind != SemTypeKind.String
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: "non-null reference", actual: "null"}) if interned_kind(declared_type_id, table) == SemTypeKind.Ref and expression_is_null(value)
+                            table <- check_reference_initializer(value, declared_type_id, name, line, names, types, table) if interned_kind(declared_type_id, table) == SemTypeKind.Ref and not expression_is_null(value)
+                            # The declaration twin of the return's Wall B below: a value that can
+                            # never inhabit an optional's BASE (stage0: `variable "a" expects
+                            # sview?, got cstr`). `null` is always legal; an optional or unknown
+                            # value has no firm family and stays silent.
+                            if interned_kind(declared_type_id, table) == SemTypeKind.Optional and interned_elem_count(declared_type_id, table) == 1 and not expression_is_null(value):
+                                declared_base: sview = diagnostic_name_of_row(interned_elem(declared_type_id, 0, table), table)
+                                declared_surface: sview = surface_name_of_row(interned_elem(declared_type_id, 0, table), table)
+                                base_value_type: InferType = infer_expression_type(value, names, types, table)
+                                base_family: mutable sview = literal_kind_of(value)
+                                base_family <- family_of_kind(base_value_type) if base_family == ""
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: declared_base, actual: stage0_expr_spelling(value, base_value_type), detail3: "?"}) if declared_base != "" and (firm_never_fits(base_family, declared_surface) or string_member_never_fits(base_value_type, declared_surface))
+                                base_enum: sview = enum_value_never_fits(value, declared_surface, names, types, table)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: declared_surface, actual: base_enum, detail3: "?"}) if base_enum != ""
+                            # `x: i64 = null` — a null initializer for a declared type that
+                            # cannot hold null. The ref case above owns `T&`; ONLY an optional
+                            # can actually take null, so every other FIRM kind is an error.
+                            # MEASURED: i64, cstr, bool and f64 all report
+                            # `variable "x" expects <T>, got null`, while `x: i64? = null` is
+                            # accepted. Unknown/Void/Optional stay silent, so an unresolved
+                            # annotation cannot produce a false positive.
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: type_name, actual: "null"}) if expression_is_null(value) and kind_cannot_hold_null(interned_kind(declared_type_id, table)) and type_name != ""
+                            table <- check_nested_array_literal(value, declared_type_id, 0, names, types, table)
+                            table <- check_ternary_condition(value, names, types, table)
+                            table <- check_operator_operands(value, names, types, table) if not (value is Expr.Block(_, _, _, _))
+                            table <- check_value_match_exhaustive(value, names, types, table)
+                            # A known generic/container value must retain its complete
+                            # structural identity at initialization. In particular, region
+                            # arguments are part of that identity: copying
+                            # `Handle[arena_a]` into `Handle[arena_b]` would relabel a borrow
+                            # and can hide use-after-destroy. Unknown call schemes stay
+                            # conservative because their source TypeId is zero.
+                            initializer_type_id: mutable u32 = 0
+                            initializer_type_id <- initializer_structural_type_id_of(value, declared_type_id, names, types, table) if interned_kind(declared_type_id, table) == SemTypeKind.Container
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, line: line.line, expected: interned_name(declared_type_id, table), actual: interned_name(initializer_type_id, table)}) if interned_kind(declared_type_id, table) == SemTypeKind.Container and interned_kind(initializer_type_id, table) == SemTypeKind.Container and not type_ids_compatible(declared_type_id, initializer_type_id, table) and not dynarray_initializer_bridge(declared_type_id, initializer_type_id, table)
+                            table <- check_block_value_against(value, type_name, name, line, false, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            note_local_type(names, types, name, type_name)
+                            # Structural channel (Phase C): install the annotation's
+                            # interned TypeId alongside the lexical name after its
+                            # initializer has been checked in the enclosing scope.
+                            note_local_type_id(name, type_expression, table) can Global{Read,Write}
+                        Stmt.Assign(target, operator, value, line):
+                            table <- check_ternary_condition(value, names, types, table)
+                            table <- check_operator_operands(value, names, types, table) if not (value is Expr.Block(_, _, _, _))
+                            table <- check_value_match_exhaustive(value, names, types, table)
+                            table <- check_container_mutation_stored_value(value, names, types, table)
+                            table <- check_parallel_rebind_threading(target, operator, value, names, types, table)
+                            match target:
+                                Expr.Ident(target_name, target_line):
+                                    if operator == TokenKind.Assign:
+                                        # A block RHS is walked for its own statements; a fresh
+                                        # binding has no type to judge the tail against.
+                                        table <- check_block_value_against(value, "", target_name, line, false, return_type_name, return_type_id, names, types, table) can Global{Read,Write} if value is Expr.Block(_, _, _, _)
+                                        # `x = v` defines a fresh, unannotated local. (The
+                                        # structural pair keeps both channels index-aligned so
+                                        # one scope mark closes both.)
+                                        note_local_type(names, types, target_name, "")
+                                        note_local_type_id_direct(target_name, 0, table)
+                                    if operator == TokenKind.LArrow:
+                                        target_type: sview = local_type_of(names, types, target_name)
+                                        target_structural: u32 = local_type_id_of(target_name, table)
+                                        table <- check_stored_value(value, target_structural, target_name, Ast::expr_pos(value), true, names, types, table) if target_structural != 0
+                                        if target_type != "" or value is Expr.Block(_, _, _, _):
+                                            # An untyped target has no type to judge a block's tail against, but the
+                                            # block's own statements are still walked (target_type is "" then).
+                                            table <- check_block_value_against(value, target_type, target_name, line, true, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                                        else:
+                                            # Structural target (Phase C): a scalar can never be
+                                            # assigned to a CONTAINER-typed local (`xs <- 5` —
+                                            # oracle: "cannot assign int to darray[i64]"). An
+                                            # OPTIONAL target legally accepts its base value and
+                                            # never flags here. Both literal and firm-inferred
+                                            # scalar values are walls; unknowns stay silent.
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: target_name, line: line.line, expected: "non-null reference", actual: "null"}) if interned_kind(target_structural, table) == SemTypeKind.Ref and expression_is_null(value)
+                                            source_structural: u32 = structural_type_id_of(value, names, types, table)
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: target_name, line: line.line, expected: interned_name(target_structural, table), actual: interned_name(source_structural, table)}) if interned_kind(target_structural, table) == SemTypeKind.Container and interned_kind(source_structural, table) == SemTypeKind.Container and not type_ids_compatible(target_structural, source_structural, table)
+                                            if interned_kind(target_structural, table) == SemTypeKind.Container:
+                                                assigned_kind: mutable sview = literal_kind_of(value)
+                                                assigned_kind <- infer_family(value, names, types, table) if assigned_kind == ""
+                                                is_scalar_value: bool = ScalarValueKind::is_scalar_value_kind(assigned_kind)
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignScalarToContainer, name: target_name, pos: line, line: line.line, expected: interned_name(target_structural, table), actual: assigned_kind, detail: type_name_of_row(interned_elem(target_structural, 0, table), table)}) if is_scalar_value
+                                Expr.Index(indexed_target, index_key, indexed_target_line):
+                                    if operator == TokenKind.LArrow:
+                                        # `c[k] <- v` (Phase C): dict targets wall both the KEY
+                                        # (against elem 0) and the VALUE (against elem 1);
+                                        # darray/array targets wall the value (elem 0). Unknown
+                                        # containers/keys/values stay silent.
+                                        indexed_id: u32 = structural_type_id_of(indexed_target, names, types, table)
+                                        indexed_head: sview = interned_name(indexed_id, table) if interned_kind(indexed_id, table) == SemTypeKind.Container else ""
+                                        if indexed_head == "dict":
+                                            key_spelling: sview = type_name_of_row(interned_elem(indexed_id, 0, table), table)
+                                            if key_spelling != "":
+                                                # The key TYPE itself may have no value equality, so
+                                                # the runtime hash table cannot be built at all —
+                                                # independent of whether this particular key VALUE
+                                                # fits (the wall just below).
+                                                assign_value_spelling: sview = type_name_of_row(interned_elem(indexed_id, 1, table), table)
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RuntimeDictKeyUnsupported, name: "", pos: Ast::expr_pos(indexed_target), line: line.line, expected: key_spelling, actual: assign_value_spelling}) if dict_key_type_unsupported(key_spelling)
+                                                key_literal: sview = literal_kind_of(index_key)
+                                                key_family: sview = infer_family(index_key, names, types, table) if key_literal == "" else ""
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DictIndexKeyTypeMismatch, name: "", pos: Ast::expr_pos(index_key), line: line.line, expected: key_spelling, actual: stage0_literal_spelling(key_literal)}) if key_literal != "" and literal_never_fits(key_literal, key_spelling)
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DictIndexKeyTypeMismatch, name: "", pos: Ast::expr_pos(index_key), line: line.line, expected: key_spelling, actual: key_family}) if key_family != "" and firm_never_fits(key_family, key_spelling)
+                                            # EVERY dict index-assign is rejected by stage0, whatever
+                                            # the value type: `d[k]` yields an OPTIONAL REFERENCE
+                                            # (`mutable i64&?`) and a bare value cannot be assigned
+                                            # to one. MEASURED with the std prepended, via -emit obj:
+                                            #   d[k] <- 5     dict[i64, i64]    "cannot assign int to mutable i64&?"
+                                            #   d[k] <- v     v: i64            "cannot assign i64 to mutable i64&?"
+                                            #   d[k] <- 5     dict[cstr, i64]   "cannot assign int to mutable i64&?"
+                                            #   d[k] <- "x"   dict[i64, sview]  "cannot assign static u8& to mutable sview&?"
+                                            #   xs[0] <- 5    darray            ACCEPTED — this is dict-specific
+                                            #
+                                            # So it REPLACES the value-fits check that used to run
+                                            # here: stage0 errors on this statement unconditionally,
+                                            # and reporting a "value expects T" mismatch as well
+                                            # would be a second diagnostic stage0 never emits.
+                                            dict_value_spelling: sview = type_name_of_row(interned_elem(indexed_id, 1, table), table)
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DictIndexAssignToOptionalRef, name: "", line: line.line, expected: stage0_operand_spelling(value, infer_expression_type(value, names, types, table)), actual: dict_value_spelling}) if dict_value_spelling != ""
+                                        if indexed_head == "darray" or indexed_head == "array":
+                                            element_spelling: sview = surface_name_of_row(interned_elem(indexed_id, 0, table), table)
+                                            element_type_id: u32 = interned_elem(indexed_id, 0, table) if interned_elem_count(indexed_id, table) > 0 else 0
+                                            table <- check_stored_value(value, element_type_id, "element", Ast::expr_pos(value), true, names, types, table) if element_type_id != 0
+                                            # stage0 words an element write like any mutation
+                                            # ("cannot assign bool to i64") and spans the target's
+                                            # head identifier; this used to print the declaration
+                                            # sentence `variable "element" expects ...` at the value.
+                                            table <- check_assigned_value_against(value, element_spelling, ident_extent_or_line(indexed_target, line.line), names, types, table) if element_spelling != ""
+                                Expr.Field(field_object, target_field, target_field_line):
+                                    if operator == TokenKind.LArrow:
+                                        # `p.x <- v`: the assigned value must fit field x's declared
+                                        # type (a Field target is always a mutation, never a define).
+                                        object_type: InferType = infer_expression_type(field_object, names, types, table)
+                                        field_type: sview = field_type_of(table, object_type.name, target_field) if object_type.kind == SemTypeKind.Named else ""
+                                        field_type_id: u32 = field_type_id_of(table, object_type.name, target_field) if object_type.kind == SemTypeKind.Named else 0
+                                        table <- check_stored_value(value, field_type_id, target_field, Ast::expr_pos(value), true, names, types, table) if field_type_id != 0
+                                        # Mutation wording and head span, as for an element write.
+                                        table <- check_assigned_value_against(value, field_type, ident_extent_or_line(field_object, line.line), names, types, table) if field_type != ""
+                                Expr.Binary(place, TokenKind.As, _, _):
+                                    if operator == TokenKind.LArrow:
+                                        place_value_type_id: u32 = assignment_referent_type_id(place, names, types, table)
+                                        table <- check_stored_value(value, place_value_type_id, "reference", Ast::expr_pos(value), true, names, types, table) if place_value_type_id != 0
+                                _:
+                                    pass
+                        Stmt.Return(value, line):
+                            if value is return_expression:
+                                table <- check_ternary_condition(return_expression, names, types, table)
+                                table <- check_operator_operands(return_expression, names, types, table) if not (return_expression is Expr.Block(_, _, _, _))
+                                table <- check_value_match_exhaustive(return_expression, names, types, table)
+                                table <- check_stored_value(return_expression, return_type_id, "return", Ast::expr_pos(return_expression), false, names, types, table) if return_type_id != 0
+                                table <- check_container_mutation_stored_value(return_expression, names, types, table)
+                                # docs/119 §2.1 `return` + block: the tail is the returned value.
+                                table <- check_block_value_against(return_expression, return_type_name, "return", line, false, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            # `return null` from a function whose return type cannot hold null.
+                            # Same wall as the VarDecl form above, keyed on the RETURN type's
+                            # interned kind so `-> i64?` stays silent. stage0: "return type
+                            # expects i64, got null".
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: return_type_name, actual: "null"}) if return_type_name != "" and value is null_returned and expression_is_null(null_returned) and return_kind_cannot_hold_null(interned_kind(return_type_id, table))
+                            # Structural return wall (Phase C): a scalar returned from a
+                            # `-> darray[T]` function (oracle: "return type expects
+                            # darray[i64], got int"). Optional return types accept their
+                            # base value and never flag.
+                            if return_type_name == "" and interned_kind(return_type_id, table) == SemTypeKind.Container and value is structurally_returned:
+                                returned_kind: mutable sview = literal_kind_of(structurally_returned)
+                                returned_kind <- infer_family(structurally_returned, names, types, table) if returned_kind == ""
+                                returned_scalar: bool = ScalarValueKind::is_scalar_value_kind(returned_kind)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: interned_name(return_type_id, table), actual: returned_kind, detail: diagnostic_name_of_row(interned_elem(return_type_id, 0, table), table) if interned_kind(return_type_id, table) == SemTypeKind.Container else sview("", 0, 0)}) if returned_scalar
+                                # Wall A: a container of the SAME head whose element type can
+                                # never convert (oracle: "return type expects darray[i64], got
+                                # darray[sview]"). Same-family element WIDTHS stay silent here
+                                # even though stage0 compares elements exactly — firm_never_fits
+                                # is deliberately conservative, so darray[u8] <- darray[i32] is a
+                                # known, bounded accept-gap rather than a false positive risk.
+                                returned_id: u32 = structural_type_id_of(structurally_returned, names, types, table)
+                                expected_elem: sview = diagnostic_name_of_row(interned_elem(return_type_id, 0, table), table)
+                                returned_elem: sview = diagnostic_name_of_row(interned_elem(returned_id, 0, table), table)
+                                same_head: bool = interned_kind(returned_id, table) == SemTypeKind.Container and interned_name(returned_id, table) == interned_name(return_type_id, table) and interned_name(returned_id, table) != ""
+                                single_elem: bool = interned_elem_count(return_type_id, table) == 1 and interned_elem_count(returned_id, table) == 1
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: interned_name(return_type_id, table), actual: interned_name(returned_id, table), detail: expected_elem, detail2: returned_elem}) if not returned_scalar and same_head and single_elem and expected_elem != "" and returned_elem != "" and firm_never_fits(family_of_type_name(returned_elem), expected_elem)
+                            # Wall B: a value that can never inhabit an optional return type's
+                            # BASE (oracle: "return type expects i64?, got bool"). `return null`
+                            # is always legal here and is excluded outright; the base spelling
+                            # carries the `?` through detail3 so the renderer can rebuild it
+                            # without composing a non-source sview.
+                            if return_type_name == "" and interned_kind(return_type_id, table) == SemTypeKind.Optional and value is optionally_returned and not expression_is_null(optionally_returned):
+                                optional_base: sview = diagnostic_name_of_row(interned_elem(return_type_id, 0, table), table)
+                                optional_surface: sview = surface_name_of_row(interned_elem(return_type_id, 0, table), table)
+                                optional_family: mutable sview = literal_kind_of(optionally_returned)
+                                optional_family <- infer_family(optionally_returned, names, types, table) if optional_family == ""
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: optional_base, actual: stage0_expr_spelling(optionally_returned, infer_expression_type(optionally_returned, names, types, table)), detail3: "?"}) if optional_base != "" and interned_elem_count(return_type_id, table) == 1 and (firm_never_fits(optional_family, optional_surface) or string_member_never_fits(infer_expression_type(optionally_returned, names, types, table), optional_surface))
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: line, line: line.line, expected: "non-null reference", actual: "null"}) if interned_kind(return_type_id, table) == SemTypeKind.Ref and value is null_return and expression_is_null(null_return)
+                        # NOTE (§5.1): the condition's own `Ast::Pos` is NOT stage0's span here
+                        # (a Field/Call node carries its `.`/`(` token). MEASURED 2026-09-07:
+                        # stage0 spans the chain's HEAD identifier (`b` in `b.names`,
+                        # `make_names` in `make_names()`), which ident_extent_or_line returns.
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- check_operator_operands(condition, names, types, table)
+                            condition_family: sview = infer_family(condition, names, types, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolCondition, name: "if", pos: ident_extent_or_line(condition, line.line), line: line.line, expected: "bool", actual: infer_spelling(condition, names, types, table), detail: container_elem_spelling_of(condition, names, types, table)}) if condition_family != "" and condition_family != "bool"
+                            then_scope_mark: usize = names.count
+                            table <- check_variable_initializers(then_body, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            table <- close_type_scope(then_scope_mark, names, types, table)
+                            table <- check_variable_initializers(else_body, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            table <- close_type_scope(then_scope_mark, names, types, table)
+                        Stmt.While(condition, body, line):
+                            table <- check_operator_operands(condition, names, types, table)
+                            condition_family: sview = infer_family(condition, names, types, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolCondition, name: "while", pos: line, line: line.line, expected: "bool", actual: infer_spelling(condition, names, types, table), detail: container_elem_spelling_of(condition, names, types, table)}) if condition_family != "" and condition_family != "bool"
+                            while_scope_mark: usize = names.count
+                            table <- check_variable_initializers(body, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            table <- close_type_scope(while_scope_mark, names, types, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            for_scope_mark: usize = names.count
+                            table <- check_operator_operands(iterable, names, types, table)
+                            table <- check_loop_iterable(iterable, names, types, table, line.line)
+                            # `for x, y in xs` destructures each ITEM as a tuple, so a NON-dict
+                            # container whose item is certainly not a tuple cannot bind (stage0:
+                            # "iterable for tuple pattern requires a tuple item, got B"). stage0
+                            # iterates through a reference to the container, and spells an
+                            # optional item `B?` and a nested dynamic array item `darray[i64]`.
+                            if variables.count >= 2:
+                                tuple_iterable_id: mutable u32 = structural_type_id_of(iterable, names, types, table)
+                                while interned_kind(tuple_iterable_id, table) == SemTypeKind.Ref |tuple_iterable_id|:
+                                    tuple_iterable_id <- interned_elem(tuple_iterable_id, 0, table)
+                                tuple_iterable_head: sview = interned_name(tuple_iterable_id, table) if interned_kind(tuple_iterable_id, table) == SemTypeKind.Container else ""
+                                tuple_elem_id: u32 = interned_elem(tuple_iterable_id, 0, table) if tuple_iterable_head == "darray" or tuple_iterable_head == "array" or tuple_iterable_head == "set" or tuple_iterable_head == "view" else 0
+                                tuple_elem_kind: SemTypeKind = interned_kind(tuple_elem_id, table)
+                                tuple_elem_nested_darray: bool = tuple_elem_kind == SemTypeKind.Container and interned_name(tuple_elem_id, table) == "darray"
+                                tuple_item_wrapper: sview = "?" if tuple_elem_kind == SemTypeKind.Optional else ("darray" if tuple_elem_nested_darray else "")
+                                tuple_leaf_id: u32 = interned_elem(tuple_elem_id, 0, table) if tuple_item_wrapper != "" else tuple_elem_id
+                                tuple_leaf_spelling: sview = tuple_item_leaf_spelling(tuple_leaf_id, table)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TupleIterableNotTuple, name: "", pos: binder_pos_at(line.offset, line.line, table), line: line.line, expected: "", actual: tuple_leaf_spelling, detail: tuple_item_wrapper}) if tuple_leaf_spelling != "" and for_loop_has_plain_binder(line.offset, table)
+                            # Loop-variable ELEMENT typing (Phase C): iterating a
+                            # container-typed local binds its element type — `for x in
+                            # xs:` (darray/set, one variable) types x as the element,
+                            # `for k, v in d:` (dict, two variables) types the key and
+                            # value. Any other shape stays untyped ("").
+                            iterable_id: mutable u32 = 0
+                            match iterable:
+                                Expr.Ident(iterable_name, iterable_line):
+                                    iterable_id <- local_type_id_of(iterable_name, table)
+                                Expr.Call(iterable_callee, iterable_args, iterable_arg_names, iterable_call_line):
+                                    # `for x in g():` / `for x in M::g():` — the returned
+                                    # container's elements.
+                                    match iterable_callee:
+                                        Expr.Ident(iterable_fn, iterable_fn_line):
+                                            iterable_id <- function_return_type_id(table, iterable_fn)
+                                        Expr.Scope(iterable_scope, iterable_scoped_fn, iterable_scope_line):
+                                            iterable_id <- function_return_type_id(table, iterable_scoped_fn)
+                                        _:
+                                            pass
+                                Expr.Field(iterable_object, iterable_field, iterable_field_line):
+                                    # `for x in p.items:` — a registered struct field's container.
+                                    field_object_type: InferType = infer_expression_type(iterable_object, names, types, table)
+                                    if field_object_type.kind == SemTypeKind.Named:
+                                        iterable_id <- field_type_id_of(table, field_object_type.name, iterable_field)
+                                _:
+                                    pass
+                            iterable_head: sview = interned_name(iterable_id, table) if interned_kind(iterable_id, table) == SemTypeKind.Container else ""
+                            sequence_element: u32 = interned_elem(iterable_id, 0, table) if (iterable_head == "darray" or iterable_head == "array" or iterable_head == "set") and variables.count == 1 else 0
+                            dict_key: u32 = interned_elem(iterable_id, 0, table) if iterable_head == "dict" and variables.count == 2 else 0
+                            dict_value: u32 = interned_elem(iterable_id, 1, table) if iterable_head == "dict" and variables.count == 2 else 0
+                            while variable_index < variables.count |variable_index: usize = 0, names, types, table|:
+                                variable_element: u32 = when variable_index:
+                                    0 -> sequence_element if sequence_element != 0 else dict_key
+                                    1 -> dict_value
+                                    _ -> 0
+                                note_local_type(names, types, variables[variable_index], surface_name_of_row(variable_element, table))
+                                note_local_type_id_direct(variables[variable_index], variable_element, table)
+                                variable_index <- variable_index + 1
+                            table <- check_variable_initializers(body, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            table <- close_type_scope(for_scope_mark, names, types, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            block_scope_mark: usize = names.count
+                            note_local_type(names, types, binding, "") if binding != ""
+                            note_local_type_id_direct(binding, 0, table) if binding != ""
+                            table <- check_variable_initializers(body, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                            table <- close_type_scope(block_scope_mark, names, types, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- check_match_exhaustive(scrutinee, arms, line, names, types, table)
+                            table <- check_scalar_match_arm_types(scrutinee, arms, line.line, names, types, table)
+                            table <- check_sequence_match_arm_types(scrutinee, arms, line.line, names, types, table)
+                            for arm in arms |table, names, types| -> table:
+                                arm_scope_mark: usize = names.count
+                                table <- check_variable_initializers(arm.body, return_type_name, return_type_id, names, types, table) can Global{Read,Write}
+                                table <- close_type_scope(arm_scope_mark, names, types, table)
+                        Stmt.Expr(expression, line):
+                            # Bare expression statements (method calls like `xs.push(v)`)
+                            # get the same operator/argument walk as value positions.
+                            table <- check_operator_operands(expression, names, types, table) if not (expression is Expr.Block(_, _, _, _))
+                            table <- check_container_mutation_stored_value(expression, names, types, table)
+                            # A loop header is represented as a value block around
+                            # accumulator declarations and the loop. Check writes in
+                            # that nested scope before discarding its locals; otherwise
+                            # `break 42` can silently overwrite a bool accumulator.
+                            table <- check_block_value_against(expression, "", "", line, false, return_type_name, return_type_id, names, types, table) can Global{Read,Write} if expression is Expr.Block(_, _, _, _)
+                        Stmt.Contract(kind, expression, line):
+                            contract_scope_mark: usize = names.count
+                            # `result` is a contract-only binding whose type is the
+                            # declared return type. Give the operator checker the same
+                            # structural type information the proof/contract passes use.
+                            if kind == "ensure" and return_type_id != 0:
+                                note_local_type(names, types, "result", "")
+                                note_local_type_id_direct("result", return_type_id, table)
+                            table <- check_operator_operands(expression, names, types, table)
+                            # `assert` is lowered as a boolean branch. The standalone
+                            # assert-nonbool pass deliberately handles only syntax-local
+                            # literals, because it has no function-local type environment;
+                            # this pass does have the environment and must reject a firmly
+                            # typed non-bool local such as `n: i64 = 1; assert n` before the
+                            # backend can emit invalid `br i64` IR.
+                            if kind == "assert":
+                                inferred_assert_type: InferType = infer_expression_type(expression, names, types, table)
+                                assert_family: sview = family_of_kind(inferred_assert_type)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssertConditionNonBool, name: "", pos: line, line: line.line, expected: "", actual: infer_spelling(expression, names, types, table)}) if assert_family != "" and assert_family != "bool" and assert_nonbool_family(expression) == ""
+                            table <- close_type_scope(contract_scope_mark, names, types, table)
+                        Stmt.Invalid:
+                            pass
+                        Stmt.Break(label, line):
+                            pass
+                        Stmt.Continue(label, line):
+                            pass

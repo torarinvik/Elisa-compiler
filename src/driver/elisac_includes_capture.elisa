@@ -1,0 +1,119 @@
+def expand_includes_capture(path: darray[u8]&, out: mutable darray[u8]&, seen: mutable darray[u8]&, active: mutable darray[u8]&, depth: i64, line_map: mutable darray[u8]&, emitted_lines: mutable u32&, cycle_detected: mutable bool&, read_failed: mutable bool&, identity: mutable SourceIdentity::Capture&, parent_visit: usize, root_source: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    if depth > 64:
+        read_failed <- true
+        return false
+    # absolute_path and the POSIX open call consume C strings. Refuse embedded NUL bytes
+    # before either can truncate the requested name and silently open a different file.
+    if path_contains_nul(path):
+        read_failed <- true
+        return false
+    # ABSOLUTE, cleaned paths — stage0 prints what filepath.Abs produced, and more
+    # importantly `path_already_seen` compares raw bytes: the same file reached as
+    # `./x.elisa` from one directory and `../lexer/x.elisa` from another did not dedup, so
+    # the include closure over the compiler's own tree reported 575 files where stage0
+    # reports 509. Canonicalising at the door fixes the listing and the dedup together.
+    absolute: darray[u8] = ProjectSystem::absolute_path(path)
+    identity_visit: usize = SourceIdentity::record(absolute, parent_visit, identity) can Memory.Allocate, Abort.Panic
+    if path_already_seen(active, absolute):
+        cycle_detected <- true
+        return false
+    return true if path_already_seen(seen, absolute)
+    active.extend(absolute)
+    active.push(0)
+    # Record the path by APPENDING its bytes plus a NUL. A `darray[darray[u8]]` would need
+    # each entry allocated in a region outliving the table, which the region checker
+    # correctly rejects for a locally-built buffer; one flat buffer sidesteps the
+    # ownership question entirely.
+    seen.extend(absolute)
+    seen.push(0)
+    path_c: mutable darray[u8] = []
+    path_c.extend(absolute)
+    path_c.push(0)
+    path_cstr: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    contents: mutable darray[u8] = []
+    if depth == 0 and root_source.count > 0:
+        contents.extend(root_source)
+    else:
+        if not source_readable(path_cstr):
+            read_failed <- true
+            active.count <- active.count - absolute.count - 1.usize()
+            return false
+        contents <- read_file(path_cstr)
+    if contents.count == 0:
+        active.count <- active.count - absolute.count - 1.usize()
+        return false
+    SourceIdentity::mark_expanded(identity_visit, identity) can Abort.Panic
+    if depth == 0 and emit_mode_is("edir"):
+        if contents.count > 0.usize() and contents[contents.count - 1.usize()] == ELISAC_LINE_FEED_BYTE:
+            _ = setenv("ELISA_STAGE1_EDIR_SOURCE_TERMINAL_NEWLINE", "1", 1)
+        else:
+            _ = setenv("ELISA_STAGE1_EDIR_SOURCE_TERMINAL_NEWLINE", "0", 1)
+    if line_directives_enabled():
+        push_line_directive(out, 1, absolute)
+        emitted_lines <- emitted_lines + 1
+    # The map entry names the file's FIRST REAL line — after the directive line when one
+    # was emitted — so a fault at file line N maps back to N, not N + 1.
+    push_line_map_entry(line_map, emitted_lines + 1, 1, absolute)
+    directory: darray[u8] = path_directory(absolute)
+    # Lines are SPANS into `contents`, not a copied-out buffer.
+    #
+    # The buffer version accumulated each line byte by byte into a `line` darray that grew
+    # while `out` and `seen` were already live below it. Under the driver's non-relocating
+    # arena only the TAIL allocation can grow, so the first line longer than ~519 bytes
+    # panicked in arena_realloc ("cannot grow in place: not the tail allocation") — which
+    # made the CLI unable to read ANY file containing a long line, its own sources included.
+    # Nothing caught it because the wrapper flattens includes before the driver runs, so the
+    # only route through this code was one no gate exercised.
+    # The sentinel iteration at `index == contents.count` flushes a FINAL UNTERMINATED line.
+    # It used to run unconditionally, so a file ending in a newline — almost every file — had
+    # its already-flushed last line followed by an extra empty one. One spurious blank line
+    # per included file: the compiler's own closure came out 22 lines longer than the
+    # wrapper's flattening of the same sources, which showed up as line-numbered internal
+    # symbols disagreeing between the two.
+    trailing_partial: bool = contents.count > 0.usize() and contents[contents.count - 1.usize()] != 10
+    expanded: mutable bool = true
+    index: mutable usize = 0.usize()
+    line_start: mutable usize = 0.usize()
+    source_line: mutable u32 = 0
+    while index < contents.count + (1.usize() if trailing_partial else 0.usize()) |index, line_start, source_line, emitted_lines, line_map, absolute, contents, out, seen, directory, depth, trailing_partial, identity|:
+        at_end: bool = index == contents.count
+        byte: u8 = 10 if at_end else contents[index]
+        if byte == 10:
+            included: darray[u8] = include_directive_path_span(contents, line_start, index)
+            if included.count > 0:
+                resolved: darray[u8] = resolve_include_path(directory, included)
+                resume_flat: usize = out.count
+                included_ok: bool = (expand_includes_capture(resolved, out, seen, active, depth + 1, line_map, emitted_lines, cycle_detected, read_failed, identity, identity_visit, root_source) can Memory.Allocate, Abort.Panic, Unsafe.PointerCast) if expanded else true
+                expanded <- false if not included_ok
+                if included_ok:
+                    # This file RESUMES after the include directive: the next flattened line is
+                    # this file's line `source_line + 2` (source_line is 0-based and still points
+                    # at the directive).
+                    if line_directives_enabled():
+                        # stage0's newline guard: an include that contributed nothing still ends
+                        # its parent's line before the resume directive.
+                        if out.count == resume_flat:
+                            out.push(10)
+                            # That guard byte is an EMPTY BUFFER LINE where the include stood;
+                            # the line map must count it or every later line maps one too low.
+                            emitted_lines <- emitted_lines + 1
+                        push_line_directive(out, source_line + 2, absolute)
+                        emitted_lines <- emitted_lines + 1
+                    # As at the root: the resume entry names the parent's next REAL line.
+                    push_line_map_entry(line_map, emitted_lines + 1, source_line + 2, absolute)
+            else:
+                # The line's bytes as one block copy (was a push per byte).
+                line_length: usize = index - line_start
+                if line_length > 0:
+                    out_start: usize = out.count
+                    out.reserve(out_start + line_length)
+                    out.count <- out_start + line_length
+                    trusted [Unsafe.PointerCast, Unsafe.RawExtern]:
+                        _ = memcpy((&out[out_start]).cast[mutable void&], (&contents[line_start]).cast[void&], line_length)
+                out.push(10)
+                emitted_lines <- emitted_lines + 1
+            line_start <- index + 1.usize()
+            source_line <- source_line + 1
+        index <- index + 1.usize()
+    active.count <- active.count - absolute.count - 1.usize()
+    return expanded
