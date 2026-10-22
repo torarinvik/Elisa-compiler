@@ -382,7 +382,7 @@ integration_text = INTEGRATION.read_text()
 if not all(fragment in integration_text for fragment in required_integration_fragments):
     raise SystemExit("EASM decimal integration smoke lost a malformed-input or i64-boundary control")
 integration_compact = compact(integration_text)
-if integration_compact.count("assertlength<=&source.count") != 2:
+if integration_compact.count("assertlength<=source.count") != 2:
     raise SystemExit("EASM decimal integration smoke must prove the borrowed source-count precondition at both parser calls")
 if integration_compact.count("can[Memory.Allocate,Abort.Panic,Global.Read]") != 3 or \
         integration_compact.count("canMemory.Allocate,Abort.Panic,Global.Read:") != 3:

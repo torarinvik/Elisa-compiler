@@ -1319,12 +1319,12 @@ index: usize = chv_flow_latest(flow, root_name) if root_name != \"\" else flow.n
 return index < flow.names.count and flow.may_owned_view[index]""")
 if field_projection_arm is None or compact_code(field_projection_arm) != expected_field_projection_arm:
     raise SystemExit("aggregate field projections must inherit view taint from their root binding")
-if "constCHV_VIEW_ALIAS_MAX_DEPTH:u32=8" not in compact_code(holder_text):
-    raise SystemExit("holder-view alias recursion limit must remain named")
 if "constCHV_DIAGNOSTIC_ARGUMENT_NUMBER_BASE:usize=1" not in compact_code(holder_text):
     raise SystemExit("holder-view diagnostic argument numbering must use a named constant")
-if "constCHV_REF_ALIAS_MAX_DEPTH:u32=8" not in compact_code(holder_text):
-    raise SystemExit("reference alias recursion limit must remain named")
+if "ifdepth>" in compact_code(owned_view_source) or "ifdepth>" in compact_code(function_section(holder_text, "chv_expression_may_alias_ref")):
+    raise SystemExit("AST nesting alone must not manufacture owned-view or reference provenance")
+if "ifdepth>" in compact_code(function_section(holder_text, "chv_call_method_info")):
+    raise SystemExit("transparent callee nesting must preserve view-producing method identity")
 if "flow.may_owned_view[index]" not in compact_code(owned_view_source):
     raise SystemExit("holder-view alias lookup must read the latest flow binding")
 if "flow.owned[index]orflow.may_owned_view[index]" not in compact_code(owned_view_source):

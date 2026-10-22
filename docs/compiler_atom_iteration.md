@@ -22,12 +22,14 @@ constant-pattern lowering. Indirect function values may require explicit referen
 in a probe; this tool is a development aid rather than a general linker.
 
 The `pymodule_struct_typedef`, `try_fallback_source`, `authority_coverage`,
-`authority_annotation_index`, and `iterator_alias_resolution` atoms use `-strict`.
-All other atoms use `-permissive`, so unrelated dependency contracts that cannot
-be proved in the sliced context retain their runtime checks. Source checking and
-SMT stay enabled in both modes. These results do **not** qualify a full strict
-compiler build or establish end-to-end incremental build time. Keep the complete
-self-compilation check as a separate gate, also capped at 30 seconds.
+`authority_annotation_index`, `iterator_alias_resolution`, `lmut_scope`,
+`loop_program_view`, and `type_region_suffix` atoms use `-strict`. All other
+atoms use `-permissive`, so unrelated dependency contracts that cannot be proved
+in the sliced context retain their runtime checks. Source checking and SMT stay
+enabled in both modes. These results do
+**not** qualify a full strict compiler build or establish end-to-end incremental
+build time. Keep the complete self-compilation check as a separate gate, also
+capped at 30 seconds.
 
 The `scalar_hash_native_smoke.sh` parity check compiles the production `ctx_hash_u64`
 and `ctx_unhash_u64` helpers, runs twelve boundary and representative vectors, and
@@ -740,3 +742,12 @@ cap: `-O3` reached the 6 GiB guard, `-O0` also reached that guard, and raising t
 single-build limit to 9 GiB avoided the guard but still timed out at 30s. No
 timed-out seed was retried unchanged. The next full-build attempt needs a source
 or pipeline optimization before it can be claimed as current.
+
+Bracketed type-region suffixes now retain their expression offsets instead of
+discarding the qualifier. The loop element checker uses that metadata to exempt
+`sview` elements qualified by a global region, matching Stage0's program-lived
+element rule. A local or generic region with the same name cancels the exemption
+within its scope. The strict `type_region_suffix` atom exercises the production
+suffix recorder used by the first and subsequent bracket arguments;
+`loop_program_view` checks acceptance, ordinary-view rejection, and region-name
+shadowing. These focused checks do not establish a fresh Stage1 self-compile.
