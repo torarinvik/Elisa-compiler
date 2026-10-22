@@ -31,6 +31,10 @@ assert functions["parent"]["parameters"] == [{"name": "value", "type": "i64", "d
 assert functions["shadow"]["parameters"] == [{"name": "value", "type": "i64", "default": "53"}]
 assert functions["from_left"]["parameters"] == [{"name": "value", "type": "i64", "default": "2"}]
 assert functions["from_right"]["parameters"] == [{"name": "value", "type": "i64", "default": "77"}]
+assert functions["from_nested_alias_chain"]["parameters"] == [{"name": "value", "type": "i64", "default": "42"}]
+assert functions["nested_module_wins"]["parameters"] == [{"name": "value", "type": "i64", "default": "82"}]
+assert functions["nested_chain_module_wins"]["parameters"] == [{"name": "value", "type": "i64", "default": "95"}]
+assert functions["nested_alias_suffix_fallback"]["parameters"] == [{"name": "value", "type": "i64", "default": "58"}]
 PY
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
@@ -46,6 +50,10 @@ grep -Fq 'def parent(value: int = 91) -> int: ...' "$WORK/qualified_enum_default
 grep -Fq 'def shadow(value: int = 53) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
 grep -Fq 'def from_left(value: int = 2) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
 grep -Fq 'def from_right(value: int = 77) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
+grep -Fq 'def from_nested_alias_chain(value: int = 42) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
+grep -Fq 'def nested_module_wins(value: int = 82) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
+grep -Fq 'def nested_chain_module_wins(value: int = 95) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
+grep -Fq 'def nested_alias_suffix_fallback(value: int = 58) -> int: ...' "$WORK/qualified_enum_defaults.pyi"
 python3 -m py_compile "$WORK/qualified_enum_defaults.pyi"
 
 if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROOT/build/runtime/elisacore_runtime.o" ]]; then
@@ -84,6 +92,14 @@ assert module.from_left() == 2
 assert str(inspect.signature(module.from_left)) == "(value=2)"
 assert module.from_right() == 77
 assert str(inspect.signature(module.from_right)) == "(value=77)"
+assert module.from_nested_alias_chain() == 42
+assert str(inspect.signature(module.from_nested_alias_chain)) == "(value=42)"
+assert module.nested_module_wins() == 82
+assert str(inspect.signature(module.nested_module_wins)) == "(value=82)"
+assert module.nested_chain_module_wins() == 95
+assert str(inspect.signature(module.nested_chain_module_wins)) == "(value=95)"
+assert module.nested_alias_suffix_fallback() == 58
+assert str(inspect.signature(module.nested_alias_suffix_fallback)) == "(value=58)"
 PY
 
 echo "pymodule qualified enum defaults smoke OK"

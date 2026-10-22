@@ -67,7 +67,7 @@ extend Semantic:
                     Stmt.Continue(_, _):         true
                     Stmt.Match(scrutinee, arms, line):
                         if statement_match_is_catch(table, line.line):
-                            expression_catch_terminates(scrutinee, arms, table)
+                            expression_catch_terminates(scrutinee, arms, table, line.line)
                         else:
                             expression_evaluation_aborts(scrutinee, table) or arms_all_terminate(scrutinee, arms, table)
                     Stmt.If(condition, then_body, else_body, _):
@@ -154,19 +154,94 @@ extend Semantic:
         # Whether a guaranteed-aborting expression has any reachable catchable-raise outcome.
         # A Catch around such a branch can continue through its handler even though the
         # guarded expression itself cannot complete normally.
+        def flow_expression_sequence_may_raise_catchably(expressions: darray[Ast::Expr], table: SymbolTable&) -> (may_raise: bool, reaches_end: bool):
+            can Memory.Allocate, Abort.Panic:
+                for expression in expressions:
+                    return (true, false) if expression_may_raise_catchably(expression, table)
+                    return (false, false) if expression_evaluation_aborts(expression, table)
+                return (false, true)
+
+        def flow_iterable_is_provably_nonempty(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return match expression:
+                    Ast::Expr.Array(elements, _) | Ast::Expr.Tuple(elements, _) | Ast::Expr.SetLit(elements, _): elements.count > 0
+                    Ast::Expr.DictLit(entries, _): entries.count > 0
+                    Ast::Expr.StringLit(text, _): text.len > 2
+                    Ast::Expr.Paren(inner, _): flow_iterable_is_provably_nonempty(inner)
+                    _: false
+
+        def flow_match_arms_may_raise_catchably(scrutinee: Ast::Expr, arms: darray[Ast::MatchArm], is_catch: bool, scrutinee_aborts: bool, scrutinee_may_raise: bool, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                arm_index: mutable usize = 0
+                while arm_index < arms.count |arm_index, arms, is_catch, scrutinee, scrutinee_aborts, scrutinee_may_raise, table|:
+                    arm: Ast::MatchArm = arms[arm_index]
+                    arm_reachable: mutable bool = false
+                    if is_catch:
+                        arm_reachable <- (not scrutinee_aborts if arm_index == 0 else scrutinee_may_raise) and progress_catch_arm_reachable(arms, arm_index)
+                    else:
+                        arm_reachable <- not scrutinee_aborts and progress_match_arm_reachable(scrutinee, arms, arm_index)
+                    if arm_reachable:
+                        # A guard is evaluated before its truth value is known. In
+                        # particular, `raise(E) and false` still has a catchable path.
+                        return true if expression_may_raise_catchably(arm.guard, table)
+                        guard_aborts: bool = expression_evaluation_aborts(arm.guard, table)
+                        guard: (known: bool, value: bool) = expression_literal_bool(arm.guard)
+                        if not guard_aborts and not (guard.known and not guard.value):
+                            return true if flow_statements_may_raise_catchably(arm.body, table)
+                    arm_index <- arm_index + 1
+                return false
+
+        def flow_callable_name(expression: Ast::Expr) -> sview @source:
+            can Abort.Panic:
+                return match expression:
+                    Ast::Expr.Ident(name, _) | Ast::Expr.Scope(_, name, _): name
+                    Ast::Expr.Paren(inner, _): flow_callable_name(inner)
+                    _: ""
+
+        def flow_callable_declares_error(callee_name: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if callee_name == ""
+                declared_error: (known: bool, family: sview @source) = try_noncall_callable_error_family(callee_name, table.protocol_annotations)
+                return declared_error.known and declared_error.family != ""
+
         def expression_may_raise_catchably(expression: Ast::Expr, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return match expression:
-                    Ast::Expr.Call(Ast::Expr.Ident("raise", _), arguments, _, _):
-                        argument_raises: bool = any argument in arguments where expression_may_raise_catchably(argument, table)
-                        argument_aborts: bool = any argument in arguments where expression_evaluation_aborts(argument, table)
-                        argument_raises or not argument_aborts
                     Ast::Expr.Call(callee, arguments, _, _):
                         callee_raises: bool = expression_may_raise_catchably(callee, table)
-                        callee_raises or (not expression_evaluation_aborts(callee, table) and any argument in arguments where expression_may_raise_catchably(argument, table))
+                        if callee_raises:
+                            true
+                        elif expression_evaluation_aborts(callee, table):
+                            false
+                        else:
+                            argument_result: (may_raise: bool, reaches_end: bool) = flow_expression_sequence_may_raise_catchably(arguments, table)
+                            argument_result.may_raise or (argument_result.reaches_end and (expression_directly_raises(expression) or flow_callable_declares_error(flow_callable_name(callee), table)))
+                    Ast::Expr.StaticEffectCall(_, _, candidates, arguments, _, _):
+                        runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)
+                        runtime_result: (may_raise: bool, reaches_end: bool) = flow_expression_sequence_may_raise_catchably(runtime_children, table)
+                        if runtime_result.may_raise:
+                            true
+                        elif not runtime_result.reaches_end:
+                            false
+                        else:
+                            any candidate in candidates where flow_callable_declares_error(candidate.callee, table)
+                    Ast::Expr.Binary(left, operator, right, _):
+                        left_raises: bool = expression_may_raise_catchably(left, table)
+                        if left_raises:
+                            true
+                        elif expression_evaluation_aborts(left, table):
+                            false
+                        else:
+                            right_is_required: mutable bool = true
+                            if operator == TokenKind.And or operator == TokenKind.Or:
+                                literal: (known: bool, value: bool) = expression_literal_bool(left)
+                                right_is_required <- not literal.known or ((operator == TokenKind.And and literal.value) or (operator == TokenKind.Or and not literal.value))
+                            expression_may_raise_catchably(right, table) if right_is_required else false
                     Ast::Expr.If(condition, then_value, else_value, _):
-                        if expression_evaluation_aborts(condition, table):
-                            expression_may_raise_catchably(condition, table)
+                        if expression_may_raise_catchably(condition, table):
+                            true
+                        elif expression_evaluation_aborts(condition, table):
+                            false
                         else:
                             literal: (known: bool, value: bool) = expression_literal_bool(condition)
                             if literal.known:
@@ -174,37 +249,99 @@ extend Semantic:
                             else:
                                 expression_may_raise_catchably(then_value, table) or expression_may_raise_catchably(else_value, table)
                     Ast::Expr.Match(scrutinee, arms, _):
-                        scrutinee_aborts: bool = expression_evaluation_aborts(scrutinee, table)
-                        if scrutinee_aborts:
-                            expression_may_raise_catchably(scrutinee, table)
-                        else:
-                            arm_index: mutable usize = 0
-                            while arm_index < arms.count |arm_index, arms, scrutinee, table|:
-                                arm: Ast::MatchArm = arms[arm_index]
-                                guard: (known: bool, value: bool) = expression_literal_bool(arm.guard)
-                                if progress_match_arm_reachable(scrutinee, arms, arm_index) and not (guard.known and not guard.value):
-                                    return true if expression_may_raise_catchably(arm.guard, table) or flow_statements_may_raise_catchably(arm.body, table)
-                                arm_index <- arm_index + 1
+                        scrutinee_raises: bool = expression_may_raise_catchably(scrutinee, table)
+                        if scrutinee_raises:
+                            true
+                        elif expression_evaluation_aborts(scrutinee, table):
                             false
+                        else:
+                            flow_match_arms_may_raise_catchably(scrutinee, arms, false, false, false, table)
                     Ast::Expr.Catch(guarded, arms, _):
                         guarded_aborts: bool = expression_evaluation_aborts(guarded, table)
                         guarded_may_raise: bool = expression_may_raise_catchably(guarded, table)
                         if guarded_aborts and not guarded_may_raise:
                             false
                         else:
-                            arm_index: mutable usize = 0
-                            while arm_index < arms.count |arm_index, arms, guarded_aborts, table|:
-                                arm: Ast::MatchArm = arms[arm_index]
-                                guard: (known: bool, value: bool) = expression_literal_bool(arm.guard)
-                                arm_reachable: bool = not (guard.known and not guard.value) and (not guarded_aborts or arm_index > 0) and progress_catch_arm_reachable(arms, arm_index)
-                                if arm_reachable:
-                                    return true if expression_may_raise_catchably(arm.guard, table) or flow_statements_may_raise_catchably(arm.body, table)
-                                arm_index <- arm_index + 1
-                            false
+                            flow_match_arms_may_raise_catchably(guarded, arms, true, guarded_aborts, guarded_may_raise, table)
                     Ast::Expr.Block(statements, value, _, _):
-                        flow_statements_may_raise_catchably(statements, table) or expression_may_raise_catchably(value, table)
+                        if flow_statements_may_raise_catchably(statements, table):
+                            true
+                        elif statements_terminate(statements, table):
+                            false
+                        else:
+                            expression_may_raise_catchably(value, table)
+                    Ast::Expr.Field(object, _, _) | Ast::Expr.Scope(object, _, _):
+                        expression_may_raise_catchably(object, table)
+                    Ast::Expr.Index(object, index, _):
+                        children: darray[Ast::Expr] @source = [object, index]
+                        flow_expression_sequence_may_raise_catchably(children, table).may_raise
+                    Ast::Expr.IndexN(object, indices, _):
+                        children: mutable darray[Ast::Expr] = [object]
+                        children.extend(indices)
+                        flow_expression_sequence_may_raise_catchably(children, table).may_raise
+                    Ast::Expr.Slice(object, low, high, _):
+                        children: darray[Ast::Expr] @source = [object, low, high]
+                        flow_expression_sequence_may_raise_catchably(children, table).may_raise
+                    Ast::Expr.Array(elements, _) | Ast::Expr.Tuple(elements, _) | Ast::Expr.SetLit(elements, _):
+                        flow_expression_sequence_may_raise_catchably(elements, table).may_raise
+                    Ast::Expr.DictLit(entries, _):
+                        for entry in entries:
+                            key_raises: bool = expression_may_raise_catchably(entry.key, table)
+                            return true if key_raises
+                            return false if expression_evaluation_aborts(entry.key, table)
+                            value_raises: bool = expression_may_raise_catchably(entry.value, table)
+                            return true if value_raises
+                            return false if expression_evaluation_aborts(entry.value, table)
+                        false
+                    Ast::Expr.Construct(type_expression, fields, _):
+                        type_raises: bool = expression_may_raise_catchably(type_expression, table)
+                        if type_raises:
+                            true
+                        elif expression_evaluation_aborts(type_expression, table):
+                            false
+                        else:
+                            for field in fields:
+                                field_raises: bool = expression_may_raise_catchably(field.value, table)
+                                return true if field_raises
+                                return false if expression_evaluation_aborts(field.value, table)
+                            false
+                    Ast::Expr.RecordUpdate(base, fields, _):
+                        base_raises: bool = expression_may_raise_catchably(base, table)
+                        if base_raises:
+                            true
+                        elif expression_evaluation_aborts(base, table):
+                            false
+                        else:
+                            for field in fields:
+                                field_raises: bool = expression_may_raise_catchably(field.value, table)
+                                return true if field_raises
+                                return false if expression_evaluation_aborts(field.value, table)
+                            false
+                    Ast::Expr.GetElse(guarded, recovery, _):
+                        if expression_may_raise_catchably(guarded, table):
+                            true
+                        elif expression_evaluation_aborts(guarded, table):
+                            false
+                        else:
+                            flow_statements_may_raise_catchably(recovery, table)
+                    Ast::Expr.Comprehension(_, iterable, condition, body, _, _):
+                        if expression_may_raise_catchably(iterable, table):
+                            true
+                        elif expression_evaluation_aborts(iterable, table) or progress_empty_iterable(iterable):
+                            false
+                        elif expression_may_raise_catchably(condition, table):
+                            true
+                        elif expression_evaluation_aborts(condition, table):
+                            false
+                        else:
+                            condition_literal: (known: bool, value: bool) = expression_literal_bool(condition)
+                            expression_may_raise_catchably(body, table) if not (condition_literal.known and not condition_literal.value) else false
+                    Ast::Expr.Refinement(base, predicate, _):
+                        children: darray[Ast::Expr] @source = [base, predicate]
+                        flow_expression_sequence_may_raise_catchably(children, table).may_raise
                     Ast::Expr.Paren(inner, _) | Ast::Expr.Unary(_, inner, _) | Ast::Expr.Move(inner, _) | Ast::Expr.RegionNew(inner, _, _):
                         expression_may_raise_catchably(inner, table)
+                    Ast::Expr.Lambda(_, _, _): false
                     _: false
 
         def flow_statements_may_raise_catchably(statements: darray[Ast::Stmt], table: SymbolTable&) -> bool:
@@ -217,11 +354,14 @@ extend Semantic:
                             if value is present_value:
                                 return true if expression_may_raise_catchably(present_value, table)
                         Ast::Stmt.VarDecl(_, type_expression, value, _):
-                            return true if expression_may_raise_catchably(type_expression, table) or expression_may_raise_catchably(value, table)
+                            children: darray[Ast::Expr] @source = [type_expression, value]
+                            return true if flow_expression_sequence_may_raise_catchably(children, table).may_raise
                         Ast::Stmt.Assign(target, _, value, _):
-                            return true if expression_may_raise_catchably(target, table) or expression_may_raise_catchably(value, table)
+                            children: darray[Ast::Expr] @source = [target, value]
+                            return true if flow_expression_sequence_may_raise_catchably(children, table).may_raise
                         Ast::Stmt.If(condition, then_body, else_body, _):
                             return true if expression_may_raise_catchably(condition, table)
+                            return false if expression_evaluation_aborts(condition, table)
                             literal: (known: bool, value: bool) = expression_literal_bool(condition)
                             if literal.known:
                                 selected: darray[Ast::Stmt] = then_body if literal.value else else_body
@@ -230,48 +370,51 @@ extend Semantic:
                                 return true if flow_statements_may_raise_catchably(then_body, table) or flow_statements_may_raise_catchably(else_body, table)
                         Ast::Stmt.Block(body: body, _):
                             return true if flow_statements_may_raise_catchably(body, table)
+                        Ast::Stmt.While(condition, body, _):
+                            return true if expression_may_raise_catchably(condition, table)
+                            return false if expression_evaluation_aborts(condition, table)
+                            condition_literal: (known: bool, value: bool) = expression_literal_bool(condition)
+                            return true if not (condition_literal.known and not condition_literal.value) and flow_statements_may_raise_catchably(body, table)
+                        Ast::Stmt.For(_, _, iterable, body, _):
+                            return true if expression_may_raise_catchably(iterable, table)
+                            return false if expression_evaluation_aborts(iterable, table) or progress_empty_iterable(iterable)
+                            return true if flow_statements_may_raise_catchably(body, table)
                         Ast::Stmt.Match(scrutinee, arms, line):
                             is_catch: bool = statement_match_is_catch(table, line.line)
                             scrutinee_aborts: bool = expression_evaluation_aborts(scrutinee, table)
                             scrutinee_may_raise: bool = expression_may_raise_catchably(scrutinee, table)
-                            if scrutinee_aborts and not (is_catch and scrutinee_may_raise):
-                                return scrutinee_may_raise
-                            arm_index: mutable usize = 0
-                            while arm_index < arms.count |arm_index, arms, is_catch, scrutinee, scrutinee_aborts, table|:
-                                arm: Ast::MatchArm = arms[arm_index]
-                                guard: (known: bool, value: bool) = expression_literal_bool(arm.guard)
-                                reachable: bool = not (guard.known and not guard.value) and (progress_catch_arm_reachable(arms, arm_index) if is_catch else progress_match_arm_reachable(scrutinee, arms, arm_index)) and not (is_catch and scrutinee_aborts and arm_index == 0)
-                                if reachable:
-                                    return true if expression_may_raise_catchably(arm.guard, table) or flow_statements_may_raise_catchably(arm.body, table)
-                                arm_index <- arm_index + 1
+                            return true if not is_catch and scrutinee_may_raise
+                            return false if scrutinee_aborts and not (is_catch and scrutinee_may_raise)
+                            return true if flow_match_arms_may_raise_catchably(scrutinee, arms, is_catch, scrutinee_aborts, scrutinee_may_raise, table)
+                        Ast::Stmt.Contract(_, expression, _):
+                            return true if expression_may_raise_catchably(expression, table)
                         _:
                             pass
                     return false if statement_terminates(statement, table)
                 return false
 
-        def catch_error_arms_terminate(arms: darray[Ast::MatchArm], table: SymbolTable&) -> bool:
+        def catch_error_arms_terminate(arms: darray[Ast::MatchArm], table: SymbolTable&, line: u32) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return false if arms.count < 2
-                error_arms: darray[Ast::MatchArm] @source = [arms[index] for index in 1..<arms.count]
-                return false if not progress_catch_error_arms_total(arms, table)
-                arm_index: mutable usize = 0
-                while arm_index < error_arms.count |arm_index, error_arms, table|:
-                    arm: Ast::MatchArm = error_arms[arm_index]
+                return false if not progress_catch_error_arms_total_at(arms, table, line)
+                arm_index: mutable usize = 1
+                while arm_index < arms.count |arm_index, arms, table|:
+                    arm: Ast::MatchArm = arms[arm_index]
                     guard: (known: bool, value: bool) = expression_literal_bool(arm.guard)
-                    if progress_match_arm_reachable(Ast::Expr.Absent, error_arms, arm_index) and not (guard.known and not guard.value):
+                    if progress_catch_arm_reachable(arms, arm_index) and not (guard.known and not guard.value):
                         return false if not expression_evaluation_aborts(arm.guard, table) and not statements_terminate(arm.body, table)
                     arm_index <- arm_index + 1
                 return true
 
-        def expression_catch_terminates(guarded: Ast::Expr, arms: darray[Ast::MatchArm], table: SymbolTable&) -> bool:
+        def expression_catch_terminates(guarded: Ast::Expr, arms: darray[Ast::MatchArm], table: SymbolTable&, line: u32) -> bool:
             can Memory.Allocate, Abort.Panic:
                 guarded_aborts: bool = expression_evaluation_aborts(guarded, table)
                 catchable_raise: bool = expression_may_raise_catchably(guarded, table)
                 if guarded_aborts:
                     return true if not catchable_raise
-                    return catch_error_arms_terminate(arms, table)
+                    return catch_error_arms_terminate(arms, table, line)
                 return false if arms.count == 0 or not statements_terminate(arms[0].body, table)
-                return catch_error_arms_terminate(arms, table)
+                return catch_error_arms_terminate(arms, table, line)
 
         # Statement-position Catch is represented by Stmt.Match plus a parser marker. Keep
         # its catchable raise path separate from ordinary Match's eager scrutinee abort.
@@ -323,18 +466,33 @@ extend Semantic:
                         expression_evaluation_aborts(object, table) or expression_evaluation_aborts(low, table) or expression_evaluation_aborts(high, table)
                     Ast::Expr.Array(elements, _) | Ast::Expr.Tuple(elements, _) | Ast::Expr.SetLit(elements, _):
                         any element in elements where expression_evaluation_aborts(element, table)
-                    Ast::Expr.Catch(guarded, arms, _):
-                        expression_catch_terminates(guarded, arms, table)
+                    Ast::Expr.Catch(guarded, arms, line):
+                        expression_catch_terminates(guarded, arms, table, line.line)
                     Ast::Expr.GetElse(guarded, _, _):
                         expression_evaluation_aborts(guarded, table)
-                    Ast::Expr.Comprehension(_, iterable, _, _, _, _):
-                        expression_evaluation_aborts(iterable, table)
+                    Ast::Expr.Comprehension(_, iterable, condition, body, _, _):
+                        if expression_evaluation_aborts(iterable, table):
+                            true
+                        elif not flow_iterable_is_provably_nonempty(iterable):
+                            false
+                        elif expression_evaluation_aborts(condition, table):
+                            true
+                        else:
+                            condition_literal: (known: bool, value: bool) = expression_literal_bool(condition)
+                            if condition_literal.known and not condition_literal.value:
+                                false
+                            elif condition is Ast::Expr.Absent or (condition_literal.known and condition_literal.value):
+                                expression_evaluation_aborts(body, table)
+                            else:
+                                false
                     Ast::Expr.DictLit(entries, _):
                         any entry in entries where expression_evaluation_aborts(entry.key, table) or expression_evaluation_aborts(entry.value, table)
-                    Ast::Expr.Construct(_, fields, _):
-                        any field in fields where expression_evaluation_aborts(field.value, table)
+                    Ast::Expr.Construct(type_expression, fields, _):
+                        expression_evaluation_aborts(type_expression, table) or any field in fields where expression_evaluation_aborts(field.value, table)
                     Ast::Expr.RecordUpdate(base, fields, _):
                         expression_evaluation_aborts(base, table) or any field in fields where expression_evaluation_aborts(field.value, table)
+                    Ast::Expr.Refinement(base, predicate, _):
+                        expression_evaluation_aborts(base, table) or expression_evaluation_aborts(predicate, table)
                     _: false
 
 
@@ -380,18 +538,33 @@ extend Semantic:
                         expression_evaluation_aborts(object, table) or expression_evaluation_aborts(low, table) or expression_evaluation_aborts(high, table)
                     Ast::Expr.Array(elements, _) | Ast::Expr.Tuple(elements, _) | Ast::Expr.SetLit(elements, _):
                         any element in elements where expression_evaluation_aborts(element, table)
-                    Ast::Expr.Catch(guarded, arms, _):
-                        expression_catch_terminates(guarded, arms, table)
+                    Ast::Expr.Catch(guarded, arms, line):
+                        expression_catch_terminates(guarded, arms, table, line.line)
                     Ast::Expr.GetElse(guarded, _, _):
                         expression_evaluation_aborts(guarded, table)
-                    Ast::Expr.Comprehension(_, iterable, _, _, _, _):
-                        expression_evaluation_aborts(iterable, table)
+                    Ast::Expr.Comprehension(_, iterable, condition, body, _, _):
+                        if expression_evaluation_aborts(iterable, table):
+                            true
+                        elif not flow_iterable_is_provably_nonempty(iterable):
+                            false
+                        elif expression_evaluation_aborts(condition, table):
+                            true
+                        else:
+                            condition_literal: (known: bool, value: bool) = expression_literal_bool(condition)
+                            if condition_literal.known and not condition_literal.value:
+                                false
+                            elif condition is Ast::Expr.Absent or (condition_literal.known and condition_literal.value):
+                                expression_evaluation_aborts(body, table)
+                            else:
+                                false
                     Ast::Expr.DictLit(entries, _):
                         any entry in entries where expression_evaluation_aborts(entry.key, table) or expression_evaluation_aborts(entry.value, table)
-                    Ast::Expr.Construct(_, fields, _):
-                        any field in fields where expression_evaluation_aborts(field.value, table)
+                    Ast::Expr.Construct(type_expression, fields, _):
+                        expression_evaluation_aborts(type_expression, table) or any field in fields where expression_evaluation_aborts(field.value, table)
                     Ast::Expr.RecordUpdate(base, fields, _):
                         expression_evaluation_aborts(base, table) or any field in fields where expression_evaluation_aborts(field.value, table)
+                    Ast::Expr.Refinement(base, predicate, _):
+                        expression_evaluation_aborts(base, table) or expression_evaluation_aborts(predicate, table)
                     Ast::Expr.Paren(inner, _) | Ast::Expr.Unary(_, inner, _) | Ast::Expr.Move(inner, _) | Ast::Expr.RegionNew(inner, _, _):
                         expression_aborts(inner, table)
                     _:                              false

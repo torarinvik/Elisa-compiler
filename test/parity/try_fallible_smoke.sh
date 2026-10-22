@@ -386,6 +386,15 @@ grep -q 'try requires a fallible expression' <<< "$catch_nested_terminating_all_
 }
 ! grep -q 'cannot propagate F from a function returning E' <<< "$catch_nested_terminating_all_handlers_ignores_unreachable_family"
 
+# The inner Catch can raise only on the declared-fallible call's error path. The outer
+# Catch recovers that path, so its returning error arm must remain in the conditional's
+# source facts and expose load_f's F family to the final Try.
+nested_catch_recovery_branch_keeps_fallible_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e(flag: bool) -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad(flag: bool) -> i64 error[E] can[Abort.Panic]:\n    value = (catch (catch load_e(flag):\n        success:\n            panic()\n        error problem:\n            raise F.Other):\n        success:\n            0\n        error problem:\n            load_f()) if flag else 0\n    return try value\n' | "$RPT")
+grep -q 'cannot propagate F from a function returning E' <<< "$nested_catch_recovery_branch_keeps_fallible_family" || {
+    echo "try_fallible FAILED: nested Catch recovery branch lost the fallible F family: $nested_catch_recovery_branch_keeps_fallible_family"
+    exit 1
+}
+
 match_aborting_guard_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad(flag: bool) -> i64 can[Abort.Panic]:\n    value = match flag:\n        true if panic(): load_f()\n        false: 1\n    return try value\n' | "$RPT")
 grep -q '^P 0$' <<< "$match_aborting_guard_ignores_unreachable_family"
 grep -q 'try requires a fallible expression' <<< "$match_aborting_guard_ignores_unreachable_family" || {

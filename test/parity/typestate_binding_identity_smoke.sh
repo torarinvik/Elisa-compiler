@@ -19,4 +19,4 @@ else
     echo "binding identity probe failed control $status" >&2
     exit "$status"
 fi
-echo 'Stage1 binding identities/capabilities OK: exact occurrence lookup, indexed/fallback agreement, ambiguous spans and cyclic links fail closed; scoped explicit moves, family/state aliases/imports, retained annotations, lexical precedence and sibling isolation'
+echo 'Stage1 binding identities/capabilities OK: exact occurrence lookup, indexed/fallback agreement, ambiguous spans and cyclic links fail closed; scoped explicit moves, family/state aliases/imports, nested module-alias chains, retained annotations, lexical precedence and sibling isolation'

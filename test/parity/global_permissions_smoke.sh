@@ -370,6 +370,13 @@ EOF
 for case_file in reads_writes store_and_grant trusted_firewall rooted_store qualified_return qualified_globals same_named_module_functions same_named_module_functions_reversed; do
     expect_agree "$case_file" "$WORK/$case_file.elisa"
 done
+expect_agree "chained and qualified using aliases" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa"
+expect_stage1_row "chained module alias resolves its target" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa" "alias_chain_write Global.Write"
+expect_stage1_row "qualified alias suffix stays under its target" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa" "qualified_alias_chain_write Global.Write"
+expect_stage1_row "chained alias selects the aliased writer" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa" "alias_chain_call Global.Write"
+expect_stage1_row "qualified alias suffix selects the aliased writer" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa" "qualified_alias_chain_call Global.Write"
+expect_stage1_row "nested alias resolves from its lexical module" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa" "nested_alias_chain_write Global.Write"
+expect_stage1_row "nested alias selects the lexical module writer" "$REPO_ROOT/test/repro/global_authority_using_alias_chain.elisa" "nested_alias_chain_call Global.Write"
 expect_stage1_row "qualified module read is inferred" "$WORK/qualified_globals.elisa" "read_hits Global.Read"
 expect_stage1_row "qualified simple write is inferred" "$WORK/qualified_globals.elisa" "set_hits Global.Write"
 expect_stage1_row "qualified compound write infers read" "$WORK/qualified_globals.elisa" "bump_hits Global.Read"

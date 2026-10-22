@@ -664,12 +664,11 @@ def main() -> i64:
 CASE
 run_case chained_alias_wildcard_import 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Outer:
-    module Inner:
-        public:
-            global mutable hot: i64 = 1
+    public:
+        global mutable hot: i64 = 1
 using Outer as First
 using First as Second
-using Second::Inner
+using Second
 def main() -> i64:
     return hot
 CASE

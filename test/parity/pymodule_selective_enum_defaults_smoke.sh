@@ -30,6 +30,14 @@ assert functions["nested_qualified"]["parameters"] == [{"name": "value", "type":
 assert functions["alias_wins"]["parameters"] == [{"name": "value", "type": "i64", "default": "66"}]
 assert functions["chained_alias"]["parameters"] == [{"name": "value", "type": "i64", "default": "71"}]
 assert functions["qualified_target_alias"]["parameters"] == [{"name": "value", "type": "i64", "default": "83"}]
+assert functions["forward_alias_first"]["parameters"] == [{"name": "value", "type": "i64", "default": "86"}]
+assert functions["forward_alias_second"]["parameters"] == [{"name": "value", "type": "i64", "default": "85"}]
+assert functions["nested_alias_chain"]["parameters"] == [{"name": "value", "type": "i64", "default": "84"}]
+assert functions["alias_missing_enum_fallback"]["parameters"] == [{"name": "value", "type": "i64", "default": "11"}]
+assert functions["alias_nested_suffix"]["parameters"] == [{"name": "value", "type": "i64", "default": "90"}]
+assert functions["alias_missing_suffix_fallback"]["parameters"] == [{"name": "value", "type": "i64", "default": "89"}]
+assert functions["child_alias_fallback"]["parameters"] == [{"name": "value", "type": "i64", "default": "66"}]
+assert functions["nested_source_import"]["parameters"] == [{"name": "value", "type": "i64", "default": "58"}]
 assert functions["long_chained_alias"]["parameters"] == [{"name": "value", "type": "i64", "default": "71"}]
 PY
 
@@ -43,6 +51,14 @@ grep -Fq 'def nested_qualified(value: int = 82) -> int: ...' "$WORK/selective_en
 grep -Fq 'def alias_wins(value: int = 66) -> int: ...' "$WORK/selective_enum_defaults.pyi"
 grep -Fq 'def chained_alias(value: int = 71) -> int: ...' "$WORK/selective_enum_defaults.pyi"
 grep -Fq 'def qualified_target_alias(value: int = 83) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def forward_alias_first(value: int = 86) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def forward_alias_second(value: int = 85) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def nested_alias_chain(value: int = 84) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def alias_missing_enum_fallback(value: int = 11) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def alias_nested_suffix(value: int = 90) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def alias_missing_suffix_fallback(value: int = 89) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def child_alias_fallback(value: int = 66) -> int: ...' "$WORK/selective_enum_defaults.pyi"
+grep -Fq 'def nested_source_import(value: int = 58) -> int: ...' "$WORK/selective_enum_defaults.pyi"
 grep -Fq 'def long_chained_alias(value: int = 71) -> int: ...' "$WORK/selective_enum_defaults.pyi"
 python3 -m py_compile "$WORK/selective_enum_defaults.pyi"
 
@@ -109,6 +125,22 @@ assert module.chained_alias() == 71
 assert str(inspect.signature(module.chained_alias)) == "(value=71)"
 assert module.qualified_target_alias() == 83
 assert str(inspect.signature(module.qualified_target_alias)) == "(value=83)"
+assert module.forward_alias_first() == 86
+assert str(inspect.signature(module.forward_alias_first)) == "(value=86)"
+assert module.forward_alias_second() == 85
+assert str(inspect.signature(module.forward_alias_second)) == "(value=85)"
+assert module.nested_alias_chain() == 84
+assert str(inspect.signature(module.nested_alias_chain)) == "(value=84)"
+assert module.alias_missing_enum_fallback() == 11
+assert str(inspect.signature(module.alias_missing_enum_fallback)) == "(value=11)"
+assert module.alias_nested_suffix() == 90
+assert str(inspect.signature(module.alias_nested_suffix)) == "(value=90)"
+assert module.alias_missing_suffix_fallback() == 89
+assert str(inspect.signature(module.alias_missing_suffix_fallback)) == "(value=89)"
+assert module.child_alias_fallback() == 66
+assert str(inspect.signature(module.child_alias_fallback)) == "(value=66)"
+assert module.nested_source_import() == 58
+assert str(inspect.signature(module.nested_source_import)) == "(value=58)"
 assert module.long_chained_alias() == 71
 assert str(inspect.signature(module.long_chained_alias)) == "(value=71)"
 assert fallback.alias_fallback() == 57
