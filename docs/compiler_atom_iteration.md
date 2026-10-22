@@ -23,10 +23,10 @@ in a probe; this tool is a development aid rather than a general linker.
 
 The `pymodule_struct_typedef`, `try_fallback_source`, `authority_coverage`,
 `authority_annotation_index`, `iterator_alias_resolution`, `lmut_scope`,
-`loop_program_view`, and `type_region_suffix` atoms use `-strict`. All other
-atoms use `-permissive`, so unrelated dependency contracts that cannot be proved
-in the sliced context retain their runtime checks. Source checking and SMT stay
-enabled in both modes. These results do
+`loop_program_view`, `type_region_suffix`, `holder_view_depth`, and
+`holder_view_wrappers` atoms use `-strict`. All other atoms use `-permissive`, so unrelated dependency contracts
+that cannot be proved in the sliced context retain their runtime checks. Source
+checking and SMT stay enabled in both modes. These results do
 **not** qualify a full strict compiler build or establish end-to-end incremental
 build time. Keep the complete self-compilation check as a separate gate, also
 capped at 30 seconds.
@@ -751,3 +751,19 @@ within its scope. The strict `type_region_suffix` atom exercises the production
 suffix recorder used by the first and subsequent bracket arguments;
 `loop_program_view` checks acceptance, ordinary-view rejection, and region-name
 shadowing. These focused checks do not establish a fresh Stage1 self-compile.
+
+The holder-view provenance helpers now follow AST children without treating eight
+levels of nesting as evidence of owned storage or a caller-reference alias. Name
+provenance already terminates in the flow table; these traversals do not expand
+alias expressions. The strict `holder_view_depth` atom checks deep scalar and
+borrowed-view expressions, reference aliases, and wrapped method identity. The
+`holder_scalar_deep.elisa` fixture reproduces the old Stage1 false rejection of
+twelve scalar identity calls stored into a numeric holder field; Stage0 accepts
+the fixture. The source-side proof audit passes. Full proof replay remains
+unverified until a fresh strict Stage1 product is available.
+
+The strict `holder_view_wrappers` atom checks that evaluated block results retain
+their possible borrowed-view provenance through unary and binary expressions,
+field projections, indexing, and slicing. Each wrapper has a scalar control.
+The production walker retains child facts rather than replacing them with a
+syntax-only lookup that cannot classify the block's result.

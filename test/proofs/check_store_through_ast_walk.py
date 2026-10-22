@@ -31,10 +31,13 @@ EXPECTED_EXPR_NAMES = tuple("""Invalid Absent IntLit FloatLit StringLit CharLit 
     Array Tuple SetLit DictLit Construct RecordUpdate If Match Catch Comprehension Refinement GetElse Lambda Block""".split())
 EXPECTED_STMT_NAMES = tuple("Invalid Expr Block VarDecl Assign If While For Return Break Continue Match Contract".split())
 EXPECTED_SIDE_TABLE_FIELDS = {
-    "MatchArm": tuple("pattern:Pattern body:darray[Stmt] guard:Expr pos:Pos".split()),
-    "DictEntry": tuple("key:Expr value:Expr".split()),
-    "FieldInit": tuple("name:sview value:Expr is_copy_base:bool".split()),
-    "StaticEffectCandidate": tuple("effect_type:Expr callee:sview captures:darray[Expr] effect_identity_id:u32 handler_identity_id:u32 callee_owner:sview".split()),
+    "MatchArm": ("pattern:Pattern", "body:darray[Stmt] @source", "guard:Expr", "pos:Pos"),
+    "DictEntry": ("key:Expr", "value:Expr"),
+    "FieldInit": ("name:sview @source", "value:Expr", "is_copy_base:bool"),
+    "StaticEffectCandidate": (
+        "effect_type:Expr", "callee:sview @source", "captures:darray[Expr] @source",
+        "effect_identity_id:u32", "handler_identity_id:u32", "callee_owner:sview @source",
+    ),
 }
 CHV_FLOW_NAMES = (
     "flow", "then_flow", "else_flow", "merged_flow", "arm_flow", "guarded_flow",
@@ -201,10 +204,10 @@ EXPRESSION_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |out|:"),
     ("for argument in arguments |out|:", "sts_collect_names(argument, out)", 0),
     ("for argument in arguments |out|:", "sts_collect_names(argument, out)", 1),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, _, _):", "for candidate in candidates |out|:"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, _):", "for candidate in candidates |out|:"),
     ("for candidate in candidates |out|:", "for capture in candidate.captures |out|:"),
     ("for capture in candidate.captures |out|:", "sts_collect_names(capture, out)"),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, _, _):", "for argument in arguments |out|:"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, _):", "for argument in arguments |out|:"),
     ("for argument in arguments |out|:", "sts_collect_names(argument, out)", 2),
     ("Expr.Field(object, _, _):", "sts_collect_names(object, out)"),
     ("Expr.Index(object, index, _):", "sts_collect_names(object, out)"),
@@ -245,9 +248,9 @@ EXPRESSION_EDGES = (
     ("for arm in arms |out|:", "sts_collect_names(arm.guard, out)", 1),
     ("for arm in arms |out|:", "sts_collect_statement_names(arm.body, out)", 0),
     ("for arm in arms |out|:", "sts_collect_statement_names(arm.body, out)", 1),
-    ("Expr.Comprehension(_, iterable, condition, body, _, _):", "sts_collect_names(iterable, out)"),
-    ("Expr.Comprehension(_, iterable, condition, body, _, _):", "sts_collect_names(condition, out)"),
-    ("Expr.Comprehension(_, iterable, condition, body, _, _):", "sts_collect_names(body, out)"),
+    ("Expr.Comprehension(iterable: iterable, condition: condition, body: body, _):", "sts_collect_names(iterable, out)"),
+    ("Expr.Comprehension(iterable: iterable, condition: condition, body: body, _):", "sts_collect_names(condition, out)"),
+    ("Expr.Comprehension(iterable: iterable, condition: condition, body: body, _):", "sts_collect_names(body, out)"),
     ("Expr.Refinement(base, predicate, _):", "sts_collect_names(base, out)"),
     ("Expr.Refinement(base, predicate, _):", "sts_collect_names(predicate, out)"),
     ("Expr.GetElse(guarded, recovery, _):", "sts_collect_names(guarded, out)"),
@@ -261,8 +264,8 @@ EXPRESSION_EDGES = (
 
 STATEMENT_COLLECTOR_EDGES = (
     ("Stmt.Expr(expression, _):", "sts_collect_names(expression, out)"),
-    ("Stmt.Block(_, _, _, body, _):", "sts_collect_statement_names(body, out)"),
-    ("Stmt.VarDecl(_, _, value, _):", "sts_collect_names(value, out)"),
+    ("Stmt.Block(body: body, _):", "sts_collect_statement_names(body, out)"),
+    ("Stmt.VarDecl(value: value, _):", "sts_collect_names(value, out)"),
     ("Stmt.Assign(target, _, value, _):", "sts_collect_names(target, out)"),
     ("Stmt.Assign(target, _, value, _):", "sts_collect_names(value, out)"),
     ("Stmt.If(condition, then_body, else_body, _):", "sts_collect_names(condition, out)"),
@@ -270,8 +273,8 @@ STATEMENT_COLLECTOR_EDGES = (
     ("Stmt.If(condition, then_body, else_body, _):", "sts_collect_statement_names(else_body, out)"),
     ("Stmt.While(condition, body, _):", "sts_collect_names(condition, out)"),
     ("Stmt.While(condition, body, _):", "sts_collect_statement_names(body, out)"),
-    ("Stmt.For(_, _, iterable, body, _):", "sts_collect_names(iterable, out)"),
-    ("Stmt.For(_, _, iterable, body, _):", "sts_collect_statement_names(body, out)"),
+    ("Stmt.For(iterable: iterable, body: body, _):", "sts_collect_names(iterable, out)"),
+    ("Stmt.For(iterable: iterable, body: body, _):", "sts_collect_statement_names(body, out)"),
     ("Stmt.Return(value, _):", "sts_collect_names(return_value, out)"),
     ("Stmt.Match(scrutinee, arms, _):", "sts_collect_names(scrutinee, out)"),
     ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |out|:"),
@@ -282,14 +285,15 @@ STATEMENT_COLLECTOR_EDGES = (
 
 STATEMENT_UNIFIER_EDGES = (
     ("Stmt.VarDecl(declared_name, declared_type, declared_value, _):", "sts_unify_bound(declared_name, declared_type, declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_collect_names(assign_target, assign_names)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_collect_names(assign_value, assign_names)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_all(classes, assign_names)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_calls(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
-    ("Stmt.Assign(assign_target, _, assign_value, _):", "sts_unify_calls(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Assign(assign_target, assign_operator, assign_value, _):", "if not sts_same_target_lmut_rebind(assign_target, assign_operator, assign_value, has_unreadable_binder, function_owner, reference_sites, table) and not sts_assignment_rhs_is_reference_free(assign_value, assign_operator, has_unreadable_binder, function_owner, reference_sites, table):"),
+    ("if not sts_same_target_lmut_rebind(assign_target, assign_operator, assign_value, has_unreadable_binder, function_owner, reference_sites, table) and not sts_assignment_rhs_is_reference_free(assign_value, assign_operator, has_unreadable_binder, function_owner, reference_sites, table):", "sts_collect_names(assign_target, assign_names)"),
+    ("if not sts_same_target_lmut_rebind(assign_target, assign_operator, assign_value, has_unreadable_binder, function_owner, reference_sites, table) and not sts_assignment_rhs_is_reference_free(assign_value, assign_operator, has_unreadable_binder, function_owner, reference_sites, table):", "sts_collect_names(assign_value, assign_names)"),
+    ("if not sts_same_target_lmut_rebind(assign_target, assign_operator, assign_value, has_unreadable_binder, function_owner, reference_sites, table) and not sts_assignment_rhs_is_reference_free(assign_value, assign_operator, has_unreadable_binder, function_owner, reference_sites, table):", "sts_unify_all(classes, assign_names)"),
+    ("Stmt.Assign(assign_target, assign_operator, assign_value, _):", "sts_unify_calls(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Assign(assign_target, assign_operator, assign_value, _):", "sts_unify_calls(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Expr(statement_value, _):", "sts_unify_calls(statement_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Return(returned, _):", "if returned is returned_value:"),
-    ("if returned is returned_value:", "sts_unify_calls(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("if returned is returned_value:", "sts_unify_return_calls(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.If(condition, then_body, else_body, _):", "sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.If(condition, then_body, else_body, _):", "sts_statements(then_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.If(condition, then_body, else_body, _):", "sts_statements(else_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
@@ -299,7 +303,7 @@ STATEMENT_UNIFIER_EDGES = (
     ("for loop_variable in loop_variables |classes, reference_sites|:", "sts_unify_bound(loop_variable, Expr.Invalid, iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_unify_calls(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "sts_statements(loop_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
-    ("Stmt.Block(_, _, _, block_body, _):", "sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
+    ("Stmt.Block(body: block_body, _):", "sts_statements(block_body, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Match(scrutinee, arms, _):", "sts_unify_calls(scrutinee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
     ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |classes, reference_sites|:"),
     ("for arm in arms |classes, reference_sites|:", "sts_unify_calls(arm.guard, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),
@@ -351,7 +355,7 @@ HOLDER_SCAN_EXPRESSION_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "chv_scan_expression_locals(callee, in_region, binders, owned, view_names, view_values)"),
     ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |binders, owned, view_names, view_values|:"),
     ("for argument in arguments |binders, owned, view_names, view_values|:", "chv_scan_expression_locals(argument, in_region, binders, owned, view_names, view_values)"),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, _, _):", "for child in Ast::effect_runtime_children(candidates, arguments) |binders, owned, view_names, view_values|:"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, _):", "for child in Ast::effect_runtime_children(candidates, arguments) |binders, owned, view_names, view_values|:"),
     ("Expr.Field(object, _, _):", "chv_scan_expression_locals(object, in_region, binders, owned, view_names, view_values)"),
     ("Expr.Scope(base, _, _):", "chv_scan_expression_locals(base, in_region, binders, owned, view_names, view_values)"),
     ("Expr.Index(object, index, _):", "chv_scan_expression_locals(object, in_region, binders, owned, view_names, view_values)"),
@@ -416,15 +420,15 @@ HOLDER_WALK_STATEMENT_EDGES = (
 
 HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, table)"),
-    ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |table| -> table:"),
-    ("for argument in arguments |table| -> table:", "argument_owned_views.push(flow.last_value_may_be_owned_view)", 0),
-    ("for argument in arguments |table| -> table:", "argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))", 0),
+    ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:"),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "argument_owned_views.push(flow.last_value_may_be_owned_view)", 0),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))", 0),
     ("Expr.Call(callee, arguments, _, _):", "table <- chv_check_call(expression, argument_owned_views, argument_may_alias_refs, receiver_may_be_owned_view, receiver_may_alias_reference, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, argument_names, _):", "runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)"),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, argument_names, _):", "for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:"),
     ("for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:", "runtime_owned_views.push(flow.last_value_may_be_owned_view)"),
     ("for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:", "runtime_may_alias_refs.push(chv_expression_may_alias_ref(child, ref_params, flow, 0))"),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, argument_names, _):", "chv_check_static_effect_call(candidates, arguments, argument_names, runtime_owned_views, runtime_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "table <- chv_check_static_effect_call(candidates, arguments, argument_names, runtime_owned_views, runtime_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Field(object, _, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Scope(base, _, _):", "table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Index(object, index, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
@@ -436,34 +440,34 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.IndexN(object, arguments, _):", "if not index_receiver_is_type_application(object):"),
     ("if not index_receiver_is_type_application(object):", "for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", 1),
     ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Binary(left, _, right, _):", "table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Binary(left, _, right, _):", "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Binary(left, _, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
-    ("Expr.Binary(left, _, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
-    ("Expr.Binary(left, _, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
-    ("Expr.Binary(left, _, right, _):", "chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
     ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Move(operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.RegionNew(operand, _, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Paren(inner, _):", "table <- chv_walk_expression(inner, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Array(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
-    ("Expr.Tuple(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
-    ("Expr.SetLit(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
-    ("Expr.DictLit(entries, _):", "for entry in entries |table, aggregate_may_be_owned_view| -> table:"),
-    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Construct(_, fields, _):", "for field in fields |table, aggregate_may_be_owned_view| -> table:"),
+    ("Expr.Array(elements, _):", "for element in elements |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("Expr.Tuple(elements, _):", "for element in elements |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("Expr.SetLit(elements, _):", "for element in elements |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("Expr.DictLit(entries, _):", "for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Construct(_, fields, _):", "for field in fields |table, aggregate_may_be_owned_view, flow| -> table:"),
     ("Expr.RecordUpdate(base, fields, _):", "table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.If(condition, then_value, else_value, _):", "table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.If(condition, then_value, else_value, _):", "table <- chv_walk_expression(then_value, in_region, ref_params, binders, owned, view_names, view_values, then_flow, summary, table)"),
     ("Expr.If(condition, then_value, else_value, _):", "table <- chv_walk_expression(else_value, in_region, ref_params, binders, owned, view_names, view_values, else_flow, summary, table)"),
-    ("Expr.Match(scrutinee, arms, _):", "for arm in arms |table| -> table:"),
+    ("Expr.Match(scrutinee, arms, _):", "for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:"),
     ("Expr.Catch(guarded, arms, _):", "table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, guarded_flow, summary, table)"),
-    ("Expr.Catch(guarded, arms, _):", "for arm in arms |table| -> table:"),
-    ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 0),
-    ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 1),
-    ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 0),
-    ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)", 1),
+    ("Expr.Catch(guarded, arms, _):", "for arm in arms |table, branch_value_may_be_owned, merged_flow| -> table:"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("for arm in arms |table, branch_value_may_be_owned, merged_flow| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),
     ("for outer_ref in ref_params |comprehension_ref_params|:", "comprehension_ref_params.push(outer_ref) if outer_ref != variable"),
@@ -480,19 +484,24 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Block(block_statements, block_value, _, _):", "table <- chv_walk_expression(block_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
 )
 
+BINARY_OPERATOR_FALLBACK_EDGES = (
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
+    ("if binary_operator != TokenKind.And and binary_operator != TokenKind.Or:", "table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+)
+
 CONSTRUCT_VIEW_TAINT_EDGES = (
-    ("Expr.Construct(_, fields, _):", "for field in fields |table, aggregate_may_be_owned_view| -> table:"),
-    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.Construct(_, fields, _):", "for field in fields |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for field in fields |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for field in fields |table, aggregate_may_be_owned_view, flow| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Construct(_, fields, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
 )
 
 RECORD_UPDATE_VIEW_TAINT_EDGES = (
     ("Expr.RecordUpdate(base, fields, _):", "table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.RecordUpdate(base, fields, _):", "aggregate_may_be_owned_view: mutable bool = flow.last_value_may_be_owned_view"),
-    ("Expr.RecordUpdate(base, fields, _):", "for field in fields |table, aggregate_may_be_owned_view| -> table:"),
-    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for field in fields |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.RecordUpdate(base, fields, _):", "for field in fields |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for field in fields |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for field in fields |table, aggregate_may_be_owned_view, flow| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.RecordUpdate(base, fields, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
 )
 
@@ -503,26 +512,26 @@ FIELD_PROJECTION_VIEW_TAINT_EDGES = (
 )
 
 ARRAY_VIEW_TAINT_EDGES = (
-    ("Expr.Array(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
-    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.Array(elements, _):", "for element in elements |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for element in elements |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for element in elements |table, aggregate_may_be_owned_view, flow| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Array(elements, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
-    ("Expr.Tuple(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
-    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 1),
-    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view", 1),
+    ("Expr.Tuple(elements, _):", "for element in elements |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for element in elements |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 1),
+    ("for element in elements |table, aggregate_may_be_owned_view, flow| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view", 1),
     ("Expr.Tuple(elements, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
-    ("Expr.SetLit(elements, _):", "for element in elements |table, aggregate_may_be_owned_view| -> table:"),
-    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 2),
-    ("for element in elements |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view", 2),
+    ("Expr.SetLit(elements, _):", "for element in elements |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for element in elements |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 2),
+    ("for element in elements |table, aggregate_may_be_owned_view, flow| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view", 2),
     ("Expr.SetLit(elements, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
 )
 
 DICT_VIEW_TAINT_EDGES = (
-    ("Expr.DictLit(entries, _):", "for entry in entries |table, aggregate_may_be_owned_view| -> table:"),
-    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "key_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for entry in entries |table, aggregate_may_be_owned_view| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or key_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("Expr.DictLit(entries, _):", "for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:"),
+    ("for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:", "key_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:", "table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:", "aggregate_may_be_owned_view <- aggregate_may_be_owned_view or key_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.DictLit(entries, _):", "flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view"),
 )
 
@@ -552,23 +561,22 @@ METHOD_CALL_VIEW_RESULT_EDGES = (
     ("Expr.Call(Expr.Field(receiver, _, _), call_arguments, _, _):", "receiver_may_be_owned: bool = chv_is_owned_view(receiver, flow, depth + 1) or (receiver_index < flow.names.count and (flow.owned[receiver_index] or flow.may_owned_view[receiver_index]))"),
     ("Expr.Call(Expr.Field(receiver, _, _), call_arguments, _, _):", "arguments_may_be_owned: bool = any call_argument in call_arguments where chv_is_owned_view(call_argument, flow, depth + 1)"),
     ("Expr.Call(Expr.Field(receiver, _, _), call_arguments, _, _):", "return receiver_may_be_owned or arguments_may_be_owned"),
-    ("Expr.Call(_, call_arguments, _, _):", "return any call_argument in call_arguments where chv_is_owned_view(call_argument, flow, depth + 1)"),
 )
 
 CALLABLE_VIEW_RESULT_EDGES = (
-    ("Expr.Call(_, call_arguments, _, _):", "return any call_argument in call_arguments where chv_is_owned_view(call_argument, flow, depth + 1)"),
+    ("Expr.Call(arguments: call_arguments, _):", "return any call_argument in call_arguments where chv_is_owned_view(call_argument, flow, depth + 1)"),
 )
 
 CALL_RESULT_VIEW_TAINT_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: mutable bool = chv_is_owned_view(expression, flow, 0)"),
-    ("for argument in arguments |table| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Call(callee, arguments, _, _):", "flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view"),
 )
 
 STATIC_EFFECT_RESULT_VIEW_TAINT_EDGES = (
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, argument_names, _):", "runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)"),
     ("for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:", "runtime_may_be_owned_view <- runtime_may_be_owned_view or flow.last_value_may_be_owned_view"),
-    ("Expr.StaticEffectCall(_, _, candidates, arguments, argument_names, _):", "flow.last_value_may_be_owned_view <- runtime_may_be_owned_view"),
+    ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "flow.last_value_may_be_owned_view <- runtime_may_be_owned_view"),
 )
 
 ASSIGN_VIEW_TAINT_EDGES = (
@@ -586,13 +594,13 @@ PLACE_ROOT_PROJECTION_EDGES = (
     ("Expr.Field(object, _, _):", "return chv_place_root(object)"),
     ("Expr.Index(object, _, _):", "return chv_place_root(object)"),
     ("Expr.IndexN(object, _, _):", "return chv_place_root(object)"),
-    ("Expr.Slice(object, _, _, _):", "return chv_place_root(object)"),
+    ("Expr.Slice(object: object, _):", "return chv_place_root(object)"),
 )
 
 EFFECT_CANDIDATE_EDGES = (
-    ("for candidate in candidates |table| -> table:", "candidate_arguments.extend(candidate.captures)"),
-    ("for candidate in candidates |table| -> table:", "candidate_arguments.extend(arguments)"),
-    ("for candidate in candidates |table| -> table:", "chv_check_call_target(candidate.callee, candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not chv_call_has_named_arguments(argument_names)"),
+    ("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "candidate_arguments.extend(candidate.captures)"),
+    ("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "candidate_arguments.extend(arguments)"),
+    ("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "chv_check_call_target(candidate.callee, candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not chv_call_has_named_arguments(argument_names)"),
 )
 
 VIEW_FLOW_MERGE_EDGES = (
@@ -619,7 +627,7 @@ INDEX_OPERATOR_EDGES = (
     ("Expr.Index(object, index, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Index(object, index, _):", "if not index_receiver_is_type_application(object):"),
     ("if not index_receiver_is_type_application(object):", "table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 0),
-    ("if not index_receiver_is_type_application(object):", "chv_check_unknown_call([object, index], [object_may_be_owned_view, index_may_be_owned_view], [object_may_alias_ref, index_may_alias_ref], ref_params, binders, owned, view_names, view_values, flow, table)", 0),
+    ("if not index_receiver_is_type_application(object):", "table <- chv_check_unknown_call([object, index], [object_may_be_owned_view, index_may_be_owned_view], [object_may_alias_ref, index_may_alias_ref], ref_params, binders, owned, view_names, view_values, flow, table)", 0),
     ("Expr.IndexN(object, arguments, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.IndexN(object, arguments, _):", "indexed_arguments: mutable darray[Ast::Expr] = [object]"),
     ("Expr.IndexN(object, arguments, _):", "if not index_receiver_is_type_application(object):"),
@@ -628,7 +636,7 @@ INDEX_OPERATOR_EDGES = (
     ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "indexed_arguments.push(argument)"),
     ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "indexed_owned_views.push(flow.last_value_may_be_owned_view)"),
     ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "indexed_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))"),
-    ("if not index_receiver_is_type_application(object):", "chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)", 1),
+    ("if not index_receiver_is_type_application(object):", "table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)", 1),
 )
 
 INDEX_VIEW_RESULT_EDGES = (
@@ -638,7 +646,14 @@ INDEX_VIEW_RESULT_EDGES = (
 
 UNARY_NEGATION_EDGES = (
     ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Unary(operator, operand, _):", "flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)"),
+    ("Expr.Unary(operator, operand, _):", "operand_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("Expr.Unary(operator, operand, _):", "flow.last_value_may_be_owned_view <- operand_may_be_owned_view"),
+)
+
+BINARY_VIEW_WALK_EDGES = (
+    ("Expr.Binary(left, binary_operator, right, _):", "left_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("Expr.Binary(left, binary_operator, right, _):", "right_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("Expr.Binary(left, binary_operator, right, _):", "flow.last_value_may_be_owned_view <- left_may_be_owned_view or right_may_be_owned_view"),
 )
 
 UNARY_VIEW_RESULT_EDGES = (
@@ -650,29 +665,29 @@ REF_ALIAS_ADDRESS_EDGES = (
 )
 
 SUMMARY_CALL_EDGES = (
-    ("while target < call_arguments.count |target, table| -> table:", "if sts_is_writable(summary, callee_name, target):"),
+    ("while target < call_arguments.count |target, table, source_cache_ready, source_checked, source_is_owned_view| -> table:", "if sts_is_writable(summary, callee_name, target):"),
     ("if sts_is_writable(summary, callee_name, target):", "if chv_alias_reference_at(call_arguments, argument_may_alias_refs, target, ref_params, flow):"),
-    ("while source < call_arguments.count |source, table| -> table:", "if source != target and sts_has_pair(summary, callee_name, target, source):"),
+    ("while source < call_arguments.count |source, table, source_is_owned_view, source_checked| -> table:", "if source != target and sts_has_pair(summary, callee_name, target, source):"),
     ("if source != target and sts_has_pair(summary, callee_name, target, source):", "if not source_checked[source]:"),
     ("if not source_checked[source]:", "source_is_owned_view[source] <- chv_owned_view_at(call_arguments, argument_owned_views, source, flow)"),
 )
 
 OVERLOAD_SUMMARY_EDGES = (
     ("for function in functions |summary, summarised, summarised_unreadable, function_owners, table|:", "match function:"),
-    ("match function:", "Decl.Func(function_name, function_parameters, _, function_body, _, _, function_pos):"),
+    ("match function:", "Decl.Func(name: function_name, params: function_parameters, body: function_body, pos: function_pos, _):"),
     ("if writable_found and function_parameters.count > 1:", "summarised.push(function)"),
     ("for function_index in 0..<summarised.count |function_index, more_rows, summary, summarised, summarised_unreadable, function_owners, reference_sites, table|:", "match summarised[function_index]:"),
-    ("match summarised[function_index]:", "Decl.Func(function_name, function_parameters, _, function_body, _, _, _):"),
-    ("Decl.Func(function_name, function_parameters, _, function_body, _, _, _):", "more_rows <- true if (sts_summarise_function(function_name, function_parameters, function_body, summarised_unreadable[function_index], function_owners[function_index], reference_sites, table, summary) can Global{Read,Write})"),
+    ("match summarised[function_index]:", "Decl.Func(name: function_name, params: function_parameters, body: function_body, _):"),
+    ("Decl.Func(name: function_name, params: function_parameters, body: function_body, _):", "more_rows <- true if (sts_summarise_function(function_name, function_parameters, function_body, summarised_unreadable[function_index], function_owners[function_index], reference_sites, table, summary) can Global{Read,Write})"),
 )
 
 CALLEE_DISPATCH_EDGES = (
-    ("Expr.Ident(callee_name, _):", "chv_check_named_call(callee_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Scope(_, scoped_name, _):", "chv_check_named_call(scoped_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Index(head, _, _):", "chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.IndexN(head, _, _):", "chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Paren(inner, _):", "chv_check_named_callee(inner, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("_:", "chv_check_unknown_call(call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Ident(callee_name, _):", "table <- chv_check_named_call(callee_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Scope(_, scoped_name, _):", "table <- chv_check_named_call(scoped_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Index(head, _, _):", "table <- chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.IndexN(head, _, _):", "table <- chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Paren(inner, _):", "table <- chv_check_named_callee(inner, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("_:", "table <- chv_check_unknown_call(call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
 )
 
 FIELD_UNKNOWN_CALL_EDGES = (
@@ -682,12 +697,12 @@ FIELD_UNKNOWN_CALL_EDGES = (
     ("Expr.Field(receiver, _, _):", "method_owned_views.extend(argument_owned_views)"),
     ("Expr.Field(receiver, _, _):", "method_may_alias_refs: mutable darray[bool] = [method_receiver_may_alias_ref]"),
     ("Expr.Field(receiver, _, _):", "method_may_alias_refs.extend(argument_may_alias_refs)"),
-    ("Expr.Field(receiver, _, _):", "chv_check_unknown_call(method_arguments, method_owned_views, method_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Field(receiver, _, _):", "table <- chv_check_unknown_call(method_arguments, method_owned_views, method_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
 )
 
 NAMED_CALL_EDGES = (
-    ("if not chv_call_has_named_arguments(argument_names) and sts_is_declared(summary, callee_name) and not (any binder in binders where binder == callee_name):", "chv_check_call_target(callee_name, call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("else:", "chv_check_unknown_call(call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("if not chv_call_has_named_arguments(argument_names) and sts_is_declared(summary, callee_name) and not (any binder in binders where binder == callee_name):", "table <- chv_check_call_target(callee_name, call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("else:", "table <- chv_check_unknown_call(call_arguments, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
 )
 
 NAMED_ARGUMENT_UNIFIER_EDGES = (
@@ -702,8 +717,8 @@ NAMED_ARGUMENT_UNIFIER_EDGES = (
 )
 
 NAMED_ARGUMENT_STATIC_EFFECT_EDGES = (
-    ("for candidate in candidates |table| -> table:", "chv_check_call_target(candidate.callee, candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not chv_call_has_named_arguments(argument_names)"),
-    ("for candidate in candidates |table| -> table:", "chv_check_unknown_call(candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table) if chv_call_has_named_arguments(argument_names)"),
+    ("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "chv_check_call_target(candidate.callee, candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not chv_call_has_named_arguments(argument_names)"),
+    ("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "chv_check_unknown_call(candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table) if chv_call_has_named_arguments(argument_names)"),
 )
 
 UNKNOWN_CALL_EDGES = (
@@ -846,7 +861,9 @@ declared_type_id: u32 = annotation_type_id(declared_type, table) can Global{Read
 bound_type_is_reference_free: mutable bool = false
 can Memory.Allocate, Abort.Panic, Global{Read,Write}:
     bound_type_is_reference_free <- bam_type_is_proven_reference_free_cached(declared_type_id, reference_sites, table) if declared_type_id != 0
-if not bound_type_is_reference_free:
+bound_type_id: u32 = declared_type_id
+bound_type_is_host_handle: bool = sts_type_is_llvm_handle(bound_type_id, table)
+if not bound_type_is_reference_free and not bound_type_is_host_handle:
     bound_names: mutable darray[sview] = []
     bound_names.push(name) if name != ""
     sts_collect_names(value, bound_names)
@@ -909,8 +926,8 @@ theorem_routes = {
         "callee_call": (("Expr.Call(callee, arguments, argument_names, _):", "sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)"),),
     },
     "proof_chv_static_effect_candidates_check_captures_and_arguments": {
-        "captures_checked": (("for candidate in candidates |table| -> table:", "candidate_arguments.extend(candidate.captures)"),),
-        "arguments_checked": (("for candidate in candidates |table| -> table:", "candidate_arguments.extend(arguments)"),),
+        "captures_checked": (("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "candidate_arguments.extend(candidate.captures)"),),
+        "arguments_checked": (("for candidate in candidates |table, flow, candidate_capture_offset| -> table:", "candidate_arguments.extend(arguments)"),),
     },
     "proof_chv_comprehension_scope_masks_shadowed_reference": {
         "reference_parameter": (("Expr.Comprehension(variable, iterable, condition, body, _, _):", "for outer_ref in ref_params |comprehension_ref_params|:"),),
@@ -976,15 +993,15 @@ theorem_routes = {
     "proof_chv_binary_operator_checks_both_operands": {
         "receiver_checked": (HOLDER_WALK_EXPRESSION_EDGES[21],),
         "operand_checked": (HOLDER_WALK_EXPRESSION_EDGES[22],),
-        "fallback_checked": (HOLDER_WALK_EXPRESSION_EDGES[26],),
+        "fallback_checked": BINARY_OPERATOR_FALLBACK_EDGES,
     },
     "proof_chv_binary_operator_result_tracks_reference_operands": {
         "left_alias": (REF_ALIAS_HELPER_EDGES[3],),
         "right_alias": (REF_ALIAS_HELPER_EDGES[3],),
     },
     "proof_chv_binary_operator_result_tracks_view_operands": {
-        "left_may_be_view": VIEW_ALIAS_BINARY_EDGES,
-        "right_may_be_view": VIEW_ALIAS_BINARY_EDGES,
+        "left_may_be_view": (BINARY_VIEW_WALK_EDGES[0], BINARY_VIEW_WALK_EDGES[2]),
+        "right_may_be_view": (BINARY_VIEW_WALK_EDGES[1], BINARY_VIEW_WALK_EDGES[2]),
     },
     "proof_chv_index_overloads_check_receiver_and_keys": {
         "receiver_checked": (INDEX_OPERATOR_EDGES[0], INDEX_OPERATOR_EDGES[4]),
@@ -1027,8 +1044,8 @@ theorem_routes = {
     },
     "proof_chv_named_callees_cover_dispatch_routes": {
         "direct_call_checked": (
-            ("Expr.Scope(_, scoped_name, _):", "chv_check_named_call(scoped_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-            ("Expr.Index(head, _, _):", "chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+            ("Expr.Scope(_, scoped_name, _):", "table <- chv_check_named_call(scoped_name, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+            ("Expr.Index(head, _, _):", "table <- chv_check_named_callee(head, call_arguments, argument_names, argument_owned_views, argument_may_alias_refs, method_receiver_owned_view, method_receiver_may_alias_ref, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
         ),
     },
     "proof_chv_named_arguments_use_unknown_call_fallback": {
@@ -1056,13 +1073,13 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_comprehension_scope_masks_shadowed_reference":
         proof_source, proof_edges = holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES
     elif name == "proof_chv_binary_operator_checks_both_operands":
-        proof_source, proof_edges = holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES
+        proof_source = holder_walk_expressions
+        proof_edges = HOLDER_WALK_EXPRESSION_EDGES + BINARY_OPERATOR_FALLBACK_EDGES
     elif name == "proof_chv_binary_operator_result_tracks_reference_operands":
         proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
         proof_edges = REF_ALIAS_HELPER_EDGES
     elif name == "proof_chv_binary_operator_result_tracks_view_operands":
-        proof_source = function_section(holder_text, "chv_is_owned_view")
-        proof_edges = VIEW_ALIAS_BINARY_EDGES
+        proof_source, proof_edges = holder_walk_expressions, BINARY_VIEW_WALK_EDGES
     elif name == "proof_chv_index_overloads_check_receiver_and_keys":
         proof_source, proof_edges = holder_walk_expressions, INDEX_OPERATOR_EDGES
     elif name == "proof_chv_index_result_tracks_receiver_view":
@@ -1233,6 +1250,7 @@ for source, edges, label in (
     (holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES, "holder-view expression walk"),
 ):
     validate_edge_set(source, edges, label)
+validate_edge_set(holder_walk_expressions, BINARY_OPERATOR_FALLBACK_EDGES, "holder-view binary operator fallback")
 validate_edge_set(holder_walk_expressions, ARRAY_VIEW_TAINT_EDGES, "holder-view array and tuple taint")
 validate_edge_set(holder_walk_expressions, DICT_VIEW_TAINT_EDGES, "holder-view dictionary taint")
 validate_edge_set(holder_walk_expressions, COMPREHENSION_VIEW_TAINT_EDGES, "holder-view comprehension result taint")
@@ -1286,6 +1304,7 @@ validate_edge_set(function_section(holder_text, "chv_check_named_call"), NAMED_C
 validate_edge_set(function_section(holder_text, "chv_check_unknown_call"), UNKNOWN_CALL_EDGES, "holder-view indirect-call fallback")
 validate_edge_set(holder_walk_expressions, INDEX_OPERATOR_EDGES, "holder-view overloaded index fallback")
 validate_edge_set(holder_walk_expressions, UNARY_NEGATION_EDGES, "holder-view unary negation fallback")
+validate_edge_set(holder_walk_expressions, BINARY_VIEW_WALK_EDGES, "holder-view binary result provenance")
 validate_edge_set(function_section(holder_text, "chv_is_owned_view"), INDEX_VIEW_RESULT_EDGES, "holder-view index result provenance")
 validate_edge_set(function_section(holder_text, "chv_is_owned_view"), UNARY_VIEW_RESULT_EDGES, "holder-view unary result provenance")
 
