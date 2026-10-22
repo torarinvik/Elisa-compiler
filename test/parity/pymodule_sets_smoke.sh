@@ -33,6 +33,8 @@ assert sets.count_i64(frozenset({1, 2})) == 2
 assert sets.count_i64(value for value in (1, 2, 3)) == 3
 assert sets.count_text({"α", "", "β"}) == 3
 assert sets.count_text({b"\xce\xb1", b"", b"\xce\xb2"}) == 3
+assert sets.count_text({"same", b"same"}) == 1
+assert sets.roundtrip_text({"same", b"same"}) == {"same"}
 assert sets.count_u8({0, 255}) == 2
 assert sets.count_bool({True, False}) == 2
 assert sets.roundtrip_i64({1, -2, 3}) == {1, -2, 3}

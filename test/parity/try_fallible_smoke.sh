@@ -19,6 +19,12 @@ grep -q 'try requires a fallible expression' <<< "$unary_numeric_parameter"
 nested_numeric_expression=$(printf 'def bad(left: i64, right: i64) -> i64:\n    return try (left + right) * 2\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$nested_numeric_expression"
 
+numeric_alias_parameter=$(printf 'type Count = i64\ndef bad(value: Count) -> i64:\n    return try value + 1\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$numeric_alias_parameter"
+
+numeric_alias_local=$(printf 'type Count = i64\ndef bad() -> i64:\n    value: Count = 1\n    return try value + 1\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$numeric_alias_local"
+
 typed_local_chained_numeric=$(printf 'def bad() -> i64:\n    value: i64 = 2\n    return try (value + 3) * 7\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$typed_local_chained_numeric"
 
@@ -97,6 +103,9 @@ grep -q '^D 0$' <<< "$fallible_call_alias"
 pure_call_alias_nonfallible=$(printf 'def pure() -> i64:\n    return 1\ndef bad() -> i64:\n    value = pure()\n    return try value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$pure_call_alias_nonfallible"
 
+catch_success_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            success\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$catch_success_alias_nonfallible"
+
 conditional_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = load() if flag else load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_alias"
 
@@ -144,6 +153,10 @@ grep -q '^D 0$' <<< "$multi_target_rebinding"
 
 same_line_parameter_families=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(left: i64 error[E], right: i64 error[F]) -> i64 error[E]:\n    return try right\n' | "$RPT")
 grep -q 'cannot propagate F from a function returning E' <<< "$same_line_parameter_families"
+
+multi_family_parameter_union=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(value: i64 error[E, F]) -> i64 error[E]:\n    return try value\n' | "$RPT")
+grep -q '^P 1$' <<< "$multi_family_parameter_union"
+grep -q 'error-union value types currently support exactly one family' <<< "$multi_family_parameter_union"
 
 multi_target_fresh_family=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load_f() -> i64 error[F]:\n    return 1\ndef mismatch() -> i64 error[E]:\n    rebind first: i64, value: i64 = 1, load_f()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate F from a function returning E' <<< "$multi_target_fresh_family"

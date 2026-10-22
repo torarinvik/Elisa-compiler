@@ -41,6 +41,10 @@ assert functions["contains_i64"]["parameters"] == [
     {"name": "key", "type": "i64"},
 ]
 assert functions["contains_i64"]["return"] == "bool"
+assert functions["count_i64"]["parameters"] == [
+    {"name": "values", "type": "set[i64]"},
+]
+assert functions["count_i64"]["return"] == "usize"
 assert functions["contains_i8"]["parameters"] == [
     {"name": "values", "type": "set[i8]"},
     {"name": "key", "type": "i8"},
@@ -61,6 +65,7 @@ grep -Fq 'def roundtrip_nested(values: Mapping[int, Mapping[int, Iterable[int]]]
 grep -Fq 'def roundtrip_bool(values: Iterable[bool]) -> set[bool]: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_bool(values: Iterable[bool], key: bool) -> bool: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_i64(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def count_i64(values: Iterable[int]) -> int: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_i8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_u8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/dict_set_probe.pyi"
@@ -78,6 +83,8 @@ assert dict_set_probe.roundtrip({1: [2, 3], 4: ()}) == value
 text_value = {"α": {"one", "two"}, "empty": set()}
 assert dict_set_probe.roundtrip_text(text_value) == text_value
 assert dict_set_probe.roundtrip_text({"α": ["one", "two"]}) == {"α": {"one", "two"}}
+assert dict_set_probe.roundtrip_text({"same": ["x", "x"]}) == {"same": {"x"}}
+assert dict_set_probe.roundtrip_text({"same": ["first"], b"same": ["last"]}) == {"same": {"last"}}
 nested_value = {1: {10: {20, 30}, 11: set()}, 2: {}}
 assert dict_set_probe.roundtrip_nested(nested_value) == nested_value
 assert dict_set_probe.count_bool({2, 3}) == 1
@@ -88,8 +95,17 @@ assert dict_set_probe.contains_bool([2, 3], True)
 assert not dict_set_probe.contains_bool([2, 3], False)
 assert dict_set_probe.contains_i64([1, 4], 1)
 assert dict_set_probe.contains_i64([-1, 4], -1)
+assert dict_set_probe.count_i64([1, True]) == 1
+assert dict_set_probe.count_i64([True, 1]) == 1
 assert dict_set_probe.contains_i8([-1, 4], -1)
 assert dict_set_probe.contains_u8([255, 4], 255)
+for bad in ([1.0, 1], [1, 1.0]):
+    try:
+        dict_set_probe.contains_i64(bad, 1)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(("contains_i64 accepted a float set element", bad))
 
 for function, bad in (
     (dict_set_probe.roundtrip, {"bad": {1}}),

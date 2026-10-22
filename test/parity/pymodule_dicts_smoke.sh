@@ -39,6 +39,7 @@ assert dicts.count_i64(values={1: 2}) == 1
 assert dicts.count_i64(UserDict({1: 2, 3: 4})) == 2
 assert dicts.count_after_key(99, {1: 2, 3: 4}) == 2
 assert dicts.count_text({"a": 1, "b": 2}) == 2
+assert dicts.count_text({"same": 1, b"same": 2}) == 1
 assert dicts.count_u64({1: 2, 3: 4}) == 2
 assert dicts.count_float({1: 1.5, 2: 2.5}) == 2
 assert dicts.count_bool({"yes": True, "no": False}) == 2
@@ -54,6 +55,9 @@ assert dicts.roundtrip_i64({1: 40, 2: 2}) == {1: 40, 2: 2}
 assert dicts.roundtrip_i32({1: -2147483648, 2: 2147483647}) == {1: -2147483648, 2: 2147483647}
 assert dicts.roundtrip_u8({"low": 0, "high": 255}) == {"low": 0, "high": 255}
 assert dicts.roundtrip_text({"yes": True, "no": False}) == {"yes": True, "no": False}
+assert dicts.roundtrip_text({"same": True, b"same": False}) == {"same": False}
+assert dicts.count_sview_keys({"same": 1, b"same": 2}) == 1
+assert dicts.roundtrip_sview_keys({"same": 1, b"same": 2}) == {"same": 2}
 assert dicts.roundtrip_float({1: 1.5, 2: 2.5}) == {1: 1.5, 2: 2.5}
 f32_values = dicts.roundtrip_f32({1: 1.5, 2: -2.25})
 assert abs(f32_values[1] - 1.5) < 1e-6

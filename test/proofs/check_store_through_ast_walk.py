@@ -454,7 +454,7 @@ FOR_ITERATOR_REF_ALIAS_EDGES = (
 )
 
 ITERABLE_BINDING_FACTS_ALIAS_EDGES = (
-    ("can Memory.Allocate, Abort.Panic:", "known, elements = chv_iterable_binding_elements(iterable, slot, destructure, view_names, view_values)"),
+    ("can Memory.Allocate, Abort.Panic:", "known, elements = chv_iterable_binding_elements(iterable, slot, destructure, flow, view_names, view_values)"),
     ("for element in elements |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values|:", "may_alias_reference <- may_alias_reference or (not element_is_aggregate and chv_expression_may_alias_ref(element, ref_params, flow, table, 0))"),
     ("can Memory.Allocate, Abort.Panic:", "return (true, may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview)"),
 )

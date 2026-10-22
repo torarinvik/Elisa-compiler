@@ -71,6 +71,10 @@ extend Semantic:
             numeric: mutable darray[bool] = []
             integer: mutable darray[bool] = []
             origins: mutable darray[usize] = []
+            type_alias_names: mutable darray[sview] = []
+            type_alias_known_nonfallible: mutable darray[bool] = []
+            type_alias_numeric: mutable darray[bool] = []
+            type_alias_integer: mutable darray[bool] = []
 
         def try_noncall_family_index(environment: TryNonCallErrorFamilyEnv&, name: sview) -> usize:
             can Abort.Panic:
@@ -133,6 +137,10 @@ extend Semantic:
                 clone.numeric.extend(environment.numeric)
                 clone.integer.extend(environment.integer)
                 clone.origins.extend(environment.origins)
+                clone.type_alias_names.extend(environment.type_alias_names)
+                clone.type_alias_known_nonfallible.extend(environment.type_alias_known_nonfallible)
+                clone.type_alias_numeric.extend(environment.type_alias_numeric)
+                clone.type_alias_integer.extend(environment.type_alias_integer)
                 return clone
 
         # Branch scans retain the base facts for outer bindings. The only write that
@@ -683,6 +691,58 @@ extend Semantic:
                 known_nonfallible: bool = numeric or type_name in {"bool", "string", "cstr", "dstr", "sview"}
                 return (known_nonfallible, numeric, integer)
 
+        # The source scan only resolves a deliberately small alias subset: globally unique
+        # aliases whose target is a primitive scalar name, optionally under a transparent
+        # paren or mutability/storage wrapper. Qualified, chained, generic, and duplicate
+        # aliases stay unknown rather than borrowing a possibly unrelated spelling.
+        def try_noncall_declared_type_facts(type_expression: Ast::Expr) -> (known_nonfallible: bool, numeric: bool, integer: bool):
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return try_noncall_type_name_facts(name)
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail:
+                        return try_noncall_declared_type_facts(inner)
+                    Expr.Paren(inner, _):
+                        return try_noncall_declared_type_facts(inner)
+                    _:
+                        return (false, false, false)
+
+        def try_noncall_type_alias_facts_add(declarations: darray[Ast::Decl], environment: mutable TryNonCallErrorFamilyEnv&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |environment|:
+                    match declaration:
+                        Decl.Alias(alias_name, target, _) if target is not Expr.Invalid:
+                            target_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_declared_type_facts(target)
+                            environment.type_alias_names.push(alias_name)
+                            environment.type_alias_known_nonfallible.push(target_facts.known_nonfallible)
+                            environment.type_alias_numeric.push(target_facts.numeric)
+                            environment.type_alias_integer.push(target_facts.integer)
+                        Decl.Module(_, module_body, _) | Decl.Scoped(module_body, _):
+                            try_noncall_type_alias_facts_add(module_body, environment)
+                        _:
+                            pass
+
+        def try_noncall_type_facts_with_aliases(type_expression: Ast::Expr, environment: TryNonCallErrorFamilyEnv&) -> (known_nonfallible: bool, numeric: bool, integer: bool):
+            can Abort.Panic:
+                direct_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_declared_type_facts(type_expression)
+                return direct_facts if direct_facts.known_nonfallible
+                match type_expression:
+                    Expr.Ident(alias_name, _):
+                        match_count: mutable usize = 0
+                        alias_facts: mutable (known_nonfallible: bool, numeric: bool, integer: bool) = (false, false, false)
+                        for index in 0..<environment.type_alias_names.count |match_count, alias_facts, environment, alias_name|:
+                            if environment.type_alias_names[index] == alias_name:
+                                match_count <- match_count + 1.usize()
+                                alias_facts <- (environment.type_alias_known_nonfallible[index], environment.type_alias_numeric[index], environment.type_alias_integer[index])
+                        return alias_facts if match_count == 1.usize()
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail:
+                        return try_noncall_type_facts_with_aliases(inner, environment)
+                    Expr.Paren(inner, _):
+                        return try_noncall_type_facts_with_aliases(inner, environment)
+                    _:
+                        pass
+                return (false, false, false)
+
         def try_noncall_pattern_binding_facts(pattern: Ast::Pattern, candidate: sview) -> (known_nonfallible: bool, numeric: bool, integer: bool):
             can Abort.Panic:
                 match pattern:
@@ -711,7 +771,7 @@ extend Semantic:
                             return (environment.known_nonfallible[index], environment.numeric[index], environment.integer[index])
                         for parameter in params:
                             if parameter.name == name:
-                                return try_noncall_type_name_facts(ident_name_of(parameter.type_expression)) if parameter.type_expression is Expr.Ident(_, _)
+                                return try_noncall_type_facts_with_aliases(parameter.type_expression, environment)
                     Expr.Paren(inner, _):
                         return try_noncall_expression_value_facts(inner, params, environment)
                     Expr.IntLit(_, _):
@@ -855,12 +915,12 @@ extend Semantic:
                         for outer_name in environment.names |then_environment|:
                             # Pattern bindings established by the condition are visible in
                             # the true value and shadow any same-named outer fact.
-                            if try_noncall_truthy_condition_binds_name(condition, outer_name):
-                                condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, outer_name, params)
+                            if try_noncall_truthy_condition_binds_name(condition, outer_name, annotations):
+                                condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, outer_name, params, annotations)
                                 try_noncall_family_bind(&then_environment, outer_name, "", condition_facts.known_nonfallible, condition_facts.numeric, condition_facts.integer)
                         then_facts: mutable (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(then_value, params, then_environment, annotations)
-                        if not then_facts.known_nonfallible and then_facts.family == "" and then_value is Expr.Ident(then_binder, _) and try_noncall_truthy_condition_binds_name(condition, then_binder):
-                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, then_binder, params)
+                        if not then_facts.known_nonfallible and then_facts.family == "" and then_value is Expr.Ident(then_binder, _) and try_noncall_truthy_condition_binds_name(condition, then_binder, annotations):
+                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, then_binder, params, annotations)
                             then_facts <- ("", condition_facts.known_nonfallible)
                         else_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(else_value, params, environment, annotations)
                         return (then_facts.family, false) if then_facts.family != "" and then_facts.family == else_facts.family
@@ -891,8 +951,8 @@ extend Semantic:
                                 for outer_name in environment.names |arm_environment|:
                                     # Successful `is`/`as` bindings in a guard are visible
                                     # through the arm body and shadow same-named outer facts.
-                                    if try_noncall_truthy_condition_binds_name(arm.guard, outer_name):
-                                        guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, outer_name, params)
+                                    if try_noncall_truthy_condition_binds_name(arm.guard, outer_name, annotations):
+                                        guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, outer_name, params, annotations)
                                         try_noncall_family_bind(&arm_environment, outer_name, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
                                 arm_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_block_source_facts(arm.body, params, arm_environment, annotations)
                                 if arm_facts.family != "":
@@ -936,8 +996,8 @@ extend Semantic:
                                     binder_facts <- payload_facts if arm.pattern is Pattern.Binding(success_name) and success_name == arm_binder and payload_facts.known_nonfallible
                                     try_noncall_family_bind(&arm_environment, arm_binder, "", binder_facts.known_nonfallible, binder_facts.numeric, binder_facts.integer)
                                 for outer_name in environment.names |arm_environment|:
-                                    if try_noncall_truthy_condition_binds_name(arm.guard, outer_name):
-                                        guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, outer_name, params)
+                                    if try_noncall_truthy_condition_binds_name(arm.guard, outer_name, annotations):
+                                        guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, outer_name, params, annotations)
                                         try_noncall_family_bind(&arm_environment, outer_name, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
                                 arm_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_block_source_facts(arm.body, params, arm_environment, annotations)
                                 if arm_facts.family != "":
@@ -979,8 +1039,9 @@ extend Semantic:
                             declared_family: mutable sview @source = try_noncall_local_error_family(annotations, position.offset)
                             source_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(value, params, arm_environment, annotations)
                             declared_known_nonfallible: mutable bool = declared_family == "" and type_expression is not Expr.Absent
-                            declared_numeric: mutable bool = try_noncall_numeric_type(type_expression)
-                            declared_integer: mutable bool = try_noncall_integer_type(type_expression)
+                            declared_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(type_expression, arm_environment)
+                            declared_numeric: mutable bool = declared_type_facts.numeric
+                            declared_integer: mutable bool = declared_type_facts.integer
                             if declared_family == "" and type_expression is Expr.Absent:
                                 declared_family <- source_facts.family
                                 declared_known_nonfallible <- source_facts.known_nonfallible
@@ -1027,18 +1088,28 @@ extend Semantic:
                 position: Ast::Pos = Ast::expr_pos(expression)
                 return any annotation in annotations where annotation.owner == "__try_fallback_expression" and annotation.line == position.line and annotation.offset == position.offset
 
-        def try_noncall_truthy_condition_binds_name(condition: Ast::Expr, candidate: sview) -> bool:
+        def try_noncall_variant_alias_binds_name(condition: Ast::Expr, candidate: sview, annotations: darray[Ast::EnumAnnotation]&) -> bool:
+            can Abort.Panic:
+                match condition:
+                    Expr.Binary(_, TokenKind.Is, Expr.Field(_, _, variant_line), _):
+                        return any annotation in annotations where annotation.owner == candidate and annotation.name == "__is_variant_alias" and annotation.line == variant_line.line
+                    _:
+                        return false
+
+        def try_noncall_truthy_condition_binds_name(condition: Ast::Expr, candidate: sview, annotations: darray[Ast::EnumAnnotation]&) -> bool:
             can Abort.Panic:
                 match condition:
                     Expr.Paren(inner, _):
-                        return try_noncall_truthy_condition_binds_name(inner, candidate)
+                        return try_noncall_truthy_condition_binds_name(inner, candidate, annotations)
                     Expr.Binary(left, operator, right, _):
                         match operator:
                             TokenKind.And:
-                                return try_noncall_truthy_condition_binds_name(left, candidate) or try_noncall_truthy_condition_binds_name(right, candidate)
+                                return try_noncall_truthy_condition_binds_name(left, candidate, annotations) or try_noncall_truthy_condition_binds_name(right, candidate, annotations)
                             TokenKind.Or:
-                                return try_noncall_truthy_condition_binds_name(left, candidate) and try_noncall_truthy_condition_binds_name(right, candidate)
-                            TokenKind.Is | TokenKind.As:
+                                return try_noncall_truthy_condition_binds_name(left, candidate, annotations) and try_noncall_truthy_condition_binds_name(right, candidate, annotations)
+                            TokenKind.Is:
+                                return try_noncall_pattern_expression_binds_name(right, candidate) or try_noncall_variant_alias_binds_name(condition, candidate, annotations)
+                            TokenKind.As:
                                 return try_noncall_pattern_expression_binds_name(right, candidate)
                             _:
                                 pass
@@ -1073,18 +1144,18 @@ extend Semantic:
                         pass
                 return ""
 
-        def try_noncall_condition_binding_facts(condition: Ast::Expr, candidate: sview, params: darray[Ast::ParamDecl]) -> (known_nonfallible: bool, numeric: bool, integer: bool):
+        def try_noncall_condition_binding_facts(condition: Ast::Expr, candidate: sview, params: darray[Ast::ParamDecl], annotations: darray[Ast::EnumAnnotation]&) -> (known_nonfallible: bool, numeric: bool, integer: bool):
             can Abort.Panic:
                 match condition:
                     Expr.Paren(inner, _):
-                        return try_noncall_condition_binding_facts(inner, candidate, params)
+                        return try_noncall_condition_binding_facts(inner, candidate, params, annotations)
                     Expr.Binary(left, TokenKind.And, right, _):
-                        return try_noncall_condition_binding_facts(left, candidate, params) if try_noncall_truthy_condition_binds_name(left, candidate)
-                        return try_noncall_condition_binding_facts(right, candidate, params)
+                        return try_noncall_condition_binding_facts(left, candidate, params, annotations) if try_noncall_truthy_condition_binds_name(left, candidate, annotations)
+                        return try_noncall_condition_binding_facts(right, candidate, params, annotations)
                     Expr.Binary(left, TokenKind.Or, right, _):
-                        return (false, false, false) if not try_noncall_truthy_condition_binds_name(left, candidate) or not try_noncall_truthy_condition_binds_name(right, candidate)
-                        left_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(left, candidate, params)
-                        right_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(right, candidate, params)
+                        return (false, false, false) if not try_noncall_truthy_condition_binds_name(left, candidate, annotations) or not try_noncall_truthy_condition_binds_name(right, candidate, annotations)
+                        left_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(left, candidate, params, annotations)
+                        right_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(right, candidate, params, annotations)
                         return left_facts if left_facts.known_nonfallible == right_facts.known_nonfallible and left_facts.numeric == right_facts.numeric and left_facts.integer == right_facts.integer
                     Expr.Binary(left, operator, right, _) if operator in {TokenKind.Is, TokenKind.As}:
                         return (false, false, false) if not try_noncall_pattern_expression_binds_name(right, candidate)
@@ -1162,7 +1233,9 @@ extend Semantic:
                         index: usize = try_noncall_family_index(environment, name)
                         return try_noncall_family_known_numeric(environment, name) if index < environment.names.count
                         for parameter in params:
-                            return try_noncall_numeric_type(parameter.type_expression) if parameter.name == name
+                            if parameter.name == name:
+                                parameter_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(parameter.type_expression, environment)
+                                return parameter_type_facts.numeric
                     _:
                         pass
                 return false
@@ -1182,7 +1255,9 @@ extend Semantic:
                         index: usize = try_noncall_family_index(environment, name)
                         return environment.integer[index] if index < environment.names.count
                         for parameter in params:
-                            return try_noncall_integer_type(parameter.type_expression) if parameter.name == name
+                            if parameter.name == name:
+                                parameter_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(parameter.type_expression, environment)
+                                return parameter_type_facts.integer
                     _:
                         pass
                 return false
@@ -1357,10 +1432,10 @@ extend Semantic:
                         visible_count: usize = environment.names.count
                         base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                         right_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
-                        if operator == TokenKind.And and try_noncall_truthy_condition_binds_name(left, candidate):
+                        if operator == TokenKind.And and try_noncall_truthy_condition_binds_name(left, candidate, annotations):
                             right_shadow <- true
                             right_error_family <- ""
-                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(left, candidate, params)
+                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(left, candidate, params, annotations)
                             try_noncall_family_bind(right_environment, candidate, "", condition_facts.known_nonfallible, condition_facts.numeric, condition_facts.integer)
                         try_noncall_scan_expression(right, candidate, params, right_environment, annotations, annotation, site_offset, right_shadow, right_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         if operator == TokenKind.And or operator == TokenKind.Or:
@@ -1410,10 +1485,10 @@ extend Semantic:
                         then_error_family: mutable sview = current_local_error_family
                         then_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                         else_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
-                        if try_noncall_truthy_condition_binds_name(condition, candidate):
+                        if try_noncall_truthy_condition_binds_name(condition, candidate, annotations):
                             then_shadow <- true
                             then_error_family <- ""
-                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, candidate, params)
+                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, candidate, params, annotations)
                             try_noncall_family_bind(then_environment, candidate, "", condition_facts.known_nonfallible, condition_facts.numeric, condition_facts.integer)
                         try_noncall_scan_expression(then_value, candidate, params, then_environment, annotations, annotation, site_offset, then_shadow, then_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         try_noncall_scan_expression(else_value, candidate, params, else_environment, annotations, annotation, site_offset, current_shadow, current_local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
@@ -1441,11 +1516,11 @@ extend Semantic:
                                 binder_facts <- scrutinee_facts if not pattern_facts.known_nonfallible and not pattern_facts.numeric and not pattern_facts.integer
                                 try_noncall_family_bind(arm_environment, candidate, "", binder_facts.known_nonfallible, binder_facts.numeric, binder_facts.integer)
                             try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
-                            guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate)
+                            guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate, annotations)
                             body_shadow: bool = arm_shadow or guard_binds_candidate
                             body_error_family: sview = "" if guard_binds_candidate else arm_error_family
                             if guard_binds_candidate:
-                                guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params)
+                                guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params, annotations)
                                 try_noncall_family_bind(arm_environment, candidate, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
                             try_noncall_scan_statements(arm.body, candidate, params, arm_environment, annotations, annotation, site_offset, body_shadow, body_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             candidate_wrote <- true if try_noncall_family_branch_wrote(base_environment, arm_environment, candidate)
@@ -1480,11 +1555,11 @@ extend Semantic:
                                 binder_facts <- payload_facts if arm.pattern is Pattern.Binding(success_name) and success_name == candidate and payload_facts.known_nonfallible
                                 try_noncall_family_bind(arm_environment, candidate, "", binder_facts.known_nonfallible, binder_facts.numeric, binder_facts.integer)
                             try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
-                            guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate)
+                            guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate, annotations)
                             body_shadow: bool = arm_shadow or guard_binds_candidate
                             body_error_family: sview = "" if guard_binds_candidate else arm_error_family
                             if guard_binds_candidate:
-                                guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params)
+                                guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params, annotations)
                                 try_noncall_family_bind(arm_environment, candidate, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
                             try_noncall_scan_statements(arm.body, candidate, params, arm_environment, annotations, annotation, site_offset, body_shadow, body_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             candidate_wrote <- true if try_noncall_family_branch_wrote(base_environment, arm_environment, candidate)
@@ -1569,8 +1644,9 @@ extend Semantic:
                             try_noncall_scan_expression(value, candidate, params, environment, annotations, annotation, site_offset, local_shadow, local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             declared_family: mutable sview @source = try_noncall_local_error_family(annotations, position.offset)
                             declared_known_nonfallible: mutable bool = declared_family == "" and type_expression is not Expr.Absent
-                            declared_numeric: mutable bool = try_noncall_numeric_type(type_expression)
-                            declared_integer: mutable bool = try_noncall_integer_type(type_expression)
+                            declared_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(type_expression, environment)
+                            declared_numeric: mutable bool = declared_type_facts.numeric
+                            declared_integer: mutable bool = declared_type_facts.integer
                             if declared_family == "" and type_expression is Expr.Absent:
                                 source_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(value, params, environment, annotations)
                                 declared_family <- source_facts.family
@@ -1613,10 +1689,10 @@ extend Semantic:
                             then_error_family: mutable sview = local_error_family
                             then_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             else_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
-                            if try_noncall_truthy_condition_binds_name(condition, candidate):
+                            if try_noncall_truthy_condition_binds_name(condition, candidate, annotations):
                                 then_shadow <- true
                                 then_error_family <- ""
-                                condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, candidate, params)
+                                condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, candidate, params, annotations)
                                 try_noncall_family_bind(then_environment, candidate, "", condition_facts.known_nonfallible, condition_facts.numeric, condition_facts.integer)
                             try_noncall_scan_statements(then_body, candidate, params, then_environment, annotations, annotation, site_offset, then_shadow, then_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             try_noncall_scan_statements(else_body, candidate, params, else_environment, annotations, annotation, site_offset, local_shadow, local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
@@ -1631,10 +1707,10 @@ extend Semantic:
                             body_shadow: mutable bool = local_shadow
                             body_error_family: mutable sview = local_error_family
                             loop_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
-                            if try_noncall_truthy_condition_binds_name(condition, candidate):
+                            if try_noncall_truthy_condition_binds_name(condition, candidate, annotations):
                                 body_shadow <- true
                                 body_error_family <- ""
-                                condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, candidate, params)
+                                condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, candidate, params, annotations)
                                 try_noncall_family_bind(loop_environment, candidate, "", condition_facts.known_nonfallible, condition_facts.numeric, condition_facts.integer)
                             try_noncall_scan_statements(body, candidate, params, loop_environment, annotations, annotation, site_offset, body_shadow, body_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             try_noncall_family_join_into(environment, base_environment, base_environment, loop_environment, visible_count)
@@ -1695,11 +1771,11 @@ extend Semantic:
                                     binder_facts <- scrutinee_facts if not pattern_facts.known_nonfallible and not pattern_facts.numeric and not pattern_facts.integer
                                     try_noncall_family_bind(arm_environment, candidate, "", binder_facts.known_nonfallible, binder_facts.numeric, binder_facts.integer)
                                 try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
-                                guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate)
+                                guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate, annotations)
                                 body_shadow: bool = arm_shadow or guard_binds_candidate
                                 body_error_family: sview = "" if guard_binds_candidate else arm_error_family
                                 if guard_binds_candidate:
-                                    guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params)
+                                    guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params, annotations)
                                     try_noncall_family_bind(arm_environment, candidate, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
                                 try_noncall_scan_statements(arm.body, candidate, params, arm_environment, annotations, annotation, site_offset, body_shadow, body_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                                 candidate_wrote <- true if try_noncall_family_branch_wrote(base_environment, arm_environment, candidate)
@@ -1721,7 +1797,7 @@ extend Semantic:
                             pass
                 return (local_shadow, local_error_family)
 
-        def try_noncall_binding_at_site(body: darray[Ast::Stmt], candidate: sview, params: darray[Ast::ParamDecl], annotations: darray[Ast::EnumAnnotation]&, annotation: Ast::EnumAnnotation, site_offset: u32, parameter_error_family: sview @source) -> (found: bool, shadowed: bool, local_error_family: sview @source, lambda_error_family: sview @source, inside_lambda: bool, known_nonfallible: bool):
+        def try_noncall_binding_at_site(body: darray[Ast::Stmt], candidate: sview, params: darray[Ast::ParamDecl], declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, annotation: Ast::EnumAnnotation, site_offset: u32, parameter_error_family: sview @source) -> (found: bool, shadowed: bool, local_error_family: sview @source, lambda_error_family: sview @source, inside_lambda: bool, known_nonfallible: bool):
             can Memory.Allocate, Abort.Panic:
                 found: mutable bool = false
                 shadowed_at_site: mutable bool = false
@@ -1730,9 +1806,11 @@ extend Semantic:
                 inside_lambda_at_site: mutable bool = false
                 known_nonfallible_at_site: mutable bool = false
                 environment: mutable TryNonCallErrorFamilyEnv = TryNonCallErrorFamilyEnv{}
+                try_noncall_type_alias_facts_add(declarations, environment)
                 for parameter in params |environment, params, annotations|:
                     parameter_facts: (known: bool, family: sview @source) = try_parameter_error_family(params, parameter.name, annotations)
-                    try_noncall_family_bind(environment, parameter.name, parameter_facts.family, parameter_facts.known and parameter_facts.family == "", try_noncall_numeric_type(parameter.type_expression), try_noncall_integer_type(parameter.type_expression))
+                    type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(parameter.type_expression, environment)
+                    try_noncall_family_bind(environment, parameter.name, parameter_facts.family, parameter_facts.known and parameter_facts.family == "", type_facts.numeric, type_facts.integer)
                 try_noncall_scan_statements(body, candidate, params, environment, annotations, annotation, site_offset, false, parameter_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                 return (found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
 
@@ -1747,7 +1825,7 @@ extend Semantic:
                                 try_noncall_record_statements(body, annotation, nearest_offset, nearest_name)
                                 continue if nearest_offset == 4294967295
                                 parameter_facts: (known: bool, family: sview @source) = try_parameter_error_family(params, nearest_name, annotations)
-                                binding: (found: bool, shadowed: bool, local_error_family: sview @source, lambda_error_family: sview @source, inside_lambda: bool, known_nonfallible: bool) = try_noncall_binding_at_site(body, nearest_name, params, annotations, annotation, nearest_offset, parameter_facts.family)
+                                binding: (found: bool, shadowed: bool, local_error_family: sview @source, lambda_error_family: sview @source, inside_lambda: bool, known_nonfallible: bool) = try_noncall_binding_at_site(body, nearest_name, params, declarations, annotations, annotation, nearest_offset, parameter_facts.family)
                                 return (true, binding.local_error_family, binding.lambda_error_family, binding.inside_lambda) if nearest_name == "" and binding.found and binding.local_error_family != ""
                                 return (binding.found and binding.known_nonfallible, "", binding.lambda_error_family, binding.inside_lambda) if nearest_name == ""
                                 return (true, binding.local_error_family, binding.lambda_error_family, binding.inside_lambda) if binding.found and binding.local_error_family != ""

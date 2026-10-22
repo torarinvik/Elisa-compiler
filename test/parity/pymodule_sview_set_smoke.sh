@@ -22,16 +22,16 @@ import json
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-assert manifest["functions"] == [{
-    "name": "roundtrip",
-    "target": "roundtrip",
-    "parameters": [{"name": "values", "type": "set[sview]"}],
-    "return": "set[sview]",
-}]
+functions = {row["name"]: row for row in manifest["functions"]}
+assert functions["roundtrip"]["parameters"] == [{"name": "values", "type": "set[sview]"}]
+assert functions["roundtrip"]["return"] == "set[sview]"
+assert functions["count"]["parameters"] == [{"name": "values", "type": "set[sview]"}]
+assert functions["count"]["return"] == "usize"
 PY
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi -o "$WORK/sview_set.pyi" "$SOURCE" >/dev/null
 grep -Fq 'def roundtrip(values: Iterable[str | bytes]) -> set[str]: ...' "$WORK/sview_set.pyi"
+grep -Fq 'def count(values: Iterable[str | bytes]) -> int: ...' "$WORK/sview_set.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/sview_set.pyi"
 
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
@@ -43,6 +43,8 @@ import sview_set
 
 values = {"a\x00key", "empty", "unicode-λ"}
 assert sview_set.roundtrip(values) == values
+assert sview_set.count({"same", b"same"}) == 1
+assert sview_set.roundtrip({"same", b"same"}) == {"same"}
 assert sview_set.roundtrip({b"bytes", b"\xce\xb1"}) == {"bytes", "α"}
 assert sview_set.roundtrip(frozenset(values)) == values
 assert sview_set.roundtrip(value for value in values) == values
