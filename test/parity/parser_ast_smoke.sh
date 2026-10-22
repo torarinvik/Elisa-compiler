@@ -37,5 +37,6 @@ run_parser_test_file() {
 }
 
 run_parser_test_file parser_ast_test.elisa "structural" 124
+run_parser_test_file effect_clone_registration_smoke.elisa "effect-clone capture ABI" 1
 run_parser_test_file parser_guard_condition_list_unit.elisa "guard parser/formatter unit" 4
 run_parser_test_file parser_guard_condition_list.elisa "guard full-parser integration" 3

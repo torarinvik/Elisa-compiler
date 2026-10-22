@@ -147,6 +147,18 @@ def direct_child(source: str, parent: str, child: str, occurrence: int = 0) -> b
     return len(children) == 1
 
 
+def validate_ordered_source_lines(source: str, expected_lines: tuple[str, ...], label: str) -> None:
+    """Require selected source steps to appear in execution order within one AST arm."""
+    lines = [source_route(line) for line in source.splitlines()]
+    previous_index = -1
+    for expected in expected_lines:
+        next_index = next((index for index in range(previous_index + 1, len(lines))
+                           if lines[index] == expected or lines[index].startswith(expected)), None)
+        if next_index is None:
+            raise SystemExit(f"{label} is missing or reorders step: {expected}")
+        previous_index = next_index
+
+
 def edge_parts(edge: tuple) -> tuple[str, str, int]:
     if len(edge) == 2:
         return edge[0], edge[1], 0
@@ -401,22 +413,41 @@ HOLDER_WALK_STATEMENT_EDGES = (
     ("Stmt.Expr(statement_value, _):", "table <- chv_walk_expression(statement_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "table <- chv_walk_expression(declared_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Assign(target, operator, assigned_value, _):", "table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Stmt.Assign(target, operator, assigned_value, _):", "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "if parallel_shape:"),
+    ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Stmt.Assign(target, operator, assigned_value, _):", "else:"),
+    ("else:", "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Return(value, _):", "table <- chv_walk_expression(return_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if value is return_value"),
     ("Stmt.If(condition, then_body, else_body, _):", "table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.If(condition, then_body, else_body, _):", "table <- chv_walk_statements(then_body, in_region, ref_params, binders, owned, view_names, view_values, then_flow, summary, table)"),
     ("Stmt.If(condition, then_body, else_body, _):", "table <- chv_walk_statements(else_body, in_region, ref_params, binders, owned, view_names, view_values, else_flow, summary, table)"),
     ("Stmt.While(condition, loop_body, _):", "table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.While(condition, loop_body, _):", "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)"),
-    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Stmt.For(_, loop_variables, iterable, loop_body, _):", "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)"),
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)"),
     ("Stmt.Block(kind, _, binding, block_body, _):", "table <- chv_walk_statements(block_body, in_region or kind == \"region\" or kind == \"in\", ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Match(scrutinee, arms, _):", "table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |table| -> table:"),
     ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("Stmt.Contract(_, expression, _):", "table <- chv_walk_expression(expression, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref, foreign_handle)"),
+    ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)"),
+)
+
+FOR_ITERATOR_VIEW_TAINT_EDGES = (
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "iterable_may_be_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)"),
+    ("for loop_variable in loop_variables |loop_flow|:", "chv_flow_bind(loop_flow, loop_variable, false, iterable_may_be_owned_view, loop_variable_may_alias_reference)"),
+)
+
+FOR_ITERATOR_REF_ALIAS_EDGES = (
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "iterable_may_alias_reference: bool = chv_expression_may_alias_ref(iterable, ref_params, flow, 0)"),
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "known_elements, iterable_elements = chv_known_iterable_elements(iterable)"),
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "loop_element_may_alias_reference: mutable bool = false"),
+    ("if known_elements:", "for iterable_element in iterable_elements |loop_element_may_alias_reference|:"),
+    ("for iterable_element in iterable_elements |loop_element_may_alias_reference|:", "loop_element_may_alias_reference <- loop_element_may_alias_reference or chv_expression_may_alias_ref(iterable_element, ref_params, flow, 0)"),
+    ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "loop_variable_may_alias_reference: bool = loop_element_may_alias_reference or (bind == \"mutable\" and iterable_may_alias_reference)"),
+    ("for loop_variable in loop_variables |loop_flow|:", "chv_flow_bind(loop_flow, loop_variable, false, iterable_may_be_owned_view, loop_variable_may_alias_reference)"),
 )
 
 HOLDER_WALK_EXPRESSION_EDGES = (
@@ -502,9 +533,15 @@ EXPRESSION_BINDING_FACTS_OR_EDGES = (
 PARALLEL_ASSIGNMENT_FLOW_EDGES = (
     ("Stmt.Assign(target, operator, assigned_value, _):", "parallel_values_found, parallel_values = chv_parallel_value_elements(assigned_value)"),
     ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "parallel_owned_views.push(value_may_be_owned_view)"),
-    ("elif target is Expr.Array(target_elements, _):", "element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view"),
-    ("elif target is Expr.Array(target_elements, _):", "chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "parallel_alias_refs.push(value_may_alias_reference)"),
+    ("elif target is Expr.Array(target_elements, _):", "for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, parallel_shape, parallel_owned_views, parallel_alias_refs, target_elements|:"),
+    ("for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, parallel_shape, parallel_owned_views, parallel_alias_refs, target_elements|:", "if target_elements[target_index] is Expr.Ident(target_name, _):"),
+    ("if target_elements[target_index] is Expr.Ident(target_name, _):", "element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view"),
+    ("if target_elements[target_index] is Expr.Ident(target_name, _):", "element_may_alias_reference: bool = parallel_alias_refs[target_index] if parallel_shape else assigned_value_may_alias_reference"),
+    ("if target_elements[target_index] is Expr.Ident(target_name, _):", "target_alias: bool = element_may_be_owned_view or (operator != TokenKind.Assign and previous_target_may_be_owned_view)"),
+    ("if operator == TokenKind.Assign:", "chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)"),
 )
 
 BINARY_AND_RIGHT_WALK_EDGE = (
@@ -584,8 +621,8 @@ COMPREHENSION_VIEW_TAINT_EDGES = (
 
 COMPREHENSION_BINDER_VIEW_TAINT_EDGES = (
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "iterable_may_yield_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "chv_flow_bind(comprehension_flow, variable, false, iterable_may_yield_owned_view, false)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "iterable_may_yield_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)"),
+    ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "chv_flow_bind(comprehension_flow, variable, false, iterable_may_yield_owned_view, iterable_may_yield_alias_reference)"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, comprehension_flow, summary, table)"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view"),
     ("Expr.Comprehension(variable, iterable, condition, body, _, _):", "flow.last_value_may_be_owned_view <- body_may_be_owned_view"),
@@ -654,6 +691,8 @@ ASSIGN_VIEW_TAINT_EDGES = (
     ("Stmt.Assign(target, operator, assigned_value, _):", "previous_may_owned_view <- flow.may_owned_view[previous_index] if previous_index < flow.names.count"),
     ("else:", "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("else:", "assigned_value_may_be_owned_view <- flow.last_value_may_be_owned_view"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "value_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:", "assigned_value_may_be_owned_view <- assigned_value_may_be_owned_view or value_may_be_owned_view"),
     ("Stmt.Assign(target, operator, assigned_value, _):", "table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)"),
     ("Stmt.Assign(target, operator, assigned_value, _):", "if assigned_root != \"\":"),
@@ -675,23 +714,11 @@ EFFECT_CANDIDATE_EDGES = (
 )
 
 VIEW_FLOW_MERGE_EDGES = (
-    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "foreign_handle: bool = index < target.foreign_handle.count and target.foreign_handle[index]"),
-    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_owned_view[index] <- (left.may_owned_view[index] or right.may_owned_view[index]) and not foreign_handle"),
+    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_owned_view[index] <- left.may_owned_view[index] or right.may_owned_view[index]"),
 )
 
 REF_ALIAS_FLOW_MERGE_EDGES = (
-    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "foreign_handle: bool = index < target.foreign_handle.count and target.foreign_handle[index]"),
-    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_alias_reference[index] <- (left.may_alias_reference[index] or right.may_alias_reference[index]) and not foreign_handle"),
-)
-
-FOREIGN_HANDLE_ASSIGNMENT_EDGES = (
-    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_fresh_binding: bool = operator == TokenKind.Assign and assigned_name != \"\""),
-    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_foreign_handle: bool = not assigned_fresh_binding and previous_index < flow.foreign_handle.count and flow.foreign_handle[previous_index]"),
-    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias: bool = (assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)) and not assigned_foreign_handle"),
-    ("Stmt.Assign(target, operator, assigned_value, _):", "assigned_alias_ref: bool = (assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)) and not assigned_foreign_handle"),
-    ("elif assigned_index < flow.names.count:", "foreign_handle: bool = not projection_assignment and assigned_index < flow.foreign_handle.count and flow.foreign_handle[assigned_index]"),
-    ("elif assigned_index < flow.names.count:", "flow.may_owned_view[assigned_index] <- assigned_alias and not foreign_handle"),
-    ("elif assigned_index < flow.names.count:", "flow.may_alias_reference[assigned_index] <- assigned_alias_ref and not foreign_handle"),
+    ("while index < visible_count and index < target.names.count and index < left.names.count and index < right.names.count |index, target, left, right|:", "target.may_alias_reference[index] <- left.may_alias_reference[index] or right.may_alias_reference[index]"),
 )
 
 REF_ALIAS_HELPER_EDGES = (
@@ -702,6 +729,18 @@ REF_ALIAS_HELPER_EDGES = (
     ("Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _) | Expr.Block(_, _, _, _) | Expr.GetElse(_, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):", "return ref_params.count > 0"),
     ("Expr.Binary(left, binary_operator, right, _):", "return false if chv_binary_operator_returns_bool(binary_operator, right)"),
     ("Expr.Unary(operator, operand, _):", "return false if operator == TokenKind.Not"),
+    ("Expr.Tuple(elements, _) | Expr.Array(elements, _) | Expr.SetLit(elements, _):", "return any element in elements where chv_expression_may_alias_ref(element, ref_params, flow, depth + 1)"),
+    ("Expr.DictLit(entries, _):", "return any entry in entries where chv_expression_may_alias_ref(entry.key, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(entry.value, ref_params, flow, depth + 1)"),
+    ("Expr.Construct(_, fields, _):", "return any field in fields where chv_expression_may_alias_ref(field.value, ref_params, flow, depth + 1)"),
+    ("Expr.RecordUpdate(base, fields, _):", "return chv_expression_may_alias_ref(base, ref_params, flow, depth + 1) or any field in fields where chv_expression_may_alias_ref(field.value, ref_params, flow, depth + 1)"),
+)
+
+COMPREHENSION_REF_ALIAS_EDGES = (
+    ("Expr.Comprehension(variable, iterable, _, body, _, _):", "known_elements, iterable_elements = chv_known_iterable_elements(iterable)"),
+    ("if known_elements:", "for iterable_element in iterable_elements |iterable_may_yield_alias_reference|:"),
+    ("for iterable_element in iterable_elements |iterable_may_yield_alias_reference|:", "iterable_may_yield_alias_reference <- iterable_may_yield_alias_reference or chv_expression_may_alias_ref(iterable_element, ref_params, flow, depth + 1)"),
+    ("Expr.Comprehension(variable, iterable, _, body, _, _):", "chv_flow_bind(&comprehension_flow, variable, false, false, iterable_may_yield_alias_reference)"),
+    ("Expr.Comprehension(variable, iterable, _, body, _, _):", "return chv_expression_may_alias_ref(body, comprehension_ref_params, comprehension_flow, depth + 1)"),
 )
 
 VIEW_ALIAS_BINARY_EDGES = (
@@ -1076,7 +1115,6 @@ theorem_routes = {
     "proof_chv_view_alias_join_preserves_owned_fact": {
         "left_branch_may_own": VIEW_FLOW_MERGE_EDGES,
         "right_branch_may_own": VIEW_FLOW_MERGE_EDGES,
-        "foreign_handle_guard": (VIEW_FLOW_MERGE_EDGES[0],),
     },
     "proof_chv_aggregate_construct_keeps_field_view_taint": {
         "field_walked": (CONSTRUCT_VIEW_TAINT_EDGES[0], CONSTRUCT_VIEW_TAINT_EDGES[1]),
@@ -1090,11 +1128,10 @@ theorem_routes = {
         "aggregate_taint_set": (RECORD_UPDATE_VIEW_TAINT_EDGES[5],),
     },
     "proof_chv_projection_assignment_preserves_aggregate_taint": {
-        "rhs_may_be_view": (ASSIGN_VIEW_TAINT_EDGES[5],),
+        "rhs_may_be_view": (ASSIGN_VIEW_TAINT_EDGES[5], ASSIGN_VIEW_TAINT_EDGES[6], ASSIGN_VIEW_TAINT_EDGES[7]),
         "previous_root_may_be_view": (ASSIGN_VIEW_TAINT_EDGES[3],),
-        "compound_assignment": (ASSIGN_VIEW_TAINT_EDGES[7],),
+        "compound_assignment": (ASSIGN_VIEW_TAINT_EDGES[9],),
         "target_is_projection": (ASSIGN_VIEW_TAINT_EDGES[1],),
-        "foreign_handle_guard": FOREIGN_HANDLE_ASSIGNMENT_EDGES,
     },
     "proof_chv_comprehension_result_tracks_yielded_view": {
         "body_may_be_owned_view": COMPREHENSION_VIEW_TAINT_EDGES,
@@ -1103,6 +1140,14 @@ theorem_routes = {
         "collection_taint_reaches_iterable_binding": ARRAY_VIEW_TAINT_EDGES[:4] + (HOLDER_WALK_STATEMENT_EDGES[-1],) + IDENTIFIER_VIEW_TAINT_EDGES,
         "iterable_taint_reaches_binder": COMPREHENSION_BINDER_VIEW_TAINT_EDGES[:3],
         "binder_taint_reaches_result": IDENTIFIER_VIEW_TAINT_EDGES + COMPREHENSION_BINDER_VIEW_TAINT_EDGES[3:],
+    },
+    "proof_chv_for_iterator_inherits_iterable_view_taint": {
+        "iterable_may_be_owned_view": FOR_ITERATOR_VIEW_TAINT_EDGES,
+    },
+    "proof_chv_for_iterator_inherits_iterable_reference_alias": {
+        "yielded_element_alias": FOR_ITERATOR_REF_ALIAS_EDGES[1:5],
+        "mutable_slot_alias": (FOR_ITERATOR_REF_ALIAS_EDGES[0], FOR_ITERATOR_REF_ALIAS_EDGES[5]),
+        "binder_bound": (FOR_ITERATOR_REF_ALIAS_EDGES[6],),
     },
     "proof_chv_method_result_tracks_receiver_or_arguments": {
         "receiver_may_be_owned": (METHOD_CALL_VIEW_RESULT_EDGES[2],),
@@ -1125,13 +1170,18 @@ theorem_routes = {
     "proof_chv_reference_alias_join_preserves_either_path": {
         "left_path_may_alias": REF_ALIAS_FLOW_MERGE_EDGES,
         "right_path_may_alias": REF_ALIAS_FLOW_MERGE_EDGES,
-        "foreign_handle_guard": (REF_ALIAS_FLOW_MERGE_EDGES[0],),
     },
     "proof_chv_reference_targets_cover_alias_routes": {
         "direct_parameter": (REF_ALIAS_HELPER_EDGES[0],),
         "local_alias": (REF_ALIAS_HELPER_EDGES[1],),
         "call_result": (REF_ALIAS_HELPER_EDGES[2],),
         "projection_fallback": (REF_ALIAS_HELPER_EDGES[4],),
+        "aggregate_alias": REF_ALIAS_HELPER_EDGES[7:],
+    },
+    "proof_chv_comprehension_result_tracks_yielded_alias": {
+        "yielded_element_alias_checked": COMPREHENSION_REF_ALIAS_EDGES[:3],
+        "binder_alias_bound": (COMPREHENSION_REF_ALIAS_EDGES[3],),
+        "body_alias_checked": (COMPREHENSION_REF_ALIAS_EDGES[4],),
     },
     "proof_chv_binary_operator_checks_both_operands": {
         "receiver_checked": (HOLDER_WALK_EXPRESSION_EDGES[21],),
@@ -1340,6 +1390,13 @@ for name, routes in theorem_routes.items():
         proof_source, proof_edges = holder_walk_statements, ASSIGN_VIEW_TAINT_EDGES
     elif name == "proof_chv_comprehension_result_tracks_yielded_view":
         proof_source, proof_edges = holder_walk_expressions, COMPREHENSION_VIEW_TAINT_EDGES
+    elif name == "proof_chv_for_iterator_inherits_iterable_view_taint":
+        proof_source, proof_edges = holder_walk_statements, FOR_ITERATOR_VIEW_TAINT_EDGES
+    elif name == "proof_chv_for_iterator_inherits_iterable_reference_alias":
+        proof_source, proof_edges = holder_walk_statements, FOR_ITERATOR_REF_ALIAS_EDGES
+    elif name == "proof_chv_comprehension_result_tracks_yielded_alias":
+        proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
+        proof_edges = COMPREHENSION_REF_ALIAS_EDGES
     elif name == "proof_chv_comprehension_element_view_reaches_yielded_result":
         proof_source = "\n".join((
             holder_walk_expressions,
@@ -1449,17 +1506,23 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_indirect_calls_fail_closed":
         validate_exact_boolean_theorem(positive_text, name, routes, "reference_target_checked and owned_view_checked", proof_source, proof_edges)
     elif name == "proof_chv_view_alias_join_preserves_owned_fact":
-        validate_exact_boolean_theorem(positive_text, name, routes, "(left_branch_may_own or right_branch_may_own) and not foreign_handle_guard", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "left_branch_may_own or right_branch_may_own", proof_source, proof_edges)
     elif name == "proof_chv_aggregate_construct_keeps_field_view_taint":
         validate_exact_boolean_theorem(positive_text, name, routes, "field_walked and field_taint_joined and aggregate_taint_set", proof_source, proof_edges)
     elif name == "proof_chv_record_update_keeps_base_and_field_view_taint":
         validate_exact_boolean_theorem(positive_text, name, routes, "base_taint_kept and field_walked and field_taint_joined and aggregate_taint_set", proof_source, proof_edges)
     elif name == "proof_chv_projection_assignment_preserves_aggregate_taint":
-        validate_exact_boolean_theorem(positive_text, name, routes, "(rhs_may_be_view or ((compound_assignment or target_is_projection) and previous_root_may_be_view)) and not foreign_handle_guard", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "rhs_may_be_view or ((compound_assignment or target_is_projection) and previous_root_may_be_view)", proof_source, proof_edges)
     elif name == "proof_chv_comprehension_result_tracks_yielded_view":
         validate_exact_boolean_theorem(positive_text, name, routes, "body_may_be_owned_view", proof_source, proof_edges)
     elif name == "proof_chv_comprehension_element_view_reaches_yielded_result":
         validate_exact_boolean_theorem(positive_text, name, routes, "collection_taint_reaches_iterable_binding and iterable_taint_reaches_binder and binder_taint_reaches_result", proof_source, proof_edges)
+    elif name == "proof_chv_for_iterator_inherits_iterable_view_taint":
+        validate_exact_boolean_theorem(positive_text, name, routes, "iterable_may_be_owned_view", proof_source, proof_edges)
+    elif name == "proof_chv_for_iterator_inherits_iterable_reference_alias":
+        validate_exact_boolean_theorem(positive_text, name, routes, "binder_bound and (yielded_element_alias or mutable_slot_alias)", proof_source, proof_edges)
+    elif name == "proof_chv_comprehension_result_tracks_yielded_alias":
+        validate_exact_boolean_theorem(positive_text, name, routes, "yielded_element_alias_checked and binder_alias_bound and body_alias_checked", proof_source, proof_edges)
     elif name == "proof_chv_method_result_tracks_receiver_or_arguments":
         validate_exact_boolean_theorem(positive_text, name, routes, "receiver_may_be_owned or arguments_may_be_owned", proof_source, proof_edges)
     elif name == "proof_chv_callable_result_tracks_argument_view":
@@ -1471,9 +1534,9 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_aggregate_field_projection_requires_tainted_root":
         validate_exact_boolean_theorem(positive_text, name, routes, "root_is_known and aggregate_may_contain_view", proof_source, proof_edges)
     elif name == "proof_chv_reference_alias_join_preserves_either_path":
-        validate_exact_boolean_theorem(positive_text, name, routes, "(left_path_may_alias or right_path_may_alias) and not foreign_handle_guard", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "left_path_may_alias or right_path_may_alias", proof_source, proof_edges)
     elif name == "proof_chv_reference_targets_cover_alias_routes":
-        validate_exact_boolean_theorem(positive_text, name, routes, "direct_parameter and local_alias and call_result and projection_fallback", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "direct_parameter and local_alias and call_result and projection_fallback and aggregate_alias", proof_source, proof_edges)
     elif name == "proof_chv_binary_operator_checks_both_operands":
         validate_exact_boolean_theorem(positive_text, name, routes, "receiver_checked and operand_checked and fallback_checked", proof_source, proof_edges)
     elif name == "proof_chv_index_overloads_check_receiver_and_keys":
@@ -1519,7 +1582,43 @@ for source, edges, label in (
 validate_edge_set(holder_walk_expressions, CATCH_ARM_PROVENANCE_EDGES, "holder-view catch-arm provenance")
 validate_edge_set(function_section(holder_text, "chv_expression_binding_facts"), EXPRESSION_BINDING_FACTS_OR_EDGES, "holder-view disjunction binder provenance")
 validate_edge_set(holder_walk_statements, PARALLEL_ASSIGNMENT_FLOW_EDGES, "holder-view parallel-assignment provenance")
-validate_edge_set(holder_walk_statements, FOREIGN_HANDLE_ASSIGNMENT_EDGES, "holder-view foreign-handle assignment")
+validate_edge_set(holder_walk_statements, FOR_ITERATOR_VIEW_TAINT_EDGES, "holder-view for-iterator view taint")
+validate_edge_set(holder_walk_statements, FOR_ITERATOR_REF_ALIAS_EDGES, "holder-view for-iterator reference alias")
+assignment_arm = match_arm_body(holder_walk_statements, "match statement:", "Stmt.Assign(target, operator, assigned_value, _):")
+if assignment_arm is None:
+    raise SystemExit("holder-view assignment arm is missing")
+validate_ordered_source_lines(assignment_arm, (
+    "if parallel_shape:",
+    "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference| -> table:",
+    "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)",
+    "value_may_be_owned_view: bool = flow.last_value_may_be_owned_view",
+    "parallel_owned_views.push(value_may_be_owned_view)",
+    "assigned_value_may_be_owned_view <- assigned_value_may_be_owned_view or value_may_be_owned_view",
+    "else:",
+    "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)",
+    "assigned_value_may_be_owned_view <- flow.last_value_may_be_owned_view",
+    "chv_flow_bind_expression_binders(assigned_value, ref_params, flow, table)",
+    "table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)",
+    "assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)",
+), "holder-view assignment taint order")
+for_arm = match_arm_body(holder_walk_statements, "match statement:", "Stmt.For(bind, loop_variables, iterable, loop_body, _):")
+if for_arm is None:
+    raise SystemExit("holder-view for arm is missing")
+validate_ordered_source_lines(for_arm, (
+    "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)",
+    "iterable_may_be_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)",
+    "iterable_may_alias_reference: bool = chv_expression_may_alias_ref(iterable, ref_params, flow, 0)",
+    "known_elements, iterable_elements = chv_known_iterable_elements(iterable)",
+    "loop_element_may_alias_reference: mutable bool = false",
+    "if known_elements:",
+    "for iterable_element in iterable_elements |loop_element_may_alias_reference|:",
+    "loop_element_may_alias_reference <- loop_element_may_alias_reference or chv_expression_may_alias_ref(iterable_element, ref_params, flow, 0)",
+    "loop_variable_may_alias_reference: bool = loop_element_may_alias_reference or (bind == \"mutable\" and iterable_may_alias_reference)",
+    "loop_flow: mutable CHVViewFlow = chv_flow_clone(flow)",
+    "for loop_variable in loop_variables |loop_flow|:",
+    "chv_flow_bind(loop_flow, loop_variable, false, iterable_may_be_owned_view, loop_variable_may_alias_reference)",
+    "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)",
+), "holder-view for-iterator taint order")
 validate_edge_set(holder_walk_expressions, BINARY_OPERATOR_FALLBACK_EDGES, "holder-view binary operator fallback")
 validate_edge_set(function_section(holder_text, "chv_binary_operator_has_non_runtime_target"), (BINARY_NON_RUNTIME_TARGET_EDGES[0],), "holder-view non-runtime binary target classification")
 validate_edge_set(holder_walk_expressions, ARRAY_VIEW_TAINT_EDGES, "holder-view array and tuple taint")

@@ -357,34 +357,6 @@ extend Semantic:
                         chv_scan_locals(statements, in_region, binders, owned, view_names, view_values)
                         chv_scan_expression_locals(value, in_region, binders, owned, view_names, view_values)
 
-        # An opaque extern type names foreign-managed storage, but may still hold a
-        # pointer into Elisa storage. Keep this classification separate from the value's
-        # borrow provenance; it must never clear that provenance.
-        def chv_type_name_is_foreign_handle(name: sview, table: SymbolTable&) -> bool:
-            can Abort.Panic:
-                return false if not table.symbol_name_index_valid or table.symbol_name_indexed_rows != table.symbols.count or table.symbol_name_next.count != table.symbols.count
-                matches: mutable usize = 0
-                opaque: mutable bool = false
-                row: mutable u32 = symbol_chain_head(table, name)
-                while row != SYMBOL_INDEX_ROW_NONE |row, matches, opaque, table, name|:
-                    symbol: Symbol = table.symbols[row.usize()]
-                    if symbol.name == name:
-                        matches <- matches + 1
-                        opaque <- symbol.kind == SymbolKind.Extern and symbol.opaque_extern_type
-                    row <- table.symbol_name_next[row.usize()]
-                return false if matches != 1 or not opaque
-                return not any parameter in table.generic_param_names where parameter == name
-
-        def chv_type_is_foreign_handle(type_expression: Ast::Expr, table: SymbolTable&) -> bool:
-            can Abort.Panic:
-                match type_expression:
-                    Expr.Paren(inner, _) | Expr.Unary(TokenKind.Mutable, inner, _):
-                        return chv_type_is_foreign_handle(inner, table)
-                    Expr.Ident(name, _) | Expr.Scope(_, name, _):
-                        return chv_type_name_is_foreign_handle(name, table)
-                    _:
-                        return false
-
         # Parallel assignment evaluates one tuple/array value once, then lands its
         # elements in corresponding targets. Parentheses do not change that shape.
         def chv_parallel_value_elements(value: Ast::Expr) -> (found: bool, elements: darray[Ast::Expr]):
@@ -533,6 +505,64 @@ extend Semantic:
                     _:
                         return false
 
+        # Extract elements only when the iterable's aggregate shape is explicit.
+        # Callers can then use each element's own provenance instead of copying the
+        # container's taint onto every yielded value.
+        def chv_known_iterable_elements(iterable: Ast::Expr) -> (known: bool, elements: darray[Ast::Expr]) can[Memory.Allocate, Abort.Panic]:
+            can Memory.Allocate, Abort.Panic:
+                match iterable:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return chv_known_iterable_elements(inner)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        return (true, [element for element in elements])
+                    Expr.DictLit(entries, _):
+                        elements: mutable darray[Ast::Expr] = []
+                        for entry in entries |elements|:
+                            elements.push(entry.key)
+                            elements.push(entry.value)
+                        return (true, elements)
+                    _:
+                        return (false, [])
+
+        # Iterating an sview yields scalar bytes, not borrowed-view elements. The
+        # initializer source records the view-producing expression for local names.
+        def chv_iterable_is_scalar_sview(iterable: Ast::Expr, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if depth > view_names.count
+                match iterable:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return chv_iterable_is_scalar_sview(inner, view_names, view_values, depth + 1)
+                    Expr.Call(Expr.Field(_, method, _), arguments, _, _):
+                        return arguments.count == 0 and (method == "as_sview" or method == "as_cstr")
+                    Expr.Ident(name, _):
+                        index: mutable usize = view_names.count
+                        while index > 0 |index|:
+                            index <- index - 1
+                            if view_names[index] == name and index < view_values.count:
+                                match view_values[index]:
+                                    Expr.Call(Expr.Field(_, method, _), arguments, _, _):
+                                        return arguments.count == 0 and (method == "as_sview" or method == "as_cstr")
+                                    Expr.Ident(initializer_name, _) if initializer_name != name:
+                                        return chv_iterable_is_scalar_sview(view_values[index], view_names, view_values, depth + 1)
+                                    _:
+                                        return false
+                        return false
+                    _:
+                        return false
+
+        # For known aggregate literals, join the element facts. Unknown iterables
+        # retain the old conservative whole-value fact, except scalar sview iteration.
+        def chv_iterable_element_may_be_owned_view(iterable: Ast::Expr, flow: CHVViewFlow&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, fallback_may_be_owned_view: bool, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                known_elements, elements = chv_known_iterable_elements(iterable)
+                if known_elements:
+                    may_yield_owned_view: mutable bool = false
+                    for element in elements |may_yield_owned_view, flow|:
+                        may_yield_owned_view <- may_yield_owned_view or chv_is_owned_view(element, flow, depth + 1)
+                    return may_yield_owned_view
+                return false if chv_iterable_is_scalar_sview(iterable, view_names, view_values, 0)
+                return fallback_may_be_owned_view
+
         # A writable reference may be hidden behind a local reference alias or a call
         # returning a reference. Unknown call results conservatively alias any caller
         # reference, while local aliases use the branch-joined flow fact.
@@ -549,6 +579,28 @@ extend Semantic:
                         return chv_expression_may_alias_ref(then_value, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(else_value, ref_params, flow, depth + 1)
                     Expr.Call(_, _, _, _):
                         return ref_params.count > 0
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        return any element in elements where chv_expression_may_alias_ref(element, ref_params, flow, depth + 1)
+                    Expr.DictLit(entries, _):
+                        return any entry in entries where chv_expression_may_alias_ref(entry.key, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(entry.value, ref_params, flow, depth + 1)
+                    Expr.Construct(_, fields, _):
+                        return any field in fields where chv_expression_may_alias_ref(field.value, ref_params, flow, depth + 1)
+                    Expr.RecordUpdate(base, fields, _):
+                        return chv_expression_may_alias_ref(base, ref_params, flow, depth + 1) or any field in fields where chv_expression_may_alias_ref(field.value, ref_params, flow, depth + 1)
+                    Expr.Comprehension(variable, iterable, _, body, _, _):
+                        known_elements, iterable_elements = chv_known_iterable_elements(iterable)
+                        iterable_may_yield_alias_reference: mutable bool = false
+                        if known_elements:
+                            for iterable_element in iterable_elements |iterable_may_yield_alias_reference|:
+                                iterable_may_yield_alias_reference <- iterable_may_yield_alias_reference or chv_expression_may_alias_ref(iterable_element, ref_params, flow, depth + 1)
+                        else:
+                            iterable_may_yield_alias_reference <- ref_params.count > 0 or chv_expression_may_alias_ref(iterable, ref_params, flow, depth + 1)
+                        comprehension_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        chv_flow_bind(&comprehension_flow, variable, false, false, iterable_may_yield_alias_reference)
+                        comprehension_ref_params: mutable darray[sview] = []
+                        for outer_ref in ref_params |comprehension_ref_params|:
+                            comprehension_ref_params.push(outer_ref) if outer_ref != variable
+                        return chv_expression_may_alias_ref(body, comprehension_ref_params, comprehension_flow, depth + 1)
                     Expr.Binary(left, binary_operator, right, _):
                         return false if chv_binary_operator_returns_bool(binary_operator, right)
                         return chv_expression_may_alias_ref(left, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(right, ref_params, flow, depth + 1)
@@ -1171,10 +1223,17 @@ extend Semantic:
                         flow.last_value_may_be_owned_view <- branch_value_may_be_owned
                     Expr.Comprehension(variable, iterable, condition, body, _, _):
                         table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
-                        iterable_may_yield_owned_view: bool = flow.last_value_may_be_owned_view
+                        iterable_may_yield_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)
+                        known_elements, iterable_elements = chv_known_iterable_elements(iterable)
+                        iterable_may_yield_alias_reference: mutable bool = false
+                        if known_elements:
+                            for iterable_element in iterable_elements |iterable_may_yield_alias_reference|:
+                                iterable_may_yield_alias_reference <- iterable_may_yield_alias_reference or chv_expression_may_alias_ref(iterable_element, ref_params, flow, 0)
+                        else:
+                            iterable_may_yield_alias_reference <- ref_params.count > 0 or chv_expression_may_alias_ref(iterable, ref_params, flow, 0)
                         branch_mark: usize = flow.names.count
                         comprehension_flow: mutable CHVViewFlow = chv_flow_clone(flow)
-                        chv_flow_bind(&comprehension_flow, variable, false, iterable_may_yield_owned_view, false)
+                        chv_flow_bind(&comprehension_flow, variable, false, iterable_may_yield_owned_view, iterable_may_yield_alias_reference)
                         comprehension_ref_params: mutable darray[sview] = []
                         comprehension_binders: mutable darray[sview] = [name for name in binders]
                         comprehension_owned: mutable darray[sview] = [name for name in owned]
@@ -1251,11 +1310,10 @@ extend Semantic:
                             chv_flow_bind_expression_binders(declared_value, ref_params, flow, table)
                             typed_owned: bool = chv_type_is_owned_container(type_expression) and not type_marker_present_here(type_expression, TokenKind.Ampersand)
                             literal_owned: bool = (type_expression is Expr.Absent) and (declared_value is Expr.Array(_, _))
-                            foreign_handle: bool = chv_type_is_foreign_handle(type_expression, table)
                             declared_alias_ref: bool = chv_expression_may_alias_ref(declared_value, ref_params, flow, 0)
                             # Opaque extern values may retain borrowed Elisa pointers, so
                             # their type does not erase initializer provenance.
-                            chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref, foreign_handle)
+                            chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)
                         Stmt.Assign(target, operator, assigned_value, _):
                             assigned_name: sview = ident_name_of(target)
                             assigned_root: sview = chv_place_root(target)
@@ -1292,20 +1350,15 @@ extend Semantic:
                                 assigned_value_may_alias_reference <- chv_expression_may_alias_ref(assigned_value, ref_params, flow, 0)
                             chv_flow_bind_expression_binders(assigned_value, ref_params, flow, table)
                             table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
-                            assigned_fresh_binding: bool = operator == TokenKind.Assign and assigned_name != ""
-                            assigned_foreign_handle: bool = not assigned_fresh_binding and previous_index < flow.foreign_handle.count and flow.foreign_handle[previous_index]
-                            assigned_alias: bool = (assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)) and not assigned_foreign_handle
-                            assigned_alias_ref: bool = (assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)) and not assigned_foreign_handle
+                            assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)
+                            assigned_alias_ref: bool = assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)
                             if assigned_root != "":
                                 assigned_index: usize = chv_flow_latest(flow, assigned_root)
                                 if operator == TokenKind.Assign and assigned_name != "":
-                                    # `=` introduces a new binding; it must not inherit an
-                                    # older same-named local's type classification.
                                     chv_flow_bind(flow, assigned_root, false, assigned_alias, assigned_alias_ref)
                                 elif assigned_index < flow.names.count:
-                                    foreign_handle: bool = not projection_assignment and assigned_index < flow.foreign_handle.count and flow.foreign_handle[assigned_index]
-                                    flow.may_owned_view[assigned_index] <- assigned_alias and not foreign_handle
-                                    flow.may_alias_reference[assigned_index] <- assigned_alias_ref and not foreign_handle
+                                    flow.may_owned_view[assigned_index] <- assigned_alias
+                                    flow.may_alias_reference[assigned_index] <- assigned_alias_ref
                                 else:
                                     chv_flow_bind(flow, assigned_root, false, assigned_alias, assigned_alias_ref)
                             elif target is Expr.Array(target_elements, _):
@@ -1314,18 +1367,15 @@ extend Semantic:
                                         target_flow_index: usize = chv_flow_latest(flow, target_name)
                                         previous_target_may_be_owned_view: bool = target_flow_index < flow.names.count and flow.may_owned_view[target_flow_index]
                                         previous_target_may_alias_reference: bool = target_flow_index < flow.names.count and flow.may_alias_reference[target_flow_index]
-                                        target_fresh_binding: bool = operator == TokenKind.Assign
-                                        target_foreign_handle: bool = not target_fresh_binding and target_flow_index < flow.foreign_handle.count and flow.foreign_handle[target_flow_index]
                                         element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view
                                         element_may_alias_reference: bool = parallel_alias_refs[target_index] if parallel_shape else assigned_value_may_alias_reference
-                                        target_alias: bool = (element_may_be_owned_view or (operator != TokenKind.Assign and previous_target_may_be_owned_view)) and not target_foreign_handle
-                                        target_alias_ref: bool = (element_may_alias_reference or (operator != TokenKind.Assign and previous_target_may_alias_reference)) and not target_foreign_handle
+                                        target_alias: bool = element_may_be_owned_view or (operator != TokenKind.Assign and previous_target_may_be_owned_view)
+                                        target_alias_ref: bool = element_may_alias_reference or (operator != TokenKind.Assign and previous_target_may_alias_reference)
                                         if operator == TokenKind.Assign:
                                             chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)
                                         elif target_flow_index < flow.names.count:
-                                            foreign_handle: bool = target_flow_index < flow.foreign_handle.count and flow.foreign_handle[target_flow_index]
-                                            flow.may_owned_view[target_flow_index] <- target_alias and not foreign_handle
-                                            flow.may_alias_reference[target_flow_index] <- target_alias_ref and not foreign_handle
+                                            flow.may_owned_view[target_flow_index] <- target_alias
+                                            flow.may_alias_reference[target_flow_index] <- target_alias_ref
                                         else:
                                             chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)
                         Stmt.Return(value, _):
@@ -1346,12 +1396,23 @@ extend Semantic:
                             chv_flow_bind_truthy_condition_binders(condition, ref_params, &loop_flow, table)
                             table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, &loop_flow, summary, table)
                             chv_flow_merge(flow, &loop_flow, branch_mark)
-                        Stmt.For(_, loop_variables, iterable, loop_body, _):
+                        Stmt.For(bind, loop_variables, iterable, loop_body, _):
                             table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            # View provenance follows possible yielded views. Only mutable
+                            # loop binding exposes writable iterable slots. Copied loop
+                            # values still inherit facts from explicit aggregate elements.
+                            iterable_may_be_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)
+                            iterable_may_alias_reference: bool = chv_expression_may_alias_ref(iterable, ref_params, flow, 0)
+                            known_elements, iterable_elements = chv_known_iterable_elements(iterable)
+                            loop_element_may_alias_reference: mutable bool = false
+                            if known_elements:
+                                for iterable_element in iterable_elements |loop_element_may_alias_reference|:
+                                    loop_element_may_alias_reference <- loop_element_may_alias_reference or chv_expression_may_alias_ref(iterable_element, ref_params, flow, 0)
+                            loop_variable_may_alias_reference: bool = loop_element_may_alias_reference or (bind == "mutable" and iterable_may_alias_reference)
                             branch_mark: usize = flow.names.count
                             loop_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                             for loop_variable in loop_variables |loop_flow|:
-                                chv_flow_bind(&loop_flow, loop_variable, false, false, false)
+                                chv_flow_bind(&loop_flow, loop_variable, false, iterable_may_be_owned_view, loop_variable_may_alias_reference)
                             table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, &loop_flow, summary, table)
                             chv_flow_merge(flow, &loop_flow, branch_mark)
                         Stmt.Block(kind, _, binding, block_body, _):
@@ -1398,7 +1459,7 @@ extend Semantic:
                                 ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
                                 parameter_owned: bool = chv_type_is_owned_container(parameter.type_expression) and not type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
                                 parameter_may_alias_reference: bool = type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
-                                chv_flow_bind(flow, parameter.name, parameter_owned, false, parameter_may_alias_reference, chv_type_is_foreign_handle(parameter.type_expression, table))
+                                chv_flow_bind(flow, parameter.name, parameter_owned, false, parameter_may_alias_reference)
                             if ref_params.count > 0:
                                 owned: mutable darray[sview] = []
                                 view_names: mutable darray[sview] = []

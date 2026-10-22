@@ -220,6 +220,7 @@ run_positive "helper_sibling_capture.elisa"
 run_positive "helper_multiple_effects.elisa"
 run_positive "helper_module_install.elisa"
 run_positive "helper_nested_capture.elisa"
+run_positive "helper_error_union_capture.elisa"
 run_positive "helper_mutual_recursive.elisa"
 run_native_contract "helper_mutual_recursive.elisa"
 run_native_result "helper_namespace.elisa" 22
@@ -227,6 +228,7 @@ run_native_result "helper_explicit_chain.elisa" 31
 run_native_result "helper_qualified_chain.elisa" 47
 run_native_result "helper_multiple_effects.elisa" 33
 run_native_result "helper_nested_capture.elisa" 22
+run_native_result "helper_error_union_capture.elisa" 22
 run_native_result "module_duplicate_handler_names.elisa" 1
 run_native_result "module_forward_handler.elisa" 7
 run_native_result "module_forward_duplicate_handler_names.elisa" 1
