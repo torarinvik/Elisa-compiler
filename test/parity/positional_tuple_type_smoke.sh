@@ -22,10 +22,14 @@ check_rejected() {
         status=$?
     fi
     [ "$status" -ne 0 ] || fail "$label accepted positional tuple type"
-    printf '%s\n' "$output" | grep -q "expected :, got ," || fail "$label lost the tuple-type diagnostic"
-    [ "$(printf '%s\n' "$output" | grep -c "expected :, got ,")" -ge 2 ] || fail "$label missed one tuple-type diagnostic"
+    if [[ "$label" == stage0 ]]; then
+        [ "$(printf '%s\n' "$output" | grep -c "expected ), got ,")" -ge 5 ] || fail "$label missed a positional tuple type diagnostic"
+    else
+        [ "$(printf '%s\n' "$output" | grep -c "expected :, got ,")" -ge 2 ] || fail "$label missed a struct-field or alias tuple-type diagnostic"
+        [ "$(printf '%s\n' "$output" | grep -c "expected ), got ,")" -ge 3 ] || fail "$label missed a nested parameter type diagnostic"
+    fi
 }
 
 check_rejected stage0 "$ELISACORE_BIN"
 check_rejected stage1 "$STAGE1_BIN"
-echo "positional tuple type smoke OK: stage0 and stage1 reject struct-field and alias forms"
+echo "positional tuple type smoke OK: stage0 and stage1 reject struct-field, alias, nested, generic, and modifier-wrapped tuple-argument forms"

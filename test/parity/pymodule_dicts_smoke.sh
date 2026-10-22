@@ -43,6 +43,7 @@ assert dicts.count_u64({1: 2, 3: 4}) == 2
 assert dicts.count_float({1: 1.5, 2: 2.5}) == 2
 assert dicts.count_bool({"yes": True, "no": False}) == 2
 assert dicts.count_bool_keys({True: 1, False: 0}) == 2
+assert dicts.count_bool_keys({2: 11, 3: 22}) == 1
 assert dicts.get_i64({1: 40, 2: 2}, 1) == 40
 assert dicts.get_i64({1: 40, 2: 2}, key=2) == 2
 assert dicts.get_i64({1: 40}, 99) == -1
@@ -59,6 +60,7 @@ assert abs(f32_values[1] - 1.5) < 1e-6
 assert abs(f32_values[2] + 2.25) < 1e-6
 assert dicts.roundtrip_u64({1: 2, 2**63: 2**64 - 1}) == {1: 2, 2**63: 2**64 - 1}
 assert dicts.roundtrip_bool_keys({True: 11, False: 22}) == {True: 11, False: 22}
+assert dicts.roundtrip_bool_keys({2: 11, 3: 22}) == {True: 22}
 assert dicts.roundtrip_i8_keys({-128: 1, 127: 2}) == {-128: 1, 127: 2}
 assert dicts.get_i8({-128: 10, -1: 20, 127: 30}, -1) == 20
 assert dicts.roundtrip_i16_keys({-32768: 1, 32767: 2}) == {-32768: 1, 32767: 2}

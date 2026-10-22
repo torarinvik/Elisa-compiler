@@ -39,11 +39,58 @@ same=0
 total=0
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
     name="$(basename "$src" .elisa)"
+    # Signed-step behavior intentionally tightens the Stage1 proof rule beyond the
+    # separate Stage0 compiler's legacy operator-only heuristic.
+    [ "$name" = "progress_step_signs" ] && continue
     s0 -emit progress "$src" </dev/null > "$WORK/$name.s0" 2>/dev/null || continue
     s1 -emit progress -o "$WORK/$name.s1" "$src" >/dev/null 2>&1 || continue
     total=$((total + 1))
     cmp -s "$WORK/$name.s0" "$WORK/$name.s1" && same=$((same + 1))
 done
+
+# This fixture specifically guards step direction: zero and wrong-sign steps must remain
+# unwitnessed, while positive literal steps with the matching update operator count.
+step_fixture="$WORK/progress_step_signs.s1"
+if ! s1 -emit progress -o "$step_fixture" "$REPO_ROOT/test/repro/progress_step_signs.elisa" >/dev/null 2>&1 || [ ! -s "$step_fixture" ]; then
+    echo "emit_progress parity FAILED: progress_step_signs fixture did not produce a Stage1 report"
+    exit 1
+fi
+if ! grep -q '^warnings: 18$' "$step_fixture" || [ "$(grep -c 'evidence=none' "$step_fixture")" -ne 18 ] || [ "$(grep -c 'evidence=progress' "$step_fixture")" -ne 4 ]; then
+    echo "emit_progress parity FAILED: progress_step_signs did not classify all 18 unproven and 4 valid steps as expected"
+    exit 1
+fi
+if ! grep -q '^  valid_compound_increment: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: canonical compound increment was not accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  valid_explicit_increment: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: canonical explicit increment was not accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  valid_compound_decrement: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: canonical compound decrement was not accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  valid_explicit_decrement: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: canonical explicit decrement was not accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  unrecognized_compound_decrement_negative_step: obligations=Loop:1 evidence=none ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: noncanonical negative step was incorrectly accepted for a decreasing bound"
+    exit 1
+fi
+if ! grep -q '^  unrecognized_compound_increment_negative_subtract: obligations=Loop:1 evidence=none ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: noncanonical negative step was incorrectly accepted for an increasing bound"
+    exit 1
+fi
+if ! grep -q '^  unrecognized_explicit_increment_parenthesized_positive_step: obligations=Loop:1 evidence=none ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: unsupported parenthesized step was incorrectly accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  unrecognized_compound_increment_unary_positive_step: obligations=Loop:1 evidence=none ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: unsupported unary-positive step was incorrectly accepted as progress"
+    exit 1
+fi
 
 if [ "$same" -lt "$baseline" ]; then
     echo "emit_progress parity FAILED: $same byte-identical of $total, ratchet requires >= $baseline"

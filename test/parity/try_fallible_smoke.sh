@@ -108,6 +108,15 @@ grep -q 'cannot propagate E from a function returning F' <<< "$match_fallible_bl
 
 match_pattern_binder_shadows_family=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(subject: i64, value: i64 error[E]) -> i64 error[F]:\n    copied = value\n    result = match subject:\n        copied: copied\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$match_pattern_binder_shadows_family"
+! grep -q 'cannot propagate E from a function returning F' <<< "$match_pattern_binder_shadows_family"
+
+match_guard_pattern_shadows_family=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(subject: darray[i64], value: i64 error[E]) -> i64 error[F]:\n    copied = value\n    result = match subject:\n        _ if subject is [copied]: copied\n        _: 0\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$match_guard_pattern_shadows_family"
+! grep -q 'cannot propagate E from a function returning F' <<< "$match_guard_pattern_shadows_family"
+
+if_guard_pattern_shadows_family=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(subject: darray[i64], value: i64 error[E]) -> i64 error[F]:\n    copied = value\n    result = copied if subject is [copied] else 0\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$if_guard_pattern_shadows_family"
+! grep -q 'cannot propagate E from a function returning F' <<< "$if_guard_pattern_shadows_family"
 
 parameter_rebinding=$(printf 'error E:\n    Bad\n\ndef forward(mutable value: i64 error[E]) -> i64 error[E]:\n    rebind value = value\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$parameter_rebinding"

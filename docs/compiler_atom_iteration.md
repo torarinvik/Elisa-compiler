@@ -23,9 +23,11 @@ in a probe; this tool is a development aid rather than a general linker.
 
 The `pymodule_struct_typedef`, `try_fallback_source`, `authority_coverage`,
 `authority_annotation_index`, `iterator_alias_resolution`, `lmut_scope`,
-`loop_program_view`, `type_region_suffix`, `holder_view_depth`, and
-`holder_view_wrappers` atoms use `-strict`. All other atoms use `-permissive`, so unrelated dependency contracts
-that cannot be proved in the sliced context retain their runtime checks. Source
+`loop_program_view`, `type_region_suffix`, `holder_view_depth`,
+`holder_view_wrappers`, `foreign_handle_flow`, and
+`holder_comprehension_alias`, and `try_fallible_entry` atoms use `-strict`.
+All other atoms use `-permissive`, so unrelated dependency contracts that
+cannot be proved in the sliced context retain their runtime checks. Source
 checking and SMT stay enabled in both modes. These results do
 **not** qualify a full strict compiler build or establish end-to-end incremental
 build time. Keep the complete self-compilation check as a separate gate, also

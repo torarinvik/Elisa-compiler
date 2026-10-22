@@ -38,7 +38,21 @@ grep -q "try fallback expects void" <<< "$out" && fail "false positive on contro
 out=$(printf "${VALUE_FN}def f(x: i64) -> i64:\n    v: i64 = try may_value(x) else 0\n    return v\n" | "$RPT")
 grep -q "try fallback expects void" <<< "$out" && fail "false positive on value payload: $out"
 
-# 5. The compiler must not TRAP on the offending shape, and must agree with stage0.
+nested_fallback=$(cat <<'ELISA' | "$RPT"
+error E:
+    Bad(sview)
+
+def may_value() -> i64 error[E]:
+    return 1
+
+def nested(flag: bool) -> i64:
+    pair = (try may_value() else "".cast[u8], 0) if flag else (0, 0)
+    return 0
+ELISA
+)
+grep -q "try fallback expects i64, got u8" <<< "$nested_fallback" || fail "nested conditional/tuple fallback type mismatch not flagged: $nested_fallback"
+
+# 6. The compiler must not TRAP on the offending shape, and must agree with stage0.
 #    (rc=133 is 128+SIGTRAP, the original crash. Checking the rc, not the wording, is the
 #    point here: a crash produced no wording at all.)
 S1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
@@ -54,7 +68,7 @@ s0_rc=$?
 [ "$s1_rc" = "$s0_rc" ] || fail "stage1 rc=$s1_rc disagrees with stage0 rc=$s0_rc"
 [ "$s1_rc" != 0 ] || fail "try-void-else-value was accepted; stage0 rejects it"
 
-# 6. 0 findings across frontend + stdlib — the check must be sound on real code.
+# 7. 0 findings across frontend + stdlib — the check must be sound on real code.
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -c "try fallback expects void" || true)

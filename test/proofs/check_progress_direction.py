@@ -38,6 +38,8 @@ for fragment in (
     "constenumDirectionofu8:NoDirectionIncreaseDecrease",
     "returnwhenoperator:Lexer::TokenKind.Lt|Lexer::TokenKind.LtEq->Direction.IncreaseLexer::TokenKind.Gt|Lexer::TokenKind.GtEq->Direction.Decrease_->Direction.NoDirection",
     "returnwhendirection:Direction.Increase->operator==increase_operatorDirection.Decrease->operator==decrease_operator_->false",
+    "defadvances_by_step(direction:Direction,operator:Lexer::TokenKind,step_direction:Direction,increase_operator:Lexer::TokenKind,decrease_operator:Lexer::TokenKind)->bool:",
+    "returnfalseifstep_direction!=Direction.Increase",
     "ensureresult==(",
 ):
     if fragment not in classifier:
@@ -46,8 +48,12 @@ if 'include"./progress_direction.elisa"' not in progress:
     raise SystemExit("progress emitter no longer imports the proved direction classifier")
 if "ProgressDirection::from_comparison_operator(pc_op)" not in progress:
     raise SystemExit("progress emitter no longer delegates comparison classification")
-if progress.count("ProgressDirection::advances(") != 2:
-    raise SystemExit("progress emitter no longer uses the proved update-direction rule at both sites")
+if progress.count("ProgressDirection::advances_by_step(direction,operator,step_direction,plus_operator,minus_operator)") != 1:
+    raise SystemExit("progress emitter no longer delegates signed-step decisions to the proved rule")
+if progress.count("returntrueifprogress_update_advances(direction,pb_operator,pb_value,") != 1 or progress.count("returntrueifprogress_update_advances(direction,pv_op,pv_right,") != 1:
+    raise SystemExit("progress emitter no longer checks both compound and explicit updates through the signed-step rule")
+if "ifexpressionisExpr.IntLit(step_value,_):returnProgressDirection::Direction.Increaseifstep_value>0returnProgressDirection::Direction.NoDirection" not in progress:
+    raise SystemExit("progress emitter no longer requires a bare positive integer literal step")
 if 'include"./elisac_emit_progress.elisa"' not in driver or "emit_progress_report(" not in driver:
     raise SystemExit("compiler driver no longer connects the proved progress rule to reporting")
 if 'include"../../src/driver/progress_direction.elisa"' not in positive:
@@ -59,13 +65,16 @@ for declaration in (
     "all_loop_bound_comparisons_have_the_expected_direction",
     "unrelated_comparisons_have_no_progress_direction",
     "source_directional_update_rule_is_exact",
+    "source_signed_step_update_rule_is_exact",
     "accepted_updates_match_their_bound_direction",
+    "signed_steps_match_the_canonical_rule",
 ):
     if f"def{declaration}(" not in positive:
         raise SystemExit(f"positive proof lost {declaration}")
 for fragment in (
-    "ensureresult==(whenoperator:Lexer::TokenKind.Lt|Lexer::TokenKind.LtEq->ProgressDirection::Direction.IncreaseLexer::TokenKind.Gt|Lexer::TokenKind.GtEq->ProgressDirection::Direction.Decrease_->ProgressDirection::Direction.NoDirection)",
-    "ensureresult==(whendirection:ProgressDirection::Direction.Increase->operator==increase_operatorProgressDirection::Direction.Decrease->operator==decrease_operator_->false)",
+    "ensurewhenoperator:Lexer::TokenKind.Lt|Lexer::TokenKind.LtEq->result==(ProgressDirection::Direction.Increase)Lexer::TokenKind.Gt|Lexer::TokenKind.GtEq->result==(ProgressDirection::Direction.Decrease)_->result==(ProgressDirection::Direction.NoDirection)",
+    "ensurewhendirection:ProgressDirection::Direction.Increase->result==(operator==increase_operator)ProgressDirection::Direction.Decrease->result==(operator==decrease_operator)_->result==(false)",
+    "ensureresult==((direction==ProgressDirection::Direction.Increaseandoperator==increase_operatorandstep_direction==ProgressDirection::Direction.Increase)or(direction==ProgressDirection::Direction.Decreaseandoperator==decrease_operatorandstep_direction==ProgressDirection::Direction.Increase))",
 ):
     if fragment not in positive:
         raise SystemExit("positive proof no longer states the production direction match exactly")
@@ -113,17 +122,22 @@ assert {
     "Direction",
     "from_comparison_operator",
     "advances",
+    "advances_by_step",
     "source_comparison_operator_mapping_is_exact",
     "all_loop_bound_comparisons_have_the_expected_direction",
     "unrelated_comparisons_have_no_progress_direction",
     "source_directional_update_rule_is_exact",
+    "source_signed_step_update_rule_is_exact",
     "accepted_updates_match_their_bound_direction",
+    "signed_steps_match_the_canonical_rule",
 } <= verified
 
 code, rejected = run(NEGATIVE)
 negative_names = {
     "less_than_must_not_mean_decrease",
     "addition_must_not_advance_a_decreasing_bound",
+    "zero_step_must_not_advance",
+    "negative_step_must_not_advance_an_increasing_bound",
 }
 assert code == 1 and rejected["status"] == rejected["verification_state"] == "failed"
 assert {row["name"] for row in rejected["findings"]} == negative_names
