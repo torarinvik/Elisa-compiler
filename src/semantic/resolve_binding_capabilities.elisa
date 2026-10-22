@@ -7,9 +7,13 @@ extend Semantic:
 
         def binding_import_metadata(annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for annotation in annotations |table|:
+                for annotation in annotations |table| -> table:
                     if annotation.owner == "__from_member" or annotation.owner == "__from_src" or annotation.name == "__using_alias" or annotation.name == "__using_alias_target" or annotation.name == "__binding_wildcard_import":
-                        table.binding_import_annotations <- table.binding_import_annotations.push(annotation)
+                        normalized: mutable Ast::EnumAnnotation = annotation
+                        if annotation.name == "__using_alias_target":
+                            rebind canonical_target: sview @source, table = binding_resolve_module_alias_target(annotation.owner, annotation.module, annotation.offset, table)
+                            normalized <- annotation{owner = canonical_target}
+                        table.binding_import_annotations <- table.binding_import_annotations.push(normalized)
 
         def unknown_binding_capabilities() -> BindingCapabilities:
             BindingCapabilities{known: false, borrowed: false, writable: false, linear_mutable: false, declaration_id: DeclId{value: INVALID_DECL_ID_VALUE}}
@@ -34,6 +38,26 @@ extend Semantic:
                         ambiguous <- true
                 return BINDING_MODULE_ALIAS_ROW_AMBIGUOUS if ambiguous else best
 
+        # Alias declarations canonicalize through earlier aliases only. Parser
+        # annotations carry the source offset that separates an earlier alias from a
+        # later declaration with the same visible name.
+        def binding_module_alias_row_before(name: sview, scope: sview, before_offset: u32, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                best: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                best_rank: mutable usize = 0
+                ambiguous: mutable bool = false
+                for index in 0..<table.binding_import_annotations.count |best, best_rank, ambiguous, before_offset|:
+                    annotation: Ast::EnumAnnotation = table.binding_import_annotations[index]
+                    continue if annotation.name != "__using_alias" or annotation.owner != name or annotation.offset >= before_offset or not named_type_owner_is_lexical(annotation.module, scope)
+                    rank: usize = annotation.module.len + 1
+                    if best == SYMBOL_INDEX_ROW_NONE or rank > best_rank:
+                        best <- index.u32()
+                        best_rank <- rank
+                        ambiguous <- false
+                    elif rank == best_rank:
+                        ambiguous <- true
+                return BINDING_MODULE_ALIAS_ROW_AMBIGUOUS if ambiguous else best
+
         # FNV-1a (name_hash) of `prefix[0..prefix_length) ++ "::" ++ target`, or of `target`
         # alone when prefix_length is 0, hashed piecewise so no candidate name is allocated.
         def binding_module_candidate_hash(prefix: sview, prefix_length: usize, target: sview) -> u64:
@@ -48,11 +72,38 @@ extend Semantic:
                     hash <- (hash ^ target[offset].u64()) * SEMANTIC_HASH_PRIME
                 return hash
 
+        def binding_module_path_join(parent: sview, child: sview @source, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                return child if parent == ""
+                bytes: mutable darray[u8] = []
+                for offset in 0..<parent.len |bytes, parent|:
+                    bytes.push(parent[offset])
+                bytes.push(58)
+                bytes.push(58)
+                for offset in 0..<child.len |bytes, child|:
+                    bytes.push(child[offset])
+                return intern_joined_text(bytes, table)
+
         def binding_module_symbol_is_using_alias(symbol: Symbol, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 for annotation in table.binding_import_annotations:
-                    return true if annotation.name == "__using_alias" and annotation.owner == symbol.name and annotation.module == symbol.module_owner and annotation.line == symbol.line and annotation.offset == symbol.offset
+                    # Alias symbols are appended after declaration collection, when
+                    # `table.current_module` has been restored to the root. Their module
+                    # provenance therefore lives in the parser annotation, while the
+                    # symbol's source token identity is its name/line/offset.
+                    return true if annotation.name == "__using_alias" and annotation.owner == symbol.name and annotation.line == symbol.line and annotation.offset == symbol.offset
                 return false
+
+        def binding_module_path_matches_child(candidate: sview, parent: sview, child: sview) -> bool:
+            can Abort.Panic:
+                expected_length: usize = parent.len + 2.usize() + child.len
+                return false if parent == "" or child == "" or candidate.len != expected_length
+                for index in 0..<parent.len |candidate, parent|:
+                    return false if candidate[index] != parent[index]
+                return false if candidate[parent.len] != 58 or candidate[parent.len + 1.usize()] != 58
+                for index in 0..<child.len |candidate, parent, child|:
+                    return false if candidate[parent.len + 2.usize() + index] != child[index]
+                return true
 
         # A module symbol matches `target` only when its name is `target` itself or
         # `ANCESTOR::target` for `scope` or one of its `::` ancestors. That is a handful of
@@ -106,16 +157,13 @@ extend Semantic:
                         prefix_length <- next
                 return "" if ambiguous else owner
 
-        # Resolve a `using ... as Alias` target through earlier module aliases as well as
-        # concrete module symbols. The target can be either an alias by itself (`First`) or
-        # an aliased prefix (`First::Nested`). Resolve the prefix in the alias declaration's
-        # lexical scope, then continue looking up the suffix relative to that concrete module.
-        def binding_resolve_module_alias_target(target: sview, scope: sview, table: SymbolTable&, depth: u32 = 0) -> sview:
+        # Canonicalize a `using ... as Alias` target from its declaration scope. Only
+        # aliases declared earlier may expand; an ordinary module target remains scoped
+        # even when only a same-named root module exists. Keeping that canonical path lets
+        # a missing alias candidate fall through to the raw qualifier spelling.
+        def binding_resolve_module_alias_target(target: sview @source, scope: sview, before_offset: u32, table: lmut SymbolTable, depth: u32 = 0) -> sview @source:
             can Memory.Allocate, Abort.Panic:
                 return "" if target == "" or depth >= BINDING_CAPABILITY_MAX_RESOLUTION_DEPTH
-                concrete_owner: sview = binding_import_module_owner(target, scope, table)
-                return concrete_owner if concrete_owner != ""
-
                 separator: mutable usize = target.len
                 while index + 1.usize() < target.len |index: mutable usize = 0.usize(), separator, target|:
                     if target[index] == 58 and target[index + 1.usize()] == 58:
@@ -123,21 +171,57 @@ extend Semantic:
                         break
                     index <- index + 1.usize()
                 alias_name: sview = string_view_slice(target, 0, separator.i64())
-                alias_row: u32 = binding_module_alias_row(alias_name, scope, table)
-                return "" if alias_row == SYMBOL_INDEX_ROW_NONE or alias_row == BINDING_MODULE_ALIAS_ROW_AMBIGUOUS
+                alias_row: u32 = binding_module_alias_row_before(alias_name, scope, before_offset, table)
+                return "" if alias_row == BINDING_MODULE_ALIAS_ROW_AMBIGUOUS
+                if alias_row == SYMBOL_INDEX_ROW_NONE:
+                    rebind scoped_target: sview @source, table = binding_module_path_join(scope, target, table)
+                    return scoped_target
                 alias: Ast::EnumAnnotation = table.binding_import_annotations[alias_row.usize()]
-                alias_target: mutable sview = ""
+                alias_target: mutable sview @source = ""
                 alias_target_count: mutable usize = 0
                 for annotation in table.binding_import_annotations |alias, alias_target, alias_target_count|:
                     if annotation.name == "__using_alias_target" and annotation.module == alias.module and annotation.line == alias.line and annotation.offset == alias.offset:
                         alias_target <- annotation.owner
                         alias_target_count <- alias_target_count + 1.usize()
                 return "" if alias_target_count != 1 or alias_target == ""
-                resolved_target: sview = binding_resolve_module_alias_target(alias_target, alias.module, table, depth + 1)
+                rebind resolved_target: sview @source, table = binding_resolve_module_alias_target(alias_target, alias.module, alias.offset, table, depth + 1)
                 return "" if resolved_target == ""
                 return resolved_target if separator == target.len
-                suffix: sview = string_view_slice(target, separator + 2.usize(), target.len.i64())
-                return binding_import_module_owner(suffix, resolved_target, table)
+                suffix: sview @source = string_view_slice(target, separator + 2.usize(), target.len.i64())
+                rebind joined_target: sview @source, table = binding_module_path_join(resolved_target, suffix, table)
+                return joined_target
+
+        # Resolve a qualified nominal through one stage of name lookup. Stage0 checks
+        # enclosing namespaces first, then a visible alias, then the raw root spelling.
+        # Keeping those stages separate matters when a root alias and a nearer concrete
+        # module share a name.
+        def binding_nominal_qualified_candidate(name: sview, qualifier_parts: darray[sview]&, scope: sview, table: SymbolTable&, include_constants: bool, match_kind: u32, alias_owner: sview, out_ambiguous: mutable bool&) -> u32:
+            can Abort.Panic:
+                best: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                best_rank: mutable usize = 0
+                out_ambiguous <- false
+                row: mutable u32 = symbol_chain_head(table, name)
+                while row != SYMBOL_INDEX_ROW_NONE |row, best, best_rank, out_ambiguous|:
+                    symbol: Symbol = table.symbols[row.usize()]
+                    nominal: bool = symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum or symbol.kind == SymbolKind.Alias or (include_constants and symbol.kind == SymbolKind.Const)
+                    visible: mutable bool = false
+                    if match_kind == 0:
+                        visible <- module_symbol_matches_relative(symbol.module_owner, scope, qualifier_parts, qualifier_parts.count)
+                    elif match_kind == 1:
+                        visible <- symbol.module_owner == alias_owner if qualifier_parts.count == 1
+                        visible <- module_symbol_matches(symbol.module_owner, alias_owner, qualifier_parts, 1, qualifier_parts.count) if qualifier_parts.count > 1
+                    else:
+                        visible <- module_symbol_matches(symbol.module_owner, "", qualifier_parts, 0, qualifier_parts.count)
+                    if nominal and symbol.name == name and visible:
+                        rank: usize = symbol.module_owner.len + 1
+                        if best == SYMBOL_INDEX_ROW_NONE or rank > best_rank:
+                            best <- row
+                            best_rank <- rank
+                            out_ambiguous <- false
+                        elif rank == best_rank:
+                            out_ambiguous <- true
+                    row <- table.symbol_name_next[row.usize()]
+                return SYMBOL_INDEX_ROW_NONE if out_ambiguous == true else best
 
         # Resolve a nominal head, never guess through equal-rank declarations.
         # Generic-alias applications still need substitution metadata.
@@ -158,13 +242,14 @@ extend Semantic:
                         qualified <- true
                     _:
                         return SYMBOL_INDEX_ROW_NONE
-                alias_owner: mutable sview = ""
-                aliased: mutable bool = false
                 if qualified:
+                    lexical_ambiguous: mutable bool = false
+                    lexical_row: u32 = binding_nominal_qualified_candidate(name, qualifier_parts, scope, table, include_constants, 0, "", lexical_ambiguous)
+                    return SYMBOL_INDEX_ROW_NONE if lexical_ambiguous
+                    return lexical_row if lexical_row != SYMBOL_INDEX_ROW_NONE
                     alias_row: u32 = binding_module_alias_row(qualifier_parts[0], scope, table)
                     return SYMBOL_INDEX_ROW_NONE if alias_row == BINDING_MODULE_ALIAS_ROW_AMBIGUOUS
                     if alias_row != SYMBOL_INDEX_ROW_NONE:
-                        aliased <- true
                         alias: Ast::EnumAnnotation = table.binding_import_annotations[alias_row.usize()]
                         target: mutable sview = ""
                         target_count: mutable usize = 0
@@ -173,8 +258,17 @@ extend Semantic:
                                 target <- annotation.owner
                                 target_count <- target_count + 1
                         return SYMBOL_INDEX_ROW_NONE if target_count != 1 or target == ""
-                        alias_owner <- binding_resolve_module_alias_target(target, alias.module, table)
+                        # Metadata already stores the declaration-scope canonical target,
+                        # including when that target has no matching module declaration.
+                        alias_owner: sview = target
                         return SYMBOL_INDEX_ROW_NONE if alias_owner == ""
+                        alias_ambiguous: mutable bool = false
+                        alias_candidate: u32 = binding_nominal_qualified_candidate(name, qualifier_parts, scope, table, include_constants, 1, alias_owner, alias_ambiguous)
+                        return SYMBOL_INDEX_ROW_NONE if alias_ambiguous
+                        return alias_candidate if alias_candidate != SYMBOL_INDEX_ROW_NONE
+                    raw_ambiguous: mutable bool = false
+                    raw_candidate: u32 = binding_nominal_qualified_candidate(name, qualifier_parts, scope, table, include_constants, 2, "", raw_ambiguous)
+                    return SYMBOL_INDEX_ROW_NONE if raw_ambiguous else raw_candidate
                 row: mutable u32 = symbol_chain_head(table, name)
                 best: mutable u32 = SYMBOL_INDEX_ROW_NONE
                 best_rank: mutable usize = 0
@@ -182,10 +276,7 @@ extend Semantic:
                 while row != SYMBOL_INDEX_ROW_NONE |row, best, best_rank, ambiguous|:
                     symbol: Symbol = table.symbols[row.usize()]
                     nominal: bool = symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum or symbol.kind == SymbolKind.Alias or (include_constants and symbol.kind == SymbolKind.Const)
-                    visible: mutable bool = (module_symbol_matches(symbol.module_owner, "", qualifier_parts, 0, qualifier_parts.count) or module_symbol_matches_relative(symbol.module_owner, scope, qualifier_parts, qualifier_parts.count)) if qualified else named_type_owner_is_lexical(symbol.module_owner, scope)
-                    if aliased:
-                        visible <- symbol.module_owner == alias_owner if qualifier_parts.count == 1
-                        visible <- module_symbol_matches(symbol.module_owner, alias_owner, qualifier_parts, 1, qualifier_parts.count) if qualifier_parts.count > 1
+                    visible: bool = named_type_owner_is_lexical(symbol.module_owner, scope)
                     if nominal and symbol.name == name and visible:
                         rank: usize = symbol.module_owner.len + 1
                         if best == SYMBOL_INDEX_ROW_NONE or rank > best_rank:
