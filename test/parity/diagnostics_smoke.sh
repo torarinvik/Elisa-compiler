@@ -638,6 +638,12 @@ while [[ "$index" -lt "$num_diagnostics" ]]; do
     index=$((index + 1))
 done
 
+# The direct warning plus match guards/bodies and the catch expression, guards, and body
+# prove each structured arm walker visits its conditions and statements.
+require_diagnostic_count logical_constant_operand_arm_traversal \
+    "$FIXTURES/logical_constant_operand.pos.elisa" \
+    'logical operator with constant boolean operand' 8
+
 echo "-- guard_condition_nonbool --"
 run_case guard_condition_nonbool pos "$FIXTURES/guard_condition_nonbool.pos.elisa" "logical operator requires bool operands"
 run_case guard_condition_nonbool neg "$FIXTURES/guard_condition_nonbool.neg.elisa" "logical operator requires bool operands"

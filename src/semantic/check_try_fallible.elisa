@@ -368,10 +368,10 @@ extend Semantic:
                         return false if not enum_has_variant(table, destination, table.enum_variant_name[variant_index])
                 return saw_source_tag
 
-        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, enclosing: (line: u32, offset: u32), enclosing_module: sview, callee_qualifier: sview, annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_index: mutable TryErrorSetIndex&, propagation_site_count: usize, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable) -> void:
+        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, enclosing: (line: u32, offset: u32), enclosing_module: sview, callee_qualifier: sview, annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_index: mutable TryErrorSetIndex&, propagation_site_count: usize, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable, first_class_error_family: sview = "") -> void:
             can Memory.Allocate, Abort.Panic, Global.Read:
                 scope_known: bool = enclosing.line != 0 or enclosing.offset != 0 or enclosing_module != "" or callee_qualifier != ""
-                source: sview @source = callable_error_indexed_family(error_index, annotations, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known)
+                source: sview @source = first_class_error_family if first_class_error_family != "" else callable_error_indexed_family(error_index, annotations, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known)
                 return if source == ""
                 function_line: u32 = enclosing.line
                 destinations: mutable darray[sview @source] = []
@@ -395,7 +395,187 @@ extend Semantic:
                 first, second <- second, first if swap
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryPropagationMismatch, name: source, pos: annotation.pos, line: annotation.line, expected: first, actual: "", detail: second})
 
-        def check_try_fallible_rows(annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, try_qualifiers: dict[u64, sview]&, error_index: CallableErrorAnnotationIndex&, try_site_count: usize, table: lmut SymbolTable) -> void:
+        # The compact AST erases the `try` head and records `__noncall` when its operand
+        # is not a Call. Recover the narrow `try parameter` form from the function body and
+        # the parser's `__param_error_union` metadata. A parameter marker is line-keyed, so
+        # accept it only when every parameter on that source line is marked; otherwise the
+        # parser metadata cannot unambiguously associate the errorset with a parameter.
+        def try_noncall_record_expression(expression: Ast::Expr, annotation: Ast::EnumAnnotation, nearest_offset: mutable u32&, nearest_name: mutable sview& @source) -> void:
+            can Abort.Panic:
+                position: Ast::Pos = Ast::expr_pos(expression)
+                return if position.line != annotation.line or position.offset <= annotation.offset or position.offset >= nearest_offset
+                nearest_offset <- position.offset
+                nearest_name <- ""
+                match expression:
+                    Expr.Ident(name, _):
+                        nearest_name <- name
+                    Expr.Paren(inner, _):
+                        match inner:
+                            Expr.Ident(paren_name, _):
+                                nearest_name <- paren_name
+                            _:
+                                pass
+                    _:
+                        pass
+
+        def try_noncall_record_statements(statements: darray[Ast::Stmt], annotation: Ast::EnumAnnotation, nearest_offset: mutable u32&, nearest_name: mutable sview& @source) -> void:
+            can Abort.Panic:
+                for statement in statements |annotation, nearest_offset, nearest_name|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            try_noncall_record_expression(expression, annotation, nearest_offset, nearest_name)
+                        Stmt.Assign(_, _, value, _):
+                            try_noncall_record_expression(value, annotation, nearest_offset, nearest_name)
+                        Stmt.VarDecl(_, _, value, _):
+                            try_noncall_record_expression(value, annotation, nearest_offset, nearest_name)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                try_noncall_record_expression(returned, annotation, nearest_offset, nearest_name)
+                        Stmt.If(condition, then_body, else_body, _):
+                            try_noncall_record_expression(condition, annotation, nearest_offset, nearest_name)
+                            try_noncall_record_statements(then_body, annotation, nearest_offset, nearest_name)
+                            try_noncall_record_statements(else_body, annotation, nearest_offset, nearest_name)
+                        Stmt.While(condition, body, _):
+                            try_noncall_record_expression(condition, annotation, nearest_offset, nearest_name)
+                            try_noncall_record_statements(body, annotation, nearest_offset, nearest_name)
+                        Stmt.For(_, _, iterable, body, _):
+                            try_noncall_record_expression(iterable, annotation, nearest_offset, nearest_name)
+                            try_noncall_record_statements(body, annotation, nearest_offset, nearest_name)
+                        Stmt.Block(_, _, _, body, _):
+                            try_noncall_record_statements(body, annotation, nearest_offset, nearest_name)
+                        Stmt.Match(scrutinee, arms, _):
+                            try_noncall_record_expression(scrutinee, annotation, nearest_offset, nearest_name)
+                            for arm in arms |annotation, nearest_offset, nearest_name|:
+                                try_noncall_record_expression(arm.guard, annotation, nearest_offset, nearest_name)
+                                try_noncall_record_statements(arm.body, annotation, nearest_offset, nearest_name)
+                        Stmt.Contract(_, expression, _):
+                            try_noncall_record_expression(expression, annotation, nearest_offset, nearest_name)
+                        _:
+                            pass
+
+        def try_parameter_error_family(params: darray[Ast::ParamDecl], parameter_name: sview, annotations: darray[Ast::EnumAnnotation]&) -> sview:
+            can Abort.Panic:
+                parameter_line: mutable u32 = 0
+                for parameter in params |parameter_line, parameter_name|:
+                    parameter_line <- parameter.name_pos.line if parameter.name == parameter_name
+                return "" if parameter_line == 0
+                params_on_line: mutable usize = 0
+                for parameter in params |params_on_line, parameter_line|:
+                    params_on_line <- params_on_line + 1.usize() if parameter.name_pos.line == parameter_line
+                family: mutable sview = ""
+                family_count: mutable usize = 0
+                conflicting_families: mutable bool = false
+                for annotation in annotations |family, family_count, conflicting_families, parameter_line|:
+                    if annotation.owner == "__param_error_union" and annotation.line == parameter_line:
+                        family <- annotation.name if family_count == 0
+                        conflicting_families <- true if annotation.name != family
+                        family_count <- family_count + 1.usize()
+                return "" if family_count == 0 or family_count != params_on_line or conflicting_families
+                return family
+
+        def try_noncall_pattern_shadows_name(pattern: Ast::Pattern, candidate: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                binders: mutable darray[sview @source] = []
+                gather_arm_pattern(pattern, binders)
+                return any binder in binders where binder == candidate
+
+        def try_noncall_target_binds_name(target: Ast::Expr, candidate: sview) -> bool:
+            can Abort.Panic:
+                match target:
+                    Expr.Ident(name, _):
+                        return name == candidate
+                    Expr.Paren(inner, _):
+                        return try_noncall_target_binds_name(inner, candidate)
+                    Expr.Tuple(elements, _):
+                        for element in elements:
+                            return true if try_noncall_target_binds_name(element, candidate)
+                    _:
+                        pass
+                return false
+
+        def try_noncall_scan_expression(expression: Ast::Expr, annotation: Ast::EnumAnnotation, site_offset: u32, current_shadow: bool, found: mutable bool&, shadowed_at_site: mutable bool&) -> void:
+            can Abort.Panic:
+                return if found
+                position: Ast::Pos = Ast::expr_pos(expression)
+                if position.line == annotation.line and position.offset == site_offset:
+                    found <- true
+                    shadowed_at_site <- current_shadow
+
+        # Scan statements in order and pass only bindings active along the path containing
+        # the operand. Later declarations and sibling blocks do not shadow an earlier use.
+        def try_noncall_scan_statements(statements: darray[Ast::Stmt], candidate: sview, annotation: Ast::EnumAnnotation, site_offset: u32, inherited_shadow: bool, found: mutable bool&, shadowed_at_site: mutable bool&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                local_shadow: mutable bool = inherited_shadow
+                for statement in statements |local_shadow, found, shadowed_at_site|:
+                    return if found
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            try_noncall_scan_expression(expression, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                        Stmt.VarDecl(name, _, value, _):
+                            try_noncall_scan_expression(value, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            local_shadow <- true if name == candidate
+                        Stmt.Assign(target, operator, value, _):
+                            try_noncall_scan_expression(value, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            local_shadow <- true if operator == TokenKind.Assign and try_noncall_target_binds_name(target, candidate)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                try_noncall_scan_expression(returned, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                        Stmt.If(condition, then_body, else_body, _):
+                            try_noncall_scan_expression(condition, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            try_noncall_scan_statements(then_body, candidate, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            try_noncall_scan_statements(else_body, candidate, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                        Stmt.While(condition, body, _):
+                            try_noncall_scan_expression(condition, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            try_noncall_scan_statements(body, candidate, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                        Stmt.For(_, variables, iterable, body, _):
+                            try_noncall_scan_expression(iterable, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            loop_shadow: bool = local_shadow or any variable in variables where variable == candidate
+                            try_noncall_scan_statements(body, candidate, annotation, site_offset, loop_shadow, found, shadowed_at_site)
+                        Stmt.Block(_, _, binding, body, _):
+                            block_shadow: bool = local_shadow or binding == candidate
+                            try_noncall_scan_statements(body, candidate, annotation, site_offset, block_shadow, found, shadowed_at_site)
+                        Stmt.Match(scrutinee, arms, _):
+                            try_noncall_scan_expression(scrutinee, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                            for arm in arms |local_shadow, candidate, annotation, site_offset, found, shadowed_at_site|:
+                                return if found
+                                arm_shadow: bool = local_shadow or try_noncall_pattern_shadows_name(arm.pattern, candidate)
+                                try_noncall_scan_expression(arm.guard, annotation, site_offset, arm_shadow, found, shadowed_at_site)
+                                try_noncall_scan_statements(arm.body, candidate, annotation, site_offset, arm_shadow, found, shadowed_at_site)
+                        Stmt.Contract(_, expression, _):
+                            try_noncall_scan_expression(expression, annotation, site_offset, local_shadow, found, shadowed_at_site)
+                        _:
+                            pass
+
+        def try_noncall_parameter_shadowed(body: darray[Ast::Stmt], candidate: sview, annotation: Ast::EnumAnnotation, site_offset: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable bool = false
+                shadowed_at_site: mutable bool = false
+                try_noncall_scan_statements(body, candidate, annotation, site_offset, false, found, shadowed_at_site)
+                return found and shadowed_at_site
+
+        def try_noncall_parameter_error_family(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, annotation: Ast::EnumAnnotation, enclosing: (line: u32, offset: u32)) -> sview:
+            can Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(_, params, _, body, _, _, function_pos):
+                            if function_pos.line == enclosing.line and function_pos.offset == enclosing.offset:
+                                nearest_offset: mutable u32 = 4294967295
+                                nearest_name: mutable sview @source = ""
+                                try_noncall_record_statements(body, annotation, nearest_offset, nearest_name)
+                                if nearest_name != "":
+                                    return "" if try_noncall_parameter_shadowed(body, nearest_name, annotation, nearest_offset)
+                                    return try_parameter_error_family(params, nearest_name, annotations)
+                        Decl.Module(_, module_body, _):
+                            module_family: sview = try_noncall_parameter_error_family(module_body, annotations, annotation, enclosing)
+                            return module_family if module_family != ""
+                        Decl.Scoped(scoped_body, _):
+                            scoped_family: sview = try_noncall_parameter_error_family(scoped_body, annotations, annotation, enclosing)
+                            return scoped_family if scoped_family != ""
+                        _:
+                            pass
+                return ""
+
+        def check_try_fallible_rows(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, try_qualifiers: dict[u64, sview]&, error_index: CallableErrorAnnotationIndex&, try_site_count: usize, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic, Global.Read:
                 function_positions: mutable FallibleFunctionPositionIndex = FallibleFunctionPositionIndex{positions: [], offsets_ordered: true, ready: false}
                 error_set_index: mutable TryErrorSetIndex = TryErrorSetIndex{by_offset_heads: {}, by_offset_tails: {}, zero_offset_line_heads: {}, zero_offset_line_tails: {}, next: [], ready: false}
@@ -415,7 +595,8 @@ extend Semantic:
                     row_module: sview = fallible_fn_module_indexed(module_index, module_annotations, row_enclosing.offset, row_enclosing.line)
                     row_qualifier: sview = try_callee_qualifier(try_qualifiers, annotation.offset)
                     row_scope_known: bool = row_enclosing.line != 0 or row_enclosing.offset != 0 or row_module != "" or row_qualifier != ""
-                    row_is_fallible: bool = callable_error_indexed_returns_error(error_index, annotations, module_index, module_annotations, annotation.owner, row_module, row_qualifier, row_scope_known)
+                    first_class_error_family: sview = try_noncall_parameter_error_family(declarations, annotations, annotation, row_enclosing) if annotation.owner == "__noncall" else ""
+                    row_is_fallible: bool = first_class_error_family != "" or callable_error_indexed_returns_error(error_index, annotations, module_index, module_annotations, annotation.owner, row_module, row_qualifier, row_scope_known)
                     # A callee that is not a declared function (a fn-typed parameter or
                     # local, e.g. `try f(x)` with `f: fn(...) -> T error[R]`) may be
                     # fallible through its TYPE — unknowable here, so stay silent.
@@ -426,7 +607,7 @@ extend Semantic:
                     if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and row_is_fallible:
                         propagation_site_count <- propagation_site_count + 1.usize()
                         can Global{Read,Write}:
-                            table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table)
+                            table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family)
 
         # The bare callee name of `try f(...) else …`, "" for anything else. Deliberately
         # bare-ident only: a qualified callee would need the module-resolution dance above,
@@ -755,5 +936,5 @@ extend Semantic:
                     fallible_try_projection_add(projection, annotation) can Global{Read,Write} if projection_ready
                 fallible_function_module_index_build(module_index, projection.module_annotations) can Global{Read,Write} if try_site_count > 0 or fallback_site_count > 0
                 callable_error_index_build(file.enum_annotations, error_index, true) can Global{Read,Write} if try_site_count > 0
-                table <- check_try_fallible_rows(file.enum_annotations, projection.error_set_annotations, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0
+                table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.error_set_annotations, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0
                 table <- try_fallback_void_decls(file.top_decls, file.enum_annotations, module_index, projection.module_annotations, error_index, fallback_function_positions, table) can Global{Read,Write} if fallback_site_count > 0

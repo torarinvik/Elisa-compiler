@@ -419,7 +419,7 @@ HOLDER_WALK_STATEMENT_EDGES = (
 )
 
 HOLDER_WALK_EXPRESSION_EDGES = (
-    ("Expr.Call(callee, arguments, _, _):", "table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, table)"),
+    ("Expr.Call(callee, arguments, _, _):", "table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)"),
     ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:"),
     ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "argument_owned_views.push(flow.last_value_may_be_owned_view)", 0),
     ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))", 0),
@@ -438,8 +438,8 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Slice(object, low, high, _):", "table <- chv_walk_expression(high, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.IndexN(object, arguments, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.IndexN(object, arguments, _):", "if not index_receiver_is_type_application(object):"),
-    ("if not index_receiver_is_type_application(object):", "for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", 1),
-    ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("if not index_receiver_is_type_application(object):", "for argument in arguments |table|:", 1),
+    ("for argument in arguments |table|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, binary_operator, right, _):", "table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, binary_operator, right, _):", "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
@@ -573,6 +573,33 @@ CALL_RESULT_VIEW_TAINT_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view"),
 )
 
+CALL_RESULT_CALLEE_JOIN_EDGE = (
+    "Expr.Call(callee, arguments, _, _):",
+    "result_may_be_owned_view <- chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == \"as_sview\" or method_name == \"as_cstr\" or method_name == \"view\")) or callee_may_be_owned_view",
+)
+
+CALL_CALLEE_INDEXED_VIEW_EDGES = (
+    ("match callee:", "Expr.Index(head, index, _):"),
+    ("Expr.Index(head, index, _):", "table <- chv_walk_call_callee(head, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)"),
+    ("Expr.Index(head, index, _):", "head_may_be_owned_view: bool = callee_may_be_owned_view or chv_is_owned_view(head, flow, 0)"),
+    ("Expr.Index(head, index, _):", "index_may_be_owned_view: mutable bool = false"),
+    ("Expr.Index(head, index, _):", "if not index_receiver_is_type_application(head):"),
+    ("if not index_receiver_is_type_application(head):", "table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("if not index_receiver_is_type_application(head):", "index_may_be_owned_view <- flow.last_value_may_be_owned_view"),
+    ("if not index_receiver_is_type_application(head):", "indexed_arguments: darray[Ast::Expr] = [head, index]"),
+    ("if not index_receiver_is_type_application(head):", "indexed_owned_views: darray[bool] = [head_may_be_owned_view, index_may_be_owned_view]"),
+    ("if not index_receiver_is_type_application(head):", "indexed_alias_refs: darray[bool] = [chv_expression_may_alias_ref(head, ref_params, flow, 0), chv_expression_may_alias_ref(index, ref_params, flow, 0)]"),
+    ("if not index_receiver_is_type_application(head):", "table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Index(head, index, _):", "callee_may_be_owned_view <- head_may_be_owned_view or index_may_be_owned_view"),
+    ("match callee:", "Expr.IndexN(head, arguments, _):"),
+    ("Expr.IndexN(head, arguments, _):", "table <- chv_walk_call_callee(head, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)"),
+    ("Expr.IndexN(head, arguments, _):", "head_may_be_owned_view: bool = callee_may_be_owned_view or chv_is_owned_view(head, flow, 0)"),
+    ("Expr.IndexN(head, arguments, _):", "# In call position IndexN is explicit generic application. Its"),
+    ("Expr.IndexN(head, arguments, _):", "# bracket arguments are type/shape inputs and never runtime values."),
+    ("Expr.IndexN(head, arguments, _):", "callee_may_be_owned_view <- head_may_be_owned_view"),
+    ("Expr.IndexN(head, arguments, _):", "flow.last_value_may_be_owned_view <- callee_may_be_owned_view"),
+)
+
 STATIC_EFFECT_RESULT_VIEW_TAINT_EDGES = (
     ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)"),
     ("for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:", "runtime_may_be_owned_view <- runtime_may_be_owned_view or flow.last_value_may_be_owned_view"),
@@ -615,53 +642,85 @@ REF_ALIAS_HELPER_EDGES = (
     ("_:", "return true if any reference_parameter in ref_params where reference_parameter == root"),
     ("_:", "return index < flow.names.count and flow.may_alias_reference[index]"),
     ("Expr.Call(_, _, _, _):", "return ref_params.count > 0"),
-    ("Expr.Binary(left, _, right, _):", "return chv_expression_may_alias_ref(left, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(right, ref_params, flow, depth + 1)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "return chv_expression_may_alias_ref(left, ref_params, flow, depth + 1) or chv_expression_may_alias_ref(right, ref_params, flow, depth + 1)"),
     ("Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _) | Expr.Block(_, _, _, _) | Expr.GetElse(_, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):", "return ref_params.count > 0"),
+    ("Expr.Binary(left, binary_operator, right, _):", "return false if chv_binary_operator_returns_bool(binary_operator, right)"),
+    ("Expr.Unary(operator, operand, _):", "return false if operator == TokenKind.Not"),
 )
 
 VIEW_ALIAS_BINARY_EDGES = (
-    ("Expr.Binary(left, _, right, _):", "return chv_is_owned_view(left, flow, depth + 1) or chv_is_owned_view(right, flow, depth + 1)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "return chv_is_owned_view(left, flow, depth + 1) or chv_is_owned_view(right, flow, depth + 1)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "return false if chv_binary_operator_returns_bool(binary_operator, right)"),
 )
 
 INDEX_OPERATOR_EDGES = (
     ("Expr.Index(object, index, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Index(object, index, _):", "if not index_receiver_is_type_application(object):"),
     ("if not index_receiver_is_type_application(object):", "table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 0),
-    ("if not index_receiver_is_type_application(object):", "table <- chv_check_unknown_call([object, index], [object_may_be_owned_view, index_may_be_owned_view], [object_may_alias_ref, index_may_alias_ref], ref_params, binders, owned, view_names, view_values, flow, table)", 0),
+    ("if not index_receiver_is_type_application(object):", "indexed_arguments: darray[Ast::Expr] = [object, index]", 0),
+    ("if not index_receiver_is_type_application(object):", "indexed_owned_views: darray[bool] = [object_may_be_owned_view, index_may_be_owned_view]", 0),
+    ("if not index_receiver_is_type_application(object):", "indexed_alias_refs: darray[bool] = [object_may_alias_ref, index_may_alias_ref]", 0),
+    ("if not index_receiver_is_type_application(object):", "table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)", 0),
     ("Expr.IndexN(object, arguments, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.IndexN(object, arguments, _):", "indexed_arguments: mutable darray[Ast::Expr] = [object]"),
     ("Expr.IndexN(object, arguments, _):", "if not index_receiver_is_type_application(object):"),
-    ("if not index_receiver_is_type_application(object):", "for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", 1),
-    ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "indexed_arguments.push(argument)"),
-    ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "indexed_owned_views.push(flow.last_value_may_be_owned_view)"),
-    ("for argument in arguments |table, indexed_arguments, indexed_owned_views, indexed_alias_refs|:", "indexed_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, 0))"),
-    ("if not index_receiver_is_type_application(object):", "table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)", 1),
+    ("if not index_receiver_is_type_application(object):", "for argument in arguments |table|:", 1),
+    ("for argument in arguments |table|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
 )
 
 INDEX_VIEW_RESULT_EDGES = (
-    ("Expr.Index(object, _, _):", "return chv_is_owned_view(object, flow, depth + 1)"),
-    ("Expr.IndexN(object, _, _):", "return chv_is_owned_view(object, flow, depth + 1)"),
+    ("Expr.Index(object, index, _):", "index_may_be_owned_view: mutable bool = false"),
+    ("Expr.Index(object, index, _):", "if not index_receiver_is_type_application(object):"),
+    ("if not index_receiver_is_type_application(object):", "index_may_be_owned_view <- chv_is_owned_view(index, flow, depth + 1)"),
+    ("Expr.Index(object, index, _):", "return chv_is_owned_view(object, flow, depth + 1) or index_may_be_owned_view"),
+)
+
+INDEXN_VIEW_RESULT_EDGES = (
+    ("Expr.IndexN(object, arguments, _):", "# IndexN represents multi-index selection or generic application. Unlike"),
+    ("Expr.IndexN(object, arguments, _):", "# single-key Index, it does not lower through the __index__ protocol, so"),
+    ("Expr.IndexN(object, arguments, _):", "# selector/type arguments cannot become the returned view's storage."),
+    ("Expr.IndexN(object, arguments, _):", "return chv_is_owned_view(object, flow, depth + 1)"),
+)
+
+INDEXN_VIEW_WALK_EDGES = (
+    ("Expr.IndexN(object, arguments, _):", "flow.last_value_may_be_owned_view <- object_may_be_owned_view or chv_is_owned_view(expression, flow, 0)"),
 )
 
 UNARY_NEGATION_EDGES = (
     ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Unary(operator, operand, _):", "operand_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("Expr.Unary(operator, operand, _):", "flow.last_value_may_be_owned_view <- operand_may_be_owned_view"),
+    ("Expr.Unary(operator, operand, _):", "unary_result_may_be_owned_view: bool = operator != TokenKind.Not"),
+    ("Expr.Unary(operator, operand, _):", "flow.last_value_may_be_owned_view <- operand_may_be_owned_view and unary_result_may_be_owned_view"),
 )
 
 BINARY_VIEW_WALK_EDGES = (
     ("Expr.Binary(left, binary_operator, right, _):", "left_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
     ("Expr.Binary(left, binary_operator, right, _):", "right_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("Expr.Binary(left, binary_operator, right, _):", "flow.last_value_may_be_owned_view <- left_may_be_owned_view or right_may_be_owned_view"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_result_is_bool: bool = chv_binary_operator_returns_bool(binary_operator, right)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "flow.last_value_may_be_owned_view <- (left_may_be_owned_view or right_may_be_owned_view) if not binary_result_is_bool else false"),
+)
+
+BINARY_BOOLEAN_RESULT_EDGES = (
+    ("Expr.Binary(left, binary_operator, right, _):", BINARY_VIEW_WALK_EDGES[2][1]),
+    ("can Memory.Allocate, Abort.Panic:", "boolean_operator: bool = operator == TokenKind.EqEq or operator == TokenKind.BangEq or operator == TokenKind.Lt or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.GtEq or operator == TokenKind.In or operator == TokenKind.Is or operator == TokenKind.And or operator == TokenKind.Or"),
+    ("can Memory.Allocate, Abort.Panic:", "return boolean_operator or (operator == TokenKind.As and not chv_is_reinterpret_target_marker(right))"),
+    ("Expr.Binary(left, binary_operator, right, _):", BINARY_VIEW_WALK_EDGES[3][1]),
+)
+
+REINTERPRET_TARGET_MARKER_EDGES = (
+    ("match target:", "Expr.Ident(name, _):"),
+    ("match target:", "_:"),
+    ("Expr.Ident(name, _):", "return name == \"&\" or name == \"!\""),
+    ("_:", "return false"),
 )
 
 UNARY_VIEW_RESULT_EDGES = (
-    ("Expr.Unary(_, operand, _):", "return chv_is_owned_view(operand, flow, depth + 1)"),
+    ("Expr.Unary(operator, operand, _):", "return chv_is_owned_view(operand, flow, depth + 1)"),
+    ("Expr.Unary(operator, operand, _):", "return false if operator == TokenKind.Not"),
 )
 
 REF_ALIAS_ADDRESS_EDGES = (
-    ("Expr.Unary(_, operand, _):", "return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)"),
+    ("Expr.Unary(operator, operand, _):", "return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)"),
+    ("Expr.Unary(operator, operand, _):", "return false if operator == TokenKind.Not"),
 )
 
 SUMMARY_CALL_EDGES = (
@@ -798,6 +857,31 @@ def validate_exact_boolean_theorem(text: str, name: str, routes: dict[str, tuple
         for edge in route_edges:
             parent, child, occurrence = edge_parts(edge)
             if (parent, child, occurrence) not in edge_set or not direct_child(source, parent, child, occurrence):
+                raise SystemExit(f"{name} route {parameter} is no longer source-bound")
+
+
+def validate_exact_boolean_theorem_source_routes(
+        text: str, name: str, parameters_expected: tuple[str, ...],
+        expression: str, sources: dict[str, str],
+        routes: dict[str, tuple[tuple[str, tuple], ...]]) -> None:
+    """Bind a theorem's input routes across separate source functions in order."""
+    match = re.search(rf"(?ms)^def {re.escape(name)}\((.*?)\)\s*-> bool:\n(.*?)(?=^def |\Z)", text)
+    if not match:
+        raise SystemExit(f"missing source-bound theorem {name}")
+    parameters = tuple(re.findall(r"([A-Za-z_][A-Za-z0-9_]*): bool", match.group(1)))
+    if parameters != parameters_expected or tuple(routes) != parameters:
+        raise SystemExit(f"{name} proof inputs no longer match source routes")
+    expected = compact_code(f"ensure result == ({expression})\nreturn {expression}")
+    if compact_code(match.group(2)) != expected:
+        raise SystemExit(f"{name} no longer proves its stated Boolean relationship")
+    for parameter, route_steps in routes.items():
+        if not route_steps:
+            raise SystemExit(f"{name} route {parameter} has no source-bound steps")
+        for source_name, edge in route_steps:
+            if source_name not in sources:
+                raise SystemExit(f"{name} route {parameter} names an unknown source section")
+            parent, child, occurrence = edge_parts(edge)
+            if not direct_child(sources[source_name], parent, child, occurrence):
                 raise SystemExit(f"{name} route {parameter} is no longer source-bound")
 
 
@@ -996,33 +1080,47 @@ theorem_routes = {
         "fallback_checked": BINARY_OPERATOR_FALLBACK_EDGES,
     },
     "proof_chv_binary_operator_result_tracks_reference_operands": {
+        "boolean_result": (REF_ALIAS_HELPER_EDGES[5], BINARY_BOOLEAN_RESULT_EDGES[1], BINARY_BOOLEAN_RESULT_EDGES[2]) + REINTERPRET_TARGET_MARKER_EDGES,
         "left_alias": (REF_ALIAS_HELPER_EDGES[3],),
         "right_alias": (REF_ALIAS_HELPER_EDGES[3],),
     },
     "proof_chv_binary_operator_result_tracks_view_operands": {
-        "left_may_be_view": (BINARY_VIEW_WALK_EDGES[0], BINARY_VIEW_WALK_EDGES[2]),
-        "right_may_be_view": (BINARY_VIEW_WALK_EDGES[1], BINARY_VIEW_WALK_EDGES[2]),
+        "boolean_result": BINARY_BOOLEAN_RESULT_EDGES + REINTERPRET_TARGET_MARKER_EDGES,
+        "left_may_be_view": (BINARY_VIEW_WALK_EDGES[0], BINARY_VIEW_WALK_EDGES[3]),
+        "right_may_be_view": (BINARY_VIEW_WALK_EDGES[1], BINARY_VIEW_WALK_EDGES[3]),
+    },
+    "proof_chv_binary_boolean_result_clears_view_taint": {
+        "boolean_result_classified": BINARY_BOOLEAN_RESULT_EDGES[:3] + REINTERPRET_TARGET_MARKER_EDGES,
+        "result_taint_cleared": (BINARY_BOOLEAN_RESULT_EDGES[3],),
     },
     "proof_chv_index_overloads_check_receiver_and_keys": {
-        "receiver_checked": (INDEX_OPERATOR_EDGES[0], INDEX_OPERATOR_EDGES[4]),
-        "key_checked": (INDEX_OPERATOR_EDGES[2], INDEX_OPERATOR_EDGES[8]),
-        "call_checked": (INDEX_OPERATOR_EDGES[3], INDEX_OPERATOR_EDGES[12]),
-        "type_application_skipped": (INDEX_OPERATOR_EDGES[1], INDEX_OPERATOR_EDGES[6], INDEX_OPERATOR_EDGES[7]),
+        "receiver_checked": (INDEX_OPERATOR_EDGES[0], INDEX_OPERATOR_EDGES[7]),
+        "key_checked": (INDEX_OPERATOR_EDGES[2],),
+        "call_checked": INDEX_OPERATOR_EDGES[3:7],
+        "type_application_skipped": (INDEX_OPERATOR_EDGES[1], INDEX_OPERATOR_EDGES[8], INDEX_OPERATOR_EDGES[9]),
     },
     "proof_chv_index_result_tracks_receiver_view": {
-        "receiver_may_be_view": INDEX_VIEW_RESULT_EDGES,
+        "receiver_may_be_view": (INDEX_VIEW_RESULT_EDGES[3],),
+        "index_key_may_be_view": (INDEX_VIEW_RESULT_EDGES[2],),
+        "runtime_index_guarded": (INDEX_VIEW_RESULT_EDGES[1],),
+    },
+    "proof_chv_indexn_result_tracks_receiver_only": {
+        "receiver_may_be_view": INDEXN_VIEW_RESULT_EDGES,
     },
     "proof_chv_address_of_uses_operand_reference_provenance": {
-        "operand_alias_checked": REF_ALIAS_ADDRESS_EDGES,
+        "boolean_not": (REF_ALIAS_ADDRESS_EDGES[1],),
+        "operand_alias_checked": (REF_ALIAS_ADDRESS_EDGES[0],),
     },
     "proof_chv_unary_negation_tracks_reference_operand": {
-        "operand_alias_checked": REF_ALIAS_ADDRESS_EDGES,
+        "boolean_not": (REF_ALIAS_ADDRESS_EDGES[1],),
+        "operand_alias_checked": (REF_ALIAS_ADDRESS_EDGES[0],),
     },
     "proof_chv_unary_negation_visits_operand": {
         "operand_checked": (UNARY_NEGATION_EDGES[0],),
     },
     "proof_chv_unary_negation_tracks_view_operand": {
-        "operand_may_be_view": UNARY_VIEW_RESULT_EDGES,
+        "boolean_not": (UNARY_VIEW_RESULT_EDGES[1],),
+        "operand_may_be_view": (UNARY_VIEW_RESULT_EDGES[0],),
     },
     "proof_chv_projection_fallback_requires_caller_reference": {
         "caller_reference_exists": (REF_ALIAS_HELPER_EDGES[4],),
@@ -1065,6 +1163,8 @@ for path, expected in ((POSITIVE, positive_names), (NEGATIVE, negative_names)):
     if names != expected:
         raise SystemExit(f"{path.name} theorem inventory changed")
 for name, routes in theorem_routes.items():
+    source_route_sources = None
+    source_route_edges = None
     if name == "proof_sts_effect_names_reach_fallback":
         proof_source, proof_edges = effect_text, ()
     elif name == "proof_chv_static_effect_candidates_check_captures_and_arguments":
@@ -1076,15 +1176,60 @@ for name, routes in theorem_routes.items():
         proof_source = holder_walk_expressions
         proof_edges = HOLDER_WALK_EXPRESSION_EDGES + BINARY_OPERATOR_FALLBACK_EDGES
     elif name == "proof_chv_binary_operator_result_tracks_reference_operands":
-        proof_source = function_section(holder_text, "chv_expression_may_alias_ref")
-        proof_edges = REF_ALIAS_HELPER_EDGES
+        source_route_sources = {
+            "alias": function_section(holder_text, "chv_expression_may_alias_ref"),
+            "operator": function_section(holder_text, "chv_binary_operator_returns_bool"),
+            "marker": function_section(holder_text, "chv_is_reinterpret_target_marker"),
+        }
+        source_route_edges = {
+            "boolean_result": (("alias", REF_ALIAS_HELPER_EDGES[5]),
+                               ("operator", BINARY_BOOLEAN_RESULT_EDGES[1]),
+                               ("operator", BINARY_BOOLEAN_RESULT_EDGES[2])) +
+                              tuple(("marker", edge) for edge in REINTERPRET_TARGET_MARKER_EDGES),
+            "left_alias": (("alias", REF_ALIAS_HELPER_EDGES[3]),),
+            "right_alias": (("alias", REF_ALIAS_HELPER_EDGES[3]),),
+        }
+        proof_source, proof_edges = "", ()
     elif name == "proof_chv_binary_operator_result_tracks_view_operands":
-        proof_source, proof_edges = holder_walk_expressions, BINARY_VIEW_WALK_EDGES
+        source_route_sources = {
+            "walker": holder_walk_expressions,
+            "operator": function_section(holder_text, "chv_binary_operator_returns_bool"),
+            "marker": function_section(holder_text, "chv_is_reinterpret_target_marker"),
+        }
+        boolean_result_route = (("walker", BINARY_BOOLEAN_RESULT_EDGES[0]),
+                                ("operator", BINARY_BOOLEAN_RESULT_EDGES[1]),
+                                ("operator", BINARY_BOOLEAN_RESULT_EDGES[2])) + tuple(
+                                    ("marker", edge) for edge in REINTERPRET_TARGET_MARKER_EDGES)
+        source_route_edges = {
+            "boolean_result": boolean_result_route,
+            "left_may_be_view": (("walker", BINARY_VIEW_WALK_EDGES[0]),
+                                 ("walker", BINARY_VIEW_WALK_EDGES[3])),
+            "right_may_be_view": (("walker", BINARY_VIEW_WALK_EDGES[1]),
+                                  ("walker", BINARY_VIEW_WALK_EDGES[3])),
+        }
+        proof_source, proof_edges = "", ()
+    elif name == "proof_chv_binary_boolean_result_clears_view_taint":
+        source_route_sources = {
+            "walker": holder_walk_expressions,
+            "operator": function_section(holder_text, "chv_binary_operator_returns_bool"),
+            "marker": function_section(holder_text, "chv_is_reinterpret_target_marker"),
+        }
+        source_route_edges = {
+            "boolean_result_classified": (("walker", BINARY_BOOLEAN_RESULT_EDGES[0]),
+                                          ("operator", BINARY_BOOLEAN_RESULT_EDGES[1]),
+                                          ("operator", BINARY_BOOLEAN_RESULT_EDGES[2])) +
+                                         tuple(("marker", edge) for edge in REINTERPRET_TARGET_MARKER_EDGES),
+            "result_taint_cleared": (("walker", BINARY_BOOLEAN_RESULT_EDGES[3]),),
+        }
+        proof_source, proof_edges = "", ()
     elif name == "proof_chv_index_overloads_check_receiver_and_keys":
         proof_source, proof_edges = holder_walk_expressions, INDEX_OPERATOR_EDGES
     elif name == "proof_chv_index_result_tracks_receiver_view":
         proof_source = function_section(holder_text, "chv_is_owned_view")
         proof_edges = INDEX_VIEW_RESULT_EDGES
+    elif name == "proof_chv_indexn_result_tracks_receiver_only":
+        proof_source = function_section(holder_text, "chv_is_owned_view")
+        proof_edges = INDEXN_VIEW_RESULT_EDGES
     elif name == "proof_chv_view_alias_join_preserves_owned_fact":
         proof_source = function_section(holder_text, "chv_flow_set_merge")
         proof_edges = VIEW_FLOW_MERGE_EDGES
@@ -1110,7 +1255,19 @@ for name, routes in theorem_routes.items():
         proof_source = function_section(holder_text, "chv_is_owned_view")
         proof_edges = CALLABLE_VIEW_RESULT_EDGES
     elif name == "proof_chv_call_result_tracks_argument_view":
-        proof_source, proof_edges = holder_walk_expressions, CALL_RESULT_VIEW_TAINT_EDGES
+        source_route_sources = {
+            "walker": holder_walk_expressions,
+            "callee": function_section(holder_text, "chv_walk_call_callee"),
+        }
+        source_route_edges = {
+            "direct_result_may_be_owned": (("walker", HOLDER_WALK_EXPRESSION_EDGES[0]),) +
+                                          tuple(("callee", edge) for edge in CALL_CALLEE_INDEXED_VIEW_EDGES) +
+                                          (("walker", CALL_RESULT_CALLEE_JOIN_EDGE),
+                                           ("walker", CALL_RESULT_VIEW_TAINT_EDGES[2])),
+            "argument_may_be_owned": (("walker", CALL_RESULT_VIEW_TAINT_EDGES[1]),
+                                      ("walker", CALL_RESULT_VIEW_TAINT_EDGES[2])),
+        }
+        proof_source, proof_edges = "", ()
     elif name == "proof_chv_static_effect_result_tracks_runtime_views":
         proof_source, proof_edges = holder_walk_expressions, STATIC_EFFECT_RESULT_VIEW_TAINT_EDGES
     elif name == "proof_chv_aggregate_field_projection_requires_tainted_root":
@@ -1172,7 +1329,17 @@ for name, routes in theorem_routes.items():
         proof_source, proof_edges = unifier_source, EXPRESSION_UNIFIER_EDGES
     else:
         proof_source, proof_edges = collect_source, EXPRESSION_EDGES
-    if name == "proof_chv_static_effect_candidates_check_captures_and_arguments":
+    if source_route_edges is not None:
+        boolean_expressions = {
+            "proof_chv_binary_operator_result_tracks_reference_operands": "not boolean_result and (left_alias or right_alias)",
+            "proof_chv_binary_operator_result_tracks_view_operands": "not boolean_result and (left_may_be_view or right_may_be_view)",
+            "proof_chv_binary_boolean_result_clears_view_taint": "boolean_result_classified and result_taint_cleared",
+            "proof_chv_call_result_tracks_argument_view": "direct_result_may_be_owned or argument_may_be_owned",
+        }
+        validate_exact_boolean_theorem_source_routes(
+            positive_text, name, tuple(routes), boolean_expressions[name],
+            source_route_sources, source_route_edges)
+    elif name == "proof_chv_static_effect_candidates_check_captures_and_arguments":
         validate_exact_boolean_theorem(positive_text, name, routes, "captures_checked and arguments_checked", proof_source, proof_edges)
     elif name == "proof_chv_comprehension_scope_masks_shadowed_reference":
         validate_exact_boolean_theorem(positive_text, name, routes, "reference_parameter and not binder_shadows_reference", proof_source, proof_edges)
@@ -1208,22 +1375,20 @@ for name, routes in theorem_routes.items():
         validate_exact_boolean_theorem(positive_text, name, routes, "direct_parameter and local_alias and call_result and projection_fallback", proof_source, proof_edges)
     elif name == "proof_chv_binary_operator_checks_both_operands":
         validate_exact_boolean_theorem(positive_text, name, routes, "receiver_checked and operand_checked and fallback_checked", proof_source, proof_edges)
-    elif name == "proof_chv_binary_operator_result_tracks_reference_operands":
-        validate_exact_boolean_theorem(positive_text, name, routes, "left_alias or right_alias", proof_source, proof_edges)
-    elif name == "proof_chv_binary_operator_result_tracks_view_operands":
-        validate_exact_boolean_theorem(positive_text, name, routes, "left_may_be_view or right_may_be_view", proof_source, proof_edges)
     elif name == "proof_chv_index_overloads_check_receiver_and_keys":
         validate_exact_boolean_theorem(positive_text, name, routes, "receiver_checked and key_checked and call_checked and type_application_skipped", proof_source, proof_edges)
     elif name == "proof_chv_index_result_tracks_receiver_view":
+        validate_exact_boolean_theorem(positive_text, name, routes, "receiver_may_be_view or (runtime_index_guarded and index_key_may_be_view)", proof_source, proof_edges)
+    elif name == "proof_chv_indexn_result_tracks_receiver_only":
         validate_exact_boolean_theorem(positive_text, name, routes, "receiver_may_be_view", proof_source, proof_edges)
     elif name == "proof_chv_address_of_uses_operand_reference_provenance":
-        validate_exact_boolean_theorem(positive_text, name, routes, "operand_alias_checked", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "not boolean_not and operand_alias_checked", proof_source, proof_edges)
     elif name == "proof_chv_unary_negation_tracks_reference_operand":
-        validate_exact_boolean_theorem(positive_text, name, routes, "operand_alias_checked", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "not boolean_not and operand_alias_checked", proof_source, proof_edges)
     elif name == "proof_chv_unary_negation_visits_operand":
         validate_exact_boolean_theorem(positive_text, name, routes, "operand_checked", proof_source, proof_edges)
     elif name == "proof_chv_unary_negation_tracks_view_operand":
-        validate_exact_boolean_theorem(positive_text, name, routes, "operand_may_be_view", proof_source, proof_edges)
+        validate_exact_boolean_theorem(positive_text, name, routes, "not boolean_not and operand_may_be_view", proof_source, proof_edges)
     elif name == "proof_chv_projection_fallback_requires_caller_reference":
         validate_exact_boolean_theorem(positive_text, name, routes, "caller_reference_exists", proof_source, proof_edges)
     elif name == "proof_chv_summary_calls_check_reference_aliases":
@@ -1273,6 +1438,7 @@ validate_edge_set(effect_call_source, NAMED_ARGUMENT_STATIC_EFFECT_EDGES, "named
 validate_edge_set(unifier_source, NAMED_ARGUMENT_UNIFIER_EDGES, "named-argument store-through fallback")
 reference_alias_source = function_section(holder_text, "chv_expression_may_alias_ref")
 validate_edge_set(reference_alias_source, REF_ALIAS_HELPER_EDGES, "reference-alias expression classification")
+validate_edge_set(function_section(holder_text, "chv_is_owned_view"), VIEW_ALIAS_BINARY_EDGES, "holder-view binary result classification")
 validate_edge_set(function_section(holder_text, "chv_flow_set_merge"), REF_ALIAS_FLOW_MERGE_EDGES, "reference-alias branch join")
 validate_edge_set(function_section(holder_text, "chv_check_call_target"), SUMMARY_CALL_EDGES, "summary-call reference target check")
 scalar_reference_fallback = match_arm_body(reference_alias_source, "match argument:", "_:")
@@ -1288,9 +1454,9 @@ if "inner(id_holder(out), owned_view)" not in positive_text or "local_holder.slo
     raise SystemExit("reference alias proof must document call-result and projection cases")
 if "&local_holder" not in positive_text:
     raise SystemExit("reference alias proof must document the local address-of control")
-unary_alias_arm = match_arm_body(reference_alias_source, "match argument:", "Expr.Unary(_, operand, _):")
-if unary_alias_arm is None or compact_code(unary_alias_arm) != compact_code("return chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)"):
-    raise SystemExit("unary operands must retain their own reference provenance")
+unary_alias_arm = match_arm_body(reference_alias_source, "match argument:", "Expr.Unary(operator, operand, _):")
+if unary_alias_arm is None or compact_code(unary_alias_arm) != compact_code("return false if operator == TokenKind.Not\nreturn chv_expression_may_alias_ref(operand, ref_params, flow, depth + 1)"):
+    raise SystemExit("logical Not must clear reference provenance while other unary operators retain it")
 named_argument_detector = function_section(holder_text, "chv_call_has_named_arguments")
 if compact_code(named_argument_detector) != compact_code("can Abort.Panic:\n    return any argument_name in argument_names where argument_name != \"\""):
     raise SystemExit("holder-view named-argument detection must recognize every nonempty label")
@@ -1305,7 +1471,37 @@ validate_edge_set(function_section(holder_text, "chv_check_unknown_call"), UNKNO
 validate_edge_set(holder_walk_expressions, INDEX_OPERATOR_EDGES, "holder-view overloaded index fallback")
 validate_edge_set(holder_walk_expressions, UNARY_NEGATION_EDGES, "holder-view unary negation fallback")
 validate_edge_set(holder_walk_expressions, BINARY_VIEW_WALK_EDGES, "holder-view binary result provenance")
+validate_edge_set(holder_walk_expressions, (BINARY_BOOLEAN_RESULT_EDGES[0], BINARY_BOOLEAN_RESULT_EDGES[3]), "holder-view boolean-result taint flow")
+validate_edge_set(function_section(holder_text, "chv_binary_operator_returns_bool"), BINARY_BOOLEAN_RESULT_EDGES[1:3], "holder-view boolean operator classification")
+validate_edge_set(function_section(holder_text, "chv_is_reinterpret_target_marker"), REINTERPRET_TARGET_MARKER_EDGES, "reinterpret target marker classification")
 validate_edge_set(function_section(holder_text, "chv_is_owned_view"), INDEX_VIEW_RESULT_EDGES, "holder-view index result provenance")
+owned_view_source = function_section(holder_text, "chv_is_owned_view")
+validate_edge_set(owned_view_source, INDEXN_VIEW_RESULT_EDGES, "holder-view multi-index result provenance")
+indexn_view_result_arm = match_arm_body(owned_view_source, "match argument:", "Expr.IndexN(object, arguments, _):")
+expected_indexn_view_result_arm = compact_code("""# IndexN represents multi-index selection or generic application. Unlike
+# single-key Index, it does not lower through the __index__ protocol, so
+# selector/type arguments cannot become the returned view's storage.
+return chv_is_owned_view(object, flow, depth + 1)""")
+if indexn_view_result_arm is None or compact_code(indexn_view_result_arm) != expected_indexn_view_result_arm:
+    raise SystemExit("IndexN result provenance must exclude selector and type argument taint")
+validate_edge_set(holder_walk_expressions, INDEXN_VIEW_WALK_EDGES, "holder-view multi-index walk result provenance")
+indexn_walk_arm = match_arm_body(holder_walk_expressions, "match expression:", "Expr.IndexN(object, arguments, _):")
+expected_indexn_walk_arm = compact_code("""table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+object_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+if not index_receiver_is_type_application(object):
+    for argument in arguments |table|:
+        table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+flow.last_value_may_be_owned_view <- object_may_be_owned_view or chv_is_owned_view(expression, flow, 0)""")
+if indexn_walk_arm is None or compact_code(indexn_walk_arm) != expected_indexn_walk_arm:
+    raise SystemExit("IndexN selectors must be visited without unknown-call dispatch or selector result taint")
+call_callee_source = function_section(holder_text, "chv_walk_call_callee")
+indexn_call_callee_arm = match_arm_body(call_callee_source, "match callee:", "Expr.IndexN(head, arguments, _):")
+expected_indexn_call_callee_arm = compact_code("""table <- chv_walk_call_callee(head, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)
+head_may_be_owned_view: bool = callee_may_be_owned_view or chv_is_owned_view(head, flow, 0)
+callee_may_be_owned_view <- head_may_be_owned_view
+flow.last_value_may_be_owned_view <- callee_may_be_owned_view""")
+if indexn_call_callee_arm is None or compact_code(indexn_call_callee_arm) != expected_indexn_call_callee_arm:
+    raise SystemExit("IndexN call-callee type arguments must not be walked or treated as runtime result provenance")
 validate_edge_set(function_section(holder_text, "chv_is_owned_view"), UNARY_VIEW_RESULT_EDGES, "holder-view unary result provenance")
 
 if "if owned.count > 0" in compact_code(function_section(holder_text, "chv_walk_declarations")):

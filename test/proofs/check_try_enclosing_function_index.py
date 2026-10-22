@@ -134,12 +134,12 @@ def contains_contiguous_block(source: str, block: str) -> bool:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -255,12 +255,12 @@ if not contains_contiguous_block(rows_function, expected_dispatch):
 if compact_inline(rows_function).count("enclosing_try_function_indexed(") != 1 or \
         compact_inline(rows_function).count("enclosing_try_function(") != 1:
     raise SystemExit("try rows must retain exactly one indexed and one linear enclosing-function dispatch arm")
-propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table)"
+propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family)"
 if compact_inline(propagation_call) not in compact_inline(rows_function):
     raise SystemExit("resolved enclosing function must flow into try-propagation diagnostics")
 
 main_try_check = function_section(source_text, "check_try_fallible")
-rows_call = "table <- check_try_fallible_rows(file.enum_annotations, projection.error_set_annotations, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
+rows_call = "table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.error_set_annotations, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
 if compact_inline(main_try_check).count(compact_inline(rows_call)) != 1:
     raise SystemExit("check_try_fallible must invoke the source-row checker when at least one try site exists")
 

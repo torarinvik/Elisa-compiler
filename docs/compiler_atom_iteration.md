@@ -767,3 +767,20 @@ their possible borrowed-view provenance through unary and binary expressions,
 field projections, indexing, and slicing. Each wrapper has a scalar control.
 The production walker retains child facts rather than replacing them with a
 syntax-only lookup that cannot classify the block's result.
+
+The bootstrap's AST-walk visited-set pool now releases oversized tables after
+32 consecutive sparse uses, and discards exceptional walks above 16,384 nodes.
+Shrinking immediately was rejected because an alternating large/small benchmark
+regrew the map on every large walk. With the delayed policy, the focused sparse
+reset benchmark measured about 15 ns versus 168 ns for clearing a retained large
+map; alternating walks stayed near 79 microseconds with no recurring allocations.
+These local measurements do not establish a full-build speedup. The capped full
+compiler semantic check still timed out; its allocation profile identifies
+repeated call-filled element-state merges as a larger remaining source.
+
+Call-filled element states now gather argument provenance and merge it once.
+A deterministic 500-case comparison checks the result against the prior
+sequential fold, including nested fields and parameter dependencies. The
+eight-state merge benchmark reduced allocations from 2,800 bytes / 14 allocations
+to 400 bytes / 2 allocations (about 3.7 to 1.1 microseconds in that focused run).
+The source-gathering and full-build costs are outside that microbenchmark.
