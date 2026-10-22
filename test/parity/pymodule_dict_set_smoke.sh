@@ -57,6 +57,18 @@ assert functions["contains_int"]["return"] == "bool"
 assert functions["roundtrip_isize"]["parameters"] == [{"name": "values", "type": "set[isize]"}]
 assert functions["roundtrip_usize"]["parameters"] == [{"name": "values", "type": "set[usize]"}]
 assert functions["roundtrip_uintptr"]["parameters"] == [{"name": "values", "type": "set[uintptr]"}]
+assert functions["roundtrip_u64"]["parameters"] == [{"name": "value", "type": "u64"}]
+assert functions["roundtrip_u64"]["return"] == "u64"
+assert functions["unsigned_then_signed"]["parameters"] == [
+    {"name": "value", "type": "u64"},
+    {"name": "signed", "type": "i64"},
+]
+assert functions["unsigned_then_signed"]["return"] == "i64"
+assert functions["set_then_optional_uintptr"]["parameters"] == [
+    {"name": "values", "type": "set[i64]"},
+    {"name": "value", "type": "uintptr?"},
+]
+assert functions["set_then_optional_uintptr"]["return"] == "usize"
 assert functions["contains_i8"]["parameters"] == [
     {"name": "values", "type": "set[i8]"},
     {"name": "key", "type": "i8"},
@@ -83,6 +95,9 @@ grep -Fq 'def contains_int(values: Iterable[int], key: int) -> bool: ...' "$WORK
 grep -Fq 'def roundtrip_isize(values: Iterable[int]) -> set[int]: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def roundtrip_usize(values: Iterable[int]) -> set[int]: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def roundtrip_uintptr(values: Iterable[int]) -> set[int]: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def roundtrip_u64(value: int) -> int: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def unsigned_then_signed(value: int, signed: int) -> int: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def set_then_optional_uintptr(values: Iterable[int], value: int | None) -> int: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_i8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_u8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/dict_set_probe.pyi"
@@ -124,8 +139,41 @@ assert dict_set_probe.roundtrip_isize({-sys.maxsize - 1, sys.maxsize}) == {-sys.
 pointer_unsigned_max = 2 * sys.maxsize + 1
 assert dict_set_probe.roundtrip_usize({0, pointer_unsigned_max}) == {0, pointer_unsigned_max}
 assert dict_set_probe.roundtrip_uintptr({0, pointer_unsigned_max}) == {0, pointer_unsigned_max}
+unsigned_long_long_max = (1 << 64) - 1
+assert dict_set_probe.roundtrip_u64(unsigned_long_long_max) == unsigned_long_long_max
 assert dict_set_probe.contains_i8([-1, 4], -1)
 assert dict_set_probe.contains_u8([255, 4], 255)
+
+for bad in (-1, 1 << 64):
+    try:
+        dict_set_probe.roundtrip_u64(bad)
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError(("roundtrip_u64 accepted an out-of-range value", bad))
+
+try:
+    dict_set_probe.unsigned_then_signed("bad unsigned", "bad signed")
+except TypeError as exc:
+    assert exc.parameter == "signed"
+else:
+    raise AssertionError("parse failure was attributed to the unsigned object parameter")
+
+class CountedInt(int):
+    pass
+
+element = CountedInt(17)
+values = {element}
+baseline_refcount = sys.getrefcount(element)
+for _ in range(100):
+    try:
+        dict_set_probe.set_then_optional_uintptr(values, -1)
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError("negative optional uintptr was accepted")
+assert sys.getrefcount(element) == baseline_refcount, "failed optional conversion leaked the earlier set materialization"
+
 for bad in ([1.0, 1], [1, 1.0]):
     try:
         dict_set_probe.contains_i64(bad, 1)

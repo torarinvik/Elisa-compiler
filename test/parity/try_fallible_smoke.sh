@@ -106,8 +106,39 @@ grep -q '^D 0$' <<< "$fallible_call_alias"
 pure_call_alias_nonfallible=$(printf 'def pure() -> i64:\n    return 1\ndef bad() -> i64:\n    value = pure()\n    return try value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$pure_call_alias_nonfallible"
 
+qualified_pure_call_alias_nonfallible=$(printf 'error E:\n    Bad\nmodule Backend:\n    public:\n        def pure() -> i64:\n            return 1\nmodule Other:\n    public:\n        def pure() -> i64 error[E]:\n            return 2\ndef bad() -> i64:\n    value = Backend::pure()\n    return try value\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$qualified_pure_call_alias_nonfallible"
+
+nested_qualified_module_declarations='error E:
+    Bad
+module OuterA:
+    public:
+        module Common:
+            public:
+                def pure() -> i64:
+                    return 1
+module OuterB:
+    public:
+        module Common:
+            public:
+                def pure() -> i64 error[E]:
+                    return 2'
+nested_qualified_pure_call_alias_nonfallible=$(printf '%s\ndef bad() -> i64:\n    value = OuterA::Common::pure()\n    return try value\n' "$nested_qualified_module_declarations" | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nested_qualified_pure_call_alias_nonfallible"
+nested_qualified_pure_call_alias_fallible=$(printf '%s\ndef good() -> i64:\n    value = OuterB::Common::pure()\n    return try value\n' "$nested_qualified_module_declarations" | "$RPT")
+if grep -q 'try requires a fallible expression' <<< "$nested_qualified_pure_call_alias_fallible"; then
+    echo "try_fallible FAILED: fallible OuterB::Common::pure was classified as nonfallible"
+    exit 1
+fi
+
 catch_success_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            success\n        error problem:\n            0\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_alias_nonfallible"
+
+catch_success_arithmetic_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            success\n        error problem:\n            0\n    return try (result + 1)\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$catch_success_arithmetic_alias_nonfallible"
+
+catch_success_bool_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load_flag() -> bool error[E]:\n    return true\ndef bad() -> bool:\n    result = catch load_flag():\n        success:\n            success\n        error problem:\n            false\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$catch_success_bool_alias_nonfallible"
 
 conditional_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = load() if flag else load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_alias"
@@ -177,6 +208,9 @@ grep -q 'cannot propagate E from a function returning F' <<< "$inferred_alias_mi
 
 lambda_return_mismatch=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\n\ndef build(value: i64 error[E]) -> i64:\n    callback = fn() -> i64 error[F] => try value\n    return 0\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$lambda_return_mismatch"
+
+lambda_numeric_shadow=$(printf 'error E:\n    Bad\ndef build() -> i64:\n    count: i64 = 1\n    callback = fn(count: i64 error[E]) -> i64 error[E] => try count\n    return 0\n' | "$RPT")
+grep -q '^D 0$' <<< "$lambda_numeric_shadow"
 
 lambda_without_error_destination=$(printf 'error E:\n    Bad\ndef maybe() -> i64 error[E]:\n    return 1\ndef build() -> i64 error[E]:\n    callback = fn() -> i64 => try maybe()\n    return 0\n' | "$RPT")
 grep -q 'try without else requires an error union' <<< "$lambda_without_error_destination"

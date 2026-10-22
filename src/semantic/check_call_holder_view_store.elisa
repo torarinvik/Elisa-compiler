@@ -55,6 +55,8 @@ extend Semantic:
             shape_shadow_names: mutable darray[sview] = []
             rebind_claims: mutable darray[Ast::EnumAnnotation] = []
             reference_holders: mutable darray[sview] = []
+            type_alias_names: mutable darray[sview] = []
+            type_alias_targets: mutable darray[Ast::Expr] = []
             last_value_may_be_owned_view: mutable bool = false
 
         def chv_flow_latest(flow: CHVViewFlow&, name: sview) -> usize:
@@ -85,6 +87,8 @@ extend Semantic:
                 clone.shape_shadow_names.extend(flow.shape_shadow_names)
                 clone.rebind_claims.extend(flow.rebind_claims)
                 clone.reference_holders.extend(flow.reference_holders)
+                clone.type_alias_names.extend(flow.type_alias_names)
+                clone.type_alias_targets.extend(flow.type_alias_targets)
                 clone.last_value_may_be_owned_view <- flow.last_value_may_be_owned_view
                 return clone
 
@@ -231,6 +235,18 @@ extend Semantic:
                     more <- false
                     chv_collect_reference_holders(declarations, reference_holders, more)
                 return reference_holders
+
+        def chv_collect_type_aliases(declarations: darray[Ast::Decl], names: mutable darray[sview]&, targets: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, targets|:
+                    match declaration:
+                        Decl.Alias(name, target, _):
+                            names.push(name)
+                            targets.push(target)
+                        Decl.Module(_, body, _) | Decl.Scoped(body, _):
+                            chv_collect_type_aliases(body, names, targets)
+                        _:
+                            pass
 
         # Structs holding a view field, directly or through a field of another such struct.
         def chv_view_holders(declarations: darray[Ast::Decl]) -> darray[sview]:
@@ -448,6 +464,10 @@ extend Semantic:
                     Expr.Catch(guarded, arms, _):
                         chv_scan_expression_locals(guarded, in_region, binders, owned, view_names, view_values)
                         for arm in arms |binders, owned, view_names, view_values|:
+                            pattern_names: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm.pattern, pattern_names)
+                            for pattern_name in pattern_names |binders|:
+                                binders.push(pattern_name)
                             chv_scan_expression_locals(arm.guard, in_region, binders, owned, view_names, view_values)
                             chv_scan_locals(arm.body, in_region, binders, owned, view_names, view_values)
                     Expr.Comprehension(variable, iterable, condition, body, _, _):
@@ -570,54 +590,112 @@ extend Semantic:
                 empty_reference_holders: mutable darray[sview] = []
                 return chv_type_may_contain_alias_reference_with_holders(type_expression, empty_reference_holders, depth)
 
-        def chv_type_is_direct_alias_reference(type_expression: Ast::Expr, depth: u32) -> bool:
+        def chv_type_alias_target(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&, depth: u32) -> (found: bool, target: Ast::Expr):
+            can Abort.Panic:
+                return (false, type_expression) if depth > 64
+                alias_name: mutable sview = ""
+                match type_expression:
+                    Expr.Ident(name, _):
+                        alias_name <- name
+                    # The alias inventory is flat and cannot prove that a
+                    # qualified reference names this alias's defining module.
+                    # Leave scoped names unresolved; callers treat a matching
+                    # alias name conservatively instead of borrowing another
+                    # module's target.
+                    _:
+                        return (false, type_expression)
+                found_count: mutable usize = 0
+                target_expression: mutable Ast::Expr = type_expression
+                for index in 0..<alias_names.count |found_count, target_expression, alias_names, alias_targets|:
+                    if alias_names[index] == alias_name and index < alias_targets.count:
+                        found_count <- found_count + 1
+                        target_expression <- alias_targets[index]
+                return (found_count == 1, target_expression)
+
+        # Alias lookup currently retains bare names while walking nested modules.
+        # If two scopes provide the same name, keep direct-reference classification
+        # conservative instead of treating the unresolved qualified alias as clean.
+        def chv_type_alias_name_count(type_expression: Ast::Expr, alias_names: darray[sview]&) -> usize:
+            can Abort.Panic:
+                alias_name: mutable sview = ""
+                match type_expression:
+                    Expr.Ident(name, _) | Expr.Scope(_, name, _):
+                        alias_name <- name
+                    _:
+                        return 0
+                matches: mutable usize = 0
+                for name in alias_names |matches|:
+                    matches <- matches + 1 if name == alias_name
+                return matches
+
+        def chv_type_is_direct_alias_reference(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&, depth: u32) -> bool:
             can Memory.Allocate, Abort.Panic:
-                return false if depth > 64
+                # A long or cyclic alias chain is unresolved here. Keep it
+                # conservative instead of losing a possible direct reference.
+                return true if depth > 64
                 match type_expression:
                     Expr.Unary(operator, _, _) if operator == TokenKind.Ampersand:
                         return true
                     Expr.Unary(_, operand, _) | Expr.Paren(operand, _):
-                        return chv_type_is_direct_alias_reference(operand, depth + 1)
+                        return chv_type_is_direct_alias_reference(operand, alias_names, alias_targets, depth + 1)
+                    Expr.Ident(_, _) | Expr.Scope(_, _, _):
+                        found, target = chv_type_alias_target(type_expression, alias_names, alias_targets, depth + 1)
+                        return chv_type_is_direct_alias_reference(target, alias_names, alias_targets, depth + 1) if found
+                        return chv_type_alias_name_count(type_expression, alias_names) > 0
                     _:
                         return false
 
         # Return the element type when TYPE_EXPRESSION is a collection this pass
         # understands. Keeping this type fact on bindings lets nested iteration
         # distinguish `darray[&T]` from `darray[RefBox]`, even when both are opaque.
-        def chv_type_iterable_element(type_expression: Ast::Expr, depth: u32) -> (known: bool, element_type: Ast::Expr):
+        def chv_type_iterable_element(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&, depth: u32) -> (known: bool, element_type: Ast::Expr):
             can Memory.Allocate, Abort.Panic:
                 return (false, type_expression) if depth > 64
                 match type_expression:
                     Expr.Paren(inner, _):
-                        return chv_type_iterable_element(inner, depth + 1)
+                        return chv_type_iterable_element(inner, alias_names, alias_targets, depth + 1)
                     Expr.Unary(_, inner, _):
-                        return chv_type_iterable_element(inner, depth + 1)
+                        return chv_type_iterable_element(inner, alias_names, alias_targets, depth + 1)
                     Expr.Index(Expr.Ident(head, _), element_type, _) if head == "darray" or head == "array" or head == "set":
                         return (true, element_type)
+                    Expr.Ident(_, _) | Expr.Scope(_, _, _):
+                        found, target = chv_type_alias_target(type_expression, alias_names, alias_targets, depth + 1)
+                        if found:
+                            return chv_type_iterable_element(target, alias_names, alias_targets, depth + 1)
+                        return (false, type_expression)
                     _:
                         return (false, type_expression)
 
-        def chv_type_iterable_yields_alias_reference(type_expression: Ast::Expr, depth: u32) -> (known: bool, may_yield: bool):
+        def chv_type_iterable_yields_alias_reference(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&, depth: u32) -> (known: bool, may_yield: bool):
             can Memory.Allocate, Abort.Panic:
-                known, element_type = chv_type_iterable_element(type_expression, depth + 1)
-                return (known, known and chv_type_is_direct_alias_reference(element_type, depth + 1))
+                known, element_type = chv_type_iterable_element(type_expression, alias_names, alias_targets, depth + 1)
+                # The flattened table cannot resolve ambiguous qualified names,
+                # and the depth guard can stop a unique alias chain before its
+                # element type is reached. Treat either unresolved alias as
+                # potentially yielding references rather than clean.
+                return (true, true) if not known and chv_type_alias_name_count(type_expression, alias_names) > 0
+                return (known, known and chv_type_is_direct_alias_reference(element_type, alias_names, alias_targets, depth + 1))
 
         def chv_flow_set_iterable_element_type(flow: mutable CHVViewFlow&, binding_name: sview, iterable: Ast::Expr) -> void:
             can Abort.Panic:
                 match iterable:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         chv_flow_set_iterable_element_type(flow, binding_name, inner)
+                    Expr.Slice(object, _, _, _):
+                        # Slicing keeps the collection's element type.
+                        chv_flow_set_iterable_element_type(flow, binding_name, object)
                     Expr.Ident(iterable_name, _):
                         iterable_index: usize = chv_flow_latest(flow, iterable_name)
                         if iterable_index < flow.names.count and iterable_index < flow.binding_type_known.count and flow.binding_type_known[iterable_index]:
-                            if flow.binding_types[iterable_index] is iterable_type:
-                                element_facts: (known: bool, element_type: Ast::Expr) = chv_type_iterable_element(iterable_type, 0)
+                            iterable_type_option: Ast::Expr? = flow.binding_types[iterable_index]
+                            if iterable_type_option is iterable_type:
+                                element_facts: (known: bool, element_type: Ast::Expr) = chv_type_iterable_element(iterable_type, flow.type_alias_names, flow.type_alias_targets, 0)
                                 if element_facts.known:
                                     binding_index: usize = chv_flow_latest(flow, binding_name)
                                     if binding_index < flow.names.count:
                                         flow.binding_types[binding_index] <- element_facts.element_type
                                         flow.binding_type_known[binding_index] <- true
-                                        yield_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(element_facts.element_type, 0)
+                                        yield_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(element_facts.element_type, flow.type_alias_names, flow.type_alias_targets, 0)
                                         flow.may_yield_alias_reference[binding_index] <- yield_facts.may_yield
                                         flow.may_yield_alias_reference_known[binding_index] <- yield_facts.known
                     _:
@@ -949,6 +1027,8 @@ extend Semantic:
                 match iterable:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         return chv_iterable_element_may_contain_alias_ref(inner, ref_params, flow, table, depth + 1)
+                    Expr.Slice(object, _, _, _):
+                        return chv_iterable_element_may_contain_alias_ref(object, ref_params, flow, table, depth + 1)
                     Expr.If(condition, then_value, else_value, _):
                         then_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                         chv_flow_bind_truthy_condition_binders(condition, ref_params, &then_flow, table)
@@ -977,6 +1057,8 @@ extend Semantic:
                 match iterable:
                     Expr.Paren(inner, _) | Expr.Move(inner, _):
                         return chv_iterable_element_may_alias_reference(inner, ref_params, flow, table, depth + 1)
+                    Expr.Slice(object, _, _, _):
+                        return chv_iterable_element_may_alias_reference(object, ref_params, flow, table, depth + 1)
                     Expr.If(condition, then_value, else_value, _):
                         then_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                         chv_flow_bind_truthy_condition_binders(condition, ref_params, &then_flow, table)
@@ -987,12 +1069,42 @@ extend Semantic:
                             if index < flow.may_yield_alias_reference_known.count and flow.may_yield_alias_reference_known[index]:
                                 return flow.may_yield_alias_reference[index]
                             if index < flow.binding_type_known.count and flow.binding_type_known[index]:
-                                if flow.binding_types[index] is binding_type:
-                                    type_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(binding_type, depth + 1)
+                                binding_type_option: Ast::Expr? = flow.binding_types[index]
+                                if binding_type_option is binding_type:
+                                    type_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(binding_type, flow.type_alias_names, flow.type_alias_targets, depth + 1)
                                     return type_facts.may_yield if type_facts.known
                     _:
                         pass
                 return chv_iterable_element_may_contain_alias_ref(iterable, ref_params, flow, table, depth + 1)
+
+        def chv_iterable_element_alias_facts(iterable: Ast::Expr, ref_params: darray[sview]&, flow: CHVViewFlow&, table: SymbolTable&, depth: u32) -> (known: bool, may_yield: bool):
+            can Memory.Allocate, Abort.Panic:
+                return (false, false) if depth > 64
+                known_shape, shape = chv_known_iterable_shape(iterable, depth + 1)
+                if known_shape:
+                    return (true, chv_iterable_element_may_alias_reference(iterable, ref_params, flow, table, depth + 1))
+                match iterable:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return chv_iterable_element_alias_facts(inner, ref_params, flow, table, depth + 1)
+                    Expr.Slice(object, _, _, _):
+                        return chv_iterable_element_alias_facts(object, ref_params, flow, table, depth + 1)
+                    Expr.Ident(name, _):
+                        index: usize = chv_flow_latest(flow, name)
+                        if index < flow.names.count:
+                            if index < flow.may_yield_alias_reference_known.count and flow.may_yield_alias_reference_known[index]:
+                                return (true, flow.may_yield_alias_reference[index])
+                            if index < flow.binding_type_known.count and flow.binding_type_known[index]:
+                                type_option: Ast::Expr? = flow.binding_types[index]
+                                if type_option is binding_type:
+                                    type_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(binding_type, flow.type_alias_names, flow.type_alias_targets, depth + 1)
+                                    return type_facts if type_facts.known
+                        return (false, chv_iterable_element_may_alias_reference(iterable, ref_params, flow, table, depth + 1))
+                    Expr.If(_, then_value, else_value, _):
+                        left_facts: (known: bool, may_yield: bool) = chv_iterable_element_alias_facts(then_value, ref_params, flow, table, depth + 1)
+                        right_facts: (known: bool, may_yield: bool) = chv_iterable_element_alias_facts(else_value, ref_params, flow, table, depth + 1)
+                        return (left_facts.known and right_facts.known, left_facts.may_yield or right_facts.may_yield)
+                    _:
+                        return (false, chv_iterable_element_may_alias_reference(iterable, ref_params, flow, table, depth + 1))
 
         def chv_iterable_element_is_scalar_sview(iterable: Ast::Expr, flow: CHVViewFlow&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, depth: u32) -> bool:
             can Memory.Allocate, Abort.Panic:
@@ -1007,6 +1119,8 @@ extend Semantic:
                         all_scalar <- all_scalar and chv_expression_is_scalar_sview(element, flow, view_names, view_values, depth + 1)
                     return all_scalar
                 match iterable:
+                    Expr.Slice(object, _, _, _):
+                        return chv_iterable_element_is_scalar_sview(object, flow, view_names, view_values, depth + 1)
                     Expr.Ident(name, _):
                         index: usize = chv_flow_latest(flow, name)
                         return index < flow.names.count and flow.may_yield_scalar_sview[index]
@@ -1027,6 +1141,8 @@ extend Semantic:
                         all_scalar <- all_scalar and chv_iterable_element_is_scalar_sview(element, flow, view_names, view_values, depth + 1)
                     return all_scalar
                 match iterable:
+                    Expr.Slice(object, _, _, _):
+                        return chv_iterable_element_yields_scalar_sview(object, flow, view_names, view_values, depth + 1)
                     Expr.Ident(name, _):
                         index: usize = chv_flow_latest(flow, name)
                         return index < flow.names.count and flow.may_yield_scalar_sview[index]
@@ -1117,7 +1233,12 @@ extend Semantic:
                     Expr.Call(Expr.Field(_, method, _), arguments, _, _) if method == "as_sview" or method == "as_cstr":
                         return false if arguments.count == 0
                         return ref_params.count > 0
-                    Expr.Call(_, _, _, _) | Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Slice(_, _, _, _) | Expr.Block(_, _, _, _) | Expr.GetElse(_, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                    Expr.Slice(_, _, _, _):
+                        # A slice is a view/container value. Its elements may
+                        # carry aliases, but the slice expression is not itself
+                        # a direct reference alias.
+                        return false
+                    Expr.Call(_, _, _, _) | Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _) | Expr.Block(_, _, _, _) | Expr.GetElse(_, _, _) | Expr.Match(_, _, _) | Expr.Catch(_, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
                         return ref_params.count > 0
                     Expr.Tuple(_, _) | Expr.Array(_, _) | Expr.SetLit(_, _) | Expr.DictLit(_, _) | Expr.Construct(_, _, _) | Expr.RecordUpdate(_, _, _) | Expr.Comprehension(_, _, _, _, _, _):
                         return false
@@ -1160,6 +1281,8 @@ extend Semantic:
                         return any field in fields where chv_expression_may_contain_alias_ref(field.value, ref_params, flow, table, depth + 1)
                     Expr.RecordUpdate(base, fields, _):
                         return chv_expression_may_contain_alias_ref(base, ref_params, flow, table, depth + 1) or any field in fields where chv_expression_may_contain_alias_ref(field.value, ref_params, flow, table, depth + 1)
+                    Expr.Slice(_, _, _, _):
+                        return chv_iterable_element_may_contain_alias_ref(expression, ref_params, flow, table, depth + 1)
                     Expr.If(condition, then_value, else_value, _):
                         then_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                         chv_flow_bind_truthy_condition_binders(condition, ref_params, &then_flow, table)
@@ -1267,6 +1390,41 @@ extend Semantic:
                         return chv_call_method_info(head, depth + 1)
                     _:
                         return (false, sview("", 0, 0))
+
+        # These builtin collection methods can change which values a later iteration
+        # yields. Keep this list limited to methods used by the darray, set, and map
+        # APIs; reserve changes capacity only and does not invalidate element shape.
+        def chv_collection_mutator(method: sview) -> bool:
+            can Abort.Panic:
+                return method in {"push", "push_back", "push_front", "extend", "append", "append_many", "insert", "pop", "pop_front", "remove", "remove_at", "discard", "delete", "clear", "truncate", "resize", "set", "put", "add", "get_or_insert", "update_at", "retain", "drain", "swap_remove", "swap", "sort", "reverse", "fill"}
+
+        def chv_collection_mutator_adds_values(method: sview) -> bool:
+            can Abort.Panic:
+                return method in {"push", "push_back", "push_front", "extend", "append", "append_many", "insert", "set", "put", "add", "get_or_insert", "update_at", "fill"}
+
+        # `dict.entry(key).insert(value)` mutates the dictionary rooted at the
+        # receiver of `entry`, rather than the temporary entry proxy.
+        def chv_mutator_receiver_root(receiver: Ast::Expr, depth: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return "" if depth > 64
+                match receiver:
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return chv_mutator_receiver_root(inner, depth + 1)
+                    Expr.Call(Expr.Field(base, method, _), _, _, _) if method == "entry":
+                        return chv_mutator_receiver_root(base, depth + 1)
+                    _:
+                        return chv_place_root(receiver)
+
+        def chv_mutator_receiver_root_from_callee(callee: Ast::Expr, depth: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return "" if depth > 64
+                match callee:
+                    Expr.Field(receiver, method, _) if chv_collection_mutator(method):
+                        return chv_mutator_receiver_root(receiver, depth + 1)
+                    Expr.Paren(inner, _) | Expr.Index(inner, _, _) | Expr.IndexN(inner, _, _):
+                        return chv_mutator_receiver_root_from_callee(inner, depth + 1)
+                    _:
+                        return ""
 
         def chv_walk_call_callee(callee: Ast::Expr, in_region: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, receiver_owned_view: mutable bool&, receiver_may_alias_reference: mutable bool&, callee_may_be_owned_view: mutable bool&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -1561,32 +1719,37 @@ extend Semantic:
                     _:
                         return (false, false, false)
 
-        # Pattern binders at the root alias the scrutinee. Bindings nested inside a
-        # constructor may refer to payloads or fields, so keep both provenance facts
-        # conservative when the checker has no field type information.
-        def chv_flow_bind_pattern(pattern: Ast::Pattern, root_pattern: bool, root_may_owned_view: bool, root_may_alias_reference: bool, flow: mutable CHVViewFlow&) -> void:
+        # Pattern binders at the root carry the scrutinee's direct and contained
+        # provenance separately. Nested payload bindings stay conservative because
+        # the checker has no field type information.
+        def chv_flow_bind_pattern_name(name: sview, root_pattern: bool, root_may_owned_view: bool, root_may_direct_alias_reference: bool, root_may_contain_alias_reference: bool, flow: mutable CHVViewFlow&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if name != "":
+                    bound_may_direct_alias_reference: bool = root_may_direct_alias_reference if root_pattern else true
+                    bound_may_contain_alias_reference: bool = root_may_contain_alias_reference if root_pattern else true
+                    chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, bound_may_direct_alias_reference or bound_may_contain_alias_reference)
+                    bound_index: usize = chv_flow_latest(flow, name)
+                    flow.may_direct_alias_reference[bound_index] <- bound_may_direct_alias_reference if bound_index < flow.names.count
+                    flow.may_contain_alias_reference[bound_index] <- bound_may_contain_alias_reference if bound_index < flow.names.count
+
+        def chv_flow_bind_pattern(pattern: Ast::Pattern, root_pattern: bool, root_may_owned_view: bool, root_may_direct_alias_reference: bool, root_may_contain_alias_reference: bool, flow: mutable CHVViewFlow&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match pattern:
-                    Pattern.Binding(name) | Pattern.Rest(name):
-                        if name != "":
-                            chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, root_may_alias_reference if root_pattern else true)
-                    Pattern.TypeBind(_, name):
-                        if name != "":
-                            chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, root_may_alias_reference if root_pattern else true)
+                    Pattern.Binding(name) | Pattern.Rest(name) | Pattern.TypeBind(_, name):
+                        chv_flow_bind_pattern_name(name, root_pattern, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
                     Pattern.As(name, inner):
-                        if name != "":
-                            chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, root_may_alias_reference if root_pattern else true)
+                        chv_flow_bind_pattern_name(name, root_pattern, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
                         for child in inner |flow|:
-                            chv_flow_bind_pattern(child, false, root_may_owned_view, root_may_alias_reference, flow)
+                            chv_flow_bind_pattern(child, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
                     Pattern.Variant(_, fields) | Pattern.Tuple(fields) | Pattern.Or(fields):
                         for field in fields |flow|:
-                            chv_flow_bind_pattern(field, false, root_may_owned_view, root_may_alias_reference, flow)
+                            chv_flow_bind_pattern(field, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
                     Pattern.Struct(_, fields):
                         for field in fields |flow|:
-                            chv_flow_bind_pattern(field, false, root_may_owned_view, root_may_alias_reference, flow)
+                            chv_flow_bind_pattern(field, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
                     Pattern.Field(_, inner):
                         for child in inner |flow|:
-                            chv_flow_bind_pattern(child, false, root_may_owned_view, root_may_alias_reference, flow)
+                            chv_flow_bind_pattern(child, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
                     _:
                         pass
 
@@ -1646,20 +1809,33 @@ extend Semantic:
                     Expr.Call(callee, arguments, _, _):
                         result_may_be_owned_view: mutable bool = chv_is_owned_view(expression, flow, 0)
                         method_found, method_name = chv_call_method_info(callee, 0)
+                        mutator_root: sview = chv_mutator_receiver_root_from_callee(callee, 0) if method_found else ""
                         receiver_may_be_owned_view: mutable bool = false
                         receiver_may_alias_reference: mutable bool = false
                         callee_may_be_owned_view: mutable bool = false
                         table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)
                         result_may_be_owned_view <- chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == "as_sview" or method_name == "as_cstr" or method_name == "view")) or callee_may_be_owned_view
                         arguments_may_be_owned_view: mutable bool = false
+                        arguments_may_contain_alias_reference: mutable bool = false
                         argument_owned_views: mutable darray[bool] = []
                         argument_may_alias_refs: mutable darray[bool] = []
-                        for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:
+                        for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:
                             table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                             arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view
                             argument_owned_views.push(flow.last_value_may_be_owned_view)
                             argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, table, 0))
+                            arguments_may_contain_alias_reference <- arguments_may_contain_alias_reference or chv_expression_may_contain_alias_ref(argument, ref_params, flow, table, 0)
                         table <- chv_check_call(expression, argument_owned_views, argument_may_alias_refs, receiver_may_be_owned_view, receiver_may_alias_reference, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        if mutator_root != "":
+                            mutator_index: usize = chv_flow_latest(flow, mutator_root)
+                            if mutator_index < flow.names.count:
+                                flow.shape_unknown[mutator_index] <- true
+                                if chv_collection_mutator_adds_values(method_name):
+                                    flow.may_contain_alias_reference[mutator_index] <- flow.may_contain_alias_reference[mutator_index] or arguments_may_contain_alias_reference
+                                # An inferred literal's exact element-yield fact no longer
+                                # describes the mutated collection. Explicit element types
+                                # remain authoritative and are read from binding_types.
+                                flow.may_yield_alias_reference_known[mutator_index] <- false if mutator_index >= flow.binding_type_known.count or not flow.binding_type_known[mutator_index]
                         flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view
                     Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):
                         runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)
@@ -1813,7 +1989,8 @@ extend Semantic:
                     Expr.Match(scrutinee, arms, _):
                         table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                         scrutinee_may_be_owned_view: bool = flow.last_value_may_be_owned_view
-                        scrutinee_may_alias_reference: bool = chv_expression_may_alias_ref(scrutinee, ref_params, flow, table, 0)
+                        scrutinee_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(scrutinee, ref_params, flow, table, 0)
+                        scrutinee_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(scrutinee, ref_params, flow, table, 0)
                         branch_mark: usize = flow.names.count
                         entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                         merged_flow: mutable CHVViewFlow = chv_flow_clone(flow)
@@ -1821,7 +1998,7 @@ extend Semantic:
                         branch_value_may_be_owned: mutable bool = false
                         for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:
                             arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
-                            chv_flow_bind_pattern(arm.pattern, true, scrutinee_may_be_owned_view, scrutinee_may_alias_reference, &arm_flow)
+                            chv_flow_bind_pattern(arm.pattern, true, scrutinee_may_be_owned_view, scrutinee_may_direct_alias_reference, scrutinee_may_contain_alias_reference, arm_flow)
                             table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                             table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                             branch_value_may_be_owned <- branch_value_may_be_owned or arm_flow.last_value_may_be_owned_view
@@ -1838,7 +2015,8 @@ extend Semantic:
                         guarded_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
                         table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, &guarded_flow, summary, table)
                         branch_value_may_be_owned: mutable bool = guarded_flow.last_value_may_be_owned_view
-                        guarded_may_alias_reference: bool = chv_expression_may_alias_ref(guarded, ref_params, guarded_flow, table, 0)
+                        guarded_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(guarded, ref_params, guarded_flow, table, 0)
+                        guarded_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(guarded, ref_params, guarded_flow, table, 0)
                         merged_flow: mutable CHVViewFlow = chv_flow_clone(guarded_flow)
                         arm_index: mutable usize = 0
                         for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:
@@ -1848,7 +2026,7 @@ extend Semantic:
                             # Catch arm zero binds the guarded success value. Later arms
                             # bind error variants and cannot reuse success provenance; with
                             # no error payload types, keep their roots conservatively tainted.
-                            chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_alias_reference if is_success_arm else true, &arm_flow)
+                            chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_direct_alias_reference if is_success_arm else true, guarded_may_contain_alias_reference if is_success_arm else true, arm_flow)
                             table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                             table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                             branch_value_may_be_owned <- branch_value_may_be_owned or arm_flow.last_value_may_be_owned_view
@@ -1958,9 +2136,9 @@ extend Semantic:
                             typed_owned: bool = chv_type_is_owned_container(type_expression) and not type_marker_present_here(type_expression, TokenKind.Ampersand)
                             literal_owned: bool = (type_expression is Expr.Absent) and (declared_value is Expr.Array(_, _))
                             declared_alias_ref: bool = chv_expression_may_alias_ref(declared_value, ref_params, flow, table, 0)
-                            declared_direct_alias_ref: bool = chv_type_is_direct_alias_reference(type_expression, 0) or chv_expression_may_direct_alias_ref(declared_value, ref_params, flow, table, 0)
+                            declared_direct_alias_ref: bool = chv_type_is_direct_alias_reference(type_expression, flow.type_alias_names, flow.type_alias_targets, 0) if not (type_expression is Expr.Absent) else chv_expression_may_direct_alias_ref(declared_value, ref_params, flow, table, 0)
                             declared_shape_known, declared_shape = chv_known_iterable_shape(declared_value, 0)
-                            declared_type_yield_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(type_expression, 0)
+                            declared_type_yield_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(type_expression, flow.type_alias_names, flow.type_alias_targets, 0)
                             declared_yield_alias_reference: bool = declared_type_yield_facts.may_yield if declared_type_yield_facts.known else chv_iterable_element_may_alias_reference(declared_value, ref_params, flow, table, 0)
                             declared_yield_alias_known: bool = declared_type_yield_facts.known or declared_shape_known
                             declared_type_may_contain_alias_reference: bool = chv_type_may_contain_alias_reference_with_holders(type_expression, flow.reference_holders, 0) if not declared_shape_known else false
@@ -1986,11 +2164,13 @@ extend Semantic:
                             projection_assignment: bool = assigned_name == "" and assigned_root != ""
                             previous_may_owned_view: mutable bool = false
                             previous_may_alias_reference: mutable bool = false
+                            previous_may_direct_alias_reference: mutable bool = false
                             previous_may_contain_alias_reference: mutable bool = false
                             previous_may_be_scalar_sview: mutable bool = false
                             previous_index: usize = chv_flow_latest(flow, assigned_root) if assigned_root != "" else flow.names.count
                             previous_may_owned_view <- flow.may_owned_view[previous_index] if previous_index < flow.names.count
                             previous_may_alias_reference <- flow.may_alias_reference[previous_index] if previous_index < flow.names.count
+                            previous_may_direct_alias_reference <- flow.may_direct_alias_reference[previous_index] if previous_index < flow.names.count
                             previous_may_contain_alias_reference <- flow.may_contain_alias_reference[previous_index] if previous_index < flow.names.count
                             previous_may_be_scalar_sview <- flow.may_be_scalar_sview[previous_index] if previous_index < flow.names.count
                             parallel_targets: mutable darray[Ast::Expr] = []
@@ -2000,44 +2180,63 @@ extend Semantic:
                             parallel_shape: bool = parallel_values_found and parallel_targets.count > 0 and parallel_targets.count == parallel_values.count
                             parallel_owned_views: mutable darray[bool] = []
                             parallel_alias_refs: mutable darray[bool] = []
+                            parallel_direct_alias_refs: mutable darray[bool] = []
                             parallel_contained_alias_refs: mutable darray[bool] = []
+                            parallel_yield_alias_refs: mutable darray[bool] = []
+                            parallel_yield_alias_knowns: mutable darray[bool] = []
                             parallel_scalar_sviews: mutable darray[bool] = []
                             parallel_yield_scalar_sviews: mutable darray[bool] = []
                             assigned_value_may_be_owned_view: mutable bool = false
                             assigned_value_may_alias_reference: mutable bool = false
+                            assigned_value_may_direct_alias_reference: mutable bool = false
                             assigned_value_may_contain_alias_reference: mutable bool = false
+                            assigned_value_may_yield_alias_reference: mutable bool = false
+                            assigned_value_yield_alias_reference_known: mutable bool = true
                             assigned_value_may_be_scalar_sview: mutable bool = false
                             assigned_value_may_yield_scalar_sview: mutable bool = false
                             if parallel_shape:
                                 # Walk each value exactly once, left to right. Preserve its
                                 # own facts for the matching synthetic rebind temporary.
-                                for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:
+                                for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:
                                     table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                                     value_may_be_owned_view: bool = flow.last_value_may_be_owned_view
                                     value_may_alias_reference: bool = chv_expression_may_alias_ref(parallel_value, ref_params, flow, table, 0)
+                                    value_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(parallel_value, ref_params, flow, table, 0)
                                     value_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(parallel_value, ref_params, flow, table, 0)
+                                    value_yield_alias_facts: (known: bool, may_yield: bool) = chv_iterable_element_alias_facts(parallel_value, ref_params, flow, table, 0)
                                     value_may_be_scalar_sview: bool = chv_expression_is_scalar_sview(parallel_value, flow, view_names, view_values, 0)
                                     value_may_yield_scalar_sview: bool = chv_iterable_element_is_scalar_sview(parallel_value, flow, view_names, view_values, 0)
                                     parallel_owned_views.push(value_may_be_owned_view)
                                     parallel_alias_refs.push(value_may_alias_reference)
+                                    parallel_direct_alias_refs.push(value_may_direct_alias_reference)
                                     parallel_contained_alias_refs.push(value_may_contain_alias_reference)
+                                    parallel_yield_alias_refs.push(value_yield_alias_facts.may_yield)
+                                    parallel_yield_alias_knowns.push(value_yield_alias_facts.known)
                                     parallel_scalar_sviews.push(value_may_be_scalar_sview)
                                     parallel_yield_scalar_sviews.push(value_may_yield_scalar_sview)
                                     assigned_value_may_be_owned_view <- assigned_value_may_be_owned_view or value_may_be_owned_view
                                     assigned_value_may_alias_reference <- assigned_value_may_alias_reference or value_may_alias_reference
+                                    assigned_value_may_direct_alias_reference <- assigned_value_may_direct_alias_reference or value_may_direct_alias_reference
                                     assigned_value_may_contain_alias_reference <- assigned_value_may_contain_alias_reference or value_may_contain_alias_reference
+                                    assigned_value_may_yield_alias_reference <- assigned_value_may_yield_alias_reference or value_yield_alias_facts.may_yield
+                                    assigned_value_yield_alias_reference_known <- assigned_value_yield_alias_reference_known and value_yield_alias_facts.known if parallel_values.count > 1 else value_yield_alias_facts.known
                                 flow.last_value_may_be_owned_view <- assigned_value_may_be_owned_view
                             else:
                                 table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                                 assigned_value_may_be_owned_view <- flow.last_value_may_be_owned_view
                                 assigned_value_may_alias_reference <- chv_expression_may_alias_ref(assigned_value, ref_params, flow, table, 0)
+                                assigned_value_may_direct_alias_reference <- chv_expression_may_direct_alias_ref(assigned_value, ref_params, flow, table, 0)
                                 assigned_value_may_contain_alias_reference <- chv_expression_may_contain_alias_ref(assigned_value, ref_params, flow, table, 0)
+                                assigned_value_yield_alias_facts: (known: bool, may_yield: bool) = chv_iterable_element_alias_facts(assigned_value, ref_params, flow, table, 0)
+                                assigned_value_may_yield_alias_reference <- assigned_value_yield_alias_facts.may_yield
+                                assigned_value_yield_alias_reference_known <- assigned_value_yield_alias_facts.known
                                 assigned_value_may_be_scalar_sview <- chv_expression_is_scalar_sview(assigned_value, flow, view_names, view_values, 0)
                                 assigned_value_may_yield_scalar_sview <- chv_iterable_element_is_scalar_sview(assigned_value, flow, view_names, view_values, 0)
                             chv_flow_bind_expression_binders(assigned_value, ref_params, flow, table)
                             table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                             assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)
                             assigned_alias_ref: bool = assigned_value_may_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_alias_reference)
+                            assigned_direct_alias_ref: bool = assigned_value_may_direct_alias_reference or ((operator != TokenKind.Assign or projection_assignment) and previous_may_direct_alias_reference)
                             assigned_contains_alias_ref: bool = assigned_value_may_contain_alias_reference or (projection_assignment and assigned_value_may_alias_reference) or ((operator != TokenKind.Assign or projection_assignment) and previous_may_contain_alias_reference)
                             if assigned_root != "":
                                 assigned_index: mutable usize = chv_flow_latest(flow, assigned_root)
@@ -2047,58 +2246,81 @@ extend Semantic:
                                     # so branch-local shadowing cannot leak after the join.
                                     chv_flow_bind(flow, assigned_root, false, assigned_alias, assigned_alias_ref)
                                     assigned_index <- chv_flow_latest(flow, assigned_root)
+                                    flow.may_direct_alias_reference[assigned_index] <- assigned_value_may_direct_alias_reference if assigned_index < flow.names.count
                                     flow.may_contain_alias_reference[assigned_index] <- assigned_value_may_contain_alias_reference if assigned_index < flow.names.count
+                                    flow.may_yield_alias_reference[assigned_index] <- assigned_value_may_yield_alias_reference if assigned_index < flow.names.count
+                                    flow.may_yield_alias_reference_known[assigned_index] <- assigned_value_yield_alias_reference_known if assigned_index < flow.names.count
                                     flow.may_be_scalar_sview[assigned_index] <- assigned_value_may_be_scalar_sview if assigned_index < flow.names.count
                                     flow.may_yield_scalar_sview[assigned_index] <- assigned_value_may_yield_scalar_sview if assigned_index < flow.names.count
                                     flow.shape_unknown[assigned_index] <- true if assigned_index < flow.names.count
                                 elif assigned_index < flow.names.count:
                                     flow.may_owned_view[assigned_index] <- assigned_alias
                                     flow.may_alias_reference[assigned_index] <- assigned_alias_ref
+                                    flow.may_direct_alias_reference[assigned_index] <- assigned_direct_alias_ref if assigned_name != "" else previous_may_direct_alias_reference
                                     flow.may_contain_alias_reference[assigned_index] <- assigned_contains_alias_ref
+                                    flow.may_yield_alias_reference[assigned_index] <- assigned_value_may_yield_alias_reference if assigned_name != "" else flow.may_yield_alias_reference[assigned_index] or assigned_value_may_yield_alias_reference
+                                    flow.may_yield_alias_reference_known[assigned_index] <- assigned_value_yield_alias_reference_known if assigned_name != "" else flow.may_yield_alias_reference_known[assigned_index] and assigned_value_yield_alias_reference_known
                                     flow.may_be_scalar_sview[assigned_index] <- assigned_value_may_be_scalar_sview if assigned_name != "" else false
                                     flow.may_yield_scalar_sview[assigned_index] <- assigned_value_may_yield_scalar_sview if assigned_name != "" else false
                                     flow.shape_unknown[assigned_index] <- true
                                 else:
                                     chv_flow_bind(flow, assigned_root, false, assigned_alias, assigned_alias_ref)
                                     assigned_index <- chv_flow_latest(flow, assigned_root)
+                                    flow.may_direct_alias_reference[assigned_index] <- assigned_value_may_direct_alias_reference if assigned_index < flow.names.count
                                     flow.may_contain_alias_reference[assigned_index] <- assigned_value_may_contain_alias_reference if assigned_index < flow.names.count
+                                    flow.may_yield_alias_reference[assigned_index] <- assigned_value_may_yield_alias_reference if assigned_index < flow.names.count
+                                    flow.may_yield_alias_reference_known[assigned_index] <- assigned_value_yield_alias_reference_known if assigned_index < flow.names.count
                                     flow.may_be_scalar_sview[assigned_index] <- assigned_value_may_be_scalar_sview if assigned_index < flow.names.count
                                     flow.may_yield_scalar_sview[assigned_index] <- assigned_value_may_yield_scalar_sview if assigned_index < flow.names.count
                                     flow.shape_unknown[assigned_index] <- true if assigned_index < flow.names.count
                             elif target is Expr.Array(target_elements, _):
-                                for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_be_scalar_sview, assigned_value_may_yield_scalar_sview, parallel_shape, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, target_elements|:
+                                for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known, assigned_value_may_be_scalar_sview, assigned_value_may_yield_scalar_sview, parallel_shape, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, target_elements|:
                                     if target_elements[target_index] is Expr.Ident(target_name, _):
                                         target_flow_index: mutable usize = chv_flow_latest(flow, target_name)
                                         previous_target_may_be_owned_view: bool = target_flow_index < flow.names.count and flow.may_owned_view[target_flow_index]
                                         previous_target_may_alias_reference: bool = target_flow_index < flow.names.count and flow.may_alias_reference[target_flow_index]
+                                        previous_target_may_direct_alias_reference: bool = target_flow_index < flow.names.count and flow.may_direct_alias_reference[target_flow_index]
                                         previous_target_may_contain_alias_reference: bool = target_flow_index < flow.names.count and flow.may_contain_alias_reference[target_flow_index]
                                         previous_target_may_be_scalar_sview: bool = target_flow_index < flow.names.count and flow.may_be_scalar_sview[target_flow_index]
                                         element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view
                                         element_may_alias_reference: bool = parallel_alias_refs[target_index] if parallel_shape else assigned_value_may_alias_reference
+                                        element_may_direct_alias_reference: bool = parallel_direct_alias_refs[target_index] if parallel_shape else assigned_value_may_direct_alias_reference
                                         element_may_contain_alias_reference: bool = parallel_contained_alias_refs[target_index] if parallel_shape else assigned_value_may_contain_alias_reference
+                                        element_may_yield_alias_reference: bool = parallel_yield_alias_refs[target_index] if parallel_shape else assigned_value_may_yield_alias_reference
+                                        element_yield_alias_known: bool = parallel_yield_alias_knowns[target_index] if parallel_shape else assigned_value_yield_alias_reference_known
                                         element_may_be_scalar_sview: bool = parallel_scalar_sviews[target_index] if parallel_shape else assigned_value_may_be_scalar_sview
                                         element_may_yield_scalar_sview: bool = parallel_yield_scalar_sviews[target_index] if parallel_shape else assigned_value_may_yield_scalar_sview
                                         target_alias: bool = element_may_be_owned_view or (operator != TokenKind.Assign and previous_target_may_be_owned_view)
                                         target_alias_ref: bool = element_may_alias_reference or (operator != TokenKind.Assign and previous_target_may_alias_reference)
+                                        target_direct_alias_ref: bool = element_may_direct_alias_reference or (operator != TokenKind.Assign and previous_target_may_direct_alias_reference)
                                         target_is_rebind_claim: bool = operator == TokenKind.Assign and chv_flow_has_lmut_rebind_claim(flow, target_name, assign_pos.line)
                                         if operator == TokenKind.Assign and not target_is_rebind_claim:
                                             chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)
                                             target_flow_index <- chv_flow_latest(flow, target_name)
+                                            flow.may_direct_alias_reference[target_flow_index] <- element_may_direct_alias_reference if target_flow_index < flow.names.count
                                             flow.may_contain_alias_reference[target_flow_index] <- element_may_contain_alias_reference if target_flow_index < flow.names.count
+                                            flow.may_yield_alias_reference[target_flow_index] <- element_may_yield_alias_reference if target_flow_index < flow.names.count
+                                            flow.may_yield_alias_reference_known[target_flow_index] <- element_yield_alias_known if target_flow_index < flow.names.count
                                             flow.may_be_scalar_sview[target_flow_index] <- element_may_be_scalar_sview if target_flow_index < flow.names.count
                                             flow.may_yield_scalar_sview[target_flow_index] <- element_may_yield_scalar_sview if target_flow_index < flow.names.count
                                             flow.shape_unknown[target_flow_index] <- true if target_flow_index < flow.names.count
                                         elif target_flow_index < flow.names.count:
                                             flow.may_owned_view[target_flow_index] <- target_alias
                                             flow.may_alias_reference[target_flow_index] <- target_alias_ref
+                                            flow.may_direct_alias_reference[target_flow_index] <- target_direct_alias_ref
                                             flow.may_contain_alias_reference[target_flow_index] <- element_may_contain_alias_reference if operator == TokenKind.Assign else element_may_contain_alias_reference or previous_target_may_contain_alias_reference
+                                            flow.may_yield_alias_reference[target_flow_index] <- element_may_yield_alias_reference if operator == TokenKind.Assign else flow.may_yield_alias_reference[target_flow_index] or element_may_yield_alias_reference
+                                            flow.may_yield_alias_reference_known[target_flow_index] <- element_yield_alias_known if operator == TokenKind.Assign else flow.may_yield_alias_reference_known[target_flow_index] and element_yield_alias_known
                                             flow.may_be_scalar_sview[target_flow_index] <- element_may_be_scalar_sview
                                             flow.may_yield_scalar_sview[target_flow_index] <- element_may_yield_scalar_sview
                                             flow.shape_unknown[target_flow_index] <- true
                                         else:
                                             chv_flow_bind(flow, target_name, false, target_alias, target_alias_ref)
                                             target_flow_index <- chv_flow_latest(flow, target_name)
+                                            flow.may_direct_alias_reference[target_flow_index] <- element_may_direct_alias_reference if target_flow_index < flow.names.count
                                             flow.may_contain_alias_reference[target_flow_index] <- element_may_contain_alias_reference if target_flow_index < flow.names.count
+                                            flow.may_yield_alias_reference[target_flow_index] <- element_may_yield_alias_reference if target_flow_index < flow.names.count
+                                            flow.may_yield_alias_reference_known[target_flow_index] <- element_yield_alias_known if target_flow_index < flow.names.count
                                             flow.may_be_scalar_sview[target_flow_index] <- element_may_be_scalar_sview if target_flow_index < flow.names.count
                                             flow.may_yield_scalar_sview[target_flow_index] <- element_may_yield_scalar_sview if target_flow_index < flow.names.count
                                             flow.shape_unknown[target_flow_index] <- true if target_flow_index < flow.names.count
@@ -2127,6 +2349,7 @@ extend Semantic:
                             # values still inherit facts from explicit aggregate elements.
                             iterable_may_be_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)
                             iterable_may_alias_reference: bool = chv_expression_may_alias_ref(iterable, ref_params, flow, table, 0)
+                            iterable_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(iterable, ref_params, flow, table, 0)
                             loop_element_may_alias_reference: bool = chv_iterable_element_may_alias_reference(iterable, ref_params, flow, table, 0)
                             loop_element_may_contain_alias_reference: bool = chv_iterable_element_may_contain_alias_ref(iterable, ref_params, flow, table, 0)
                             loop_element_is_scalar_sview: bool = chv_iterable_element_is_scalar_sview(iterable, flow, view_names, view_values, 0)
@@ -2140,12 +2363,15 @@ extend Semantic:
                                 loop_variable_may_be_owned_view: bool = element_facts.may_owned_view if element_facts.known else iterable_may_be_owned_view
                                 loop_variable_may_alias_reference: mutable bool = element_facts.may_alias_reference if element_facts.known else loop_element_may_alias_reference
                                 loop_variable_may_alias_reference <- loop_variable_may_alias_reference or (bind == "mutable" and iterable_may_alias_reference)
+                                loop_variable_may_direct_alias_reference: mutable bool = element_facts.may_alias_reference if element_facts.known else loop_element_may_alias_reference
+                                loop_variable_may_direct_alias_reference <- loop_variable_may_direct_alias_reference or (bind == "mutable" and iterable_may_direct_alias_reference)
                                 loop_variable_may_contain_alias_reference: bool = element_facts.may_contain_alias_reference if element_facts.known else loop_element_may_contain_alias_reference
                                 loop_variable_is_scalar_sview: bool = element_facts.may_be_scalar_sview if element_facts.known else loop_element_is_scalar_sview
                                 loop_variable_yields_scalar_sview: bool = element_facts.may_yield_scalar_sview if element_facts.known else loop_element_yields_scalar_sview
                                 chv_flow_bind(&loop_flow, loop_variable, false, loop_variable_may_be_owned_view, loop_variable_may_alias_reference)
                                 chv_flow_set_iterable_element_type(&loop_flow, loop_variable, iterable)
                                 loop_index: usize = chv_flow_latest(loop_flow, loop_variable)
+                                loop_flow.may_direct_alias_reference[loop_index] <- loop_variable_may_direct_alias_reference if loop_index < loop_flow.names.count
                                 loop_flow.may_contain_alias_reference[loop_index] <- loop_variable_may_contain_alias_reference if loop_index < loop_flow.names.count
                                 loop_flow.may_be_scalar_sview[loop_index] <- loop_variable_is_scalar_sview if loop_index < loop_flow.names.count
                                 loop_flow.may_yield_scalar_sview[loop_index] <- loop_variable_yields_scalar_sview if loop_index < loop_flow.names.count
@@ -2159,14 +2385,15 @@ extend Semantic:
                         Stmt.Match(scrutinee, arms, _):
                             table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                             scrutinee_may_be_owned_view: bool = flow.last_value_may_be_owned_view
-                            scrutinee_may_alias_reference: bool = chv_expression_may_alias_ref(scrutinee, ref_params, flow, table, 0)
+                            scrutinee_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(scrutinee, ref_params, flow, table, 0)
+                            scrutinee_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(scrutinee, ref_params, flow, table, 0)
                             branch_mark: usize = flow.names.count
                             entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                             merged_flow: mutable CHVViewFlow = chv_flow_clone(flow)
                             merged_ready: mutable bool = false
                             for arm in arms |table| -> table:
                                 arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
-                                chv_flow_bind_pattern(arm.pattern, true, scrutinee_may_be_owned_view, scrutinee_may_alias_reference, &arm_flow)
+                                chv_flow_bind_pattern(arm.pattern, true, scrutinee_may_be_owned_view, scrutinee_may_direct_alias_reference, scrutinee_may_contain_alias_reference, arm_flow)
                                 table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                                 table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
                                 if not merged_ready:
@@ -2182,7 +2409,7 @@ extend Semantic:
                         Stmt.Continue(_, _):
                             pass
 
-        def chv_walk_declarations_with_reference_holders(declarations: darray[Ast::Decl], summary: StoreThroughSummary&, rebind_claims: darray[Ast::EnumAnnotation]&, reference_holders: darray[sview]&, table: lmut SymbolTable) -> void:
+        def chv_walk_declarations_with_reference_holders(declarations: darray[Ast::Decl], summary: StoreThroughSummary&, rebind_claims: darray[Ast::EnumAnnotation]&, reference_holders: darray[sview]&, type_alias_names: darray[sview]&, type_alias_targets: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -2192,15 +2419,18 @@ extend Semantic:
                             flow: mutable CHVViewFlow = CHVViewFlow{}
                             flow.rebind_claims.extend(rebind_claims)
                             flow.reference_holders.extend(reference_holders)
+                            flow.type_alias_names.extend(type_alias_names)
+                            flow.type_alias_targets.extend(type_alias_targets)
                             for parameter in parameters |ref_params, binders|:
                                 binders.push(parameter.name)
-                                ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                                parameter_direct_alias_reference: bool = chv_type_is_direct_alias_reference(parameter.type_expression, flow.type_alias_names, flow.type_alias_targets, 0)
+                                ref_params.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand) or parameter_direct_alias_reference
                                 parameter_owned: bool = chv_type_is_owned_container(parameter.type_expression) and not type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
-                                parameter_may_alias_reference: bool = type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                                parameter_may_alias_reference: bool = type_marker_present_here(parameter.type_expression, TokenKind.Ampersand) or parameter_direct_alias_reference
                                 chv_flow_bind(flow, parameter.name, parameter_owned, false, parameter_may_alias_reference)
                                 parameter_index: usize = chv_flow_latest(flow, parameter.name)
-                                flow.may_direct_alias_reference[parameter_index] <- parameter_may_alias_reference or chv_type_is_direct_alias_reference(parameter.type_expression, 0) if parameter_index < flow.names.count
-                                parameter_yield_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(parameter.type_expression, 0)
+                                flow.may_direct_alias_reference[parameter_index] <- parameter_direct_alias_reference if parameter_index < flow.names.count
+                                parameter_yield_facts: (known: bool, may_yield: bool) = chv_type_iterable_yields_alias_reference(parameter.type_expression, flow.type_alias_names, flow.type_alias_targets, 0)
                                 flow.may_yield_alias_reference[parameter_index] <- parameter_yield_facts.may_yield if parameter_index < flow.names.count
                                 flow.may_yield_alias_reference_known[parameter_index] <- parameter_yield_facts.known if parameter_index < flow.names.count
                                 flow.binding_types[parameter_index] <- parameter.type_expression if parameter_index < flow.names.count and not (parameter.type_expression is Expr.Absent)
@@ -2217,16 +2447,19 @@ extend Semantic:
                                 chv_flow_add_shape_shadows(flow, view_names)
                                 table <- chv_walk_statements(body, false, ref_params, binders, owned, view_names, view_values, flow, summary, table)
                         Decl.Module(_, module_body, _):
-                            table <- chv_walk_declarations_with_reference_holders(module_body, summary, rebind_claims, reference_holders, table)
+                            table <- chv_walk_declarations_with_reference_holders(module_body, summary, rebind_claims, reference_holders, type_alias_names, type_alias_targets, table)
                         Decl.Scoped(scoped_body, _):
-                            table <- chv_walk_declarations_with_reference_holders(scoped_body, summary, rebind_claims, reference_holders, table)
+                            table <- chv_walk_declarations_with_reference_holders(scoped_body, summary, rebind_claims, reference_holders, type_alias_names, type_alias_targets, table)
                         _:
                             pass
 
         def chv_walk_declarations(declarations: darray[Ast::Decl], summary: StoreThroughSummary&, rebind_claims: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 reference_holders: darray[sview] = chv_reference_holders(declarations)
-                table <- chv_walk_declarations_with_reference_holders(declarations, summary, rebind_claims, reference_holders, table)
+                type_alias_names: mutable darray[sview] = []
+                type_alias_targets: mutable darray[Ast::Expr] = []
+                chv_collect_type_aliases(declarations, type_alias_names, type_alias_targets)
+                table <- chv_walk_declarations_with_reference_holders(declarations, summary, rebind_claims, reference_holders, type_alias_names, type_alias_targets, table)
 
     public:
         def check_call_holder_view_store(file: Ast::File&, table: lmut SymbolTable) -> void:

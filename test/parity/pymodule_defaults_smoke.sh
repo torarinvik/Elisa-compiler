@@ -22,6 +22,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
 
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import inspect
+import sys
 import defaults
 
 assert defaults.scaled(2) == 11
@@ -33,6 +34,15 @@ assert defaults.enabled(True) is True
 assert defaults.ratio(8) == 4.0
 assert defaults.count_from() == 0
 assert defaults.count_from(9) == 9
+pointer_unsigned_max = 2 * sys.maxsize + 1
+assert defaults.count_from(pointer_unsigned_max) == pointer_unsigned_max
+for bad in (-1, pointer_unsigned_max + 1):
+    try:
+        defaults.count_from(bad)
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError(("count_from accepted an out-of-range usize", bad))
 assert defaults.char_code() == 65
 assert defaults.char_code(66) == 66
 assert defaults.cstr_default() == "hello"
@@ -105,7 +115,7 @@ grep -Fq 'def bytes_default(values: bytes | bytearray | memoryview = b"\x01\x02\
 grep -Fq 'def nested(values: Sequence[Sequence[int]] = [[1, 2], [3]]) -> int: ...' "$WORK/defaults_unsupported.pyi"
 grep -Fq 'def viewed(values: Sequence[int] = [1, 2]) -> int: ...' "$WORK/defaults_unsupported.pyi"
 
-for invalid_default in negative_unsigned out_of_range bad_escape; do
+for invalid_default in negative_unsigned negative_usize negative_uintptr out_of_range bad_escape; do
     if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \
         -o "$WORK/$invalid_default.json" \
         "$ROOT/test/repro/pymodule_defaults_${invalid_default}.elisa" \
@@ -116,6 +126,19 @@ for invalid_default in negative_unsigned out_of_range bad_escape; do
     grep -Fq "only literal scalar/text or recursively literal container defaults" "$WORK/${invalid_default}_manifest.log"
 done
 
+if "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.maxsize <= 2147483647 else 1)'; then
+    for invalid_default in usize_32bit_out_of_range isize_32bit_out_of_range; do
+        if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \
+            -o "$WORK/$invalid_default.json" \
+            "$ROOT/test/repro/pymodule_defaults_${invalid_default}.elisa" \
+            >"$WORK/${invalid_default}_manifest.log" 2>&1; then
+            echo "$invalid_default default should be rejected on 32-bit targets" >&2
+            exit 1
+        fi
+        grep -Fq "only literal scalar/text or recursively literal container defaults" "$WORK/${invalid_default}_manifest.log"
+    done
+fi
+
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
     -o "$WORK/negative_unsigned.c" \
     "$ROOT/test/repro/pymodule_defaults_negative_unsigned.elisa" >"$WORK/negative_unsigned.log" 2>&1; then
@@ -124,6 +147,16 @@ if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
 fi
 grep -Fq "only literal scalar/text or recursively literal container defaults" "$WORK/negative_unsigned.log"
 
+for invalid_default in negative_usize negative_uintptr; do
+    if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
+        -o "$WORK/$invalid_default.c" \
+        "$ROOT/test/repro/pymodule_defaults_${invalid_default}.elisa" >"$WORK/$invalid_default.log" 2>&1; then
+        echo "$invalid_default default should be rejected by pymodule-c" >&2
+        exit 1
+    fi
+    grep -Fq "only literal scalar/text or recursively literal container defaults" "$WORK/$invalid_default.log"
+done
+
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
     -o "$WORK/out_of_range.c" \
     "$ROOT/test/repro/pymodule_defaults_out_of_range.elisa" >"$WORK/out_of_range.log" 2>&1; then
@@ -131,6 +164,26 @@ if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
     exit 1
 fi
 grep -Fq "only literal scalar/text or recursively literal container defaults" "$WORK/out_of_range.log"
+
+# `usize` and `isize` defaults are bounded by the target pointer width. On a
+# 32-bit host these values must be refused; on a 64-bit host both are valid.
+if "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.maxsize < 2**32 else 1)'; then
+    for invalid_default in usize_32bit_out_of_range isize_32bit_out_of_range; do
+        if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
+            -o "$WORK/$invalid_default.c" \
+            "$ROOT/test/repro/pymodule_defaults_${invalid_default}.elisa" >"$WORK/$invalid_default.log" 2>&1; then
+            echo "$invalid_default default should be rejected on 32-bit targets" >&2
+            exit 1
+        fi
+        grep -Fq "only literal scalar/text or recursively literal container defaults" "$WORK/$invalid_default.log"
+    done
+else
+    for valid_default in usize_32bit_out_of_range isize_32bit_out_of_range; do
+        bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
+            -o "$WORK/$valid_default.c" \
+            "$ROOT/test/repro/pymodule_defaults_${valid_default}.elisa" >/dev/null
+    done
+fi
 
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
     -o "$WORK/bad_escape.c" \

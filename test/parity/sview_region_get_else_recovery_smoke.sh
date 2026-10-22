@@ -9,10 +9,31 @@ SOURCES=(
     "$ROOT/test/repro/sview_region_get_else_recovery.neg.elisa"
     "$ROOT/test/repro/sview_region_get_else_block_initializer.neg.elisa"
     "$ROOT/test/repro/sview_region_get_else_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_get_else_match_annotated_scrutinee.neg.elisa"
 )
 STAGE1_ONLY_SOURCES=(
     "$ROOT/test/repro/sview_region_get_else_nested_call_return.neg.elisa"
     "$ROOT/test/repro/sview_region_get_else_nested_array_return.neg.elisa"
+)
+STAGE1_ONLY_STORE_SOURCES=(
+    "$ROOT/test/repro/sview_region_get_else_match_arm_scope.neg.elisa"
+    "$ROOT/test/repro/sview_region_get_else_match_continuing_arm.neg.elisa"
+    "$ROOT/test/repro/sview_region_get_else_match_payload_binder.neg.elisa"
+    "$ROOT/test/repro/sview_region_get_else_while_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_if_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_match_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_statement_match_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_for_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_comprehension_store.neg.elisa"
+)
+STAGE1_ONLY_POSITIVE_SOURCES=(
+    "$ROOT/test/repro/sview_region_get_else_match_terminating_arm.pos.elisa"
+    "$ROOT/test/repro/sview_region_get_else_match_terminating_call_arg.pos.elisa"
+    "$ROOT/test/repro/sview_region_get_else_match_terminating_binary_operand.pos.elisa"
+    "$ROOT/test/repro/sview_region_get_else_match_terminating_short_circuit.pos.elisa"
+    "$ROOT/test/repro/sview_region_if_terminating_branch.pos.elisa"
+    "$ROOT/test/repro/sview_region_match_terminating_branch.pos.elisa"
+    "$ROOT/test/repro/sview_region_get_else_while_false.pos.elisa"
 )
 
 fail() { echo "sview GetElse recovery region smoke FAIL: $1" >&2; exit 1; }
@@ -47,4 +68,20 @@ for source in "${STAGE1_ONLY_SOURCES[@]}"; do
         || fail "stage1 rejection did not identify the nested region return escape ($name): $(tail -n 8 "$WORK/stage1-$name.log")"
 done
 
-echo "sview GetElse recovery region smoke OK: both stages inspect recovery stores; Stage1 inspects nested recovery returns"
+for source in "${STAGE1_ONLY_STORE_SOURCES[@]}"; do
+    name="$(basename "$source" .neg.elisa)"
+    if "$STAGE1" -emit llvm -O0 -o "$WORK/stage1-$name.ll" "$source" >"$WORK/stage1-$name.log" 2>&1; then
+        fail "stage1 accepted an inner-to-outer store in a GetElse recovery branch ($name)"
+    fi
+    grep -Fq 'value in region "inner" is stored into longer-lived region "outer"' "$WORK/stage1-$name.log" \
+        || fail "stage1 rejection did not identify the inner-to-outer lifetime escape ($name): $(tail -n 8 "$WORK/stage1-$name.log")"
+done
+
+for source in "${STAGE1_ONLY_POSITIVE_SOURCES[@]}"; do
+    name="$(basename "$source" .pos.elisa)"
+    if ! "$STAGE1" -emit llvm -O0 -o "$WORK/stage1-$name.ll" "$source" >"$WORK/stage1-$name.log" 2>&1; then
+        fail "stage1 propagated a region taint from unreachable recovery control flow ($name): $(tail -n 8 "$WORK/stage1-$name.log")"
+    fi
+done
+
+echo "sview GetElse recovery region smoke OK: both stages inspect recovery stores; Stage1 inspects nested returns and expression-arm flow"

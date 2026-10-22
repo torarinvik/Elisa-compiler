@@ -425,8 +425,8 @@ HOLDER_WALK_STATEMENT_EDGES = (
     ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "table <- chv_walk_expression(declared_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "if parallel_shape:"),
-    ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:"),
-    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:", "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:", "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "else:"),
     ("else:", "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 0),
     ("Stmt.Return(value, _):", "table <- chv_walk_expression(return_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table) if value is return_value"),
@@ -467,16 +467,16 @@ FOR_ITERATOR_REF_ALIAS_EDGES = (
 ITERABLE_BINDING_FACTS_ALIAS_EDGES = (
     ("can Memory.Allocate, Abort.Panic:", "known, outer_shape = chv_known_iterable_shape_with_locals(iterable, flow, view_names, view_values, 0)"),
     ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "element_is_aggregate, nested_shape = chv_known_iterable_shape_with_locals(element, flow, view_names, view_values, 0)"),
-    ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "may_alias_reference <- may_alias_reference or (not element_is_aggregate and chv_expression_may_alias_ref(element, ref_params, flow, table, 0))"),
+    ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "may_alias_reference <- may_alias_reference or (not element_is_aggregate and chv_expression_may_direct_alias_ref(element, ref_params, flow, table, 0))"),
     ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "may_contain_alias_reference <- may_contain_alias_reference or chv_expression_may_contain_alias_ref(element, ref_params, flow, table, 0)"),
     ("can Memory.Allocate, Abort.Panic:", "return (true, may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview)"),
 )
 
 HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)"),
-    ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:"),
-    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "argument_owned_views.push(flow.last_value_may_be_owned_view)", 0),
-    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, table, 0))", 0),
+    ("Expr.Call(callee, arguments, _, _):", "for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:"),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:", "argument_owned_views.push(flow.last_value_may_be_owned_view)", 0),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:", "argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, table, 0))", 0),
     ("Expr.Call(callee, arguments, _, _):", "table <- chv_check_call(expression, argument_owned_views, argument_may_alias_refs, receiver_may_be_owned_view, receiver_may_alias_reference, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)"),
     ("Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):", "for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:"),
@@ -541,10 +541,22 @@ HOLDER_WALK_EXPRESSION_EDGES = (
 )
 
 CATCH_ARM_PROVENANCE_EDGES = (
+    ("Expr.Catch(guarded, arms, _):",
+     "guarded_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(guarded, ref_params, guarded_flow, table, 0)"),
+    ("Expr.Catch(guarded, arms, _):",
+     "guarded_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(guarded, ref_params, guarded_flow, table, 0)"),
     ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:",
      "is_success_arm: bool = arm_index == 0"),
     ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:",
-     "chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_alias_reference if is_success_arm else true, arm_flow)"),
+     "chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_direct_alias_reference if is_success_arm else true, guarded_may_contain_alias_reference if is_success_arm else true, arm_flow)"),
+)
+
+CATCH_PATTERN_BINDING_EDGES = (
+    ("if name != \"\":", "bound_may_direct_alias_reference: bool = root_may_direct_alias_reference if root_pattern else true"),
+    ("if name != \"\":", "bound_may_contain_alias_reference: bool = root_may_contain_alias_reference if root_pattern else true"),
+    ("if name != \"\":", "chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, bound_may_direct_alias_reference or bound_may_contain_alias_reference)"),
+    ("if name != \"\":", "flow.may_direct_alias_reference[bound_index] <- bound_may_direct_alias_reference if bound_index < flow.names.count"),
+    ("if name != \"\":", "flow.may_contain_alias_reference[bound_index] <- bound_may_contain_alias_reference if bound_index < flow.names.count"),
 )
 
 EXPRESSION_BINDING_FACTS_OR_EDGES = (
@@ -555,12 +567,12 @@ EXPRESSION_BINDING_FACTS_OR_EDGES = (
 
 PARALLEL_ASSIGNMENT_FLOW_EDGES = (
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "parallel_values_found, parallel_values = chv_parallel_value_elements(assigned_value)"),
-    ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:"),
-    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:", "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:", "parallel_owned_views.push(value_may_be_owned_view)"),
-    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:", "parallel_alias_refs.push(value_may_alias_reference)"),
-    ("elif target is Expr.Array(target_elements, _):", "for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_be_scalar_sview, assigned_value_may_yield_scalar_sview, parallel_shape, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, target_elements|:"),
-    ("for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_be_scalar_sview, assigned_value_may_yield_scalar_sview, parallel_shape, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, target_elements|:", "if target_elements[target_index] is Expr.Ident(target_name, _):"),
+    ("if parallel_shape:", "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:", "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:", "parallel_owned_views.push(value_may_be_owned_view)"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:", "parallel_alias_refs.push(value_may_alias_reference)"),
+    ("elif target is Expr.Array(target_elements, _):", "for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known, assigned_value_may_be_scalar_sview, assigned_value_may_yield_scalar_sview, parallel_shape, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, target_elements|:"),
+    ("for target_index in 0..<target_elements.count |flow, operator, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known, assigned_value_may_be_scalar_sview, assigned_value_may_yield_scalar_sview, parallel_shape, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, target_elements|:", "if target_elements[target_index] is Expr.Ident(target_name, _):"),
     ("if target_elements[target_index] is Expr.Ident(target_name, _):", "element_may_be_owned_view: bool = parallel_owned_views[target_index] if parallel_shape else assigned_value_may_be_owned_view"),
     ("if target_elements[target_index] is Expr.Ident(target_name, _):", "element_may_alias_reference: bool = parallel_alias_refs[target_index] if parallel_shape else assigned_value_may_alias_reference"),
     ("if target_elements[target_index] is Expr.Ident(target_name, _):", "element_may_contain_alias_reference: bool = parallel_contained_alias_refs[target_index] if parallel_shape else assigned_value_may_contain_alias_reference"),
@@ -673,7 +685,7 @@ CALLABLE_VIEW_RESULT_EDGES = (
 
 CALL_RESULT_VIEW_TAINT_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: mutable bool = chv_is_owned_view(expression, flow, 0)"),
-    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Call(callee, arguments, _, _):", "flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view"),
 )
 
@@ -717,8 +729,8 @@ ASSIGN_VIEW_TAINT_EDGES = (
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "previous_may_owned_view <- flow.may_owned_view[previous_index] if previous_index < flow.names.count"),
     ("else:", "table <- chv_walk_expression(assigned_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 0),
     ("else:", "assigned_value_may_be_owned_view <- flow.last_value_may_be_owned_view", 0),
-    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:", "value_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:", "assigned_value_may_be_owned_view <- assigned_value_may_be_owned_view or value_may_be_owned_view"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:", "value_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:", "assigned_value_may_be_owned_view <- assigned_value_may_be_owned_view or value_may_be_owned_view"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "table <- chv_walk_expression(target, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "if assigned_root != \"\":"),
@@ -771,19 +783,22 @@ COMPREHENSION_REF_ALIAS_EDGES = (
 
 COMPREHENSION_CONTAIN_ALIAS_EDGES = (
     ("can Memory.Allocate, Abort.Panic:", "return false if chv_flow_iterable_is_scalar_sview(expression, flow, depth + 1)"),
-    ("if known_elements:", "return any element in elements where chv_expression_may_alias_ref(element, ref_params, flow, table, depth + 1)"),
+    ("if known_elements:", "element_count: usize = chv_known_iterable_shape_count(elements)"),
+    ("for element_index in 0..<element_count |found, elements, ref_params, flow, table|:", "element: Ast::Expr = chv_known_iterable_shape_element(elements, element_index)"),
+    ("for element_index in 0..<element_count |found, elements, ref_params, flow, table|:", "found <- found or chv_expression_may_contain_alias_ref(element, ref_params, flow, table, depth + 1)"),
     ("match expression:", "Expr.If(condition, then_value, else_value, _):"),
     ("Expr.If(condition, then_value, else_value, _):", "chv_flow_bind_truthy_condition_binders(condition, ref_params, then_flow, table)"),
     ("Expr.If(condition, then_value, else_value, _):", "return chv_expression_may_contain_alias_ref(then_value, ref_params, then_flow, table, depth + 1) or chv_expression_may_contain_alias_ref(else_value, ref_params, flow, table, depth + 1)"),
     ("Expr.Ident(name, _):", "if index < flow.names.count:"),
     ("if index < flow.names.count:", "return flow.may_contain_alias_reference[index] or flow.may_alias_reference[index]"),
-    ("Expr.Ident(name, _):", "return any reference_parameter in ref_params where reference_parameter == name"),
+    ("_:", "return chv_expression_may_alias_ref(expression, ref_params, flow, table, depth + 1)"),
 )
 
 ITERABLE_REF_ALIAS_EDGES = (
-    ("if known_elements:", "for element in elements |may_yield_alias_reference|:"),
-    ("for element in elements |may_yield_alias_reference|:", "element_is_aggregate, nested_elements = chv_known_iterable_elements(element)"),
-    ("for element in elements |may_yield_alias_reference|:", "may_yield_alias_reference <- may_yield_alias_reference or (not element_is_aggregate and chv_expression_may_alias_ref(element, ref_params, flow, table, depth + 1))"),
+    ("if known_elements:", "element_count: usize = chv_known_iterable_shape_count(elements)"),
+    ("for element_index in 0..<element_count |may_yield_alias_reference, elements, ref_params, flow, table|:", "element: Ast::Expr = chv_known_iterable_shape_element(elements, element_index)"),
+    ("for element_index in 0..<element_count |may_yield_alias_reference, elements, ref_params, flow, table|:", "element_is_aggregate, nested_shape = chv_known_iterable_shape(element, depth + 1)"),
+    ("for element_index in 0..<element_count |may_yield_alias_reference, elements, ref_params, flow, table|:", "may_yield_alias_reference <- may_yield_alias_reference or (not element_is_aggregate and chv_expression_may_direct_alias_ref(element, ref_params, flow, table, depth + 1))"),
     ("if known_elements:", "return may_yield_alias_reference"),
     ("can Memory.Allocate, Abort.Panic:", "return false if chv_flow_iterable_is_scalar_sview(iterable, flow, depth + 1)"),
     ("can Memory.Allocate, Abort.Panic:", "return chv_iterable_element_may_contain_alias_ref(iterable, ref_params, flow, table, depth + 1)"),
@@ -791,7 +806,9 @@ ITERABLE_REF_ALIAS_EDGES = (
 
 ITERABLE_CONTAIN_ALIAS_EDGES = (
     ("can Memory.Allocate, Abort.Panic:", "return false if chv_flow_iterable_is_scalar_sview(iterable, flow, depth + 1)"),
-    ("if known_elements:", "return any element in elements where chv_expression_may_contain_alias_ref(element, ref_params, flow, table, depth + 1)"),
+    ("if known_elements:", "element_count: usize = chv_known_iterable_shape_count(elements)"),
+    ("for element_index in 0..<element_count |found, elements, ref_params, flow, table|:", "element: Ast::Expr = chv_known_iterable_shape_element(elements, element_index)"),
+    ("for element_index in 0..<element_count |found, elements, ref_params, flow, table|:", "found <- found or chv_expression_may_contain_alias_ref(element, ref_params, flow, table, depth + 1)"),
     ("match iterable:", "Expr.Ident(name, _):"),
     ("match iterable:", "Expr.Paren(inner, _) | Expr.Move(inner, _):"),
     ("Expr.Paren(inner, _) | Expr.Move(inner, _):", "return chv_iterable_element_may_contain_alias_ref(inner, ref_params, flow, table, depth + 1)"),
@@ -803,6 +820,10 @@ ITERABLE_CONTAIN_ALIAS_EDGES = (
     ("Expr.Ident(name, _):", "if index < flow.names.count:"),
     ("if index < flow.names.count:", "return flow.may_contain_alias_reference[index]"),
     ("can Memory.Allocate, Abort.Panic:", "return chv_expression_may_contain_alias_ref(iterable, ref_params, flow, table, depth + 1)"),
+)
+
+TYPE_ALIAS_ITERABLE_COLLISION_EDGES = (
+    ("can Memory.Allocate, Abort.Panic:", "return (true, true) if not known and chv_type_alias_name_count(type_expression, alias_names) > 0"),
 )
 
 GETELSE_RECOVERY_TERMINATION_EDGES = (
@@ -1739,7 +1760,9 @@ for source, edges, label in (
 ):
     validate_edge_set(source, edges, label)
 validate_edge_set(holder_walk_expressions, CATCH_ARM_PROVENANCE_EDGES, "holder-view catch-arm provenance")
+validate_edge_set(function_section(holder_text, "chv_flow_bind_pattern_name"), CATCH_PATTERN_BINDING_EDGES, "holder-view pattern binding direct/contained provenance")
 validate_edge_set(function_section(holder_text, "chv_expression_binding_facts"), EXPRESSION_BINDING_FACTS_OR_EDGES, "holder-view disjunction binder provenance")
+validate_edge_set(function_section(holder_text, "chv_type_iterable_yields_alias_reference"), TYPE_ALIAS_ITERABLE_COLLISION_EDGES, "holder-view ambiguous iterable alias fallback")
 validate_edge_set(holder_walk_statements, PARALLEL_ASSIGNMENT_FLOW_EDGES, "holder-view parallel-assignment provenance")
 validate_edge_set(holder_walk_statements, FOR_ITERATOR_VIEW_TAINT_EDGES, "holder-view for-iterator view taint")
 validate_edge_set(holder_walk_statements, FOR_ITERATOR_REF_ALIAS_EDGES, "holder-view for-iterator reference alias")
@@ -1748,7 +1771,7 @@ if assignment_arm is None:
     raise SystemExit("holder-view assignment arm is missing")
 validate_ordered_source_lines(assignment_arm, (
     "if parallel_shape:",
-    "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_contained_alias_refs, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_contain_alias_reference| -> table:",
+    "for parallel_value in parallel_values |table, parallel_owned_views, parallel_alias_refs, parallel_direct_alias_refs, parallel_contained_alias_refs, parallel_yield_alias_refs, parallel_yield_alias_knowns, parallel_scalar_sviews, parallel_yield_scalar_sviews, flow, assigned_value_may_be_owned_view, assigned_value_may_alias_reference, assigned_value_may_direct_alias_reference, assigned_value_may_contain_alias_reference, assigned_value_may_yield_alias_reference, assigned_value_yield_alias_reference_known| -> table:",
     "table <- chv_walk_expression(parallel_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)",
     "value_may_be_owned_view: bool = flow.last_value_may_be_owned_view",
     "parallel_owned_views.push(value_may_be_owned_view)",

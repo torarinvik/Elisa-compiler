@@ -27,6 +27,22 @@ assert rows["roundtrip_optional_uintptr"]["parameters"] == [{"name": "values", "
 assert rows["roundtrip_optional_isize"]["return"] == "darray[darray[isize?]]"
 assert rows["roundtrip_optional_isize_scalar"]["parameters"] == [{"name": "value", "type": "isize?"}]
 assert rows["roundtrip_optional_uintptr_scalar"]["parameters"] == [{"name": "value", "type": "uintptr?"}]
+assert rows["echo_u8"]["parameters"] == [{"name": "value", "type": "u8"}]
+assert rows["echo_u8_after_default"]["parameters"] == [
+    {"name": "prior", "type": "darray[i64]"},
+    {"name": "value", "type": "u8"},
+]
+assert rows["echo_u64"]["parameters"] == [{"name": "value", "type": "u64"}]
+assert rows["echo_usize"]["parameters"] == [{"name": "value", "type": "usize"}]
+assert rows["echo_uintptr"]["parameters"] == [{"name": "value", "type": "uintptr"}]
+assert rows["echo_uintptr_and_i64"]["parameters"] == [
+    {"name": "value", "type": "uintptr"},
+    {"name": "count", "type": "i64"},
+]
+assert rows["optional_uintptr_defaults"]["parameters"] == [
+    {"name": "prior", "type": "u64?"},
+    {"name": "value", "type": "uintptr?"},
+]
 assert rows["count"]["return"] == "i64"
 assert rows["roundtrip_deep"]["parameters"] == [{"name": "values", "type": "darray[darray[darray[darray[i64]]]]"}]
 assert rows["roundtrip_deep"]["return"] == "darray[darray[darray[darray[i64]]]]"
@@ -45,6 +61,11 @@ grep -Fq 'def roundtrip_optional_isize(values: Sequence[Sequence[int | None]]) -
 grep -Fq 'def roundtrip_optional_uintptr(values: Sequence[Sequence[int | None]]) -> list[list[int | None]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_optional_isize_scalar(value: int | None) -> int | None: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_optional_uintptr_scalar(value: int | None) -> int | None: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def echo_u8(value: int) -> int: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def echo_u8_after_default(prior: Sequence[int] = [7], value: int = 0) -> int: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def echo_u64(value: int) -> int: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def echo_usize(value: int) -> int: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def echo_uintptr(value: int) -> int: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_deep(values: Sequence[Sequence[Sequence[Sequence[int]]]]) -> list[list[list[list[int]]]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_points(values: Sequence[Sequence[Point | PointInput]]) -> list[list[Point]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_points_deep(values: Sequence[Sequence[Sequence[Point | PointInput]]]) -> list[list[list[Point]]]: ...' "$WORK/nested_darrays.pyi"
@@ -56,6 +77,18 @@ bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c -o "$WORK/nested_darrays.
 grep -Fq 'Py_DECREF(field_obj); *destination = holder.value; return 0;' "$WORK/nested_darrays.c"
 grep -Fq 'INTPTR_MIN' "$WORK/nested_darrays.c"
 grep -Fq 'UINTPTR_MAX' "$WORK/nested_darrays.c"
+"$PYTHON_BIN" - "$WORK/nested_darrays.c" <<'PY'
+import pathlib, re, sys
+generated = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert re.search(r'arg1_number > UINTPTR_MAX\).*?Py_XDECREF\(arg0_default\);', generated, re.S), (
+    "optional pointer-width overflow path must release an earlier omitted scalar default"
+)
+assert "PyLong_AsUnsignedLongLong(arg0_obj)" in generated
+assert re.search(r'PyLong_AsUnsignedLongLong\(arg0_obj\).*?PyErr_Occurred\(\)', generated, re.S)
+assert re.search(r'u8 value out of range.*?Py_XDECREF\(arg0_default\);', generated, re.S), (
+    "u8 range failure must release a previously materialized omitted container default"
+)
+PY
 
 if ! command -v clang >/dev/null 2>&1 || ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
     echo "pymodule nested darrays manifest/stub smoke OK (native build unavailable)"
@@ -79,6 +112,25 @@ assert nested_darrays.roundtrip_optional_isize_scalar(None) is None
 assert nested_darrays.roundtrip_optional_isize_scalar(-sys.maxsize - 1) == -sys.maxsize - 1
 assert nested_darrays.roundtrip_optional_uintptr_scalar(None) is None
 assert nested_darrays.roundtrip_optional_uintptr_scalar(pointer_unsigned_max) == pointer_unsigned_max
+assert nested_darrays.echo_u8(255) == 255
+assert nested_darrays.echo_u8_after_default(value=255) == 255
+assert nested_darrays.echo_u64(2**64 - 1) == 2**64 - 1
+assert nested_darrays.echo_usize(pointer_unsigned_max) == pointer_unsigned_max
+assert nested_darrays.echo_uintptr(pointer_unsigned_max) == pointer_unsigned_max
+assert nested_darrays.optional_uintptr_defaults(value=0) == 0
+try:
+    nested_darrays.echo_uintptr_and_i64("bad", "bad")
+except TypeError as exc:
+    assert exc.parameter == "count"
+else:
+    raise AssertionError("later scalar parse error was attributed to the unsigned parameter")
+try:
+    nested_darrays.echo_uintptr("bad")
+except TypeError as exc:
+    assert exc.parameter == "value"
+    assert exc.expected == "int"
+else:
+    raise AssertionError("non-integer unsigned scalar was accepted")
 assert nested_darrays.count(payload) == 3
 payload_refcount = sys.getrefcount(payload)
 for _ in range(100):
@@ -102,6 +154,17 @@ for bad in ([[1, "bad"]], [None], [[2**63]]):
         raise AssertionError(f"invalid nested value accepted: {bad!r}")
 
 for fn, bad in (
+    (nested_darrays.echo_u8, 256),
+    (lambda value: nested_darrays.echo_u8_after_default(value=value), 256),
+    (nested_darrays.echo_u8, 2**64),
+    (nested_darrays.echo_u64, -1),
+    (nested_darrays.echo_u64, 2**64),
+    (nested_darrays.echo_u64, 2**100),
+    (nested_darrays.echo_usize, -1),
+    (nested_darrays.echo_usize, pointer_unsigned_max + 1),
+    (nested_darrays.echo_uintptr, -1),
+    (nested_darrays.echo_uintptr, pointer_unsigned_max + 1),
+    (lambda value: nested_darrays.optional_uintptr_defaults(value=value), pointer_unsigned_max + 1),
     (nested_darrays.roundtrip_isize, [[sys.maxsize + 1]]),
     (nested_darrays.roundtrip_optional_isize, [[sys.maxsize + 1]]),
     (nested_darrays.roundtrip_usize, [[pointer_unsigned_max + 1]]),
